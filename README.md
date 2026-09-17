@@ -134,3 +134,12 @@ back to a built-in default; the GPU tests need the model and a working device.
 * Batched decode is functionally correct but currently slower per step than
   batch-1 for batches > 1; prefill and decode are memory-bandwidth bound on
   integrated GPUs.
+
+## License
+
+sycl-infer is released under the MIT License — see [`LICENSE`](LICENSE).
+
+Bundled third-party code (`third_party/`) retains its own license: cpp-httplib,
+nlohmann/json, minja and the llama.cpp Unicode tables are all MIT-licensed.  See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the per-component
+inventory and full license texts.
