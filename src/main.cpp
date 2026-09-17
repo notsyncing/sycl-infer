@@ -156,7 +156,7 @@ int main(int argc, char ** argv) {
                 toks = e.tk.encode(prompt, /*parse_special=*/true);
             } else {
                 std::vector<chat_msg> msgs = {{"user", prompt}};
-                toks = e.tk.encode(render_chat(msgs, true, false));
+                toks = e.tk.encode(render_chat(e.m.chat_template, msgs, true, false));
             }
             gen_params gp;
             gp.max_tokens = max_tokens;

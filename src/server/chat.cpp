@@ -1,5 +1,6 @@
 #include "chat.h"
 
+#include "chat_template.h"
 
 namespace si {
 
@@ -20,8 +21,15 @@ static std::string trim(const std::string & s) {
     return s.substr(b, e - b);
 }
 
-std::string render_chat(const std::vector<chat_msg> & msgs, bool add_generation_prompt,
-                        bool enable_thinking) {
+std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs,
+                        bool add_generation_prompt, bool enable_thinking) {
+    std::string out;
+    if (render_chat_template(tmpl, msgs, add_generation_prompt, enable_thinking, out)) return out;
+    return render_chat_builtin(msgs, add_generation_prompt, enable_thinking);
+}
+
+std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_generation_prompt,
+                                bool enable_thinking) {
     std::string out;
     if (msgs.empty()) return out;
 

@@ -309,7 +309,7 @@ int serve(engine & e, const server_config & cfg) {
         bool thinking = false;
         if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
             thinking = body["chat_template_kwargs"].value("enable_thinking", false);
-        std::string text = render_chat(msgs, true, thinking);
+        std::string text = render_chat(e.m.chat_template, msgs, true, thinking);
         static const bool srv_t = getenv("PF_SRV_TIME") != nullptr;
         const auto t_tok0 = std::chrono::steady_clock::now();
         auto prompt = e.tk.encode(text);

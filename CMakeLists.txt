@@ -74,6 +74,7 @@ add_library(sycl_infer_core STATIC
     src/engine/sampler.cpp
     # server: chat template, continuous batching scheduler, HTTP API
     src/server/chat.cpp
+    src/server/chat_template.cpp
     src/server/scheduler.cpp
     src/server/server.cpp
 )
@@ -120,6 +121,7 @@ function(si_add_test name)
 endfunction()
 
 si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
+si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)
 si_add_test(test_cpuref      tests/engine/test_cpuref.cpp)
 si_add_test(test_forward     tests/engine/test_forward.cpp)

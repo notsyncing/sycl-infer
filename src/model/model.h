@@ -52,6 +52,8 @@ struct layer_t {
 struct model {
     gguf_file gguf;
     hparams hp;
+    // tokenizer.chat_template (Jinja); empty when the GGUF does not carry one
+    std::string chat_template;
     std::vector<layer_t> layers;
     std::vector<int> gdn_layer_index; // layer id -> sequential index among GDN layers (-1)
     wt tok_embd;

@@ -48,6 +48,7 @@ const loader * find(const std::string & name) {
 // are delegated to the loader selected by `general.architecture`.
 void model::load(const std::string & path) {
     gguf.load(path);
+    if (const std::string * ct = gguf.get_str("tokenizer.chat_template")) chat_template = *ct;
     const std::string * arch_p = gguf.get_str("general.architecture");
     const std::string name = arch_p ? *arch_p : "";
     const arch::loader * a = arch::find(name);

@@ -57,6 +57,7 @@ GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
 
 ```bash
 ./build/test_tokenizer     # tokenizer round-trips (CPU only, no GPU work)
+./build/test_chat_template # GGUF chat template vs reference Jinja2 output (CPU only)
 ./build/test_compare       # CPU reference vs llama.cpp dumps (CPU only)
 ./build/test_cpuref        # CPU reference head (CPU only)
 ./build/test_gpu_stages    # every kernel vs the CPU reference (GPU)
@@ -87,14 +88,18 @@ src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers)
 src/engine/     engine.{h,cpp} (orchestration), engine_graph.cpp (seg_plan,
                 record_forward, build_graphs), engine_kvpool.cpp (dynamic KV
                 pool), engine_prefix_cache.cpp, sampler.{h,cpp}
-src/server/     chat.{h,cpp}, chat_util.h, scheduler.{h,cpp}, server.{h,cpp}
+src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
+                chat_template.{h,cpp} (minja Jinja wrapper for the GGUF
+                tokenizer.chat_template), chat_util.h, scheduler.{h,cpp},
+                server.{h,cpp}
 src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp +
                 <kernel>_stage.cpp (one per kernel)
-tests/model/    test_tokenizer.cpp, test_compare.cpp
+tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
 tests/engine/   test_cpuref.cpp, test_forward.cpp, test_gpu_vs_ref.cpp
-third_party/    httplib.h, json.hpp, unicode tables (vendored llama.cpp MIT)
+third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
+                unicode tables (vendored llama.cpp MIT)
 ```
 
 ## How to extend
@@ -191,7 +196,8 @@ kernel variants, so performance numbers must state the env used.
 **Diagnostics**
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
 `PF_TIME`, `PF_DBG_MID` (stop after embedding/norm/attn/ffn), `PF_DBG_GEMV`,
-`PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`, `SCHED_DEBUG`,
+`PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`, `PF_CHAT_TMPL_DEBUG`
+(log why a GGUF chat template fell back to the built-in renderer), `SCHED_DEBUG`,
 `STOP_AFTER_LAYER`, `PF_ABL_NOATTN`, `PF_ABL_NOGDN`.
 
 ## Invariants and gotchas
