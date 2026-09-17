@@ -8,7 +8,6 @@
 #include <thread>
 #include <vector>
 
-#include "chat_util.h"
 #include "engine.h"
 
 namespace si {
@@ -16,10 +15,10 @@ namespace si {
 struct sequence {
     int id = 0;
     int slot = -1;
-    std::vector<int> prompt;   // tokens to prefill
+    std::vector<int> prompt; // tokens to prefill
     int prompt_pos = 0;
-    std::vector<int> blocks;   // KV cache blocks
-    std::vector<int> recent;   // tokens for sampling penalties
+    std::vector<int> blocks; // KV cache blocks
+    std::vector<int> recent; // tokens for sampling penalties
     gen_params gp;
     sampler_state ss;
     bool admitted = false;
@@ -31,11 +30,11 @@ struct sequence {
 
     // PF_SRV_TIME diagnostics (unused/null on the default path)
     std::chrono::steady_clock::time_point t_submit;
-    double wait_ms = 0;   // submit -> first prefill
-    double admit_ms = 0;  // slot zero + block table setup
-    double pf_ms = 0;     // summed time of all prefill forwards
+    double wait_ms = 0;  // submit -> first prefill
+    double admit_ms = 0; // slot zero + block table setup
+    double pf_ms = 0;    // summed time of all prefill forwards
     int n_chunks = 0;
-    int reused = 0;       // prompt tokens served from the prefix cache
+    int reused = 0; // prompt tokens served from the prefix cache
 
     // token/text stream out
     std::mutex m;
@@ -53,7 +52,9 @@ struct sequence {
     bool pop(std::string & out) {
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [&] { return !text_out.empty() || finished; });
-        if (text_out.empty()) return false;
+        if (text_out.empty()) {
+            return false;
+        }
         out = std::move(text_out.front());
         text_out.pop_front();
         return true;
@@ -68,20 +69,22 @@ struct sequence {
 struct scheduler {
     engine & e;
     std::mutex m;
-    std::condition_variable cv;  // wakes the loop on submit/shutdown instead of polling
+    std::condition_variable cv; // wakes the loop on submit/shutdown instead of polling
     std::vector<std::shared_ptr<sequence>> waiting;
     std::vector<std::shared_ptr<sequence>> active;
     std::thread th;
     bool stopping = false;
     int next_id = 1;
 
-    scheduler(engine & eng) : e(eng) {}
-    ~scheduler() { shutdown(); }
+    scheduler(engine & eng) : e(eng) {
+    }
+    ~scheduler() {
+        shutdown();
+    }
 
     void start();
     void shutdown();
-    std::shared_ptr<sequence> submit(std::vector<int> prompt, const gen_params & gp,
-                                     std::vector<std::string> stops);
+    std::shared_ptr<sequence> submit(std::vector<int> prompt, const gen_params & gp, std::vector<std::string> stops);
 
 private:
     void loop();

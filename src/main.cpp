@@ -53,12 +53,16 @@ int main(int argc, char ** argv) {
     std::string prompt;
     std::string host = "0.0.0.0";
     int port = 8080;
-    int ctx = 0;                 // 0 = auto (kDefaultCtx)
-    if (const char * e = getenv("PF_CTX")) ctx = atoi(e);
-    bool ctx_full = false;       // --ctx full: read the maximum from the GGUF
-    int blocks = 0;              // KV blocks committed at startup; 0 = auto
-    int kv_cap_mb = INT_MIN;     // INT_MIN = auto (size the cap from --ctx)
-    if (const char * e = getenv("PF_KV_CAP_MB")) kv_cap_mb = atoi(e);
+    int ctx = 0; // 0 = auto (kDefaultCtx)
+    if (const char * e = getenv("PF_CTX")) {
+        ctx = atoi(e);
+    }
+    bool ctx_full = false;   // --ctx full: read the maximum from the GGUF
+    int blocks = 0;          // KV blocks committed at startup; 0 = auto
+    int kv_cap_mb = INT_MIN; // INT_MIN = auto (size the cap from --ctx)
+    if (const char * e = getenv("PF_KV_CAP_MB")) {
+        kv_cap_mb = atoi(e);
+    }
     int max_tokens = 256;
     float temp = 0.7f;
     float top_p = 0.95f;
@@ -71,29 +75,51 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
-        if (a == "--model") model_path = next();
-        else if (a == "--prompt") prompt = next();
-        else if (a == "--ctx") {
+        if (a == "--model") {
+            model_path = next();
+        } else if (a == "--prompt") {
+            prompt = next();
+        } else if (a == "--ctx") {
             std::string v = next();
-            if (v == "full") ctx_full = true;
-            else ctx = atoi(v.c_str());
+            if (v == "full") {
+                ctx_full = true;
+            } else {
+                ctx = atoi(v.c_str());
+            }
+        } else if (a == "--blocks") {
+            blocks = atoi(next().c_str());
+        } else if (a == "--kv-cap-mb") {
+            kv_cap_mb = atoi(next().c_str());
+        } else if (a == "--port") {
+            port = atoi(next().c_str());
+        } else if (a == "--host") {
+            host = next();
+        } else if (a == "--max-tokens") {
+            max_tokens = atoi(next().c_str());
+        } else if (a == "--temp") {
+            temp = (float)atof(next().c_str());
+        } else if (a == "--top-p") {
+            top_p = (float)atof(next().c_str());
+        } else if (a == "--top-k") {
+            top_k = atoi(next().c_str());
+        } else if (a == "--raw") {
+            raw = true;
+        } else if (a == "--mmproj") {
+            mmproj_path = next();
+        } else if (a == "--image") {
+            image_paths.push_back(next());
+        } else if (a == "-h" || a == "--help") {
+            usage(argv[0]);
+            return 0;
+        } else {
+            cmd = a;
         }
-        else if (a == "--blocks") blocks = atoi(next().c_str());
-        else if (a == "--kv-cap-mb") kv_cap_mb = atoi(next().c_str());
-        else if (a == "--port") port = atoi(next().c_str());
-        else if (a == "--host") host = next();
-        else if (a == "--max-tokens") max_tokens = atoi(next().c_str());
-        else if (a == "--temp") temp = (float) atof(next().c_str());
-        else if (a == "--top-p") top_p = (float) atof(next().c_str());
-        else if (a == "--top-k") top_k = atoi(next().c_str());
-        else if (a == "--raw") raw = true;
-        else if (a == "--mmproj") mmproj_path = next();
-        else if (a == "--image") image_paths.push_back(next());
-        else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
-        else cmd = a;
     }
 
-    if (cmd.empty()) { usage(argv[0]); return 1; }
+    if (cmd.empty()) {
+        usage(argv[0]);
+        return 1;
+    }
 
     if (ctx_full) {
         try {
@@ -103,14 +129,15 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (ctx <= 0) {
-            fprintf(stderr, "error: model does not declare a context length (%s)\n",
-                    model_path.c_str());
+            fprintf(stderr, "error: model does not declare a context length (%s)\n", model_path.c_str());
             return 1;
         }
     }
 
     const bool ctx_auto = ctx <= 0;
-    if (ctx_auto) ctx = kDefaultCtx;
+    if (ctx_auto) {
+        ctx = kDefaultCtx;
+    }
 
     try {
         // The block pool must hold max_seq tokens or prefill cannot use the
@@ -124,33 +151,34 @@ int main(int argc, char ** argv) {
         const bool lazy_blocks = ctx_auto || ctx_full;
         const int need_blocks = (ctx + kBlockSize - 1) / kBlockSize;
         int n_blocks = blocks > 0 ? blocks : (lazy_blocks ? 512 : std::max(512, need_blocks));
-        if (kv_cap_mb != INT_MIN && n_blocks < need_blocks) n_blocks = need_blocks;
+        if (kv_cap_mb != INT_MIN && n_blocks < need_blocks) {
+            n_blocks = need_blocks;
+        }
 
         engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb);
         {
-            const double kv_mb = (double) e.kv_bytes_total() / (1024.0 * 1024.0);
-            const double cap_mb = (double) e.kv_bytes_cap() / (1024.0 * 1024.0);
-            const double per_tok_kb = e.pool_blocks > 0
-                                          ? (double) e.kv_bytes_total() /
-                                                (double) ((size_t) e.pool_blocks * kBlockSize) / 1024.0
-                                          : 0.0;
+            const double kv_mb = (double)e.kv_bytes_total() / (1024.0 * 1024.0);
+            const double cap_mb = (double)e.kv_bytes_cap() / (1024.0 * 1024.0);
+            const double per_tok_kb =
+                e.pool_blocks > 0 ? (double)e.kv_bytes_total() / (double)((size_t)e.pool_blocks * kBlockSize) / 1024.0
+                                  : 0.0;
             fprintf(stderr,
                     "[ctx] max_seq=%d tokens%s, kv_blocks=%d (%d tokens), kv_pool=%.0f MB, "
                     "kv_cap=%d blocks (%.0f MB, %s), kv_type=%s (%.0f KB/token)\n",
-                    e.max_seq, ctx_full ? " (full)" : (ctx_auto ? " (auto)" : ""), n_blocks,
-                    n_blocks * kBlockSize,
-                    kv_mb, e.pool_cap, cap_mb, e.kv_virtual ? "virtual USM" : "fixed",
-                    kv_dtype_name(kv_dtype()), per_tok_kb);
+                    e.max_seq, ctx_full ? " (full)" : (ctx_auto ? " (auto)" : ""), n_blocks, n_blocks * kBlockSize,
+                    kv_mb, e.pool_cap, cap_mb, e.kv_virtual ? "virtual USM" : "fixed", kv_dtype_name(kv_dtype()),
+                    per_tok_kb);
             // device memory report (best effort: the free_memory aspect is not
             // implemented by every backend)
             try {
                 if (e.q.get_device().has(sycl::aspect::ext_intel_free_memory)) {
                     const uint64_t free_b = e.q.get_device().get_info<sycl::ext::intel::info::device::free_memory>();
                     fprintf(stderr, "[ctx] device free memory %.0f MB, KV reservation %.0f MB%s\n",
-                            (double) free_b / (1024.0 * 1024.0), cap_mb,
-                            (double) free_b < cap_mb * 0.5 ? " (WARNING: KV cap exceeds half the free memory)" : "");
+                            (double)free_b / (1024.0 * 1024.0), cap_mb,
+                            (double)free_b < cap_mb * 0.5 ? " (WARNING: KV cap exceeds half the free memory)" : "");
                 }
-            } catch (...) {}
+            } catch (...) {
+            }
         }
         if (cmd == "serve") {
             server_config cfg;
@@ -172,8 +200,9 @@ int main(int argc, char ** argv) {
                 return true;
             };
             if (!image_paths.empty()) {
-                if (mmproj_path.empty())
+                if (mmproj_path.empty()) {
                     throw std::runtime_error("--image requires --mmproj <mmproj.gguf>");
+                }
                 vision_model vm;
                 vm.load(mmproj_path);
                 std::vector<mm_image> imgs;
@@ -191,19 +220,19 @@ int main(int argc, char ** argv) {
                     std::vector<uint8_t> rgb;
                     int w = 0, h = 0;
                     std::string err;
-                    if (!mm_image_decode_file(p, rgb, w, h, &err))
+                    if (!mm_image_decode_file(p, rgb, w, h, &err)) {
                         throw std::runtime_error("image: " + err);
+                    }
                     imgs.push_back(mm_image_preprocess(rgb.data(), w, h, cfg));
                 }
                 chat_msg m;
                 m.role = "user";
-                for (size_t i = 0; i < imgs.size(); i++) m.parts.push_back({true, ""});
+                for (size_t i = 0; i < imgs.size(); i++) {
+                    m.parts.push_back({true, ""});
+                }
                 m.parts.push_back({false, prompt});
-                const std::string rendered =
-                    render_chat(e.m.chat_template, {m}, /*add_generation_prompt=*/true, false);
-                mm_prompt mp =
-                    mm_build_prompt_device(vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd,
-                                           e.d_img_embd);
+                const std::string rendered = render_chat(e.m.chat_template, {m}, /*add_generation_prompt=*/true, false);
+                mm_prompt mp = mm_build_prompt_device(vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd, e.d_img_embd);
                 e.generate_mm(mp, gp, emit);
                 fputs(ub.flush().c_str(), stdout);
                 printf("\n");

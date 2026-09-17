@@ -16,8 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <sycl/sycl.hpp>
-#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>                // IWYU pragma: keep
+#include <sycl/ext/oneapi/bfloat16.hpp> // IWYU pragma: keep
 
 namespace si {
 
@@ -35,11 +35,16 @@ inline int kv_dtype_bytes(kv_dtype_t t) {
 // For i8 this returns the raw int8 value; the scale handling lives in
 // engine::kv_read_vec, which knows the row geometry.
 inline float kv_ld_host(kv_dtype_t t, const void * base, size_t i) {
-    if (t == kv_dtype_t::f32) return ((const float *) base)[i];
-    if (t == kv_dtype_t::bf16)
-        return (float) ((const sycl::ext::oneapi::bfloat16 *) base)[i];
-    if (t == kv_dtype_t::i8) return (float) ((const int8_t *) base)[i];
-    return (float) ((const sycl::half *) base)[i];
+    if (t == kv_dtype_t::f32) {
+        return ((const float *)base)[i];
+    }
+    if (t == kv_dtype_t::bf16) {
+        return (float)((const sycl::ext::oneapi::bfloat16 *)base)[i];
+    }
+    if (t == kv_dtype_t::i8) {
+        return (float)((const int8_t *)base)[i];
+    }
+    return (float)((const sycl::half *)base)[i];
 }
 
 } // namespace si

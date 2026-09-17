@@ -13,8 +13,12 @@ int main(int argc, char ** argv) {
 
     const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
     std::vector<int> toks;
-    for (int i = 2; i < argc; i++) toks.push_back(atoi(argv[i]));
-    if (toks.empty()) toks = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
+    for (int i = 2; i < argc; i++) {
+        toks.push_back(atoi(argv[i]));
+    }
+    if (toks.empty()) {
+        toks = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
+    }
 
     engine e(model_path, 512);
     auto gpu = e.eval(toks);
@@ -26,13 +30,21 @@ int main(int argc, char ** argv) {
     double maxd = 0, maxv = 0;
     int argmax_gpu = 0, argmax_ref = 0;
     for (size_t i = 0; i < gpu.size(); i++) {
-        double d = std::fabs((double) gpu[i] - ref.logits[i]);
-        if (d > maxd) maxd = d;
-        if (std::fabs((double) ref.logits[i]) > maxv) maxv = std::fabs((double) ref.logits[i]);
-        if (gpu[i] > gpu[argmax_gpu]) argmax_gpu = (int) i;
-        if (ref.logits[i] > ref.logits[argmax_ref]) argmax_ref = (int) i;
+        double d = std::fabs((double)gpu[i] - ref.logits[i]);
+        if (d > maxd) {
+            maxd = d;
+        }
+        if (std::fabs((double)ref.logits[i]) > maxv) {
+            maxv = std::fabs((double)ref.logits[i]);
+        }
+        if (gpu[i] > gpu[argmax_gpu]) {
+            argmax_gpu = (int)i;
+        }
+        if (ref.logits[i] > ref.logits[argmax_ref]) {
+            argmax_ref = (int)i;
+        }
     }
-    printf("logits: max|diff|=%.6f (max|ref|=%.2f) argmax gpu=%d ref=%d %s\n",
-           maxd, maxv, argmax_gpu, argmax_ref, argmax_gpu == argmax_ref ? "SAME" : "DIFFERENT");
+    printf("logits: max|diff|=%.6f (max|ref|=%.2f) argmax gpu=%d ref=%d %s\n", maxd, maxv, argmax_gpu, argmax_ref,
+           argmax_gpu == argmax_ref ? "SAME" : "DIFFERENT");
     return 0;
 }

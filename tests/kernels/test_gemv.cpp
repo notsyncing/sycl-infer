@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 
-
 #include "engine.h"
 #include "kernels.h"
 #include "model.h"
@@ -17,21 +16,25 @@ static int failures = 0;
 
 static void check_gemv(engine & e, const std::string & name, int TB) {
     const gguf_tensor_info * ti = e.m.gguf.find(name);
-    if (!ti) { printf("SKIP %s (missing)\n", name.c_str()); return; }
-    const int K = (int) ti->dims[0];
-    const int N = (int) ti->n_rows();
-    printf("test %-28s type=%-5s K=%-5d N=%-6d TB=%d ... ", name.c_str(),
-           ggml_type_name(ti->type), K, N, TB);
+    if (!ti) {
+        printf("SKIP %s (missing)\n", name.c_str());
+        return;
+    }
+    const int K = (int)ti->dims[0];
+    const int N = (int)ti->n_rows();
+    printf("test %-28s type=%-5s K=%-5d N=%-6d TB=%d ... ", name.c_str(), ggml_type_name(ti->type), K, N, TB);
     fflush(stdout);
 
     std::mt19937 rng(1234);
     std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<float> hx((size_t) TB * K);
-    for (auto & v : hx) v = nd(rng);
-    std::vector<float> hy((size_t) TB * N);
+    std::vector<float> hx((size_t)TB * K);
+    for (auto & v : hx) {
+        v = nd(rng);
+    }
+    std::vector<float> hy((size_t)TB * N);
 
-    float * dx = sycl::malloc_device<float>((size_t) TB * K, e.q);
-    float * dy = sycl::malloc_device<float>((size_t) TB * N, e.q);
+    float * dx = sycl::malloc_device<float>((size_t)TB * K, e.q);
+    float * dy = sycl::malloc_device<float>((size_t)TB * N, e.q);
     e.q.memcpy(dx, hx.data(), hx.size() * 4).wait();
 
     gemv_seg s{};
@@ -55,8 +58,8 @@ static void check_gemv(engine & e, const std::string & name, int TB) {
         const int slice = 8; // engine uses 8-token slices for the prefill path
         for (int sl = 0; sl * slice < TB; sl++) {
             gemv_seg c = s;
-            c.x = s.x + (size_t) sl * slice * s.x_stride;
-            c.out = s.out + (size_t) sl * slice * s.out_stride;
+            c.x = s.x + (size_t)sl * slice * s.x_stride;
+            c.out = s.out + (size_t)sl * slice * s.out_stride;
             segs.push_back(c);
         }
     } else {
@@ -65,8 +68,10 @@ static void check_gemv(engine & e, const std::string & name, int TB) {
     gemv_seg * dsegs = sycl::malloc_device<gemv_seg>(segs.size(), e.q);
     e.q.memcpy(dsegs, segs.data(), segs.size() * sizeof(gemv_seg)).wait();
     int tot = 0;
-    for (auto & g : segs) tot += g.n_rows;
-    gemv_group_launch(e.q, s.type, dsegs, (int) segs.size(), tot, TB, K / 256);
+    for (auto & g : segs) {
+        tot += g.n_rows;
+    }
+    gemv_group_launch(e.q, s.type, dsegs, (int)segs.size(), tot, TB, K / 256);
     e.q.memcpy(hy.data(), dy, hy.size() * 4).wait();
 
     // cpu reference (sample rows for large N)
@@ -75,20 +80,24 @@ static void check_gemv(engine & e, const std::string & name, int TB) {
     const int rstep = N > 4096 ? 97 : 1;
     for (int t = 0; t < TB; t++) {
         for (int r = 0; r < N; r += rstep) {
-            dequantize_row(ti->type, (const char *) ti->data + (size_t) r * quant_row_bytes(ti->type, K),
-                           wrow.data(), K);
+            dequantize_row(ti->type, (const char *)ti->data + (size_t)r * quant_row_bytes(ti->type, K), wrow.data(), K);
             double ref = 0;
-            for (int k = 0; k < K; k++) ref += (double) wrow[k] * hx[(size_t) t * K + k];
-            const double err = std::fabs(ref - hy[(size_t) t * N + r]);
+            for (int k = 0; k < K; k++) {
+                ref += (double)wrow[k] * hx[(size_t)t * K + k];
+            }
+            const double err = std::fabs(ref - hy[(size_t)t * N + r]);
             max_err = std::max(max_err, err / std::max(1.0, std::fabs(ref)));
             ref_max = std::max(ref_max, std::fabs(ref));
-            if (t == 0 && r < 4)
-                printf("\n   r%d: ref=%.6f got=%.6f", r, ref, hy[(size_t) t * N + r]);
+            if (t == 0 && r < 4) {
+                printf("\n   r%d: ref=%.6f got=%.6f", r, ref, hy[(size_t)t * N + r]);
+            }
         }
     }
     const bool ok = max_err < 2e-3;
     printf("\n   rel err max=%.3e (|ref|max=%.1f) %s\n", max_err, ref_max, ok ? "OK" : "FAIL");
-    if (!ok) failures++;
+    if (!ok) {
+        failures++;
+    }
     sycl::free(dx, e.q);
     sycl::free(dy, e.q);
     sycl::free(dsegs, e.q);

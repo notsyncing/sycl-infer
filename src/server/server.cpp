@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "chat.h"
+#include "chat_util.h"
 #include "httplib.h"
 #include "image.h"
 #include "json.hpp"
@@ -52,7 +53,9 @@ struct sse_queue {
     bool pop(std::string & out) {
         std::unique_lock<std::mutex> lk(m);
         cv.wait(lk, [&] { return !items.empty() || done; });
-        if (items.empty()) return false;
+        if (items.empty()) {
+            return false;
+        }
         out = std::move(items.front());
         items.pop_front();
         return true;
@@ -64,11 +67,12 @@ gen_params parse_params(const json & body) {
     auto getf = [&](const char * k, float d) {
         return body.contains(k) && body[k].is_number() ? body[k].get<float>() : d;
     };
-    auto geti = [&](const char * k, int d) {
-        return body.contains(k) && body[k].is_number() ? body[k].get<int>() : d;
-    };
-    if (body.contains("max_tokens")) gp.max_tokens = geti("max_tokens", 256);
-    else if (body.contains("max_completion_tokens")) gp.max_tokens = geti("max_completion_tokens", 256);
+    auto geti = [&](const char * k, int d) { return body.contains(k) && body[k].is_number() ? body[k].get<int>() : d; };
+    if (body.contains("max_tokens")) {
+        gp.max_tokens = geti("max_tokens", 256);
+    } else if (body.contains("max_completion_tokens")) {
+        gp.max_tokens = geti("max_completion_tokens", 256);
+    }
     gp.temperature = getf("temperature", 1.0f);
     gp.top_p = getf("top_p", 0.95f);
     gp.top_k = geti("top_k", 40);
@@ -80,20 +84,28 @@ gen_params parse_params(const json & body) {
     gp.ignore_eos = body.value("ignore_eos", false);
     if (body.contains("seed") && body["seed"].is_number()) {
         long long s = body["seed"].get<long long>();
-        gp.seed = (uint64_t) s;
+        gp.seed = (uint64_t)s;
     }
-    if (gp.max_tokens <= 0) gp.max_tokens = 256;
+    if (gp.max_tokens <= 0) {
+        gp.max_tokens = 256;
+    }
     return gp;
 }
 
 std::vector<std::string> parse_stop(const json & body) {
     std::vector<std::string> stops;
-    if (!body.contains("stop")) return stops;
+    if (!body.contains("stop")) {
+        return stops;
+    }
     const json & s = body["stop"];
-    if (s.is_string()) stops.push_back(s.get<std::string>());
-    else if (s.is_array()) {
-        for (auto & v : s)
-            if (v.is_string()) stops.push_back(v.get<std::string>());
+    if (s.is_string()) {
+        stops.push_back(s.get<std::string>());
+    } else if (s.is_array()) {
+        for (auto & v : s) {
+            if (v.is_string()) {
+                stops.push_back(v.get<std::string>());
+            }
+        }
     }
     return stops;
 }
@@ -110,11 +122,21 @@ struct mm_server {
 };
 
 int b64_val(unsigned char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+    }
+    if (c == '+') {
+        return 62;
+    }
+    if (c == '/') {
+        return 63;
+    }
     return -1;
 }
 
@@ -122,15 +144,21 @@ bool b64_decode(const std::string & s, std::vector<uint8_t> & out) {
     out.clear();
     int val = 0, bits = 0;
     for (unsigned char c : s) {
-        if (c == '=') break;
-        if (c == '\n' || c == '\r' || c == ' ') continue;
+        if (c == '=') {
+            break;
+        }
+        if (c == '\n' || c == '\r' || c == ' ') {
+            continue;
+        }
         const int v = b64_val(c);
-        if (v < 0) return false;
+        if (v < 0) {
+            return false;
+        }
         val = (val << 6) | v;
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            out.push_back((uint8_t) (val >> bits));
+            out.push_back((uint8_t)(val >> bits));
         }
     }
     return true;
@@ -161,7 +189,9 @@ bool decode_image_url(const std::string & url, std::vector<uint8_t> & bytes, std
 
 std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string> & image_urls) {
     std::vector<chat_msg> msgs;
-    if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
+    if (!body.contains("messages") || !body["messages"].is_array()) {
+        return msgs;
+    }
     for (auto & m : body["messages"]) {
         chat_msg cm;
         cm.role = m.value("role", "user");
@@ -172,14 +202,15 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string>
                 cm.content = c.get<std::string>();
             } else if (c.is_array()) {
                 for (auto & part : c) {
-                    if (!part.is_object()) continue;
+                    if (!part.is_object()) {
+                        continue;
+                    }
                     const std::string type = part.value("type", "text");
                     if (type == "image_url" || type == "image") {
                         std::string url;
                         if (part.contains("image_url")) {
                             const json & iu = part["image_url"];
-                            url = iu.is_string() ? iu.get<std::string>()
-                                                 : iu.value("url", std::string());
+                            url = iu.is_string() ? iu.get<std::string>() : iu.value("url", std::string());
                         } else {
                             url = part.value("image", std::string());
                         }
@@ -194,48 +225,51 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string>
                 }
             }
         }
-        if (!has_image) cm.parts.clear(); // text-only messages keep the plain path
+        if (!has_image) {
+            cm.parts.clear(); // text-only messages keep the plain path
+        }
         msgs.push_back(std::move(cm));
     }
     return msgs;
 }
 
-std::string make_chat_response(const std::string & id, const std::string & model,
-                               const std::string & text, const std::string & finish,
-                               int prompt_tokens, int completion_tokens, uint64_t created) {
+std::string make_chat_response(const std::string & id, const std::string & model, const std::string & text,
+                               const std::string & finish, int prompt_tokens, int completion_tokens, uint64_t created) {
     json resp = {
         {"id", id},
         {"object", "chat.completion"},
         {"created", created},
         {"model", model},
         {"choices", json::array({{
-            {"index", 0},
-            {"message", {{"role", "assistant"}, {"content", text}}},
-            {"finish_reason", finish},
-        }})},
-        {"usage", {{"prompt_tokens", prompt_tokens},
-                   {"completion_tokens", completion_tokens},
-                   {"total_tokens", prompt_tokens + completion_tokens}}},
+                        {"index", 0},
+                        {"message", {{"role", "assistant"}, {"content", text}}},
+                        {"finish_reason", finish},
+                    }})},
+        {"usage",
+         {{"prompt_tokens", prompt_tokens},
+          {"completion_tokens", completion_tokens},
+          {"total_tokens", prompt_tokens + completion_tokens}}},
     };
     return dump_json(resp);
 }
 
-std::string make_completion_response(const std::string & id, const std::string & model,
-                                     const std::string & text, const std::string & finish,
-                                     int prompt_tokens, int completion_tokens, uint64_t created) {
+std::string make_completion_response(const std::string & id, const std::string & model, const std::string & text,
+                                     const std::string & finish, int prompt_tokens, int completion_tokens,
+                                     uint64_t created) {
     json resp = {
         {"id", id},
         {"object", "text_completion"},
         {"created", created},
         {"model", model},
         {"choices", json::array({{
-            {"index", 0},
-            {"text", text},
-            {"finish_reason", finish},
-        }})},
-        {"usage", {{"prompt_tokens", prompt_tokens},
-                   {"completion_tokens", completion_tokens},
-                   {"total_tokens", prompt_tokens + completion_tokens}}},
+                        {"index", 0},
+                        {"text", text},
+                        {"finish_reason", finish},
+                    }})},
+        {"usage",
+         {{"prompt_tokens", prompt_tokens},
+          {"completion_tokens", completion_tokens},
+          {"total_tokens", prompt_tokens + completion_tokens}}},
     };
     return dump_json(resp);
 }
@@ -243,7 +277,7 @@ std::string make_completion_response(const std::string & id, const std::string &
 std::string gen_id() {
     static std::atomic<uint64_t> counter{0};
     char buf[64];
-    snprintf(buf, sizeof(buf), "chatcmpl-%llu", (unsigned long long) counter.fetch_add(1) + 1);
+    snprintf(buf, sizeof(buf), "chatcmpl-%llu", (unsigned long long)counter.fetch_add(1) + 1);
     return buf;
 }
 
@@ -252,20 +286,21 @@ std::string gen_id() {
 // instead of letting scheduler::admit retire the sequence silently (HTTP 200,
 // empty stream, finish_reason=length, 0 tokens).
 bool reject_too_long(const engine & e, size_t prompt_tokens, httplib::Response & res) {
-    if ((int) prompt_tokens <= e.max_seq) return false;
-    json j = {{"error",
-               {{"message", "prompt length " + std::to_string(prompt_tokens) +
-                                " tokens exceeds the server context (max_seq=" +
-                                std::to_string(e.max_seq) + "); restart with --ctx " +
-                                std::to_string(prompt_tokens) + " (or PF_CTX) or shorten the prompt"},
-                {"type", "invalid_request_error"},
-                {"code", "context_length_exceeded"}}},
-              {"max_seq", e.max_seq},
-              {"prompt_tokens", (int) prompt_tokens}};
+    if ((int)prompt_tokens <= e.max_seq) {
+        return false;
+    }
+    json j = {
+        {"error",
+         {{"message", "prompt length " + std::to_string(prompt_tokens) + " tokens exceeds the server context (max_seq="
+                          + std::to_string(e.max_seq) + "); restart with --ctx " + std::to_string(prompt_tokens)
+                          + " (or PF_CTX) or shorten the prompt"},
+          {"type", "invalid_request_error"},
+          {"code", "context_length_exceeded"}}},
+        {"max_seq", e.max_seq},
+        {"prompt_tokens", (int)prompt_tokens}};
     res.status = 400;
     res.set_content(dump_json(j), "application/json");
-    fprintf(stderr, "[http] 400 context_length_exceeded: prompt=%zu tokens > max_seq=%d\n",
-            prompt_tokens, e.max_seq);
+    fprintf(stderr, "[http] 400 context_length_exceeded: prompt=%zu tokens > max_seq=%d\n", prompt_tokens, e.max_seq);
     return true;
 }
 
@@ -275,11 +310,9 @@ struct stream_ctx {
 };
 
 // generate into an SSE stream from the scheduler; returns after starting the producer thread
-void run_stream(scheduler & sched, engine & e, std::shared_ptr<stream_ctx> st,
-                std::vector<int> prompt, const gen_params & gp,
-                const std::vector<std::string> & stops,
-                const std::string & model, const std::string & id, bool chat, uint64_t created,
-                bool include_usage) {
+void run_stream(scheduler & sched, engine & e, std::shared_ptr<stream_ctx> st, std::vector<int> prompt,
+                const gen_params & gp, const std::vector<std::string> & stops, const std::string & model,
+                const std::string & id, bool chat, uint64_t created, bool include_usage) {
     st->q = std::make_shared<sse_queue>();
     auto seq = sched.submit(std::move(prompt), gp, stops);
     st->th = std::thread([=]() {
@@ -289,16 +322,18 @@ void run_stream(scheduler & sched, engine & e, std::shared_ptr<stream_ctx> st,
         auto send_delta = [&](const std::string & piece) {
             json j;
             if (chat) {
-                j = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+                j = {{"id", id},
+                     {"object", "chat.completion.chunk"},
+                     {"created", created},
                      {"model", model},
-                     {"choices", json::array({{{"index", 0},
-                                               {"delta", {{"content", piece}}},
-                                               {"finish_reason", nullptr}}})}};
+                     {"choices",
+                      json::array({{{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
             } else {
-                j = {{"id", id}, {"object", "text_completion"}, {"created", created},
+                j = {{"id", id},
+                     {"object", "text_completion"},
+                     {"created", created},
                      {"model", model},
-                     {"choices", json::array({{{"index", 0}, {"text", piece},
-                                               {"finish_reason", nullptr}}})}};
+                     {"choices", json::array({{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}}})}};
             }
             q->push("data: " + dump_json(j) + "\n\n");
         };
@@ -307,38 +342,52 @@ void run_stream(scheduler & sched, engine & e, std::shared_ptr<stream_ctx> st,
             text += item;
             size_t cut = std::string::npos;
             for (const auto & s : seq->stops) {
-                if (s.empty()) continue;
+                if (s.empty()) {
+                    continue;
+                }
                 size_t p = text.rfind(s);
-                if (p != std::string::npos) cut = std::min(cut, p);
+                if (p != std::string::npos) {
+                    cut = std::min(cut, p);
+                }
             }
             if (cut != std::string::npos) {
                 std::string send = text.substr(0, cut);
-                if (!send.empty()) send_delta(send);
+                if (!send.empty()) {
+                    send_delta(send);
+                }
                 stopped = true;
                 break;
             }
-            if (!item.empty()) send_delta(item);
+            if (!item.empty()) {
+                send_delta(item);
+            }
         }
         const std::string finish = stopped ? "stop" : seq->finish_reason;
         json finalj;
         if (chat) {
-            finalj = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+            finalj = {{"id", id},
+                      {"object", "chat.completion.chunk"},
+                      {"created", created},
                       {"model", model},
-                      {"choices", json::array({{{"index", 0}, {"delta", json::object()},
-                                                {"finish_reason", finish}}})}};
+                      {"choices", json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}})}};
         } else {
-            finalj = {{"id", id}, {"object", "text_completion"}, {"created", created},
+            finalj = {{"id", id},
+                      {"object", "text_completion"},
+                      {"created", created},
                       {"model", model},
-                      {"choices", json::array({{{"index", 0}, {"text", ""},
-                                                {"finish_reason", finish}}})}};
+                      {"choices", json::array({{{"index", 0}, {"text", ""}, {"finish_reason", finish}}})}};
         }
         q->push("data: " + dump_json(finalj) + "\n\n");
         if (include_usage) {
-            json uj = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
-                       {"model", model}, {"choices", json::array()},
-                       {"usage", {{"prompt_tokens", seq->prompt_tokens},
-                                  {"completion_tokens", seq->n_generated},
-                                  {"total_tokens", seq->prompt_tokens + seq->n_generated}}}};
+            json uj = {{"id", id},
+                       {"object", "chat.completion.chunk"},
+                       {"created", created},
+                       {"model", model},
+                       {"choices", json::array()},
+                       {"usage",
+                        {{"prompt_tokens", seq->prompt_tokens},
+                         {"completion_tokens", seq->n_generated},
+                         {"total_tokens", seq->prompt_tokens + seq->n_generated}}}};
             q->push("data: " + dump_json(uj) + "\n\n");
         }
         q->push("data: [DONE]\n\n");
@@ -356,27 +405,33 @@ struct mm_run_result {
 
 // Run a multimodal prompt on the single-sequence path, forwarding decoded text
 // pieces to `on_piece` (return false to stop early).
-void run_mm_generate(engine & e, const mm_prompt & mp, const gen_params & gp,
-                     const std::vector<std::string> & stops,
-                     const std::function<bool(const std::string &)> & on_piece,
-                     mm_run_result & out) {
+void run_mm_generate(engine & e, const mm_prompt & mp, const gen_params & gp, const std::vector<std::string> & stops,
+                     const std::function<bool(const std::string &)> & on_piece, mm_run_result & out) {
     utf8_stream_buffer ub;
     std::string text;
     bool stopped = false;
     auto cb = [&](int tok) -> bool {
         const std::string piece = ub.push(e.tk.token_piece(tok));
-        if (piece.empty()) return true;
+        if (piece.empty()) {
+            return true;
+        }
         text += piece;
         out.n_gen++;
         size_t cut = std::string::npos;
         for (const auto & s : stops) {
-            if (s.empty()) continue;
+            if (s.empty()) {
+                continue;
+            }
             const size_t p = text.rfind(s);
-            if (p != std::string::npos) cut = std::min(cut, p);
+            if (p != std::string::npos) {
+                cut = std::min(cut, p);
+            }
         }
         if (cut != std::string::npos) {
             const std::string send = text.substr(0, cut);
-            if (!send.empty()) on_piece(send);
+            if (!send.empty()) {
+                on_piece(send);
+            }
             stopped = true;
             return false;
         }
@@ -384,7 +439,9 @@ void run_mm_generate(engine & e, const mm_prompt & mp, const gen_params & gp,
     };
     e.generate_mm(mp, gp, cb);
     const std::string tail = ub.flush();
-    if (!tail.empty() && !stopped) on_piece(tail);
+    if (!tail.empty() && !stopped) {
+        on_piece(tail);
+    }
     out.text = text;
     out.finish = stopped ? "stop" : "length";
 }
@@ -399,8 +456,7 @@ int serve(engine & e, const server_config & cfg) {
             mm.vm.load(cfg.mmproj_path);
             mm.cfg.patch_size = mm.vm.hp.patch_size;
             mm.cfg.merge = mm.vm.hp.merge;
-            const int patch_area =
-                mm.cfg.patch_size * mm.cfg.patch_size * mm.cfg.merge * mm.cfg.merge;
+            const int patch_area = mm.cfg.patch_size * mm.cfg.patch_size * mm.cfg.merge * mm.cfg.merge;
             mm.cfg.min_pixels = 8 * patch_area;
             mm.cfg.max_pixels = kMaxImgTokens * patch_area;
             for (int c = 0; c < 3; c++) {
@@ -409,11 +465,11 @@ int serve(engine & e, const server_config & cfg) {
             }
             mm.ready = true;
             fprintf(stderr, "[mm] vision projector loaded: %s (%d layers, %dx%d patches, merge %d)\n",
-                    cfg.mmproj_path.c_str(), mm.vm.hp.n_layer, mm.vm.hp.image_size,
-                    mm.vm.hp.image_size, mm.vm.hp.merge);
+                    cfg.mmproj_path.c_str(), mm.vm.hp.n_layer, mm.vm.hp.image_size, mm.vm.hp.image_size,
+                    mm.vm.hp.merge);
         } catch (const std::exception & ex) {
-            fprintf(stderr, "[mm] cannot load mmproj %s: %s (image input disabled)\n",
-                    cfg.mmproj_path.c_str(), ex.what());
+            fprintf(stderr, "[mm] cannot load mmproj %s: %s (image input disabled)\n", cfg.mmproj_path.c_str(),
+                    ex.what());
         }
     }
     httplib::Server srv;
@@ -437,10 +493,9 @@ int serve(engine & e, const server_config & cfg) {
 
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {{"object", "list"},
-                  {"data", json::array({{{"id", cfg.model_id},
-                                         {"object", "model"},
-                                         {"created", 1700000000},
-                                         {"owned_by", "local"}}})}};
+                  {"data",
+                   json::array(
+                       {{{"id", cfg.model_id}, {"object", "model"}, {"created", 1700000000}, {"owned_by", "local"}}})}};
         res.set_content(dump_json(j), "application/json");
     });
 
@@ -457,20 +512,20 @@ int serve(engine & e, const server_config & cfg) {
         std::vector<std::string> image_urls;
         auto msgs = parse_messages(body, image_urls);
         bool thinking = false;
-        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
             thinking = body["chat_template_kwargs"].value("enable_thinking", false);
+        }
         gen_params gp = parse_params(body);
         auto stops = parse_stop(body);
         const bool stream = body.value("stream", false);
         const std::string id = gen_id();
-        const uint64_t created = (uint64_t) time(nullptr);
+        const uint64_t created = (uint64_t)time(nullptr);
         const std::string model = body.value("model", cfg.model_id);
 
         if (!image_urls.empty()) {
             if (!mm.ready) {
                 res.status = 400;
-                res.set_content("{\"error\":{\"message\":\"image input requires --mmproj\"}}",
-                                "application/json");
+                res.set_content("{\"error\":{\"message\":\"image input requires --mmproj\"}}", "application/json");
                 return;
             }
             // multimodal requests share the engine's image-embedding buffer, so
@@ -483,61 +538,74 @@ int serve(engine & e, const server_config & cfg) {
                     std::vector<uint8_t> bytes, rgb;
                     std::string err;
                     int w = 0, h = 0;
-                    if (!decode_image_url(u, bytes, err) ||
-                        !mm_image_decode_mem(bytes.data(), bytes.size(), rgb, w, h, &err))
+                    if (!decode_image_url(u, bytes, err)
+                        || !mm_image_decode_mem(bytes.data(), bytes.size(), rgb, w, h, &err)) {
                         throw std::runtime_error(err);
+                    }
                     imgs.push_back(mm_image_preprocess(rgb.data(), w, h, mm.cfg));
                 }
-                const std::string rendered =
-                    render_chat(e.m.chat_template, msgs, true, thinking);
-                mp = mm_build_prompt_device(mm.vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd,
-                                            e.d_img_embd);
+                const std::string rendered = render_chat(e.m.chat_template, msgs, true, thinking);
+                mp = mm_build_prompt_device(mm.vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd, e.d_img_embd);
             } catch (const std::exception & ex) {
                 res.status = 400;
                 json j = {{"error", {{"message", ex.what()}, {"type", "invalid_request_error"}}}};
                 res.set_content(dump_json(j), "application/json");
                 return;
             }
-            if (reject_too_long(e, mp.tokens.size(), res)) return;
+            if (reject_too_long(e, mp.tokens.size(), res)) {
+                return;
+            }
 
             if (!stream) {
                 mm_run_result out;
                 run_mm_generate(e, mp, gp, stops, [](const std::string &) { return true; }, out);
-                res.set_content(make_chat_response(id, model, out.text, out.finish,
-                                                   (int) mp.tokens.size(), out.n_gen, created),
-                                "application/json");
+                res.set_content(
+                    make_chat_response(id, model, out.text, out.finish, (int)mp.tokens.size(), out.n_gen, created),
+                    "application/json");
                 return;
             }
             auto st = std::make_shared<stream_ctx>();
             st->q = std::make_shared<sse_queue>();
             bool include_usage = false;
-            if (body.contains("stream_options") && body["stream_options"].is_object())
+            if (body.contains("stream_options") && body["stream_options"].is_object()) {
                 include_usage = body["stream_options"].value("include_usage", false);
+            }
             st->th = std::thread([&e, mp, gp, stops, id, model, created, st, include_usage, req_lk]() {
                 auto * q = st->q.get();
                 auto send_delta = [&](const std::string & piece) {
-                    if (piece.empty()) return true;
-                    json j = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
-                              {"model", model},
-                              {"choices", json::array({{{"index", 0},
-                                                        {"delta", {{"content", piece}}},
-                                                        {"finish_reason", nullptr}}})}};
+                    if (piece.empty()) {
+                        return true;
+                    }
+                    json j = {
+                        {"id", id},
+                        {"object", "chat.completion.chunk"},
+                        {"created", created},
+                        {"model", model},
+                        {"choices",
+                         json::array({{{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
                     q->push("data: " + dump_json(j) + "\n\n");
                     return true;
                 };
                 mm_run_result out;
                 run_mm_generate(e, mp, gp, stops, send_delta, out);
-                json finalj = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
-                               {"model", model},
-                               {"choices", json::array({{{"index", 0}, {"delta", json::object()},
-                                                         {"finish_reason", out.finish}}})}};
+                json finalj = {
+                    {"id", id},
+                    {"object", "chat.completion.chunk"},
+                    {"created", created},
+                    {"model", model},
+                    {"choices",
+                     json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", out.finish}}})}};
                 q->push("data: " + dump_json(finalj) + "\n\n");
                 if (include_usage) {
-                    json uj = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
-                               {"model", model}, {"choices", json::array()},
-                               {"usage", {{"prompt_tokens", (int) mp.tokens.size()},
-                                          {"completion_tokens", out.n_gen},
-                                          {"total_tokens", (int) mp.tokens.size() + out.n_gen}}}};
+                    json uj = {{"id", id},
+                               {"object", "chat.completion.chunk"},
+                               {"created", created},
+                               {"model", model},
+                               {"choices", json::array()},
+                               {"usage",
+                                {{"prompt_tokens", (int)mp.tokens.size()},
+                                 {"completion_tokens", out.n_gen},
+                                 {"total_tokens", (int)mp.tokens.size() + out.n_gen}}}};
                     q->push("data: " + dump_json(uj) + "\n\n");
                 }
                 q->push("data: [DONE]\n\n");
@@ -557,7 +625,9 @@ int serve(engine & e, const server_config & cfg) {
                     return true;
                 },
                 [st](bool) {
-                    if (st->th.joinable()) st->th.join();
+                    if (st->th.joinable()) {
+                        st->th.join();
+                    }
                 });
             return;
         }
@@ -566,12 +636,14 @@ int serve(engine & e, const server_config & cfg) {
         static const bool srv_t = getenv("PF_SRV_TIME") != nullptr;
         const auto t_tok0 = std::chrono::steady_clock::now();
         auto prompt = e.tk.encode(text);
-        if (srv_t)
+        if (srv_t) {
             fprintf(stderr, "[http] tokenize=%.2f ms chars=%zu tokens=%zu\n",
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0)
-                        .count(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0).count(),
                     text.size(), prompt.size());
-        if (reject_too_long(e, prompt.size(), res)) return;
+        }
+        if (reject_too_long(e, prompt.size(), res)) {
+            return;
+        }
 
         if (!stream) {
             auto seq = sched.submit(std::move(prompt), gp, stops);
@@ -580,7 +652,9 @@ int serve(engine & e, const server_config & cfg) {
             while (seq->pop(item)) {
                 out_text += item;
                 for (const auto & s : seq->stops) {
-                    if (s.empty()) continue;
+                    if (s.empty()) {
+                        continue;
+                    }
                     size_t p = out_text.rfind(s);
                     if (p != std::string::npos) {
                         out_text.resize(p);
@@ -588,19 +662,22 @@ int serve(engine & e, const server_config & cfg) {
                         break;
                     }
                 }
-                if (stopped) break;
+                if (stopped) {
+                    break;
+                }
             }
             const std::string finish = stopped ? "stop" : seq->finish_reason;
-            res.set_content(make_chat_response(id, model, out_text, finish, seq->prompt_tokens,
-                                               seq->n_generated, created),
-                            "application/json");
+            res.set_content(
+                make_chat_response(id, model, out_text, finish, seq->prompt_tokens, seq->n_generated, created),
+                "application/json");
             return;
         }
 
         auto st = std::make_shared<stream_ctx>();
         bool include_usage = false;
-        if (body.contains("stream_options") && body["stream_options"].is_object())
+        if (body.contains("stream_options") && body["stream_options"].is_object()) {
             include_usage = body["stream_options"].value("include_usage", false);
+        }
         run_stream(sched, e, st, prompt, gp, stops, model, id, true, created, include_usage);
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
@@ -616,7 +693,9 @@ int serve(engine & e, const server_config & cfg) {
                 return true;
             },
             [st](bool) {
-                if (st->th.joinable()) st->th.join();
+                if (st->th.joinable()) {
+                    st->th.join();
+                }
             });
     };
     srv.Post("/v1/chat/completions", handle_chat);
@@ -646,17 +725,19 @@ int serve(engine & e, const server_config & cfg) {
                 prompt = e.tk.encode(ps);
             }
         }
-        if (srv_t)
+        if (srv_t) {
             fprintf(stderr, "[http] tokenize=%.2f ms chars=%zu tokens=%zu\n",
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0)
-                        .count(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0).count(),
                     prompt_chars, prompt.size());
-        if (reject_too_long(e, prompt.size(), res)) return;
+        }
+        if (reject_too_long(e, prompt.size(), res)) {
+            return;
+        }
         gen_params gp = parse_params(body);
         auto stops = parse_stop(body);
         const bool stream = body.value("stream", false);
         const std::string id = gen_id();
-        const uint64_t created = (uint64_t) time(nullptr);
+        const uint64_t created = (uint64_t)time(nullptr);
         const std::string model = body.value("model", cfg.model_id);
 
         if (!stream) {
@@ -666,7 +747,9 @@ int serve(engine & e, const server_config & cfg) {
             while (seq->pop(item)) {
                 out_text += item;
                 for (const auto & s : seq->stops) {
-                    if (s.empty()) continue;
+                    if (s.empty()) {
+                        continue;
+                    }
                     size_t p = out_text.rfind(s);
                     if (p != std::string::npos) {
                         out_text.resize(p);
@@ -674,19 +757,22 @@ int serve(engine & e, const server_config & cfg) {
                         break;
                     }
                 }
-                if (stopped) break;
+                if (stopped) {
+                    break;
+                }
             }
             const std::string finish = stopped ? "stop" : seq->finish_reason;
-            res.set_content(make_completion_response(id, model, out_text, finish, seq->prompt_tokens,
-                                                     seq->n_generated, created),
-                            "application/json");
+            res.set_content(
+                make_completion_response(id, model, out_text, finish, seq->prompt_tokens, seq->n_generated, created),
+                "application/json");
             return;
         }
 
         auto st = std::make_shared<stream_ctx>();
         bool include_usage = false;
-        if (body.contains("stream_options") && body["stream_options"].is_object())
+        if (body.contains("stream_options") && body["stream_options"].is_object()) {
             include_usage = body["stream_options"].value("include_usage", false);
+        }
         run_stream(sched, e, st, prompt, gp, stops, model, id, false, created, include_usage);
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
@@ -702,7 +788,9 @@ int serve(engine & e, const server_config & cfg) {
                 return true;
             },
             [st](bool) {
-                if (st->th.joinable()) st->th.join();
+                if (st->th.joinable()) {
+                    st->th.join();
+                }
             });
     };
     srv.Post("/v1/completions", handle_completion);

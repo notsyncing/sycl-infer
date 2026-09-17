@@ -1,0 +1,43 @@
+---
+# Style for sycl-infer (see AGENTS.md): C++17, namespace si, 4-space indent,
+# braces attached to the construct (K&R), `type * name` spacing.
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++17
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+
+BreakBeforeBraces: Attach
+PointerAlignment: Middle
+ReferenceAlignment: Pointer
+
+AccessModifierOffset: -4
+NamespaceIndentation: None
+FixNamespaceComments: false
+
+AllowShortFunctionsOnASingleLine: None
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+
+# every if/else/for/while/do body gets braces, even a one-liner
+InsertBraces: true
+
+AlignConsecutiveDeclarations: false
+AlignConsecutiveAssignments: false
+AlignConsecutiveMacros: false
+AlignTrailingComments: true
+AlignOperands: true
+
+BreakBeforeBinaryOperators: NonAssignment
+BreakBeforeTernaryOperators: true
+
+# Keep include ordering (clang-tidy's misc-include-cleaner owns include hygiene).
+SortIncludes: false
+IncludeBlocks: Preserve

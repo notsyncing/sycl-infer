@@ -21,10 +21,12 @@ struct gen_params {
 
 struct sampler_state {
     std::mt19937_64 rng;
-    void seed(uint64_t s) { rng.seed(s); }
+    void seed(uint64_t s) {
+        rng.seed(s);
+    }
 };
 
-int sample_token(const float * logits, int n_vocab, const gen_params & gp,
-                 const std::vector<int> & recent, sampler_state & ss);
+int sample_token(const float * logits, int n_vocab, const gen_params & gp, const std::vector<int> & recent,
+                 sampler_state & ss);
 
 } // namespace si

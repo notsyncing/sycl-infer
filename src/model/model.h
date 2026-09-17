@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include <sycl/sycl.hpp>
+#include <sycl/sycl.hpp> // IWYU pragma: keep
 
 #include "gguf.h"
 #include "w8.h"
@@ -27,7 +27,9 @@ struct hparams {
     // M-RoPE pair counts per section (t, h, w, e); all-zero = plain RoPE
     int rope_sections[4] = {0, 0, 0, 0};
 
-    bool is_recr(int il) const { return (il + 1) % full_attn_interval != 0; }
+    bool is_recr(int il) const {
+        return (il + 1) % full_attn_interval != 0;
+    }
 };
 
 struct layer_t {
@@ -73,9 +75,11 @@ struct model {
     void build_w8(sycl::queue & q);
     void free_w8(sycl::queue & q);
     const void * dev_ptr(const void * host_ptr) const {
-        return (const char *) dev_weights + ((const char *) host_ptr - (const char *) gguf.map_base);
+        return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
     }
-    const float * dev_f32(const float * p) const { return (const float *) dev_ptr(p); }
+    const float * dev_f32(const float * p) const {
+        return (const float *)dev_ptr(p);
+    }
 };
 
 // Maximum context length advertised by the model's GGUF metadata

@@ -1,7 +1,9 @@
 #pragma once
-#include <cstdint>
+#include <cstddef>
+#include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "gguf.h"
@@ -19,8 +21,8 @@ struct tokenizer {
     std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_rank;
     std::vector<int> special_ids; // sorted by text length desc
     int n_vocab = 0;
-    int eos_id = -1;   // <|im_end|>
-    int eot_id = -1;   // <|endoftext|>
+    int eos_id = -1; // <|im_end|>
+    int eot_id = -1; // <|endoftext|>
     int pad_id = -1;
     int im_start_id = -1, im_end_id = -1, think_id = -1, endthink_id = -1;
 

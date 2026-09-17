@@ -25,8 +25,8 @@ struct mm_image {
 struct image_preproc_cfg {
     int patch_size = 16;
     int merge = 2;
-    int min_pixels = 0;   // 0 = disabled
-    int max_pixels = 0;   // 0 = disabled
+    int min_pixels = 0; // 0 = disabled
+    int max_pixels = 0; // 0 = disabled
     float mean[3] = {0.5f, 0.5f, 0.5f};
     float std[3] = {0.5f, 0.5f, 0.5f};
 };

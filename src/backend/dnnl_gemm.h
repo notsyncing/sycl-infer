@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <memory>
-#include <sycl/sycl.hpp>
+#include <sycl/sycl.hpp> // IWYU pragma: keep
 
 namespace si {
 
@@ -44,8 +44,7 @@ struct dnnl_gemm {
     // out[m][row] = alpha * sx[m]*sw[row]*acc[m][row] + residual[m][row]
     // (acc from the oneDNN matmul of the currently quantized activations).
     // Returns false and writes nothing when the tensor/shape is unsupported.
-    bool gemm(const void * key, const float * residual, float alpha, int M, int K, float * out,
-              int out_stride);
+    bool gemm(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
 
     // Execute every cached primitive once on dummy data so the first real
     // request does not pay the one-time kernel load.  Call after all weights

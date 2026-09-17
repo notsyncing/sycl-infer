@@ -11,10 +11,14 @@ float * gemm_ws(sycl::queue & q, size_t need) {
     static float * buf = nullptr;
     static size_t cap = 0;
     if (need > cap) {
-        if (buf) sycl::free(buf, q);
+        if (buf) {
+            sycl::free(buf, q);
+        }
         buf = sycl::malloc_device<float>(need, q);
         cap = need;
-        if (!buf) cap = 0;
+        if (!buf) {
+            cap = 0;
+        }
     }
     return buf;
 }

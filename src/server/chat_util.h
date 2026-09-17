@@ -1,5 +1,5 @@
 #pragma once
-#include <cstdint>
+#include <cstddef>
 #include <string>
 
 namespace si {
@@ -12,18 +12,36 @@ struct utf8_stream_buffer {
         pending += piece;
         size_t i = 0, last_good = 0;
         while (i < pending.size()) {
-            const unsigned char c = (unsigned char) pending[i];
+            const unsigned char c = (unsigned char)pending[i];
             size_t len;
-            if (c < 0x80) len = 1;
-            else if ((c >> 5) == 0x6) len = 2;
-            else if ((c >> 4) == 0xE) len = 3;
-            else if ((c >> 3) == 0x1E) len = 4;
-            else { i++; last_good = i; continue; }
-            if (i + len > pending.size()) break;
+            if (c < 0x80) {
+                len = 1;
+            } else if ((c >> 5) == 0x6) {
+                len = 2;
+            } else if ((c >> 4) == 0xE) {
+                len = 3;
+            } else if ((c >> 3) == 0x1E) {
+                len = 4;
+            } else {
+                i++;
+                last_good = i;
+                continue;
+            }
+            if (i + len > pending.size()) {
+                break;
+            }
             bool ok = true;
-            for (size_t k = 1; k < len; k++)
-                if ((pending[i + k] & 0xC0) != 0x80) { ok = false; break; }
-            if (!ok) { i++; last_good = i; continue; }
+            for (size_t k = 1; k < len; k++) {
+                if ((pending[i + k] & 0xC0) != 0x80) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                i++;
+                last_good = i;
+                continue;
+            }
             i += len;
             last_good = i;
         }

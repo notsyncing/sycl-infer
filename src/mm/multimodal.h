@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include <sycl/sycl.hpp>
+#include <sycl/sycl.hpp> // IWYU pragma: keep
 
 #include "image.h"
 
@@ -26,25 +26,25 @@ struct vision_model;
 
 struct mm_prompt {
     std::vector<int> tokens;
-    std::vector<int32_t> mrope;   // 4 * n, section-major ([s * n + i])
-    std::vector<int32_t> img_row; // n, -1 or a row in `embd`
-    std::vector<float> embd;      // n_img * text n_embd (host path)
+    std::vector<int32_t> mrope;     // 4 * n, section-major ([s * n + i])
+    std::vector<int32_t> img_row;   // n, -1 or a row in `embd`
+    std::vector<float> embd;        // n_img * text n_embd (host path)
     const float * d_embd = nullptr; // device path: n_img * n_embd, owned by caller
     int n_img = 0;
-    int pos_after = 0;            // next decode position
-    bool has_images() const { return n_img > 0; }
+    int pos_after = 0; // next decode position
+    bool has_images() const {
+        return n_img > 0;
+    }
 };
 
 // `rendered` must contain exactly one `<|image_pad|>` per entry of `images`.
 // `n_embd` is the text model width (the vision projection width).
-mm_prompt mm_build_prompt(const tokenizer & tk, const std::string & rendered,
-                          const std::vector<mm_image> & images, const vision_model & vm,
-                          int n_embd);
+mm_prompt mm_build_prompt(const tokenizer & tk, const std::string & rendered, const std::vector<mm_image> & images,
+                          const vision_model & vm, int n_embd);
 
 // Device variant: runs the vision tower on the GPU and writes the merged
 // embeddings into `d_out` (n_img * n_embd floats).  `vm` must outlive the call.
-mm_prompt mm_build_prompt_device(vision_model & vm, sycl::queue & q, const tokenizer & tk,
-                                 const std::string & rendered, const std::vector<mm_image> & images,
-                                 int n_embd, float * d_out);
+mm_prompt mm_build_prompt_device(vision_model & vm, sycl::queue & q, const tokenizer & tk, const std::string & rendered,
+                                 const std::vector<mm_image> & images, int n_embd, float * d_out);
 
 } // namespace si

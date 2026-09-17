@@ -6,48 +6,67 @@ namespace si {
 
 static std::string rstrip_nl(const std::string & s) {
     size_t e = s.size();
-    while (e > 0 && s[e - 1] == '\n') e--;
+    while (e > 0 && s[e - 1] == '\n') {
+        e--;
+    }
     return s.substr(0, e);
 }
 static std::string lstrip_nl(const std::string & s) {
     size_t b = 0;
-    while (b < s.size() && s[b] == '\n') b++;
+    while (b < s.size() && s[b] == '\n') {
+        b++;
+    }
     return s.substr(b);
 }
 static std::string trim(const std::string & s) {
     size_t b = 0, e = s.size();
-    while (b < e && (s[b] == ' ' || s[b] == '\n' || s[b] == '\t' || s[b] == '\r')) b++;
-    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\n' || s[e - 1] == '\t' || s[e - 1] == '\r')) e--;
+    while (b < e && (s[b] == ' ' || s[b] == '\n' || s[b] == '\t' || s[b] == '\r')) {
+        b++;
+    }
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\n' || s[e - 1] == '\t' || s[e - 1] == '\r')) {
+        e--;
+    }
     return s.substr(b, e - b);
 }
 
-std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs,
-                        bool add_generation_prompt, bool enable_thinking) {
+std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
+                        bool enable_thinking) {
     std::string out;
-    if (render_chat_template(tmpl, msgs, add_generation_prompt, enable_thinking, out)) return out;
+    if (render_chat_template(tmpl, msgs, add_generation_prompt, enable_thinking, out)) {
+        return out;
+    }
     return render_chat_builtin(msgs, add_generation_prompt, enable_thinking);
 }
 
-std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_generation_prompt,
-                                bool enable_thinking) {
+std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_generation_prompt, bool enable_thinking) {
     std::string out;
-    if (msgs.empty()) return out;
+    if (msgs.empty()) {
+        return out;
+    }
 
     // structured content: interleave text with the vision placeholder
     auto content_of = [](const chat_msg & m) {
-        if (m.parts.empty()) return m.content;
+        if (m.parts.empty()) {
+            return m.content;
+        }
         std::string s;
         for (const chat_part & p : m.parts) {
-            if (p.is_image) s += "<|vision_start|><|image_pad|><|vision_end|>";
-            else s += p.text;
+            if (p.is_image) {
+                s += "<|vision_start|><|image_pad|><|vision_end|>";
+            } else {
+                s += p.text;
+            }
         }
         return s;
     };
 
     // find last query index (last user message)
     int last_query = -1;
-    for (int i = (int) msgs.size() - 1; i >= 0; i--) {
-        if (msgs[i].role == "user") { last_query = i; break; }
+    for (int i = (int)msgs.size() - 1; i >= 0; i--) {
+        if (msgs[i].role == "user") {
+            last_query = i;
+            break;
+        }
     }
 
     size_t start = 0;
@@ -77,7 +96,7 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
                 }
             }
             out += "<|im_start|>assistant\n";
-            if (has_reasoning && (int) i > last_query) {
+            if (has_reasoning && (int)i > last_query) {
                 out += "<think>\n" + trim(reasoning) + "\n</think>\n\n" + content;
             } else {
                 out += content;
@@ -90,8 +109,11 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
 
     if (add_generation_prompt) {
         out += "<|im_start|>assistant\n";
-        if (enable_thinking) out += "<think>\n";
-        else out += "<think>\n\n</think>\n\n";
+        if (enable_thinking) {
+            out += "<think>\n";
+        } else {
+            out += "<think>\n\n</think>\n\n";
+        }
     }
     return out;
 }

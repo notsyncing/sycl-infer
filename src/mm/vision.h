@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include <sycl/sycl.hpp>
+#include <sycl/sycl.hpp> // IWYU pragma: keep
 
 #include "gguf.h"
 #include "image.h"
@@ -65,12 +65,12 @@ struct vision_input {
     const float * chw = nullptr; // plane-major R,G,B, width*height each
     int width = 0;
     int height = 0;
-    int pw = 0;                  // patches per row (width / patch_size)
-    int ph = 0;                  // patches per column
-    int n_patches = 0;           // pw * ph (tokens entering the ViT)
-    int out_w = 0;               // merged grid width (pw / merge)
-    int out_h = 0;               // merged grid height (ph / merge)
-    int n_out = 0;               // merged tokens (out_w * out_h)
+    int pw = 0;        // patches per row (width / patch_size)
+    int ph = 0;        // patches per column
+    int n_patches = 0; // pw * ph (tokens entering the ViT)
+    int out_w = 0;     // merged grid width (pw / merge)
+    int out_h = 0;     // merged grid height (ph / merge)
+    int n_out = 0;     // merged tokens (out_w * out_h)
 };
 
 struct vision_model {
@@ -108,7 +108,7 @@ struct vision_model {
     void upload(sycl::queue & q);
     ~vision_model();
     const void * dev_ptr(const void * host_ptr) const {
-        return (const char *) dev_weights + ((const char *) host_ptr - (const char *) gguf.map_base);
+        return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
     }
 
     // Reference forward on the host: writes n_out * proj_dim embeddings.

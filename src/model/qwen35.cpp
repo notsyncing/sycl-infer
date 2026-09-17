@@ -16,28 +16,30 @@ void load_qwen35(model & m) {
     auto key = [&](const char * k) { return arch + "." + k; };
 
     auto & hp = m.hp;
-    hp.n_layer = (int) f.get_u32(key("block_count"));
-    hp.n_embd = (int) f.get_u32(key("embedding_length"));
-    hp.n_ff = (int) f.get_u32(key("feed_forward_length"));
-    hp.n_head = (int) f.get_u32(key("attention.head_count"));
-    hp.n_head_kv = (int) f.get_u32(key("attention.head_count_kv"));
-    hp.head_dim = (int) f.get_u32(key("attention.key_length"));
-    hp.n_rot = (int) f.get_u32(key("rope.dimension_count"));
+    hp.n_layer = (int)f.get_u32(key("block_count"));
+    hp.n_embd = (int)f.get_u32(key("embedding_length"));
+    hp.n_ff = (int)f.get_u32(key("feed_forward_length"));
+    hp.n_head = (int)f.get_u32(key("attention.head_count"));
+    hp.n_head_kv = (int)f.get_u32(key("attention.head_count_kv"));
+    hp.head_dim = (int)f.get_u32(key("attention.key_length"));
+    hp.n_rot = (int)f.get_u32(key("rope.dimension_count"));
     hp.rope_base = f.get_f32(key("rope.freq_base"), 10000.f);
     hp.rms_eps = f.get_f32(key("attention.layer_norm_rms_epsilon"), 1e-6f);
-    hp.d_state = (int) f.get_u32(key("ssm.state_size"));
-    hp.n_group = (int) f.get_u32(key("ssm.group_count"));
-    hp.dt_rank = (int) f.get_u32(key("ssm.time_step_rank"));
-    hp.d_inner = (int) f.get_u32(key("ssm.inner_size"));
-    hp.conv_k = (int) f.get_u32(key("ssm.conv_kernel"));
-    hp.full_attn_interval = (int) f.get_u32(key("full_attention_interval"), 4);
-    hp.attn_scale = 1.0f / std::sqrt((float) hp.head_dim);
-    if (const gguf_kv * sec = f.meta(key("rope.dimension_sections")))
-        for (int i = 0; i < 4 && i < (int) sec->arr.size(); i++)
+    hp.d_state = (int)f.get_u32(key("ssm.state_size"));
+    hp.n_group = (int)f.get_u32(key("ssm.group_count"));
+    hp.dt_rank = (int)f.get_u32(key("ssm.time_step_rank"));
+    hp.d_inner = (int)f.get_u32(key("ssm.inner_size"));
+    hp.conv_k = (int)f.get_u32(key("ssm.conv_kernel"));
+    hp.full_attn_interval = (int)f.get_u32(key("full_attention_interval"), 4);
+    hp.attn_scale = 1.0f / std::sqrt((float)hp.head_dim);
+    if (const gguf_kv * sec = f.meta(key("rope.dimension_sections"))) {
+        for (int i = 0; i < 4 && i < (int)sec->arr.size(); i++) {
             hp.rope_sections[i] = sec->arr[i].as_i32();
+        }
+    }
 
     const auto * toks = f.meta("tokenizer.ggml.tokens");
-    hp.n_vocab = toks ? (int) toks->arr.size() : 0;
+    hp.n_vocab = toks ? (int)toks->arr.size() : 0;
 
     m.tok_embd = bind_tensor(f, "token_embd.weight");
     m.output_norm = bind_f32(f, "output_norm.weight");

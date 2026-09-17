@@ -22,26 +22,24 @@ void stage_attn(stage_env & env) {
     env.set_info(T, 0, 1);
     std::vector<int> blocks;
     const int need = (T + kBlockSize - 1) / kBlockSize;
-    for (int i = 0; i < need; i++) blocks.push_back(env.e.alloc_block());
+    for (int i = 0; i < need; i++) {
+        blocks.push_back(env.e.alloc_block());
+    }
     env.e.set_table(0, blocks);
-    qk_norm_rope_launch(env.e.q, env.e.d_qbuf, env.e.d_kbuf, env.e.d_vbuf,
-                        env.e.m.dev_f32(L3.q_norm), env.e.m.dev_f32(L3.k_norm), env.e.d_kpool,
-                        env.e.d_vpool, env.e.d_tables, env.e.d_info, hp.n_head, hp.n_head_kv,
-                        hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps, env.e.max_blocks, 1, T,
-                        env.e.d_kscales, env.e.d_vscales);
+    qk_norm_rope_launch(env.e.q, env.e.d_qbuf, env.e.d_kbuf, env.e.d_vbuf, env.e.m.dev_f32(L3.q_norm),
+                        env.e.m.dev_f32(L3.k_norm), env.e.d_kpool, env.e.d_vpool, env.e.d_tables, env.e.d_info,
+                        hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps, env.e.max_blocks, 1,
+                        T, env.e.d_kscales, env.e.d_vscales);
 
     // classic split attention + combine
-    attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool,
-                env.e.d_partials, env.e.d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, 16,
-                env.e.d_info, hp.attn_scale, env.e.max_blocks, 1, T, nullptr, -1, env.e.d_kscales,
-                env.e.d_vscales);
-    attn_combine_launch(env.e.q, env.e.d_partials, env.e.d_qbuf, env.e.d_attn_out, env.e.d_info,
-                        hp.n_head, hp.head_dim, 16, 1, T);
-    std::vector<float> hb((size_t) T * hp.n_head * hp.head_dim);
+    attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool, env.e.d_partials, env.e.d_tables,
+                hp.n_head, hp.n_head_kv, hp.head_dim, 16, env.e.d_info, hp.attn_scale, env.e.max_blocks, 1, T, nullptr,
+                -1, env.e.d_kscales, env.e.d_vscales);
+    attn_combine_launch(env.e.q, env.e.d_partials, env.e.d_qbuf, env.e.d_attn_out, env.e.d_info, hp.n_head, hp.head_dim,
+                        16, 1, T);
+    std::vector<float> hb((size_t)T * hp.n_head * hp.head_dim);
     env.e.q.memcpy(hb.data(), env.e.d_attn_out, hb.size() * 4).wait();
-    const double attn_tol = kv_dtype() == kv_dtype_t::f32  ? 2e-3
-                            : kv_dtype() == kv_dtype_t::i8 ? 3e-2
-                                                           : 5e-3;
+    const double attn_tol = kv_dtype() == kv_dtype_t::f32 ? 2e-3 : kv_dtype() == kv_dtype_t::i8 ? 3e-2 : 5e-3;
     env.cmp("attn_gated-3", hb, env.get("attn_pregate-3"), attn_tol);
 
     // grouped vs classic partials
@@ -52,12 +50,12 @@ void stage_attn(stage_env & env) {
         env.e.d_info->pos[0] = pos0;
         env.e.d_info->slot[0] = 1;
         env.e.d_info->active[0] = 1;
-        const size_t npart = (size_t) nreal * hp.n_head * nsp * (2 + hp.head_dim);
+        const size_t npart = (size_t)nreal * hp.n_head * nsp * (2 + hp.head_dim);
         std::vector<float> p_cls(npart), p_grp(npart);
         auto run = [&](int g) {
-            attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool,
-                        env.e.d_partials, env.e.d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp,
-                        env.e.d_info, hp.attn_scale, env.e.max_blocks, 1, nreal, nullptr, g);
+            attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool, env.e.d_partials,
+                        env.e.d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, env.e.d_info, hp.attn_scale,
+                        env.e.max_blocks, 1, nreal, nullptr, g);
             env.e.q.wait();
         };
         run(0);
@@ -70,11 +68,14 @@ void stage_attn(stage_env & env) {
             double md = 0;
             size_t at = 0;
             for (size_t i = 0; i < npart; i++) {
-                const double d = std::fabs((double) p_cls[i] - p_grp[i]);
-                if (d > md) { md = d; at = i; }
+                const double d = std::fabs((double)p_cls[i] - p_grp[i]);
+                if (d > md) {
+                    md = d;
+                    at = i;
+                }
             }
-            printf("   max|diff|=%.6g at %zu (classic %.6g group %.6g)\n", md, at,
-                   (double) p_cls[at], (double) p_grp[at]);
+            printf("   max|diff|=%.6g at %zu (classic %.6g group %.6g)\n", md, at, (double)p_cls[at],
+                   (double)p_grp[at]);
             env.fails++;
         }
     };

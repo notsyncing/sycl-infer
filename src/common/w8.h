@@ -39,25 +39,27 @@
 //     use their own min correction.
 // ---------------------------------------------------------------------------
 
+#include <cstddef>
 #include <cstdint>
-#include <sycl/sycl.hpp>
 
 namespace si {
 
 constexpr int kRB = 128; // weight row-block for the SIn layout
 
 struct w8t {
-    uint8_t * vals = nullptr;   // packed k-bit values, see layout above
-    uint32_t * meta = nullptr;  // {fp16 scale, fp16 min} (4 B/group), or the
-                                // fp16 scale alone when meta_elem == 2 (Q6_K
-                                // tensors whose groups all satisfy
-                                // min == 32*scale exactly)
+    uint8_t * vals = nullptr;  // packed k-bit values, see layout above
+    uint32_t * meta = nullptr; // {fp16 scale, fp16 min} (4 B/group), or the
+                               // fp16 scale alone when meta_elem == 2 (Q6_K
+                               // tensors whose groups all satisfy
+                               // min == 32*scale exactly)
     int32_t K = 0;
     int32_t N = 0;
-    uint32_t type = 0;          // source ggml type (12/13/14)
-    int32_t bits = 0;           // packed value width (4/5/6/8)
-    int32_t meta_elem = 4;      // bytes per meta entry of THIS tensor (2 or 4)
-    bool ok() const { return vals != nullptr; }
+    uint32_t type = 0;     // source ggml type (12/13/14)
+    int32_t bits = 0;      // packed value width (4/5/6/8)
+    int32_t meta_elem = 4; // bytes per meta entry of THIS tensor (2 or 4)
+    bool ok() const {
+        return vals != nullptr;
+    }
 };
 
 // host-side repack of one GGUF K-quant tensor into the SIn layout.
@@ -66,8 +68,8 @@ struct w8t {
 // 16-bit entries).
 // `scale_only`: write just the fp16 scale (the kernel derives min == 32*scale).
 // returns false if the type is unsupported.
-bool w8_repack(uint32_t ggml_type, const void * src, int K, int N,
-               uint8_t * vals_out, uint32_t * meta_out, bool scale_only = false);
+bool w8_repack(uint32_t ggml_type, const void * src, int K, int N, uint8_t * vals_out, uint32_t * meta_out,
+               bool scale_only = false);
 
 // Q6_K scale_only is valid only if every group's fp16 scale is exact enough
 // that 32*fp16(scale) == fp16(32*scale): a flushed-to-zero fp16 scale with a
@@ -85,10 +87,14 @@ size_t w8_meta_bytes(uint32_t type, int K, int N, bool scale_only = false);
 uint32_t w8_effective_type(uint32_t type);
 
 // values per group (the meta granularity) and bytes of packed values per group
-static inline constexpr int w8_group_size(uint32_t type) { return type == 14 ? 16 : 32; }
+static inline constexpr int w8_group_size(uint32_t type) {
+    return type == 14 ? 16 : 32;
+}
 static inline constexpr int w8_group_bytes(uint32_t type) {
     // Q5_K groups carry 4 bytes of padding so rows stay 8-byte aligned
-    if (type == 13) return 24;
+    if (type == 13) {
+        return 24;
+    }
     const int k = type == 12 ? 4 : 6;
     return w8_group_size(type) * k / 8;
 }

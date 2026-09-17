@@ -18,9 +18,11 @@
 
 namespace si {
 
-bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> & msgs,
-                          bool add_generation_prompt, bool enable_thinking, std::string & out) {
-    if (tmpl.empty()) return false;
+bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
+                          bool enable_thinking, std::string & out) {
+    if (tmpl.empty()) {
+        return false;
+    }
     static const bool dbg = getenv("PF_CHAT_TMPL_DEBUG") != nullptr;
     try {
         minja::chat_template ct(tmpl, /*bos_token=*/"", /*eos_token=*/"");
@@ -33,8 +35,11 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
             }
             auto content = nlohmann::ordered_json::array();
             for (const chat_part & p : m.parts) {
-                if (p.is_image) content.push_back({{"type", "image"}});
-                else content.push_back({{"type", "text"}, {"text", p.text}});
+                if (p.is_image) {
+                    content.push_back({{"type", "image"}});
+                } else {
+                    content.push_back({{"type", "text"}, {"text", p.text}});
+                }
             }
             messages.push_back({{"role", m.role}, {"content", content}});
         }
@@ -49,7 +54,9 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
         out = ct.apply(inputs);
         return true;
     } catch (const std::exception & ex) {
-        if (dbg) fprintf(stderr, "[chat_template] %s\n", ex.what());
+        if (dbg) {
+            fprintf(stderr, "[chat_template] %s\n", ex.what());
+        }
         return false;
     }
 }

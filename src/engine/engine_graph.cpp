@@ -11,8 +11,12 @@ namespace si {
 // ---------------------------------------------------------------------------
 static bool g_capturing = false;
 struct capture_guard {
-    capture_guard() { g_capturing = true; }
-    ~capture_guard() { g_capturing = false; }
+    capture_guard() {
+        g_capturing = true;
+    }
+    ~capture_guard() {
+        g_capturing = false;
+    }
 };
 static double prof_ci_t[256];
 static long prof_ci_n[256];
@@ -27,15 +31,19 @@ static long prof_calls = 0;
 // row * tpb, the quantized activation views by row * (K*32) bytes
 static gemv_seg row_offset_seg(const gemv_seg & s, int r, int tpb) {
     gemv_seg c = s;
-    const size_t off = (size_t) r * tpb;
+    const size_t off = (size_t)r * tpb;
     c.x = s.x + off * s.x_stride;
-    if (s.act_up) c.act_up = s.act_up + off * s.x_stride;
+    if (s.act_up) {
+        c.act_up = s.act_up + off * s.x_stride;
+    }
     c.out = s.out + off * s.out_stride;
-    if (s.residual) c.residual = s.residual + off * s.out_stride;
+    if (s.residual) {
+        c.residual = s.residual + off * s.out_stride;
+    }
     if (s.w8.vals) {
-        c.x8 = s.x8 + (size_t) r * (size_t) s.w8.K * 32;
-        c.xmeta = s.xmeta + (size_t) r * (s.w8.K / 32);
-        c.xsumq = s.xsumq + (size_t) r * (s.w8.K / 16);
+        c.x8 = s.x8 + (size_t)r * (size_t)s.w8.K * 32;
+        c.xmeta = s.xmeta + (size_t)r * (s.w8.K / 32);
+        c.xsumq = s.xsumq + (size_t)r * (s.w8.K / 16);
     }
     return c;
 }
@@ -47,16 +55,19 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     auto add_sliced = [&](gemv_seg s) {
         for (int sl = 0; sl < n_slices; sl++) {
             gemv_seg c = s;
-            c.x = s.x + (size_t) sl * tb * s.x_stride;
-            if (s.act_up) c.act_up = s.act_up + (size_t) sl * tb * s.x_stride;
-            c.out = s.out + (size_t) sl * tb * s.out_stride;
-            if (s.residual) c.residual = s.residual + (size_t) sl * tb * s.out_stride;
+            c.x = s.x + (size_t)sl * tb * s.x_stride;
+            if (s.act_up) {
+                c.act_up = s.act_up + (size_t)sl * tb * s.x_stride;
+            }
+            c.out = s.out + (size_t)sl * tb * s.out_stride;
+            if (s.residual) {
+                c.residual = s.residual + (size_t)sl * tb * s.out_stride;
+            }
             plan.add(c);
         }
     };
     // SI8 variant: one full-chunk segment (no 8-token slicing), DP4A GEMM
-    auto add8 = [&](const w8t & w8, const float * x, int xs, float * out, int os,
-                    const float * res) {
+    auto add8 = [&](const w8t & w8, const float * x, int xs, float * out, int os, const float * res) {
         gemv_seg c{};
         c.w = nullptr;
         c.type = w8.vals ? 12 : 0;
@@ -74,8 +85,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         c.xsumq = d_xsumq;
         plan.add(c);
     };
-    auto mk = [&](const wt & w, const float * x, int xs, float * out, int os,
-                  const float * res) {
+    auto mk = [&](const wt & w, const float * x, int xs, float * out, int os, const float * res) {
         gemv_seg s{};
         s.w = m.dev_ptr(w.data);
         s.meta32 = meta32_of(w.data);
@@ -129,7 +139,8 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
             plan.begin_call(tb, hp.n_head * hp.head_dim / 256);
             if (use_w8) {
                 add8(L.wo8, d_attn_out, hp.n_head * hp.head_dim, d_x, hp.n_embd, d_x);
-                plan.set_xq(d_attn_out, nullptr, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim);
+                plan.set_xq(d_attn_out, nullptr, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim,
+                            hp.n_head * hp.head_dim);
             } else {
                 add_sliced(mk(L.wo, d_attn_out, hp.n_head * hp.head_dim, d_x, hp.n_embd, d_x));
             }
@@ -184,8 +195,8 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     }
     return plan;
 }
-void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows,
-                            gemv_seg * d_segs_rows, int at_nsp_hint) {
+void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows,
+                            int at_nsp_hint) {
     // mode 2: chunk-batched prefill. `rows` is the total token count, split into
     // rows/kMaxT chunk rows; GEMM calls are executed segment-major (all chunk
     // rows of one tensor back to back) so the weights stay L2-hot.
@@ -197,24 +208,28 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     auto tms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto pt0 = tnow();
     double c_embed = 0, c_gemv = 0, c_head = 0, c_attn = 0, c_gdn = 0, c_norm = 0;
-    double c_g8 = 0, c_gf = 0;   // w8 GEMM vs fp32/side GEMV time inside gemv
+    double c_g8 = 0, c_gf = 0; // w8 GEMM vs fp32/side GEMV time inside gemv
     size_t ci = 0;
     static const bool dbg_pfb2 = getenv("PF_DBG_PFB") != nullptr;
     // per-group timing under PF_PROF (PF_NOGRAPH mode only: waits serialize)
     auto stamp = [&](double & acc, const std::chrono::high_resolution_clock::time_point & a) {
-        if (prof) { q.wait(); acc += tms(a, tnow()); }
+        if (prof) {
+            q.wait();
+            acc += tms(a, tnow());
+        }
     };
     auto gemv_at = [&](size_t idx) {
         const int gb = plan.call_group_begin[idx];
         const int gc = plan.call_group_count[idx];
         if (dbg_pfb2) {
             const gemv_seg & s0 = plan.segs[plan.groups[gb].off];
-            fprintf(stderr, "[gemv_at] idx=%zu groups=%d first_w8=%d mode=%d rows=%d", idx, gc,
-                    s0.w8.vals ? 1 : 0, mode, rows);
-            if (plan.call_tb[idx] == 1)
+            fprintf(stderr, "[gemv_at] idx=%zu groups=%d first_w8=%d mode=%d rows=%d", idx, gc, s0.w8.vals ? 1 : 0,
+                    mode, rows);
+            if (plan.call_tb[idx] == 1) {
                 fprintf(stderr, " HEAD x=%p out=%p out_stride=%d n_rows=%d type=%u d_x=%p d_logits=%p",
-                        (const void *) s0.x, (void *) s0.out, s0.out_stride, s0.n_rows, s0.type,
-                        (void *) d_x, (void *) d_logits);
+                        (const void *)s0.x, (void *)s0.out, s0.out_stride, s0.n_rows, s0.type, (void *)d_x,
+                        (void *)d_logits);
+            }
             fprintf(stderr, "\n");
         }
         // DP4A path: quantize this call's activations once, then run the
@@ -237,17 +252,21 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         // on oneDNN, at M = kMaxT: the chunked path is otherwise ~100 ms for a
         // 25-token tail because every GEMM is a full-weight pass at M=32.
         const bool dnnl_call = [&]() -> bool {
-            if (!use_dnnl || mode == 0 || single) return false;
-            if (idx >= plan.call_xq.size() || !plan.call_xq[idx].x) return false;
+            if (!use_dnnl || mode == 0 || single) {
+                return false;
+            }
+            if (idx >= plan.call_xq.size() || !plan.call_xq[idx].x) {
+                return false;
+            }
             const int gb0 = plan.call_group_begin[idx];
             const int gc0 = plan.call_group_count[idx];
             for (int g = 0; g < gc0; g++) {
                 const seg_plan::group_t & gr0 = plan.groups[gb0 + g];
                 for (int j = 0; j < gr0.n; j++) {
                     const gemv_seg & sj = plan.segs[gr0.off + j];
-                    if (sj.w8.vals &&
-                        (!dnnl->has_weight(sj.w8.vals) || sj.w8.K != plan.call_xq[idx].K))
+                    if (sj.w8.vals && (!dnnl->has_weight(sj.w8.vals) || sj.w8.K != plan.call_xq[idx].K)) {
                         return false;
+                    }
                 }
             }
             return true;
@@ -256,26 +275,30 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const seg_plan::xq_t & xq = plan.call_xq[idx];
             const auto a2 = tnow();
             dnnl->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K);
-            if (prof_on()) { q.wait(); prof_acc[5] += tms(a2, tnow()); }
+            if (prof_on()) {
+                q.wait();
+                prof_acc[5] += tms(a2, tnow());
+            }
         } else if (idx < plan.call_xq.size() && plan.call_xq[idx].x) {
             const seg_plan::xq_t & xq = plan.call_xq[idx];
             const bool p2 = prof_on();
             const auto a2 = tnow();
             if (mode == 2 && !single) {
-                xq_launch(q, xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq,
-                          d_info, tbm, xq.K);
-            } else
-            for (int r = 0; r < nb; r++) {
-                const float * xr = xq.x + (size_t) r * kMaxT * xq.x_stride;
-                const float * ur = xq.up ? xq.up + (size_t) r * kMaxT * xq.up_stride : nullptr;
-                // TB must be the call's token count (kMaxT for prefill chunks,
-                // the batch size for decode) - it sets the x8 group stride
-                xq_launch(q, xr, ur, xq.x_stride, xq.up_stride,
-                          d_x8 + (size_t) r * (size_t) xq.K * tb,
-                          d_xmeta + (size_t) r * (xq.K / 32),
-                          d_xsumq + (size_t) r * (xq.K / 16), d_info, tb, xq.K);
+                xq_launch(q, xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, d_info, tbm, xq.K);
+            } else {
+                for (int r = 0; r < nb; r++) {
+                    const float * xr = xq.x + (size_t)r * kMaxT * xq.x_stride;
+                    const float * ur = xq.up ? xq.up + (size_t)r * kMaxT * xq.up_stride : nullptr;
+                    // TB must be the call's token count (kMaxT for prefill chunks,
+                    // the batch size for decode) - it sets the x8 group stride
+                    xq_launch(q, xr, ur, xq.x_stride, xq.up_stride, d_x8 + (size_t)r * (size_t)xq.K * tb,
+                              d_xmeta + (size_t)r * (xq.K / 32), d_xsumq + (size_t)r * (xq.K / 16), d_info, tb, xq.K);
+                }
             }
-            if (p2) { q.wait(); prof_acc[5] += tms(a2, tnow()); }
+            if (p2) {
+                q.wait();
+                prof_acc[5] += tms(a2, tnow());
+            }
         }
         for (int g = 0; g < gc; g++) {
             const seg_plan::group_t & gr = plan.groups[gb + g];
@@ -288,31 +311,33 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 if (mode != 0 && !single) {
                     for (int j = 0; j < gr.n; j++) {
                         const gemv_seg & sj = plan.segs[gr.off + j];
-                        if (dnnl_call && dnnl->gemm(sj.w8.vals, sj.residual, sj.alpha, tbm,
-                                                    sj.w8.K, sj.out, sj.out_stride))
+                        if (dnnl_call
+                            && dnnl->gemm(sj.w8.vals, sj.residual, sj.alpha, tbm, sj.w8.K, sj.out, sj.out_stride)) {
                             continue;
+                        }
                         // fallback: an unsupported oneDNN shape (unexpected) needs
                         // the dp4a x8 quantization the dnnl_call branch skipped
                         if (dnnl_call) {
                             const seg_plan::xq_t & xq = plan.call_xq[idx];
-                            xq_launch(q, xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta,
-                                      d_xsumq, d_info, tbm, xq.K);
+                            xq_launch(q, xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, d_info, tbm,
+                                      xq.K);
                         }
-                        dp4a_gemm_launch(q, sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out,
-                                         sj.out_stride, sj.residual, sj.alpha, tbm);
+                        dp4a_gemm_launch(q, sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out, sj.out_stride, sj.residual,
+                                         sj.alpha, tbm);
                     }
-                } else
-                for (int r = 0; r < nb; r++) {
-                    for (int j = 0; j < gr.n; j++) {
-                        const gemv_seg sj = (nb > 1)
-                            ? row_offset_seg(plan.segs[gr.off + j], r, kMaxT)
-                            : plan.segs[gr.off + j];
-                        if (tb == 1) // single-token decode: dedicated coalesced GEMV
-                            dp4a_gemv_launch(q, sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out,
-                                             sj.residual, sj.alpha, sj.w8.N);
-                        else
-                            dp4a_gemm_launch(q, sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out,
-                                             sj.out_stride, sj.residual, sj.alpha, tb);
+                } else {
+                    for (int r = 0; r < nb; r++) {
+                        for (int j = 0; j < gr.n; j++) {
+                            const gemv_seg sj =
+                                (nb > 1) ? row_offset_seg(plan.segs[gr.off + j], r, kMaxT) : plan.segs[gr.off + j];
+                            if (tb == 1) { // single-token decode: dedicated coalesced GEMV
+                                dp4a_gemv_launch(q, sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out, sj.residual, sj.alpha,
+                                                 sj.w8.N);
+                            } else {
+                                dp4a_gemm_launch(q, sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out, sj.out_stride,
+                                                 sj.residual, sj.alpha, tb);
+                            }
+                        }
                     }
                 }
             } else if (mode == 2 && !single) {
@@ -320,35 +345,38 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 // the token-block grid.  Per-row calls of these (small) fp32
                 // tensors cost ~0.5 ms of dispatch tail each, so one call per
                 // group is much cheaper than NCH calls.
-                gemv_group_launch(q, gr.type, d_segs + gr.off, gr.n, gr.rows, tb,
-                                  plan.call_nsb[idx], NCH);
+                gemv_group_launch(q, gr.type, d_segs + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx], NCH);
             } else {
                 for (int r = 0; r < nb; r++) {
-                    const gemv_seg * segs_r = (nb > 1 && d_segs_rows)
-                        ? d_segs_rows + (size_t) r * NSEG
-                        : d_segs;
-                    gemv_group_launch(q, gr.type, segs_r + gr.off, gr.n, gr.rows, tb,
-                                      plan.call_nsb[idx]);
+                    const gemv_seg * segs_r = (nb > 1 && d_segs_rows) ? d_segs_rows + (size_t)r * NSEG : d_segs;
+                    gemv_group_launch(q, gr.type, segs_r + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx]);
                 }
             }
             if (prof) {
                 q.wait();
                 const double dt = tms(a_g2, tnow());
-                if (s0.w8.vals) c_g8 += dt; else c_gf += dt;
+                if (s0.w8.vals) {
+                    c_g8 += dt;
+                } else {
+                    c_gf += dt;
+                }
             }
         }
-        (void) a_grp;
+        (void)a_grp;
     };
     auto gemv = [&]() {
         const auto a = tnow();
         gemv_at(ci);
-        const int my_ci = (int) ci;
+        const int my_ci = (int)ci;
         ci++;
         if (prof) {
             q.wait();
             const double dt = tms(a, tnow());
             c_gemv += dt;
-            if (my_ci < 256) { prof_ci_t[my_ci] += dt; prof_ci_n[my_ci]++; }
+            if (my_ci < 256) {
+                prof_ci_t[my_ci] += dt;
+                prof_ci_n[my_ci]++;
+            }
         }
     };
     const float * out_norm = m.dev_f32(m.output_norm);
@@ -360,17 +388,27 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     const int nreal = (mode == 0) ? 1 : (mode == 2 ? kMaxT : rows);
     // debug stops: 1 = after the first sub-layer of a layer, 2 = after post-attn
     // norm, 3 = after the first FFN GEMM, 4 = right after the embedding
-    const int dbg_mid = [] { const char* e = getenv("PF_DBG_MID"); return e ? atoi(e) : 0; }();
+    const int dbg_mid = [] {
+        const char * e = getenv("PF_DBG_MID");
+        return e ? atoi(e) : 0;
+    }();
 
     {
         const auto a = tnow();
-        embed_launch(q, m.dev_ptr(m.tok_embd.data), m.tok_embd.type, d_info, d_x, hp.n_embd,
-                     m.tok_embd_row_bytes);
-        if (prof) { q.wait(); c_embed += tms(a, tnow()); }
-        if (dbg_mid == 4) return;
+        embed_launch(q, m.dev_ptr(m.tok_embd.data), m.tok_embd.type, d_info, d_x, hp.n_embd, m.tok_embd_row_bytes);
+        if (prof) {
+            q.wait();
+            c_embed += tms(a, tnow());
+        }
+        if (dbg_mid == 4) {
+            return;
+        }
     }
 
-    const int stop_layer = [] { const char* e = getenv("STOP_AFTER_LAYER"); return e ? atoi(e) : -1; }();
+    const int stop_layer = [] {
+        const char * e = getenv("STOP_AFTER_LAYER");
+        return e ? atoi(e) : -1;
+    }();
     // debug: 1 = after the first sub-layer of a layer, 2 = after post-attn
     // norm, 3 = after the first FFN GEMM, 4 = right after the embedding
     for (int il = 0; il < hp.n_layer; il++) {
@@ -388,19 +426,19 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         stamp(c_norm, a_n);
         if (L.recurrent) {
             gemv();
-            const size_t conv_per = (size_t) (hp.conv_k - 1) * 3 * hp.d_inner; // per slot
-            const size_t gdn_per = (size_t) hp.dt_rank * hp.d_state * hp.d_state; // per slot
+            const size_t conv_per = (size_t)(hp.conv_k - 1) * 3 * hp.d_inner;    // per slot
+            const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state; // per slot
             const int gi = m.gdn_layer_index[il];
-            float * cs = d_conv_state + (size_t) gi * kMaxB * conv_per;   // [layer][slot][3][conv_dim]
-            float * gs = d_gdn_state + (size_t) gi * kMaxB * gdn_per;     // [layer][slot][rank][S][S]
+            float * cs = d_conv_state + (size_t)gi * kMaxB * conv_per; // [layer][slot][3][conv_dim]
+            float * gs = d_gdn_state + (size_t)gi * kMaxB * gdn_per;   // [layer][slot][rank][S][S]
             // prefix cache: per-layer slice of a checkpoint slot (see pc_snap)
             pc_snap snap{};
             if (d_pc_states && pc_enabled) {
                 snap.base = d_pc_states;
-                snap.stride = (int64_t) pc_state_floats;
-                snap.layer_off = (int64_t) gi * ((int64_t) gdn_per + (int64_t) conv_per);
-                snap.gdn_per = (int32_t) gdn_per;
-                snap.conv_per = (int32_t) conv_per;
+                snap.stride = (int64_t)pc_state_floats;
+                snap.layer_off = (int64_t)gi * ((int64_t)gdn_per + (int64_t)conv_per);
+                snap.gdn_per = (int32_t)gdn_per;
+                snap.conv_per = (int32_t)conv_per;
             }
             // the GDN recurrence is sequential over tokens.  In chunk-batched
             // prefill the whole batch is *materialized* (qkv), so one call per
@@ -422,68 +460,74 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const auto a_g = tnow();
             auto a_sub = tnow();
             if (mode == 2 && fuse_gdn >= 1 && !nogdn) {
-                conv_l2_launch(q, d_qkv, cs, m.dev_f32(L.ssm_conv1d), d_conv_out, d_info,
-                               3 * hp.d_inner, hp.conv_k, hp.d_state, hp.n_group, hp.rms_eps, NCH,
-                               kMaxT, 0, kMaxT, /*cross_row=*/true);
-                stamp(prof_acc[11], a_sub); a_sub = tnow();
-                conv_state_update_launch(q, d_qkv, cs, d_info, 3 * hp.d_inner, hp.conv_k, NCH, 0,
-                                         kMaxT, kMaxT, /*last_row_only=*/true, snap);
-                stamp(prof_acc[12], a_sub); a_sub = tnow();
+                conv_l2_launch(q, d_qkv, cs, m.dev_f32(L.ssm_conv1d), d_conv_out, d_info, 3 * hp.d_inner, hp.conv_k,
+                               hp.d_state, hp.n_group, hp.rms_eps, NCH, kMaxT, 0, kMaxT, /*cross_row=*/true);
+                stamp(prof_acc[11], a_sub);
+                a_sub = tnow();
+                conv_state_update_launch(q, d_qkv, cs, d_info, 3 * hp.d_inner, hp.conv_k, NCH, 0, kMaxT, kMaxT,
+                                         /*last_row_only=*/true, snap);
+                stamp(prof_acc[12], a_sub);
+                a_sub = tnow();
                 static const bool tdbg = getenv("PF_TIME") != nullptr;
                 if (fuse_gdn >= 2) {
-                    if (tdbg && !g_capturing) q.wait();
+                    if (tdbg && !g_capturing) {
+                        q.wait();
+                    }
                     const auto t0 = tnow();
-                    gdn_launch(q, d_conv_out, d_alpha, m.dev_f32(L.ssm_dt), m.dev_f32(L.ssm_a),
-                               d_beta, gs, d_attn_pre, d_info, hp.d_state, hp.dt_rank,
-                               3 * hp.d_inner, 1.0f / std::sqrt((float) hp.d_state), kMaxB, 1, 0,
-                               T, T, snap);
+                    gdn_launch(q, d_conv_out, d_alpha, m.dev_f32(L.ssm_dt), m.dev_f32(L.ssm_a), d_beta, gs, d_attn_pre,
+                               d_info, hp.d_state, hp.dt_rank, 3 * hp.d_inner, 1.0f / std::sqrt((float)hp.d_state),
+                               kMaxB, 1, 0, T, T, snap);
                     if (tdbg && !g_capturing) {
                         q.wait();
                         fprintf(stderr, "[t] layer %d gdn=%.2f ms\n", il, tms(t0, tnow()));
                     }
                 } else {
-                    for (int r0 = 0; r0 < NCH; r0++)
-                        gdn_launch(q, d_conv_out, d_alpha, m.dev_f32(L.ssm_dt),
-                                   m.dev_f32(L.ssm_a), d_beta, gs, d_attn_pre, d_info, hp.d_state,
-                                   hp.dt_rank, 3 * hp.d_inner,
-                                   1.0f / std::sqrt((float) hp.d_state), kMaxB, 1, r0, -1, -1, snap);
+                    for (int r0 = 0; r0 < NCH; r0++) {
+                        gdn_launch(q, d_conv_out, d_alpha, m.dev_f32(L.ssm_dt), m.dev_f32(L.ssm_a), d_beta, gs,
+                                   d_attn_pre, d_info, hp.d_state, hp.dt_rank, 3 * hp.d_inner,
+                                   1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, r0, -1, -1, snap);
+                    }
                 }
-                stamp(prof_acc[13], a_sub); a_sub = tnow();
+                stamp(prof_acc[13], a_sub);
+                a_sub = tnow();
             } else if (!nogdn) {
                 static const bool dbg_g = getenv("PF_GDN_DBG") != nullptr;
                 for (int r0 = 0; r0 < gdn_rows; r0++) {
                     const int rr0 = (mode == 2) ? r0 : 0;
                     const int rn = (mode == 2) ? 1 : nrows;
-                    if (dbg_g)
-                        fprintf(stderr, "[gdn] mode=%d r0=%d rr0=%d rn=%d gdn_nr=%d info_n_rows=%d "
-                                        "active=%d tpb=%d\n",
-                                mode, r0, rr0, rn, gdn_nr, d_info->n_rows, d_info->active[rr0],
-                                d_info->tpb);
-                    conv_l2_launch(q, d_qkv, cs, m.dev_f32(L.ssm_conv1d), d_conv_out, d_info,
-                                   3 * hp.d_inner, hp.conv_k, hp.d_state, hp.n_group, hp.rms_eps,
-                                   rn, gdn_nr, rr0);
-                    conv_state_update_launch(q, d_qkv, cs, d_info, 3 * hp.d_inner, hp.conv_k, rn,
-                                             rr0, -1, -1, false, snap);
-                    gdn_launch(q, d_conv_out, d_alpha, m.dev_f32(L.ssm_dt), m.dev_f32(L.ssm_a),
-                               d_beta, gs, d_attn_pre, d_info, hp.d_state, hp.dt_rank,
-                               3 * hp.d_inner, 1.0f / std::sqrt((float) hp.d_state), kMaxB, rn,
-                               rr0, -1, -1, snap);
+                    if (dbg_g) {
+                        fprintf(stderr,
+                                "[gdn] mode=%d r0=%d rr0=%d rn=%d gdn_nr=%d info_n_rows=%d "
+                                "active=%d tpb=%d\n",
+                                mode, r0, rr0, rn, gdn_nr, d_info->n_rows, d_info->active[rr0], d_info->tpb);
+                    }
+                    conv_l2_launch(q, d_qkv, cs, m.dev_f32(L.ssm_conv1d), d_conv_out, d_info, 3 * hp.d_inner, hp.conv_k,
+                                   hp.d_state, hp.n_group, hp.rms_eps, rn, gdn_nr, rr0);
+                    conv_state_update_launch(q, d_qkv, cs, d_info, 3 * hp.d_inner, hp.conv_k, rn, rr0, -1, -1, false,
+                                             snap);
+                    gdn_launch(q, d_conv_out, d_alpha, m.dev_f32(L.ssm_dt), m.dev_f32(L.ssm_a), d_beta, gs, d_attn_pre,
+                               d_info, hp.d_state, hp.dt_rank, 3 * hp.d_inner, 1.0f / std::sqrt((float)hp.d_state),
+                               kMaxB, rn, rr0, -1, -1, snap);
                 }
-                stamp(prof_acc[13], a_sub); a_sub = tnow();
+                stamp(prof_acc[13], a_sub);
+                a_sub = tnow();
             }
             // gated_norm has no state dependency on the row order, so all chunk
             // rows run in one dispatch (batched it is ~4x cheaper than NCH calls)
-            gated_norm_launch(q, d_attn_pre, d_z, m.dev_f32(L.ssm_norm), d_attn_merged, d_info,
-                              hp.dt_rank, hp.d_state, hp.rms_eps, mode == 2 ? NCH : nrows, gdn_nr, 0);
-            stamp(prof_acc[14], a_sub); a_sub = tnow();
+            gated_norm_launch(q, d_attn_pre, d_z, m.dev_f32(L.ssm_norm), d_attn_merged, d_info, hp.dt_rank, hp.d_state,
+                              hp.rms_eps, mode == 2 ? NCH : nrows, gdn_nr, 0);
+            stamp(prof_acc[14], a_sub);
+            a_sub = tnow();
             stamp(c_gdn, a_g);
             gemv();
-            if (dbg_mid == 1) break;
+            if (dbg_mid == 1) {
+                break;
+            }
         } else {
             gemv();
             // pool layer stride is in bytes (kv_layer_stride, see kv_setup)
-            void * kp = (char *) d_kpool + (size_t) attn_idx * kv_layer_stride;
-            void * vp = (char *) d_vpool + (size_t) attn_idx * kv_layer_stride;
+            void * kp = (char *)d_kpool + (size_t)attn_idx * kv_layer_stride;
+            void * vp = (char *)d_vpool + (size_t)attn_idx * kv_layer_stride;
             const auto a_a = tnow();
             // Attention split count for this forward.
             //  PF_ATTN_SPLIT=N           force N splits for prefill (1 = fused)
@@ -512,15 +556,20 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             if (mode == 0) {
                 nsp = dec_splits;
                 part = d_partials_dec;
-                if (at_split > 0) nsp = std::min(std::max(at_split, 1), dec_splits);
+                if (at_split > 0) {
+                    nsp = std::min(std::max(at_split, 1), dec_splits);
+                }
             } else if (mode == 2) {
                 nsp = n_splits;
-                if (at_split > 0) nsp = at_split;
-                else if (at_nsp_hint > 0) nsp = at_nsp_hint; // recorded variant
-                else {
+                if (at_split > 0) {
+                    nsp = at_split;
+                } else if (at_nsp_hint > 0) {
+                    nsp = at_nsp_hint; // recorded variant
+                } else {
                     int max_nkv = 0;
-                    for (int r = 0; r < nrows; r++)
+                    for (int r = 0; r < nrows; r++) {
                         max_nkv = std::max(max_nkv, d_info->pos[r] + nreal);
+                    }
                     nsp = (max_nkv + at_split_keys - 1) / at_split_keys;
                 }
                 nsp = std::min(std::max(nsp, 1), n_splits);
@@ -530,48 +579,63 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 nsp = std::min(std::max(nsp, 1), n_splits);
                 part = d_partials;
             }
-            if (noattn) { gemv(); attn_idx++; if (dbg_mid == 1) break; continue; }
-            const void * ksc = d_kscales ? (char *) d_kscales + (size_t) attn_idx * kv_scale_stride
-                                         : nullptr;
-            const void * vsc = d_vscales ? (char *) d_vscales + (size_t) attn_idx * kv_scale_stride
-                                         : nullptr;
-            qk_norm_rope_launch(q, d_qbuf, d_kbuf, d_vbuf, m.dev_f32(L.q_norm), m.dev_f32(L.k_norm),
-                                kp, vp, d_tables, d_info, hp.n_head, hp.n_head_kv, hp.head_dim,
-                                hp.n_rot, hp.rope_base, hp.rms_eps, max_blocks, nrows, nreal,
-                                ksc, vsc);
+            if (noattn) {
+                gemv();
+                attn_idx++;
+                if (dbg_mid == 1) {
+                    break;
+                }
+                continue;
+            }
+            const void * ksc = d_kscales ? (char *)d_kscales + (size_t)attn_idx * kv_scale_stride : nullptr;
+            const void * vsc = d_vscales ? (char *)d_vscales + (size_t)attn_idx * kv_scale_stride : nullptr;
+            qk_norm_rope_launch(q, d_qbuf, d_kbuf, d_vbuf, m.dev_f32(L.q_norm), m.dev_f32(L.k_norm), kp, vp, d_tables,
+                                d_info, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
+                                max_blocks, nrows, nreal, ksc, vsc);
             const bool at_fused = (nsp == 1 && at_fuse);
-            attn_launch(q, d_qbuf, d_qbuf, kp, vp, part, d_tables, hp.n_head,
-                        hp.n_head_kv, hp.head_dim, nsp, d_info, hp.attn_scale, max_blocks,
-                        nrows, nreal, at_fused ? d_attn_out : nullptr, -1, ksc, vsc);
+            attn_launch(q, d_qbuf, d_qbuf, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, d_info,
+                        hp.attn_scale, max_blocks, nrows, nreal, at_fused ? d_attn_out : nullptr, -1, ksc, vsc);
             // n_splits == 1 (batched prefill): the attention kernel writes the
             // gated output directly and the combine kernel is skipped
-            if (!at_fused)
-                attn_combine_launch(q, part, d_qbuf, d_attn_out, d_info, hp.n_head,
-                                    hp.head_dim, nsp, nrows, nreal);
+            if (!at_fused) {
+                attn_combine_launch(q, part, d_qbuf, d_attn_out, d_info, hp.n_head, hp.head_dim, nsp, nrows, nreal);
+            }
             stamp(c_attn, a_a);
             gemv();
             attn_idx++;
-            if (dbg_mid == 1) break;
+            if (dbg_mid == 1) {
+                break;
+            }
         }
         const auto a_n2 = tnow();
         rmsnorm_launch(q, d_x, m.dev_f32(L.post_attn_norm), d_xnorm, T, hp.n_embd, hp.rms_eps);
         stamp(c_norm, a_n2);
-        if (dbg_mid == 2) break;
+        if (dbg_mid == 2) {
+            break;
+        }
         gemv();
-        if (dbg_mid == 3) break;
+        if (dbg_mid == 3) {
+            break;
+        }
         gemv();
-        if (il == stop_layer) break;
+        if (il == stop_layer) {
+            break;
+        }
     }
 
     const auto a_out = tnow();
     rmsnorm_launch(q, d_x, out_norm, d_xnorm, T, hp.n_embd, hp.rms_eps);
-    if (mode != 0)
+    if (mode != 0) {
         copy_row_launch(q, d_xnorm, d_last_hidden, d_info, hp.n_embd, -1);
+    }
     stamp(c_norm, a_out);
     {
         const auto a = tnow();
         gemv_at(plan.call_offsets.size() - 1); // head is always the last call group
-        if (prof) { q.wait(); c_head += tms(a, tnow()); }
+        if (prof) {
+            q.wait();
+            c_head += tms(a, tnow());
+        }
     }
     if (prof) {
         q.wait();
@@ -589,30 +653,33 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         if ((prof_calls % every) == 0) {
             printf("[prof] %s: gemv=%.2f xq=%.2f head=%.2f attn=%.2f gdn=%.2f norm=%.2f "
                    "other=%.2f total=%.2f ms (embed=%.2f)\n",
-                   mode == 2 ? "batch" : "chunk", prof_acc[2] / every, prof_acc[5] / every, c_head,
-                   prof_acc[6] / every, prof_acc[7] / every, prof_acc[8] / every,
-                   prof_acc[3] / every, prof_acc[4] / every, prof_acc[0] / every);
-            printf("      gemv split: w8=%.2f fp32/side=%.2f (incl. per-group sync)\n",
-                   c_g8, c_gf);
-            printf("      gdn split: conv_l2=%.2f conv_state=%.2f gdn=%.2f gated=%.2f\n",
-                   prof_acc[11] / every, prof_acc[12] / every, prof_acc[13] / every,
-                   prof_acc[14] / every);
-            for (double & v : prof_acc) v = 0;
+                   mode == 2 ? "batch" : "chunk", prof_acc[2] / every, prof_acc[5] / every, c_head, prof_acc[6] / every,
+                   prof_acc[7] / every, prof_acc[8] / every, prof_acc[3] / every, prof_acc[4] / every,
+                   prof_acc[0] / every);
+            printf("      gemv split: w8=%.2f fp32/side=%.2f (incl. per-group sync)\n", c_g8, c_gf);
+            printf("      gdn split: conv_l2=%.2f conv_state=%.2f gdn=%.2f gated=%.2f\n", prof_acc[11] / every,
+                   prof_acc[12] / every, prof_acc[13] / every, prof_acc[14] / every);
+            for (double & v : prof_acc) {
+                v = 0;
+            }
             c_g8 = c_gf = 0;
             prof_calls = 0;
             // top call groups by accumulated time
             int idx[256];
-            for (int i = 0; i < 256; i++) idx[i] = i;
+            for (int i = 0; i < 256; i++) {
+                idx[i] = i;
+            }
             std::sort(idx, idx + 256, [](int a, int b) { return prof_ci_t[a] > prof_ci_t[b]; });
             for (int k = 0; k < 8; k++) {
                 const int i = idx[k];
-                if (prof_ci_t[i] <= 0 || prof_ci_n[i] == 0) continue;
+                if (prof_ci_t[i] <= 0 || prof_ci_n[i] == 0) {
+                    continue;
+                }
                 const seg_plan::xq_t & xq = plan.call_xq[i];
                 const gemv_seg & s0 = plan.segs[plan.groups[plan.call_group_begin[i]].off];
                 printf("   ci=%2d %8.2f ms/call  n=%ld  K=%d N=%d type=%s nr=%d os=%d xq=%d\n", i,
                        prof_ci_t[i] / prof_ci_n[i], prof_ci_n[i], xq.K, s0.w8.ok() ? s0.w8.N : 0,
-                       ggml_type_name(s0.w8.ok() ? s0.w8.type : s0.type), s0.n_rows,
-                       s0.out_stride, xq.x ? 1 : 0);
+                       ggml_type_name(s0.w8.ok() ? s0.w8.type : s0.type), s0.n_rows, s0.out_stride, xq.x ? 1 : 0);
                 prof_ci_t[i] = 0;
                 prof_ci_n[i] = 0;
             }
@@ -621,15 +688,19 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
 }
 void engine::build_graphs() {
     capture_guard cg;
-    plan_pf_ = build_plan(kMaxT, 8, false);      // 1 row x kMaxT tokens, 8-token gemv slices
+    plan_pf_ = build_plan(kMaxT, 8, false); // 1 row x kMaxT tokens, 8-token gemv slices
     plan_pf_.finalize();
-    if (plan_pf_.segs.size() > 4096) throw std::runtime_error("segment buffer too small");
+    if (plan_pf_.segs.size() > 4096) {
+        throw std::runtime_error("segment buffer too small");
+    }
     q.memcpy(d_segs_pf, plan_pf_.segs.data(), plan_pf_.segs.size() * sizeof(gemv_seg)).wait();
 
     for (auto & b : buckets_) {
         b.plan = build_plan(b.tb, b.tb, true);
         b.plan.finalize();
-        if (b.plan.segs.size() > 1024) throw std::runtime_error("segment buffer too small");
+        if (b.plan.segs.size() > 1024) {
+            throw std::runtime_error("segment buffer too small");
+        }
         q.memcpy(b.d_segs, b.plan.segs.data(), b.plan.segs.size() * sizeof(gemv_seg)).wait();
         b.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
         b.g->begin_recording(q);
@@ -649,8 +720,7 @@ void engine::build_graphs() {
         if (pf8) {
             plan_pf8_ = build_plan(kMaxT, kMaxT, false, true, true);
             plan_pf8_.finalize();
-            q.memcpy(d_segs_pf8, plan_pf8_.segs.data(),
-                     plan_pf8_.segs.size() * sizeof(gemv_seg)).wait();
+            q.memcpy(d_segs_pf8, plan_pf8_.segs.data(), plan_pf8_.segs.size() * sizeof(gemv_seg)).wait();
             g_pf8 = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
             g_pf8->begin_recording(q);
             record_forward(1, plan_pf8_, d_segs_pf8, kMaxT);
@@ -664,9 +734,9 @@ void engine::build_graphs() {
                 plan_dec8_ = build_plan(1, 1, true, true, true);
                 plan_dec8_.finalize();
                 gemv_seg * d_segs_d8 = sycl::malloc_device<gemv_seg>(plan_dec8_.segs.size(), q);
-                q.memcpy(d_segs_d8, plan_dec8_.segs.data(),
-                         plan_dec8_.segs.size() * sizeof(gemv_seg)).wait();
-                g_dec8 = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
+                q.memcpy(d_segs_d8, plan_dec8_.segs.data(), plan_dec8_.segs.size() * sizeof(gemv_seg)).wait();
+                g_dec8 =
+                    std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
                 g_dec8->begin_recording(q);
                 record_forward(0, plan_dec8_, d_segs_d8, 1);
                 g_dec8->end_recording();
@@ -681,14 +751,16 @@ void engine::build_graphs() {
                 plan_pfb_ = build_plan(kMaxT, kMaxT, false, true, true);
                 plan_pfb_.finalize();
                 const size_t nseg = plan_pfb_.segs.size();
-                d_segs_pfb = sycl::malloc_device<gemv_seg>((size_t) kMaxB * nseg, q);
+                d_segs_pfb = sycl::malloc_device<gemv_seg>((size_t)kMaxB * nseg, q);
                 // ONE copy for all rows: a per-row q.memcpy from the same host
                 // vector races with the next row's writes (the copy is async),
                 // which silently mixed the row offsets
-                std::vector<gemv_seg> h((size_t) kMaxB * nseg);
-                for (int r = 0; r < kMaxB; r++)
-                    for (size_t i = 0; i < nseg; i++)
-                        h[(size_t) r * nseg + i] = row_offset_seg(plan_pfb_.segs[i], r, kMaxT);
+                std::vector<gemv_seg> h((size_t)kMaxB * nseg);
+                for (int r = 0; r < kMaxB; r++) {
+                    for (size_t i = 0; i < nseg; i++) {
+                        h[(size_t)r * nseg + i] = row_offset_seg(plan_pfb_.segs[i], r, kMaxT);
+                    }
+                }
                 q.memcpy(d_segs_pfb, h.data(), h.size() * sizeof(gemv_seg)).wait();
                 // prefill K-split: a recorded graph bakes its grid, so each
                 // variant picks a split for its own chunk size (the direct
@@ -705,15 +777,13 @@ void engine::build_graphs() {
                     if (!use_dnnl) {
                         const char * ese = getenv("PF_ATTN_SPLIT");
                         const int fixed = ese ? atoi(ese) : 0;
-                        const int hint = fixed > 0 ? fixed
-                                                   : std::min({n_splits, 4, std::max(1, v.ntok / 128)});
-                        v.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(
-                            q.get_context(), q.get_device());
+                        const int hint = fixed > 0 ? fixed : std::min({n_splits, 4, std::max(1, v.ntok / 128)});
+                        v.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(),
+                                                                                               q.get_device());
                         v.g->begin_recording(q);
                         record_forward(2, plan_pfb_, d_segs_pfb, v.ntok, d_segs_pfb, hint);
                         v.g->end_recording();
-                        v.e = std::make_unique<sx::command_graph<sx::graph_state::executable>>(
-                            v.g->finalize());
+                        v.e = std::make_unique<sx::command_graph<sx::graph_state::executable>>(v.g->finalize());
                     }
                     pfb_vars_.push_back(std::move(v));
                 }
@@ -721,9 +791,9 @@ void engine::build_graphs() {
             seg_plan plan_pf8_nh = build_plan(kMaxT, kMaxT, false, true, false);
             plan_pf8_nh.finalize();
             gemv_seg * d_segs_nh = sycl::malloc_device<gemv_seg>(plan_pf8_nh.segs.size(), q);
-            q.memcpy(d_segs_nh, plan_pf8_nh.segs.data(),
-                     plan_pf8_nh.segs.size() * sizeof(gemv_seg)).wait();
-            auto g_nh = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
+            q.memcpy(d_segs_nh, plan_pf8_nh.segs.data(), plan_pf8_nh.segs.size() * sizeof(gemv_seg)).wait();
+            auto g_nh =
+                std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
             g_nh->begin_recording(q);
             record_forward(1, plan_pf8_nh, d_segs_nh, kMaxT);
             g_nh->end_recording();
