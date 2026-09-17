@@ -1,0 +1,302 @@
+#include "scheduler.h"
+
+#include <algorithm>
+#include <chrono>
+
+namespace si {
+
+static bool srv_time() {
+    static const bool t = getenv("PF_SRV_TIME") != nullptr;
+    return t;
+}
+
+static double dms(std::chrono::steady_clock::time_point a,
+                  std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+void scheduler::start() {
+    th = std::thread([this] { loop(); });
+}
+
+void scheduler::shutdown() {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        stopping = true;
+    }
+    cv.notify_all();
+    if (th.joinable()) th.join();
+}
+
+std::shared_ptr<sequence> scheduler::submit(std::vector<int> prompt, const gen_params & gp,
+                                            std::vector<std::string> stops) {
+    auto s = std::make_shared<sequence>();
+    {
+        std::lock_guard<std::mutex> lk(m);
+        s->id = next_id++;
+        s->prompt = std::move(prompt);
+        s->gp = gp;
+        s->stops = std::move(stops);
+        s->prompt_tokens = (int) s->prompt.size();
+        s->ss.seed(gp.seed ? gp.seed : (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count());
+        if (srv_time()) s->t_submit = std::chrono::steady_clock::now();
+        waiting.push_back(s);
+    }
+    cv.notify_all();
+    return s;
+}
+
+bool scheduler::admit(std::shared_ptr<sequence> & s) {
+    // a prompt that does not fit the configured context cannot be prefilled
+    // (its block table row is only max_seq/kBlockSize entries long): retire it
+    // cleanly instead of writing KV through table entries that do not exist
+    if ((int) s->prompt.size() > e.max_seq) {
+        retire(s, "length");
+        return true;
+    }
+    // find a free state slot
+    bool used[kMaxB] = {false};
+    for (auto & a : active) used[a->slot] = true;
+    int slot = -1;
+    for (int i = 0; i < kMaxB; i++)
+        if (!used[i]) { slot = i; break; }
+    if (slot < 0) return false;
+    // prefix cache: attach cached KV blocks and restore the recurrent state of
+    // the matched prefix; `matched` token positions are then already done
+    std::vector<int> blocks;
+    const int matched = e.pc_admit(slot, s->prompt, blocks);
+    if (matched <= 0) e.zero_slot(slot);
+    s->reused = matched;
+    // allocate blocks for the first prefill chunk
+    const int first_end = std::min<int>(matched + kMaxT, (int) s->prompt.size());
+    const int need = (std::max(first_end, 1) + kBlockSize - 1) / kBlockSize;
+    for (int i = (int) blocks.size(); i < need; i++) {
+        int b = e.alloc_block();
+        if (b < 0) {
+            e.pc_retire(slot, blocks);
+            return false;
+        }
+        blocks.push_back(b);
+    }
+    s->slot = slot;
+    s->prompt_pos = matched;
+    s->blocks = std::move(blocks);
+    e.set_table(slot, s->blocks);
+    s->admitted = true;
+    return true;
+}
+
+void scheduler::retire(std::shared_ptr<sequence> & s, const char * reason) {
+    s->finish_reason = reason;
+    e.pc_retire(s->slot, s->blocks);
+    s->blocks.clear();
+    {
+        std::lock_guard<std::mutex> lk(s->m);
+        s->finished = true;
+    }
+    s->cv.notify_all();
+}
+
+static bool dbg() { static bool d = getenv("SCHED_DEBUG") != nullptr; return d; }
+
+void scheduler::loop() {
+    std::vector<int32_t> toks(kMaxB, 0), poss(kMaxB, 0), slots(kMaxB, 0);
+    std::vector<float> logits(e.m.hp.n_vocab);
+    std::vector<utf8_stream_buffer> ubs(kMaxB);
+
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (stopping && waiting.empty() && active.empty()) break;
+        }
+        bool did_work = false;
+
+        // ---- admit waiting sequences ----
+        {
+            std::lock_guard<std::mutex> lk(e.mtx);
+            std::lock_guard<std::mutex> lk2(m);
+            while (!waiting.empty()) {
+                auto s = waiting.front();
+                const auto t_a0 = std::chrono::steady_clock::now();
+                if (!admit(s)) break;
+                if (srv_time()) s->admit_ms = dms(t_a0, std::chrono::steady_clock::now());
+                waiting.erase(waiting.begin());
+                active.push_back(s);
+            }
+            // ---- one chunked prefill step (round robin) ----
+            for (auto & s : active) {
+                if (s->finished) continue;
+                if (s->prompt_pos < (int) s->prompt.size()) {
+                    const int rem = (int) s->prompt.size() - s->prompt_pos;
+                    // chunk-batched prefill: the recorded mode-2 graphs cover
+                    // 64/128/256/512 tokens in one forward (weights read ~once
+                    // instead of once per 32-token chunk); pick the largest
+                    // size that fits the remaining prompt and the block pool
+                    int n = 0;
+                    bool batch_pf = false;
+                    for (int cand = e.batched_prefill_fit(rem); cand >= 2 * kMaxT; cand -= kMaxT) {
+                        const int need = (s->prompt_pos + cand + kBlockSize - 1) / kBlockSize;
+                        bool ok = true;
+                        while ((int) s->blocks.size() < need) {
+                            int b = e.alloc_block();
+                            if (b < 0) { ok = false; break; }
+                            s->blocks.push_back(b);
+                            e.set_table(s->slot, s->blocks);
+                        }
+                        if (ok) { n = cand; batch_pf = true; break; }
+                    }
+                    if (!batch_pf) {
+                        n = std::min<int>(kMaxT, rem);
+                        // ensure blocks for this chunk
+                        const int end = s->prompt_pos + n;
+                        const int need = (end + kBlockSize - 1) / kBlockSize;
+                        while ((int) s->blocks.size() < need) {
+                            int b = e.alloc_block();
+                            if (b < 0) break;
+                            s->blocks.push_back(b);
+                            e.set_table(s->slot, s->blocks);
+                        }
+                    }
+                    // the pool (or another sequence) may have starved this chunk:
+                    // prefill must not write through unallocated block-table slots
+                    if ((int) s->blocks.size() * kBlockSize < s->prompt_pos + n) {
+                        retire(s, "length");
+                        break;
+                    }
+                    // only the final prompt chunk needs the LM head
+                    const bool last_chunk = (s->prompt_pos + n >= (int) s->prompt.size());
+                    static const bool tdbg = srv_time();
+                    const auto t_pf0 = std::chrono::steady_clock::now();
+                    if (tdbg && s->n_chunks == 0) s->wait_ms = dms(s->t_submit, t_pf0);
+                    if (batch_pf) e.prefill_batch(s->prompt, s->prompt_pos, n, s->slot, s->prompt_pos);
+                    else e.prefill_chunk(s->prompt, s->prompt_pos, n, s->slot, last_chunk);
+                    const auto t_pf1 = std::chrono::steady_clock::now();
+                    if (tdbg) s->pf_ms += dms(t_pf0, t_pf1);
+                    s->n_chunks++;
+                    if (dbg()) fprintf(stderr, "[sched] prefill seq=%d slot=%d chunk pos=%d n=%d (prompt %zu)\n",
+                                       s->id, s->slot, s->prompt_pos, n, s->prompt.size());
+                    s->prompt_pos += n;
+                    // prefix cache: turn the blocks just prefilled into cache
+                    // nodes (and capture a state checkpoint on block boundaries)
+                    e.pc_commit(s->slot, s->prompt, s->blocks, s->prompt_pos);
+                    did_work = true;
+                    // if this completes the prompt, fetch the first token's logits
+                    if (s->prompt_pos >= (int) s->prompt.size()) {
+                        // the prefill graph produced logits into d_logits row 0
+                        const auto t_fl0 = std::chrono::steady_clock::now();
+                        e.fetch_logits(0, logits.data());
+                        s->recent = s->prompt;
+                        const auto t_sm0 = std::chrono::steady_clock::now();
+                        int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss);
+                        s->recent.push_back(tok);
+                        s->n_generated++;
+                        if (tdbg) {
+                            const auto t_now = std::chrono::steady_clock::now();
+                            auto ms = [](auto a, auto b) {
+                                return std::chrono::duration<double, std::milli>(b - a).count();
+                            };
+                            // `prefill` is the last chunk's forward; `prefill_total`
+                            // sums all chunk forwards (the first token cannot be
+                            // sampled before every prompt token has been prefilled)
+                            fprintf(stderr,
+                                    "[srv] prefill=%.1f fetch=%.2f sample=%.2f to_first_tok=%.1f ms "
+                                    "(wait=%.2f admit=%.2f prefill_total=%.1f chunks=%d reused=%d total=%.1f)\n",
+                                    ms(t_pf0, t_pf1), ms(t_fl0, t_sm0), ms(t_sm0, t_now),
+                                    ms(t_pf0, t_now), s->wait_ms, s->admit_ms, s->pf_ms,
+                                    s->n_chunks, s->reused, ms(s->t_submit, t_now));
+                        }
+                        // don't stream the EOS token itself: it is a control
+                        // token, not content
+                        const bool eos =
+                            !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
+                        if (!eos) {
+                            std::string piece = ubs[0].push(e.tk.token_piece(tok));
+                            if (!piece.empty()) s->push(piece);
+                        }
+                        if (eos || s->n_generated >= s->gp.max_tokens) {
+                            retire(s, s->n_generated >= s->gp.max_tokens ? "length" : "stop");
+                        }
+                    }
+                    break; // one prefill chunk per iteration
+                }
+            }
+        }
+
+        // ---- batched decode ----
+        {
+            std::lock_guard<std::mutex> lk(e.mtx);
+            std::lock_guard<std::mutex> lk2(m);
+            int nb = 0;
+            std::vector<std::shared_ptr<sequence>> batch;
+            for (auto & s : active) {
+                if (s->finished) continue;
+                if (s->prompt_pos < (int) s->prompt.size()) continue; // still prefilling
+                if (s->recent.empty()) continue;
+                if (nb >= kMaxB) break;
+                // grow the block table if needed
+                const int pos = (int) s->recent.size(); // next position to write
+                const int need = (pos + kBlockSize - 1) / kBlockSize;
+                while ((int) s->blocks.size() < need) {
+                    int b = e.alloc_block();
+                    if (b < 0) break;
+                    s->blocks.push_back(b);
+                    e.set_table(s->slot, s->blocks);
+                }
+                // the decode writes the KV of recent.back() at position pos-1;
+                // it must be below max_seq and backed by an allocated block
+                const int wpos = pos - 1;
+                if (wpos >= e.max_seq || wpos >= (int) s->blocks.size() * kBlockSize) {
+                    retire(s, "length");
+                    continue;
+                }
+                toks[nb] = s->recent.back();
+                poss[nb] = pos - 1;
+                slots[nb] = s->slot;
+                batch.push_back(s);
+                nb++;
+            }
+            if (nb > 0) {
+                e.decode_batch(toks.data(), poss.data(), slots.data(), nb);
+                if (dbg()) {
+                    fprintf(stderr, "[sched] decode nb=%d:", nb);
+                    for (int r = 0; r < nb; r++) fprintf(stderr, " seq=%d slot=%d pos=%d tok=%d", batch[r]->id, slots[r], poss[r], toks[r]);
+                    fprintf(stderr, "\n");
+                }
+                did_work = true;
+                for (int r = 0; r < nb; r++) {
+                    auto & s = batch[r];
+                    e.fetch_logits(r, logits.data());
+                    int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss);
+                    if (dbg()) fprintf(stderr, "[sched]   prefill-sampled seq=%d tok=%d\n", s->id, tok);
+                    s->recent.push_back(tok);
+                    s->n_generated++;
+                    // don't stream the EOS token itself: it is a control token,
+                    // not content
+                    bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
+                    if (!eos) {
+                        std::string piece = ubs[r].push(e.tk.token_piece(tok));
+                        if (!piece.empty()) s->push(piece);
+                    }
+                    if (eos || s->n_generated >= s->gp.max_tokens) {
+                        retire(s, s->n_generated >= s->gp.max_tokens && !eos ? "length" : "stop");
+                    }
+                }
+            }
+            // remove finished
+            active.erase(std::remove_if(active.begin(), active.end(),
+                                        [](const std::shared_ptr<sequence> & s) { return s->finished; }),
+                         active.end());
+        }
+
+        if (!did_work) {
+            // Wake on the next submit/shutdown instead of a fixed 2 ms poll: the
+            // old sleep added 0-2 ms to every first token.  The timeout is only
+            // a fallback.
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait_for(lk, std::chrono::milliseconds(2),
+                        [&] { return stopping || !waiting.empty() || !active.empty(); });
+        }
+    }
+}
+
+} // namespace si

@@ -1,0 +1,18 @@
+# clangd configuration for the SYCL/C++ sources.
+#
+# icpx injects its SYCL include directory internally, so it never appears in the
+# compile_commands.json flags and clangd cannot find <sycl/sycl.hpp> on its own.
+# Add it explicitly (`latest` follows the installed oneAPI compiler).
+#
+# Drop -fsycl: upstream clangd has no SYCL device pass and mis-parses Intel's
+# headers when it is forwarded as -fsycl-is-device.  Host parsing is what an IDE
+# needs for navigation, completion and diagnostics.
+CompileFlags:
+  CompilationDatabase: "build"
+  Add:
+    - -isystem/opt/intel/oneapi/compiler/latest/include
+  Remove:
+    - -fsycl
+
+Diagnostics:
+  UnusedIncludes: Strict
