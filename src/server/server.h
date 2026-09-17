@@ -10,6 +10,8 @@ struct server_config {
     std::string host = "0.0.0.0";
     int port = 8080;
     int n_threads = 4;
+    // vision projector GGUF; empty disables image input
+    std::string mmproj_path;
 };
 
 int serve(engine & e, const server_config & cfg);

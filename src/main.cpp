@@ -8,8 +8,11 @@
 #include "chat.h"
 #include "chat_util.h"
 #include "engine.h"
+#include "image.h"
 #include "model.h"
+#include "multimodal.h"
 #include "server.h"
+#include "vision.h"
 
 using namespace si;
 
@@ -23,6 +26,7 @@ static void usage(const char * prog) {
             "usage:\n"
             "  %s --model <gguf> [--ctx N] [--blocks N] [--kv-cap-mb N] [--port N] [--host H] serve\n"
             "  %s --model <gguf> gen --prompt \"...\" [--max-tokens N] [--temp T] [--raw]\n"
+            "  %s --model <gguf> --mmproj <mmproj.gguf> gen --image <file> --prompt \"...\"\n"
             "\n"
             "  --ctx N     max sequence length in tokens (default %d, or PF_CTX).\n"
             "              A prompt longer than this is rejected with HTTP 400.\n"
@@ -41,7 +45,7 @@ static void usage(const char * prog) {
             "     (default on); PF_PC_STATES=N bounds the state checkpoints\n"
             "     (default 8, ~19 MB each).  PF_GEMM_DNNL=0 forces the dp4a\n"
             "     prefill path (oneDNN int8 GEMMs are the default).\n",
-            prog, prog, kDefaultCtx, kBlockSize);
+            prog, prog, prog, kDefaultCtx, kBlockSize);
 }
 
 int main(int argc, char ** argv) {
@@ -60,6 +64,8 @@ int main(int argc, char ** argv) {
     float top_p = 0.95f;
     int top_k = 40;
     bool raw = false;
+    std::string mmproj_path;
+    std::vector<std::string> image_paths;
     std::string cmd;
 
     for (int i = 1; i < argc; i++) {
@@ -81,6 +87,8 @@ int main(int argc, char ** argv) {
         else if (a == "--top-p") top_p = (float) atof(next().c_str());
         else if (a == "--top-k") top_k = atoi(next().c_str());
         else if (a == "--raw") raw = true;
+        else if (a == "--mmproj") mmproj_path = next();
+        else if (a == "--image") image_paths.push_back(next());
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else cmd = a;
     }
@@ -148,9 +156,59 @@ int main(int argc, char ** argv) {
             server_config cfg;
             cfg.host = host;
             cfg.port = port;
+            cfg.mmproj_path = mmproj_path;
             return serve(e, cfg);
         }
         if (cmd == "gen") {
+            gen_params gp;
+            gp.max_tokens = max_tokens;
+            gp.temperature = temp;
+            gp.top_p = top_p;
+            gp.top_k = top_k;
+            utf8_stream_buffer ub;
+            auto emit = [&](int tok) {
+                fputs(ub.push(e.tk.token_piece(tok)).c_str(), stdout);
+                fflush(stdout);
+                return true;
+            };
+            if (!image_paths.empty()) {
+                if (mmproj_path.empty())
+                    throw std::runtime_error("--image requires --mmproj <mmproj.gguf>");
+                vision_model vm;
+                vm.load(mmproj_path);
+                std::vector<mm_image> imgs;
+                image_preproc_cfg cfg;
+                cfg.patch_size = vm.hp.patch_size;
+                cfg.merge = vm.hp.merge;
+                const int patch_area = cfg.patch_size * cfg.patch_size * cfg.merge * cfg.merge;
+                cfg.min_pixels = 8 * patch_area;
+                cfg.max_pixels = kMaxImgTokens * patch_area;
+                for (int c = 0; c < 3; c++) {
+                    cfg.mean[c] = vm.hp.mean[c];
+                    cfg.std[c] = vm.hp.std[c];
+                }
+                for (const std::string & p : image_paths) {
+                    std::vector<uint8_t> rgb;
+                    int w = 0, h = 0;
+                    std::string err;
+                    if (!mm_image_decode_file(p, rgb, w, h, &err))
+                        throw std::runtime_error("image: " + err);
+                    imgs.push_back(mm_image_preprocess(rgb.data(), w, h, cfg));
+                }
+                chat_msg m;
+                m.role = "user";
+                for (size_t i = 0; i < imgs.size(); i++) m.parts.push_back({true, ""});
+                m.parts.push_back({false, prompt});
+                const std::string rendered =
+                    render_chat(e.m.chat_template, {m}, /*add_generation_prompt=*/true, false);
+                mm_prompt mp =
+                    mm_build_prompt_device(vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd,
+                                           e.d_img_embd);
+                e.generate_mm(mp, gp, emit);
+                fputs(ub.flush().c_str(), stdout);
+                printf("\n");
+                return 0;
+            }
             std::vector<int> toks;
             if (raw) {
                 toks = e.tk.encode(prompt, /*parse_special=*/true);
@@ -158,17 +216,7 @@ int main(int argc, char ** argv) {
                 std::vector<chat_msg> msgs = {{"user", prompt}};
                 toks = e.tk.encode(render_chat(e.m.chat_template, msgs, true, false));
             }
-            gen_params gp;
-            gp.max_tokens = max_tokens;
-            gp.temperature = temp;
-            gp.top_p = top_p;
-            gp.top_k = top_k;
-            utf8_stream_buffer ub;
-            e.generate(toks, gp, [&](int tok) {
-                fputs(ub.push(e.tk.token_piece(tok)).c_str(), stdout);
-                fflush(stdout);
-                return true;
-            });
+            e.generate(toks, gp, emit);
             fputs(ub.flush().c_str(), stdout);
             printf("\n");
             return 0;

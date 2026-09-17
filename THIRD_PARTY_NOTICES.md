@@ -10,6 +10,7 @@ reproduced in the files listed below.
 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) v0.56.0 | `third_party/httplib.h` | MIT | [`third_party/LICENSE-httplib.txt`](third_party/LICENSE-httplib.txt) |
 | [JSON for Modern C++](https://github.com/nlohmann/json) v3.12.0 | `third_party/json.hpp`, `third_party/nlohmann/json.hpp` | MIT | [`third_party/LICENSE-nlohmann-json.txt`](third_party/LICENSE-nlohmann-json.txt) |
 | [minja](https://github.com/google/minja) | `third_party/minja/` | MIT | [`third_party/minja/LICENSE`](third_party/minja/LICENSE) |
+| [stb_image](https://github.com/nothings/stb) v2.30 | `third_party/stb/stb_image.h` | public domain (MIT alternative) | header text (dual-licensed) |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) Unicode tables | `third_party/unicode.{h,cpp}`, `third_party/unicode-data.{h,cpp}` | MIT | [`third_party/LICENSE-llama.cpp-unicode.txt`](third_party/LICENSE-llama.cpp-unicode.txt) |
 
 ## Notes

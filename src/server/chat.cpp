@@ -33,6 +33,17 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
     std::string out;
     if (msgs.empty()) return out;
 
+    // structured content: interleave text with the vision placeholder
+    auto content_of = [](const chat_msg & m) {
+        if (m.parts.empty()) return m.content;
+        std::string s;
+        for (const chat_part & p : m.parts) {
+            if (p.is_image) s += "<|vision_start|><|image_pad|><|vision_end|>";
+            else s += p.text;
+        }
+        return s;
+    };
+
     // find last query index (last user message)
     int last_query = -1;
     for (int i = (int) msgs.size() - 1; i >= 0; i--) {
@@ -41,17 +52,18 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
 
     size_t start = 0;
     if (msgs[0].role == "system") {
-        const std::string c = trim(msgs[0].content);
+        const std::string c = trim(content_of(msgs[0]));
         out += "<|im_start|>system\n" + c + "<|im_end|>\n";
         start = 1;
     }
 
     for (size_t i = start; i < msgs.size(); i++) {
         const chat_msg & msg = msgs[i];
+        const std::string mcontent = content_of(msg);
         if (msg.role == "user") {
-            out += "<|im_start|>user\n" + msg.content + "<|im_end|>\n";
+            out += "<|im_start|>user\n" + mcontent + "<|im_end|>\n";
         } else if (msg.role == "assistant") {
-            std::string content = msg.content;
+            std::string content = mcontent;
             std::string reasoning;
             bool has_reasoning = false;
             const size_t close_pos = content.rfind("</think>");

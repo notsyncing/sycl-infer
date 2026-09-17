@@ -58,6 +58,7 @@ GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
 ```bash
 ./build/test_tokenizer     # tokenizer round-trips (CPU only, no GPU work)
 ./build/test_chat_template # GGUF chat template vs reference Jinja2 output (CPU only)
+./build/test_multimodal    # image preprocessing, vision encoder (host + device), positions (CPU+GPU)
 ./build/test_compare       # CPU reference vs llama.cpp dumps (CPU only)
 ./build/test_cpuref        # CPU reference head (CPU only)
 ./build/test_gpu_stages    # every kernel vs the CPU reference (GPU)
@@ -81,10 +82,15 @@ src/kernels/    kernels.h (public launch API + step_info/gemv_seg), kernel_utils
                 (shared device helpers in namespace si::kd), kv_type.{h,cpp},
                 and one .cpp per kernel: rmsnorm, embed, copy_row, gemv,
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
-                dp4a_gemm (+ dp4a_common for the shared split-K workspace)
+                dp4a_gemm (+ dp4a_common for the shared split-K workspace),
+                vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
+                bidirectional attention)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
                 model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
                 tokenizer.{h,cpp}
+src/mm/         image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
+                vision.{h,cpp} (mmproj loader + host vision encoder),
+                multimodal.{h,cpp} (prompt expansion + M-RoPE positions)
 src/engine/     engine.{h,cpp} (orchestration), engine_graph.cpp (seg_plan,
                 record_forward, build_graphs), engine_kvpool.cpp (dynamic KV
                 pool), engine_prefix_cache.cpp, sampler.{h,cpp}
@@ -97,9 +103,11 @@ tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp +
                 <kernel>_stage.cpp (one per kernel)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
+tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, positions)
 tests/engine/   test_cpuref.cpp, test_forward.cpp, test_gpu_vs_ref.cpp
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
-                unicode tables (vendored llama.cpp MIT)
+                unicode tables (vendored llama.cpp MIT), stb/stb_image.h
+                (public-domain image decode)
 ```
 
 ## How to extend
@@ -145,6 +153,42 @@ put kernel bodies in headers.
 2. Declare it in `tests/kernels/stage_tests.h`.
 3. Call it in `tests/kernels/test_gpu_stages.cpp`.
 4. Add the file to the `test_gpu_stages` source list in `CMakeLists.txt`.
+
+### Multimodal (vision) input
+
+The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
+`clip` GGUF (`Qwen3.5-0.8B-mmproj-BF16.gguf`), loaded with `--mmproj`:
+
+* `mm_image_preprocess` does the Qwen-VL smart resize (aspect preserving, sides
+  aligned to `patch_size*merge`), a Pillow-compatible bicubic resample, and
+  `(x-mean)/std` normalization into plane-major CHW f32.
+* `vision_model::encode_host` is the reference forward and
+  `vision_model::encode_device` the SYCL one (`src/kernels/vit.cpp`): summed
+  16x16 conv patch embedding (GEMM), 2x2 spatial-merge reorder, learned position
+  embeddings, 12 LayerNorm + fused-QKV + GELU-MLP blocks with 2D vision RoPE and
+  bidirectional attention (online softmax, tiled through SLM), then the
+  `qwen3vl_merger` (concat 4 patches - a stride reinterpretation - -> mm.0 ->
+  GELU -> mm.2).  Both paths agree to ~2e-4; `test_multimodal` checks that.
+* The mmproj stores the linears as BF16 and the norms/biases/patch/position
+  tensors as F32; `upload` copies the whole GGUF blob once and `dev_ptr` maps a
+  host tensor pointer into it.  `encode_device` runs on the queue it is given,
+  which must be **in-order** (the vision stages are dependent kernel launches);
+  the engine's queue is.  Device scratch grows to the largest image seen.
+* The vision tower's own RoPE is the 4-section `VISION` mode (pairs 0..15 use
+  the patch row, 16..31 the column, exponent restarting per section) - do not
+  confuse it with the text model's *interleaved* M-RoPE.
+* `kMaxImgTokens` (1024) bounds one image's merged tokens and `kMaxImgPatches`
+  (4x that) the ViT patch tokens; `mm_image_preprocess` caps `max_pixels` to
+  match, and `encode_device` grows its scratch buffers to the largest image seen.
+* `mm_build_prompt` computes the merged embeddings on the host;
+  `mm_build_prompt_device` runs the tower on the GPU into the engine's
+  `d_img_embd`.  Both return the same token/position layout: each `<|image_pad|>`
+  expands to `n_out` merged tokens, `img_row` maps them to embedding rows, and
+  the 4-section M-RoPE positions are `(base, base+row, base+col)` with the image
+  consuming `max(nx, ny)` positions.
+
+CLI: `gen --image FILE` (repeatable).  Server: an OpenAI `image_url` content
+part with a base64 `data:` URL (`/v1/chat/completions`), streaming and not.
 
 ## Conventions
 
@@ -220,6 +264,17 @@ kernel variants, so performance numbers must state the env used.
   (`engine::kv_layer_stride`, `kv_scale_stride`).
 * `ld.bfd` warnings about `libsvml.so`/`libimf.so`/`libintlc.so.5` needed by
   `libdnnl.so` are benign (resolved from the oneAPI runtime path at run time).
+* **Multimodal**: an image consumes `max(nx, ny)` positions, not one per token,
+  and the text model uses *interleaved* M-RoPE (`rope.dimension_sections`, e.g.
+  `[11,11,10,0]`) where the pair index picks the temporal/row/col position
+  (`src/kernels/qk_norm_rope.cpp`).  Image tokens never reach `tok_embd`: the
+  embed kernel copies `step_info::img_embd[img_row[t]]` instead.  The
+  multimodal path bypasses the prefix cache and uses the single-sequence
+  `engine::generate_mm`; `kMaxImgTokens` bounds one image's merged tokens.
+  Because an image consumes `max(nx, ny)` positions for `4*nx*ny` tokens, the
+  KV slot index (token count) and the RoPE position diverge: decode keeps
+  `info->pos` = token count and carries the running RoPE position in
+  `step_info::mrope` with `mrope_on` set.
 
 ## Quick verification before finishing a change
 

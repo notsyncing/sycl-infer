@@ -24,6 +24,14 @@ void embed_launch(queue & q, const void * table, uint32_t type,
         const int sb = g % n_sb;
         const int tid = it.get_local_id(0);
         if (t >= info->n_rows * info->n_real) return;
+        // multimodal: tokens whose embedding was produced by the vision encoder
+        // are copied verbatim instead of looked up in the token table
+        const int ir = info->img_row[t];
+        if (info->img_embd && ir >= 0) {
+            out[(size_t) t * n_embd + sb * 256 + tid] =
+                info->img_embd[(size_t) ir * n_embd + sb * 256 + tid];
+            return;
+        }
         const int tok = info->tokens[t];
         const char * rowp = (const char *) table + (size_t) tok * row_bytes + (size_t) sb * sb_bytes;
         out[(size_t) t * n_embd + sb * 256 + tid] = dequant_elem_sb(type, rowp, tid);

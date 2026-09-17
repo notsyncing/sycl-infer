@@ -22,6 +22,12 @@ constexpr int kMaxDecSplits = 256;
 // prefix-cache snapshot map length: boundaries are indexed by complete blocks,
 // so this covers max_seq <= kPcMapLen*32 tokens (32768 with 1024)
 constexpr int kPcMapLen = 1024;
+// max merged vision tokens one image may contribute to a prompt (bounds the
+// engine's image-embedding buffer and the vision scratch buffers)
+constexpr int kMaxImgTokens = 1024;
+// max ViT patch tokens one image may produce (4 patches per merged token); the
+// device vision buffers are sized from this
+constexpr int kMaxImgPatches = 4 * kMaxImgTokens;
 
 // one GEMV output segment (for batched multi-segment launches)
 struct gemv_seg {
@@ -66,6 +72,17 @@ struct step_info {
     int32_t pc_stride;                 // floats per checkpoint slot
     float * pc_base;                   // checkpoint pool (device USM)
     int32_t pc_row_slot[kPcMapLen];    // boundary -> checkpoint slot or -1
+
+    // ---- multimodal input (images) ----------------------------------------
+    // When `mrope_on` is set the attention RoPE reads a full 4-section position
+    // per token from `mrope` (section-major: mrope[s*kMaxB*kMaxT + r*kMaxT + t])
+    // instead of the implicit `pos[r] + t`.  `img_row[t]` >= 0 replaces the
+    // token's embedding with row `img_row[t]` of `img_embd` (n_embd floats).
+    int32_t mrope_on;
+    int32_t mrope_sections[4];         // text-model rope sections (pairs)
+    int32_t mrope[4 * kMaxB * kMaxT];
+    const float * img_embd;
+    int32_t img_row[kMaxB * kMaxT];
 };
 
 // per-layer snapshot target handed to the conv/GDN kernels: the state slice of
@@ -156,5 +173,42 @@ void dp4a_gemv_launch(sycl::queue & q, const w8t & w, const int8_t * x8,
 void dp4a_gemm_launch(sycl::queue & q, const w8t & w, const int8_t * x8,
                       const sycl::float2 * xmeta, const int32_t * xsumq, float * out,
                       int out_stride, const float * residual, float alpha, int TB);
+
+// ---------------------------------------------------------------------------
+// Vision encoder kernels (src/kernels/vit.cpp).  All activations are fp32 and
+// the weights are BF16 (type 30) or F32 (type 0), row-major [N][K].
+// ---------------------------------------------------------------------------
+
+// out[t][n] = alpha * sum_k W[n][k] * x[t][k] + (residual ? residual[t][n] : 0)
+void vit_gemm_launch(sycl::queue & q, const void * w, uint32_t wtype, int N, int K,
+                     const float * x, int x_stride, float * out, int out_stride, int T,
+                     float alpha, const float * residual);
+
+// LayerNorm over n elements per row (bias optional), with an optional input
+// stride and output stride.
+void vit_layernorm_launch(sycl::queue & q, const float * x, int x_stride, const float * w,
+                          const float * b, float * out, int out_stride, int rows, int n,
+                          float eps);
+
+// in-place GELU (tanh approximation), matching ggml_gelu
+void vit_gelu_launch(sycl::queue & q, float * x, int n);
+
+// y[row][i] += bias[i] for rows rows of cols elements
+void vit_add_bias_launch(sycl::queue & q, float * y, int y_stride, const float * bias, int rows,
+                         int cols);
+
+// y[row][i] += x[row][i] for rows rows of cols elements
+void vit_add_launch(sycl::queue & q, float * y, int y_stride, const float * x, int x_stride,
+                    int rows, int cols);
+
+// 2D "vision" RoPE on the Q and K halves of the fused qkv buffer
+// ([n_tok][3*n_embd]); pairs 0..head_dim/4-1 use the patch row, the rest the
+// patch column, with the frequency exponent reset per section.
+void vit_rope_launch(sycl::queue & q, float * qkv, int qkv_stride, int n_tok, int n_head,
+                     int head_dim, int out_w, int merge, float rope_base);
+
+// bidirectional (non-causal) attention over all n_tok tokens, per head
+void vit_attn_launch(sycl::queue & q, const float * qkv, int qkv_stride, float * out,
+                     int out_stride, int n_tok, int n_head, int head_dim, float scale);
 
 } // namespace si

@@ -4,13 +4,17 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 
 #include "chat.h"
 #include "httplib.h"
+#include "image.h"
 #include "json.hpp"
+#include "multimodal.h"
 #include "scheduler.h"
+#include "vision.h"
 
 using json = nlohmann::json;
 
@@ -94,23 +98,103 @@ std::vector<std::string> parse_stop(const json & body) {
     return stops;
 }
 
-std::vector<chat_msg> parse_messages(const json & body) {
+// ---------------------------------------------------------------- vision input
+// Loaded once at startup; the vision forward runs on the host and reads only
+// the (immutable) mmproj weights, so the mutex serializes preprocessing/encode
+// against other concurrent multimodal requests.
+struct mm_server {
+    vision_model vm;
+    image_preproc_cfg cfg;
+    bool ready = false;
+    std::mutex m;
+};
+
+int b64_val(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+bool b64_decode(const std::string & s, std::vector<uint8_t> & out) {
+    out.clear();
+    int val = 0, bits = 0;
+    for (unsigned char c : s) {
+        if (c == '=') break;
+        if (c == '\n' || c == '\r' || c == ' ') continue;
+        const int v = b64_val(c);
+        if (v < 0) return false;
+        val = (val << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t) (val >> bits));
+        }
+    }
+    return true;
+}
+
+// Only base64 data URLs are accepted; fetching remote URLs would need an HTTP
+// client and would expose the server as an SSRF proxy.
+bool decode_image_url(const std::string & url, std::vector<uint8_t> & bytes, std::string & err) {
+    if (url.rfind("data:", 0) != 0) {
+        err = "unsupported image URL (only data: URLs are accepted)";
+        return false;
+    }
+    const size_t comma = url.find(',');
+    if (comma == std::string::npos) {
+        err = "malformed data URL";
+        return false;
+    }
+    if (url.substr(5, comma - 5).find(";base64") == std::string::npos) {
+        err = "only base64 data URLs are supported";
+        return false;
+    }
+    if (!b64_decode(url.substr(comma + 1), bytes)) {
+        err = "invalid base64 image data";
+        return false;
+    }
+    return true;
+}
+
+std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string> & image_urls) {
     std::vector<chat_msg> msgs;
     if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
     for (auto & m : body["messages"]) {
         chat_msg cm;
         cm.role = m.value("role", "user");
+        bool has_image = false;
         if (m.contains("content")) {
             const json & c = m["content"];
             if (c.is_string()) {
                 cm.content = c.get<std::string>();
             } else if (c.is_array()) {
                 for (auto & part : c) {
-                    if (part.is_object() && part.contains("text") && part["text"].is_string())
-                        cm.content += part["text"].get<std::string>();
+                    if (!part.is_object()) continue;
+                    const std::string type = part.value("type", "text");
+                    if (type == "image_url" || type == "image") {
+                        std::string url;
+                        if (part.contains("image_url")) {
+                            const json & iu = part["image_url"];
+                            url = iu.is_string() ? iu.get<std::string>()
+                                                 : iu.value("url", std::string());
+                        } else {
+                            url = part.value("image", std::string());
+                        }
+                        image_urls.push_back(url);
+                        cm.parts.push_back({true, ""});
+                        has_image = true;
+                    } else if (part.contains("text") && part["text"].is_string()) {
+                        const std::string t = part["text"].get<std::string>();
+                        cm.content += t;
+                        cm.parts.push_back({false, t});
+                    }
                 }
             }
         }
+        if (!has_image) cm.parts.clear(); // text-only messages keep the plain path
         msgs.push_back(std::move(cm));
     }
     return msgs;
@@ -264,9 +348,74 @@ void run_stream(scheduler & sched, engine & e, std::shared_ptr<stream_ctx> st,
 
 } // namespace
 
+struct mm_run_result {
+    std::string text;
+    std::string finish = "length";
+    int n_gen = 0;
+};
+
+// Run a multimodal prompt on the single-sequence path, forwarding decoded text
+// pieces to `on_piece` (return false to stop early).
+void run_mm_generate(engine & e, const mm_prompt & mp, const gen_params & gp,
+                     const std::vector<std::string> & stops,
+                     const std::function<bool(const std::string &)> & on_piece,
+                     mm_run_result & out) {
+    utf8_stream_buffer ub;
+    std::string text;
+    bool stopped = false;
+    auto cb = [&](int tok) -> bool {
+        const std::string piece = ub.push(e.tk.token_piece(tok));
+        if (piece.empty()) return true;
+        text += piece;
+        out.n_gen++;
+        size_t cut = std::string::npos;
+        for (const auto & s : stops) {
+            if (s.empty()) continue;
+            const size_t p = text.rfind(s);
+            if (p != std::string::npos) cut = std::min(cut, p);
+        }
+        if (cut != std::string::npos) {
+            const std::string send = text.substr(0, cut);
+            if (!send.empty()) on_piece(send);
+            stopped = true;
+            return false;
+        }
+        return on_piece(piece);
+    };
+    e.generate_mm(mp, gp, cb);
+    const std::string tail = ub.flush();
+    if (!tail.empty() && !stopped) on_piece(tail);
+    out.text = text;
+    out.finish = stopped ? "stop" : "length";
+}
+
 int serve(engine & e, const server_config & cfg) {
     scheduler sched(e);
     sched.start();
+    std::mutex mm_req;
+    mm_server mm;
+    if (!cfg.mmproj_path.empty()) {
+        try {
+            mm.vm.load(cfg.mmproj_path);
+            mm.cfg.patch_size = mm.vm.hp.patch_size;
+            mm.cfg.merge = mm.vm.hp.merge;
+            const int patch_area =
+                mm.cfg.patch_size * mm.cfg.patch_size * mm.cfg.merge * mm.cfg.merge;
+            mm.cfg.min_pixels = 8 * patch_area;
+            mm.cfg.max_pixels = kMaxImgTokens * patch_area;
+            for (int c = 0; c < 3; c++) {
+                mm.cfg.mean[c] = mm.vm.hp.mean[c];
+                mm.cfg.std[c] = mm.vm.hp.std[c];
+            }
+            mm.ready = true;
+            fprintf(stderr, "[mm] vision projector loaded: %s (%d layers, %dx%d patches, merge %d)\n",
+                    cfg.mmproj_path.c_str(), mm.vm.hp.n_layer, mm.vm.hp.image_size,
+                    mm.vm.hp.image_size, mm.vm.hp.merge);
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "[mm] cannot load mmproj %s: %s (image input disabled)\n",
+                    cfg.mmproj_path.c_str(), ex.what());
+        }
+    }
     httplib::Server srv;
     srv.set_read_timeout(3600, 0);
     srv.set_write_timeout(3600, 0);
@@ -305,10 +454,114 @@ int serve(engine & e, const server_config & cfg) {
             res.set_content("{\"error\":{\"message\":\"invalid json\"}}", "application/json");
             return;
         }
-        auto msgs = parse_messages(body);
+        std::vector<std::string> image_urls;
+        auto msgs = parse_messages(body, image_urls);
         bool thinking = false;
         if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
             thinking = body["chat_template_kwargs"].value("enable_thinking", false);
+        gen_params gp = parse_params(body);
+        auto stops = parse_stop(body);
+        const bool stream = body.value("stream", false);
+        const std::string id = gen_id();
+        const uint64_t created = (uint64_t) time(nullptr);
+        const std::string model = body.value("model", cfg.model_id);
+
+        if (!image_urls.empty()) {
+            if (!mm.ready) {
+                res.status = 400;
+                res.set_content("{\"error\":{\"message\":\"image input requires --mmproj\"}}",
+                                "application/json");
+                return;
+            }
+            // multimodal requests share the engine's image-embedding buffer, so
+            // they are serialized for their whole lifetime (build + generate)
+            auto req_lk = std::make_shared<std::unique_lock<std::mutex>>(mm_req);
+            mm_prompt mp;
+            try {
+                std::vector<mm_image> imgs;
+                for (const std::string & u : image_urls) {
+                    std::vector<uint8_t> bytes, rgb;
+                    std::string err;
+                    int w = 0, h = 0;
+                    if (!decode_image_url(u, bytes, err) ||
+                        !mm_image_decode_mem(bytes.data(), bytes.size(), rgb, w, h, &err))
+                        throw std::runtime_error(err);
+                    imgs.push_back(mm_image_preprocess(rgb.data(), w, h, mm.cfg));
+                }
+                const std::string rendered =
+                    render_chat(e.m.chat_template, msgs, true, thinking);
+                mp = mm_build_prompt_device(mm.vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd,
+                                            e.d_img_embd);
+            } catch (const std::exception & ex) {
+                res.status = 400;
+                json j = {{"error", {{"message", ex.what()}, {"type", "invalid_request_error"}}}};
+                res.set_content(dump_json(j), "application/json");
+                return;
+            }
+            if (reject_too_long(e, mp.tokens.size(), res)) return;
+
+            if (!stream) {
+                mm_run_result out;
+                run_mm_generate(e, mp, gp, stops, [](const std::string &) { return true; }, out);
+                res.set_content(make_chat_response(id, model, out.text, out.finish,
+                                                   (int) mp.tokens.size(), out.n_gen, created),
+                                "application/json");
+                return;
+            }
+            auto st = std::make_shared<stream_ctx>();
+            st->q = std::make_shared<sse_queue>();
+            bool include_usage = false;
+            if (body.contains("stream_options") && body["stream_options"].is_object())
+                include_usage = body["stream_options"].value("include_usage", false);
+            st->th = std::thread([&e, mp, gp, stops, id, model, created, st, include_usage, req_lk]() {
+                auto * q = st->q.get();
+                auto send_delta = [&](const std::string & piece) {
+                    if (piece.empty()) return true;
+                    json j = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+                              {"model", model},
+                              {"choices", json::array({{{"index", 0},
+                                                        {"delta", {{"content", piece}}},
+                                                        {"finish_reason", nullptr}}})}};
+                    q->push("data: " + dump_json(j) + "\n\n");
+                    return true;
+                };
+                mm_run_result out;
+                run_mm_generate(e, mp, gp, stops, send_delta, out);
+                json finalj = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+                               {"model", model},
+                               {"choices", json::array({{{"index", 0}, {"delta", json::object()},
+                                                         {"finish_reason", out.finish}}})}};
+                q->push("data: " + dump_json(finalj) + "\n\n");
+                if (include_usage) {
+                    json uj = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+                               {"model", model}, {"choices", json::array()},
+                               {"usage", {{"prompt_tokens", (int) mp.tokens.size()},
+                                          {"completion_tokens", out.n_gen},
+                                          {"total_tokens", (int) mp.tokens.size() + out.n_gen}}}};
+                    q->push("data: " + dump_json(uj) + "\n\n");
+                }
+                q->push("data: [DONE]\n\n");
+                q->finish();
+            });
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("Connection", "keep-alive");
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [st](size_t, httplib::DataSink & sink) {
+                    std::string item;
+                    if (!st->q->pop(item)) {
+                        sink.done();
+                        return true;
+                    }
+                    sink.write(item.data(), item.size());
+                    return true;
+                },
+                [st](bool) {
+                    if (st->th.joinable()) st->th.join();
+                });
+            return;
+        }
+
         std::string text = render_chat(e.m.chat_template, msgs, true, thinking);
         static const bool srv_t = getenv("PF_SRV_TIME") != nullptr;
         const auto t_tok0 = std::chrono::steady_clock::now();
@@ -319,12 +572,6 @@ int serve(engine & e, const server_config & cfg) {
                         .count(),
                     text.size(), prompt.size());
         if (reject_too_long(e, prompt.size(), res)) return;
-        gen_params gp = parse_params(body);
-        auto stops = parse_stop(body);
-        const bool stream = body.value("stream", false);
-        const std::string id = gen_id();
-        const uint64_t created = (uint64_t) time(nullptr);
-        const std::string model = body.value("model", cfg.model_id);
 
         if (!stream) {
             auto seq = sched.submit(std::move(prompt), gp, stops);

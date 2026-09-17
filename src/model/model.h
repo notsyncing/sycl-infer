@@ -24,6 +24,8 @@ struct hparams {
     float rope_base = 0.f, rms_eps = 0.f, attn_scale = 0.f;
     int d_state = 0, n_group = 0, dt_rank = 0, d_inner = 0, conv_k = 0;
     int full_attn_interval = 4;
+    // M-RoPE pair counts per section (t, h, w, e); all-zero = plain RoPE
+    int rope_sections[4] = {0, 0, 0, 0};
 
     bool is_recr(int il) const { return (il + 1) % full_attn_interval != 0; }
 };

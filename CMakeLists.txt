@@ -60,12 +60,17 @@ add_library(sycl_infer_core STATIC
     src/kernels/dp4a_common.cpp
     src/kernels/dp4a_gemv.cpp
     src/kernels/dp4a_gemm.cpp
+    src/kernels/vit.cpp
     # model: GGUF loading, weights, tokenizer
     src/model/gguf.cpp
     src/model/model.cpp
     src/model/model_w8.cpp
     src/model/qwen35.cpp
     src/model/tokenizer.cpp
+    # mm: multimodal image preprocessing + vision encoder
+    src/mm/image.cpp
+    src/mm/vision.cpp
+    src/mm/multimodal.cpp
     # engine: forward execution, graph capture, KV pool, prefix cache
     src/engine/engine.cpp
     src/engine/engine_graph.cpp
@@ -83,6 +88,7 @@ target_include_directories(sycl_infer_core PUBLIC
     src/backend
     src/kernels
     src/model
+    src/mm
     src/engine
     src/server
     third_party
@@ -122,6 +128,7 @@ endfunction()
 
 si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
+si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)
 si_add_test(test_cpuref      tests/engine/test_cpuref.cpp)
 si_add_test(test_forward     tests/engine/test_forward.cpp)

@@ -16,6 +16,7 @@
 #include "dnnl_gemm.h"
 #include "kernels.h"
 #include "model.h"
+#include "multimodal.h"
 #include "sampler.h"
 #include "tokenizer.h"
 
@@ -99,6 +100,7 @@ struct engine {
     float *d_partials_dec = nullptr; // decode partials [kMaxB][n_head][dec_splits][2+head_dim]
     float *d_logits = nullptr;      // [kMaxB][vocab]
     float *d_last_hidden = nullptr;
+    float *d_img_embd = nullptr;    // [kMaxImgTokens][n_embd] vision embeddings
 
     // paged KV cache + tables.  The pools are raw byte storage whose element
     // type is kv_dtype() (f32/bf16/f16, see kernels.h); sizes are in elements
@@ -247,6 +249,11 @@ struct engine {
     std::vector<int> generate(const std::vector<int> & prompt, const gen_params & gp,
                               const std::function<bool(int)> & cb,
                               std::vector<float> * first_logits = nullptr);
+    // multimodal variant: `p` carries the expanded tokens, the vision
+    // embeddings and the M-RoPE positions of the prompt
+    std::vector<int> generate_mm(const mm_prompt & p, const gen_params & gp,
+                                 const std::function<bool(int)> & cb,
+                                 std::vector<float> * first_logits = nullptr);
     bool is_eos(int tok) const { return tok == tk.eos_id || tok == tk.eot_id; }
 
     // zero the recurrent state (GDN + conv) of one slot (used when admitting a sequence)
@@ -313,6 +320,11 @@ private:
                         gemv_seg * d_segs_rows = nullptr, int at_nsp_hint = 0);
 
     std::vector<float> run_head();
+
+    // shared body of generate/generate_mm (mm == nullptr for text-only prompts)
+    std::vector<int> generate_impl(const std::vector<int> & prompt, const mm_prompt * mm,
+                                   const gen_params & gp, const std::function<bool(int)> & cb,
+                                   std::vector<float> * first_logits);
 
     // dynamic pool internals
     struct kv_extent {

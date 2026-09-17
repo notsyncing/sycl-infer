@@ -30,6 +30,10 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
   replayed, keeping per-token launch overhead minimal.
 * **OpenAI-compatible API** — streaming and non-streaming chat/completions with
   temperature / top-k / top-p / min-p / penalties.
+* **Multimodal (vision) input** — Qwen3.5 image input via a `clip` mmproj GGUF:
+  the vision encoder runs on the GPU (`src/kernels/vit.cpp`), the CLI takes
+  `--mmproj` + `--image`, and the server accepts OpenAI `image_url` content
+  parts (base64 `data:` URLs).
 
 ## Supported models
 
@@ -72,6 +76,10 @@ Optional: AOT-compile the device image with `-DSYCL_INFER_AOT=ON` (defaults to
 # one-shot CLI generation
 ./build/sycl-infer --model /path/to/model.gguf gen \
     --prompt "Hello" --max-tokens 128 --temp 0.7
+
+# multimodal: describe an image (needs the matching mmproj GGUF)
+./build/sycl-infer --model /path/to/model.gguf --mmproj /path/to/mmproj.gguf \
+    gen --image photo.png --prompt "Describe this image."
 ```
 
 Common flags:
@@ -79,6 +87,8 @@ Common flags:
 | flag | default | meaning |
 |---|---|---|
 | `--model <gguf>` | – | model file (required) |
+| `--mmproj <gguf>` | – | vision projector; required for `--image` and server image input |
+| `--image <file>` | – | `gen`: attach an image (repeatable) |
 | `--ctx N` | 20480 | max sequence length in tokens |
 | `--blocks N` | 512 | KV blocks committed at startup (32 tokens each) |
 | `--kv-cap-mb N` | auto | upper bound for the dynamically grown KV pool |
@@ -117,6 +127,7 @@ The full tuning/diagnostics knob list and internals are documented in
 source /opt/intel/oneapi/setvars.sh
 cmake --build build -j
 ./build/test_tokenizer    # tokenizer round-trips (CPU)
+./build/test_multimodal   # image preprocessing, vision encoder (host + device), positions (CPU+GPU)
 ./build/test_gpu_stages   # every kernel vs the CPU reference (GPU)
 ./build/test_gemv         # per-tensor GEMV vs CPU dequant reference (GPU)
 ./build/test_dp4a         # SIn repack + DP4A GEMM vs CPU reference (GPU)

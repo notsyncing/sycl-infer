@@ -211,6 +211,8 @@ void engine::alloc_buffers() {
     d_partials_dec = dalloc(q, (size_t) kMaxB * hp.n_head * dec_splits * (2 + hp.head_dim));
     d_logits = dalloc(q, (size_t) kMaxB * hp.n_vocab);
     d_last_hidden = dalloc(q, (size_t) hp.n_embd);
+    // merged vision-token embeddings of the current multimodal prompt
+    d_img_embd = dalloc(q, (size_t) kMaxImgTokens * hp.n_embd);
 
     int n_gdn = 0, n_attn = 0;
     for (int il = 0; il < hp.n_layer; il++) {
@@ -283,6 +285,8 @@ void engine::reset_state() {
     q.memset(d_conv_state, 0, (size_t) kMaxB * n_gdn * (hp.conv_k - 1) * 3 * hp.d_inner * 4);
     q.wait();
     std::memset(d_info, 0, sizeof(step_info));
+    // rope sections are model constants; the memset above clears them
+    std::memcpy(d_info->mrope_sections, hp.rope_sections, sizeof(hp.rope_sections));
     // the single-sequence entry points (eval/generate) do not run the prefix
     // cache: never let a stale tracking flag capture snapshots for them
     for (auto & s : pc_slot_) s = {};
@@ -461,6 +465,19 @@ std::vector<int> engine::generate(const std::vector<int> & prompt, const gen_par
                                   const std::function<bool(int)> & cb,
                                   std::vector<float> * first_logits) {
     std::lock_guard<std::mutex> lk(mtx);
+    return generate_impl(prompt, nullptr, gp, cb, first_logits);
+}
+
+std::vector<int> engine::generate_mm(const mm_prompt & p, const gen_params & gp,
+                                     const std::function<bool(int)> & cb,
+                                     std::vector<float> * first_logits) {
+    std::lock_guard<std::mutex> lk(mtx);
+    return generate_impl(p.tokens, (p.has_images() ? &p : nullptr), gp, cb, first_logits);
+}
+
+std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm_prompt * mm,
+                                       const gen_params & gp, const std::function<bool(int)> & cb,
+                                       std::vector<float> * first_logits) {
     reset_single();
     const hparams & hp = m.hp;
     sampler_state ss;
@@ -471,6 +488,14 @@ std::vector<int> engine::generate(const std::vector<int> & prompt, const gen_par
     int pos = 0;
     const int nprompt = (int) prompt.size();
     if (nprompt == 0) return out;
+
+    if (mm) {
+        const size_t rows = (size_t) mm->embd.size() / std::max(1, hp.n_embd);
+        if (rows > (size_t) kMaxImgTokens) throw std::runtime_error("multimodal: too many image tokens");
+        // the device path already produced the embeddings in the caller's buffer
+        if (!mm->d_embd && !mm->embd.empty())
+            q.memcpy(d_img_embd, mm->embd.data(), mm->embd.size() * sizeof(float)).wait();
+    }
 
     std::vector<int> blocks;
     const int need = (std::max(nprompt, 1) + kBlockSize - 1) / kBlockSize;
@@ -483,11 +508,27 @@ std::vector<int> engine::generate(const std::vector<int> & prompt, const gen_par
 
     while (pos < nprompt) {
         const int n = std::min<int>(kMaxT, nprompt - pos);
+        if (mm) {
+            // per-chunk M-RoPE positions (section-major) and image row mapping
+            d_info->mrope_on = 1;
+            d_info->img_embd = mm->d_embd ? mm->d_embd : (mm->embd.empty() ? nullptr : d_img_embd);
+            for (int s = 0; s < 4; s++)
+                for (int i = 0; i < n; i++)
+                    d_info->mrope[s * (kMaxB * kMaxT) + i] = mm->mrope[(size_t) s * nprompt + pos + i];
+            for (int i = 0; i < n; i++) d_info->img_row[i] = mm->img_row[pos + i];
+        }
         prefill_chunk(prompt, pos, n, 0);
         pos += n;
     }
     logits = run_head();
     if (first_logits) *first_logits = logits;
+
+    // decode positions: an image shifts the position counter away from the
+    // token count, so continue from the prompt's final position.  The KV slot
+    // index stays the *token* count (`pos`); the RoPE position is carried
+    // separately through the M-RoPE array.
+    int next_pos = mm ? mm->pos_after : nprompt;
+    d_info->img_embd = nullptr;
 
     int32_t tok_buf[kMaxB] = {0}, pos_buf[kMaxB] = {0}, slot_buf[kMaxB] = {0};
     for (int step = 0; step < gp.max_tokens; step++) {
@@ -497,7 +538,7 @@ std::vector<int> engine::generate(const std::vector<int> & prompt, const gen_par
         if (!cb(tok)) break;
         if (step + 1 >= gp.max_tokens) break;
         if (pos >= max_seq - 1) break;
-        // grow the block table if needed
+        // grow the block table if needed (KV slots advance one per token)
         if (pos % kBlockSize == 0) {
             int b = alloc_block();
             if (b < 0) break;
@@ -507,8 +548,14 @@ std::vector<int> engine::generate(const std::vector<int> & prompt, const gen_par
         tok_buf[0] = tok;
         pos_buf[0] = pos;
         slot_buf[0] = 0;
+        if (mm) {
+            // single decode row: every section uses the running position
+            d_info->mrope_on = 1;
+            for (int s = 0; s < 4; s++) d_info->mrope[s * (kMaxB * kMaxT)] = next_pos;
+        }
         decode_batch(tok_buf, pos_buf, slot_buf, 1);
         pos++;
+        next_pos++;
         fetch_logits(0, logits.data());
     }
     for (int b : blocks) free_block(b);

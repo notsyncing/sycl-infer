@@ -32,6 +32,9 @@ void load_qwen35(model & m) {
     hp.conv_k = (int) f.get_u32(key("ssm.conv_kernel"));
     hp.full_attn_interval = (int) f.get_u32(key("full_attention_interval"), 4);
     hp.attn_scale = 1.0f / std::sqrt((float) hp.head_dim);
+    if (const gguf_kv * sec = f.meta(key("rope.dimension_sections")))
+        for (int i = 0; i < 4 && i < (int) sec->arr.size(); i++)
+            hp.rope_sections[i] = sec->arr[i].as_i32();
 
     const auto * toks = f.meta("tokenizer.ggml.tokens");
     hp.n_vocab = toks ? (int) toks->arr.size() : 0;

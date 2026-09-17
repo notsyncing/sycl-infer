@@ -26,8 +26,18 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
         minja::chat_template ct(tmpl, /*bos_token=*/"", /*eos_token=*/"");
 
         nlohmann::ordered_json messages = nlohmann::ordered_json::array();
-        for (const chat_msg & m : msgs)
-            messages.push_back({{"role", m.role}, {"content", m.content}});
+        for (const chat_msg & m : msgs) {
+            if (m.parts.empty()) {
+                messages.push_back({{"role", m.role}, {"content", m.content}});
+                continue;
+            }
+            auto content = nlohmann::ordered_json::array();
+            for (const chat_part & p : m.parts) {
+                if (p.is_image) content.push_back({{"type", "image"}});
+                else content.push_back({{"type", "text"}, {"text", p.text}});
+            }
+            messages.push_back({{"role", m.role}, {"content", content}});
+        }
 
         minja::chat_template_inputs inputs;
         inputs.messages = std::move(messages);

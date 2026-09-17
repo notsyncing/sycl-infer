@@ -36,6 +36,25 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf,
         const int row = r * info->tpb + t;
         const int32_t * table = tables + (size_t) info->slot[r] * max_blocks;
         const sub_group sgg = it.get_sub_group();
+        // M-RoPE: with an image in the prompt the rotation position is no longer
+        // `pos` for every dimension pair.  Qwen3.5 uses interleaved M-RoPE: the
+        // pair index selects the temporal/row/col position by an interleaved
+        // 0,1,2 pattern (the frequency exponent stays the global pair index).
+        float rpos = (float) pos;
+        if (info->mrope_on) {
+            const int ridx = r * kMaxT + t;
+            const int n = kMaxB * kMaxT;
+            const int s0 = info->mrope_sections[0];
+            const int s1 = info->mrope_sections[1];
+            const int s2 = info->mrope_sections[2];
+            const int sect_dims = s0 + s1 + s2 + info->mrope_sections[3];
+            const int sector = sect_dims > 0 ? lane % sect_dims : lane;
+            int sec = 3;
+            if (sector % 3 == 1 && sector < 3 * s1) sec = 1;
+            else if (sector % 3 == 2 && sector < 3 * s2) sec = 2;
+            else if (sector % 3 == 0 && sector < 3 * s0) sec = 0;
+            rpos = (float) info->mrope[sec * n + ridx];
+        }
 
         if (sg < n_head) {
             float * qh = qbuf + (size_t) row * qstride + (size_t) sg * 2 * head_dim;
@@ -50,7 +69,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf,
             for (int i = 0; i < head_dim / 32; i++)
                 qh[lane + 32 * i] *= inv * q_norm[lane + 32 * i];
             if (lane < n_rot / 2) {
-                const float ang = pos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
+                const float ang = rpos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
                 const float c = sycl::cos(ang), s = sycl::sin(ang);
                 const float x0 = qh[lane], x1 = qh[lane + n_rot / 2];
                 qh[lane] = x0 * c - x1 * s;
@@ -70,7 +89,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf,
             for (int i = 0; i < head_dim / 32; i++)
                 khp[lane + 32 * i] *= inv * k_norm[lane + 32 * i];
             if (lane < n_rot / 2) {
-                const float ang = pos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
+                const float ang = rpos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
                 const float c = sycl::cos(ang), s = sycl::sin(ang);
                 const float x0 = khp[lane], x1 = khp[lane + n_rot / 2];
                 khp[lane] = x0 * c - x1 * s;
