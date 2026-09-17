@@ -74,4 +74,9 @@ struct model {
     const float * dev_f32(const float * p) const { return (const float *) dev_ptr(p); }
 };
 
+// Maximum context length advertised by the model's GGUF metadata
+// (`<general.architecture>.context_length`); 0 when the key is absent.  Reads
+// only metadata, so it can size the engine before the model is constructed.
+int model_context_length(const std::string & path);
+
 } // namespace si

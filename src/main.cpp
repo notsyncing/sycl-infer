@@ -8,6 +8,7 @@
 #include "chat.h"
 #include "chat_util.h"
 #include "engine.h"
+#include "model.h"
 #include "server.h"
 
 using namespace si;
@@ -25,6 +26,8 @@ static void usage(const char * prog) {
             "\n"
             "  --ctx N     max sequence length in tokens (default %d, or PF_CTX).\n"
             "              A prompt longer than this is rejected with HTTP 400.\n"
+            "  --ctx full  use the model's maximum context length read from the GGUF\n"
+            "              (<arch>.context_length); the KV pool still grows lazily.\n"
             "  --blocks N  KV pool blocks committed at startup (default: 512, or the\n"
             "              whole context when --ctx asks for more).  Each block is\n"
             "              %d tokens; the pool grows on demand up to the cap.\n"
@@ -48,6 +51,7 @@ int main(int argc, char ** argv) {
     int port = 8080;
     int ctx = 0;                 // 0 = auto (kDefaultCtx)
     if (const char * e = getenv("PF_CTX")) ctx = atoi(e);
+    bool ctx_full = false;       // --ctx full: read the maximum from the GGUF
     int blocks = 0;              // KV blocks committed at startup; 0 = auto
     int kv_cap_mb = INT_MIN;     // INT_MIN = auto (size the cap from --ctx)
     if (const char * e = getenv("PF_KV_CAP_MB")) kv_cap_mb = atoi(e);
@@ -63,7 +67,11 @@ int main(int argc, char ** argv) {
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--model") model_path = next();
         else if (a == "--prompt") prompt = next();
-        else if (a == "--ctx") ctx = atoi(next().c_str());
+        else if (a == "--ctx") {
+            std::string v = next();
+            if (v == "full") ctx_full = true;
+            else ctx = atoi(v.c_str());
+        }
         else if (a == "--blocks") blocks = atoi(next().c_str());
         else if (a == "--kv-cap-mb") kv_cap_mb = atoi(next().c_str());
         else if (a == "--port") port = atoi(next().c_str());
@@ -79,6 +87,20 @@ int main(int argc, char ** argv) {
 
     if (cmd.empty()) { usage(argv[0]); return 1; }
 
+    if (ctx_full) {
+        try {
+            ctx = model_context_length(model_path);
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "error: cannot read model context length: %s\n", ex.what());
+            return 1;
+        }
+        if (ctx <= 0) {
+            fprintf(stderr, "error: model does not declare a context length (%s)\n",
+                    model_path.c_str());
+            return 1;
+        }
+    }
+
     const bool ctx_auto = ctx <= 0;
     if (ctx_auto) ctx = kDefaultCtx;
 
@@ -89,9 +111,11 @@ int main(int argc, char ** argv) {
         // footprint low; the cap is auto-sized to the context so the pool can
         // grow into the rest on demand.  An explicit --ctx keeps the old eager
         // sizing (max(512, ceil(ctx/32))), an explicit --blocks is honored as
-        // the initial committed size.
+        // the initial committed size.  --ctx full can name a very large context,
+        // so it commits lazily like auto instead of eagerly.
+        const bool lazy_blocks = ctx_auto || ctx_full;
         const int need_blocks = (ctx + kBlockSize - 1) / kBlockSize;
-        int n_blocks = blocks > 0 ? blocks : (ctx_auto ? 512 : std::max(512, need_blocks));
+        int n_blocks = blocks > 0 ? blocks : (lazy_blocks ? 512 : std::max(512, need_blocks));
         if (kv_cap_mb != INT_MIN && n_blocks < need_blocks) n_blocks = need_blocks;
 
         engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb);
@@ -105,7 +129,8 @@ int main(int argc, char ** argv) {
             fprintf(stderr,
                     "[ctx] max_seq=%d tokens%s, kv_blocks=%d (%d tokens), kv_pool=%.0f MB, "
                     "kv_cap=%d blocks (%.0f MB, %s), kv_type=%s (%.0f KB/token)\n",
-                    e.max_seq, ctx_auto ? " (auto)" : "", n_blocks, n_blocks * kBlockSize,
+                    e.max_seq, ctx_full ? " (full)" : (ctx_auto ? " (auto)" : ""), n_blocks,
+                    n_blocks * kBlockSize,
                     kv_mb, e.pool_cap, cap_mb, e.kv_virtual ? "virtual USM" : "fixed",
                     kv_dtype_name(kv_dtype()), per_tok_kb);
             // device memory report (best effort: the free_memory aspect is not

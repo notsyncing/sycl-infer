@@ -55,6 +55,14 @@ void model::load(const std::string & path) {
     a->load(*this);
 }
 
+int model_context_length(const std::string & path) {
+    gguf_file f;
+    f.load(path);
+    const std::string * arch = f.get_str("general.architecture");
+    if (!arch) return 0;
+    return (int) f.get_u32(*arch + ".context_length", 0);
+}
+
 void model::upload(sycl::queue & q) {
     dev_weights_size = gguf.map_size;
     dev_weights = sycl::malloc_device(dev_weights_size, q);
