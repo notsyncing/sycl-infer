@@ -383,5 +383,6 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
   分给它的层（`weight_maps_` 逐张量上传），不持有整份 GGUF 副本。
 * `layer_attn_local_[il]` 给出该层在**所属设备**注意力层里的序号；`kv_setup` 为每个设备分配只含
   其注意力层的 paged KV 池，block id 全局一致（同一张 block table，见 [05-kv-cache.md](05-kv-cache.md)）。
-* 多设备关闭前缀缓存（三层记录需要多池）、`pf8` 与 oneDNN；递归状态（GDN/conv）在共享主机 USM 中
-  按全局 GDN 层序号索引，因此混合模型也可用。
+* 多设备支持前缀缓存：block id 全局、递归状态检查点在共享主机 USM 中按全局 GDN 层序号索引；
+  `pc_serialize_block`/`pc_deserialize_block` 经 `engine::kv_layer_ptrs` 把每个全局注意力层解析到所属
+  设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。`pf8` 与 oneDNN 仍关闭。

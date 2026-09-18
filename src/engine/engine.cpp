@@ -100,12 +100,10 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         }
         const char * ep = getenv("PF_PREFIX_CACHE");
         pc_enabled = !(ep && atoi(ep) == 0);
-        if (multi_dev) {
-            // the three-tier cache serializes each attention layer's KV from one
-            // pool; with a per-device split that would need a multi-pool record,
-            // so the kvcache stays off for multi-device runs
-            pc_enabled = false;
-        }
+        // multi-device note: block ids and recurrent-state checkpoints are global
+        // (host-USM shared buffers), so the three-tier cache works here too; only
+        // the block serialize/deserialize must resolve each attention layer to its
+        // device's pool - see kv_layer_ptrs()
         if (pc_enabled) {
             const hparams & hp = m.hp;
             int n_gdn = 0;

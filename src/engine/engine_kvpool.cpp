@@ -102,6 +102,33 @@ int engine::attn_layers() const {
     return n;
 }
 
+void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const {
+    if (multi_dev) {
+        // global attention layer `a` is stored in the pool of the device that
+        // computes its layer, at that device's local attention index
+        int il = -1, na = 0;
+        for (int t = 0; t < m.hp.n_layer; t++) {
+            if (!m.hp.is_recr(t)) {
+                if (na++ == a) {
+                    il = t;
+                    break;
+                }
+            }
+        }
+        const int d = layer_dev_[(size_t)il];
+        const int la = layer_attn_local_[(size_t)il];
+        kp = (const char *)dev_kpool_[(size_t)d] + (size_t)la * kv_layer_stride;
+        vp = (const char *)dev_vpool_[(size_t)d] + (size_t)la * kv_layer_stride;
+        ksc = dev_kscales_[(size_t)d] ? (const char *)dev_kscales_[(size_t)d] + (size_t)la * kv_scale_stride : nullptr;
+        vsc = dev_vscales_[(size_t)d] ? (const char *)dev_vscales_[(size_t)d] + (size_t)la * kv_scale_stride : nullptr;
+        return;
+    }
+    kp = (const char *)d_kpool + (size_t)a * kv_layer_stride;
+    vp = (const char *)d_vpool + (size_t)a * kv_layer_stride;
+    ksc = d_kscales ? (const char *)d_kscales + (size_t)a * kv_scale_stride : nullptr;
+    vsc = d_vscales ? (const char *)d_vscales + (size_t)a * kv_scale_stride : nullptr;
+}
+
 void engine::kv_setup(int n_attn, int initial_blocks) {
     const size_t block_bytes = kv_block_bytes();
     if (multi_dev) {

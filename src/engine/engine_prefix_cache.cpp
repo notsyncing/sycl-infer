@@ -119,18 +119,16 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
     blob.resize(2 * (kb + sb) * (size_t)na);
     size_t off = 0;
     for (int l = 0; l < na; l++) {
-        const char * kp = (const char *)d_kpool + (size_t)l * kv_layer_stride + (size_t)block * kb;
-        const char * vp = (const char *)d_vpool + (size_t)l * kv_layer_stride + (size_t)block * kb;
-        q.memcpy(blob.data() + off, kp, kb);
+        const char * kp, * vp, * ksc, * vsc;
+        kv_layer_ptrs(l, kp, vp, ksc, vsc);
+        q.memcpy(blob.data() + off, kp + (size_t)block * kb, kb);
         off += kb;
-        q.memcpy(blob.data() + off, vp, kb);
+        q.memcpy(blob.data() + off, vp + (size_t)block * kb, kb);
         off += kb;
         if (sb) {
-            const char * ks = (const char *)d_kscales + (size_t)l * kv_scale_stride + (size_t)block * sb;
-            const char * vs = (const char *)d_vscales + (size_t)l * kv_scale_stride + (size_t)block * sb;
-            q.memcpy(blob.data() + off, ks, sb);
+            q.memcpy(blob.data() + off, ksc + (size_t)block * sb, sb);
             off += sb;
-            q.memcpy(blob.data() + off, vs, sb);
+            q.memcpy(blob.data() + off, vsc + (size_t)block * sb, sb);
             off += sb;
         }
     }
@@ -145,18 +143,16 @@ void engine::pc_deserialize_block(const uint8_t * blob, int block) {
                           : 0;
     size_t off = 0;
     for (int l = 0; l < na; l++) {
-        char * kp = (char *)d_kpool + (size_t)l * kv_layer_stride + (size_t)block * kb;
-        char * vp = (char *)d_vpool + (size_t)l * kv_layer_stride + (size_t)block * kb;
-        q.memcpy(kp, blob + off, kb);
+        const char * kp, * vp, * ksc, * vsc;
+        kv_layer_ptrs(l, kp, vp, ksc, vsc);
+        q.memcpy((void *)(kp + (size_t)block * kb), blob + off, kb);
         off += kb;
-        q.memcpy(vp, blob + off, kb);
+        q.memcpy((void *)(vp + (size_t)block * kb), blob + off, kb);
         off += kb;
         if (sb) {
-            char * ks = (char *)d_kscales + (size_t)l * kv_scale_stride + (size_t)block * sb;
-            char * vs = (char *)d_vscales + (size_t)l * kv_scale_stride + (size_t)block * sb;
-            q.memcpy(ks, blob + off, sb);
+            q.memcpy((void *)(ksc + (size_t)block * sb), blob + off, sb);
             off += sb;
-            q.memcpy(vs, blob + off, sb);
+            q.memcpy((void *)(vsc + (size_t)block * sb), blob + off, sb);
             off += sb;
         }
     }
@@ -209,7 +205,12 @@ bool engine::pc_node_to_disk(int ni) {
 // Graceful-shutdown flush: move all RAM records and every resident VRAM node
 // into the disk tier so a restart can resume them.  No-op without a disk dir.
 void engine::pc_flush_to_disk() {
-    if (!pc_enabled || !pcd_enabled || !pcd || !d_kpool) {
+    // pools exist: single pool on the normal path, per-device pools on the
+    // multi-device path
+    const bool pools_ready =
+        multi_dev ? std::any_of(dev_kpool_.begin(), dev_kpool_.end(), [](void * p) { return p != nullptr; })
+                  : d_kpool != nullptr;
+    if (!pc_enabled || !pcd_enabled || !pcd || !pools_ready) {
         return;
     }
     if (pcr_enabled && pcr) {

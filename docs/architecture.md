@@ -355,8 +355,9 @@ micro-batch（单序列/单批），不做跨设备重叠。具体地：
 * **KV 按设备分开**：`layer_attn_local_[il]` 给出该层在所属设备注意力层中的序号，`dev_kpool_[d]`
   只包含该设备的注意力层。block id 是全局的（同一张 block table），所以 paged attention 与
   `set_table` 无需改动。
-* 多设备路径直接重放计划（无图）、激活走主机 USM，因此不支持前缀缓存（三层 KV 缓存需要多池
-  记录）；`pf8` 与 oneDNN 也在多设备下关闭。
+* 多设备路径直接重放计划（无图）、激活走主机 USM；**前缀缓存可用**——block id 全局、递归状态检查点
+  在共享主机 USM，`pc_serialize_block`/`pc_deserialize_block` 经 `kv_layer_ptrs` 按设备解析每层的池。
+  `pf8` 与 oneDNN 在多设备下关闭。
 
 这满足“dense 模型跨设备流水”的需求：混合模型（GDN + attention）同样可用，因为递归状态也在共享
 主机 USM 中按全局 GDN 层序号索引。

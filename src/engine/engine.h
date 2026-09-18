@@ -491,6 +491,11 @@ private:
         }
     }
     int attn_layers() const;
+    // base pointers of global attention layer `a`'s K/V storage (+ int8 scale
+    // planes, null when the kv type has none): the single pool on the normal
+    // path, the owning device's pool in multi-device mode (block ids are global,
+    // so `block` offsets within each device's local layer stride are the same)
+    void kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const;
 
     // prefix cache internals
     struct pc_node {

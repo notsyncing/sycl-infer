@@ -15,8 +15,10 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 节点只有在携带边界处的递归状态检查点时才可用作恢复点。
 
 > **CPU 与多设备**：CPU 单设备完全支持该缓存（KV/状态都在主机 USM，序列化是主机拷贝），
-> `test_pc_cpu` 覆盖磁盘 spill/promote 往返。多设备（`--layer-map`）会在构造时关闭该缓存
-> （`pc_enabled = false`）：三层记录需要把每个注意力层的 KV 从对应设备的池里拼出来，暂未实现。
+> `test_pc_cpu` 覆盖磁盘 spill/promote 往返。多设备（`--layer-map`）同样支持：block id 与递归状态
+> 检查点都是全局的，recr 状态检查点写在共享主机 USM 里，序列化/恢复通过 `engine::kv_layer_ptrs`
+> 把每个全局注意力层解析到所属设备的池（`dev_kpool_[d] + layer_attn_local_[il] * kv_layer_stride`），
+> 块内偏移与单设备布局一致。已用 serve 双请求（共享前缀）验证命中（`prompt_cache_hit_tokens`）。
 
 ---
 
