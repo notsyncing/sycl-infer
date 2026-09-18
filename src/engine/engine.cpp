@@ -205,6 +205,55 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
             pc_disk_init();
         }
     }
+    // multi-device decode: build per-device SIn (w8) copies of the GPU
+    // partitions' layer weights so single-sequence decode runs int8 - dp4a_gemv
+    // on the GPU layers, i8_gemv on the CPU ones - instead of the fp32 GEMVs it
+    // fell back to.  PF_DP4A / PF_DP4A_DEC=0 keep the fp32 decode path.
+    if (multi_dev) {
+        const char * e_d = getenv("PF_DP4A_DEC");
+        const bool dec_off = e_d && atoi(e_d) == 0;
+        const char * e_a = getenv("PF_DP4A");
+        const bool d4a_off = e_a && atoi(e_a) == 0;
+        md_int8 = !dec_off && !d4a_off;
+        if (md_int8) {
+            w8_dev_.resize(backends_.size());
+            for (size_t d = 0; d < backends_.size(); d++) {
+                if (dev_kind_[d] != 0) {
+                    continue; // the CPU partitions decode straight from GGUF
+                }
+                sycl::queue & qd = *dev_queues_[d];
+                // the LM head always runs on the primary device (backend 0)
+                if (d == 0 && m.tok_embd.data) {
+                    m.build_w8_one(qd, m.tok_embd, w8_dev_[d][m.tok_embd.data]);
+                }
+                for (int il = 0; il < m.hp.n_layer; il++) {
+                    if (layer_dev_[(size_t)il] != (int)d) {
+                        continue;
+                    }
+                    const layer_t & L = m.layers[(size_t)il];
+                    auto b = [&](const wt & t) {
+                        if (t.data) {
+                            m.build_w8_one(qd, t, w8_dev_[d][t.data]);
+                        }
+                    };
+                    b(L.ffn_gate);
+                    b(L.ffn_up);
+                    b(L.ffn_down);
+                    if (L.recurrent) {
+                        b(L.wqkv);
+                        b(L.wgate);
+                        b(L.ssm_out);
+                    } else {
+                        b(L.wq);
+                        b(L.wk);
+                        b(L.wv);
+                        b(L.wo);
+                    }
+                }
+            }
+            fprintf(stderr, "[dev] built per-device int8 decode weights\n");
+        }
+    }
     // oneDNN int8 matmul for the prefill GEMMs (PF_GEMM_DNNL, default on).
     // The converted weights live in device USM and are built once here;
     // PF_GEMM_DNNL=0 keeps the dp4a/fp32 path bit-identical to before.
@@ -246,9 +295,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // one dnnl_gemm per GPU backend, holding only the layers that device
         // computes (the CPU partitions keep the fp32/i8 host path).  Every
         // prefill GEMM tensor of a GPU layer is converted - including the
-        // small ssm_beta/ssm_alpha, which ride in the wqkv call - and the
-        // weight keys are the fp32 device pointers the plan segments carry in
-        // gemv_seg::w (there are no SIn w8 copies on the multi-device path).
+        // small ssm_beta/ssm_alpha, which ride in the wqkv call.
         const char * envw = getenv("PF_DNNL_NOWARM");
         const bool nowarm = envw && atoi(envw) != 0;
         dnnl_dev_.resize(backends_.size());
@@ -261,7 +308,20 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
                 if (!t.data) {
                     return; // attention layers have no ssm_beta/ssm_alpha
                 }
-                const void * key = wptr((int)d, t.data); // == the segments' sj.w
+                // key the conversion on the per-device SIn copy when the decode
+                // path builds one - the plan segments then carry the same
+                // w8.vals, so oneDNN and dp4a agree on the key.  Tensors without
+                // a w8 view (ssm_beta/ssm_alpha) key on the fp32 device pointer.
+                const void * key = nullptr;
+                if (w8_dev_.size()) {
+                    auto it = w8_dev_[(size_t)d].find(t.data);
+                    if (it != w8_dev_[(size_t)d].end()) {
+                        key = it->second.vals;
+                    }
+                }
+                if (!key) {
+                    key = wptr((int)d, t.data); // == the segments' sj.w
+                }
                 if (key) {
                     D->add_weight(key, t.data, t.type, t.K, t.N);
                 }
@@ -395,6 +455,17 @@ engine::~engine() {
     }
     kv_release_pool();
     m.free_w8(q);
+    // multi-device per-device SIn copies: free on each device's own queue
+    for (size_t d = 0; d < w8_dev_.size(); d++) {
+        for (auto & kv : w8_dev_[d]) {
+            if (kv.second.vals && d < dev_queues_.size() && dev_queues_[d]) {
+                sycl::free(kv.second.vals, *dev_queues_[d]);
+            }
+            if (kv.second.meta && d < dev_queues_.size() && dev_queues_[d]) {
+                sycl::free(kv.second.meta, *dev_queues_[d]);
+            }
+        }
+    }
     for (auto & mp : weight_maps_) {
         for (auto & kv : mp) {
             sycl::free(kv.second, q);
@@ -929,6 +1000,13 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
         return;
     }
     if (cpu_mode && pf8_dec && n_rows == 1 && d_segs_dec8) {
+        record_forward(0, plan_dec8_, d_segs_dec8, 1);
+        sync_all();
+        return;
+    }
+    if (multi_dev && md_int8 && n_rows == 1 && d_segs_dec8) {
+        // int8 single-token decode on both partitions: the GPU layers run
+        // dp4a_gemv on their per-device w8 copies, the CPU ones i8_gemv
         record_forward(0, plan_dec8_, d_segs_dec8, 1);
         sync_all();
         return;

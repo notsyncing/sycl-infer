@@ -126,6 +126,14 @@ struct engine {
     // holds just its partition of the weights, not a whole-GGUF copy.  Empty
     // for a backend that reads the host mmap directly (CPU).
     std::vector<std::unordered_map<const void *, void *>> weight_maps_;
+    // multi-device decode: per-backend map of the SIn (w8) copies of the GPU
+    // partitions' layer weights (host tensor pointer -> w8t on that device,
+    // allocated on the device's queue).  The single-sequence decode plan then
+    // runs the GPU segments on dp4a_gemv (like single-device) and the CPU ones
+    // on i8_gemv; empty vector when int8 decode is disabled (PF_DP4A /
+    // PF_DP4A_DEC=0).
+    bool md_int8 = false;
+    std::vector<std::unordered_map<const void *, w8t>> w8_dev_;
     std::vector<int> layer_dev_;                           // layer -> backend index
     std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)
     std::vector<int> dev_kind_;                            // backend -> 0 gpu / 1 cpu

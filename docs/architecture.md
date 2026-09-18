@@ -357,10 +357,13 @@ micro-batch（单序列/单批），不做跨设备重叠。具体地：
   `set_table` 无需改动。
 * 多设备路径直接重放计划（无图）、激活走主机 USM；**前缀缓存可用**——block id 全局、递归状态检查点
    在共享主机 USM，`pc_serialize_block`/`pc_deserialize_block` 经 `kv_layer_ptrs` 按设备解析每层的池。
-   `pf8`（打包 SIn w8 预留）在多设备下不建，但 **oneDNN 可用**：每个 GPU 后端各持有一份
-   `dnnl_gemm`（`dnnl_dev_`，绑该设备的队列），只转换该设备分区的层权重，prefill 以 pf8 风格整块计划
-   在 GPU 层上跑 int8 GEMM、CPU 分区层走直读 GGUF 块 的 i8 路径（`PF_GEMM_DNNL=0` 或 `PF_DP4A=0`
-   关掉这种多设备 oneDNN）。
+   整模型 SIn w8 预留不建，但两条 int8 都可用：
+  - **prefill**：每 GPU 后端各持有一份 `dnnl_gemm`（`dnnl_dev_`，绑该设备的队列），只转换该设备
+    分区的层权重，prefill 以 pf8 风格整块计划在 GPU 层上跑 int8 GEMM、CPU 分区层走直读 GGUF 块的 i8
+    路径（`PF_GEMM_DNNL=0` 或 `PF_DP4A=0` 关掉这种多设备 oneDNN）；
+  - **decode**：每 GPU 后端为它分区里的层各建一份 SIn w8 副本（`w8_dev_`，也是绑该设备的队列），
+    单序列 decode 走 `plan_dec8_`：GPU 层 `dp4a_gemv`、CPU 层 `i8_gemv`、LM head（主设备）也 int8；
+    `PF_DP4A_DEC=0` 关掉，仍走 fp32 GEMV（批式 decode n>1 目前仍是 fp32，与单设备一致）。
 
 这满足“dense 模型跨设备流水”的需求：混合模型（GDN + attention）同样可用，因为递归状态也在共享
 主机 USM 中按全局 GDN 层序号索引。

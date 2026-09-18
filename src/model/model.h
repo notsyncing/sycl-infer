@@ -75,6 +75,9 @@ struct model {
     void upload(sycl::queue & q, bool host = false);
     // build / free the SI8 int8 copies of the quantized weight tensors (DP4A path)
     void build_w8(sycl::queue & q, bool host = false);
+    // multi-device: build the SIn copy of a single tensor on `q`'s device
+    // (a non-K-quant tensor yields an empty w8t)
+    void build_w8_one(sycl::queue & q, const wt & t, w8t & out);
     void free_w8(sycl::queue & q);
     const void * dev_ptr(const void * host_ptr) const {
         if (!dev_weights) {

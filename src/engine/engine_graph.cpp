@@ -70,10 +70,19 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     // SI8/int8 variant: one full-chunk segment (no 8-token slicing).  The GPU
     // uses the packed w8 copy; the CPU sets `i8` and reads the GGUF blocks
     // directly (so w/type/K/n_rows are the real tensor geometry).  In
-    // multi-device mode the GPU has no w8 copies (pf8 off) - the segments stay
-    // shaped for the per-device oneDNN path, which keys on gemv_seg::w.
+    // multi-device mode each GPU segment takes the w8 copy of its own device's
+    // partition (w8_dev_) when the int8 decode path is on - prefill then runs
+    // oneDNN on it, single-token decode dp4a_gemv - and the CPU partitions set
+    // `i8`; otherwise the segments stay shaped for the fp32/oneDNN paths.
     auto add8 = [&](int dev, const wt & w, const w8t & w8, const float * x, int xs, float * out, int os,
                     const float * res) {
+        w8t w8v = w8;
+        if (multi_dev && w8_dev_.size()) {
+            auto it = w8_dev_[(size_t)dev].find(w.data);
+            if (it != w8_dev_[(size_t)dev].end()) {
+                w8v = it->second;
+            }
+        }
         gemv_seg c{};
         c.w = wptr(dev, w.data);
         c.type = w.type;
@@ -85,7 +94,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         c.out_stride = os;
         c.residual = res;
         c.alpha = 1.0f;
-        c.w8 = w8;
+        c.w8 = w8v;
         c.x8 = d_x8;
         c.xmeta = d_xmeta;
         c.xsumq = d_xsumq;
@@ -193,14 +202,24 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         s.out_stride = hp.n_vocab;
         s.residual = nullptr;
         s.alpha = 1.0f;
-        if (use_w8 && head_batched && m.tok_embd8.vals) {
+        if (use_w8 && head_batched) {
             // batch-1 decode: run the LM head (45% of the decode weights) on the
-            // int8 GEMV path as well
-            s.w8 = m.tok_embd8;
-            s.x8 = d_x8;
-            s.xmeta = d_xmeta;
-            s.xsumq = d_xsumq;
-            plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+            // int8 GEMV path as well.  The head always runs on the primary
+            // device (backend 0); multi-device uses that device's w8 copy.
+            w8t t8 = m.tok_embd8;
+            if (multi_dev && w8_dev_.size()) {
+                auto it = w8_dev_[0].find(m.tok_embd.data);
+                if (it != w8_dev_[0].end()) {
+                    t8 = it->second;
+                }
+            }
+            if (t8.vals) {
+                s.w8 = t8;
+                s.x8 = d_x8;
+                s.xmeta = d_xmeta;
+                s.xsumq = d_xsumq;
+                plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+            }
         }
         plan.add(s);
     }
@@ -811,18 +830,22 @@ void engine::build_plans() {
                  plan_pf_nh_slot[i].segs.size() * sizeof(gemv_seg))
             .wait();
     }
-    if (pf8 || (multi_dev && dnnl_any_dev())) {
-        plan_pf8_ = build_plan(kMaxT, kMaxT, false, true, true);
-        plan_pf8_.finalize();
-        q.memcpy(d_segs_pf8, plan_pf8_.segs.data(), plan_pf8_.segs.size() * sizeof(gemv_seg)).wait();
-        plan_pf8_nh_ = build_plan(kMaxT, kMaxT, false, true, false);
-        plan_pf8_nh_.finalize();
-        if (plan_pf8_nh_.segs.size() > 4096) {
-            throw std::runtime_error("segment buffer too small");
+    if (pf8 || (multi_dev && (dnnl_any_dev() || md_int8))) {
+        if (pf8 || (multi_dev && dnnl_any_dev())) {
+            plan_pf8_ = build_plan(kMaxT, kMaxT, false, true, true);
+            plan_pf8_.finalize();
+            q.memcpy(d_segs_pf8, plan_pf8_.segs.data(), plan_pf8_.segs.size() * sizeof(gemv_seg)).wait();
+            plan_pf8_nh_ = build_plan(kMaxT, kMaxT, false, true, false);
+            plan_pf8_nh_.finalize();
+            if (plan_pf8_nh_.segs.size() > 4096) {
+                throw std::runtime_error("segment buffer too small");
+            }
+            d_segs_pf8_nh = alloc_elems<gemv_seg>(plan_pf8_nh_.segs.size());
+            q.memcpy(d_segs_pf8_nh, plan_pf8_nh_.segs.data(), plan_pf8_nh_.segs.size() * sizeof(gemv_seg)).wait();
         }
-        d_segs_pf8_nh = alloc_elems<gemv_seg>(plan_pf8_nh_.segs.size());
-        q.memcpy(d_segs_pf8_nh, plan_pf8_nh_.segs.data(), plan_pf8_nh_.segs.size() * sizeof(gemv_seg)).wait();
-        if (pf8_dec) {
+        if (pf8_dec || (multi_dev && md_int8)) {
+            // single-token decode on int8: GPU segments dp4a_gemv (per-device
+            // w8), CPU segments i8_gemv - same plan shape both partitions
             plan_dec8_ = build_plan(1, 1, true, true, true);
             plan_dec8_.finalize();
             if (plan_dec8_.segs.size() > 1024) {

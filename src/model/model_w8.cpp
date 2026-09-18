@@ -86,6 +86,13 @@ void model::free_w8(sycl::queue & q) {
     }
 }
 
+// Multi-device support: build the SIn copy of a single tensor on a given
+// queue/device (the per-device decode path repacks only its own partition's
+// layer weights).  Non-K-quant tensors (fp16/bf16) yield an empty w8t.
+void model::build_w8_one(sycl::queue & q, const wt & t, w8t & out) {
+    build_w8_tensor(q, t, out, false);
+}
+
 void model::build_w8(sycl::queue & q, bool host) {
     build_w8_tensor(q, tok_embd, tok_embd8, host);
     for (auto & L : layers) {

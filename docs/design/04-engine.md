@@ -385,6 +385,10 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
   其注意力层的 paged KV 池，block id 全局一致（同一张 block table，见 [05-kv-cache.md](05-kv-cache.md)）。
 * 多设备支持前缀缓存：block id 全局、递归状态检查点在共享主机 USM 中按全局 GDN 层序号索引；
   `pc_serialize_block`/`pc_deserialize_block` 经 `engine::kv_layer_ptrs` 把每个全局注意力层解析到所属
-  设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。`pf8`（SIn w8 预留）不建，
-  但 GPU 分区的 prefill 走 oneDNN int8（`dnnl_dev_`，每 GPU 后端一份，只转该设备的层；`PF_GEMM_DNNL=0`
-  关掉）。CPU 分区层走直读 GGUF 块的 i8 路径（与单设备 CPU 行为相同）。
+  设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。整模型 `pf8`（SIn w8 预留）
+  不建，但两条 int8 都可用：
+  - **prefill**：GPU 分区走 oneDNN int8（`dnnl_dev_`，每 GPU 后端一份，只转该设备的层；
+    `PF_GEMM_DNNL=0` 关掉）；CPU 分区层走直读 GGUF 块的 i8 路径（与单设备 CPU 行为相同）。
+  - **decode**：每 GPU 后端为分区层各建一份 SIn w8（`w8_dev_`）；单序列 decode（`plan_dec8_`）GPU 层
+    走 `dp4a_gemv`、CPU 层走 `i8_gemv`、LM head 也 int8（`PF_DP4A_DEC=0` 关掉，回到 fp32 GEMV；批式
+    decode n>1 目前仍是 fp32，与单设备一致）。
