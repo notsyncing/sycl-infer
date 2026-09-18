@@ -69,8 +69,9 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     };
     // SI8/int8 variant: one full-chunk segment (no 8-token slicing).  The GPU
     // uses the packed w8 copy; the CPU sets `i8` and reads the GGUF blocks
-    // directly (so w/type/K/n_rows are the real tensor geometry).
-    const bool i8_mode = use_w8 && cpu_mode;
+    // directly (so w/type/K/n_rows are the real tensor geometry).  In
+    // multi-device mode the GPU has no w8 copies (pf8 off) - the segments stay
+    // shaped for the per-device oneDNN path, which keys on gemv_seg::w.
     auto add8 = [&](int dev, const wt & w, const w8t & w8, const float * x, int xs, float * out, int os,
                     const float * res) {
         gemv_seg c{};
@@ -88,7 +89,9 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         c.x8 = d_x8;
         c.xmeta = d_xmeta;
         c.xsumq = d_xsumq;
-        c.i8 = i8_mode;
+        // i8 only for CPU-partition layers: single-device CPU, or the CPU
+        // backends of a multi-device run (dev_kind_ is empty when !multi_dev)
+        c.i8 = use_w8 && (multi_dev ? dev_kind_[(size_t)dev] == 1 : cpu_mode);
         plan.add(c);
     };
     auto mk = [&](int dev, const wt & w, const float * x, int xs, float * out, int os, const float * res) {
@@ -211,6 +214,9 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     const int NCH = (mode == 2) ? (rows + kMaxT - 1) / kMaxT : 1;
     const size_t NSEG = plan.segs.size();
     const hparams & hp = m.hp;
+    // backend index of the layer currently processed (multi-device): the
+    // gemv_at closure reads it to pick the device's oneDNN instance
+    int cur_dev = 0;
     const bool prof = prof_on();
     auto tnow = [] { return std::chrono::high_resolution_clock::now(); };
     auto tms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -259,8 +265,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         // Mode 1 (chunked, incl. the <32-token prompt tail) also runs its GEMMs
         // on oneDNN, at M = kMaxT: the chunked path is otherwise ~100 ms for a
         // 25-token tail because every GEMM is a full-weight pass at M=32.
+        // the dnnl_gemm bound to the backend computing the current call (the
+        // single-device instance, or the device's own in multi-device mode)
+        dnnl_gemm * D = dnnl_for(cur_dev);
         const bool dnnl_call = [&]() -> bool {
-            if (!use_dnnl || mode == 0 || single) {
+            if (!D || mode == 0 || single) {
                 return false;
             }
             if (idx >= plan.call_xq.size() || !plan.call_xq[idx].x) {
@@ -272,7 +281,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 const seg_plan::group_t & gr0 = plan.groups[gb0 + g];
                 for (int j = 0; j < gr0.n; j++) {
                     const gemv_seg & sj = plan.segs[gr0.off + j];
-                    if (sj.w8.vals && (!dnnl->has_weight(sj.w8.vals) || sj.w8.K != plan.call_xq[idx].K)) {
+                    // key: the SIn w8 copy on the single-device path, the fp32
+                    // device weight pointer (gemv_seg::w) in multi-device mode
+                    const void * key = sj.w8.vals ? sj.w8.vals : sj.w;
+                    const int kk = sj.w8.vals ? sj.w8.K : sj.K;
+                    // multi-device has no w8 view: every segment of the call is
+                    // routed to oneDNN, so all of them must be convertible
+                    const bool need = sj.w8.vals || multi_dev;
+                    if (need && (!D->has_weight(key) || kk != plan.call_xq[idx].K)) {
                         return false;
                     }
                 }
@@ -282,7 +298,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         if (dnnl_call) {
             const seg_plan::xq_t & xq = plan.call_xq[idx];
             const auto a2 = tnow();
-            dnnl->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K);
+            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K);
             if (prof_on()) {
                 q.wait();
                 prof_acc[5] += tms(a2, tnow());
@@ -339,7 +355,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     for (int j = 0; j < gr.n; j++) {
                         const gemv_seg & sj = plan.segs[gr.off + j];
                         if (dnnl_call
-                            && dnnl->gemm(sj.w8.vals, sj.residual, sj.alpha, tbm, sj.w8.K, sj.out, sj.out_stride)) {
+                            && D->gemm(sj.w8.vals, sj.residual, sj.alpha, tbm, sj.w8.K, sj.out, sj.out_stride)) {
                             continue;
                         }
                         // fallback: an unsupported oneDNN shape (unexpected) needs
@@ -365,6 +381,24 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         }
                     }
                 }
+            } else if (multi_dev && dnnl_call) {
+                // multi-device GPU group: segments carry no SIn w8 view (the
+                // w8 copies are not built), so run the prefill GEMMs on the
+                // device's oneDNN instance, keyed by gemv_seg::w.  dnnl_call
+                // verified every segment of the call is convertible; a gemm
+                // failure (unexpected) falls the whole group back to fp32.
+                bool dnnl_done = true;
+                for (int j = 0; j < gr.n; j++) {
+                    const gemv_seg & sj = plan.segs[gr.off + j];
+                    if (!D->gemm(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
+                        dnnl_done = false;
+                        break;
+                    }
+                }
+                if (!dnnl_done) {
+                    cur_be->gemv_group(gr.type, d_segs + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx],
+                                       (mode == 2 && !single) ? NCH : 0);
+                }
             } else if (mode == 2 && !single) {
                 // chunk-batched prefill: one dispatch over all chunk rows via
                 // the token-block grid.  Per-row calls of these (small) fp32
@@ -380,7 +414,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             if (prof) {
                 q.wait();
                 const double dt = tms(a_g2, tnow());
-                if (s0.w8.vals || s0.i8) {
+                if (s0.w8.vals || s0.i8 || (multi_dev && dnnl_call)) {
                     c_g8 += dt;
                 } else {
                     c_gf += dt;
@@ -446,6 +480,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         compute_backend & LB = be_of(il);
         cur_be = &LB;
         const int dev = multi_dev ? layer_dev_[il] : 0;
+        cur_dev = dev;
         if (multi_dev && dev != prev_dev) {
             if (prev_dev >= 0) {
                 backends_[(size_t)prev_dev]->synchronize();
@@ -776,7 +811,7 @@ void engine::build_plans() {
                  plan_pf_nh_slot[i].segs.size() * sizeof(gemv_seg))
             .wait();
     }
-    if (pf8) {
+    if (pf8 || (multi_dev && dnnl_any_dev())) {
         plan_pf8_ = build_plan(kMaxT, kMaxT, false, true, true);
         plan_pf8_.finalize();
         q.memcpy(d_segs_pf8, plan_pf8_.segs.data(), plan_pf8_.segs.size() * sizeof(gemv_seg)).wait();

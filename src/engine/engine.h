@@ -289,6 +289,26 @@ struct engine {
     // (PF_GEMM_DNNL, default on); null when disabled with PF_GEMM_DNNL=0
     std::unique_ptr<dnnl_gemm> dnnl;
     bool use_dnnl = false;
+    // multi-device: one dnnl_gemm per GPU backend, each bound to that device's
+    // queue and holding only the layers that device computes (CPU layers keep
+    // reading the GGUF blocks; there are no SIn w8 copies on this path, so the
+    // weight keys are the fp32 device-weight pointers the plan segments carry
+    // in gemv_seg::w).  Null entries for CPU backends and when PF_GEMM_DNNL=0.
+    std::vector<std::unique_ptr<dnnl_gemm>> dnnl_dev_;
+    // true when at least one GPU backend owns a dnnl_gemm: multi-device prefill
+    // then runs every GPU layer on oneDNN via the full-chunk pf8-style plan
+    bool dnnl_any_dev() const {
+        return std::any_of(dnnl_dev_.begin(), dnnl_dev_.end(),
+                           [](const std::unique_ptr<dnnl_gemm> & d) { return d != nullptr; });
+    }
+    // the dnnl_gemm bound to backend `dev` (the single-device instance, or the
+    // device's own in multi-device mode; null on CPU backends)
+    dnnl_gemm * dnnl_for(int dev) const {
+        if (!multi_dev) {
+            return dnnl.get();
+        }
+        return (size_t)dev < dnnl_dev_.size() ? dnnl_dev_[(size_t)dev].get() : nullptr;
+    }
     std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_dec, e_pf;
 
     seg_plan plan_dec_, plan_pf_, plan_pf8_, plan_dec8_;

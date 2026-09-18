@@ -205,9 +205,9 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
             pc_disk_init();
         }
     }
-    // oneDNN int8 matmul for the mode-2 prefill GEMMs (PF_GEMM_DNNL, default
-    // on).  The converted weights live in device USM and are built once here;
-    // PF_GEMM_DNNL=0 keeps the dp4a chunk-batched path bit-identical to before.
+    // oneDNN int8 matmul for the prefill GEMMs (PF_GEMM_DNNL, default on).
+    // The converted weights live in device USM and are built once here;
+    // PF_GEMM_DNNL=0 keeps the dp4a/fp32 path bit-identical to before.
     use_dnnl = !cpu_mode && !multi_dev && pf8 && dnnl_gemm_enabled();
     if (use_dnnl) {
         dnnl = std::make_unique<dnnl_gemm>(q);
@@ -237,6 +237,60 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         const char * envw = getenv("PF_DNNL_NOWARM");
         if (!(envw && atoi(envw) != 0)) {
             dnnl->warmup();
+        }
+    } else if (multi_dev && dnnl_gemm_enabled() &&
+               [&] {
+                   const char * en = getenv("PF_DP4A");
+                   return !(en && atoi(en) == 0); // PF_DP4A=0 forces the fp32 path
+               }()) {
+        // one dnnl_gemm per GPU backend, holding only the layers that device
+        // computes (the CPU partitions keep the fp32/i8 host path).  Every
+        // prefill GEMM tensor of a GPU layer is converted - including the
+        // small ssm_beta/ssm_alpha, which ride in the wqkv call - and the
+        // weight keys are the fp32 device pointers the plan segments carry in
+        // gemv_seg::w (there are no SIn w8 copies on the multi-device path).
+        const char * envw = getenv("PF_DNNL_NOWARM");
+        const bool nowarm = envw && atoi(envw) != 0;
+        dnnl_dev_.resize(backends_.size());
+        for (size_t d = 0; d < backends_.size(); d++) {
+            if (dev_kind_[d] != 0) {
+                continue; // CPU backend: no oneDNN
+            }
+            auto D = std::make_unique<dnnl_gemm>(*dev_queues_[d]);
+            auto add = [&](const wt & t) {
+                if (!t.data) {
+                    return; // attention layers have no ssm_beta/ssm_alpha
+                }
+                const void * key = wptr((int)d, t.data); // == the segments' sj.w
+                if (key) {
+                    D->add_weight(key, t.data, t.type, t.K, t.N);
+                }
+            };
+            for (int il = 0; il < m.hp.n_layer; il++) {
+                if (layer_dev_[(size_t)il] != (int)d) {
+                    continue;
+                }
+                const layer_t & L = m.layers[il];
+                add(L.ffn_gate);
+                add(L.ffn_up);
+                add(L.ffn_down);
+                add(L.ssm_beta);
+                add(L.ssm_alpha);
+                if (L.recurrent) {
+                    add(L.wqkv);
+                    add(L.wgate);
+                    add(L.ssm_out);
+                } else {
+                    add(L.wq);
+                    add(L.wk);
+                    add(L.wv);
+                    add(L.wo);
+                }
+            }
+            if (!nowarm) {
+                D->warmup();
+            }
+            dnnl_dev_[d] = std::move(D);
         }
     }
     ffn_stride = 2 * m.hp.n_ff;
@@ -764,8 +818,10 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
     // PF_NOGRAPH=1: run the recorded sequence directly (diagnostics/PF_PROF)
     static const bool nog = getenv("PF_NOGRAPH") != nullptr;
     if (cpu_mode || multi_dev) {
-        if (pf8) {
-            // opt-in SI8 prefill keeps the full-chunk plan
+        if (pf8 || dnnl_any_dev()) {
+            // pf8-style full-chunk path: SI8 on single-device CPU, per-device
+            // oneDNN on the multi-device GPU layers (the CPU partitions run
+            // i8) - kept when any GPU backend owns a dnnl_gemm
             const seg_plan & pl = with_head ? plan_pf8_ : plan_pf8_nh_;
             gemv_seg * ds = with_head ? d_segs_pf8 : d_segs_pf8_nh;
             record_forward(1, pl, ds, kMaxT);

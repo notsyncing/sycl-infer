@@ -12,7 +12,7 @@
 * 选择计算后端（GPU 或 CPU）并为（可能是多个）设备分配所有激活/状态/KV/图缓冲区；
 * 把一次完整 forward 编码为 `seg_plan` 并在 GPU 上录制为 SYCL command graph；
 * 提供 prefill / decode / 单序列 API；
-* 管理动态 KV 池与三层前缀缓存（多设备时关闭，见下）。
+* 管理动态 KV 池与三层前缀缓存（多设备时同样启用，见 §11）。
 
 `engine` 的核心数据结构是 `seg_plan`；核心函数是 `build_plan` 与 `record_forward`，二者必须保持
 调用顺序一致。所有 kernel 调用都经过 `compute_backend`（见 §11），因此同一份前向逻辑在 GPU
@@ -385,4 +385,6 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
   其注意力层的 paged KV 池，block id 全局一致（同一张 block table，见 [05-kv-cache.md](05-kv-cache.md)）。
 * 多设备支持前缀缓存：block id 全局、递归状态检查点在共享主机 USM 中按全局 GDN 层序号索引；
   `pc_serialize_block`/`pc_deserialize_block` 经 `engine::kv_layer_ptrs` 把每个全局注意力层解析到所属
-  设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。`pf8` 与 oneDNN 仍关闭。
+  设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。`pf8`（SIn w8 预留）不建，
+  但 GPU 分区的 prefill 走 oneDNN int8（`dnnl_dev_`，每 GPU 后端一份，只转该设备的层；`PF_GEMM_DNNL=0`
+  关掉）。CPU 分区层走直读 GGUF 块的 i8 路径（与单设备 CPU 行为相同）。

@@ -356,8 +356,11 @@ micro-batch（单序列/单批），不做跨设备重叠。具体地：
   只包含该设备的注意力层。block id 是全局的（同一张 block table），所以 paged attention 与
   `set_table` 无需改动。
 * 多设备路径直接重放计划（无图）、激活走主机 USM；**前缀缓存可用**——block id 全局、递归状态检查点
-  在共享主机 USM，`pc_serialize_block`/`pc_deserialize_block` 经 `kv_layer_ptrs` 按设备解析每层的池。
-  `pf8` 与 oneDNN 在多设备下关闭。
+   在共享主机 USM，`pc_serialize_block`/`pc_deserialize_block` 经 `kv_layer_ptrs` 按设备解析每层的池。
+   `pf8`（打包 SIn w8 预留）在多设备下不建，但 **oneDNN 可用**：每个 GPU 后端各持有一份
+   `dnnl_gemm`（`dnnl_dev_`，绑该设备的队列），只转换该设备分区的层权重，prefill 以 pf8 风格整块计划
+   在 GPU 层上跑 int8 GEMM、CPU 分区层走直读 GGUF 块 的 i8 路径（`PF_GEMM_DNNL=0` 或 `PF_DP4A=0`
+   关掉这种多设备 oneDNN）。
 
 这满足“dense 模型跨设备流水”的需求：混合模型（GDN + attention）同样可用，因为递归状态也在共享
 主机 USM 中按全局 GDN 层序号索引。
