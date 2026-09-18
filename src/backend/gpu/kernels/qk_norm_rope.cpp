@@ -21,6 +21,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
     auto launch = [&](auto * kdst_base, auto * vdst_base, const sycl::half * ksc_base, const sycl::half * vsc_base) {
         using KVT = std::remove_cv_t<std::remove_pointer_t<decltype(kdst_base)>>;
         constexpr bool I8 = std::is_same_v<KVT, int8_t>;
+        constexpr bool I4 = std::is_same_v<KVT, uint8_t>;
         q.parallel_for(
             nd_range<1>((size_t)n_rows * n_real * n_sg * 32, n_sg * 32),
             [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
@@ -120,6 +121,27 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                                 ksc[i] = (sycl::half)sc;
                             }
                         }
+                    } else if constexpr (I4) {
+                        // two nibbles per byte: even lane l packs dims l (low) and
+                        // l+1 (high) into byte (i*32+l)/2
+                        const int ko = pos % kBlockSize;
+                        const size_t unit = (size_t)kb * n_head_kv + kh;
+                        auto * krow = kdst_base + (unit * kBlockSize + ko) * (size_t)(head_dim / 2);
+                        auto * ksc = (sycl::half *)kv_row_scales(ksc_base, unit, ko, head_dim);
+#pragma unroll
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            const float v = khp[lane + 32 * i];
+                            const float m = sg_max(sycl::fabs(v), sgg);
+                            const float sc = m > 0.f ? m / 7.f : 1.f;
+                            const uint32_t nib = (uint32_t)((uint8_t)i4_quant(v, sc) & 0xF);
+                            const uint32_t nb = sycl::permute_group_by_xor(sgg, nib, 1);
+                            if ((lane & 1) == 0) {
+                                krow[(i * 32 + lane) / 2] = (uint8_t)(nib | (nb << 4));
+                            }
+                            if (lane == 0) {
+                                ksc[i] = (sycl::half)sc;
+                            }
+                        }
                     } else {
                         auto * kdst =
                             kdst_base + (((size_t)kb * n_head_kv + kh) * kBlockSize + (pos % kBlockSize)) * head_dim;
@@ -147,6 +169,25 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                                 vsc[i] = (sycl::half)sc;
                             }
                         }
+                    } else if constexpr (I4) {
+                        const int ko = pos % kBlockSize;
+                        const size_t unit = (size_t)vb * n_head_kv + vh;
+                        auto * vrow = vdst_base + (unit * kBlockSize + ko) * (size_t)(head_dim / 2);
+                        auto * vsc = (sycl::half *)kv_row_scales(vsc_base, unit, ko, head_dim);
+#pragma unroll
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            const float v = vhp[lane + 32 * i];
+                            const float m = sg_max(sycl::fabs(v), sgg);
+                            const float sc = m > 0.f ? m / 7.f : 1.f;
+                            const uint32_t nib = (uint32_t)((uint8_t)i4_quant(v, sc) & 0xF);
+                            const uint32_t nb = sycl::permute_group_by_xor(sgg, nib, 1);
+                            if ((lane & 1) == 0) {
+                                vrow[(i * 32 + lane) / 2] = (uint8_t)(nib | (nb << 4));
+                            }
+                            if (lane == 0) {
+                                vsc[i] = (sycl::half)sc;
+                            }
+                        }
                     } else {
                         auto * vdst =
                             vdst_base + (((size_t)vb * n_head_kv + vh) * kBlockSize + (pos % kBlockSize)) * head_dim;
@@ -167,6 +208,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
         break;
     case kv_dtype_t::f16: launch((sycl::half *)kpool, (sycl::half *)vpool, nullptr, nullptr); break;
     case kv_dtype_t::i8: launch((int8_t *)kpool, (int8_t *)vpool, ksc, vsc); break;
+    case kv_dtype_t::i4: launch((uint8_t *)kpool, (uint8_t *)vpool, ksc, vsc); break;
     }
 }
 

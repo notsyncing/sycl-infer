@@ -53,9 +53,12 @@ void stage_qk_norm_rope(stage_env & env) {
             env.e.kv_read_vec(1, src * hp.head_dim, &vc[((size_t)t * hp.n_head_kv + h) * hp.head_dim], hp.head_dim);
         }
     }
-    // the pool may store bf16/f16/i8 (PF_KV_TYPE): the round-trip error is
+    // the pool may store bf16/f16/i8/i4 (PF_KV_TYPE): the round-trip error is
     // bounded by the storage precision, not by the kernel
-    const double kv_tol = kv_dtype() == kv_dtype_t::f32 ? 2e-3 : kv_dtype() == kv_dtype_t::i8 ? 2e-2 : 5e-3;
+    const double kv_tol = kv_dtype() == kv_dtype_t::f32  ? 2e-3
+                          : kv_dtype() == kv_dtype_t::i4 ? 3.0e-1
+                          : kv_dtype() == kv_dtype_t::i8 ? 2e-2
+                                                         : 5e-3;
     env.cmp("kcache-3", kc, tk, kv_tol);
     env.cmp("vcache-3", vc, tv, kv_tol);
 }

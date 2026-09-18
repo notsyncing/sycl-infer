@@ -21,10 +21,10 @@
 namespace si {
 
 // mirror of kv_dtype_t (src/backend/gpu/kernels/kv_type.h) without the SYCL include
-enum class cpu_kv_dtype : int { f32 = 0, bf16 = 1, f16 = 2, i8 = 3 };
+enum class cpu_kv_dtype : int { f32 = 0, bf16 = 1, f16 = 2, i8 = 3, i4 = 4 };
 
 inline int cpu_kv_elem_bytes(cpu_kv_dtype t) {
-    return t == cpu_kv_dtype::f32 ? 4 : (t == cpu_kv_dtype::i8 ? 1 : 2);
+    return t == cpu_kv_dtype::f32 ? 4 : ((t == cpu_kv_dtype::i8 || t == cpu_kv_dtype::i4) ? 1 : 2);
 }
 
 constexpr int kCpuI8Q = 32;

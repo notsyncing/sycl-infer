@@ -162,8 +162,8 @@ struct engine {
     float * d_img_embd = nullptr; // [kMaxImgTokens][n_embd] vision embeddings
 
     // paged KV cache + tables.  The pools are raw byte storage whose element
-    // type is kv_dtype() (f32/bf16/f16, see kernels.h); sizes are in elements
-    // of that type and all pointers are advanced in bytes.
+    // type is kv_dtype() (f32/bf16/f16/i8/i4, see kernels.h); sizes are in
+    // elements of that type and all pointers are advanced in bytes.
     void * d_kpool = nullptr; // [n_attn][n_blocks][n_head_kv][kBlockSize][head_dim]
     void * d_vpool = nullptr;
     // int8 only: per-32 fp16 scale planes, same [attn][block][kv head][token][group]

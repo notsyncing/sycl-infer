@@ -272,7 +272,7 @@ KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射�
 | `kMaxB` | 16 | 最大并发序列数 |
 | `kMaxRows` | 32 | 每 token 缓冲的最大行数 |
 | `kBlockSize` | 32 | paged KV 块大小（token） |
-| `kI8Q` | 32 | int8 KV 每多少 head dim 一个 scale |
+| `kI8Q` | 32 | int8/int4 KV 每多少 head dim 一个 scale |
 | `kMaxSplits` | 64 | prefill attention K-split 容量 |
 | `kMaxDecSplits` | 256 | decode K-split 容量 |
 | `kPcMapLen` | 1024 | 前缀缓存检查点边界映射长度（覆盖 32768 token） |
@@ -292,8 +292,8 @@ KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射�
 3. **oneDNN 不能录制进 SYCL 图**。`PF_GEMM_DNNL` 路径直接重放模式 2（`prefill_batch`）。
 4. **不要多个 TU 包含 `sycl/ext/oneapi/dot_product.hpp`**（其函数在该工具链下不是 `inline`），统一用
    `src/common/dp4a.h`。
-5. **int8 KV 布局**是 `[block][kv head][token][head_dim]` 数据 + 独立的 fp16 scale 平面；池与 scale 都
-   按字节推进（`kv_layer_stride`、`kv_scale_stride`）。
+5. **int8/int4 KV 布局**是 `[block][kv head][token][head_dim]`（i4 为 `head_dim/2` 个打包字节）数据 +
+   独立的 fp16 scale 平面；池与 scale 都按字节推进（`kv_layer_stride`、`kv_scale_stride`）。
 6. **多模态下 KV slot 序号与 RoPE 位置分离**：图像消耗 `max(nx,ny)` 个位置却有 `4*nx*ny` 个 token，
    decode 时 `info->pos` 是 token 计数，RoPE 位置由 `step_info::mrope` 携带（`mrope_on`）。
 7. **图像 token 不经过 `tok_embd`**：embed kernel 直接拷贝 `step_info::img_embd[img_row[t]]`。

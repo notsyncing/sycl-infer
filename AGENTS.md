@@ -89,9 +89,9 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2
 ./build/sycl-infer --model ... gen --prompt "Hello" --max-tokens 32
 ```
 
-`main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --port
---host --device --cpu-threads --layer-map --mmproj`, and for `gen`: `--prompt
---max-tokens --temp --top-p --top-k --raw --image`).  `--device cpu|gpu|auto`
+`main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --kv-type
+--port --host --device --cpu-threads --layer-map --mmproj`, and for `gen`:
+`--prompt --max-tokens --temp --top-p --top-k --raw --image`).  `--device cpu|gpu|auto`
 selects the compute backend; `--cpu-threads N` (or `PF_CPU_THREADS`) sets the
 host worker count;
 `--layer-map 0-11:gpu,12-23:cpu` places closed layer ranges on devices (each
@@ -327,7 +327,8 @@ kernel variants, so performance numbers must state the env used.
 
 **Model / memory**
 `PF_CTX`, `PF_KV_CAP_MB`, `PF_KV_GROW` (pool growth step, default 64 blocks),
-`PF_KV_TYPE` (`i8`|`bf16`|`f16`|`f32`, default `i8`), `PF_KV_F32`, `PF_KV_BF16`,
+`PF_KV_TYPE` (`i4`|`int4`|`i8`|`bf16`|`f16`|`f32`, default `i8`; `--kv-type`
+overrides it), `PF_KV_F32`, `PF_KV_BF16`,
 `PF_SI4` (re-quantize weights to 4-bit SIn), `PF_META` (fp32 side scales).
 
 **Compute path**

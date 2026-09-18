@@ -51,8 +51,9 @@ static void usage(const char * prog) {
             "                               the three prefix-cache tiers, shrinking disk,\n"
             "                               then RAM, then VRAM.\n"
             "  --mmproj <mmproj.gguf>       vision projector needed by --image\n"
-            "  KV storage: PF_KV_TYPE=i8|bf16|f16|f32 (default i8; PF_KV_F32 and\n"
-            "  PF_KV_BF16 are aliases), all math stays fp32.\n"
+            "  --kv-type T                  KV cache storage type: i4|i8|bf16|f16|f32\n"
+            "                               (default i8; overrides PF_KV_TYPE; all math\n"
+            "                               stays fp32, i4 packs two values per byte)\n"
             "\n"
             "serve:\n"
             "  --host H                     bind address (default 0.0.0.0)\n"
@@ -175,6 +176,14 @@ int main(int argc, char ** argv) {
             pc_ram_mb = atoi(next().c_str());
         } else if (a == "--pc-vram-mb") {
             pc_vram_mb = atoi(next().c_str());
+        } else if (a == "--kv-type") {
+            const std::string v = next();
+            kv_dtype_t kt;
+            if (!kv_dtype_parse(v.c_str(), kt)) {
+                fprintf(stderr, "error: --kv-type expects i4|i8|bf16|f16|f32\n");
+                return 1;
+            }
+            kv_dtype_set(kt);
         } else if (a == "--layer-map") {
             layer_map = next();
         } else if (a == "--device") {

@@ -80,6 +80,11 @@ inline float kv_load(cpu_kv_dtype t, const void * base, size_t i) {
         return f;
     }
     case cpu_kv_dtype::f16: return ggml_half_to_float(((const uint16_t *)base)[i]);
+    case cpu_kv_dtype::i4: {
+        const uint8_t byte = ((const uint8_t *)base)[i >> 1];
+        const int v = (i & 1) ? (byte >> 4) : (byte & 0xF);
+        return (float)((v ^ 8) - 8);
+    }
     default: return (float)((const int8_t *)base)[i];
     }
 }
@@ -100,6 +105,10 @@ inline size_t kv_row_off(size_t unit, int ko, int head_dim) {
 }
 inline size_t kv_scale_off(size_t unit, int ko, int head_dim) {
     return (unit * kCpuBlk + ko) * (size_t)(head_dim / kCpuI8Q);
+}
+// i4: row offset in packed bytes (two elements per byte)
+inline size_t kv_row_off_i4(size_t unit, int ko, int head_dim) {
+    return (unit * kCpuBlk + ko) * (size_t)(head_dim / 2);
 }
 
 // ---- RoPE (plain + the 4-section M-RoPE used by the text model) ------------

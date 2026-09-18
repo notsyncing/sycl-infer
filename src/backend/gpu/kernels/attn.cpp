@@ -153,8 +153,8 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
     const bool fuse = out != nullptr && n_splits == 1;
     const int n_wg = n_rows * n_real * n_head * n_splits;
     const int grp = group >= 0 ? group : dec_group_env();
-    // the grouped kernel has no int8 path (it reuses kv_ld4 on a full row)
-    if (grp && kv_dtype() != kv_dtype_t::i8 && !fuse && head_dim == HD && n_head_kv > 0 && n_head % n_head_kv == 0
+    // the grouped kernel has no int8/int4 path (it reuses kv_ld4 on a full row)
+    if (grp && !kv_dtype_has_scales(kv_dtype()) && !fuse && head_dim == HD && n_head_kv > 0 && n_head % n_head_kv == 0
         && n_head / n_head_kv == 4) {
         switch (kv_dtype()) {
         case kv_dtype_t::f32:
@@ -170,13 +170,15 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
             attn_group_kernel<4>(q, qbuf, (const sycl::half *)kpool, (const sycl::half *)vpool, partials, tables,
                                  n_head, n_head_kv, head_dim, n_splits, info, scale, max_blocks, n_rows, n_real);
             return;
-        case kv_dtype_t::i8: break; // int8 has no grouped path (excluded by the guard above)
+        case kv_dtype_t::i8: // quantized: no grouped path (excluded by the guard above)
+        case kv_dtype_t::i4: break;
         }
     }
     auto launch = [&](const auto * kp_base, const auto * vp_base, const sycl::half * ksc_base,
                       const sycl::half * vsc_base) {
         using KV = std::remove_cv_t<std::remove_pointer_t<decltype(kp_base)>>;
         constexpr bool I8 = std::is_same_v<KV, int8_t>;
+        constexpr bool I4 = std::is_same_v<KV, uint8_t>;
         q.parallel_for(nd_range<1>((size_t)n_wg * 32, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const int gid = it.get_group(0);
             const int r = gid / (n_real * n_head * n_splits);
@@ -229,10 +231,20 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     const size_t unit = (size_t)kb * n_head_kv + kvh;
                     const auto * kp = kv_row_data(kp_base, unit, ko, head_dim);
                     const auto * vp = kv_row_data(vp_base, unit, ko, head_dim);
-                    const sycl::float4 ka = kv_ld4(kp + d0);
-                    const sycl::float4 kb4 = kv_ld4(kp + d1);
+                    sycl::float4 ka, kb4, va, vb;
+                    if constexpr (I4) {
+                        ka = i4_ld4(kp, d0);
+                        kb4 = i4_ld4(kp, d1);
+                        va = i4_ld4(vp, d0);
+                        vb = i4_ld4(vp, d1);
+                    } else {
+                        ka = kv_ld4(kp + d0);
+                        kb4 = kv_ld4(kp + d1);
+                        va = kv_ld4(vp + d0);
+                        vb = kv_ld4(vp + d1);
+                    }
                     float dot;
-                    if constexpr (I8) {
+                    if constexpr (I8 || I4) {
                         // the two 4-dim chunks of a lane sit in blocks lane/8 and
                         // 4 + lane/8; the block scale multiplies the chunk's dot4
                         const auto * ks = kv_row_scales(ksc_base, unit, ko, head_dim);
@@ -247,9 +259,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     const float e = sycl::exp(dot - mnew);
                     const float corr = sycl::exp(m - mnew);
                     l = l * corr + e;
-                    const sycl::float4 va = kv_ld4(vp + d0);
-                    const sycl::float4 vb = kv_ld4(vp + d1);
-                    if constexpr (I8) {
+                    if constexpr (I8 || I4) {
                         const auto * vs = kv_row_scales(vsc_base, unit, ko, head_dim);
                         aa = fma4(va, e * (float)vs[lane / 8], mul4(aa, corr));
                         ab = fma4(vb, e * (float)vs[4 + lane / 8], mul4(ab, corr));
@@ -296,12 +306,18 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 const auto * kp = kv_row_data(kp_base, unit, ko, head_dim);
                 const auto * vp = kv_row_data(vp_base, unit, ko, head_dim);
                 float dot = 0.f;
-                if constexpr (I8) {
+                if constexpr (I8 || I4) {
                     // dims lane+32*i are exactly block i: one scale per iteration
                     const auto * ks = kv_row_scales(ksc_base, unit, ko, head_dim);
 #pragma unroll
                     for (int i = 0; i < HD / 32; i++) {
-                        dot += q[lane + 32 * i] * kv_ld(kp + lane + 32 * i) * (float)ks[i];
+                        float kv;
+                        if constexpr (I4) {
+                            kv = i4_ld(kp, lane + 32 * i);
+                        } else {
+                            kv = kv_ld(kp + lane + 32 * i);
+                        }
+                        dot += q[lane + 32 * i] * kv * (float)ks[i];
                     }
                 } else {
 #pragma unroll
@@ -314,11 +330,17 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 const float e = sycl::exp(dot - mnew);
                 const float corr = sycl::exp(m - mnew);
                 l = l * corr + e;
-                if constexpr (I8) {
+                if constexpr (I8 || I4) {
                     const auto * vs = kv_row_scales(vsc_base, unit, ko, head_dim);
 #pragma unroll
                     for (int i = 0; i < HD / 32; i++) {
-                        acc[i] = acc[i] * corr + e * kv_ld(vp + lane + 32 * i) * (float)vs[i];
+                        float vv;
+                        if constexpr (I4) {
+                            vv = i4_ld(vp, lane + 32 * i);
+                        } else {
+                            vv = kv_ld(vp + lane + 32 * i);
+                        }
+                        acc[i] = acc[i] * corr + e * vv * (float)vs[i];
                     }
                 } else {
 #pragma unroll
@@ -358,6 +380,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
         break;
     case kv_dtype_t::f16: launch((const sycl::half *)kpool, (const sycl::half *)vpool, nullptr, nullptr); break;
     case kv_dtype_t::i8: launch((const int8_t *)kpool, (const int8_t *)vpool, ksc, vsc); break;
+    case kv_dtype_t::i4: launch((const uint8_t *)kpool, (const uint8_t *)vpool, ksc, vsc); break;
     }
 }
 

@@ -148,6 +148,7 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 | 报告 | 主题 |
 |---|---|
 | `attn_blockread_int8kv.md` | int8 KV 的 attention block-read |
+| `int4_kv.md` | int4 KV 存储、精度与 GPU 性能 |
 | `kv_bf16_splits.md` | bf16 KV split 调优 |
 | `longctx_16k.md` / `longctx_decode.md` | 长上下文 prefill / decode |
 | `prefix_cache.md` | 前缀缓存设计与测量 |

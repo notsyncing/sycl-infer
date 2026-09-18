@@ -39,7 +39,10 @@ void stage_attn(stage_env & env) {
                         16, 1, T);
     std::vector<float> hb((size_t)T * hp.n_head * hp.head_dim);
     env.e.q.memcpy(hb.data(), env.e.d_attn_out, hb.size() * 4).wait();
-    const double attn_tol = kv_dtype() == kv_dtype_t::f32 ? 2e-3 : kv_dtype() == kv_dtype_t::i8 ? 3e-2 : 5e-3;
+    const double attn_tol = kv_dtype() == kv_dtype_t::f32  ? 2e-3
+                            : kv_dtype() == kv_dtype_t::i4 ? 3.0e-1
+                            : kv_dtype() == kv_dtype_t::i8 ? 3e-2
+                                                           : 5e-3;
     env.cmp("attn_gated-3", hb, env.get("attn_pregate-3"), attn_tol);
 
     // grouped vs classic partials

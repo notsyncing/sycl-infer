@@ -85,6 +85,25 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                     }
                     ksc[i] = ggml_float_to_half(sc);
                 }
+            } else if (kv == cpu_kv_dtype::i4) {
+                uint8_t * krow = (uint8_t *)kpool + kv_row_off_i4(unit, ko, head_dim);
+                uint16_t * ksc = (uint16_t *)kscales + kv_scale_off(unit, ko, head_dim);
+                const int nq = head_dim / kCpuI8Q;
+                for (int i = 0; i < nq; i++) {
+                    float mx = 0.0f;
+                    for (int d = 0; d < kCpuI8Q; d++) {
+                        mx = std::max(mx, std::fabs(khp[i * kCpuI8Q + d]));
+                    }
+                    const float sc = mx > 0.0f ? mx / 7.0f : 1.0f;
+                    for (int d = 0; d < kCpuI8Q; d += 2) {
+                        const int lo =
+                            (int)std::max(-7.0f, std::min(7.0f, std::round(khp[i * kCpuI8Q + d] / sc))) & 0xF;
+                        const int hi =
+                            (int)std::max(-7.0f, std::min(7.0f, std::round(khp[i * kCpuI8Q + d + 1] / sc))) & 0xF;
+                        krow[(i * kCpuI8Q + d) / 2] = (uint8_t)(lo | (hi << 4));
+                    }
+                    ksc[i] = ggml_float_to_half(sc);
+                }
             } else {
                 for (int d = 0; d < head_dim; d++) {
                     kv_store(kv, kpool, kv_row_off(unit, ko, head_dim) + d, khp[d]);
@@ -109,6 +128,25 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                     for (int d = 0; d < kCpuI8Q; d++) {
                         vrow[i * kCpuI8Q + d] =
                             (int8_t)std::max(-127.0f, std::min(127.0f, std::round(vhp[i * kCpuI8Q + d] / sc)));
+                    }
+                    vsc[i] = ggml_float_to_half(sc);
+                }
+            } else if (kv == cpu_kv_dtype::i4) {
+                uint8_t * vrow = (uint8_t *)vpool + kv_row_off_i4(unit, ko, head_dim);
+                uint16_t * vsc = (uint16_t *)vscales + kv_scale_off(unit, ko, head_dim);
+                const int nq = head_dim / kCpuI8Q;
+                for (int i = 0; i < nq; i++) {
+                    float mx = 0.0f;
+                    for (int d = 0; d < kCpuI8Q; d++) {
+                        mx = std::max(mx, std::fabs(vhp[i * kCpuI8Q + d]));
+                    }
+                    const float sc = mx > 0.0f ? mx / 7.0f : 1.0f;
+                    for (int d = 0; d < kCpuI8Q; d += 2) {
+                        const int lo =
+                            (int)std::max(-7.0f, std::min(7.0f, std::round(vhp[i * kCpuI8Q + d] / sc))) & 0xF;
+                        const int hi =
+                            (int)std::max(-7.0f, std::min(7.0f, std::round(vhp[i * kCpuI8Q + d + 1] / sc))) & 0xF;
+                        vrow[(i * kCpuI8Q + d) / 2] = (uint8_t)(lo | (hi << 4));
                     }
                     vsc[i] = ggml_float_to_half(sc);
                 }

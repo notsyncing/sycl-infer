@@ -90,6 +90,38 @@ inline const sycl::half * kv_row_scales(const sycl::half * ksc_base, size_t unit
     return ksc_base + (unit * kBlockSize + ko) * kv_i8_scale_n(head_dim);
 }
 
+// ---- int4 KV geometry (see kv_dtype_t in kernels.h) -----------------------
+// Two signed nibbles per byte (low nibble = even head dim), one fp16 scale per
+// 32 head dimensions (the same plane as i8).  A row is head_dim/2 bytes.
+inline float i4_cast(uint8_t byte, int hi) {
+    const int v = hi ? (byte >> 4) : (byte & 0xF);
+    return (float)((v ^ 8) - 8);
+}
+// unpack one already-masked nibble (low 4 bits) to signed fp32
+inline float i4_nib(uint32_t x) {
+    const int v = (int)(x & 0xFu);
+    return (float)((v ^ 8) - 8);
+}
+inline float i4_ld(const uint8_t * row, int d) {
+    return i4_cast(row[d >> 1], d & 1);
+}
+// load 4 contiguous i4 dims starting at `d` (d a multiple of 4) as float4.  The
+// byte offset d/2 is even, so one aligned 16-bit load gets all four nibbles
+// (two scalar byte loads measured slower: the decode kernel is instruction-,
+// not byte-bound at long context).
+inline sycl::float4 i4_ld4(const uint8_t * row, int d) {
+    const uint32_t w = *reinterpret_cast<const uint16_t *>(
+        __builtin_assume_aligned(static_cast<const void *>(row + (d >> 1)), 2));
+    return sycl::float4(i4_nib(w), i4_nib(w >> 4), i4_nib(w >> 8), i4_nib(w >> 12));
+}
+// quantize one fp32 value to symmetric int4 with a block scale (round-half-away)
+inline int8_t i4_quant(float v, float scale) {
+    return (int8_t)sycl::clamp(sycl::round(v / scale), -7.f, 7.f);
+}
+template <> inline const uint8_t * kv_row_data<uint8_t>(const uint8_t * base, size_t unit, int ko, int head_dim) {
+    return base + (unit * kBlockSize + ko) * (size_t)(head_dim / 2);
+}
+
 inline float fast_h2f(uint16_t h) {
     const uint32_t exp = (h >> 10) & 0x1Fu;
     if (exp == 0 || exp == 31) {

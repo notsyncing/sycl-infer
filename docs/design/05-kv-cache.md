@@ -17,12 +17,12 @@
 
 ## 2. 字节几何
 
-* `kv_block_bytes()`（`engine_kvpool.cpp:28-30`）：一个 attention 层中一个块 **K 的字节数**
-  `n_head_kv * kBlockSize * head_dim * kv_elem_bytes()`；V 同尺寸。
+* `kv_block_bytes()`（`engine_kvpool.cpp:30-32`）：一个 attention 层中一个块 **K 的字节数**
+  `n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_dtype(), head_dim)`；V 同尺寸。
 * `kv_layer_stride`：每 attention 层的字节数 = `n_blocks * kv_block_bytes()`。三处设置：
   `kv_setup` 的两条分支与 `alloc_buffers`（`engine.cpp:390`）。这里的 `n_blocks` 是**预留**大小，这
   正是池增长时图基址仍然有效的原因。
-* `kv_scale_stride`（`engine_kvpool.cpp:142`）：仅 int8，`n_blocks * n_head_kv * kBlockSize *
+* `kv_scale_stride`（`engine_kvpool.cpp`）：仅 i8/i4，`n_blocks * n_head_kv * kBlockSize *
   (head_dim/kI8Q) * sizeof(half)`。scale 平面是普通 `malloc_device`（不是虚拟内存），按完整预留分配。
 * `attn_layers()` 统计非递归（full attention）层；GDN 层不占 KV。
 
@@ -135,6 +135,11 @@
 * `i8`（默认）：对称 int8 `[-127,127]` + 每 32 head dim 一个 fp16 scale；数据平面
   `[block][kv head][token][head_dim]`，scale 平面 `[block][kv head][token][head_dim/32]`。
   3 KB/token/layer（K+V）。
+* `i4`：每字节打包两个对称 4-bit 值 `[-7,7]`（低 nibble = 偶数 dim，二补码）+ 同样的每 32 head dim
+  fp16 scale；数据平面 `[block][kv head][token][head_dim/2]`，scale 平面与 i8 相同。
+  1.5 KB/token/layer，是 i8 的一半。
 * `bf16`：2 字节元素；`f16`：同尺寸、指数更小；`f32`：历史路径，12 KB/token/layer。
 
-int8 的量化与反量化在 kernel 内完成（`qk_norm_rope` 写、`attn` 读），中间算术保持 fp32。
+int8/int4 的量化与反量化在 kernel 内完成（`qk_norm_rope` 写、`attn` 读），中间算术保持 fp32。
+KV 类型通过 `--kv-type`（CLI）或 `PF_KV_TYPE`（env）选择，见 [03-kernels.md](03-kernels.md#11-kv-存储类型kv_typeh)。
+i4 的精度/性能测量见 [`reports/int4_kv.md`](../../reports/int4_kv.md)：端到端与 i8 持平，收益是容量。

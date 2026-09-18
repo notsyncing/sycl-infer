@@ -212,11 +212,13 @@ rpos = mrope[sec*(kMaxB*kMaxT) + r*kMaxT + t]
 
 块内 token 偏移 `kb = table[pos/kBlockSize]`、`ko = pos%kBlockSize`。存储类型由 `kv_dtype()` 模板化。
 
-* 非 int8：K 写入 `pool + (((kb*n_head_kv + kh)*kBlockSize + ko)*head_dim) * elem`，布局
+* 非 int8/int4：K 写入 `pool + (((kb*n_head_kv + kh)*kBlockSize + ko)*head_dim) * elem`，布局
   `[block][kv head][token][head_dim]`；V 同理。
 * int8：`unit = kb*n_head_kv + kh`；行指针 `krow = base + (unit*kBlockSize + ko)*head_dim`；scale 指针
   `ksc = base + (unit*kBlockSize+ko)*(head_dim/kI8Q)`（fp16）。每个 32 维块内 `m = sg_max(|v|)`、
   `sc = m>0 ? m/127 : 1`、存 `i8_quant(v, sc)`，lane 0 写 `ksc[i] = (half)sc`。
+* int4：行指针按字节 `(unit*kBlockSize + ko)*(head_dim/2)`；每个 32 维块 `sc = m/7`、量化到 `[-7,7]`，
+  偶数 lane 用 `permute_group_by_xor(sg, nib, 1)` 取相邻 lane 的高 nibble 打包成一个字节；scale 平面同 i8。
 
 ---
 
@@ -226,8 +228,8 @@ rpos = mrope[sec*(kMaxB*kMaxT) + r*kMaxT + t]
 
 `HD = 256`，`qstride = n_head*2*head_dim`，`pstride = 2 + head_dim`（partial 记录：`m`、`l`、`head_dim`
 个累加值）。`fuse = (out != nullptr && n_splits == 1)`。`grp` 来自参数或 `PF_DEC_GROUP`（**默认 off**，
-`kernels.h:117` 的注释已过时）。分组 kernel 仅在 `grp && kv_dtype()!=i8 && !fuse && head_dim==256 &&
-n_head == 4*n_head_kv` 时选中。否则走经典 kernel，按 KV dtype 特化。
+`kernels.h:117` 的注释已过时）。分组 kernel 仅在 `grp && !kv_dtype_has_scales(kv_dtype()) && !fuse && head_dim==256 &&
+n_head == 4*n_head_kv` 时选中。否则走经典 kernel，按 KV dtype 特化（i8/i4 无分组路径）。
 
 ### 7.2 经典 kernel（`attn.cpp:176-350`）
 
@@ -238,8 +240,8 @@ n_head == 4*n_head_kv` 时选中。否则走经典 kernel，按 KV dtype 特化�
 * **因果**：`n_kv = pos+1`；键范围切成 `n_splits` 段，`t0 = s*chunk`，`t1 = min(t0+chunk, n_kv)`。
 * **GQA**：`kvh = (h*n_head_kv)/n_head`。
 * **向量化路径 `avec`**（默认，`PF_ATTN_VEC=0` 关闭）：每 lane 两个 4 维块 `d0=lane*4`、
-  `d1=d0+HD/2`，Q/K/V 合并访问。非 int8 `dot = dot4(qa,ka)+dot4(qb,kb4)`；int8 时两块落在 int8 block
-  `lane/8` 与 `4+lane/8`，各自乘 scale。在线 softmax：
+  `d1=d0+HD/2`，Q/K/V 合并访问。非量化 `dot = dot4(qa,ka)+dot4(qb,kb4)`；int8/int4 时两块落在量化 block
+  `lane/8` 与 `4+lane/8`，各自乘 scale（i4 用 `i4_ld4` 解包 nibble）。在线 softmax：
   `mnew=max(m,dot); e=exp(dot-mnew); corr=exp(m-mnew); l=l*corr+e`；V 用 `fma4` 累加。
 * **融合输出**（`fuse`）：gate 指针是 head 槽的第二半，输出 `(a/l)*sigmoid(gb)`。
 * 否则写 partial（`part[0]=m`、`part[1]=l`、后续累加值）。
@@ -248,7 +250,7 @@ n_head == 4*n_head_kv` 时选中。否则走经典 kernel，按 KV dtype 特化�
 
 `PF_DEC_GROUP` 可选（默认 off；Iris Xe 上经典 kernel 实测更快）。一个 warp 对应 `(r,t,kvh,s)`，
 `HPG=4` 个 query head 共享每次 K/V float4 加载；每个 head 的运算序列与经典向量化 kernel 完全相同，
-因此 partial 逐位一致。无 gate、无 int8。
+因此 partial 逐位一致。无 gate、无 int8/int4。
 
 ### 7.4 `attn_combine_launch`（`attn.cpp:364-392`）
 
@@ -327,20 +329,31 @@ out = a * inv * weight * silu(z)
 ## 11. KV 存储类型（`kv_type.{h,cpp}`）
 
 ```cpp
-enum class kv_dtype_t : int { f32=0, bf16=1, f16=2, i8=3 };
+enum class kv_dtype_t : int { f32=0, bf16=1, f16=2, i8=3, i4=4 };
 ```
 
-进程内解析一次，优先级（`kv_type.cpp:16-43`）：
+解析优先级（`kv_type.cpp`）：
 
-1. `PF_KV_F32 != 0` 或 `PF_KV_BF16 == 0` → f32；
-2. `PF_KV_TYPE` 未设/空 → i8（默认）；
-3. `PF_KV_TYPE = f32|fp32|0 / f16|fp16 / bf16 / i8|int8|q8`；未知 → 警告 + i8。
+1. `--kv-type T`（`kv_dtype_set`，在 engine 构造前生效）；
+2. `PF_KV_F32 != 0` 或 `PF_KV_BF16 == 0` → f32；
+3. `PF_KV_TYPE` 未设/空 → i8（默认）；
+4. `PF_KV_TYPE = f32|fp32|0 / f16|fp16 / bf16 / i8|int8|q8 / i4|int4|q4`；未知 → 警告 + i8。
 
-int8 几何：`[block][kv head]` 单元内是 `kBlockSize` 行 × `head_dim` int8，后接独立的
+i8 几何：`[block][kv head]` 单元内是 `kBlockSize` 行 × `head_dim` int8，后接独立的
 `kBlockSize × (head_dim/32)` fp16 scale 平面。成本 3 KB/token/layer（K+V）对比 bf16 的 6、f32 的 12。
-选择 i8 默认是因为长上下文 decode 在该 GPU 上受 DRAM 字节数限制。
 
-`kv_ld_host` 是主机侧元素读取；int8 返回原始 int8 值，scale 处理在 `engine::kv_read_vec`。
+i4 几何相同，但每个字节打包两个有符号 4-bit 值（低 nibble = 偶数 head dim，值域 `[-7,7]`，二补码），
+一行是 `head_dim/2` 字节，scale 平面与 i8 一致；成本 1.5 KB/token/layer。`kv_dtype_bits` /
+`kv_dtype_row_bytes` 给出每元素位数与行字节数，`kv_dtype_has_scales` 判断是否有独立 scale 平面。
+
+`kv_ld_host` 是主机侧元素读取；i8/i4 返回反量化后的值（i4 用元素下标定位 nibble），
+pool 的 scale 处理在 `engine::kv_read_vec`。
+
+i4 读取细节：`i4_ld4` 用**一次对齐 16-bit 加载**取 4 个 nibble（`d` 是 4 的倍数，字节偏移
+`d/2` 必为偶数），再做 4 次提取——两次标量字节加载会让 16k decode 明显变慢（该 kernel 在长
+上下文是**指令**而非字节受限）。性能取舍：i4 端到端 decode/prefill 与 i8 持平，收益是容量
+（同预算 2x 上下文）；短上下文 prefill attention 因解包 ALU 慢约 20%，但被 GEMM 稀释。测量见
+[`reports/int4_kv.md`](../../reports/int4_kv.md)。
 
 ---
 

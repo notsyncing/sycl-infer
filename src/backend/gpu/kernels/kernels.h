@@ -9,7 +9,7 @@
 namespace si {
 
 constexpr int kMaxT = 32;      // max tokens per row (prefill chunk)
-constexpr int kI8Q = 32;       // int8 KV: head dimensions per quant scale
+constexpr int kI8Q = 32;       // int8/int4 KV: head dimensions per quant scale
 constexpr int kMaxB = 16;      // max concurrent sequences (continuous batching)
 constexpr int kMaxRows = 32;   // max rows in the per-token buffers
 constexpr int kBlockSize = 32; // paged KV cache block size (tokens)
@@ -106,8 +106,8 @@ void embed_launch(sycl::queue & q, const void * table, uint32_t type, const step
                   size_t row_bytes);
 void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
                        int nsb, int n_tok_blocks = 0);
-// kscales/vscales: the int8 per-32 fp16 scale planes (nullptr for the other
-// storage types); one plane entry per (block, kv head, token, 32 dims)
+// kscales/vscales: the int8/int4 per-32 fp16 scale planes (nullptr for the
+// other storage types); one plane entry per (block, kv head, token, 32 dims)
 void qk_norm_rope_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vbuf, const float * q_norm,
                          const float * k_norm, void * kpool, void * vpool, const int32_t * tables,
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,

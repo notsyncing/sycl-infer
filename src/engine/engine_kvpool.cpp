@@ -26,7 +26,7 @@ static void * dalloc_bytes(sycl::queue & q, size_t bytes, bool host) {
 // has no virtual USM support the pool falls back to a plain fixed allocation
 // of the initial size.
 size_t engine::kv_block_bytes() const {
-    return (size_t)m.hp.n_head_kv * kBlockSize * m.hp.head_dim * kv_elem_bytes();
+    return (size_t)m.hp.n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_dtype(), m.hp.head_dim);
 }
 
 void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
@@ -56,6 +56,30 @@ void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
             const size_t e = elem_off + (size_t)i;
             const size_t row = e / hd;
             dst[i] = (float)(int8_t)tmp[(size_t)i] * (float)sc[(row - r0) * nq + (e % hd) / kI8Q];
+        }
+        return;
+    }
+    if (dt == kv_dtype_t::i4) {
+        // two nibbles per byte; the scale plane is the same as i8.  `elem_off`
+        // indexes the element grid, so the byte range is [elem_off/2, (end)/2].
+        const int hd = m.hp.head_dim;
+        const int nq = hd / kI8Q;
+        const size_t b0 = elem_off / 2;
+        const size_t b1 = (elem_off + (size_t)n + 1) / 2;
+        std::vector<uint8_t> tmp(b1 - b0);
+        q.memcpy(tmp.data(), (const uint8_t *)base + b0, tmp.size()).wait();
+        const size_t r0 = elem_off / hd, r1 = (elem_off + (size_t)n - 1) / hd;
+        std::vector<sycl::half> sc((r1 - r0 + 1) * (size_t)nq);
+        const void * sbase = which ? d_vscales : d_kscales;
+        for (size_t r = r0; r <= r1; r++) {
+            q.memcpy(&sc[(r - r0) * nq], (const sycl::half *)sbase + r * nq, (size_t)nq * 2).wait();
+        }
+        for (int i = 0; i < n; i++) {
+            const size_t e = elem_off + (size_t)i;
+            const size_t row = e / hd;
+            const uint8_t byte = tmp[e / 2 - b0];
+            const int v = (e & 1) ? (byte >> 4) : (byte & 0xF);
+            dst[i] = (float)((v ^ 8) - 8) * (float)sc[(row - r0) * nq + (e % hd) / kI8Q];
         }
         return;
     }
@@ -99,7 +123,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         dev_vpool_.assign((size_t)ndev, nullptr);
         dev_kscales_.assign((size_t)ndev, nullptr);
         dev_vscales_.assign((size_t)ndev, nullptr);
-        if (kv_dtype() == kv_dtype_t::i8) {
+        if (kv_dtype_has_scales(kv_dtype())) {
             kv_scale_stride =
                 (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
         }
@@ -110,7 +134,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
             }
             dev_kpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
             dev_vpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
-            if (kv_dtype() == kv_dtype_t::i8) {
+            if (kv_dtype_has_scales(kv_dtype())) {
                 dev_kscales_[(size_t)d] = dev_alloc_on(d, kv_scale_stride * (size_t)na);
                 dev_vscales_[(size_t)d] = dev_alloc_on(d, kv_scale_stride * (size_t)na);
             }
@@ -131,7 +155,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         kv_virtual = false;
         n_blocks = initial_blocks;
         kv_layer_stride = (size_t)n_blocks * block_bytes;
-        if (kv_dtype() == kv_dtype_t::i8) {
+        if (kv_dtype_has_scales(kv_dtype())) {
             kv_scale_stride =
                 (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
             d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn, true);
@@ -208,7 +232,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
     // int8: separate fp16 scale planes, indexed like the data pool (one plane
     // per layer for K and V).  They are tiny (head_dim/32 halves per row) and
     // do not participate in the virtual-memory growth.
-    if (kv_dtype() == kv_dtype_t::i8) {
+    if (kv_dtype_has_scales(kv_dtype())) {
         kv_scale_stride = (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
         d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn, cpu_mode);
         d_vscales = dalloc_bytes(q, kv_scale_stride * n_attn, cpu_mode);

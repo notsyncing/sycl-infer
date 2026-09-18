@@ -103,7 +103,7 @@ void engine::pc_ram_init() {
 size_t engine::pc_block_blob_bytes() const {
     const size_t kb = kv_block_bytes();
     size_t per = 2 * kb; // K + V data of one attention layer
-    if (kv_dtype() == kv_dtype_t::i8) {
+    if (kv_dtype_has_scales(kv_dtype())) {
         const size_t sb = (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
         per += 2 * sb; // K + V scale planes
     }
@@ -113,10 +113,9 @@ size_t engine::pc_block_blob_bytes() const {
 void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
     const int na = attn_layers();
     const size_t kb = kv_block_bytes();
-    const size_t sb =
-        kv_dtype() == kv_dtype_t::i8
-            ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
-            : 0;
+    const size_t sb = kv_dtype_has_scales(kv_dtype())
+                          ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
+                          : 0;
     blob.resize(2 * (kb + sb) * (size_t)na);
     size_t off = 0;
     for (int l = 0; l < na; l++) {
@@ -141,10 +140,9 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
 void engine::pc_deserialize_block(const uint8_t * blob, int block) {
     const int na = attn_layers();
     const size_t kb = kv_block_bytes();
-    const size_t sb =
-        kv_dtype() == kv_dtype_t::i8
-            ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
-            : 0;
+    const size_t sb = kv_dtype_has_scales(kv_dtype())
+                          ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
+                          : 0;
     size_t off = 0;
     for (int l = 0; l < na; l++) {
         char * kp = (char *)d_kpool + (size_t)l * kv_layer_stride + (size_t)block * kb;
