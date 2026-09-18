@@ -7,6 +7,8 @@
 
 #include "chat.h"
 #include "chat_util.h"
+#include "cpu_isa.h"
+#include "cpu_types.h"
 #include "engine.h"
 #include "image.h"
 #include "model.h"
@@ -20,51 +22,72 @@ using namespace si;
 // (16k depth + 512 prefill + 32 decode) out of the box; the KV pool commits
 // memory lazily, so this costs virtual address space, not committed RAM.
 static const int kDefaultCtx = 20480;
+static const char * kDefaultModel = "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
 
 static void usage(const char * prog) {
     fprintf(stderr,
             "usage:\n"
-            "  %s --model <gguf> [--ctx N] [--blocks N] [--kv-cap-mb N] [--pc-dir DIR]\n"
-            "     [--pc-disk-mb N] [--pc-ram-mb N] [--pc-vram-mb N] [--port N] [--host H] serve\n"
-            "  %s --model <gguf> gen --prompt \"...\" [--max-tokens N] [--temp T] [--raw]\n"
-            "  %s --model <gguf> --mmproj <mmproj.gguf> gen --image <file> --prompt \"...\"\n"
+            "  %s [--model <gguf>] [common] <command> [options]\n"
             "\n"
-            "  --ctx N     max sequence length in tokens (default %d, or PF_CTX).\n"
-            "              A prompt longer than this is rejected with HTTP 400.\n"
-            "  --ctx full  use the model's maximum context length read from the GGUF\n"
-            "              (<arch>.context_length); the KV pool still grows lazily.\n"
-            "  --blocks N  KV pool blocks committed at startup (default: 512, or the\n"
-            "              whole context when --ctx asks for more).  Each block is\n"
-            "              %d tokens; the pool grows on demand up to the cap.\n"
-            "  --kv-cap-mb N  upper bound for the dynamically grown KV pool, counted\n"
-            "              on the K side (default: auto = exactly what --ctx needs;\n"
-            "              env PF_KV_CAP_MB overrides the flag default).  It also caps\n"
-            "              the sum of the three prefix-cache tiers (VRAM+RAM+disk),\n"
-            "              shrinking disk first, then RAM, then VRAM.\n"
-            "  KV values are stored as PF_KV_TYPE (f32|bf16|f16, default bf16; bf16\n"
-            "  halves the KV bytes, all math stays fp32).  PF_KV_F32=1 = PF_KV_TYPE=f32.\n"
+            "commands:\n"
+            "  serve                        OpenAI-compatible HTTP server\n"
+            "  gen                          generate once from --prompt\n"
             "\n"
-            "  --pc-vram-mb N   device (VRAM) prefix-cache budget, converted into a\n"
-            "                   number of PF_PC_STATES checkpoints from the per-node\n"
-            "                   size (--pc-mem-mb is an alias; env PF_PC_VRAM_MB).\n"
-            "  --pc-ram-mb N    host (RAM) cache budget: nodes evicted from VRAM are\n"
-            "                   kept in RAM before spilling to disk (default 512,\n"
-            "                   env PF_PC_RAM_MB; 0 disables the RAM tier).\n"
-            "  --pc-dir DIR     enable the disk tier and keep its records in DIR\n"
-            "                   (model-specific subdirectory, read at startup).\n"
-            "  --pc-disk-mb N   disk budget (default 1024, env PF_PC_DISK_MB; 0 =\n"
-            "                   unbounded).  Eviction demotes LRU cache nodes in the\n"
-            "                   order VRAM -> RAM -> disk -> dropped.\n"
+            "common (both commands):\n"
+            "  --model <gguf>               model path (default: %s)\n"
+            "  --device cpu|gpu|auto        compute backend (default auto = PF_DEVICE,\n"
+            "                               else gpu)\n"
+            "  --cpu-threads N              CPU backend worker threads (default: physical\n"
+            "                               cores, env PF_CPU_THREADS; 0 = auto)\n"
+            "  --layer-map L:dev,...        pipeline-parallel layer placement across\n"
+            "                               devices, e.g. 0-11:gpu,12-23:cpu (closed\n"
+            "                               ranges, must cover every layer)\n"
+            "  --ctx N | full               max sequence length (default %d, env PF_CTX);\n"
+            "                               `full` reads <arch>.context_length from the GGUF\n"
+            "  --blocks N                   KV blocks committed at startup (default 512 or\n"
+            "                               ceil(ctx/%d); grows lazily up to the cap)\n"
+            "  --kv-cap-mb N                cap for the grown KV pool (default: auto from\n"
+            "                               --ctx; env PF_KV_CAP_MB).  Also caps the sum of\n"
+            "                               the three prefix-cache tiers, shrinking disk,\n"
+            "                               then RAM, then VRAM.\n"
+            "  --mmproj <mmproj.gguf>       vision projector needed by --image\n"
+            "  KV storage: PF_KV_TYPE=i8|bf16|f16|f32 (default i8; PF_KV_F32 and\n"
+            "  PF_KV_BF16 are aliases), all math stays fp32.\n"
             "\n"
-            "env: PF_PREFIX_CACHE=0 disables the cross-request prompt prefix cache\n"
-            "     (default on); PF_PC_STATES=N bounds the state checkpoints\n"
-            "     (default 8, ~19 MB each).  PF_GEMM_DNNL=0 forces the dp4a\n"
-            "     prefill path (oneDNN int8 GEMMs are the default).\n",
-            prog, prog, prog, kDefaultCtx, kBlockSize);
+            "serve:\n"
+            "  --host H                     bind address (default 0.0.0.0)\n"
+            "  --port N                     HTTP port (default 8080)\n"
+            "\n"
+            "gen:\n"
+            "  --prompt \"...\"               prompt text (chat-templated unless --raw)\n"
+            "  --raw                        encode the prompt verbatim (no chat template)\n"
+            "  --image <file>               attach an image (repeatable; needs --mmproj)\n"
+            "  --max-tokens N               generation limit (default 256)\n"
+            "  --temp T                     sampling temperature (default 0.7)\n"
+            "  --top-p P                    nucleus sampling (default 0.95)\n"
+            "  --top-k K                    top-k sampling (default 40)\n"
+            "\n"
+            "prefix cache (three LRU tiers; lookups promote, evictions demote\n"
+            "VRAM -> RAM -> disk -> dropped):\n"
+            "  --pc-vram-mb N               device/VRAM budget (alias --pc-mem-mb; env\n"
+            "                               PF_PC_VRAM_MB); selects the checkpoint count\n"
+            "  --pc-ram-mb N                host/RAM budget (default 512, env PF_PC_RAM_MB;\n"
+            "                               0 disables the tier)\n"
+            "  --pc-dir DIR                 enable the disk tier, records under DIR\n"
+            "                               (model-specific subdir, read at startup)\n"
+            "  --pc-disk-mb N               disk budget (default 1024, env PF_PC_DISK_MB;\n"
+            "                               0 = unbounded)\n"
+            "\n"
+            "  -h, --help                   this message\n"
+            "\n"
+            "env: PF_CTX, PF_KV_CAP_MB, PF_KV_TYPE, PF_PREFIX_CACHE, PF_PC_STATES,\n"
+            "  PF_DEVICE, PF_CPU_ISA, PF_CPU_THREADS, PF_DP4A, PF_DP4A_DEC,\n"
+            "  PF_GEMM_DNNL, PF_NOGRAPH, PF_PROF, PF_TIME.\n",
+            prog, kDefaultModel, kDefaultCtx, kBlockSize);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path = "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    std::string model_path = kDefaultModel;
     std::string prompt;
     std::string host = "0.0.0.0";
     int port = 8080;
@@ -92,11 +115,23 @@ int main(int argc, char ** argv) {
     int pc_mem_mb = -1;
     int pc_ram_mb = -1;
     int pc_vram_mb = -1;
+    int device = -1; // -1 auto (PF_DEVICE), 0 gpu, 1 cpu
+    std::string layer_map; // multi-device: "0-13:gpu,14-27:cpu"
     std::string cmd;
+    bool bad_arg = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
+        // `a` is the option currently being parsed; a missing value is a hard
+        // error rather than silently overwriting the default with ""
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s requires a value\n", a.c_str());
+                bad_arg = true;
+                return "";
+            }
+            return argv[++i];
+        };
         if (a == "--model") {
             model_path = next();
         } else if (a == "--prompt") {
@@ -140,14 +175,38 @@ int main(int argc, char ** argv) {
             pc_ram_mb = atoi(next().c_str());
         } else if (a == "--pc-vram-mb") {
             pc_vram_mb = atoi(next().c_str());
+        } else if (a == "--layer-map") {
+            layer_map = next();
+        } else if (a == "--device") {
+            const std::string v = next();
+            if (v == "cpu" || v == "host") {
+                device = 1;
+            } else if (v == "gpu") {
+                device = 0;
+            } else if (v == "auto") {
+                device = -1;
+            } else {
+                fprintf(stderr, "error: --device expects cpu|gpu|auto\n");
+                return 1;
+            }
+        } else if (a == "--cpu-threads") {
+            cpu_set_thread_count(atoi(next().c_str()));
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
+        } else if (!a.empty() && a[0] == '-') {
+            fprintf(stderr, "error: unknown option %s\n", a.c_str());
+            usage(argv[0]);
+            return 1;
         } else {
             cmd = a;
         }
     }
 
+    if (bad_arg) {
+        usage(argv[0]);
+        return 1;
+    }
     if (cmd.empty()) {
         usage(argv[0]);
         return 1;
@@ -188,7 +247,16 @@ int main(int argc, char ** argv) {
         }
 
         engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb, pc_dir, pc_disk_mb, pc_mem_mb,
-                 pc_ram_mb, pc_vram_mb);
+                 pc_ram_mb, pc_vram_mb, device, layer_map);
+        {
+            const char * isa = cpu_isa_spec();
+            if (e.cpu_mode) {
+                fprintf(stderr, "[dev] backend=cpu (isa=%s, threads=%d), kv in host RAM\n", isa, cpu_thread_count());
+            } else {
+                fprintf(stderr, "[dev] backend=gpu (%s)\n",
+                        e.q.get_device().get_info<sycl::info::device::name>().c_str());
+            }
+        }
         {
             const double kv_mb = (double)e.kv_bytes_total() / (1024.0 * 1024.0);
             const double cap_mb = (double)e.kv_bytes_cap() / (1024.0 * 1024.0);

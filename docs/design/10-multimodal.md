@@ -1,6 +1,6 @@
 # 设计 10：多模态（视觉）输入
 
-覆盖 `src/mm/image.{h,cpp}`、`vision.{h,cpp}`、`multimodal.{h,cpp}`、`src/kernels/vit.cpp` 以及引擎侧的
+覆盖 `src/mm/image.{h,cpp}`、`vision.{h,cpp}`、`multimodal.{h,cpp}`、`src/backend/gpu/kernels/vit.cpp` 以及引擎侧的
 `generate_mm` / `step_info` 多模态字段。
 
 ---

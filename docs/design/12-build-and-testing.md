@@ -19,13 +19,18 @@
 ### 1.2 源文件列表
 
 `sycl_infer_core` 静态库**显式列出**所有 `.cpp`（无 globbing）。新增源文件必须手动加入。目录划分：
-`third_party/unicode*`、`src/kernels/*`（每 kernel 一个 TU）、`src/model/*`、`src/mm/*`、
-`src/engine/*`、`src/server/*`。
+`third_party/unicode*`、`src/backend/gpu/kernels/*` 与 `src/backend/cpu/kernels/*`（每 kernel 一个 TU）、
+`src/model/*`、`src/mm/*`、`src/engine/*`、`src/server/*`。
 
-包含目录：`src/common`、`src/backend`、`src/kernels`、`src/model`、`src/mm`、`src/engine`、`src/server`、
-`third_party`。
+包含目录：`src/common`、`src/backend`、`src/backend/cpu`、`src/backend/gpu/kernels`、`src/model`、`src/mm`、
+`src/engine`、`src/server`、`third_party`。
 
-二进制：`sycl-infer`（`src/main.cpp`）。
+CPU 内核目录（`src/common/cpu_isa.cpp` 与 `src/backend/cpu/kernels/*`）通过 `SI_CPU_SOURCES` 列表
+设为 **`-fno-sycl`**：它们是纯主机 TU，带 AVX2 / AVX-VNNI / AVX-512 target attribute，必须留在
+SYCL device pass 之外。新增 CPU 内核要同时加入该列表。
+
+二进制：`sycl-infer`（`src/main.cpp`）。测试按后端分树：`tests/backend/cpu/`（含 `kernels/`）与
+`tests/backend/gpu/`（含 `kernels/`），共享 harness 在 `tests/common/`。
 
 ### 1.3 测试目标
 
@@ -46,6 +51,8 @@
 | `test_chat_template` | CPU | GGUF `tokenizer.chat_template` 经 minja vs 参考 Jinja2 输出，严格计数 mismatch |
 | `test_compare` | CPU | CPU 参考各阶段 vs llama.cpp tensor dump |
 | `test_cpuref` | CPU | CPU 参考 forward head on token ids（默认 `{9419}`） |
+| `test_cpu_gemv` | CPU | CPU 融合 fp32 + 整数 int8 GEMV/RMSNorm vs `quant.h` 主机反量化参考，多类型多 TB；`PF_CPU_ISA` 可锁变体 |
+| `test_pc_cpu` | CPU | 主机后端的 paged 注意力 + 前缀缓存磁盘 spill/promote 往返（日志逐位一致） |
 | `test_pc_disk` | CPU | 磁盘层记录格式往返、token 校验、LRU 预算、重开持久化、损坏/未知记录 |
 | `test_pc_ram` | CPU | RAM 层 LRU 记录存储 |
 | `test_multimodal` | CPU+GPU | 图像预处理几何、host/device 视觉编码器、位置与 prompt 布局、逐 kernel 对照 |
@@ -59,16 +66,16 @@
 
 ### 2.1 stage 测试脚手架
 
-* `tests/kernels/stage_tests.h` 声明七个 stage 入口。
+* `tests/backend/gpu/kernels/stage_tests.h` 声明七个 stage 入口。
 * 每个 `*_stage.cpp` 定义 `void stage_<kernel>(si::stage_env & env)`，用 `env.get(...)` 取快照、
   `env.cmp(...)` 比较（见 `tests/common/stage_test.h`）。
 * `tests/common/cpu_ref.h` 提供主机参考前向，被 `test_cpuref`、`test_compare`、`test_gpu_vs_ref` 使用。
 
 ### 新增 stage 测试
 
-1. 新建 `tests/kernels/<kernel>_stage.cpp`，定义 `void stage_<kernel>(si::stage_env & env)`。
+1. 新建 `tests/backend/gpu/kernels/<kernel>_stage.cpp`，定义 `void stage_<kernel>(si::stage_env & env)`。
 2. 在 `stage_tests.h` 声明。
-3. 在 `tests/kernels/test_gpu_stages.cpp` 调用。
+3. 在 `tests/backend/gpu/kernels/test_gpu_stages.cpp` 调用。
 4. 把文件加入 `CMakeLists.txt` 的 `test_gpu_stages` 源列表。
 
 ---
@@ -116,12 +123,17 @@ CLI/服务用法见 [../README.md](../../README.md) 与 [01-model-loading.md](01
 ```
 src/common/     → docs/design/02-quantization.md
 src/backend/    → docs/design/02-quantization.md
-src/kernels/    → docs/design/03-kernels.md
+src/backend/gpu/kernels/    → docs/design/03-kernels.md §1-13
+src/backend/cpu/kernels/    → docs/design/03-kernels.md §14, docs/architecture.md §11
+src/backend/cpu/    → docs/design/03-kernels.md §14, docs/architecture.md §11（设备选择与多设备执行）
 src/model/      → docs/design/01-model-loading.md, 08-tokenizer.md, 11-qwen35-model.md
 src/mm/         → docs/design/10-multimodal.md
 src/engine/     → docs/design/04-engine.md, 05-kv-cache.md, 06-prefix-cache.md, 07-sampler.md
 src/server/     → docs/design/09-server.md
-tests/          → 本文档
+tests/backend/gpu/  → docs/design/03-kernels.md, 06-prefix-cache.md
+tests/backend/cpu/  → docs/architecture.md §11, docs/design/06-prefix-cache.md
+tests/common/       → 本文档（共享 harness）
+tests/model/, tests/mm/ → 本文档
 ```
 
 ---

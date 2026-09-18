@@ -9,38 +9,76 @@
 
 namespace si {
 
-static float * dalloc(sycl::queue & q, size_t n) {
-    float * p = sycl::malloc_device<float>(n, q);
-    if (!p) {
-        throw std::runtime_error("device alloc failed");
+// Resolve the requested device: -1 = auto from PF_DEVICE (default gpu),
+// 0/1 = gpu/cpu.  Kept independent of the queue so a CPU build on a machine
+// without a SYCL CPU device still reports cpu while using a GPU context purely
+// for host-USM allocation.
+static int resolve_device(int device) {
+    if (device >= 0) {
+        return device ? 1 : 0;
     }
-    return p;
+    if (const char * e = getenv("PF_DEVICE")) {
+        if (strcmp(e, "cpu") == 0 || strcmp(e, "host") == 0 || strcmp(e, "1") == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
+
+static sycl::queue make_queue(int device_req) {
+    if (device_req == 1) {
+        try {
+            return sycl::queue(sycl::cpu_selector_v, sycl::property::queue::in_order());
+        } catch (...) {
+            // no SYCL CPU device available: the queue is only used for
+            // host-USM allocation / copies, compute runs on the CPU backend
+        }
+    }
+    return sycl::queue(sycl::gpu_selector_v, sycl::property::queue::in_order());
+}
+
 engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb,
-               const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb)
-    : q(sycl::gpu_selector_v, sycl::property::queue::in_order()), max_seq(max_seq_), n_splits(n_splits_),
+               const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb,
+               int device, const std::string & layer_map)
+    : device_req(resolve_device(device)), q(make_queue(device_req)), max_seq(max_seq_), n_splits(n_splits_),
       n_blocks(n_blocks_) {
+    dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
+    cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     tk.load(m.gguf);
-    m.upload(q);
+    if (!layer_map.empty()) {
+        setup_multi_device(layer_map);
+    }
+    if (!multi_dev) {
+        be = cpu_mode ? make_cpu_backend() : make_gpu_backend(q);
+    }
+    if (cpu_mode || multi_dev) {
+        // both replay the segment plans directly (no command graph); attention
+        // is fused since n_splits is a GPU-parallelism knob
+        n_splits = 1;
+        dec_splits = 1;
+    }
+    m.upload(q, /*host=*/cpu_mode || multi_dev);
     {
         // fp32 scale side arrays: measured as a net loss on this GPU (the packed
         // scales share cache lines with the weights; a separate array adds a
         // memory stream) -> opt-in only (PF_META=1, ~260 MB)
         const char * envm = getenv("PF_META");
-        use_meta32 = envm && atoi(envm) != 0;
+        use_meta32 = !cpu_mode && !multi_dev && envm && atoi(envm) != 0;
         if (use_meta32) {
             build_meta32(q);
         }
-        // DP4A is on by default (3x prefill); PF_DP4A=0 forces the fp32 path
+        // int8 GEMM is on by default on both backends.  The GPU packs the SIn
+        // w8 copies; the CPU's integer kernel reads the GGUF blocks directly,
+        // so it does not build (or pay for) the w8 copies.
         const char * env = getenv("PF_DP4A");
-        pf8 = !(env && atoi(env) == 0);
-        // the packed SI8 decode GEMV now beats the fp32 kernel (~30%);
-        // PF_DP4A_DEC=0 forces the fp32 decode
+        const bool dp4a_env_off = env && atoi(env) == 0;
+        pf8 = !multi_dev && !dp4a_env_off;
+        // PF_DP4A_DEC=0 forces the fp32 decode (both backends)
         const char * envd = getenv("PF_DP4A_DEC");
         pf8_dec = pf8 && !(envd && atoi(envd) == 0);
-        if (pf8) {
-            m.build_w8(q); // SI8 copies cost ~700 MB; only for the DP4A path
+        if (pf8 && !cpu_mode) {
+            m.build_w8(q); // SI8 copies cost ~700 MB; only the GPU needs them
         }
     }
     // prefix cache: ON by default (a hash lookup per request plus bounded
@@ -61,6 +99,12 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         }
         const char * ep = getenv("PF_PREFIX_CACHE");
         pc_enabled = !(ep && atoi(ep) == 0);
+        if (multi_dev) {
+            // the three-tier cache serializes each attention layer's KV from one
+            // pool; with a per-device split that would need a multi-pool record,
+            // so the kvcache stays off for multi-device runs
+            pc_enabled = false;
+        }
         if (pc_enabled) {
             const hparams & hp = m.hp;
             int n_gdn = 0;
@@ -165,7 +209,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     // oneDNN int8 matmul for the mode-2 prefill GEMMs (PF_GEMM_DNNL, default
     // on).  The converted weights live in device USM and are built once here;
     // PF_GEMM_DNNL=0 keeps the dp4a chunk-batched path bit-identical to before.
-    use_dnnl = pf8 && dnnl_gemm_enabled();
+    use_dnnl = !cpu_mode && !multi_dev && pf8 && dnnl_gemm_enabled();
     if (use_dnnl) {
         dnnl = std::make_unique<dnnl_gemm>(q);
         auto add = [&](const wt & t, const w8t & w8) {
@@ -251,8 +295,14 @@ engine::~engine() {
     f(d_tables);
     f(d_info);
     f(d_segs_dec);
+    f(d_segs_dec8);
     f(d_segs_pf);
     f(d_segs_pf8);
+    f(d_segs_pf8_nh);
+    for (int i = 0; i < kPfSlots; i++) {
+        f(d_segs_pf_slot[i]);
+        f(d_segs_pf_nh_slot[i]);
+    }
     f(d_segs_aux);
     f(d_segs_pfb);
     for (auto & b : buckets_) {
@@ -292,6 +342,12 @@ engine::~engine() {
     }
     kv_release_pool();
     m.free_w8(q);
+    for (void * b : weight_blobs_) {
+        if (b) {
+            sycl::free(b, q);
+        }
+    }
+    weight_blobs_.clear();
     if (m.dev_weights) {
         sycl::free(m.dev_weights, q);
     }
@@ -350,32 +406,184 @@ void engine::build_meta32(sycl::queue & q) {
     }
 }
 
+void * engine::alloc_bytes(size_t bytes) {
+    const bool host = cpu_mode || host_act;
+    void * p = host ? sycl::malloc_host(bytes, q) : sycl::malloc_device(bytes, q);
+    if (!p) {
+        throw std::runtime_error("device alloc failed");
+    }
+    return p;
+}
+
+void * engine::dev_alloc_on(int dev, size_t bytes) {
+    if (!multi_dev) {
+        return alloc_bytes(bytes);
+    }
+    void * p = dev_kind_[(size_t)dev] == 1 ? sycl::malloc_host(bytes, q)
+                                           : sycl::malloc_device(bytes, *dev_queues_[(size_t)dev]);
+    if (!p) {
+        throw std::runtime_error("device alloc failed");
+    }
+    return p;
+}
+
+void engine::sync_all() {
+    if (multi_dev) {
+        for (auto & b : backends_) {
+            b->synchronize();
+        }
+        return;
+    }
+    backend().synchronize();
+}
+
+const void * engine::wptr(int dev, const void * host) const {
+    if (!multi_dev) {
+        return m.dev_ptr(host);
+    }
+    const void * base = weight_blobs_[(size_t)dev];
+    if (!base) {
+        return host;
+    }
+    return (const char *)base + ((const char *)host - (const char *)m.gguf.map_base);
+}
+
+const float * engine::wf32(int dev, const float * host) const {
+    return (const float *)wptr(dev, host);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-device layer placement (pipeline parallel).  `layer_map` is a
+// comma-separated list of `begin-end:device` ranges covering [0, n_layer);
+// `device` is `gpu` or `cpu`.  The ranges execute in order, each device
+// computing its contiguous layer range and handing the hidden state to the next
+// at the partition boundary; each device gets its own weights and its own paged
+// KV pool (same global block ids), so every attention layer's KV is stored on
+// the device that computes it.
+void engine::setup_multi_device(const std::string & layer_map) {
+    struct ent {
+        int l0, l1, kind;
+    };
+    std::vector<ent> ents;
+    size_t pos = 0;
+    while (pos < layer_map.size()) {
+        size_t comma = layer_map.find(',', pos);
+        std::string tok = layer_map.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? layer_map.size() : comma + 1;
+        if (tok.empty()) {
+            continue;
+        }
+        size_t colon = tok.find(':');
+        if (colon == std::string::npos) {
+            throw std::runtime_error("bad --layer-map entry (expect begin-end:device): " + tok);
+        }
+        const std::string rng = tok.substr(0, colon);
+        const std::string dev = tok.substr(colon + 1);
+        size_t dash = rng.find('-');
+        if (dash == std::string::npos) {
+            throw std::runtime_error("bad --layer-map range: " + rng);
+        }
+        ent e;
+        e.l0 = atoi(rng.substr(0, dash).c_str());
+        // `begin-end` is an inclusive layer range
+        e.l1 = atoi(rng.substr(dash + 1).c_str()) + 1;
+        e.kind = (dev == "cpu" || dev == "host" || dev == "1") ? 1 : 0;
+        if (e.l0 < 0 || e.l1 <= e.l0) {
+            throw std::runtime_error("bad --layer-map range: " + rng);
+        }
+        ents.push_back(e);
+    }
+    if (ents.empty()) {
+        throw std::runtime_error("empty --layer-map");
+    }
+    // require a contiguous cover of [0, n_layer) in order
+    int expect = 0;
+    for (const ent & e : ents) {
+        if (e.l0 != expect) {
+            throw std::runtime_error("--layer-map must cover every layer without gaps");
+        }
+        expect = e.l1;
+    }
+    if (expect != m.hp.n_layer) {
+        throw std::runtime_error("--layer-map must end at the model's layer count");
+    }
+    const bool has_gpu = std::any_of(ents.begin(), ents.end(), [](const ent & e) { return e.kind == 0; });
+    if (has_gpu && !q.get_device().is_gpu()) {
+        // the shared host-USM activations must be allocated in the GPU context
+        q = sycl::queue(sycl::gpu_selector_v, sycl::property::queue::in_order());
+        dev_kind = device_kind::gpu;
+    }
+    // backend indices: gpu first (global tensors / LM head prefer it), cpu next
+    const int gpu_idx = has_gpu ? 0 : -1;
+    const bool has_cpu = std::any_of(ents.begin(), ents.end(), [](const ent & e) { return e.kind == 1; });
+    const int cpu_idx = has_cpu ? (has_gpu ? 1 : 0) : -1;
+    const int ndev = (gpu_idx >= 0 ? 1 : 0) + (cpu_idx >= 0 ? 1 : 0);
+    backends_.resize((size_t)ndev);
+    dev_kind_.assign((size_t)ndev, 0);
+    weight_blobs_.assign((size_t)ndev, nullptr);
+    dev_queues_.assign((size_t)ndev, nullptr);
+    if (gpu_idx >= 0) {
+        dev_kind_[gpu_idx] = 0;
+        dev_queues_[gpu_idx] = &q;
+        backends_[gpu_idx] = make_gpu_backend(q);
+        // full weight copy on the GPU device
+        void * blob = sycl::malloc_device(m.gguf.map_size, q);
+        if (!blob) {
+            throw std::runtime_error("multi-device weight allocation failed");
+        }
+        q.memcpy(blob, m.gguf.map_base, m.gguf.map_size).wait();
+        weight_blobs_[gpu_idx] = blob;
+    }
+    if (cpu_idx >= 0) {
+        dev_kind_[cpu_idx] = 1;
+        backends_[cpu_idx] = make_cpu_backend();
+    }
+    layer_dev_.assign((size_t)m.hp.n_layer, gpu_idx >= 0 ? gpu_idx : 0);
+    layer_attn_local_.assign((size_t)m.hp.n_layer, -1);
+    std::vector<int> attn_local((size_t)ndev, 0);
+    for (const ent & e : ents) {
+        const int dev = e.kind == 1 ? cpu_idx : gpu_idx;
+        for (int il = e.l0; il < e.l1; il++) {
+            layer_dev_[(size_t)il] = dev;
+            if (!m.hp.is_recr(il)) {
+                layer_attn_local_[(size_t)il] = attn_local[(size_t)dev]++;
+            }
+        }
+    }
+    multi_dev = true;
+    host_act = true;
+    pf8 = false;
+    use_dnnl = false;
+    cpu_mode = false;
+    fprintf(stderr, "[dev] multi-device layer map: %s (%d backends)\n", layer_map.c_str(), ndev);
+}
+
 void engine::alloc_buffers() {
     const hparams & hp = m.hp;
     // per-token buffers must cover every (row, token) cell: chunk-batched
     // prefill (mode 2) lays tokens out flat, one row per chunk, so it needs
     // kMaxB*kMaxT rows rather than kMaxRows (the old chunk-local value)
     const int R = kMaxB * kMaxT;
-    d_x = dalloc(q, (size_t)R * hp.n_embd);
-    d_xnorm = dalloc(q, (size_t)R * hp.n_embd);
-    d_qkv = dalloc(q, (size_t)R * 3 * hp.d_inner);
-    d_z = dalloc(q, (size_t)R * hp.d_inner);
-    d_beta = dalloc(q, (size_t)R * hp.dt_rank);
-    d_alpha = dalloc(q, (size_t)R * hp.dt_rank);
-    d_conv_out = dalloc(q, (size_t)R * 3 * hp.d_inner);
-    d_attn_pre = dalloc(q, (size_t)R * hp.d_inner);
-    d_attn_merged = dalloc(q, (size_t)R * hp.d_inner);
-    d_qbuf = dalloc(q, (size_t)R * hp.n_head * 2 * hp.head_dim);
-    d_kbuf = dalloc(q, (size_t)R * hp.n_head_kv * hp.head_dim);
-    d_vbuf = dalloc(q, (size_t)R * hp.n_head_kv * hp.head_dim);
-    d_attn_out = dalloc(q, (size_t)R * hp.n_head * hp.head_dim);
-    d_ffn = dalloc(q, (size_t)R * ffn_stride);
-    d_partials = dalloc(q, (size_t)R * hp.n_head * n_splits * (2 + hp.head_dim));
-    d_partials_dec = dalloc(q, (size_t)kMaxB * hp.n_head * dec_splits * (2 + hp.head_dim));
-    d_logits = dalloc(q, (size_t)kMaxB * hp.n_vocab);
-    d_last_hidden = dalloc(q, (size_t)hp.n_embd);
+    d_x = alloc_elems<float>((size_t)R * hp.n_embd);
+    d_xnorm = alloc_elems<float>((size_t)R * hp.n_embd);
+    d_qkv = alloc_elems<float>((size_t)R * 3 * hp.d_inner);
+    d_z = alloc_elems<float>((size_t)R * hp.d_inner);
+    d_beta = alloc_elems<float>((size_t)R * hp.dt_rank);
+    d_alpha = alloc_elems<float>((size_t)R * hp.dt_rank);
+    d_conv_out = alloc_elems<float>((size_t)R * 3 * hp.d_inner);
+    d_attn_pre = alloc_elems<float>((size_t)R * hp.d_inner);
+    d_attn_merged = alloc_elems<float>((size_t)R * hp.d_inner);
+    d_qbuf = alloc_elems<float>((size_t)R * hp.n_head * 2 * hp.head_dim);
+    d_kbuf = alloc_elems<float>((size_t)R * hp.n_head_kv * hp.head_dim);
+    d_vbuf = alloc_elems<float>((size_t)R * hp.n_head_kv * hp.head_dim);
+    d_attn_out = alloc_elems<float>((size_t)R * hp.n_head * hp.head_dim);
+    d_ffn = alloc_elems<float>((size_t)R * ffn_stride);
+    d_partials = alloc_elems<float>((size_t)R * hp.n_head * n_splits * (2 + hp.head_dim));
+    d_partials_dec = alloc_elems<float>((size_t)kMaxB * hp.n_head * dec_splits * (2 + hp.head_dim));
+    d_logits = alloc_elems<float>((size_t)kMaxB * hp.n_vocab);
+    d_last_hidden = alloc_elems<float>((size_t)hp.n_embd);
     // merged vision-token embeddings of the current multimodal prompt
-    d_img_embd = dalloc(q, (size_t)kMaxImgTokens * hp.n_embd);
+    d_img_embd = alloc_elems<float>((size_t)kMaxImgTokens * hp.n_embd);
 
     int n_gdn = 0, n_attn = 0;
     for (int il = 0; il < hp.n_layer; il++) {
@@ -389,18 +597,18 @@ void engine::alloc_buffers() {
     // per-unit scale plane, so this is not an element count any more)
     kv_layer_stride = (size_t)n_blocks * kv_block_bytes();
     kv_setup(n_attn, pool_initial);
-    d_gdn_state = dalloc(q, (size_t)kMaxB * n_gdn * hp.dt_rank * hp.d_state * hp.d_state);
-    d_conv_state = dalloc(q, (size_t)kMaxB * n_gdn * (hp.conv_k - 1) * 3 * hp.d_inner);
+    d_gdn_state = alloc_elems<float>((size_t)kMaxB * n_gdn * hp.dt_rank * hp.d_state * hp.d_state);
+    d_conv_state = alloc_elems<float>((size_t)kMaxB * n_gdn * (hp.conv_k - 1) * 3 * hp.d_inner);
     h_tables.assign((size_t)kMaxB * max_blocks, 0);
-    d_tables = sycl::malloc_device<int32_t>((size_t)kMaxB * max_blocks, q);
+    d_tables = alloc_elems<int32_t>((size_t)kMaxB * max_blocks);
     q.memcpy(d_tables, h_tables.data(), h_tables.size() * 4).wait();
 
     h_logits = (float *)malloc((size_t)kMaxB * hp.n_vocab * 4);
     d_info = sycl::malloc_host<step_info>(1, q);
     std::memset(d_info, 0, sizeof(step_info));
-    d_segs_dec = sycl::malloc_device<gemv_seg>(1024, q);
-    d_segs_pf = sycl::malloc_device<gemv_seg>(4096, q);
-    d_segs_pf8 = sycl::malloc_device<gemv_seg>(4096, q);
+    d_segs_dec = alloc_elems<gemv_seg>(1024);
+    d_segs_pf = alloc_elems<gemv_seg>(4096);
+    d_segs_pf8 = alloc_elems<gemv_seg>(4096);
     {
         // SI8 activation scratch: max K is ffn_down's (n_ff) unless a bigger
         // projection shows up; use the max over the plan-relevant dims
@@ -408,20 +616,20 @@ void engine::alloc_buffers() {
         // chunk-batched prefill quantizes one chunk row per tpb slot, so the
         // activation buffers must cover all rows (kMaxB * kMaxT)
         const size_t xrows = (size_t)kMaxB * kMaxT;
-        d_x8 = sycl::malloc_device<int8_t>(xrows * maxK, q);
-        d_xmeta = sycl::malloc_device<sycl::float2>(xrows * (maxK / 32), q);
-        d_xsumq = sycl::malloc_device<int32_t>(xrows * (maxK / 16), q);
+        d_x8 = alloc_elems<int8_t>(xrows * maxK);
+        d_xmeta = alloc_elems<sycl::float2>(xrows * (maxK / 32));
+        d_xsumq = alloc_elems<int32_t>(xrows * (maxK / 16));
     }
-    d_segs_aux = sycl::malloc_device<gemv_seg>(8, q);
+    d_segs_aux = alloc_elems<gemv_seg>(8);
     for (int tb : {1, 2, 4, 8, 16}) {
         dec_bucket b;
         b.tb = tb;
-        b.d_segs = sycl::malloc_device<gemv_seg>(1024, q);
+        b.d_segs = alloc_elems<gemv_seg>(1024);
         buckets_.push_back(std::move(b));
     }
     if (pc_enabled && pc_max_states > 0) {
         // bounded checkpoint store: one full conv+GDN state per slot
-        d_pc_states = dalloc(q, (size_t)pc_max_states * pc_state_floats);
+        d_pc_states = alloc_elems<float>((size_t)pc_max_states * pc_state_floats);
         pc_state_owner.assign(pc_max_states, -1);
         pc_state_stamp.assign(pc_max_states, 0);
         pc_state_free.resize(pc_max_states);
@@ -493,6 +701,29 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
     }
     // PF_NOGRAPH=1: run the recorded sequence directly (diagnostics/PF_PROF)
     static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    if (cpu_mode || multi_dev) {
+        if (pf8) {
+            // opt-in SI8 prefill keeps the full-chunk plan
+            const seg_plan & pl = with_head ? plan_pf8_ : plan_pf8_nh_;
+            gemv_seg * ds = with_head ? d_segs_pf8 : d_segs_pf8_nh;
+            record_forward(1, pl, ds, kMaxT);
+        } else {
+            // pick the smallest plan that still covers the n active tokens
+            int si = (n + kPfSlice - 1) / kPfSlice - 1;
+            if (si < 0) {
+                si = 0;
+            }
+            if (si >= kPfSlots) {
+                si = kPfSlots - 1;
+            }
+            const seg_plan & pl = with_head ? plan_pf_slot[si] : plan_pf_nh_slot[si];
+            gemv_seg * ds = with_head ? d_segs_pf_slot[si] : d_segs_pf_nh_slot[si];
+            record_forward(1, pl, ds, (si + 1) * kPfSlice);
+        }
+        sync_all();
+        d_info->pc_active = 0;
+        return;
+    }
     if (nog && pf8) {
         record_forward(1, plan_pf8_, d_segs_pf8, kMaxT);
         q.wait();
@@ -509,6 +740,9 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // variants (see build_graphs); callers pick it with batched_prefill_fit().
 void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0) {
     const int NCH = n / kMaxT;
+    if (cpu_mode || multi_dev) {
+        throw std::runtime_error("prefill_batch: not supported on the CPU/multi-device backend");
+    }
     static const bool dbg_pfb = getenv("PF_DBG_PFB") != nullptr;
     pc_capture_begin(slot, toks, start, pos0, n);
     if (dbg_pfb) {
@@ -576,6 +810,11 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
         q.wait();
         return;
     }
+    if (cpu_mode && pf8_dec && n_rows == 1 && d_segs_dec8) {
+        record_forward(0, plan_dec8_, d_segs_dec8, 1);
+        sync_all();
+        return;
+    }
     // pick the smallest captured graph that fits the batch
     dec_bucket * b = nullptr;
     for (auto & bk : buckets_) {
@@ -586,6 +825,11 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
     }
     if (!b) {
         b = &buckets_.back();
+    }
+    if (cpu_mode || multi_dev) {
+        record_forward(0, b->plan, b->d_segs, b->tb);
+        sync_all();
+        return;
     }
     q.ext_oneapi_graph(*b->e);
     q.wait();
@@ -618,7 +862,7 @@ std::vector<float> engine::run_head() {
     // token (the prefill graph writes it via copy_row).
     const hparams & hp = m.hp;
     gemv_seg s{};
-    s.w = m.dev_ptr(m.tok_embd.data);
+    s.w = wptr(0, m.tok_embd.data);
     s.type = m.tok_embd.type;
     s.K = hp.n_embd;
     s.n_rows = hp.n_vocab;
@@ -630,7 +874,8 @@ std::vector<float> engine::run_head() {
     s.residual = nullptr;
     s.alpha = 1.0f;
     q.memcpy(d_segs_aux, &s, sizeof(s)).wait();
-    gemv_group_launch(q, s.type, d_segs_aux, 1, hp.n_vocab, 1, hp.n_embd / 256);
+    backend().gemv_group(s.type, d_segs_aux, 1, hp.n_vocab, 1, hp.n_embd / 256, 0);
+    backend().synchronize();
     q.memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
     return std::vector<float>(h_logits, h_logits + hp.n_vocab);
 }

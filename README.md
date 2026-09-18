@@ -1,10 +1,10 @@
 # sycl-infer — a general-purpose SYCL LLM inference engine
 
 sycl-infer is a from-scratch C++17/SYCL inference engine for quantized LLM
-models on Intel GPUs.  It loads GGUF models directly, serves them through an
-OpenAI-compatible HTTP API or a CLI, and is built around a **pluggable
-architecture registry** so new model types can be added without touching the
-engine or the kernel library.
+models on Intel GPUs or the host CPU.  It loads GGUF models directly, serves
+them through an OpenAI-compatible HTTP API or a CLI, and is built around a
+**pluggable architecture registry** so new model types can be added without
+touching the engine or the kernel library.
 
 The reference model used for development, validation and benchmarks is
 Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
@@ -23,15 +23,22 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
   concurrent sequences).
 * **Cross-request prefix cache** — hashed 32-token blocks with recurrent-state
   checkpoints, so a shared prompt prefix is prefilled only once.
-* **Quantized compute** — in-house int8 DP4A/SIn kernels, plus an optional
+* **Quantized compute** — in-house int8 DP4A/SIn kernels on the GPU and an
+  integer int8 GEMV straight from the GGUF blocks on the CPU, plus an optional
   oneDNN int8 GEMM path for prefill; KV cache stored as int8 (default), bf16,
   f16 or f32.
+* **Device selection** — `--device cpu|gpu|auto`; the CPU backend has its own
+  AVX2 / AVX-VNNI / AVX-512 kernels, picks the variant at run time, and keeps
+  the paged KV in host RAM.
+* **Multi-device (pipeline parallel)** — `--layer-map 0-11:gpu,12-23:cpu` places
+  contiguous layer ranges on devices; each device owns the paged KV of its
+  attention layers.
 * **SYCL command graphs** — the full forward step is captured per shape and
-  replayed, keeping per-token launch overhead minimal.
+  replayed, keeping per-token launch overhead minimal (GPU only).
 * **OpenAI-compatible API** — streaming and non-streaming chat/completions with
   temperature / top-k / top-p / min-p / penalties.
 * **Multimodal (vision) input** — Qwen3.5 image input via a `clip` mmproj GGUF:
-  the vision encoder runs on the GPU (`src/kernels/vit.cpp`), the CLI takes
+  the vision encoder runs on the GPU (`src/backend/gpu/kernels/vit.cpp`), the CLI takes
   `--mmproj` + `--image`, and the server accepts OpenAI `image_url` content
   parts (base64 `data:` URLs).
 
@@ -54,7 +61,9 @@ Adding an architecture is a single new file under `src/model/` — see
 * Intel oneAPI DPC++ compiler (`icpx`) — tested with oneAPI 2026.1
 * oneDNN 2026.0 (optional prefill path; `/opt/intel/oneapi/dnnl/2026.0`,
   override with `-DDNNL_ROOT=`)
-* An Intel GPU with SYCL support (developed against Iris Xe-LP)
+* An Intel GPU with SYCL support (developed against Iris Xe-LP).  The CPU
+  backend (`--device cpu`) runs without a GPU, using the AVX2 / AVX-VNNI /
+  AVX-512 kernel variants selected at run time.
 
 ## Build
 
@@ -92,6 +101,9 @@ Common flags:
 | `--ctx N` | 20480 | max sequence length in tokens |
 | `--blocks N` | 512 | KV blocks committed at startup (32 tokens each) |
 | `--kv-cap-mb N` | auto | upper bound for the dynamically grown KV pool; also caps the sum of the three cache tiers (see below) |
+| `--device cpu\|gpu\|auto` | auto (gpu) | compute backend; `auto` reads `PF_DEVICE` |
+| `--cpu-threads N` | physical cores | CPU backend worker threads (`0` = auto) |
+| `--layer-map L:dev,...` | – | pipeline-parallel layer placement, e.g. `0-11:gpu,12-23:cpu` |
 | `--pc-vram-mb N` | – | VRAM (device) prefix-cache budget, converted to a checkpoint count |
 | `--pc-ram-mb N` | 512 | host-RAM prefix-cache budget (`0` disables the RAM tier) |
 | `--pc-dir DIR` | – | enable the disk prefix-cache tier in `DIR` (model-scoped) |
@@ -139,6 +151,9 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 |---|---|---|
 | `PF_CTX` | 20480 | default for `--ctx` |
 | `PF_KV_CAP_MB` | auto | default for `--kv-cap-mb` |
+| `PF_DEVICE` | `gpu` | default for `--device` (`cpu` / `gpu`) |
+| `PF_CPU_THREADS` | physical cores | CPU backend worker threads (`--cpu-threads` overrides) |
+| `PF_CPU_ISA` | auto | force a CPU kernel variant: `scalar` / `avx2` / `avx512` / `avxvnni` |
 | `PF_KV_TYPE` | `i8` | KV storage: `i8` / `bf16` / `f16` / `f32` (`PF_KV_F32=1` = f32) |
 | `PF_PREFIX_CACHE` | on | `0` disables the cross-request prefix cache |
 | `PF_PC_STATES` | 8 | VRAM recurrent-state checkpoints kept |
@@ -167,6 +182,8 @@ cmake --build build -j
 ./build/test_forward      # end-to-end logits / top-k (GPU)
 ./build/test_pc_disk      # disk prefix-cache format / LRU / reopen (CPU)
 ./build/test_pc_ram       # RAM prefix-cache tier / LRU (CPU)
+./build/test_cpu_gemv     # CPU fp32 + int8 GEMV/RMSNorm vs dequant reference (CPU)
+./build/test_pc_cpu       # host-backend paged attention + prefix-cache round-trip (CPU)
 ./build/test_pc_gpu       # prefix-cache disk spill + promote round-trip (GPU)
 ./build/test_pc_ram_gpu   # prefix-cache VRAM->RAM->VRAM round-trip (GPU)
 ./build/test_cpuref       # CPU reference head output (CPU)

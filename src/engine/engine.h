@@ -14,6 +14,7 @@
 #include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp> // IWYU pragma: keep
 
 #include "dnnl_gemm.h"
+#include "backend.h"
 #include "kernels.h"
 #include "model.h"
 #include "multimodal.h"
@@ -52,6 +53,9 @@ struct seg_plan {
         int K = 0;
     };
     std::vector<xq_t> call_xq; // one entry per call (empty = activations already fp32)
+    // false for the non-final prefill variant: record_forward must not replay a
+    // "head" call then (there is none, and the last FFN call must not repeat)
+    bool has_head = true;
     void set_xq(const float * x, const float * up, int xs, int us, int K) {
         call_xq.back() = {x, up, xs, us, K};
     }
@@ -94,7 +98,40 @@ struct seg_plan {
 struct engine {
     model m;
     tokenizer tk;
+    int device_req = -1; // resolved device request (0 = gpu, 1 = cpu)
     sycl::queue q;
+    // compute backend: one for the single-device path; multi-device runs keep
+    // one backend per layer partition (see layer_dev_ / backends_)
+    device_kind dev_kind = device_kind::gpu;
+    bool cpu_mode = false; // single-device CPU compute (no command graphs)
+    std::unique_ptr<compute_backend> be;
+    compute_backend & backend() {
+        return multi_dev ? *backends_[0] : *be;
+    }
+
+    // ---- multi-device layer placement (dense models) --------------------
+    // One backend per distinct device named in the layer map; each attention
+    // layer's paged KV lives on the device that computes it, so the pool is
+    // split per device (same global block ids, one pool per device).  For a
+    // mixed CPU/GPU map the activations stay in host USM so the boundary
+    // hidden state is shared without an explicit copy.
+    bool multi_dev = false;
+    bool host_act = false; // engine scratch allocated as host USM
+    std::vector<std::unique_ptr<compute_backend>> backends_;
+    std::vector<std::unique_ptr<sycl::queue>> owned_queues_; // extra GPU queues we create
+    std::vector<sycl::queue *> dev_queues_;                  // GPU backend queues (may alias q)
+    std::vector<void *> weight_blobs_;                       // per backend (null = host mmap)
+    std::vector<int> layer_dev_;                           // layer -> backend index
+    std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)
+    std::vector<int> dev_kind_;                            // backend -> 0 gpu / 1 cpu
+    std::vector<void *> dev_kpool_, dev_vpool_, dev_kscales_, dev_vscales_;
+    compute_backend * cur_be = nullptr; // backend of the layer being recorded
+    compute_backend & be_of(int layer) {
+        return multi_dev ? *backends_[(size_t)layer_dev_[layer]] : *be;
+    }
+    void sync_all();
+    const void * wptr(int dev, const void * host) const;
+    const float * wf32(int dev, const float * host) const;
     int max_seq;                 // max tokens per sequence (limited by the block pool)
     int n_splits;                // prefill K-split ceiling (PF_ATTN_SPLIT overrides)
     int dec_splits = kMaxSplits; // decode K-split (PF_DEC_SPLIT overrides)
@@ -165,9 +202,19 @@ struct engine {
     int32_t * d_xsumq = nullptr;
 
     gemv_seg * d_segs_dec = nullptr;
+    gemv_seg * d_segs_dec8 = nullptr; // CPU SI8 decode plan (no command graph)
     gemv_seg * d_segs_pf = nullptr;
     gemv_seg * d_segs_pf8 = nullptr;
     gemv_seg * d_segs_aux = nullptr;
+    // CPU/multi-device prefill: one plan per token count T in {8,16,24,32} so a
+    // short prompt does not compute a full kMaxT chunk.  `plan_pf_`/graph-based
+    // plans above stay for the GPU path; these are the host-side replays.
+    static constexpr int kPfSlice = 8;
+    static constexpr int kPfSlots = kMaxT / kPfSlice;
+    seg_plan plan_pf_slot[kPfSlots];    // fp32, with head (final chunk / generate)
+    seg_plan plan_pf_nh_slot[kPfSlots]; // fp32, no head (scheduler non-final chunk)
+    gemv_seg * d_segs_pf_slot[kPfSlots] = {};
+    gemv_seg * d_segs_pf_nh_slot[kPfSlots] = {};
     // decode graphs bucketed by batch size (1, 2, 4, 8, 16)
     struct dec_bucket {
         int tb;
@@ -186,6 +233,10 @@ struct engine {
     std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_pf8;
     // prefills that are not the last prompt chunk do not need the LM head
     std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_pf8_nh;
+    // CPU backend: prefill plans (final / non-final chunk) and their host
+    // segment copies; recorded graphs above are unused on the CPU path
+    seg_plan plan_pf8_nh_;
+    gemv_seg * d_segs_pf8_nh = nullptr;
     // decode (batch-1) graph on the SI8/DP4A path
     std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g_dec8;
     std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_dec8;
@@ -209,6 +260,9 @@ struct engine {
     // batch size, so it prefills the whole remainder in one forward (the old
     // 256+128+25 split re-read all weights three times for a 409-token prompt).
     int batched_prefill_fit(int rem) const {
+        if (cpu_mode) {
+            return 0; // CPU uses the chunked prefill path
+        }
         if (use_dnnl) {
             int n = (rem / kMaxT) * kMaxT;
             if (n > kMaxB * kMaxT) {
@@ -247,7 +301,7 @@ struct engine {
 
     engine(const std::string & model_path, int max_seq = 8192, int n_splits = 16, int n_blocks = 512,
            int kv_cap_mb = 0, const std::string & pc_dir = "", int pc_disk_mb = -1, int pc_mem_mb = -1,
-           int pc_ram_mb = -1, int pc_vram_mb = -1);
+           int pc_ram_mb = -1, int pc_vram_mb = -1, int device = -1, const std::string & layer_map = "");
     ~engine();
 
     void reset_state();
@@ -383,6 +437,17 @@ private:
     std::priority_queue<int, std::vector<int>, std::greater<int>> free_blocks_;
     void alloc_buffers();
     void build_graphs();
+    void build_plans();
+    // allocate `bytes` on the active backend's memory (device USM for GPU, host
+    // USM for the CPU backend) so the same engine scratch works for both
+    void * alloc_bytes(size_t bytes);
+    // allocate on a specific backend's memory (device USM for that GPU, host USM
+    // for the CPU backend); used by the multi-device KV pools
+    void * dev_alloc_on(int dev, size_t bytes);
+    void setup_multi_device(const std::string & layer_map);
+    template <typename T> T * alloc_elems(size_t n) {
+        return (T *)alloc_bytes(n * sizeof(T));
+    }
     seg_plan build_plan(int T, int tb, bool head_batched, bool use_w8 = false, bool with_head = true) const;
     void record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows = nullptr,
                         int at_nsp_hint = 0);

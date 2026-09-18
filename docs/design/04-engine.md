@@ -9,13 +9,14 @@
 
 `si::engine` 把静态权重（`model`）与 tokenizer 组合成一个可执行的推理运行时：
 
-* 分配所有激活/状态/KV/图缓冲区；
-* 把一次完整 forward 编码为 `seg_plan` 并录制为 SYCL command graph；
+* 选择计算后端（GPU 或 CPU）并为（可能是多个）设备分配所有激活/状态/KV/图缓冲区；
+* 把一次完整 forward 编码为 `seg_plan` 并在 GPU 上录制为 SYCL command graph；
 * 提供 prefill / decode / 单序列 API；
-* 管理动态 KV 池与三层前缀缓存。
+* 管理动态 KV 池与三层前缀缓存（多设备时关闭，见下）。
 
 `engine` 的核心数据结构是 `seg_plan`；核心函数是 `build_plan` 与 `record_forward`，二者必须保持
-调用顺序一致。
+调用顺序一致。所有 kernel 调用都经过 `compute_backend`（见 §11），因此同一份前向逻辑在 GPU
+（录制图）与 CPU/多设备（直接重放）上都成立。
 
 ---
 
@@ -23,10 +24,15 @@
 
 ### 2.1 构造（`engine.cpp:19-239`）
 
-1. **模型/分词器/权重**：`m.load(path)` → `tk.load(m.gguf)` → `m.upload(q)`。队列是
-   `sycl::gpu_selector_v` + `property::queue::in_order`（视觉阶段依赖顺序）。
-2. `PF_META` → `build_meta32`（默认关）。
-3. `PF_DP4A` → `pf8`、`pf8_dec`；`pf8` 时 `m.build_w8(q)`（约 700 MB）。
+1. **模型/分词器/权重**：`m.load(path)` → `tk.load(m.gguf)`。队列由 `make_queue(device_req)` 选择：
+   GPU（`sycl::gpu_selector_v`，默认）或 CPU（`sycl::cpu_selector_v`，`--device cpu`），都带
+   `property::queue::in_order`（视觉阶段/CPU 分配依赖顺序）。权重：GPU `m.upload(q)` 拷贝整文件；
+   CPU `m.upload(q, host=true)` 只把 `dev_ptr` 退化为 mmap 指针，不拷贝。
+2. 若给了 `--layer-map`，`setup_multi_device` 建多个后端、每 GPU 一份整文件权重副本，并把
+   `layer_dev_` / `layer_attn_local_` 填好（见 §11）。
+3. `PF_META` → `build_meta32`（默认关）。
+4. `PF_DP4A` → `pf8`、`pf8_dec`（默认都开）。GPU 在 `pf8` 时 `m.build_w8(q)`（约 700 MB）；
+   CPU 读 GGUF 整数 block，**不建 w8**。
 4. **前缀缓存配置**：`PF_DEC_SPLIT` clamp；计算 `pc_state_floats`（每检查点 float 数）；由
    `PF_PC_STATES` / `PF_PC_VRAM_MB` / `PF_PC_MEM_MB` 得 `pc_max_states`；RAM/磁盘预算；用
    `kv_cap_mb` 收缩三层预算；`pc_max_states == 0` 关闭整个缓存；打开 RAM/磁盘 store。
@@ -341,10 +347,40 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 
 ## 10. 已知细节与注意点
 
-* `engine.cpp:38-41` 默认启用 int8 decode（`pf8_dec` 默认 on），而 `engine.h:228` 的注释仍写 “off by
-  default”——注释已过时，以代码与 AGENTS.md 为准。
-* `plan_pf8_nh` 没有 head call，但 `record_forward` 末尾仍调用
-  `gemv_at(plan.call_offsets.size()-1)`（注释假设 head 总是最后一个 call），因此无 head 的 prefill 会
-  重跑最后一个 `ffn_down`（输出 `d_x` 未被使用）。正确性无影响，但是可测量的浪费。
+* `pf8_dec` 默认 on（GPU 与 CPU 都走 int8 decode，除非 `PF_DP4A_DEC=0`）。
+* 无 head 的 prefill 变体（`plan_pf8_nh` / `plan_pf_nh_slot`）由 `seg_plan::has_head=false` 标记，
+  `record_forward` 只在 `plan.has_head` 时重放最后一个 call，因此不会重跑 `ffn_down`。
 * `run_head` 会重复最终 chunk 已经写好的 head；`d_segs_pfb` 的行偏移副本 / `row_offset_seg` 在当前
-  分发路由下处于休眠状态（模式 2 的 fp32 用 token-block 网格，w8 用连续 `tbm=rows`）。
+  分发路由下处于休眠状态（模式 2 的 fp32 用 token-block 网格，w8/i8 用连续 `tbm=rows`）。
+
+---
+
+## 11. 后端抽象、设备选择与多设备
+
+引擎的所有 kernel 调用都经过 `compute_backend`（`src/backend/backend.h`），它一一镜像
+`src/backend/gpu/kernels/kernels.h` 的启动 API：
+
+* `gpu_backend`（`backend/gpu/gpu_backend.cpp`）转发到 SYCL kernel；`record_forward` 在 command
+  graph 录制期间调用它。
+* `cpu_backend`（`backend/cpu/cpu_backend.cpp`）把 `step_info`/`gemv_seg` 转成无 SYCL 的镜像
+  （`cpu_types.h`）后调用 `src/backend/cpu/kernels/`；主机 kernel 同步执行。
+
+**选择与执行路径**
+
+* `--device cpu|gpu|auto`（或 `PF_DEVICE`）在构造时决定 `dev_kind`/`cpu_mode` 与活跃 `be`。
+* GPU 单设备：`build_graphs` 录制 command graph，`prefill_chunk`/`decode_batch` 重放图。
+* CPU 或 `multi_dev`：`build_graphs` 只调用 `build_plans()`，`prefill_chunk`/`decode_batch` 直接调用
+  `record_forward`（与 `PF_NOGRAPH` 相同的直放路径），`sync_all()` 同步所有后端。
+* CPU 的 prefill 计划按 token 数分档（`plan_pf_slot[i] = build_plan((i+1)*8, 8, ...)`，含 head 与
+  no-head 两套），`prefill_chunk` 用 `round_up(n,8)` 选最小的一份，短 prompt 不再算满 32 行。
+
+**多设备（pipeline parallel）**
+
+* `--layer-map 0-11:gpu,12-23:cpu`：`setup_multi_device` 解析闭区间、校验无缝隙覆盖 `[0,n_layer)`，
+  建立 `backends_`（GPU 优先作为全局张量/LM head 的主设备）与 `layer_dev_`。
+* `build_plan` 用 `wptr(dev, host)` 为每层解析该设备的权重指针；`record_forward` 用 `cur_be = &be_of(il)`
+  逐层切换后端，并在层边界 `synchronize()` 上一个设备（激活在主机 USM，交接无需拷贝）。
+* `layer_attn_local_[il]` 给出该层在**所属设备**注意力层里的序号；`kv_setup` 为每个设备分配只含
+  其注意力层的 paged KV 池，block id 全局一致（同一张 block table，见 [05-kv-cache.md](05-kv-cache.md)）。
+* 多设备关闭前缀缓存（三层记录需要多池）、`pf8` 与 oneDNN；递归状态（GDN/conv）在共享主机 USM 中
+  按全局 GDN 层序号索引，因此混合模型也可用。

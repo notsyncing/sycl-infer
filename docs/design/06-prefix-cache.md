@@ -14,6 +14,10 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 固定递归状态，conv 层持有最后 `conv_k-1` 个 tap。**光有 KV 块无法重建递归状态**，因此一个缓存
 节点只有在携带边界处的递归状态检查点时才可用作恢复点。
 
+> **CPU 与多设备**：CPU 单设备完全支持该缓存（KV/状态都在主机 USM，序列化是主机拷贝），
+> `test_pc_cpu` 覆盖磁盘 spill/promote 往返。多设备（`--layer-map`）会在构造时关闭该缓存
+> （`pc_enabled = false`）：三层记录需要把每个注意力层的 KV 从对应设备的池里拼出来，暂未实现。
+
 ---
 
 ## 2. 缓存节点
@@ -232,5 +236,7 @@ flags(4) hash(8) depth(4) blob_bytes(4) state_bytes(4) toks(32*4)
 ## 9. 进一步阅读
 
 * `reports/prefix_cache.md`：前缀缓存的设计/测量报告。
-* `tests/engine/test_pc_disk.cpp`（磁盘格式/LRU/重开）、`test_pc_ram.cpp`（RAM 层）、
-  `test_pc_gpu.cpp`（磁盘 spill + promote 往返）、`test_pc_ram_gpu.cpp`（VRAM→RAM→VRAM 往返）。
+* `tests/backend/cpu/test_pc_disk.cpp`（磁盘格式/LRU/重开）、`test_pc_ram.cpp`（RAM 层）、
+  `tests/backend/cpu/test_pc_cpu.cpp`（主机后端的 paged attention + 磁盘 tier 往返）、
+  `tests/backend/gpu/test_pc_gpu.cpp`（磁盘 spill + promote 往返）、
+  `tests/backend/gpu/test_pc_ram_gpu.cpp`（VRAM→RAM→VRAM 往返）。

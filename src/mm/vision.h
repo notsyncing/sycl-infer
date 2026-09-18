@@ -5,7 +5,7 @@
 // The mmproj GGUF is a 12-layer ViT over 16x16 patches (fused QKV + GELU MLP,
 // LayerNorm, learned absolute position embeddings) followed by a 2x2 patch
 // merger.  `vision_model::encode_host` implements the reference forward on the
-// host; the SYCL path in src/kernels/vit.cpp mirrors it on the device.
+// host; the SYCL path in src/backend/gpu/kernels/vit.cpp mirrors it on the device.
 //
 // The token order after the "spatial merge" reorder is the one the text model
 // sees: 2x2 patch groups (dy,dx) are laid out contiguously, so the merger can

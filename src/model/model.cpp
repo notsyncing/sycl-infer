@@ -80,7 +80,13 @@ int model_context_length(const std::string & path) {
     return (int)f.get_u32(*arch + ".context_length", 0);
 }
 
-void model::upload(sycl::queue & q) {
+void model::upload(sycl::queue & q, bool host) {
+    if (host) {
+        // CPU backend: dev_ptr() is the identity, so no copy is made
+        dev_weights = nullptr;
+        dev_weights_size = 0;
+        return;
+    }
     dev_weights_size = gguf.map_size;
     dev_weights = sycl::malloc_device(dev_weights_size, q);
     if (!dev_weights) {

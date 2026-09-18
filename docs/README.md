@@ -24,8 +24,9 @@
 ## 快速定位
 
 * 想新增一个模型架构 → [design/01-model-loading.md](design/01-model-loading.md)、[design/11-qwen35-model.md](design/11-qwen35-model.md)
-* 想新增一个 kernel → [design/03-kernels.md](design/03-kernels.md)、[design/12-build-and-testing.md](design/12-build-and-testing.md)
+* 想新增一个 kernel（GPU 或 CPU）→ [design/03-kernels.md](design/03-kernels.md)、[design/12-build-and-testing.md](design/12-build-and-testing.md)
 * 想理解图捕获与模式 0/1/2 → [design/04-engine.md](design/04-engine.md)
+* 想看设备选择 / CPU 后端 / 多设备（`--device`、`--layer-map`）→ [architecture.md §11](architecture.md)、[design/04-engine.md §11](design/04-engine.md)
 * 想调优内存/前缀缓存 → [design/05-kv-cache.md](design/05-kv-cache.md)、[design/06-prefix-cache.md](design/06-prefix-cache.md)
 * 环境变量总表 → [AGENTS.md](../AGENTS.md#environment-variables)
 

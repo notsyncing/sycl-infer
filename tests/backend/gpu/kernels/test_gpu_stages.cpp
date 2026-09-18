@@ -1,7 +1,7 @@
 // Stage-by-stage GPU kernel validation against the CPU reference.
 //
 // One source file per kernel lives next to this runner (see the *_stage.cpp
-// siblings, mirroring src/kernels/); each prepares its own inputs from the
+// siblings, mirroring src/backend/gpu/kernels/); each prepares its own inputs from the
 // reference snapshots and compares back against them.
 #include "stage_tests.h"
 

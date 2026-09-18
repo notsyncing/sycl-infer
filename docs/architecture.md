@@ -19,7 +19,7 @@
    都通过“相对 `map_base` 的偏移”从主机指针推导（`model::dev_ptr`）。见
    [design/01-model-loading.md](design/01-model-loading.md)。
 3. **kernel 库与编排分离**。每个 kernel 一个编译单元，公开的启动 API 集中在
-   `src/kernels/kernels.h`；共享的设备辅助函数在 `src/kernels/kernel_utils.h`（`si::kd`）。kernel 体
+   `src/backend/gpu/kernels/kernels.h`；共享的设备辅助函数在 `src/backend/gpu/kernels/kernel_utils.h`（`si::kd`）。kernel 体
    不放在头文件里。
 4. **图优先执行（graph-first）**。完整的 forward step 按形状一次性录制为 SYCL command graph，之后
    逐步重放，把每 token 的启动开销压到最低。见 [design/04-engine.md](design/04-engine.md)。
@@ -28,7 +28,9 @@
    这是项目最重要的不变量。
 6. **面向集显的带宽优先**。Iris Xe-LP 是内存带宽受限平台，因此：int8 KV 默认；SIn 权重格式按 warp
    合并访问重排；prefill 阻塞批处理让权重保持 L2 热。见 [design/02-quantization.md](design/02-quantization.md)。
-7. **设备代码必须持续可用**。不存在 CPU 回退（只有参考实现和 tokenizer 跑在主机上）。
+7. **设备代码必须持续可用**。GPU（`sycl::gpu_selector_v`）是默认后端；CPU 后端（`src/backend/cpu`，手写
+   AVX2 / AVX-VNNI / AVX-512 内核）与 GPU 后端共享同一套 `compute_backend` 接口，可通过
+   `--device cpu|gpu|auto` 选择。多设备（层放置）见 §11。
 
 ---
 
@@ -47,7 +49,7 @@ flowchart LR
     SCHED --> ENG
     MAIN --> MM[src/mm vision]
     SRV --> MM
-    ENG --> KERN[src/kernels]
+    ENG --> KERN[src/backend/gpu/kernels]
     ENG --> MODEL[src/model]
     ENG --> PC[prefix cache\npc_ram / pc_disk]
     KERN --> GPU[(Intel GPU)]
@@ -70,10 +72,21 @@ src/common/     量化格式与底层公共设施
                 quant.h       ggml block 布局 + 主机端反量化参考
                 w8.{h,cpp}    SIn int8 权重格式：重排、尺寸、Q6_K scale-only 优化
                 dp4a.h        可移植的 dp4a 辅助
+                cpu_isa.{h,cpp}  主机 CPU 指令集检测与运行时变体选择
 
-src/backend/    dnnl_gemm.{h,cpp}  可选 oneDNN int8 预填充 GEMM（PF_GEMM_DNNL）
+src/backend/    backend.h       compute_backend 抽象（共享接口 + 工厂）
+                gpu/gpu_backend.cpp   转发到 SYCL kernel 库
+                cpu/cpu_backend.cpp   转换 POD 后调用主机内核
+                cpu/cpu_types.h       无 SYCL 的镜像结构 + 启动声明
+                dnnl_gemm.{h,cpp}  可选 oneDNN int8 预填充 GEMM（PF_GEMM_DNNL）
 
-src/kernels/    kernels.h      公开启动 API + step_info + gemv_seg + 常量
+src/backend/cpu/kernels/    每个主机 kernel 一个 .cpp（编译时 `-fno-sycl`，可带 AVX2 /
+                AVX-VNNI / AVX-512 target attribute；结构类内核为标量）：
+                common（线程池 + ISA 分派 + 反量化/RMSNorm 辅助）, rmsnorm,
+                embed, copy_row, gemv, qk_norm_rope, attn, conv, gdn,
+                gated_norm, xq, dp4a, i8（GGUF 整数 GEMV）
+
+src/backend/gpu/kernels/    kernels.h      公开启动 API + step_info + gemv_seg + 常量
                 kernel_utils.h 共享设备辅助（si::kd）：反量化、KV 访问、子组归约等
                 kv_type.{h,cpp} KV 存储类型选择与字节几何
                 每个 kernel 一个 .cpp：rmsnorm, embed, copy_row, gemv,
@@ -266,7 +279,7 @@ KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射�
 | `kMaxImgTokens` | 1024 | 单图最大合并视觉 token 数 |
 | `kMaxImgPatches` | 4096 | 单图最大 ViT patch token 数（= 4 × 合并 token） |
 
-定义在 `src/kernels/kernels.h`。修改这些常量会改变设备内存占用，也会改变录制图的形状集合。
+定义在 `src/backend/gpu/kernels/kernels.h`。修改这些常量会改变设备内存占用，也会改变录制图的形状集合。
 
 ---
 
@@ -298,3 +311,52 @@ KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射�
 
 任何改动都应遵守 [AGENTS.md](../AGENTS.md) 的“Quick verification”流程：构建无警告、
 `test_gpu_stages` / `test_gpu_vs_ref` / `test_forward` 通过、`clang-tidy` include-cleaner 干净。
+
+---
+
+## 11. 设备选择与多设备执行
+
+### 11.1 后端抽象
+
+`src/backend/backend.h` 的 `compute_backend` 是 `src/backend/gpu/kernels/kernels.h` 启动 API 的一一镜像
+（RMSNorm / embed / GEMV / paged attention / conv / GDN / gated_norm / xq / dp4a）。引擎的
+`record_forward` 只调用 `compute_backend`，因此同一份前向逻辑可以：
+
+* `gpu_backend`：把调用直接转发给 SYCL kernel；`record_forward` 在 command graph 录制期间调用它。
+* `cpu_backend`：把 `step_info` / `gemv_seg` 转换成无 SYCL 的镜像 POD，再调用 `src/backend/cpu` 的主机内核。
+
+`src/backend/cpu/kernels/` 用 `-fno-sycl` 单独编译，因此可以安全地使用 `<immintrin.h>` 与
+`__attribute__((target(...)))`，且不进入 SYCL device pass。热点循环按 `src/common/cpu_isa.h`
+在运行期选择 AVX2 / AVX-VNNI / AVX-512（int8 点积用 VNNI 的 `dpbusd`，否则 AVX2
+`maddubs+madd`；fp32 归约/点积同理）。`PF_CPU_ISA=scalar|avx2|avx512|avxvnni` 可强制变体；
+CPU worker 线程数由 `--cpu-threads N` 或 `PF_CPU_THREADS` 指定（默认 = 物理核数，探测失败时回退到硬件并发）。
+
+CPU 后端默认跑 **从 GGUF block 直接提取的整数 int8 GEMV**（`kernels/i8.cpp`，
+Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgemv_sb_*`），
+激活由 `cpu_xq` 量化；不需要也不构建 GPU 用的 SIn w8 副本（约 700 MB）。`PF_DP4A=0`
+强制融合 fp32 路径。不使用 oneDNN、不使用虚拟 USM，KV 池是普通主机 USM
+（`engine::kv_setup` 的 `cpu_mode` 分支），所有引擎 scratch 用 `sycl::malloc_host` 分配。
+由于没有 command graph，`prefill_chunk` / `decode_batch` 直接调用 `record_forward`
+（与 `PF_NOGRAPH` 相同的直放路径）。
+
+### 11.2 多设备层放置（pipeline parallel）
+
+`--layer-map 0-11:gpu,12-23:cpu` 把层区间映射到设备（`gpu` / `cpu`），每个区间是闭区间且必须无
+缝隙地覆盖 `[0, n_layer)`。**多设备之间采用 pipeline parallel（层区间流水）**：设备 `d` 计算自己的
+层区间 `[l0,l1)`，算完后把隐藏状态 `d_x` 交给下一个设备，后者接着算下一段；当前每次只推进一个
+micro-batch（单序列/单批），不做跨设备重叠。具体地：
+
+* `backends_` 每个设备一个后端；`layer_dev_[il]` 决定每层用哪个后端，`record_forward` 在层边界
+  同步上一个设备（`backends_[d]->synchronize()`），保证对共享主机 USM 激活的写可见——这就是
+  pipeline 的 stage 交接点。激活缓冲区走主机 USM，所以交接不需要显式的 D2D/H2D 拷贝。
+* GPU 后端各自持有整份权重副本（`weight_blobs_`），CPU 后端直接读 mmap；`wptr(dev, host)` 为
+  每层的权重张量解析出该设备的指针，`build_plan` 因此能生成一份含正确指针的计划。
+* **KV 按设备分开**：`layer_attn_local_[il]` 给出该层在所属设备注意力层中的序号，`dev_kpool_[d]`
+  只包含该设备的注意力层。block id 是全局的（同一张 block table），所以 paged attention 与
+  `set_table` 无需改动。
+* 多设备路径直接重放计划（无图）、激活走主机 USM，因此不支持前缀缓存（三层 KV 缓存需要多池
+  记录）；`pf8` 与 oneDNN 也在多设备下关闭。
+
+这满足“dense 模型跨设备流水”的需求：混合模型（GDN + attention）同样可用，因为递归状态也在共享
+主机 USM 中按全局 GDN 层序号索引。
+

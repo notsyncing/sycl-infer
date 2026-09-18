@@ -12,8 +12,13 @@ agnostic: model types are selected through the registry in
 SYCL kernel library, a paged-KV continuous-batching engine with a reusable prefix
 cache, and an OpenAI-compatible HTTP server plus a CLI.
 
-The device code must keep working on `sycl::gpu_selector_v`; there is no CPU
-fallback for the engine (only the reference/tokenizer parts run on the host).
+The GPU path must keep working on `sycl::gpu_selector_v` and remains the default.
+A host CPU backend (`src/backend/cpu`, selected with `--device cpu`) implements the same
+forward pass on the host and picks AVX2 / AVX-VNNI / AVX-512 at run time.  Dense
+(or hybrid) models can also be split across devices by layer with `--layer-map`
+(pipeline parallel: each device runs its contiguous layer range and hands the
+hidden state to the next), in which case each device owns the paged KV of the
+attention layers it computes.
 
 ## Documentation
 
@@ -64,7 +69,7 @@ cmake --build build -j$(nproc)
 * oneDNN is expected at `/opt/intel/oneapi/dnnl/2026.0` (`-DDNNL_ROOT=` to override).
 * `-DSYCL_INFER_AOT=ON` AOT-compiles the device image for `adl-p`.
 * **Debug builds force `-O2` for device code** (see CMakeLists comments).  At
-  `-O0` the IGC device image of `src/kernels/*` becomes huge and its
+  `-O0` the IGC device image of `src/backend/gpu/kernels/*` becomes huge and its
   translation takes minutes (looks like a hang) — do not remove that.
 * Source files are listed explicitly in `CMakeLists.txt` (no globbing).  Add new
   `.cpp` files there.
@@ -85,7 +90,12 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2
 ```
 
 `main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --port
---host`, and for `gen`: `--prompt --max-tokens --temp --top-p --top-k --raw`).
+--host --device --cpu-threads --layer-map --mmproj`, and for `gen`: `--prompt
+--max-tokens --temp --top-p --top-k --raw --image`).  `--device cpu|gpu|auto`
+selects the compute backend; `--cpu-threads N` (or `PF_CPU_THREADS`) sets the
+host worker count;
+`--layer-map 0-11:gpu,12-23:cpu` places closed layer ranges on devices (each
+range must cover the layer list without gaps).
 
 ## Testing
 
@@ -113,9 +123,19 @@ after touching kernels/engine, and confirm they still pass (they print
 
 ```
 src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
-                int8 weight format/repack), dp4a.h (portable dp4a helper)
-src/backend/    dnnl_gemm.{h,cpp} (optional oneDNN int8 matmul, PF_GEMM_DNNL)
-src/kernels/    kernels.h (public launch API + step_info/gemv_seg), kernel_utils.h
+                int8 weight format/repack), dp4a.h (portable dp4a helper),
+                cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch)
+src/backend/    backend.h (compute_backend abstraction), dnnl_gemm.{h,cpp}
+                (optional oneDNN int8 matmul, PF_GEMM_DNNL),
+                gpu/gpu_backend.cpp (forwards to the SYCL kernels),
+                cpu/cpu_backend.cpp (converts the PODs, calls the host kernels),
+                cpu/cpu_types.h (SYCL-free mirror structs + launch decls)
+src/backend/cpu/kernels/    one .cpp per host kernel (compiled without -fsycl,
+                AVX2 / AVX-VNNI / AVX-512 target variants): common (pool + ISA
+                dispatch + dequant/RMSNorm helpers), rmsnorm, embed, copy_row,
+                gemv, qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a,
+                i8 (integer GEMV straight from the GGUF blocks)
+src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), kernel_utils.h
                 (shared device helpers in namespace si::kd), kv_type.{h,cpp},
                 and one .cpp per kernel: rmsnorm, embed, copy_row, gemv,
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
@@ -140,14 +160,18 @@ src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 server.{h,cpp}
 src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
-tests/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp +
-                <kernel>_stage.cpp (one per kernel)
+tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
+                + <kernel>_stage.cpp (one per GPU kernel)
+tests/backend/gpu/  test_forward.cpp, test_gpu_vs_ref.cpp,
+                test_pc_gpu.cpp (disk spill + promote round-trip),
+                test_pc_ram_gpu.cpp (VRAM->RAM->VRAM round-trip)
+tests/backend/cpu/  test_cpuref.cpp, test_pc_cpu.cpp (paged attention + disk
+                tier on the host backend), test_pc_disk.cpp / test_pc_ram.cpp
+                (tier stores)
+tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
+                host reference; run PF_CPU_ISA=scalar|avx2|avx512 to pin a variant)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, positions)
-tests/engine/   test_cpuref.cpp, test_forward.cpp, test_gpu_vs_ref.cpp,
-                test_pc_disk.cpp / test_pc_ram.cpp (tier stores, CPU only),
-                test_pc_gpu.cpp (disk spill + promote round-trip, GPU),
-                test_pc_ram_gpu.cpp (VRAM->RAM->VRAM round-trip, GPU)
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
                 unicode tables (vendored llama.cpp MIT), stb/stb_image.h
                 (public-domain image decode)
@@ -171,7 +195,7 @@ loading design.
 
 ### Add a kernel
 
-1. Add `src/kernels/<name>.cpp` that defines the launcher, declares the kernel
+1. Add `src/backend/gpu/kernels/<name>.cpp` that defines the launcher, declares the kernel
    lambdas in the same TU, and includes `"kernels.h"` + `"kernel_utils.h"`.
    The usual preamble is:
    ```cpp
@@ -183,25 +207,37 @@ loading design.
    ...
    }
    ```
-2. Declare the launch function in `src/kernels/kernels.h`.
+2. Declare the launch function in `src/backend/gpu/kernels/kernels.h`.
 3. Add the `.cpp` to `CMakeLists.txt`.
 4. Add a stage test next to the others (see below).
 
 Shared device helpers (dequantization, KV element access, sub-group reductions,
-SIn/DP4A expansion, `gemm_ws`) live in `src/kernels/kernel_utils.h` under
+SIn/DP4A expansion, `gemm_ws`) live in `src/backend/gpu/kernels/kernel_utils.h` under
 `si::kd`.  Device kernels must be compiled into the TU that uses them — do not
 put kernel bodies in headers.
+
+### Add a CPU kernel
+
+1. Add `src/backend/cpu/kernels/<name>.cpp` including `"common.h"` (the shared
+   pool, ISA dispatch and dequant/RMSNorm helpers) and define the `cpu_<name>`
+   launcher; declare it in `src/backend/cpu/cpu_types.h` and forward it from
+   `src/backend/cpu/cpu_backend.cpp`.
+2. Add the `.cpp` to `CMakeLists.txt` **and** to the `SI_CPU_SOURCES` list so it
+   is compiled with `-fno-sycl` (the CPU kernel directory must stay outside the
+   SYCL device pass).
+3. Use `par(...)` for parallelism and `isa().dot_f32` / `isa().dot_i8` for the
+   ISA-dispatched inner products; structural loops can be plain scalar.
 
 See [`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the kernel
 library layout and per-kernel launch geometry.
 
 ### Add a kernel stage test
 
-1. Add `tests/kernels/<kernel>_stage.cpp` defining
+1. Add `tests/backend/gpu/kernels/<kernel>_stage.cpp` defining
    `void stage_<kernel>(si::stage_env & env)` and comparing against `env.get(...)`
    snapshots with `env.cmp(...)` (see `tests/common/stage_test.h`).
-2. Declare it in `tests/kernels/stage_tests.h`.
-3. Call it in `tests/kernels/test_gpu_stages.cpp`.
+2. Declare it in `tests/backend/gpu/kernels/stage_tests.h`.
+3. Call it in `tests/backend/gpu/kernels/test_gpu_stages.cpp`.
 4. Add the file to the `test_gpu_stages` source list in `CMakeLists.txt`.
 
 ### Multimodal (vision) input
@@ -213,7 +249,7 @@ The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
   aligned to `patch_size*merge`), a Pillow-compatible bicubic resample, and
   `(x-mean)/std` normalization into plane-major CHW f32.
 * `vision_model::encode_host` is the reference forward and
-  `vision_model::encode_device` the SYCL one (`src/kernels/vit.cpp`): summed
+  `vision_model::encode_device` the SYCL one (`src/backend/gpu/kernels/vit.cpp`): summed
   16x16 conv patch embedding (GEMM), 2x2 spatial-merge reorder, learned position
   embeddings, 12 LayerNorm + fused-QKV + GELU-MLP blocks with 2D vision RoPE and
   bidirectional attention (online softmax, tiled through SLM), then the
@@ -269,7 +305,12 @@ kernel variants, so performance numbers must state the env used.
 `PF_SI4` (re-quantize weights to 4-bit SIn), `PF_META` (fp32 side scales).
 
 **Compute path**
-`PF_DP4A` (default on), `PF_DP4A_DEC` (int8 decode, default on),
+`PF_DEVICE` (`cpu`/`gpu`, default `gpu`), `PF_CPU_ISA`
+(`scalar`|`avx2`|`avx512`|`avxvnni`, forces a CPU kernel variant),
+`PF_CPU_THREADS` (CPU backend worker threads, default = physical cores, else hardware concurrency),
+`PF_DP4A` (int8 GEMM, default on: the GPU packs SIn w8 copies, the CPU's
+integer kernel reads the GGUF blocks directly and does not build w8),
+`PF_DP4A_DEC` (int8 decode, default on),
 `PF_GEMM_DNNL` (oneDNN prefill GEMM, default on), `PF_DNNL_NOWARM`, `PF_DNNL_TIME`.
 
 **Attention**
@@ -321,7 +362,7 @@ tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
   functions are not `inline` in this toolchain) — use `src/common/dp4a.h`.
 * `kMaxT` = max prefill chunk (32), `kMaxB` = max batched sequences (16),
   `kBlockSize` = KV block size (32), `kMaxSplits`/`kMaxDecSplits` bound the
-  attention split buffers (`src/kernels/kernels.h`).  Buffer sizes are sized
+  attention split buffers (`src/backend/gpu/kernels/kernels.h`).  Buffer sizes are sized
   from these constants; raising them affects device memory.
 * The int8 KV layout is `[block][kv head][token][head_dim]` data plus a separate
   fp16 scale plane; both pool and scales are advanced in bytes
@@ -331,7 +372,7 @@ tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
 * **Multimodal**: an image consumes `max(nx, ny)` positions, not one per token,
   and the text model uses *interleaved* M-RoPE (`rope.dimension_sections`, e.g.
   `[11,11,10,0]`) where the pair index picks the temporal/row/col position
-  (`src/kernels/qk_norm_rope.cpp`).  Image tokens never reach `tok_embd`: the
+  (`src/backend/gpu/kernels/qk_norm_rope.cpp`).  Image tokens never reach `tok_embd`: the
   embed kernel copies `step_info::img_embd[img_row[t]]` instead.  The
   multimodal path bypasses the prefix cache and uses the single-sequence
   `engine::generate_mm`; `kMaxImgTokens` bounds one image's merged tokens.

@@ -43,24 +43,42 @@ add_library(sycl_infer_core STATIC
     third_party/unicode-data.cpp
     # common: quantization formats and shared low-level helpers
     src/common/w8.cpp
-    # backend: optional oneDNN int8 matmul
+    # common: host ISA detection (compiled without -fsycl, see below)
+    src/common/cpu_isa.cpp
+    # backend: the shared interface plus the GPU and CPU implementations
     src/backend/dnnl_gemm.cpp
-    # kernels: one translation unit per device kernel
-    src/kernels/kv_type.cpp
-    src/kernels/rmsnorm.cpp
-    src/kernels/embed.cpp
-    src/kernels/copy_row.cpp
-    src/kernels/gemv.cpp
-    src/kernels/qk_norm_rope.cpp
-    src/kernels/attn.cpp
-    src/kernels/conv.cpp
-    src/kernels/gdn.cpp
-    src/kernels/gated_norm.cpp
-    src/kernels/xq.cpp
-    src/kernels/dp4a_common.cpp
-    src/kernels/dp4a_gemv.cpp
-    src/kernels/dp4a_gemm.cpp
-    src/kernels/vit.cpp
+    src/backend/gpu/gpu_backend.cpp
+    src/backend/cpu/cpu_backend.cpp
+    # cpu kernels: one translation unit per host kernel (compiled without -fsycl)
+    src/backend/cpu/kernels/common.cpp
+    src/backend/cpu/kernels/rmsnorm.cpp
+    src/backend/cpu/kernels/embed.cpp
+    src/backend/cpu/kernels/copy_row.cpp
+    src/backend/cpu/kernels/gemv.cpp
+    src/backend/cpu/kernels/qk_norm_rope.cpp
+    src/backend/cpu/kernels/attn.cpp
+    src/backend/cpu/kernels/conv.cpp
+    src/backend/cpu/kernels/gdn.cpp
+    src/backend/cpu/kernels/gated_norm.cpp
+    src/backend/cpu/kernels/xq.cpp
+    src/backend/cpu/kernels/dp4a.cpp
+    src/backend/cpu/kernels/i8.cpp
+    # gpu kernels: one translation unit per device kernel
+    src/backend/gpu/kernels/kv_type.cpp
+    src/backend/gpu/kernels/rmsnorm.cpp
+    src/backend/gpu/kernels/embed.cpp
+    src/backend/gpu/kernels/copy_row.cpp
+    src/backend/gpu/kernels/gemv.cpp
+    src/backend/gpu/kernels/qk_norm_rope.cpp
+    src/backend/gpu/kernels/attn.cpp
+    src/backend/gpu/kernels/conv.cpp
+    src/backend/gpu/kernels/gdn.cpp
+    src/backend/gpu/kernels/gated_norm.cpp
+    src/backend/gpu/kernels/xq.cpp
+    src/backend/gpu/kernels/dp4a_common.cpp
+    src/backend/gpu/kernels/dp4a_gemv.cpp
+    src/backend/gpu/kernels/dp4a_gemm.cpp
+    src/backend/gpu/kernels/vit.cpp
     # model: GGUF loading, weights, tokenizer
     src/model/gguf.cpp
     src/model/model.cpp
@@ -88,13 +106,35 @@ add_library(sycl_infer_core STATIC
 target_include_directories(sycl_infer_core PUBLIC
     src/common
     src/backend
-    src/kernels
+    src/backend/cpu
+    src/backend/gpu/kernels
     src/model
     src/mm
     src/engine
     src/server
     third_party
 )
+
+# The CPU kernel library is plain host C++ with AVX2 / AVX-VNNI / AVX-512 target
+# attributes; `-fno-sycl` (after the global -fsycl) keeps it out of the SYCL
+# device pass, so <immintrin.h> and the intrinsics are compiled host-only.
+set(SI_CPU_SOURCES
+    src/common/cpu_isa.cpp
+    src/backend/cpu/kernels/common.cpp
+    src/backend/cpu/kernels/rmsnorm.cpp
+    src/backend/cpu/kernels/embed.cpp
+    src/backend/cpu/kernels/copy_row.cpp
+    src/backend/cpu/kernels/gemv.cpp
+    src/backend/cpu/kernels/qk_norm_rope.cpp
+    src/backend/cpu/kernels/attn.cpp
+    src/backend/cpu/kernels/conv.cpp
+    src/backend/cpu/kernels/gdn.cpp
+    src/backend/cpu/kernels/gated_norm.cpp
+    src/backend/cpu/kernels/xq.cpp
+    src/backend/cpu/kernels/dp4a.cpp
+    src/backend/cpu/kernels/i8.cpp
+)
+set_source_files_properties(${SI_CPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-sycl")
 
 # The vendored llama.cpp Unicode tables keep one intentionally-unused helper;
 # silence the warning here instead of editing third_party (clangd reads this
@@ -132,23 +172,25 @@ si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)
-si_add_test(test_pc_disk     tests/engine/test_pc_disk.cpp)
-si_add_test(test_pc_ram      tests/engine/test_pc_ram.cpp)
-si_add_test(test_pc_gpu      tests/engine/test_pc_gpu.cpp)
-si_add_test(test_pc_ram_gpu  tests/engine/test_pc_ram_gpu.cpp)
-si_add_test(test_cpuref      tests/engine/test_cpuref.cpp)
-si_add_test(test_forward     tests/engine/test_forward.cpp)
-si_add_test(test_gpu_vs_ref  tests/engine/test_gpu_vs_ref.cpp)
-si_add_test(test_gemv        tests/kernels/test_gemv.cpp)
-si_add_test(test_dp4a        tests/kernels/test_dp4a_gemm.cpp)
+si_add_test(test_pc_disk     tests/backend/cpu/test_pc_disk.cpp)
+si_add_test(test_pc_ram      tests/backend/cpu/test_pc_ram.cpp)
+si_add_test(test_cpuref      tests/backend/cpu/test_cpuref.cpp)
+si_add_test(test_pc_cpu      tests/backend/cpu/test_pc_cpu.cpp)
+si_add_test(test_cpu_gemv    tests/backend/cpu/kernels/test_cpu_gemv.cpp)
+si_add_test(test_forward     tests/backend/gpu/test_forward.cpp)
+si_add_test(test_gpu_vs_ref  tests/backend/gpu/test_gpu_vs_ref.cpp)
+si_add_test(test_pc_gpu      tests/backend/gpu/test_pc_gpu.cpp)
+si_add_test(test_pc_ram_gpu  tests/backend/gpu/test_pc_ram_gpu.cpp)
+si_add_test(test_gemv        tests/backend/gpu/kernels/test_gemv.cpp)
+si_add_test(test_dp4a        tests/backend/gpu/kernels/test_dp4a_gemm.cpp)
 
 si_add_test(test_gpu_stages
-    tests/kernels/test_gpu_stages.cpp
-    tests/kernels/rmsnorm_stage.cpp
-    tests/kernels/embed_stage.cpp
-    tests/kernels/qk_norm_rope_stage.cpp
-    tests/kernels/attn_stage.cpp
-    tests/kernels/conv_stage.cpp
-    tests/kernels/gdn_stage.cpp
-    tests/kernels/gated_norm_stage.cpp
+    tests/backend/gpu/kernels/test_gpu_stages.cpp
+    tests/backend/gpu/kernels/rmsnorm_stage.cpp
+    tests/backend/gpu/kernels/embed_stage.cpp
+    tests/backend/gpu/kernels/qk_norm_rope_stage.cpp
+    tests/backend/gpu/kernels/attn_stage.cpp
+    tests/backend/gpu/kernels/conv_stage.cpp
+    tests/backend/gpu/kernels/gdn_stage.cpp
+    tests/backend/gpu/kernels/gated_norm_stage.cpp
 )

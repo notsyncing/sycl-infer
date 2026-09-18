@@ -1,6 +1,6 @@
 #pragma once
 // Declarations of the per-kernel stage tests, one source file per kernel
-// (mirroring src/kernels/).  test_gpu_stages.cpp runs them in order.
+// (mirroring src/backend/gpu/kernels/).  test_gpu_stages.cpp runs them in order.
 #include "stage_test.h"
 
 void stage_rmsnorm(si::stage_env & env);

@@ -1,6 +1,7 @@
-# 设计 03：SYCL Kernel 库
+# 设计 03：SYCL Kernel 库与 CPU kernel 库
 
-覆盖 `src/kernels/` 下所有 kernel 与 `kernel_utils.h`。公开启动 API 见 `kernels.h`；量化数学与 SIn/DP4A
+覆盖 `src/backend/gpu/kernels/` 下所有 SYCL kernel 与 `kernel_utils.h`；CPU 后端的同构主机实现
+在 `src/backend/cpu/kernels/`（见 §14）。公开启动 API 见 `kernels.h`；量化数学与 SIn/DP4A
 见 [02-quantization.md](02-quantization.md)；kernel 如何被编排见 [04-engine.md](04-engine.md)。
 
 ---
@@ -363,8 +364,33 @@ int8 几何：`[block][kv head]` 单元内是 `kBlockSize` 行 × `head_dim` int
 
 ## 13. 新增 kernel
 
-1. 新建 `src/kernels/<name>.cpp`，定义启动函数、在同一 TU 内声明 kernel lambda、包含
+1. 新建 `src/backend/gpu/kernels/<name>.cpp`，定义启动函数、在同一 TU 内声明 kernel lambda、包含
    `"kernels.h"` 与 `"kernel_utils.h"`。
 2. 在 `kernels.h` 声明启动函数。
 3. 在 `CMakeLists.txt` 加入 `.cpp`（无 globbing）。
 4. 新增 stage 测试：[12-build-and-testing.md](12-build-and-testing.md)。
+
+---
+
+## 14. CPU kernel 库（`src/backend/cpu/kernels/`）
+
+CPU 后端是同一套算子的主机实现，**每个 kernel 一个 `.cpp`**，与 GPU 目录一一对应：
+
+| 文件 | 内容 |
+|---|---|
+| `common.{h,cpp}` | 线程池（自旋+休眠混合、`ready` 握手）、ISA 分派表（AVX2 / AVX-VNNI / AVX-512）、融合反量化 GEMV（`gemv_row` / `qgemv_sb_*`）、RMSNorm 辅助 |
+| `rmsnorm.cpp` `embed.cpp` `copy_row.cpp` `gemv.cpp` `qk_norm_rope.cpp` `attn.cpp` `conv.cpp` `gdn.cpp` `gated_norm.cpp` `xq.cpp` `dp4a.cpp` `i8.cpp` | 对应的 `cpu_*` 启动函数（声明在 `src/backend/cpu/cpu_types.h`） |
+
+要点：
+
+* 整个目录用 **`-fno-sycl`** 编译（CMake 的 `SI_CPU_SOURCES` 列表），因此 `<immintrin.h>` 与
+  `__attribute__((target(...)))` 只在 host pass 生效，不进入 SYCL device pass。
+* `cpu_types.h` 无 SYCL 依赖：`cpu_step_info` / `cpu_gemv_seg` 是 `step_info` / `gemv_seg` 的镜像；
+  `src/backend/cpu/cpu_backend.cpp` 在调用边界做转换。
+* 热点循环（点积、归约、整数 `maddubs`）按 `src/common/cpu_isa.h` 运行期选变体；
+  `PF_CPU_ISA=scalar|avx2|avx512|avxvnni` 可强制。结构类 kernel（paged attention、conv/GDN、
+  RoPE/M-RoPE）为标量/自动向量化，语义与 GPU kernel 一致。
+* `gemv_seg.i8`（`cpu_gemv_seg.i8`）为 CPU 专有：为真时 `cpu_i8_gemv`/`cpu_i8_gemm` 从 `seg.w`
+  指向的 GGUF block 直接做整数点积；Q8_0/未知格式与 scalar ISA 回退到融合 fp32。
+* 新增 CPU kernel 的步骤见 [AGENTS.md](../../AGENTS.md) 的 “Add a CPU kernel”
+  （同时加入 `CMakeLists.txt` 与 `SI_CPU_SOURCES`）。

@@ -1,21 +1,28 @@
 # 设计 02：量化格式与 int8 计算路径
 
-覆盖 `src/common/quant.h`、`src/common/w8.{h,cpp}`、`src/common/dp4a.h`、`src/kernels/xq.cpp`、
+覆盖 `src/common/quant.h`、`src/common/w8.{h,cpp}`、`src/common/dp4a.h`、`src/backend/gpu/kernels/xq.cpp`、
 `src/backend/dnnl_gemm.{h,cpp}`。kernel 侧的 GEMV/GEMM 实现见 [03-kernels.md](03-kernels.md)。
 
 ---
 
 ## 1. 概览
 
-引擎有两条量化计算路径和一个 fp32 回退：
+引擎有 GPU 的 SIn/DP4A、CPU 的 GGUF 整数 int8、可选 oneDNN，以及融合 fp32 回退：
 
 | 路径 | 权重格式 | 激活 | 启用 | 适用 |
 |---|---|---|---|---|
-| **SIn + DP4A** | `w8t`（GGUF 整数原值，按位宽打包） | 运行时对称 int8（`xq_launch`） | `PF_DP4A=1`（默认） | prefill GEMM + decode GEMV |
+| **SIn + DP4A**（GPU） | `w8t`（GGUF 整数原值，按位宽打包） | 运行时对称 int8（`xq_launch`） | `PF_DP4A=1`（默认） | prefill GEMM + decode GEMV |
+| **CPU 整数**（`backend/cpu/kernels/i8.cpp`） | 直接读 GGUF block，AVX2 提 4/5/6-bit | 运行时对称 int8（`cpu_xq`） | `PF_DP4A=1`（默认） | Q4_K/Q5_K/Q6_K 的 prefill/decode |
 | **oneDNN int8** | 主机转成行主序 int8 `[N][K]` + 每行 scale | 每行对称 int8，按 call 量化一次 | `PF_GEMM_DNNL=1`（默认） | 模式 2 chunk-batched prefill，以及模式 1 |
-| **fp32/按需反量化** | 直接读 GGUF block，`dequant_sb_lane` | fp32 | `PF_DP4A=0`，或 `PF_DP4A_DEC=0` 的 decode | 回退/严格测试 |
+| **fp32/融合反量化** | 直接读 GGUF block；GPU `dequant_sb_lane`，CPU `qgemv_sb_*`（SIMD 反量化+点积） | fp32 | `PF_DP4A=0`，或 `PF_DP4A_DEC=0` 的 decode | 回退/严格测试/Q8_0 |
 
 `PF_DP4A_DEC=0` 只关闭 decode 的 int8 GEMV，prefill 仍走 int8。
+
+CPU 后端默认走 **整数 int8** 路径，但**不构建 `w8t` 副本**（那是 GPU 的 SIn 格式）：`i8.cpp`
+按 32 值组从 block 里取无符号权重、用 `maddubs`/`madd` 与 `x8` 做整数点积，再按组做
+`sx*(d*sc*Σq·qx − dmin*m*Σqx)` 修正（Q6 为 `sx*d*sc*(Σq·qx − 32·Σqx)`，16 宽组映射到 x8 的
+32 宽组两个半区）。Q8_0 与 `PF_CPU_ISA=scalar` 回退到融合 fp32（`qgemv_sb_*`）。见
+[architecture.md §11](../architecture.md) 与 [03-kernels.md](03-kernels.md)。
 
 ---
 

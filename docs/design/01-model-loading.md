@@ -140,6 +140,12 @@ const void * dev_ptr(const void * host_ptr) const {
 指针，一次线性拷贝才能保持每个偏移有效。kernel 在录制图时捕获 `dev_ptr` 值，因此只要
 `dev_weights` 存活，录制的图就一直有效。
 
+`model::upload(q, host)`（`model.h:60-63`）的 `host=true` 分支 **不做拷贝**：`dev_weights = nullptr`，
+`dev_ptr` 退化为恒等（直接返回 mmap 指针），这就是 CPU 后端的模式——权重留在 mmap 里，主机内核
+直接读（见 [architecture.md §11](../architecture.md)）。多设备（`--layer-map`）不复用单一
+`dev_weights`：`engine::setup_multi_device` 为每个 GPU 后端各拷贝一份整文件，`engine::wptr(dev, host)`
+按层解析出该设备的指针（CPU 后端仍返回 mmap 指针）。
+
 `build_meta32`（`engine.cpp:303-351`）也用主机张量指针作为 `meta32_` 的 key（见
 [02-quantization.md](02-quantization.md)）。
 
@@ -216,6 +222,9 @@ const void * dev_ptr(const void * host_ptr) const {
 | `--ctx N` / `--ctx full` | 最大序列长度 | `PF_CTX` 或 20480 |
 | `--blocks N` | 启动时提交的 KV 块 | 512（lazy）或按 ctx 计算 |
 | `--kv-cap-mb N` | KV 池上限，同时限制三层缓存预算之和 | auto |
+| `--device cpu\|gpu\|auto` | 计算后端（`auto` 读 `PF_DEVICE`，否则 gpu） | auto |
+| `--cpu-threads N` | CPU worker 线程数（0 = 物理核，回退硬件并发） | auto |
+| `--layer-map L:dev,...` | 多设备层放置（pipeline parallel，闭区间无缝隙覆盖） | 空 |
 | `--host H` / `--port N` | serve 绑定 | 0.0.0.0 / 8080 |
 | `--max-tokens` / `--temp` / `--top-p` / `--top-k` | `gen` 采样 | 256 / 0.7 / 0.95 / 40 |
 | `--raw` | `gen` 原样发送（不套 chat 模板） | off |

@@ -9,8 +9,8 @@
 namespace si {
 
 // byte-sized device allocation (KV pools when they are not virtual USM)
-static void * dalloc_bytes(sycl::queue & q, size_t bytes) {
-    void * p = sycl::malloc_device(bytes, q);
+static void * dalloc_bytes(sycl::queue & q, size_t bytes, bool host) {
+    void * p = host ? sycl::malloc_host(bytes, q) : sycl::malloc_device(bytes, q);
     if (!p) {
         throw std::runtime_error("device alloc failed");
     }
@@ -80,6 +80,76 @@ int engine::attn_layers() const {
 
 void engine::kv_setup(int n_attn, int initial_blocks) {
     const size_t block_bytes = kv_block_bytes();
+    if (multi_dev) {
+        // One committed pool per device, holding only the attention layers that
+        // device computes.  Block ids are global, so the same block table works
+        // for every pool; only the per-layer base differs.
+        (void)n_attn;
+        n_blocks = pool_cap;
+        kv_virtual = false;
+        kv_layer_stride = (size_t)n_blocks * block_bytes;
+        const int ndev = (int)backends_.size();
+        std::vector<int> local_attn((size_t)ndev, 0);
+        for (int il = 0; il < m.hp.n_layer; il++) {
+            if (!m.hp.is_recr(il)) {
+                local_attn[(size_t)layer_dev_[il]]++;
+            }
+        }
+        dev_kpool_.assign((size_t)ndev, nullptr);
+        dev_vpool_.assign((size_t)ndev, nullptr);
+        dev_kscales_.assign((size_t)ndev, nullptr);
+        dev_vscales_.assign((size_t)ndev, nullptr);
+        if (kv_dtype() == kv_dtype_t::i8) {
+            kv_scale_stride =
+                (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
+        }
+        for (int d = 0; d < ndev; d++) {
+            const int na = local_attn[(size_t)d];
+            if (na <= 0) {
+                continue;
+            }
+            dev_kpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
+            dev_vpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
+            if (kv_dtype() == kv_dtype_t::i8) {
+                dev_kscales_[(size_t)d] = dev_alloc_on(d, kv_scale_stride * (size_t)na);
+                dev_vscales_[(size_t)d] = dev_alloc_on(d, kv_scale_stride * (size_t)na);
+            }
+        }
+        block_used_.assign(n_blocks, 0);
+        block_extent_.assign(n_blocks, -1);
+        pc_block_node_.assign(n_blocks, -1);
+        pool_initial = pool_cap;
+        pool_blocks = 0;
+        kv_grow(pool_cap);
+        return;
+    }
+    if (cpu_mode) {
+        // Host KV: no virtual-memory machinery; commit the whole reserved range
+        // up front as host USM and hand the blocks out through the normal free
+        // list (kv_grow only does bookkeeping when kv_virtual is false).
+        initial_blocks = pool_cap;
+        kv_virtual = false;
+        n_blocks = initial_blocks;
+        kv_layer_stride = (size_t)n_blocks * block_bytes;
+        if (kv_dtype() == kv_dtype_t::i8) {
+            kv_scale_stride =
+                (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
+            d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn, true);
+            d_vscales = dalloc_bytes(q, kv_scale_stride * n_attn, true);
+            if (!d_kscales || !d_vscales) {
+                throw std::runtime_error("int8 KV scale planes failed");
+            }
+        }
+        block_used_.assign(n_blocks, 0);
+        block_extent_.assign(n_blocks, -1);
+        pc_block_node_.assign(n_blocks, -1);
+        pool_initial = initial_blocks;
+        pool_blocks = 0;
+        d_kpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, true);
+        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, true);
+        kv_grow(initial_blocks);
+        return;
+    }
     const size_t mb2 = (size_t)2 << 20;
     // Level Zero requires mappings of >= 2 MB to be 2 MB aligned, so the whole
     // layout (layer stride and extent starts) is kept on 2 MB boundaries.
@@ -140,8 +210,8 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
     // do not participate in the virtual-memory growth.
     if (kv_dtype() == kv_dtype_t::i8) {
         kv_scale_stride = (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
-        d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn);
-        d_vscales = dalloc_bytes(q, kv_scale_stride * n_attn);
+        d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn, cpu_mode);
+        d_vscales = dalloc_bytes(q, kv_scale_stride * n_attn, cpu_mode);
         if (!d_kscales || !d_vscales) {
             throw std::runtime_error("int8 KV scale planes failed");
         }
@@ -152,8 +222,8 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
     pool_initial = initial_blocks;
     pool_blocks = 0;
     if (!kv_virtual) {
-        d_kpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn);
-        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn);
+        d_kpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, cpu_mode);
+        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, cpu_mode);
         kv_grow(initial_blocks);
         return;
     }
@@ -270,6 +340,34 @@ void engine::kv_shrink() {
 }
 
 void engine::kv_release_pool() {
+    if (multi_dev) {
+        // per-device pools (device USM on the GPU, host USM on the CPU)
+        for (void * p : dev_kpool_) {
+            if (p) {
+                sycl::free(p, q);
+            }
+        }
+        for (void * p : dev_vpool_) {
+            if (p) {
+                sycl::free(p, q);
+            }
+        }
+        for (void * p : dev_kscales_) {
+            if (p) {
+                sycl::free(p, q);
+            }
+        }
+        for (void * p : dev_vscales_) {
+            if (p) {
+                sycl::free(p, q);
+            }
+        }
+        dev_kpool_.clear();
+        dev_vpool_.clear();
+        dev_kscales_.clear();
+        dev_vscales_.clear();
+        return;
+    }
     if (kv_virtual) {
         const size_t layer_bytes = (size_t)n_blocks * kv_block_bytes();
         const int na = attn_layers();

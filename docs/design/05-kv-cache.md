@@ -1,6 +1,6 @@
 # 设计 05：分页 KV Cache 与动态块池
 
-覆盖 `src/engine/engine_kvpool.cpp` 与 `engine.h` 中的 KV 字段、`src/kernels/kv_type.{h,cpp}` 以及
+覆盖 `src/engine/engine_kvpool.cpp` 与 `engine.h` 中的 KV 字段、`src/backend/gpu/kernels/kv_type.{h,cpp}` 以及
 `qk_norm_rope` / `attn` 的 KV 访问布局。前缀缓存见 [06-prefix-cache.md](06-prefix-cache.md)。
 
 ---
@@ -33,6 +33,17 @@
 ## 3. 虚拟 USM 预留（`kv_setup`，`engine_kvpool.cpp:81-169`）
 
 由 `alloc_buffers` 在 `n_blocks = pool_cap` 之后调用 `kv_setup(n_attn, pool_initial)`。
+`kv_setup` 开头有两个分支，都会**跳过虚拟 USM**：
+
+* **CPU（`cpu_mode`）**：`kv_virtual = false`，把整个 `pool_cap` 一次性用 `sycl::malloc_host`
+  提交（K/V 与 int8 scale 平面都是主机 USM），`kv_grow` 只做空闲链表记账。没有虚拟内存与
+  map/shrink，因此 CPU 上 `kv_read_vec`/前缀缓存的磁盘序列化都是主机拷贝。
+* **多设备（`multi_dev`）**：`kv_layer_stride = pool_cap * block_bytes` 全局一致，但每个设备只有
+  一份包含**该设备注意力层**的池（`dev_kpool_[d]`/`dev_vpool_[d]` + scale 平面），由
+  `layer_attn_local_[il]` 索引；block id 全局一致，所以 block table 只需一份。`kv_release_pool`
+  释放这些按设备分配的池。
+
+下面的流程针对单设备 GPU（虚拟 USM）。
 
 1. **2 MB 颗粒度推导**：`mb2 = 2<<20`，`align = ceil(mb2 / block_bytes)`，`kv_align_blocks = align`。
    原因（注释 `:84-87`）：Level Zero 要求 ≥ 2 MB 的映射必须 2 MB 对齐，所以层 stride 与 extent 起点都

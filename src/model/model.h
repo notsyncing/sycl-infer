@@ -70,11 +70,16 @@ struct model {
     size_t dev_weights_size = 0;
 
     void load(const std::string & path);
-    void upload(sycl::queue & q);
+    // upload the whole mmap to device USM; `host` keeps the weights in the
+    // mmap and only makes dev_ptr() an identity (CPU backend)
+    void upload(sycl::queue & q, bool host = false);
     // build / free the SI8 int8 copies of the quantized weight tensors (DP4A path)
-    void build_w8(sycl::queue & q);
+    void build_w8(sycl::queue & q, bool host = false);
     void free_w8(sycl::queue & q);
     const void * dev_ptr(const void * host_ptr) const {
+        if (!dev_weights) {
+            return host_ptr; // CPU backend: weights stay in the mmap
+        }
         return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
     }
     const float * dev_f32(const float * p) const {

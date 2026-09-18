@@ -51,6 +51,9 @@ struct gemv_seg {
     const int8_t * x8 = nullptr;
     const sycl::float2 * xmeta = nullptr; // activation scales (fp32!)
     const int32_t * xsumq = nullptr;
+    // CPU-only: run the integer GEMV straight from the GGUF blocks in `w`
+    // (type/K/n_rows are the real tensor geometry), no SIn packing needed.
+    bool i8 = false;
 };
 
 // scalar state shared between kernels of one step (device memory)

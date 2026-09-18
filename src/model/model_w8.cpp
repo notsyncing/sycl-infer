@@ -16,7 +16,7 @@ namespace si {
 // verbatim from the GGUF K-quant blocks (packed at their native bit width);
 // only the layout and scale/min representation change.  PF_SI4=1 re-quantizes
 // every tensor to 4-bit asymmetric groups instead.  See w8.h for the format.
-static void build_w8_tensor(sycl::queue & q, const wt & t, w8t & out) {
+static void build_w8_tensor(sycl::queue & q, const wt & t, w8t & out, bool host) {
     out = w8t{};
     if (t.type != 12 && t.type != 13 && t.type != 14) {
         return;
@@ -27,8 +27,10 @@ static void build_w8_tensor(sycl::queue & q, const wt & t, w8t & out) {
     const bool scale_only = w8_q6_scale_only_ok(t.type, t.data, t.K, t.N);
     const size_t meta_bytes = w8_meta_bytes(t.type, t.K, t.N, scale_only);
     const uint32_t ltype = w8_effective_type(t.type);
-    out.vals = sycl::malloc_device<uint8_t>(vals_bytes, q);
-    out.meta = meta_bytes ? reinterpret_cast<uint32_t *>(sycl::malloc_device<uint8_t>(meta_bytes, q)) : nullptr;
+    out.vals = host ? sycl::malloc_host<uint8_t>(vals_bytes, q) : sycl::malloc_device<uint8_t>(vals_bytes, q);
+    out.meta = meta_bytes ? (host ? reinterpret_cast<uint32_t *>(sycl::malloc_host<uint8_t>(meta_bytes, q))
+                                  : reinterpret_cast<uint32_t *>(sycl::malloc_device<uint8_t>(meta_bytes, q)))
+                          : nullptr;
     out.K = t.K;
     out.N = t.N;
     out.type = ltype;
@@ -84,21 +86,21 @@ void model::free_w8(sycl::queue & q) {
     }
 }
 
-void model::build_w8(sycl::queue & q) {
-    build_w8_tensor(q, tok_embd, tok_embd8);
+void model::build_w8(sycl::queue & q, bool host) {
+    build_w8_tensor(q, tok_embd, tok_embd8, host);
     for (auto & L : layers) {
-        build_w8_tensor(q, L.ffn_gate, L.ffn_gate8);
-        build_w8_tensor(q, L.ffn_up, L.ffn_up8);
-        build_w8_tensor(q, L.ffn_down, L.ffn_down8);
+        build_w8_tensor(q, L.ffn_gate, L.ffn_gate8, host);
+        build_w8_tensor(q, L.ffn_up, L.ffn_up8, host);
+        build_w8_tensor(q, L.ffn_down, L.ffn_down8, host);
         if (L.recurrent) {
-            build_w8_tensor(q, L.wqkv, L.wqkv8);
-            build_w8_tensor(q, L.wgate, L.wgate8);
-            build_w8_tensor(q, L.ssm_out, L.ssm_out8);
+            build_w8_tensor(q, L.wqkv, L.wqkv8, host);
+            build_w8_tensor(q, L.wgate, L.wgate8, host);
+            build_w8_tensor(q, L.ssm_out, L.ssm_out8, host);
         } else {
-            build_w8_tensor(q, L.wq, L.wq8);
-            build_w8_tensor(q, L.wk, L.wk8);
-            build_w8_tensor(q, L.wv, L.wv8);
-            build_w8_tensor(q, L.wo, L.wo8);
+            build_w8_tensor(q, L.wq, L.wq8, host);
+            build_w8_tensor(q, L.wk, L.wk8, host);
+            build_w8_tensor(q, L.wv, L.wv8, host);
+            build_w8_tensor(q, L.wo, L.wo8, host);
         }
     }
 }
