@@ -15,6 +15,43 @@ cache, and an OpenAI-compatible HTTP server plus a CLI.
 The device code must keep working on `sycl::gpu_selector_v`; there is no CPU
 fallback for the engine (only the reference/tokenizer parts run on the host).
 
+## Documentation
+
+Detailed design docs live in [`docs/`](docs/README.md); read the relevant one
+before changing a subsystem.  They are the source of truth for *why* things are
+built the way they are; this file is the quick-reference for conventions and
+gotchas.
+
+* [`docs/architecture.md`](docs/architecture.md) — overall architecture, module
+  map, runtime object model, data flow, threading, device memory, global
+  invariants, extension points.
+* [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) — GGUF
+  parser, mmap, architecture registry, tensor binding, single-blob device
+  upload, `dev_ptr`, CLI flags.
+* [`docs/design/02-quantization.md`](docs/design/02-quantization.md) — ggml
+  K-quant layouts, SIn int8 weight format, DP4A math, `xq` activation
+  quantization, the oneDNN path and `PF_*` quant switches.
+* [`docs/design/03-kernels.md`](docs/design/03-kernels.md) — every SYCL kernel:
+  layouts, launch geometry, tuning knobs, how to add one.
+* [`docs/design/04-engine.md`](docs/design/04-engine.md) — `seg_plan`,
+  `build_plan`, `record_forward`, command graphs, prefill/decode modes,
+  `step_info` and the graph-freeze invariant.
+* [`docs/design/05-kv-cache.md`](docs/design/05-kv-cache.md) — paged KV, the
+  virtual-USM dynamic block pool, block allocator, KV storage types.
+* [`docs/design/06-prefix-cache.md`](docs/design/06-prefix-cache.md) — chained
+  hashes, recurrent-state checkpoints, VRAM/RAM/disk tiers, budgets, flush.
+* [`docs/design/07-sampler.md`](docs/design/07-sampler.md) — sampling.
+* [`docs/design/08-tokenizer.md`](docs/design/08-tokenizer.md) — byte-level BPE
+  and chat templates.
+* [`docs/design/09-server.md`](docs/design/09-server.md) — OpenAI HTTP API,
+  continuous-batching scheduler, SSE, stop strings.
+* [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) — image
+  preprocessing, vision encoder (host + device), M-RoPE assembly.
+* [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) — the
+  Qwen3.5 hybrid GDN + full-attention model.
+* [`docs/design/12-build-and-testing.md`](docs/design/12-build-and-testing.md) —
+  build targets, test matrix, verification flow.
+
 ## Build
 
 ```bash
@@ -128,6 +165,10 @@ third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
 3. Add the file to `CMakeLists.txt`.  `model::load` dispatches automatically; an
    unknown architecture still throws `unsupported architecture: <name>`.
 
+See [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
+[`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) for the full
+loading design.
+
 ### Add a kernel
 
 1. Add `src/kernels/<name>.cpp` that defines the launcher, declares the kernel
@@ -150,6 +191,9 @@ Shared device helpers (dequantization, KV element access, sub-group reductions,
 SIn/DP4A expansion, `gemm_ws`) live in `src/kernels/kernel_utils.h` under
 `si::kd`.  Device kernels must be compiled into the TU that uses them — do not
 put kernel bodies in headers.
+
+See [`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the kernel
+library layout and per-kernel launch geometry.
 
 ### Add a kernel stage test
 
@@ -195,6 +239,9 @@ The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
 
 CLI: `gen --image FILE` (repeatable).  Server: an OpenAI `image_url` content
 part with a base64 `data:` URL (`/v1/chat/completions`), streaming and not.
+
+See [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) and
+[`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the full design.
 
 ## Conventions
 
@@ -302,3 +349,7 @@ cmake --build build -j$(nproc)          # must be warning-free (except the linke
 ./build/test_forward                    # stable last_id
 clang-tidy -p build -checks='-*,misc-include-cleaner' <changed files>
 ```
+
+See [`docs/design/12-build-and-testing.md`](docs/design/12-build-and-testing.md)
+for the full build/test matrix and the `docs/` index at
+[`docs/README.md`](docs/README.md).
