@@ -228,8 +228,9 @@ struct mm_prompt {
 * **CLI**：`--image` 需要 `--mmproj`；从视觉超参建 `cfg`（`min_pixels=8*patch_area`，
   `max_pixels=kMaxImgTokens*patch_area`），逐文件解码/预处理，渲染带图片 part 的 chat，
   `mm_build_prompt_device(..., e.d_img_embd)`，`e.generate_mm`。
-* **服务器**：`mm_server` 持有 `vision_model` 与 cfg；OpenAI `image_url` `data:` part 经
-  `decode_image_url` → `mm_image_decode_mem` → `mm_image_preprocess` → 渲染 →
+* **服务器**：`mm_server` 持有 `vision_model` 与 cfg；OpenAI `image_url` part 经
+  `load_image_url`（`data:` base64 或 `http(s)://` 下载，见
+  [09-server.md §6](09-server.md)）→ `mm_image_decode_mem` → `mm_image_preprocess` → 渲染 →
   `mm_build_prompt_device`；全程 `mm_req` 串行化。
 
 ---

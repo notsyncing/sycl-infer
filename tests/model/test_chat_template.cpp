@@ -101,6 +101,57 @@ int main(int argc, char ** argv) {
               "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
 
+    // tools + assistant tool_calls + tool response through the real template
+    {
+        const std::string tools =
+            "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\","
+            "\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},"
+            "\"required\":[\"city\"]}}}]";
+        chat_msg user("user", "weather in Paris?");
+        chat_msg asst("assistant", "");
+        asst.tool_calls.push_back({"call_1", "get_weather", "{\"city\":\"Paris\"}"});
+        chat_msg tool("tool", "sunny, 20C");
+        tool.tool_call_id = "call_1";
+        chat_msg follow("user", "thanks");
+        std::string out;
+        const bool ok = render_chat_template(*tmpl, {user, asst, tool, follow}, true, false, out, tools);
+        if (!ok) {
+            g_fail++;
+            printf("  [tools] EVAL FAILED\n");
+        } else {
+            const bool good = out.find("get_weather") != std::string::npos
+                              && out.find("<function=get_weather>") != std::string::npos
+                              && out.find("<parameter=city>") != std::string::npos
+                              && out.find("Paris") != std::string::npos
+                              && out.find("<tool_response>") != std::string::npos
+                              && out.find("sunny, 20C") != std::string::npos;
+            if (!good) {
+                g_fail++;
+                printf("  [tools] MISSING MARKUP\n%s\n", out.c_str());
+            } else {
+                printf("  [tools] OK\n");
+            }
+        }
+    }
+
+    // assistant reasoning_content is re-rendered as <think> for the latest turn
+    {
+        chat_msg user("user", "q");
+        chat_msg asst("assistant", "the answer");
+        asst.reasoning_content = "my thought";
+        std::string out;
+        const bool ok = render_chat_template(*tmpl, {user, asst}, false, false, out);
+        if (!ok) {
+            g_fail++;
+            printf("  [reasoning_content] EVAL FAILED\n");
+        } else if (out.find("<think>\nmy thought\n</think>\n\nthe answer") == std::string::npos) {
+            g_fail++;
+            printf("  [reasoning_content] MISSING\n%s\n", out.c_str());
+        } else {
+            printf("  [reasoning_content] OK\n");
+        }
+    }
+
     printf(g_fail ? "chat template test FAILED (%d)\n" : "chat template test OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

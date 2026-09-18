@@ -49,8 +49,10 @@ SYCL device pass 之外。新增 CPU 内核要同时加入该列表。
 |---|---|---|
 | `test_tokenizer` | CPU | 词表加载、特殊 id、ASCII/CJK/空白/emoji/特殊 token 往返 |
 | `test_chat_template` | CPU | GGUF `tokenizer.chat_template` 经 minja vs 参考 Jinja2 输出，严格计数 mismatch |
+| `test_response_parser` | CPU | `reasoning_content`/`tool_calls` 流式拆分（整段与逐字节喂入一致） |
 | `test_compare` | CPU | CPU 参考各阶段 vs llama.cpp tensor dump |
 | `test_cpuref` | CPU | CPU 参考 forward head on token ids（默认 `{9419}`） |
+| `test_sampler` | CPU | `logit_bias` 强制/封禁 token、logprob log-softmax 与归一化、best_of 打分路径 |
 | `test_cpu_gemv` | CPU | CPU 融合 fp32 + 整数 int8 GEMV/RMSNorm vs `quant.h` 主机反量化参考，多类型多 TB；`PF_CPU_ISA` 可锁变体 |
 | `test_pc_cpu` | CPU | 主机后端的 paged 注意力 + 前缀缓存磁盘 spill/promote 往返（日志逐位一致） |
 | `test_pc_disk` | CPU | 磁盘层记录格式往返、token 校验、LRU 预算、重开持久化、损坏/未知记录 |
@@ -134,6 +136,7 @@ tests/backend/gpu/  → docs/design/03-kernels.md, 06-prefix-cache.md
 tests/backend/cpu/  → docs/architecture.md §11, docs/design/06-prefix-cache.md
 tests/common/       → 本文档（共享 harness）
 tests/model/, tests/mm/ → 本文档
+tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 ```
 
 ---

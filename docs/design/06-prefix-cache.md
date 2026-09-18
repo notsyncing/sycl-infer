@@ -224,6 +224,10 @@ flags(4) hash(8) depth(4) blob_bytes(4) state_bytes(4) toks(32*4)
 `pc_print_stats` 输出节点数、有状态节点数、总引用、命中率、复用 token、捕获状态数、驱逐节点/状态数、
 检查点尺寸×数量，以及 RAM/磁盘的 store/load/spill 与记录数。相关计数器字段见 `engine.h:330-346`。
 
+服务端把每序列的命中数 `sequence::reused` 作为 OpenAI `usage.prompt_tokens_details.cached_tokens`
+以及 `usage.prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` 返回（详见
+[09-server.md](09-server.md) §2.6/§8.2）。多模态路径绕过前缀缓存，故 `cached_tokens` 恒为 0。
+
 ---
 
 ## 8. 相关环境变量

@@ -36,11 +36,15 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
 * **SYCL command graphs** — the full forward step is captured per shape and
   replayed, keeping per-token launch overhead minimal (GPU only).
 * **OpenAI-compatible API** — streaming and non-streaming chat/completions with
-  temperature / top-k / top-p / min-p / penalties.
+  temperature / top-k / top-p / min-p / penalties, `logit_bias`,
+  `logprobs`/`top_logprobs`, `reasoning_content` (thinking models),
+  function/tool calling (`tools`, `tool_calls`, `tool` results), `n` choices,
+  `echo`/`suffix`/`best_of` and `/v1/models`; `usage` reports prefix-cache
+  `cached_tokens` and `reasoning_tokens` details.
 * **Multimodal (vision) input** — Qwen3.5 image input via a `clip` mmproj GGUF:
   the vision encoder runs on the GPU (`src/backend/gpu/kernels/vit.cpp`), the CLI takes
   `--mmproj` + `--image`, and the server accepts OpenAI `image_url` content
-  parts (base64 `data:` URLs).
+  parts (base64 `data:` URLs or remote `http(s)://` URLs, bounded to 10 s / 10 MB).
 
 ## Supported models
 
@@ -116,9 +120,13 @@ Common flags:
 HTTP endpoints:
 
 * `POST /v1/chat/completions` — OpenAI chat API (streaming + non-streaming;
-  `stop`, `ignore_eos`, `stream_options.include_usage`)
-* `POST /v1/completions` — raw text completion
-* `GET /v1/models`, `GET /health`
+  `stop`, `ignore_eos`, `stream_options.include_usage`, `n`, `reasoning_content`,
+  `tools`/`tool_choice` + `tool_calls`/`tool` results, `logit_bias`, `logprobs`/
+  `top_logprobs`, image parts)
+* `POST /v1/completions` — raw text completion (string/string[]/token-id prompt,
+  `n`, `echo`, `suffix`, `best_of`, `logit_bias`, `logprobs`,
+  `stream_options.include_usage`)
+* `GET /v1/models` + `GET /v1/models/{id}`, `GET /health`
 
 ### Prefix cache
 

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "engine.h"
@@ -36,27 +37,50 @@ struct sequence {
     int n_chunks = 0;
     int reused = 0; // prompt tokens served from the prefix cache
 
+    // One generated token: `text` is the UTF-8-safe piece (empty when the
+    // token's bytes are still incomplete) and carries the sampled token id /
+    // logprob when the request asked for logprobs or best_of scoring.
+    struct token_out {
+        std::string text;
+        int id = -1;
+        float logprob = 0.f;
+        std::vector<std::pair<int, float>> top; // (token id, logprob)
+    };
+
     // token/text stream out
     std::mutex m;
     std::condition_variable cv;
-    std::deque<std::string> text_out;
+    std::deque<token_out> out_q;
     int prompt_tokens = 0;
 
     void push(std::string s) {
+        token_out t;
+        t.text = std::move(s);
+        push_token(std::move(t));
+    }
+    void push_token(token_out t) {
         {
             std::lock_guard<std::mutex> lk(m);
-            text_out.push_back(std::move(s));
+            out_q.push_back(std::move(t));
         }
         cv.notify_all();
     }
     bool pop(std::string & out) {
-        std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return !text_out.empty() || finished; });
-        if (text_out.empty()) {
+        token_out t;
+        if (!pop_token(t)) {
             return false;
         }
-        out = std::move(text_out.front());
-        text_out.pop_front();
+        out = std::move(t.text);
+        return true;
+    }
+    bool pop_token(token_out & out) {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return !out_q.empty() || finished; });
+        if (out_q.empty()) {
+            return false;
+        }
+        out = std::move(out_q.front());
+        out_q.pop_front();
         return true;
     }
     bool pop_wait(std::string & out) { // blocking without spin for the server

@@ -2,33 +2,90 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace si {
 
+namespace {
+
+// Log-softmax of the (penalty/bias adjusted, temperature scaled) logits.  Only
+// called when the caller asked for logprobs, so the extra full-vocab pass and
+// the partial sort never touch the default sampling path.
+void fill_logprobs(const float * lg, int n_vocab, float inv_t, int chosen, int topn, sample_logprobs * out) {
+    float mx = -INFINITY;
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = lg[i] * inv_t;
+        if (v > mx) {
+            mx = v;
+        }
+    }
+    double sum = 0.0;
+    for (int i = 0; i < n_vocab; i++) {
+        sum += std::exp((double)lg[i] * inv_t - (double)mx);
+    }
+    const double log_z = std::log(sum) + (double)mx;
+    out->logprob = (float)((double)lg[chosen] * inv_t - log_z);
+    out->top.clear();
+    if (topn <= 0) {
+        return;
+    }
+    const int k = std::min(topn, n_vocab);
+    static thread_local std::vector<std::pair<float, int>> tv;
+    tv.clear();
+    tv.reserve(n_vocab);
+    for (int i = 0; i < n_vocab; i++) {
+        tv.emplace_back(lg[i] * inv_t, i);
+    }
+    std::partial_sort(tv.begin(), tv.begin() + k, tv.end(),
+                      [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
+                          return a.first > b.first;
+                      });
+    out->top.reserve(k);
+    for (int i = 0; i < k; i++) {
+        out->top.push_back({tv[i].second, (float)((double)tv[i].first - log_z)});
+    }
+}
+
+} // namespace
+
 int sample_token(const float * logits, int n_vocab, const gen_params & gp, const std::vector<int> & recent,
-                 sampler_state & ss) {
-    // repetition / presence / frequency penalties
+                 sampler_state & ss, sample_logprobs * out) {
+    // repetition / presence / frequency penalties and logit_bias
     std::vector<float> scr;
     const float * lg = logits;
     const bool do_pen = gp.repeat_penalty != 1.0f || gp.presence_penalty != 0.f || gp.frequency_penalty != 0.f;
-    if (do_pen && !recent.empty()) {
+    const bool do_bias = !gp.logit_bias.empty();
+    if ((do_pen && !recent.empty()) || do_bias) {
         scr.assign(logits, logits + n_vocab);
-        const int n = (int)recent.size();
-        const int from = std::max(0, n - gp.repeat_last_n);
-        std::unordered_map<int, int> counts;
-        for (int i = from; i < n; i++) {
-            counts[recent[i]]++;
-        }
-        for (auto & kv : counts) {
-            float & v = scr[kv.first];
-            if (gp.repeat_penalty != 1.0f) {
-                v = v > 0 ? v / gp.repeat_penalty : v * gp.repeat_penalty;
+        if (do_pen && !recent.empty()) {
+            const int n = (int)recent.size();
+            const int from = std::max(0, n - gp.repeat_last_n);
+            std::unordered_map<int, int> counts;
+            for (int i = from; i < n; i++) {
+                counts[recent[i]]++;
             }
-            v += gp.presence_penalty + gp.frequency_penalty * kv.second;
+            for (auto & kv : counts) {
+                float & v = scr[kv.first];
+                if (gp.repeat_penalty != 1.0f) {
+                    v = v > 0 ? v / gp.repeat_penalty : v * gp.repeat_penalty;
+                }
+                v += gp.presence_penalty + gp.frequency_penalty * kv.second;
+            }
+        }
+        if (do_bias) {
+            for (const auto & kv : gp.logit_bias) {
+                if (kv.first >= 0 && kv.first < n_vocab) {
+                    scr[kv.first] += kv.second;
+                }
+            }
         }
         lg = scr.data();
     }
+
+    const float inv_t = gp.temperature > 0.f ? 1.0f / gp.temperature : 1.0f;
 
     if (gp.temperature <= 0.f || gp.top_k == 1) {
         int best = 0;
@@ -37,10 +94,12 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
                 best = i;
             }
         }
+        if (out != nullptr) {
+            fill_logprobs(lg, n_vocab, inv_t, best, gp.top_logprobs, out);
+        }
         return best;
     }
 
-    const float inv_t = 1.0f / gp.temperature;
     float mx = -INFINITY;
     for (int i = 0; i < n_vocab; i++) {
         float v = lg[i] * inv_t;
@@ -97,13 +156,18 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
     std::uniform_real_distribution<double> dist(0.0, ksum);
     double r = dist(ss.rng);
     double acc = 0.0;
+    int chosen = cand[keep - 1].second;
     for (int i = 0; i < keep; i++) {
         acc += cand[i].first;
         if (r <= acc) {
-            return cand[i].second;
+            chosen = cand[i].second;
+            break;
         }
     }
-    return cand[keep - 1].second;
+    if (out != nullptr) {
+        fill_logprobs(lg, n_vocab, inv_t, chosen, gp.top_logprobs, out);
+    }
+    return chosen;
 }
 
 } // namespace si

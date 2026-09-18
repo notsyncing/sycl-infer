@@ -156,8 +156,10 @@ src/engine/     engine.{h,cpp} (orchestration), engine_graph.cpp (seg_plan,
                 sampler.{h,cpp}
 src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 chat_template.{h,cpp} (minja Jinja wrapper for the GGUF
-                tokenizer.chat_template), chat_util.h, scheduler.{h,cpp},
-                server.{h,cpp}
+                tokenizer.chat_template), response_parser.{h,cpp} (streaming
+                reasoning_content / content / tool_calls split), chat_util.h,
+                scheduler.{h,cpp}, server.{h,cpp} (OpenAI chat/completions +
+                /v1/models)
 src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
@@ -171,6 +173,8 @@ tests/backend/cpu/  test_cpuref.cpp, test_pc_cpu.cpp (paged attention + disk
 tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
                 host reference; run PF_CPU_ISA=scalar|avx2|avx512 to pin a variant)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
+tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter)
+tests/engine/   test_sampler.cpp (logit_bias + logprob reporting)
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, positions)
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
                 unicode tables (vendored llama.cpp MIT), stb/stb_image.h
@@ -274,10 +278,32 @@ The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
   consuming `max(nx, ny)` positions.
 
 CLI: `gen --image FILE` (repeatable).  Server: an OpenAI `image_url` content
-part with a base64 `data:` URL (`/v1/chat/completions`), streaming and not.
+part holding a base64 `data:` URL or an `http(s)://` URL (`/v1/chat/completions`),
+streaming and not.  Remote fetches are bounded (10 s, 10 MB), need OpenSSL at
+build time for HTTPS, and can be disabled with `PF_MM_URL_FETCH=0`.
 
 See [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) and
 [`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the full design.
+
+### OpenAI-compatible API
+
+`GET /v1/models` lists the model (id from the GGUF `general.name`) and
+`GET /v1/models/{id}` retrieves it.  `POST /v1/chat/completions` accepts
+`messages` (string or `[{type:text|image_url}]` parts), `tools`/`tool_choice`,
+assistant messages with `reasoning_content` and `tool_calls`, and `tool` role
+messages with `tool_call_id`/`name`; it returns `reasoning_content` (split at
+`</think>`) and parsed `tool_calls` (finish_reason `"tool_calls"`), streaming or
+not, for `n` choices.  `logit_bias` and `logprobs`/`top_logprobs` are supported
+(chat `logprobs.content[]`, completions legacy arrays).  `POST /v1/completions`
+accepts string / string[] / token id / token-id-array `prompt` with `n`, `echo`,
+`suffix` and `best_of` (non-streaming, scored by token logprob).  `usage`
+reports `prompt_tokens_details.cached_tokens` (the prefix cache match count,
+`sequence::reused`), DeepSeek-style `prompt_cache_hit_tokens`/
+`prompt_cache_miss_tokens`, and `completion_tokens_details.reasoning_tokens`.
+Reasoning and tool markup are split by `src/server/response_parser.cpp`
+(unit-tested by `test_response_parser`); `docs/design/09-server.md` is the source
+of truth, including its §8 field-by-field support matrix (what is implemented,
+partial or not).
 
 ## Conventions
 
@@ -341,6 +367,10 @@ at startup), `PF_PC_DISK_MB` (disk budget, default 1024, `0` = unbounded).  An e
 then RAM, then the VRAM checkpoint count); without it the three configured
 tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
 `serve`) flushes RAM and the resident VRAM nodes into the disk tier.
+
+**Server**
+`PF_MM_URL_FETCH` (`0` rejects remote `http(s)://` `image_url` parts; base64
+`data:` URLs still work).
 
 **Diagnostics**
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),

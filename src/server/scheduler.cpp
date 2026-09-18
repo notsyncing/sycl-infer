@@ -2,8 +2,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <ratio>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "chat_util.h"
+#include "kernels.h"
+#include "sampler.h"
 
 namespace si {
 
@@ -231,7 +242,10 @@ void scheduler::loop() {
                         e.fetch_logits(0, logits.data());
                         s->recent = s->prompt;
                         const auto t_sm0 = std::chrono::steady_clock::now();
-                        int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss);
+                        const bool want_lp = s->gp.wants_logprobs();
+                        sample_logprobs lp;
+                        int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss,
+                                               want_lp ? &lp : nullptr);
                         s->recent.push_back(tok);
                         s->n_generated++;
                         if (tdbg) {
@@ -253,7 +267,14 @@ void scheduler::loop() {
                         const bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
                         if (!eos) {
                             std::string piece = ubs[0].push(e.tk.token_piece(tok));
-                            if (!piece.empty()) {
+                            if (want_lp) {
+                                sequence::token_out t;
+                                t.text = std::move(piece);
+                                t.id = tok;
+                                t.logprob = lp.logprob;
+                                t.top = std::move(lp.top);
+                                s->push_token(std::move(t));
+                            } else if (!piece.empty()) {
                                 s->push(piece);
                             }
                         }
@@ -322,7 +343,10 @@ void scheduler::loop() {
                 for (int r = 0; r < nb; r++) {
                     auto & s = batch[r];
                     e.fetch_logits(r, logits.data());
-                    int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss);
+                    const bool want_lp = s->gp.wants_logprobs();
+                    sample_logprobs lp;
+                    int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss,
+                                           want_lp ? &lp : nullptr);
                     if (dbg()) {
                         fprintf(stderr, "[sched]   prefill-sampled seq=%d tok=%d\n", s->id, tok);
                     }
@@ -333,7 +357,14 @@ void scheduler::loop() {
                     bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
                     if (!eos) {
                         std::string piece = ubs[r].push(e.tk.token_piece(tok));
-                        if (!piece.empty()) {
+                        if (want_lp) {
+                            sequence::token_out t;
+                            t.text = std::move(piece);
+                            t.id = tok;
+                            t.logprob = lp.logprob;
+                            t.top = std::move(lp.top);
+                            s->push_token(std::move(t));
+                        } else if (!piece.empty()) {
                             s->push(piece);
                         }
                     }

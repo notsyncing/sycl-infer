@@ -100,6 +100,7 @@ add_library(sycl_infer_core STATIC
     # server: chat template, continuous batching scheduler, HTTP API
     src/server/chat.cpp
     src/server/chat_template.cpp
+    src/server/response_parser.cpp
     src/server/scheduler.cpp
     src/server/server.cpp
 )
@@ -153,6 +154,17 @@ endif()
 target_include_directories(sycl_infer_core PRIVATE "${DNNL_ROOT}/include")
 target_link_libraries(sycl_infer_core PUBLIC "${DNNL_LIBRARY}")
 
+# ------------------------------------------------- OpenSSL (remote https images)
+# The HTTP server downloads `image_url` parts that point at http(s) URLs.  TLS
+# needs cpp-httplib built with OpenSSL; without it plain http:// still works and
+# https:// fails with an explicit error.  Found here so server.cpp sees the
+# same macro everywhere it is used.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_compile_definitions(sycl_infer_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(sycl_infer_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 # ------------------------------------------------------------------- binaries
 add_executable(sycl-infer src/main.cpp)
 target_link_libraries(sycl-infer PRIVATE sycl_infer_core)
@@ -170,6 +182,8 @@ endfunction()
 
 si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
+si_add_test(test_response_parser tests/server/test_response_parser.cpp)
+si_add_test(test_sampler tests/engine/test_sampler.cpp)
 si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)
 si_add_test(test_pc_disk     tests/backend/cpu/test_pc_disk.cpp)

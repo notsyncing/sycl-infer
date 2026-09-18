@@ -14,9 +14,9 @@
 | 5 | [design/04-engine.md](design/04-engine.md) | `engine` 编排、`seg_plan`、`record_forward`、SYCL command graph、prefill/decode、连续批处理 |
 | 6 | [design/05-kv-cache.md](design/05-kv-cache.md) | 分页 KV cache、动态虚拟内存块池、KV 存储类型、块分配器 |
 | 7 | [design/06-prefix-cache.md](design/06-prefix-cache.md) | 跨请求前缀缓存、链式哈希、递归状态检查点、VRAM/RAM/磁盘三层 LRU |
-| 8 | [design/07-sampler.md](design/07-sampler.md) | 采样算法：penalty、temperature、top-k/top-p/min-p |
+| 8 | [design/07-sampler.md](design/07-sampler.md) | 采样算法：penalty、temperature、top-k/top-p/min-p、`logit_bias`、logprobs |
 | 9 | [design/08-tokenizer.md](design/08-tokenizer.md) | GPT-2 byte-level BPE、特殊 token、chat template |
-| 10 | [design/09-server.md](design/09-server.md) | OpenAI 兼容 HTTP 服务、连续批处理调度器、SSE 流式、CORS |
+| 10 | [design/09-server.md](design/09-server.md) | OpenAI 兼容 HTTP 服务（chat/completions/models、reasoning_content、工具调用、logprobs、usage 缓存统计）、连续批处理调度器、SSE 流式、CORS |
 | 11 | [design/10-multimodal.md](design/10-multimodal.md) | 图像预处理、视觉编码器（host/device）、M-RoPE 组装 |
 | 12 | [design/11-qwen35-model.md](design/11-qwen35-model.md) | Qwen3.5 混合架构（Gated DeltaNet + full attention）的加载与执行 |
 | 13 | [design/12-build-and-testing.md](design/12-build-and-testing.md) | 构建系统、测试矩阵、验证流程、测量报告索引 |
