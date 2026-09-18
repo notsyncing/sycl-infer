@@ -24,7 +24,8 @@ static const int kDefaultCtx = 20480;
 static void usage(const char * prog) {
     fprintf(stderr,
             "usage:\n"
-            "  %s --model <gguf> [--ctx N] [--blocks N] [--kv-cap-mb N] [--port N] [--host H] serve\n"
+            "  %s --model <gguf> [--ctx N] [--blocks N] [--kv-cap-mb N] [--pc-dir DIR]\n"
+            "     [--pc-disk-mb N] [--pc-ram-mb N] [--pc-vram-mb N] [--port N] [--host H] serve\n"
             "  %s --model <gguf> gen --prompt \"...\" [--max-tokens N] [--temp T] [--raw]\n"
             "  %s --model <gguf> --mmproj <mmproj.gguf> gen --image <file> --prompt \"...\"\n"
             "\n"
@@ -37,9 +38,23 @@ static void usage(const char * prog) {
             "              %d tokens; the pool grows on demand up to the cap.\n"
             "  --kv-cap-mb N  upper bound for the dynamically grown KV pool, counted\n"
             "              on the K side (default: auto = exactly what --ctx needs;\n"
-            "              env PF_KV_CAP_MB overrides the flag default).\n"
+            "              env PF_KV_CAP_MB overrides the flag default).  It also caps\n"
+            "              the sum of the three prefix-cache tiers (VRAM+RAM+disk),\n"
+            "              shrinking disk first, then RAM, then VRAM.\n"
             "  KV values are stored as PF_KV_TYPE (f32|bf16|f16, default bf16; bf16\n"
             "  halves the KV bytes, all math stays fp32).  PF_KV_F32=1 = PF_KV_TYPE=f32.\n"
+            "\n"
+            "  --pc-vram-mb N   device (VRAM) prefix-cache budget, converted into a\n"
+            "                   number of PF_PC_STATES checkpoints from the per-node\n"
+            "                   size (--pc-mem-mb is an alias; env PF_PC_VRAM_MB).\n"
+            "  --pc-ram-mb N    host (RAM) cache budget: nodes evicted from VRAM are\n"
+            "                   kept in RAM before spilling to disk (default 512,\n"
+            "                   env PF_PC_RAM_MB; 0 disables the RAM tier).\n"
+            "  --pc-dir DIR     enable the disk tier and keep its records in DIR\n"
+            "                   (model-specific subdirectory, read at startup).\n"
+            "  --pc-disk-mb N   disk budget (default 1024, env PF_PC_DISK_MB; 0 =\n"
+            "                   unbounded).  Eviction demotes LRU cache nodes in the\n"
+            "                   order VRAM -> RAM -> disk -> dropped.\n"
             "\n"
             "env: PF_PREFIX_CACHE=0 disables the cross-request prompt prefix cache\n"
             "     (default on); PF_PC_STATES=N bounds the state checkpoints\n"
@@ -70,6 +85,13 @@ int main(int argc, char ** argv) {
     bool raw = false;
     std::string mmproj_path;
     std::vector<std::string> image_paths;
+    // three-tier prefix cache: --pc-vram-mb (device), --pc-ram-mb (host), and
+    // --pc-disk-mb (directory via --pc-dir); --pc-mem-mb is a VRAM alias
+    std::string pc_dir;
+    int pc_disk_mb = -1;
+    int pc_mem_mb = -1;
+    int pc_ram_mb = -1;
+    int pc_vram_mb = -1;
     std::string cmd;
 
     for (int i = 1; i < argc; i++) {
@@ -108,6 +130,16 @@ int main(int argc, char ** argv) {
             mmproj_path = next();
         } else if (a == "--image") {
             image_paths.push_back(next());
+        } else if (a == "--pc-dir") {
+            pc_dir = next();
+        } else if (a == "--pc-disk-mb") {
+            pc_disk_mb = atoi(next().c_str());
+        } else if (a == "--pc-mem-mb") {
+            pc_mem_mb = atoi(next().c_str());
+        } else if (a == "--pc-ram-mb") {
+            pc_ram_mb = atoi(next().c_str());
+        } else if (a == "--pc-vram-mb") {
+            pc_vram_mb = atoi(next().c_str());
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -155,7 +187,8 @@ int main(int argc, char ** argv) {
             n_blocks = need_blocks;
         }
 
-        engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb);
+        engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb, pc_dir, pc_disk_mb, pc_mem_mb,
+                 pc_ram_mb, pc_vram_mb);
         {
             const double kv_mb = (double)e.kv_bytes_total() / (1024.0 * 1024.0);
             const double cap_mb = (double)e.kv_bytes_cap() / (1024.0 * 1024.0);

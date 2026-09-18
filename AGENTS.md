@@ -93,7 +93,10 @@ src/mm/         image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
                 multimodal.{h,cpp} (prompt expansion + M-RoPE positions)
 src/engine/     engine.{h,cpp} (orchestration), engine_graph.cpp (seg_plan,
                 record_forward, build_graphs), engine_kvpool.cpp (dynamic KV
-                pool), engine_prefix_cache.cpp, sampler.{h,cpp}
+                pool), engine_prefix_cache.cpp (VRAM tier + tier demotion),
+                pc_ram.{h,cpp} (host-RAM tier: LRU record store),
+                pc_disk.{h,cpp} (disk tier: record format, index, LRU),
+                sampler.{h,cpp}
 src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 chat_template.{h,cpp} (minja Jinja wrapper for the GGUF
                 tokenizer.chat_template), chat_util.h, scheduler.{h,cpp},
@@ -104,7 +107,10 @@ tests/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp +
                 <kernel>_stage.cpp (one per kernel)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, positions)
-tests/engine/   test_cpuref.cpp, test_forward.cpp, test_gpu_vs_ref.cpp
+tests/engine/   test_cpuref.cpp, test_forward.cpp, test_gpu_vs_ref.cpp,
+                test_pc_disk.cpp / test_pc_ram.cpp (tier stores, CPU only),
+                test_pc_gpu.cpp (disk spill + promote round-trip, GPU),
+                test_pc_ram_gpu.cpp (VRAM->RAM->VRAM round-trip, GPU)
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
                 unicode tables (vendored llama.cpp MIT), stb/stb_image.h
                 (public-domain image decode)
@@ -235,7 +241,18 @@ kernel variants, so performance numbers must state the env used.
 `PF_GDN_VEC` (float4 path, default on), `PF_GDN_FUSE` (1/2).
 
 **Prefix cache**
-`PF_PREFIX_CACHE` (default on), `PF_PC_STATES` (default 8), `PF_PC_DEBUG`.
+Three LRU tiers; an eviction demotes VRAM -> RAM -> disk -> dropped and a
+lookup promotes the other way (a promotion is a move, so a record lives in one
+tier).  `PF_PREFIX_CACHE` (default on), `PF_PC_STATES` (default 8),
+`PF_PC_DEBUG`, `PF_PC_VRAM_MB` (VRAM budget; derives `PF_PC_STATES` from the
+per-node bytes; `PF_PC_MEM_MB` is an alias), `PF_PC_RAM_MB` (host-RAM budget,
+default 512, `0` disables the tier), `PF_PC_DIR` (enable the disk tier and its
+base directory; records live in a model-fingerprint subdirectory and are read
+at startup), `PF_PC_DISK_MB` (disk budget, default 1024, `0` = unbounded).  An explicit
+`PF_KV_CAP_MB` also caps the sum of the three tier budgets (shrinking disk,
+then RAM, then the VRAM checkpoint count); without it the three configured
+tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
+`serve`) flushes RAM and the resident VRAM nodes into the disk tier.
 
 **Diagnostics**
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),

@@ -16,7 +16,8 @@ static float * dalloc(sycl::queue & q, size_t n) {
     }
     return p;
 }
-engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb)
+engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb,
+               const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb)
     : q(sycl::gpu_selector_v, sycl::property::queue::in_order()), max_seq(max_seq_), n_splits(n_splits_),
       n_blocks(n_blocks_) {
     m.load(model_path);
@@ -60,15 +61,6 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         }
         const char * ep = getenv("PF_PREFIX_CACHE");
         pc_enabled = !(ep && atoi(ep) == 0);
-        const char * en = getenv("PF_PC_STATES");
-        pc_max_states = en ? atoi(en) : 8;
-        if (pc_max_states < 0) {
-            pc_max_states = 0;
-        }
-        // no checkpoints -> nothing to resume from, so the whole cache is off
-        if (pc_max_states == 0) {
-            pc_enabled = false;
-        }
         if (pc_enabled) {
             const hparams & hp = m.hp;
             int n_gdn = 0;
@@ -76,6 +68,98 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
                 n_gdn += hp.is_recr(il);
             }
             pc_state_floats = (size_t)n_gdn * (gdn_per_slot() + conv_per_slot());
+        }
+        // VRAM budget: cache nodes resident in device memory are bounded by the
+        // checkpoint pool (a stateful node also holds one KV block, and the KV
+        // pool bounds the state-less ones).  An explicit PF_PC_STATES wins;
+        // otherwise --pc-vram-mb / PF_PC_VRAM_MB (or its --pc-mem-mb /
+        // PF_PC_MEM_MB alias) is divided by the per-node bytes; default 8.
+        const size_t per_node = (pc_state_floats ? pc_state_floats * 4 : 0) + pc_block_blob_bytes();
+        int vram_mb = -1;
+        if (pc_vram_mb >= 0) {
+            vram_mb = pc_vram_mb;
+        } else if (pc_mem_mb >= 0) {
+            vram_mb = pc_mem_mb;
+        }
+        int states = -1;
+        if (vram_mb < 0) {
+            if (const char * en = getenv("PF_PC_STATES")) {
+                states = atoi(en);
+            } else if (const char * ev = getenv("PF_PC_VRAM_MB")) {
+                vram_mb = atoi(ev);
+            } else if (const char * em = getenv("PF_PC_MEM_MB")) {
+                vram_mb = atoi(em);
+            }
+        }
+        if (states < 0 && vram_mb >= 0) {
+            if (vram_mb == 0) {
+                states = 0;
+            } else if (per_node > 0) {
+                states = (int)std::max<int64_t>(1, (int64_t)vram_mb * 1024 * 1024 / (int64_t)per_node);
+            }
+        }
+        if (states < 0) {
+            states = 8; // historical default
+        }
+        const int ram_mb = pc_ram_mb >= 0 ? pc_ram_mb : (getenv("PF_PC_RAM_MB") ? atoi(getenv("PF_PC_RAM_MB")) : 512);
+        const int disk_mb =
+            pc_disk_mb >= 0 ? pc_disk_mb : (getenv("PF_PC_DISK_MB") ? atoi(getenv("PF_PC_DISK_MB")) : 1024);
+        size_t ram_bytes = (size_t)std::max(ram_mb, 0) * 1024 * 1024;
+        size_t disk_bytes = (size_t)std::max(disk_mb, 0) * 1024 * 1024;
+        size_t vram_bytes = (size_t)std::max(states, 0) * per_node;
+        // The three tiers are one KV budget: an explicit device-pool ceiling
+        // (--kv-cap-mb / PF_KV_CAP_MB) bounds their sum, shrinking disk first,
+        // then RAM, then the VRAM checkpoint count.  Without one the three
+        // configured tiers define the budget themselves.
+        bool tiers_clamped = false;
+        if (pc_enabled && kv_cap_mb > 0) {
+            const size_t cap = (size_t)kv_cap_mb * 1024 * 1024;
+            const size_t total = vram_bytes + ram_bytes + disk_bytes;
+            if (total > cap) {
+                tiers_clamped = true;
+                size_t over = total - cap;
+                const size_t cut_disk = std::min(over, disk_bytes);
+                disk_bytes -= cut_disk;
+                over -= cut_disk;
+                const size_t cut_ram = std::min(over, ram_bytes);
+                ram_bytes -= cut_ram;
+                over -= cut_ram;
+                if (over > 0) {
+                    vram_bytes = vram_bytes > over ? vram_bytes - over : 0;
+                    states = per_node > 0 ? (int)(vram_bytes / per_node) : 0;
+                    vram_bytes = (size_t)std::max(states, 0) * per_node;
+                }
+                fprintf(stderr,
+                        "[pc] tiers clamped to --kv-cap-mb %d: vram=%d checkpoints, ram=%.0f MB, disk=%.0f MB\n",
+                        kv_cap_mb, states, (double)ram_bytes / (1024.0 * 1024.0), (double)disk_bytes / (1024.0 * 1024.0));
+            }
+        }
+        pc_max_states = states;
+        pc_vram_bytes = vram_bytes;
+        pc_ram_bytes = ram_bytes;
+        pc_disk_bytes = disk_bytes;
+        // no checkpoints -> nothing to resume from, so the whole cache is off
+        if (pc_max_states == 0) {
+            pc_enabled = false;
+        }
+        // RAM tier: on by default with the cache (a cheap staging tier between
+        // the small VRAM pool and disk); --pc-ram-mb / PF_PC_RAM_MB, 0 = off.
+        if (pc_enabled && pc_ram_bytes > 0) {
+            pc_ram_init();
+        }
+        // disk tier: directory from the flag, else PF_PC_DIR.  A disk budget
+        // clamped to zero by the KV cap disables the tier (instead of the usual
+        // "0 = unbounded" meaning).
+        if (!pc_dir_arg.empty()) {
+            pc_dir = pc_dir_arg;
+        } else if (const char * ed = getenv("PF_PC_DIR")) {
+            pc_dir = ed;
+        }
+        if (tiers_clamped && pc_disk_bytes == 0) {
+            pc_dir.clear();
+        }
+        if (pc_enabled && !pc_dir.empty()) {
+            pc_disk_init();
         }
     }
     // oneDNN int8 matmul for the mode-2 prefill GEMMs (PF_GEMM_DNNL, default
@@ -132,6 +216,12 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
                                    ? (int)(((int64_t)kv_cap_mb * 1024 * 1024) / ((int64_t)block_bytes * n_attn))
                                    : (kv_cap_mb < 0 ? max_blocks : 0);
         pool_cap = std::max(n_blocks_, cap_blocks);
+        // the VRAM cache tier lives in this pool: the reservation must be able
+        // to hold at least one KV block per cached checkpoint (the pool still
+        // commits memory lazily, so this is address space, not committed RAM)
+        if (pc_enabled) {
+            pool_cap = std::max(pool_cap, pc_max_states);
+        }
         pool_initial = n_blocks_;
     }
     {
@@ -149,6 +239,9 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
 }
 
 engine::~engine() {
+    // graceful shutdown: persist the VRAM/RAM tiers to disk (runs while the
+    // device pools and checkpoint slots are still alive)
+    pc_flush_to_disk();
     // release device/USM allocations (tests construct engines in loops)
     auto f = [&](auto * p) {
         if (p) {
@@ -191,6 +284,12 @@ engine::~engine() {
     f(d_pc_states);
     pool_print("exit");
     pc_print_stats("exit");
+    if (pcd) {
+        pcd->print_stats("exit");
+    }
+    if (pcr) {
+        pcr->print_stats("exit");
+    }
     kv_release_pool();
     m.free_w8(q);
     if (m.dev_weights) {

@@ -76,6 +76,8 @@ add_library(sycl_infer_core STATIC
     src/engine/engine_graph.cpp
     src/engine/engine_kvpool.cpp
     src/engine/engine_prefix_cache.cpp
+    src/engine/pc_disk.cpp
+    src/engine/pc_ram.cpp
     src/engine/sampler.cpp
     # server: chat template, continuous batching scheduler, HTTP API
     src/server/chat.cpp
@@ -130,6 +132,10 @@ si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)
+si_add_test(test_pc_disk     tests/engine/test_pc_disk.cpp)
+si_add_test(test_pc_ram      tests/engine/test_pc_ram.cpp)
+si_add_test(test_pc_gpu      tests/engine/test_pc_gpu.cpp)
+si_add_test(test_pc_ram_gpu  tests/engine/test_pc_ram_gpu.cpp)
 si_add_test(test_cpuref      tests/engine/test_cpuref.cpp)
 si_add_test(test_forward     tests/engine/test_forward.cpp)
 si_add_test(test_gpu_vs_ref  tests/engine/test_gpu_vs_ref.cpp)

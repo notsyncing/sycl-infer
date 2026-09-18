@@ -91,7 +91,12 @@ Common flags:
 | `--image <file>` | – | `gen`: attach an image (repeatable) |
 | `--ctx N` | 20480 | max sequence length in tokens |
 | `--blocks N` | 512 | KV blocks committed at startup (32 tokens each) |
-| `--kv-cap-mb N` | auto | upper bound for the dynamically grown KV pool |
+| `--kv-cap-mb N` | auto | upper bound for the dynamically grown KV pool; also caps the sum of the three cache tiers (see below) |
+| `--pc-vram-mb N` | – | VRAM (device) prefix-cache budget, converted to a checkpoint count |
+| `--pc-ram-mb N` | 512 | host-RAM prefix-cache budget (`0` disables the RAM tier) |
+| `--pc-dir DIR` | – | enable the disk prefix-cache tier in `DIR` (model-scoped) |
+| `--pc-disk-mb N` | 1024 | disk prefix-cache budget (`0` = unbounded) |
+| `--pc-mem-mb N` | – | alias for `--pc-vram-mb` (or set `PF_PC_STATES` directly) |
 | `--host H` / `--port N` | 0.0.0.0 / 8080 | server bind address |
 | `--max-tokens` / `--temp` / `--top-p` / `--top-k` | 256 / 0.7 / 0.95 / 40 | `gen` sampling |
 | `--raw` | off | `gen`: send the prompt verbatim (no chat template) |
@@ -103,6 +108,29 @@ HTTP endpoints:
 * `POST /v1/completions` — raw text completion
 * `GET /v1/models`, `GET /health`
 
+### Prefix cache
+
+The cross-request prompt prefix cache has three LRU tiers:
+
+| tier | holds | configured by |
+|---|---|---|
+| VRAM | KV block + recurrent-state checkpoint in device memory | `--pc-vram-mb` / `PF_PC_STATES` |
+| RAM | serialized record in host memory | `--pc-ram-mb` |
+| disk | record file in `--pc-dir` (model-scoped) | `--pc-disk-mb` |
+
+A lookup walks VRAM → RAM → disk and promotes the hit back to VRAM; an eviction
+demotes in the opposite order, **VRAM → RAM → disk → dropped**.  A promotion is a
+move, so a record lives in exactly one tier.  The RAM tier is process-local; the
+disk tier is read at startup.  On a graceful shutdown (Ctrl-C / SIGTERM, or a
+normal `gen` exit) the RAM records and the resident VRAM nodes are flushed to
+disk when a directory is configured.
+
+The three budget flags are one KV budget: when `--kv-cap-mb` / `PF_KV_CAP_MB` is
+given, the sum of the three tiers is clamped to it (shrinking disk first, then
+RAM, then the VRAM checkpoint count).  When it is not given, the configured three
+tiers define the budget themselves.  The device KV pool reservation is always
+made large enough to hold the VRAM tier.
+
 ## Configuration
 
 Runtime behavior is controlled by environment variables.  The most useful ones:
@@ -113,7 +141,11 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_KV_CAP_MB` | auto | default for `--kv-cap-mb` |
 | `PF_KV_TYPE` | `i8` | KV storage: `i8` / `bf16` / `f16` / `f32` (`PF_KV_F32=1` = f32) |
 | `PF_PREFIX_CACHE` | on | `0` disables the cross-request prefix cache |
-| `PF_PC_STATES` | 8 | recurrent-state checkpoints kept |
+| `PF_PC_STATES` | 8 | VRAM recurrent-state checkpoints kept |
+| `PF_PC_VRAM_MB` | – | VRAM budget (derives `PF_PC_STATES`); `PF_PC_MEM_MB` is an alias |
+| `PF_PC_RAM_MB` | 512 | host RAM tier budget (VRAM evictions land here first) |
+| `PF_PC_DIR` | – | enable the disk tier and keep its records here (model-scoped) |
+| `PF_PC_DISK_MB` | 1024 | disk budget; LRU records beyond it are dropped (`0` = unbounded) |
 | `PF_GEMM_DNNL` | on | `0` disables oneDNN int8 GEMM and uses the DP4A path |
 | `PF_DP4A` | on | `0` forces the fp32 path |
 | `PF_DP4A_DEC` | on | `0` forces fp32 decode |
@@ -133,6 +165,10 @@ cmake --build build -j
 ./build/test_dp4a         # SIn repack + DP4A GEMM vs CPU reference (GPU)
 ./build/test_gpu_vs_ref   # end-to-end logits vs CPU reference (GPU)
 ./build/test_forward      # end-to-end logits / top-k (GPU)
+./build/test_pc_disk      # disk prefix-cache format / LRU / reopen (CPU)
+./build/test_pc_ram       # RAM prefix-cache tier / LRU (CPU)
+./build/test_pc_gpu       # prefix-cache disk spill + promote round-trip (GPU)
+./build/test_pc_ram_gpu   # prefix-cache VRAM->RAM->VRAM round-trip (GPU)
 ./build/test_cpuref       # CPU reference head output (CPU)
 ./build/test_compare      # CPU reference vs llama.cpp dumps (CPU)
 ```

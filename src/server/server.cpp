@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -22,6 +23,14 @@ using json = nlohmann::json;
 namespace si {
 
 namespace {
+
+// SIGINT/SIGTERM only set this flag (async-signal-safe); a watchdog thread in
+// serve() turns it into srv.stop() so the process unwinds normally (scheduler
+// shutdown, then the engine destructor flushes the prefix cache).
+std::atomic<bool> g_term_requested{false};
+void on_term_signal(int) {
+    g_term_requested.store(true);
+}
 
 // Generated token pieces can split a multi-byte UTF-8 sequence; the stream
 // buffer normally holds the tail back, but a genuinely malformed sequence must
@@ -797,10 +806,26 @@ int serve(engine & e, const server_config & cfg) {
 
     printf("server listening on %s:%d\n", cfg.host.c_str(), cfg.port);
     fflush(stdout);
-    if (!srv.listen(cfg.host.c_str(), cfg.port)) {
+    std::signal(SIGINT, on_term_signal);
+    std::signal(SIGTERM, on_term_signal);
+    std::atomic<bool> listen_done{false};
+    std::thread watchdog([&] {
+        while (!g_term_requested.load() && !listen_done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (g_term_requested.load()) {
+            srv.stop();
+        }
+    });
+    const bool listening = srv.listen(cfg.host.c_str(), cfg.port);
+    listen_done.store(true);
+    watchdog.join();
+    g_term_requested.store(false);
+    if (!listening) {
         fprintf(stderr, "failed to listen on %s:%d\n", cfg.host.c_str(), cfg.port);
         return 1;
     }
+    fprintf(stderr, "[srv] shutting down, flushing prefix cache\n");
     return 0;
 }
 

@@ -17,6 +17,8 @@
 #include "kernels.h"
 #include "model.h"
 #include "multimodal.h"
+#include "pc_disk.h"
+#include "pc_ram.h"
 #include "sampler.h"
 #include "tokenizer.h"
 
@@ -244,7 +246,8 @@ struct engine {
     std::mutex mtx;
 
     engine(const std::string & model_path, int max_seq = 8192, int n_splits = 16, int n_blocks = 512,
-           int kv_cap_mb = 0);
+           int kv_cap_mb = 0, const std::string & pc_dir = "", int pc_disk_mb = -1, int pc_mem_mb = -1,
+           int pc_ram_mb = -1, int pc_vram_mb = -1);
     ~engine();
 
     void reset_state();
@@ -326,6 +329,27 @@ struct engine {
     int pc_max_states = 0; // checkpoint budget (nodes <= pc_max_states)
     uint64_t pc_stat_hits = 0, pc_stat_misses = 0, pc_stat_tokens = 0;
     uint64_t pc_stat_states = 0, pc_stat_evict_nodes = 0, pc_stat_evict_states = 0;
+    // ---- disk tier (PF_PC_DIR / --pc-dir) --------------------------------
+    // A lookup walks the tiers in order VRAM -> RAM -> disk; an eviction
+    // demotes the node the other way (VRAM -> RAM -> disk -> dropped).  The
+    // RAM and disk tiers keep the serialized record and are LRU bounded; VRAM
+    // is bounded by the checkpoint pool plus the KV block pool.
+    std::string pc_dir;       // disk base directory (empty = no disk tier)
+    size_t pc_vram_bytes = 0; // VRAM budget the checkpoint pool was sized from
+    size_t pc_disk_bytes = 0; // disk budget (0 = unbounded once enabled)
+    size_t pc_ram_bytes = 0;  // host-RAM budget (0 = no RAM tier)
+    bool pcd_enabled = false; // pc_dir set and the store opened
+    bool pcr_enabled = false; // RAM tier open
+    std::unique_ptr<pc_disk_store> pcd;
+    std::unique_ptr<pc_ram_store> pcr;
+    uint64_t pc_stat_spills = 0, pc_stat_loads = 0;                     // to/from disk
+    uint64_t pc_stat_ram_stores = 0, pc_stat_ram_loads = 0, pc_stat_ram_spills = 0;
+    // open the model-scoped directory and load the record index (no data)
+    void pc_disk_init();
+    void pc_ram_init();
+    // on graceful shutdown move every resident VRAM node and all RAM records
+    // into the disk tier (no-op without a disk directory)
+    void pc_flush_to_disk();
     // match `prompt` against the cache, restore the recurrent state and append
     // the matched blocks to `blocks`; returns the matched token count (0 if the
     // slot must be zeroed by the caller)
@@ -344,6 +368,15 @@ struct engine {
     void pc_print_stats(const char * tag) const;
     bool pc_on() const {
         return pc_enabled;
+    }
+    int pc_nodes() const {
+        return (int)pc_nodes_.size();
+    }
+    size_t pc_disk_records() const {
+        return (pcd_enabled && pcd) ? pcd->count() : 0;
+    }
+    size_t pc_ram_records() const {
+        return (pcr_enabled && pcr) ? pcr->count() : 0;
     }
 
 private:
@@ -423,6 +456,24 @@ private:
     void pc_state_release(int st); // unowned reserved slot back to the free list
     int pc_evict_lru();            // evict one unreferenced node; 1 = evicted
     void pc_evict_node(int ni);
+    // disk tier helpers
+    size_t pc_block_blob_bytes() const; // serialized K/V(+scales) of one block
+    void pc_serialize_block(int block, std::vector<uint8_t> & blob);
+    void pc_deserialize_block(const uint8_t * blob, int block);
+    void pc_serialize_state(int st, std::vector<float> & out);
+    void pc_deserialize_state(const float * in, int st);
+    // demote a node to the next enabled tier (RAM, else disk); returns true
+    // when the record is stored in a lower tier
+    bool pc_demote_node(int ni);
+    // write a node straight to disk, bypassing the RAM tier (flush path)
+    bool pc_node_to_disk(int ni);
+    void pc_ram_to_disk(pc_ram_entry e);
+    // promote a serialized record into a fresh VRAM node; returns the node or -1
+    int pc_promote_bytes(const pc_disk_meta & meta, const uint8_t * blob, const float * state);
+    int pc_promote_ram(uint64_t hash, const int32_t * toks);
+    int pc_promote_disk(pc_disk_meta meta);
+    // attach a checkpoint that only a lower tier holds to an existing VRAM node
+    bool pc_attach_state_from_lower(int ni, uint64_t hash, const int32_t * toks);
     size_t gdn_per_slot() const;
     size_t conv_per_slot() const;
 };
