@@ -379,7 +379,8 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 * `--layer-map 0-11:gpu,12-23:cpu`：`setup_multi_device` 解析闭区间、校验无缝隙覆盖 `[0,n_layer)`，
   建立 `backends_`（GPU 优先作为全局张量/LM head 的主设备）与 `layer_dev_`。
 * `build_plan` 用 `wptr(dev, host)` 为每层解析该设备的权重指针；`record_forward` 用 `cur_be = &be_of(il)`
-  逐层切换后端，并在层边界 `synchronize()` 上一个设备（激活在主机 USM，交接无需拷贝）。
+  逐层切换后端，并在层边界 `synchronize()` 上一个设备（激活在主机 USM，交接无需拷贝）。GPU 只上传
+  分给它的层（`weight_maps_` 逐张量上传），不持有整份 GGUF 副本。
 * `layer_attn_local_[il]` 给出该层在**所属设备**注意力层里的序号；`kv_setup` 为每个设备分配只含
   其注意力层的 paged KV 池，block id 全局一致（同一张 block table，见 [05-kv-cache.md](05-kv-cache.md)）。
 * 多设备关闭前缀缓存（三层记录需要多池）、`pf8` 与 oneDNN；递归状态（GDN/conv）在共享主机 USM 中

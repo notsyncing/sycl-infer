@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace si {
 
@@ -342,12 +343,12 @@ engine::~engine() {
     }
     kv_release_pool();
     m.free_w8(q);
-    for (void * b : weight_blobs_) {
-        if (b) {
-            sycl::free(b, q);
+    for (auto & mp : weight_maps_) {
+        for (auto & kv : mp) {
+            sycl::free(kv.second, q);
         }
     }
-    weight_blobs_.clear();
+    weight_maps_.clear();
     if (m.dev_weights) {
         sycl::free(m.dev_weights, q);
     }
@@ -441,11 +442,78 @@ const void * engine::wptr(int dev, const void * host) const {
     if (!multi_dev) {
         return m.dev_ptr(host);
     }
-    const void * base = weight_blobs_[(size_t)dev];
-    if (!base) {
-        return host;
+    const auto & mp = weight_maps_[(size_t)dev];
+    if (mp.empty()) {
+        return host; // CPU partition: weights stay in the host mmap
     }
-    return (const char *)base + ((const char *)host - (const char *)m.gguf.map_base);
+    const auto it = mp.find(host);
+    if (it == mp.end()) {
+        throw std::runtime_error("multi-device: weight tensor not uploaded to this device's partition");
+    }
+    return it->second;
+}
+
+// Upload only the tensors of the layers placed on `dev` (plus the global
+// tok_embd / output_norm, which always run on the primary device) so the GPU
+// holds just its partition of the weights instead of a whole-file copy.  Each
+// tensor gets its own device allocation; wptr() resolves host -> device through
+// this map, so the CPU-side layers' weights never occupy GPU memory.
+void engine::upload_device_weights(int dev) {
+    auto & mp = weight_maps_[(size_t)dev];
+    std::unordered_set<const void *> need;
+    auto addp = [&need](const void * p) {
+        if (p) {
+            need.insert(p);
+        }
+    };
+    addp(m.tok_embd.data);
+    addp(m.output_norm);
+    for (int il = 0; il < m.hp.n_layer; il++) {
+        if (layer_dev_[(size_t)il] != dev) {
+            continue;
+        }
+        const layer_t & L = m.layers[(size_t)il];
+        addp(L.attn_norm);
+        addp(L.post_attn_norm);
+        addp(L.ffn_gate.data);
+        addp(L.ffn_up.data);
+        addp(L.ffn_down.data);
+        if (L.recurrent) {
+            addp(L.wqkv.data);
+            addp(L.wgate.data);
+            addp(L.ssm_beta.data);
+            addp(L.ssm_alpha.data);
+            addp(L.ssm_out.data);
+            addp(L.ssm_a);
+            addp(L.ssm_dt);
+            addp(L.ssm_norm);
+            addp(L.ssm_conv1d);
+        } else {
+            addp(L.wq.data);
+            addp(L.wk.data);
+            addp(L.wv.data);
+            addp(L.wo.data);
+            addp(L.q_norm);
+            addp(L.k_norm);
+        }
+    }
+    size_t bytes = 0;
+    size_t n = 0;
+    for (const auto & t : m.gguf.tensors) {
+        if (!need.count(t.data)) {
+            continue; // a CPU-side layer's weight: stays in the host mmap only
+        }
+        void * g = sycl::malloc_device(t.nbytes(), q);
+        if (!g) {
+            throw std::runtime_error("multi-device weight upload failed");
+        }
+        q.memcpy(g, t.data, t.nbytes()).wait();
+        mp[t.data] = g;
+        bytes += t.nbytes();
+        n++;
+    }
+    fprintf(stderr, "[dev] device %d: uploaded %zu tensors, %.1f MB of weights\n", dev, n,
+            (double)bytes / (1024.0 * 1024.0));
 }
 
 const float * engine::wf32(int dev, const float * host) const {
@@ -520,19 +588,12 @@ void engine::setup_multi_device(const std::string & layer_map) {
     const int ndev = (gpu_idx >= 0 ? 1 : 0) + (cpu_idx >= 0 ? 1 : 0);
     backends_.resize((size_t)ndev);
     dev_kind_.assign((size_t)ndev, 0);
-    weight_blobs_.assign((size_t)ndev, nullptr);
+    weight_maps_.assign((size_t)ndev, {});
     dev_queues_.assign((size_t)ndev, nullptr);
     if (gpu_idx >= 0) {
         dev_kind_[gpu_idx] = 0;
         dev_queues_[gpu_idx] = &q;
         backends_[gpu_idx] = make_gpu_backend(q);
-        // full weight copy on the GPU device
-        void * blob = sycl::malloc_device(m.gguf.map_size, q);
-        if (!blob) {
-            throw std::runtime_error("multi-device weight allocation failed");
-        }
-        q.memcpy(blob, m.gguf.map_base, m.gguf.map_size).wait();
-        weight_blobs_[gpu_idx] = blob;
     }
     if (cpu_idx >= 0) {
         dev_kind_[cpu_idx] = 1;
@@ -549,6 +610,9 @@ void engine::setup_multi_device(const std::string & layer_map) {
                 layer_attn_local_[(size_t)il] = attn_local[(size_t)dev]++;
             }
         }
+    }
+    if (gpu_idx >= 0) {
+        upload_device_weights(gpu_idx);
     }
     multi_dev = true;
     host_act = true;

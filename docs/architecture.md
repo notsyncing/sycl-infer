@@ -349,8 +349,9 @@ micro-batch（单序列/单批），不做跨设备重叠。具体地：
 * `backends_` 每个设备一个后端；`layer_dev_[il]` 决定每层用哪个后端，`record_forward` 在层边界
   同步上一个设备（`backends_[d]->synchronize()`），保证对共享主机 USM 激活的写可见——这就是
   pipeline 的 stage 交接点。激活缓冲区走主机 USM，所以交接不需要显式的 D2D/H2D 拷贝。
-* GPU 后端各自持有整份权重副本（`weight_blobs_`），CPU 后端直接读 mmap；`wptr(dev, host)` 为
-  每层的权重张量解析出该设备的指针，`build_plan` 因此能生成一份含正确指针的计划。
+* GPU 后端只上传它自己那部分层（加全局 tok_embd / output_norm）的权重张量，CPU 后端直接读 mmap；
+  `wptr(dev, host)` 通过 `weight_maps_` 为每个权重张量解析出该设备的指针，`build_plan` 因此能生成一份
+  含正确指针的计划。GPU 显存不再持有整份 GGUF 副本。
 * **KV 按设备分开**：`layer_attn_local_[il]` 给出该层在所属设备注意力层中的序号，`dev_kpool_[d]`
   只包含该设备的注意力层。block id 是全局的（同一张 block table），所以 paged attention 与
   `set_table` 无需改动。

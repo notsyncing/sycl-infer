@@ -120,7 +120,12 @@ struct engine {
     std::vector<std::unique_ptr<compute_backend>> backends_;
     std::vector<std::unique_ptr<sycl::queue>> owned_queues_; // extra GPU queues we create
     std::vector<sycl::queue *> dev_queues_;                  // GPU backend queues (may alias q)
-    std::vector<void *> weight_blobs_;                       // per backend (null = host mmap)
+    // per backend: host tensor data ptr -> device memory copy.  Only the
+    // tensors of the layers placed on that device (plus the global tok_embd /
+    // output_norm, which run on the primary device) are uploaded, so the GPU
+    // holds just its partition of the weights, not a whole-GGUF copy.  Empty
+    // for a backend that reads the host mmap directly (CPU).
+    std::vector<std::unordered_map<const void *, void *>> weight_maps_;
     std::vector<int> layer_dev_;                           // layer -> backend index
     std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)
     std::vector<int> dev_kind_;                            // backend -> 0 gpu / 1 cpu
@@ -445,6 +450,10 @@ private:
     // for the CPU backend); used by the multi-device KV pools
     void * dev_alloc_on(int dev, size_t bytes);
     void setup_multi_device(const std::string & layer_map);
+    // multi-device: upload only the tensors of the layers placed on `dev` (plus
+    // the global tensors that always run on the primary device) into that
+    // backend's weight_maps_ entry, so the GPU memory holds just its partition
+    void upload_device_weights(int dev);
     template <typename T> T * alloc_elems(size_t n) {
         return (T *)alloc_bytes(n * sizeof(T));
     }
