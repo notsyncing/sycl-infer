@@ -79,15 +79,19 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp
     src/backend/gpu/kernels/vit.cpp
+    src/backend/gpu/kernels/at.cpp
     # model: GGUF loading, weights, tokenizer
     src/model/gguf.cpp
     src/model/model.cpp
     src/model/model_w8.cpp
     src/model/qwen35.cpp
     src/model/tokenizer.cpp
-    # mm: multimodal image preprocessing + vision encoder
+    # mm: multimodal image/video/audio preprocessing + vision/audio encoders
     src/mm/image.cpp
+    src/mm/video.cpp
+    src/mm/audio.cpp
     src/mm/vision.cpp
+    src/mm/audio_model.cpp
     src/mm/multimodal.cpp
     # engine: forward execution, graph capture, KV pool, prefix cache
     src/engine/engine.cpp

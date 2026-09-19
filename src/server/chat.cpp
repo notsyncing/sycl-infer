@@ -98,10 +98,11 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
         }
         std::string s;
         for (const chat_part & p : m.parts) {
-            if (p.is_image) {
-                s += "<|vision_start|><|image_pad|><|vision_end|>";
-            } else {
-                s += p.text;
+            switch (p.kind) {
+            case chat_part_kind::IMAGE: s += "<|vision_start|><|image_pad|><|vision_end|>"; break;
+            case chat_part_kind::VIDEO: s += "<|vision_start|><|video_pad|><|vision_end|>"; break;
+            case chat_part_kind::AUDIO: s += "<|audio_start|><|audio_pad|><|audio_end|>"; break;
+            default: s += p.text; break;
             }
         }
         return s;

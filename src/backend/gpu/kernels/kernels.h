@@ -194,4 +194,22 @@ void vit_rope_launch(sycl::queue & q, float * qkv, int qkv_stride, int n_tok, in
 void vit_attn_launch(sycl::queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok,
                      int n_head, int head_dim, float scale);
 
+// copy rows of `cols` elements: out[row][i] = x[row][i]
+void vit_copy_launch(sycl::queue & q, const float * x, int x_stride, float * out, int out_stride, int rows, int cols);
+
+// ---------------------------------------------------------------------------
+// Audio encoder kernels (src/kernels/at.cpp).
+// ---------------------------------------------------------------------------
+
+// 1D conv (reference conv1d_all in audio_model.cpp):
+//   out[t][o] = b[o] + sum_tap sum_i w[o][tap*x_in+i] * x[t*stride+tap-pad][i]
+// with zero padding outside the input; `w` is f32 [w_out][taps*x_in].
+void at_conv1d_launch(sycl::queue & q, const float * x, int x_frames, int x_in, int taps, int stride, int pad,
+                      const float * w, const float * b, float * out, int y_frames, int w_out);
+
+// 1D RoPE on the Q/K halves of a fused qkv buffer ([n_tok][3*n_embd]):
+// every pair of token t uses position t with the standard inverse frequencies.
+void at_rope1d_launch(sycl::queue & q, float * qkv, int qkv_stride, int n_tok, int n_head, int head_dim,
+                      float rope_base);
+
 } // namespace si

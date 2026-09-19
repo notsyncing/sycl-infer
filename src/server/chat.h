@@ -5,9 +5,19 @@
 
 namespace si {
 
+// Content-part modality for multimodal messages.  `kind` selects the
+// placeholder substituted into the rendered template; `data`/`format`/`url`
+// carry the raw bytes for image/video/audio parts.  Only `text` is mandatory
+// (a text part is `kind == TEXT` with an empty payload).
+enum class chat_part_kind { TEXT, IMAGE, VIDEO, AUDIO };
+
 struct chat_part {
-    bool is_image = false;
+    chat_part_kind kind = chat_part_kind::TEXT;
     std::string text;
+    // multimodal payload: decoded (or to-be-decoded) media, with the transport
+    std::string data;       // raw decoded bytes (image/video/audio)
+    std::string format;     // image: png/jpeg; audio: wav/mp3/ogg...
+    std::string url;        // source data:/http(s) URL when set
 };
 
 // One assistant function call as received in a request (OpenAI `tool_calls`).

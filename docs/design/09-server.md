@@ -310,16 +310,21 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 ## 6. 多模态请求处理
 
 * 启动时若有 `mmproj_path` 则 `mm.vm.load()`，从视觉超参导出 `image_preproc_cfg`，失败非致命（打日志，
-  后续图片请求 400）。
-* `parse_messages` 按顺序收集图片 URL，保留文本/图片交错。
-* `load_image_url` 接受 `data:`（要求 `;base64`；`b64_decode` 容忍空白、遇到 `=` 停止）与
-  `http(s)://`（`fetch_http_image` 用 httplib 下载，跟随重定向，10 s 超时、10 MB 上限——超过即
-  中断传输；HTTPS 需要构建时找到 OpenSSL，否则报错；`PF_MM_URL_FETCH=0` 可整体关闭远程抓取）。
-  其它 scheme 一律 400。`parse_http_url` 解析 `scheme://host[:port]/path`，缺 host 或端口非法即拒绝。
-* 每张图 `mm_image_decode_mem` → `mm_image_preprocess`，失败 400。
-* `render_chat(..., add_generation_prompt=true, thinking, tools_json)` → `mm_build_prompt_device`（把合并
-  嵌入写进 `e.d_img_embd`）→ 用**扩展后** token 数检查长度 → `run_mm_choice`（非流式）或
-  `stream_chat_mm_choices`（流式，逐个 choice 顺序生成）。
+  后续图片/视频请求 400）；若有 `audio_mmproj_path` 则 `mm.am.load()` 导出 `audio_preproc_cfg`，
+  失败同样非致命（音频请求 400）。
+* `parse_messages` 按顺序收集媒体的 `media_part`（`image_url`/`image`、`video_url`/`video`、
+  `input_audio`（带 `data`+`format`）、`audio_url`），保留文本/媒体交错，`chat_part` 带 `kind` 标记。
+* `load_media_bytes` 接受 `data:`（要求 `;base64`；`b64_decode` 容忍空白、遇到 `=` 停止）、内联
+  `input_audio` base64 与 `http(s)://`（`fetch_http_image` 用 httplib 下载，跟随重定向，10 s 超时、
+  10 MB 上限——超过即中断传输；HTTPS 需要构建时找到 OpenSSL，否则报错；`PF_MM_URL_FETCH=0` 可整体
+  关闭远程抓取）。其它 scheme 一律 400。`parse_http_url` 解析 `scheme://host[:port]/path`，缺 host 或
+  端口非法即拒绝。
+* 图片 `mm_image_decode_mem` → `mm_image_preprocess`；视频 `mm_video_decode_mem`（`max_frames`/`max_side`
+  由 `server_config` 控制）；音频 `mm_audio_decode_bytes`（WAV 原生，其它容器落临时文件走 ffmpeg CLI），
+  失败均 400。
+* `render_chat(..., add_generation_prompt=true, thinking, tools_json)` → `mm_build_prompt_mixed_device`
+  （按 `order` 把 image/video/audio 分别经视觉/音频塔编码进 `e.d_img_embd`）→ 用**扩展后** token 数检查
+  长度 → `run_mm_choice`（非流式）或 `stream_chat_mm_choices`（流式，逐个 choice 顺序生成）。
 * 全程持有 `mm_req`；`generate_mm` 内部持有 `engine::mtx`。
 * 注意：mm 路径 `finish_reason` 仅在 stop 命中时为 `"stop"`，EOS 终止报为 `"length"`（有工具调用时为
   `"tool_calls"`）；`n>1` 顺序生成；绕过前缀缓存与连续批处理。
@@ -333,7 +338,8 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 | `PF_SRV_TIME` | tokenize 计时与每序列 `prefill/wait/admit/chunks/reused` 日志 |
 | `SCHED_DEBUG` | 准入/prefill/decode 决策日志 |
 | `PF_CHAT_TMPL_DEBUG` | 记录导致回退 ChatML 的模板异常 |
-| `PF_MM_URL_FETCH` | `0` 禁止下载远程 `http(s)://` 图片（base64 `data:` 不受影响） |
+| `PF_MM_URL_FETCH` | `0` 禁止下载远程 `http(s)://` 图片/视频/音频（base64 `data:` 不受影响） |
+| `PF_AV_FFMPEG` | 音频/视频解码的 ffmpeg 可执行路径（默认 `ffmpeg`） |
 | `PF_GEMM_DNNL` | 通过 `batched_prefill_fit` 改变 prefill chunk 尺寸 |
 
 ---
@@ -376,6 +382,9 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 | `modalities` / `audio` / `prediction` | ❌ | 忽略 |
 | `web_search_options` | ❌ | 忽略 |
 | 图片 part `{"type":"image_url","image_url":{"url":...}}` | ✅ | `data:` base64 或 `http(s)://`（`PF_MM_URL_FETCH=0` 关闭远程） |
+| 视频 part `{"type":"video_url","video_url":{"url":...}}` | ✅ | 同 `image_url`，需 `--mmproj`，由 `max_frames`/`max_side` 控制采样 |
+| 音频 part `{"type":"input_audio","input_audio":{"data":...,"format":"wav"}}` | ✅ | `data` 为 base64 编码的内联音频（WAV/MP3/OGG…）；需 `--audio-mmproj` |
+| 音频 part `{"type":"audio_url","audio_url":{"url":...}}` | ✅ | `data:` 或 `http(s)://`，同上 |
 
 ### 8.2 `POST /v1/chat/completions` 响应
 
@@ -419,7 +428,7 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 |---|---|---|
 | `role` | ✅ | `system` / `user` / `assistant` / `tool` |
 | `role:"function"`（旧式） | ❌ | 未处理（模板会报错并回退内置渲染） |
-| `content` | ✅ | 字符串、`null`、或 part 数组（`text` / `image_url` / `image`） |
+| `content` | ✅ | 字符串、`null`、或 part 数组（`text` / `image_url` / `image` / `video_url` / `video` / `input_audio` / `audio_url`） |
 | `reasoning_content` / `reasoning` | ✅ | assistant 输入，回填模板 `<think>` |
 | `tool_calls[]` | ✅ | 输入；`function.arguments` 支持字符串或对象 |
 | `function_call`（旧式单调用） | ✅ | 作为输入解析为一个 tool_call |

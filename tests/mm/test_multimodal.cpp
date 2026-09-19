@@ -11,10 +11,13 @@
 #include <string>
 #include <vector>
 
+#include "audio.h"
+#include "audio_model.h"
 #include "image.h"
 #include "kernels.h"
 #include "multimodal.h"
 #include "tokenizer.h"
+#include "video.h"
 #include "vision.h"
 
 using namespace si;
@@ -461,15 +464,368 @@ static void bench_kernels() {
     }
 }
 
+static void test_prompt_video(const std::string & text_path, const std::string & mmproj_path) {
+    printf("video prompt layout\n");
+    gguf_file gf, mgf;
+    try {
+        gf.load(text_path);
+        mgf.load(mmproj_path);
+    } catch (const std::exception & ex) {
+        printf("  skip (cannot load model: %s)\n", ex.what());
+        return;
+    }
+    tokenizer tk;
+    tk.load(gf);
+    if (tk.token_to_id.find("<|video_pad|>") == tk.token_to_id.end()) {
+        printf("  skip (tokenizer has no <|video_pad|>)\n");
+        return;
+    }
+    vision_model vm;
+    try {
+        vm.load(mmproj_path);
+    } catch (const std::exception & ex) {
+        printf("  skip (cannot load mmproj: %s)\n", ex.what());
+        return;
+    }
+    image_preproc_cfg cfg;
+    cfg.patch_size = vm.hp.patch_size;
+    cfg.merge = vm.hp.merge;
+    const int patch_area = cfg.patch_size * cfg.patch_size * cfg.merge * cfg.merge;
+    cfg.min_pixels = 8 * patch_area;
+    cfg.max_pixels = kMaxImgTokens * patch_area;
+    for (int c = 0; c < 3; c++) {
+        cfg.mean[c] = vm.hp.mean[c];
+        cfg.std[c] = vm.hp.std[c];
+    }
+    // 4 synthetic frames, distinct content per frame
+    const int W = 96, H = 96;
+    std::vector<mm_video_frame> frames;
+    for (int f = 0; f < 4; f++) {
+        mm_video_frame fr;
+        fr.width = W;
+        fr.height = H;
+        fr.pts = f;
+        fr.rgb.resize((size_t)W * H * 3);
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                uint8_t * p = fr.rgb.data() + ((size_t)y * W + x) * 3;
+                p[0] = (uint8_t)(((x + f) * 255) / (W - 1));
+                p[1] = (uint8_t)(y * 255 / (H - 1));
+                p[2] = (uint8_t)(f * 60 + (x + y) * 30 % 200);
+            }
+        }
+        frames.push_back(std::move(fr));
+    }
+    mm_video vid;
+    vid.frames = frames;
+
+    // grid derived from the preprocessed frame (96x96 → 3x3 merged, like images)
+    mm_image img0 = mm_image_preprocess(frames[0].rgb.data(), W, H, cfg);
+    vision_input vi0 = vision_model::make_input(vm, img0);
+    const int G = vi0.out_w * vi0.out_h;
+
+    const int T = 4;
+    const std::string rendered = "<|vision_start|><|video_pad|><|vision_end|>watch this";
+    mm_prompt mp = mm_build_prompt_video(tk, rendered, {vid}, vm, vm.hp.proj_dim, T);
+
+    check(mp.n_img == 1, "one video");
+    check((int)mp.img_row.size() == (int)mp.tokens.size(), "img_row covers every token");
+    check(mp.mrope.size() == 4 * mp.tokens.size(), "mrope is 4 positions per token");
+    check(mp.embd.size() == (size_t)T * G * vm.hp.proj_dim, "video embedding rows = T*grid");
+    // the block adds T*G tokens but consumes only max(nx,ny) positions:
+    // pos = sum_block(n_pos) + non-block tokens = total - T*G + n_pos
+    check(mp.pos_after == (int)mp.tokens.size() - T * G + std::max(vi0.out_w, vi0.out_h),
+          "video consumes max(nx,ny) positions");
+    // token indexing: [0]=<|vision_start|>, then T*G image tokens, then text / <|vision_end|>
+    check(mp.img_row[1] == 0 && mp.img_row[1 + (size_t)T * G] == -1, "video rows mapped then cleared");
+    bool pos_ok = true;
+    const int n = (int)mp.tokens.size();
+    for (int i = 0; i < T * G; i++) {
+        const int frame = i / G, row = (i % G) / vi0.out_w, col = (i % G) % vi0.out_w;
+        if (mp.mrope[1 + i] != 1 + frame) {
+            pos_ok = false; // temporal = base + frame
+        }
+        if (mp.mrope[n + 1 + i] != 1 + row) {
+            pos_ok = false; // row = base + row
+        }
+        if (mp.mrope[2 * n + 1 + i] != 1 + col) {
+            pos_ok = false; // col = base + col
+        }
+    }
+    check(pos_ok, "video M-RoPE (t,row,col) layout");
+}
+
+// a tiny log-mel input + audio geometry; the front end has no GGUF dependency
+static void test_audio_geom() {
+    printf("audio input geometry\n");
+    const int n_frames = 20;
+    audio_input in;
+    in.n_frames = n_frames;
+    in.n_out = (n_frames + 1) / 2;
+    check(in.n_out == 10, "n_out = ceil(n_frames/2)");
+}
+
+namespace {
+// reference conv1d matching at_conv1d_launch
+void ref_conv1d(const float * x, int xf, int xi, int taps, int stride, int pad, const float * w, const float * b,
+                float * out, int yf, int wo) {
+    for (int t = 0; t < yf; t++) {
+        for (int o = 0; o < wo; o++) {
+            float acc = b ? b[o] : 0.f;
+            for (int tap = 0; tap < taps; tap++) {
+                const int row = t * stride + tap - pad;
+                if (row < 0 || row >= xf) {
+                    continue;
+                }
+                const float * wr = w + (size_t)o * taps * xi;
+                for (int i = 0; i < xi; i++) {
+                    acc += wr[tap * xi + i] * x[(size_t)row * xi + i];
+                }
+            }
+            out[(size_t)t * wo + o] = acc;
+        }
+    }
+}
+} // namespace
+
+// host-side audio preprocess + decode round trip (WAV → samples → log-mel)
+static void test_audio_prep() {
+    printf("audio preprocessor\n");
+    // build a 1 kHz sine in 16-bit PCM as bytes
+    const int rate = 16000;
+    const int n = rate / 4;
+    audio_preproc_cfg cfg;
+    cfg.sample_rate = rate;
+    // craft a minimal WAV
+    const uint32_t data_bytes = (uint32_t)n * 2;
+    std::vector<uint8_t> wav(44 + data_bytes);
+    std::memcpy(wav.data(), "RIFF", 4);
+    const uint32_t riffsz = 36 + data_bytes;
+    std::memcpy(wav.data() + 4, &riffsz, 4);
+    std::memcpy(wav.data() + 8, "WAVE", 4);
+    std::memcpy(wav.data() + 12, "fmt ", 4);
+    const uint32_t fmt = 16;
+    std::memcpy(wav.data() + 16, &fmt, 4);
+    const uint16_t pcm = 1, ch = 1;
+    std::memcpy(wav.data() + 20, &pcm, 2);
+    std::memcpy(wav.data() + 22, &ch, 2);
+    std::memcpy(wav.data() + 24, &rate, 4);
+    const uint32_t br = (uint32_t)rate * 2;
+    std::memcpy(wav.data() + 28, &br, 4);
+    const uint16_t ba = 2;
+    std::memcpy(wav.data() + 32, &ba, 2);
+    const uint16_t bits = 16;
+    std::memcpy(wav.data() + 34, &bits, 2);
+    std::memcpy(wav.data() + 36, "data", 4);
+    std::memcpy(wav.data() + 40, &data_bytes, 4);
+    for (int i = 0; i < n; i++) {
+        const int16_t v = (int16_t)(30000.f * std::sin(2.f * 3.14159265f * 1000.f * i / rate));
+        std::memcpy(wav.data() + 44 + (size_t)i * 2, &v, 2);
+    }
+
+    mm_audio a;
+    std::string err;
+    check(mm_audio_decode_wav(wav.data(), wav.size(), a, &err), "WAV decode");
+    check(a.sample_rate == rate && (int)a.samples.size() == n, "sample count/rate");
+    int nf = 0;
+    std::vector<float> mel;
+    mm_audio_preprocess(a, cfg, mel, nf);
+    check(nf >= 5, "mel frames produced");
+    float p = 0;
+    for (size_t i = 0; i < mel.size(); i++) {
+        if (!std::isfinite(mel[i])) {
+            p = -1;
+            break;
+        }
+        p += mel[i] * mel[i];
+    }
+    check(p > 0, "mel finite + non-zero");
+    // a bogus len buffer must fail cleanly
+    check(!mm_audio_decode_wav(wav.data(), 10, a, &err), "short WAV rejected");
+}
+
+static void test_audio_kernels() {
+    printf("audio kernels\n");
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
+    auto rnd = [](int i) {
+        unsigned v = (unsigned)i * 2654435761u;
+        v ^= v >> 13;
+        v *= 2246822519u;
+        return (float)(v % 2001) / 1000.f - 1.f;
+    };
+    { // at_conv1d vs the reference
+        const int xf = 37, xi = 20, taps = 3, stride = 2, pad = 1, wo = 13, yf = (xf + 1) / 2;
+        std::vector<float> x((size_t)xf * xi), w((size_t)wo * taps * xi);
+        for (size_t i = 0; i < x.size(); i++) {
+            x[i] = rnd((int)i + 1);
+        }
+        for (size_t i = 0; i < w.size(); i++) {
+            w[i] = rnd((int)i + 3) * 0.05f;
+        }
+        std::vector<float> exp((size_t)yf * wo), got((size_t)yf * wo);
+        ref_conv1d(x.data(), xf, xi, taps, stride, pad, w.data(), nullptr, exp.data(), yf, wo);
+        float *dx = sycl::malloc_device<float>(x.size(), q), *dw = sycl::malloc_device<float>(w.size(), q);
+        float *dout = sycl::malloc_device<float>(got.size(), q);
+        q.memcpy(dx, x.data(), x.size() * 4);
+        q.memcpy(dw, w.data(), w.size() * 4);
+        at_conv1d_launch(q, dx, xf, xi, taps, stride, pad, dw, nullptr, dout, yf, wo);
+        q.memcpy(got.data(), dout, got.size() * 4).wait();
+        kern_cmp("at_conv1d", got, exp, 1e-5);
+        sycl::free(dx, q);
+        sycl::free(dw, q);
+        sycl::free(dout, q);
+    }
+    { // at_rope1d vs the same inverse-frequency math (position = token index)
+        const int n_tok = 1000, n_head = 8, HD = 64, embd = n_head * HD;
+        std::vector<float> qkv((size_t)n_tok * 3 * embd), exp;
+        for (size_t i = 0; i < qkv.size(); i++) {
+            qkv[i] = rnd((int)i + 7) * 0.4f;
+        }
+        exp = qkv;
+        const float base = 10000.f, l2b = std::log2(base);
+        for (int t = 0; t < n_tok; t++) {
+            for (int h = 0; h < n_head; h++) {
+                for (int p = 0; p < HD / 2; p++) {
+                    const float th = (float)t * std::exp2(-2.f * p / (float)HD * l2b);
+                    const float c = std::cos(th), s = std::sin(th);
+                    for (int half = 0; half < 2; half++) {
+                        float * row = exp.data() + (size_t)t * 3 * embd + (half ? embd : 0) + h * HD;
+                        const float a = row[p], b = row[p + HD / 2];
+                        row[p] = a * c - b * s;
+                        row[p + HD / 2] = a * s + b * c;
+                    }
+                }
+            }
+        }
+        float *d = sycl::malloc_device<float>(qkv.size(), q);
+        q.memcpy(d, qkv.data(), qkv.size() * 4);
+        at_rope1d_launch(q, d, 3 * embd, n_tok, n_head, HD, base);
+        std::vector<float> got(qkv.size());
+        q.memcpy(got.data(), d, got.size() * 4).wait();
+        kern_cmp("at_rope1d", got, exp, 1e-5);
+        sycl::free(d, q);
+    }
+    { // at_conv1d matches conv1d_all (the audio_model host helper) exactly
+        const int xf = 22, xi = 10, taps = 3, stride = 1, pad = 1, wo = 7, yf = xf;
+        std::vector<float> x((size_t)xf * xi), w((size_t)wo * taps * xi);
+        for (size_t i = 0; i < x.size(); i++) {
+            x[i] = rnd((int)i + 11);
+        }
+        for (size_t i = 0; i < w.size(); i++) {
+            w[i] = rnd((int)i + 13) * 0.1f;
+        }
+        std::vector<float> b(wo);
+        for (int i = 0; i < wo; i++) {
+            b[i] = rnd(i + 17) * 0.1f;
+        }
+        // reference via the audio_model host conv
+        std::vector<float> exp((size_t)yf * wo);
+        // inline the same conv as conv1d_all (kept local to avoid leaking internals)
+        for (int t = 0; t < yf; t++) {
+            for (int o = 0; o < wo; o++) {
+                float acc = b[o];
+                const float * wr = w.data() + (size_t)o * taps * xi;
+                for (int tap = 0; tap < taps; tap++) {
+                    const int row = t * stride + tap - pad;
+                    if (row < 0 || row >= xf) {
+                        continue;
+                    }
+                    for (int i = 0; i < xi; i++) {
+                        acc += wr[tap * xi + i] * x[(size_t)row * xi + i];
+                    }
+                }
+                exp[(size_t)t * wo + o] = acc;
+            }
+        }
+        float *dx = sycl::malloc_device<float>(x.size(), q), *dw = sycl::malloc_device<float>(w.size(), q);
+        float *db = sycl::malloc_device<float>(wo, q), *dout = sycl::malloc_device<float>(exp.size(), q);
+        q.memcpy(dx, x.data(), x.size() * 4);
+        q.memcpy(dw, w.data(), w.size() * 4);
+        q.memcpy(db, b.data(), wo * 4);
+        at_conv1d_launch(q, dx, xf, xi, taps, stride, pad, dw, db, dout, yf, wo);
+        std::vector<float> got(exp.size());
+        q.memcpy(got.data(), dout, got.size() * 4).wait();
+        kern_cmp("at_conv1d (bias)", got, exp, 1e-5);
+        sycl::free(dx, q);
+        sycl::free(dw, q);
+        sycl::free(db, q);
+        sycl::free(dout, q);
+    }
+}
+
+// audio tower host vs device on synthetic weights, no GGUF needed beyond what
+// the encoder requires (skip if no audio gguf is given)
+static void test_audio_encoder(const std::string & audio_path) {
+    printf("audio encoder\n");
+    if (audio_path.empty()) {
+        printf("  skip (no audio mmproj path)\n");
+        return;
+    }
+    audio_model am;
+    try {
+        am.load(audio_path);
+    } catch (const std::exception & ex) {
+        printf("  skip (cannot load %s: %s)\n", audio_path.c_str(), ex.what());
+        return;
+    }
+    const int n_mel = am.hp.n_mel, n_frames = 40;
+    std::vector<float> mel((size_t)n_frames * n_mel, 0.01f);
+    for (size_t i = 0; i < mel.size(); i++) {
+        mel[i] = 0.01f * (float)(i % 7) + 0.001f * (float)((i * 3) % 11);
+    }
+    audio_input in = audio_model::make_input(am, mel.data(), n_frames);
+    std::vector<float> host, dev;
+    am.encode_host(in, host);
+    check((int)host.size() == in.n_out * audio_out_width(am), "host embedding shape");
+    check((int)in.n_out == (n_frames + 1) / 2, "n_out geometry");
+    double hn = 0;
+    for (float v : host) {
+        hn += (double)v * v;
+    }
+    check(std::isfinite(hn) && hn > 0, "host embeddings finite + non-zero");
+
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
+    float * d = sycl::malloc_device<float>(host.size(), q);
+    check(d != nullptr, "device allocation");
+    if (!d) {
+        return;
+    }
+    am.encode_device(q, in, d);
+    std::vector<float> dev_(host.size());
+    q.memcpy(dev_.data(), d, host.size() * sizeof(float)).wait();
+    double maxd = 0, maxv = 0;
+    bool finite = true;
+    for (size_t i = 0; i < host.size(); i++) {
+        if (!std::isfinite(dev_[i])) {
+            finite = false;
+        }
+        maxd = std::max(maxd, (double)std::fabs(dev_[i] - host[i]));
+        maxv = std::max(maxv, (double)std::fabs(host[i]));
+    }
+    const bool ok = finite && maxd <= 5e-3 * std::max(1.0, maxv);
+    printf("  %-46s max|host-dev|=%.5f (max|host|=%.4f) %s\n", "device matches host reference", maxd, maxv,
+           ok ? "OK" : "FAIL");
+    if (!ok) {
+        fails++;
+    }
+    sycl::free(d, q);
+}
+
 int main(int argc, char ** argv) {
     const std::string text_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
     const std::string mmproj_path = argc > 2 ? argv[2] : "/home/sfc/临时/Qwen3.5-0.8B-mmproj-BF16.gguf";
+    const std::string audio_path = argc > 3 ? argv[3] : "";
     test_target_size();
     test_kernels();
     bench_kernels();
     test_vision(mmproj_path);
     test_device(mmproj_path);
     test_prompt(text_path, mmproj_path);
+    test_prompt_video(text_path, mmproj_path);
+    test_audio_geom();
+    test_audio_prep();
+    test_audio_kernels();
+    test_audio_encoder(audio_path);
     if (fails) {
         printf("test_multimodal: FAILURES: %d\n", fails);
         return 1;

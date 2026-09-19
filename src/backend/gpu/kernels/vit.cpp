@@ -269,6 +269,14 @@ void vit_add_launch(queue & q, float * y, int y_stride, const float * x, int x_s
                    [=](id<2> i) { y[(size_t)i[0] * y_stride + i[1]] += x[(size_t)i[0] * x_stride + i[1]]; });
 }
 
+void vit_copy_launch(queue & q, const float * x, int x_stride, float * out, int out_stride, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) {
+        return;
+    }
+    q.parallel_for(sycl::range<2>((size_t)rows, (size_t)cols),
+                   [=](id<2> i) { out[(size_t)i[0] * out_stride + i[1]] = x[(size_t)i[0] * x_stride + i[1]]; });
+}
+
 // ---------------------------------------------------------------------------
 // 2D vision RoPE on Q and K.  head_dim is split into four sections of
 // head_dim/4 pairs; the first section uses the patch row, the second the patch

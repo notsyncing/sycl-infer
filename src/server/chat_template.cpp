@@ -36,10 +36,11 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
             } else {
                 auto content = nlohmann::ordered_json::array();
                 for (const chat_part & p : m.parts) {
-                    if (p.is_image) {
-                        content.push_back({{"type", "image"}});
-                    } else {
-                        content.push_back({{"type", "text"}, {"text", p.text}});
+                    switch (p.kind) {
+                    case chat_part_kind::IMAGE: content.push_back({{"type", "image"}}); break;
+                    case chat_part_kind::VIDEO: content.push_back({{"type", "video"}}); break;
+                    case chat_part_kind::AUDIO: content.push_back({{"type", "input_audio"}}); break;
+                    default: content.push_back({{"type", "text"}, {"text", p.text}}); break;
                     }
                 }
                 jm["content"] = std::move(content);

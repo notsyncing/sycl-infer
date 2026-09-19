@@ -32,6 +32,9 @@
 #include "multimodal.h"
 #include "response_parser.h"
 #include "sampler.h"
+#include "video.h"
+#include "audio.h"
+#include "audio_model.h"
 #include "scheduler.h"
 #include "vision.h"
 
@@ -276,7 +279,24 @@ struct mm_server {
     vision_model vm;
     image_preproc_cfg cfg;
     bool ready = false;
+    // audio tower (a separate mmproj GGUF); audio input requires it
+    audio_model am;
+    audio_preproc_cfg acfg;
+    bool audio_ready = false;
+    // video decode limits (server-configurable)
+    int max_video_frames = 16;
+    int max_video_side = 768;
     std::mutex m;
+};
+
+// A media part pulled out of a chat message.  `kind` picks the decoder;
+// `url`/`data`/`format` are the transport fields (data: URL, inline base64,
+// or stdin file bytes via load_media_bytes).
+struct media_part {
+    chat_part_kind kind = chat_part_kind::IMAGE;
+    std::string url;
+    std::string data;
+    std::string format;
 };
 
 int b64_val(unsigned char c) {
@@ -428,46 +448,58 @@ bool fetch_http_image(const std::string & url, std::vector<uint8_t> & bytes, std
     return true;
 }
 
-// Resolve an OpenAI `image_url` value to raw bytes.  `data:` URLs are decoded
-// locally; http(s) URLs are downloaded (like llama.cpp's server), bounded so
-// the endpoint cannot be used as an unbounded download proxy.  Other schemes
-// are rejected.
-bool load_image_url(const std::string & url, std::vector<uint8_t> & bytes, std::string & err) {
+// Resolve a media part to raw bytes.  `data:` URLs are decoded locally;
+// http(s) URLs are downloaded (like llama.cpp's server), bounded so the
+// endpoint cannot be used as an unbounded download proxy; `input_audio`'s
+// inline base64 `data` field is decoded directly.  Other schemes are rejected.
+bool load_media_bytes(const media_part & part, std::vector<uint8_t> & bytes, std::string & err) {
     bytes.clear();
-    if (url.rfind("data:", 0) == 0) {
-        const size_t comma = url.find(',');
-        if (comma == std::string::npos) {
-            err = "malformed data URL";
-            return false;
+    if (!part.url.empty()) {
+        const std::string & url = part.url;
+        if (url.rfind("data:", 0) == 0) {
+            const size_t comma = url.find(',');
+            if (comma == std::string::npos) {
+                err = "malformed data URL";
+                return false;
+            }
+            if (url.substr(5, comma - 5).find(";base64") == std::string::npos) {
+                err = "only base64 data URLs are supported";
+                return false;
+            }
+            if (!b64_decode(url.substr(comma + 1), bytes)) {
+                err = "invalid base64 media data";
+                return false;
+            }
+            return true;
         }
-        if (url.substr(5, comma - 5).find(";base64") == std::string::npos) {
-            err = "only base64 data URLs are supported";
-            return false;
+        if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+            // Remote fetches turn the server into a proxy, so allow deployments
+            // to opt out (e.g. when exposed beyond localhost); on by default.
+            static const bool remote_ok = [] {
+                const char * v = getenv("PF_MM_URL_FETCH");
+                return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+            }();
+            if (!remote_ok) {
+                err = "remote media URLs are disabled (PF_MM_URL_FETCH=0)";
+                return false;
+            }
+            return fetch_http_image(url, bytes, err);
         }
-        if (!b64_decode(url.substr(comma + 1), bytes)) {
-            err = "invalid base64 image data";
+        err = "unsupported media URL (expected data:, http:// or https://)";
+        return false;
+    }
+    if (!part.data.empty()) {
+        if (!b64_decode(part.data, bytes)) {
+            err = "invalid base64 media data";
             return false;
         }
         return true;
     }
-    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
-        // Remote fetches turn the server into a proxy, so allow deployments to
-        // opt out (e.g. when exposed beyond localhost); on by default.
-        static const bool remote_ok = [] {
-            const char * v = getenv("PF_MM_URL_FETCH");
-            return !(v != nullptr && v[0] == '0' && v[1] == '\0');
-        }();
-        if (!remote_ok) {
-            err = "remote image URLs are disabled (PF_MM_URL_FETCH=0)";
-            return false;
-        }
-        return fetch_http_image(url, bytes, err);
-    }
-    err = "unsupported image URL (expected data:, http:// or https://)";
+    err = "media part has neither url nor data";
     return false;
 }
 
-std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string> & image_urls) {
+std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> & media) {
     std::vector<chat_msg> msgs;
     if (!body.contains("messages") || !body["messages"].is_array()) {
         return msgs;
@@ -476,6 +508,18 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string>
         chat_msg cm;
         cm.role = m.value("role", "user");
         bool has_image = false;
+        auto add_media = [&](chat_part_kind kind, const std::string & url, const std::string & data,
+                             const std::string & format) {
+            media_part mp;
+            mp.kind = kind;
+            mp.url = url;
+            mp.data = data;
+            mp.format = format;
+            media.push_back(std::move(mp));
+            chat_part cp;
+            cp.kind = kind;
+            cm.parts.push_back(std::move(cp));
+        };
         if (m.contains("content") && !m["content"].is_null()) {
             const json & c = m["content"];
             if (c.is_string()) {
@@ -494,13 +538,43 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<std::string>
                         } else {
                             url = part.value("image", std::string());
                         }
-                        image_urls.push_back(url);
-                        cm.parts.push_back({true, ""});
+                        add_media(chat_part_kind::IMAGE, url, "", "");
+                        has_image = true;
+                    } else if (type == "video_url" || type == "video") {
+                        std::string url;
+                        if (part.contains("video_url")) {
+                            const json & vu = part["video_url"];
+                            url = vu.is_string() ? vu.get<std::string>() : vu.value("url", std::string());
+                        } else {
+                            url = part.value("video", std::string());
+                        }
+                        add_media(chat_part_kind::VIDEO, url, "", "");
+                        has_image = true;
+                    } else if (type == "input_audio") {
+                        std::string data, format;
+                        const json & a = part.value("input_audio", json::object());
+                        if (a.is_object()) {
+                            data = a.value("data", std::string());
+                            format = a.value("format", std::string());
+                        }
+                        add_media(chat_part_kind::AUDIO, "", data, format);
+                        has_image = true;
+                    } else if (type == "audio_url") {
+                        std::string url, format;
+                        if (part.contains("audio_url")) {
+                            const json & au = part["audio_url"];
+                            url = au.is_string() ? au.get<std::string>() : au.value("url", std::string());
+                            format = au.value("format", std::string());
+                        }
+                        add_media(chat_part_kind::AUDIO, url, "", format);
                         has_image = true;
                     } else if (part.contains("text") && part["text"].is_string()) {
                         const std::string t = part["text"].get<std::string>();
                         cm.content += t;
-                        cm.parts.push_back({false, t});
+                        chat_part cp;
+                        cp.kind = chat_part_kind::TEXT;
+                        cp.text = t;
+                        cm.parts.push_back(std::move(cp));
                     }
                 }
             }
@@ -1263,6 +1337,25 @@ int serve(engine & e, const server_config & cfg) {
                     ex.what());
         }
     }
+    if (!cfg.audio_mmproj_path.empty()) {
+        try {
+            mm.am.load(cfg.audio_mmproj_path);
+            mm.acfg.sample_rate = mm.am.hp.sample_rate;
+            mm.acfg.n_fft = mm.am.hp.n_fft;
+            mm.acfg.hop = mm.am.hp.hop;
+            mm.acfg.n_mel = mm.am.hp.n_mel;
+            mm.acfg.f_min = mm.am.hp.f_min;
+            mm.acfg.f_max = mm.am.hp.f_max;
+            mm.audio_ready = true;
+            fprintf(stderr, "[mm] audio projector loaded: %s (n_layer=%d, n_embd=%d, proj_dim=%d)\n",
+                    cfg.audio_mmproj_path.c_str(), mm.am.hp.n_layer, mm.am.hp.n_embd, mm.am.hp.proj_dim);
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "[mm] cannot load audio mmproj %s: %s (audio input disabled)\n",
+                    cfg.audio_mmproj_path.c_str(), ex.what());
+        }
+    }
+    mm.max_video_frames = cfg.max_video_frames;
+    mm.max_video_side = cfg.max_video_side;
 
     // model id / metadata advertised by /v1/models
     std::string model_id = cfg.model_id;
@@ -1346,8 +1439,8 @@ int serve(engine & e, const server_config & cfg) {
             bad_request(res, "invalid json", "invalid_request_error");
             return;
         }
-        std::vector<std::string> image_urls;
-        auto msgs = parse_messages(body, image_urls);
+        std::vector<media_part> media;
+        auto msgs = parse_messages(body, media);
         const bool thinking = parse_thinking(body);
         const std::string tools_json = parse_tools_json(body);
         const bool parse_tools = !tools_json.empty();
@@ -1360,9 +1453,19 @@ int serve(engine & e, const server_config & cfg) {
         const uint64_t created = (uint64_t)time(nullptr);
         const std::string model = body.value("model", model_id);
 
-        if (!image_urls.empty()) {
+        if (!media.empty()) {
             if (!mm.ready) {
-                bad_request(res, "image input requires --mmproj", "invalid_request_error");
+                bad_request(res, "image/video input requires --mmproj", "invalid_request_error");
+                return;
+            }
+            bool need_audio = false;
+            for (const media_part & p : media) {
+                if (p.kind == chat_part_kind::AUDIO) {
+                    need_audio = true;
+                }
+            }
+            if (need_audio && !mm.audio_ready) {
+                bad_request(res, "audio input requires --audio-mmproj", "invalid_request_error");
                 return;
             }
             // multimodal requests share the engine's image-embedding buffer, so
@@ -1371,18 +1474,43 @@ int serve(engine & e, const server_config & cfg) {
             mm_prompt mp;
             try {
                 std::vector<mm_image> imgs;
-                for (const std::string & u : image_urls) {
-                    std::vector<uint8_t> bytes, rgb;
+                std::vector<mm_video> vids;
+                std::vector<mm_audio> auds;
+                std::vector<mm_media_ref> order;
+                for (const media_part & p : media) {
+                    std::vector<uint8_t> bytes;
                     std::string err;
-                    int w = 0, h = 0;
-                    if (!load_image_url(u, bytes, err)
-                        || !mm_image_decode_mem(bytes.data(), bytes.size(), rgb, w, h, &err)) {
+                    if (!load_media_bytes(p, bytes, err)) {
                         throw std::runtime_error(err);
                     }
-                    imgs.push_back(mm_image_preprocess(rgb.data(), w, h, mm.cfg));
+                    if (p.kind == chat_part_kind::IMAGE) {
+                        std::vector<uint8_t> rgb;
+                        int w = 0, h = 0;
+                        if (!mm_image_decode_mem(bytes.data(), bytes.size(), rgb, w, h, &err)) {
+                            throw std::runtime_error(err);
+                        }
+                        imgs.push_back(mm_image_preprocess(rgb.data(), w, h, mm.cfg));
+                        order.push_back({MM_KIND_IMAGE, (int)imgs.size() - 1});
+                    } else if (p.kind == chat_part_kind::VIDEO) {
+                        mm_video vid;
+                        const mm_video_fmt vfmt = {mm.max_video_frames, mm.max_video_side};
+                        if (!mm_video_decode_mem(bytes.data(), bytes.size(), vfmt, vid, &err)) {
+                            throw std::runtime_error(err);
+                        }
+                        vids.push_back(std::move(vid));
+                        order.push_back({MM_KIND_VIDEO, (int)vids.size() - 1});
+                    } else if (p.kind == chat_part_kind::AUDIO) {
+                        mm_audio aud;
+                        if (!mm_audio_decode_bytes(bytes.data(), bytes.size(), mm.acfg, aud, &err)) {
+                            throw std::runtime_error(err);
+                        }
+                        auds.push_back(std::move(aud));
+                        order.push_back({MM_KIND_AUDIO, (int)auds.size() - 1});
+                    }
                 }
                 const std::string rendered = render_chat(e.m.chat_template, msgs, true, thinking, tools_json);
-                mp = mm_build_prompt_device(mm.vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd, e.d_img_embd);
+                mp = mm_build_prompt_mixed_device(mm.vm, mm.am, e.q, e.tk, rendered, imgs, vids, auds, order,
+                                                  e.m.hp.n_embd, e.d_img_embd, mm.max_video_frames);
             } catch (const std::exception & ex) {
                 bad_request(res, ex.what(), "invalid_request_error");
                 return;

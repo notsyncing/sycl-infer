@@ -18,6 +18,24 @@
 
 using namespace si;
 
+static bool read_file(const std::string & path, std::vector<uint8_t> & out) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < 0) {
+        fclose(f);
+        return false;
+    }
+    out.resize((size_t)n);
+    const bool ok = out.empty() || fread(out.data(), 1, out.size(), f) == out.size();
+    fclose(f);
+    return ok;
+}
+
 // Context length when --ctx is not given: fits the long-context benchmarks
 // (16k depth + 512 prefill + 32 decode) out of the box; the KV pool commits
 // memory lazily, so this costs virtual address space, not committed RAM.
@@ -50,7 +68,8 @@ static void usage(const char * prog) {
             "                               --ctx; env PF_KV_CAP_MB).  Also caps the sum of\n"
             "                               the three prefix-cache tiers, shrinking disk,\n"
             "                               then RAM, then VRAM.\n"
-            "  --mmproj <mmproj.gguf>       vision projector needed by --image\n"
+            "  --mmproj <mmproj.gguf>       vision projector needed by --image/--video\n"
+            "  --audio-mmproj <gguf>        audio tower needed by --audio\n"
             "  --kv-type T                  KV cache storage type: i4|i8|bf16|f16|f32\n"
             "                               (default i8; overrides PF_KV_TYPE; all math\n"
             "                               stays fp32, i4 packs two values per byte)\n"
@@ -63,6 +82,10 @@ static void usage(const char * prog) {
             "  --prompt \"...\"               prompt text (chat-templated unless --raw)\n"
             "  --raw                        encode the prompt verbatim (no chat template)\n"
             "  --image <file>               attach an image (repeatable; needs --mmproj)\n"
+            "  --video <file>               attach a video (repeatable; needs --mmproj)\n"
+            "  --audio <file>               attach audio (repeatable; needs --audio-mmproj)\n"
+            "  --max-video-frames N         frames sampled from each video (default 16)\n"
+            "  --max-video-side N           video frames above this side are rejected (default 768)\n"
             "  --max-tokens N               generation limit (default 256)\n"
             "  --temp T                     sampling temperature (default 0.7)\n"
             "  --top-p P                    nucleus sampling (default 0.95)\n"
@@ -108,7 +131,12 @@ int main(int argc, char ** argv) {
     int top_k = 40;
     bool raw = false;
     std::string mmproj_path;
+    std::string audio_mmproj_path;
     std::vector<std::string> image_paths;
+    std::vector<std::string> audio_paths;
+    std::vector<std::string> video_paths;
+    int max_video_frames = 16;
+    int max_video_side = 768;
     // three-tier prefix cache: --pc-vram-mb (device), --pc-ram-mb (host), and
     // --pc-disk-mb (directory via --pc-dir); --pc-mem-mb is a VRAM alias
     std::string pc_dir;
@@ -164,8 +192,18 @@ int main(int argc, char ** argv) {
             raw = true;
         } else if (a == "--mmproj") {
             mmproj_path = next();
+        } else if (a == "--audio-mmproj") {
+            audio_mmproj_path = next();
         } else if (a == "--image") {
             image_paths.push_back(next());
+        } else if (a == "--audio") {
+            audio_paths.push_back(next());
+        } else if (a == "--video") {
+            video_paths.push_back(next());
+        } else if (a == "--max-video-frames") {
+            max_video_frames = atoi(next().c_str());
+        } else if (a == "--max-video-side") {
+            max_video_side = atoi(next().c_str());
         } else if (a == "--pc-dir") {
             pc_dir = next();
         } else if (a == "--pc-disk-mb") {
@@ -295,6 +333,9 @@ int main(int argc, char ** argv) {
             cfg.host = host;
             cfg.port = port;
             cfg.mmproj_path = mmproj_path;
+            cfg.audio_mmproj_path = audio_mmproj_path;
+            cfg.max_video_frames = max_video_frames;
+            cfg.max_video_side = max_video_side;
             return serve(e, cfg);
         }
         if (cmd == "gen") {
@@ -309,40 +350,109 @@ int main(int argc, char ** argv) {
                 fflush(stdout);
                 return true;
             };
-            if (!image_paths.empty()) {
-                if (mmproj_path.empty()) {
-                    throw std::runtime_error("--image requires --mmproj <mmproj.gguf>");
-                }
-                vision_model vm;
-                vm.load(mmproj_path);
+            if (!image_paths.empty() || !video_paths.empty() || !audio_paths.empty()) {
                 std::vector<mm_image> imgs;
-                image_preproc_cfg cfg;
-                cfg.patch_size = vm.hp.patch_size;
-                cfg.merge = vm.hp.merge;
-                const int patch_area = cfg.patch_size * cfg.patch_size * cfg.merge * cfg.merge;
-                cfg.min_pixels = 8 * patch_area;
-                cfg.max_pixels = kMaxImgTokens * patch_area;
-                for (int c = 0; c < 3; c++) {
-                    cfg.mean[c] = vm.hp.mean[c];
-                    cfg.std[c] = vm.hp.std[c];
-                }
+                std::vector<mm_video> vids;
+                std::vector<mm_audio> auds;
+                std::vector<mm_media_ref> order;
+                vision_model vm_owned;
+                audio_model am_owned;
+                vision_model & vm = vm_owned;
+                audio_model & am = am_owned;
+                bool am_loaded = false;
+                image_preproc_cfg img_cfg;
+                mm_video_fmt vfmt;
+                vfmt.max_frames = max_video_frames;
+                vfmt.max_side = max_video_side;
+                audio_preproc_cfg acfg;
+                bool vm_loaded = false;
+                auto ensure_vm = [&]() {
+                    if (!vm_loaded) {
+                        if (mmproj_path.empty()) {
+                            throw std::runtime_error("--image/--video requires --mmproj <mmproj.gguf>");
+                        }
+                        vm_owned.load(mmproj_path);
+                        img_cfg.patch_size = vm.hp.patch_size;
+                        img_cfg.merge = vm.hp.merge;
+                        const int patch_area = img_cfg.patch_size * img_cfg.patch_size * img_cfg.merge * img_cfg.merge;
+                        img_cfg.min_pixels = 8 * patch_area;
+                        img_cfg.max_pixels = kMaxImgTokens * patch_area;
+                        for (int c = 0; c < 3; c++) {
+                            img_cfg.mean[c] = vm.hp.mean[c];
+                            img_cfg.std[c] = vm.hp.std[c];
+                        }
+                        vm_loaded = true;
+                    }
+                };
+                auto ensure_am = [&]() {
+                    if (!am_loaded) {
+                        if (audio_mmproj_path.empty()) {
+                            throw std::runtime_error("--audio requires --audio-mmproj <audio-mmproj.gguf>");
+                        }
+                        am_owned.load(audio_mmproj_path);
+                        acfg.sample_rate = am.hp.sample_rate;
+                        acfg.n_fft = am.hp.n_fft;
+                        acfg.hop = am.hp.hop;
+                        acfg.n_mel = am.hp.n_mel;
+                        acfg.f_min = am.hp.f_min;
+                        acfg.f_max = am.hp.f_max;
+                        am_loaded = true;
+                    }
+                };
                 for (const std::string & p : image_paths) {
+                    ensure_vm();
                     std::vector<uint8_t> rgb;
                     int w = 0, h = 0;
                     std::string err;
                     if (!mm_image_decode_file(p, rgb, w, h, &err)) {
                         throw std::runtime_error("image: " + err);
                     }
-                    imgs.push_back(mm_image_preprocess(rgb.data(), w, h, cfg));
+                    imgs.push_back(mm_image_preprocess(rgb.data(), w, h, img_cfg));
+                    order.push_back({MM_KIND_IMAGE, (int)imgs.size() - 1});
+                }
+                for (const std::string & p : video_paths) {
+                    ensure_vm();
+                    mm_video vid;
+                    std::string err;
+                    if (!mm_video_decode_file(p, vfmt, vid, &err)) {
+                        throw std::runtime_error("video: " + err);
+                    }
+                    vids.push_back(std::move(vid));
+                    order.push_back({MM_KIND_VIDEO, (int)vids.size() - 1});
+                }
+                for (const std::string & p : audio_paths) {
+                    ensure_am();
+                    mm_audio aud;
+                    std::string err;
+                    std::vector<uint8_t> bytes;
+                    if (!read_file(p, bytes)) {
+                        throw std::runtime_error("audio: cannot read " + p);
+                    }
+                    if (!mm_audio_decode_mem(bytes.data(), bytes.size(), acfg, aud, &err)) {
+                        // not a (readable) WAV: hand the file to the ffmpeg CLI
+                        if (!mm_audio_decode_ffmpeg(p, aud, &err)) {
+                            throw std::runtime_error("audio: " + err);
+                        }
+                    }
+                    auds.push_back(std::move(aud));
+                    order.push_back({MM_KIND_AUDIO, (int)auds.size() - 1});
                 }
                 chat_msg m;
                 m.role = "user";
-                for (size_t i = 0; i < imgs.size(); i++) {
-                    m.parts.push_back({true, ""});
+                chat_part tpart;
+                tpart.kind = chat_part_kind::TEXT;
+                tpart.text = prompt;
+                for (const mm_media_ref & mr : order) {
+                    chat_part cp;
+                    cp.kind = mr.kind == MM_KIND_IMAGE      ? chat_part_kind::IMAGE
+                               : mr.kind == MM_KIND_VIDEO   ? chat_part_kind::VIDEO
+                                                            : chat_part_kind::AUDIO;
+                    m.parts.push_back(std::move(cp));
                 }
-                m.parts.push_back({false, prompt});
+                m.parts.push_back(std::move(tpart));
                 const std::string rendered = render_chat(e.m.chat_template, {m}, /*add_generation_prompt=*/true, false);
-                mm_prompt mp = mm_build_prompt_device(vm, e.q, e.tk, rendered, imgs, e.m.hp.n_embd, e.d_img_embd);
+                mm_prompt mp = mm_build_prompt_mixed_device(vm, am, e.q, e.tk, rendered, imgs, vids, auds, order,
+                                                            e.m.hp.n_embd, e.d_img_embd, max_video_frames);
                 e.generate_mm(mp, gp, emit);
                 fputs(ub.flush().c_str(), stdout);
                 printf("\n");

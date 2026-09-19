@@ -20,11 +20,13 @@
 | 11 | [design/10-multimodal.md](design/10-multimodal.md) | 图像预处理、视觉编码器（host/device）、M-RoPE 组装 |
 | 12 | [design/11-qwen35-model.md](design/11-qwen35-model.md) | Qwen3.5 混合架构（Gated DeltaNet + full attention）的加载与执行 |
 | 13 | [design/12-build-and-testing.md](design/12-build-and-testing.md) | 构建系统、测试矩阵、验证流程、测量报告索引 |
+| 14 | [design/13-audio-video.md](design/13-audio-video.md) | 音频与视频输入：解码、音频编码塔、视频/音频 M-RoPE、混合 prompt 装配 |
 
 ## 快速定位
 
 * 想新增一个模型架构 → [design/01-model-loading.md](design/01-model-loading.md)、[design/11-qwen35-model.md](design/11-qwen35-model.md)
 * 想新增一个 kernel（GPU 或 CPU）→ [design/03-kernels.md](design/03-kernels.md)、[design/12-build-and-testing.md](design/12-build-and-testing.md)
+* 想加图像/视频/音频输入 → [design/10-multimodal.md](design/10-multimodal.md)、[design/13-audio-video.md](design/13-audio-video.md)
 * 想理解图捕获与模式 0/1/2 → [design/04-engine.md](design/04-engine.md)
 * 想看设备选择 / CPU 后端 / 多设备（`--device`、`--layer-map`）→ [architecture.md §11](architecture.md)、[design/04-engine.md §11](design/04-engine.md)
 * 想调优内存/前缀缓存 → [design/05-kv-cache.md](design/05-kv-cache.md)、[design/06-prefix-cache.md](design/06-prefix-cache.md)

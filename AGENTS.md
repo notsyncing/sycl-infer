@@ -52,6 +52,8 @@ gotchas.
   continuous-batching scheduler, SSE, stop strings.
 * [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) — image
   preprocessing, vision encoder (host + device), M-RoPE assembly.
+* [`docs/design/13-audio-video.md`](docs/design/13-audio-video.md) — audio/video
+  decode, the AuT audio tower, video/audio M-RoPE, mixed-prompt assembly.
 * [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) — the
   Qwen3.5 hybrid GDN + full-attention model.
 * [`docs/design/12-build-and-testing.md`](docs/design/12-build-and-testing.md) —
@@ -90,8 +92,10 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2
 ```
 
 `main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --kv-type
---port --host --device --cpu-threads --layer-map --mmproj`, and for `gen`:
-`--prompt --max-tokens --temp --top-p --top-k --raw --image`).  `--device cpu|gpu|auto`
+--port --host --device --cpu-threads --layer-map --mmproj --audio-mmproj`, and
+for `gen`:
+`--prompt --max-tokens --temp --top-p --top-k --raw --image --video --audio
+--max-video-frames --max-video-side`).  `--device cpu|gpu|auto`
 selects the compute backend; `--cpu-threads N` (or `PF_CPU_THREADS`) sets the
 host worker count;
 `--layer-map 0-11:gpu,12-23:cpu` places closed layer ranges on devices (each
@@ -105,7 +109,8 @@ GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
 ```bash
 ./build/test_tokenizer     # tokenizer round-trips (CPU only, no GPU work)
 ./build/test_chat_template # GGUF chat template vs reference Jinja2 output (CPU only)
-./build/test_multimodal    # image preprocessing, vision encoder (host + device), positions (CPU+GPU)
+./build/test_multimodal    # image/video prompt, audio decode+mels, vision + audio
+                              # encoders (host + device), positions (CPU+GPU)
 ./build/test_compare       # CPU reference vs llama.cpp dumps (CPU only)
 ./build/test_cpuref        # CPU reference head (CPU only)
 ./build/test_gpu_stages    # every kernel vs the CPU reference (GPU)
@@ -141,12 +146,16 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
                 vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
-                bidirectional attention)
+                bidirectional attention), at (audio tower helpers: at_conv1d,
+                at_rope1d)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
                 model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
                 tokenizer.{h,cpp}
 src/mm/         image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
                 vision.{h,cpp} (mmproj loader + host vision encoder),
+                video.{h,cpp} (video decode + uniform frame sampling),
+                audio.{h,cpp} (audio decode: WAV native / ffmpeg fallback +
+                log-mel), audio_model.{h,cpp} (AuT audio tower: host + device),
                 multimodal.{h,cpp} (prompt expansion + M-RoPE positions)
 src/engine/     engine.{h,cpp} (orchestration), engine_graph.cpp (seg_plan,
                 record_forward, build_graphs), engine_kvpool.cpp (dynamic KV
@@ -175,7 +184,8 @@ tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
 tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter)
 tests/engine/   test_sampler.cpp (logit_bias + logprob reporting)
-tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, positions)
+tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
+                prompts, audio kernels, positions)
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
                 unicode tables (vendored llama.cpp MIT), stb/stb_image.h
                 (public-domain image decode)
@@ -277,19 +287,53 @@ The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
   the 4-section M-RoPE positions are `(base, base+row, base+col)` with the image
   consuming `max(nx, ny)` positions.
 
-CLI: `gen --image FILE` (repeatable).  Server: an OpenAI `image_url` content
-part holding a base64 `data:` URL or an `http(s)://` URL (`/v1/chat/completions`),
-streaming and not.  Remote fetches are bounded (10 s, 10 MB), need OpenSSL at
-build time for HTTPS, and can be disabled with `PF_MM_URL_FETCH=0`.
-
 See [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) and
 [`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the full design.
+
+### Audio + video input
+
+On top of the vision tower there are two more modalities, mixed freely in one
+request (see [`docs/design/13-audio-video.md`](docs/design/13-audio-video.md)):
+
+* **Video** (`src/mm/video.{h,cpp}`, `--video` / `video_url`): decoded into
+  uniformly sampled frames (`mm_video_subsample`, at most `max_frames`=16,
+  frame side capped by `max_side`=768, ffmpeg fallback for MP4/etc.), each frame
+  preprocessed like an image; a `T`-frame video contributes `T·nx·ny` tokens and
+  consumes `max(out_w,out_h)` positions (M-RoPE (frame, row, col)).
+* **Audio** (`src/mm/audio.{h,cpp}` + `audio_model.{h,cpp}`, `--audio` /
+  `input_audio` / `audio_url`): WAV decoded natively, other containers through
+  the ffmpeg CLI (in-memory server data spills to a temp file), then a
+  log-mel spectrogram (16 kHz, 25 ms/10 ms, 128 bins).  The **audio mmproj must
+  be loaded separately** (`--audio-mmproj`, a second GGUF with `audio.` metadata
+  and `a.*` tensors); without it every audio request fails with a clear error.
+  The AuT-style tower is conv1->GELU->conv2(GELU, /2)->learned positions->N
+  vision-style blocks->post_ln->optional projection, emitting one embedding per
+  remaining frame (= one token, one M-RoPE position each); `out_width` must equal
+  text `n_embd`.
+* Mixed requests are assembled by `mm_build_prompt_mixed_device`
+  (`multimodal.cpp`): `mm_media_ref order` lists blocks in placeholder order,
+  each media is encoded into its slice of `d_img_embd`, total rows capped at
+  `kMaxImgTokens`.  The vision+audio device kernels reuse `vit_*` plus
+  `at_conv1d`/`at_rope1d` (`src/backend/gpu/kernels/at.cpp`).
+* Server API: `image_url` / `video_url` content parts (base64 `data:` or
+  http(s), gated by `PF_MM_URL_FETCH`) and `input_audio`/`audio_url`;
+  `chat_part` (`src/server/chat.h`) carries a `kind` tag and the renderers emit
+  `<|image_pad|>` / `<|video_pad|>` / `<|audio_pad|>` placeholders per kind.
+* Like images, image/video/audio embeddings never reach `tok_embd` and the
+  multimodal path bypasses the prefix cache.
+
+CLI: `gen --image FILE` / `--video FILE` / `--audio FILE` (each repeatable, all
+mixable), `--audio-mmproj`, `--max-video-frames`, `--max-video-side`.  Server:
+OpenAI-style `image_url`/`video_url`/`input_audio`/`audio_url` parts in
+`/v1/chat/completions`, streaming and not.
 
 ### OpenAI-compatible API
 
 `GET /v1/models` lists the model (id from the GGUF `general.name`) and
 `GET /v1/models/{id}` retrieves it.  `POST /v1/chat/completions` accepts
-`messages` (string or `[{type:text|image_url}]` parts), `tools`/`tool_choice`,
+`messages` (string or
+`[{type:text|image_url|video_url|input_audio|audio_url}]` parts),
+`tools`/`tool_choice`,
 assistant messages with `reasoning_content` and `tool_calls`, and `tool` role
 messages with `tool_call_id`/`name`; it returns `reasoning_content` (split at
 `</think>`) and parsed `tool_calls` (finish_reason `"tool_calls"`), streaming or
@@ -370,8 +414,9 @@ tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
 `serve`) flushes RAM and the resident VRAM nodes into the disk tier.
 
 **Server**
-`PF_MM_URL_FETCH` (`0` rejects remote `http(s)://` `image_url` parts; base64
-`data:` URLs still work).
+`PF_MM_URL_FETCH` (`0` rejects remote `http(s)://` `image_url`/`video_url`/`audio_url`
+parts; base64 `data:` URLs still work), `PF_AV_FFMPEG` (audio/video decode CLI
+path, default `ffmpeg`).
 
 **Diagnostics**
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
@@ -404,9 +449,12 @@ tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
   and the text model uses *interleaved* M-RoPE (`rope.dimension_sections`, e.g.
   `[11,11,10,0]`) where the pair index picks the temporal/row/col position
   (`src/backend/gpu/kernels/qk_norm_rope.cpp`).  Image tokens never reach `tok_embd`: the
-  embed kernel copies `step_info::img_embd[img_row[t]]` instead.  The
+  embed kernel copies `step_info::img_embd[img_row[t]]` instead.  Video blocks add
+  a temporal axis (M-RoPE `(frame,row,col)`, `n_pos = max(out_w,out_h)`) and audio
+  blocks are a pure time stream (`(pos,0,0)`, `n_pos = n_out`); both reuse the same
+  `img_embd` rows and `img_row` mapping.  The
   multimodal path bypasses the prefix cache and uses the single-sequence
-  `engine::generate_mm`; `kMaxImgTokens` bounds one image's merged tokens.
+  `engine::generate_mm`; `kMaxImgTokens` bounds one request's merged tokens.
   Because an image consumes `max(nx, ny)` positions for `4*nx*ny` tokens, the
   KV slot index (token count) and the RoPE position diverge: decode keeps
   `info->pos` = token count and carries the running RoPE position in
