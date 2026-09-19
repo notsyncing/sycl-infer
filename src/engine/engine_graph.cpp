@@ -843,6 +843,27 @@ void engine::build_plans() {
             d_segs_pf8_nh = alloc_elems<gemv_seg>(plan_pf8_nh_.segs.size());
             q.memcpy(d_segs_pf8_nh, plan_pf8_nh_.segs.data(), plan_pf8_nh_.segs.size() * sizeof(gemv_seg)).wait();
         }
+        if (multi_dev && dnnl_any_dev()) {
+            // chunk-batched (mode 2) prefill: same plan shape as plan_pf8_ (one
+            // row per kMaxT-token chunk), replayed directly with `rows` = total
+            // tokens so all of one prompt's chunks run GEMMs segment-major /
+            // weights L2-hot in a single forward.  d_segs_pfb holds per-chunk-row
+            // row-offset copies like the single-device graph path.
+            plan_pfb_ = build_plan(kMaxT, kMaxT, false, true, true);
+            plan_pfb_.finalize();
+            const size_t nseg = plan_pfb_.segs.size();
+            if (nseg > 4096) {
+                throw std::runtime_error("segment buffer too small");
+            }
+            d_segs_pfb = alloc_elems<gemv_seg>((size_t)kMaxB * nseg);
+            std::vector<gemv_seg> h((size_t)kMaxB * nseg);
+            for (int r = 0; r < kMaxB; r++) {
+                for (size_t i = 0; i < nseg; i++) {
+                    h[(size_t)r * nseg + i] = row_offset_seg(plan_pfb_.segs[i], r, kMaxT);
+                }
+            }
+            q.memcpy(d_segs_pfb, h.data(), h.size() * sizeof(gemv_seg)).wait();
+        }
         if (pf8_dec || (multi_dev && md_int8)) {
             // single-token decode on int8: GPU segments dp4a_gemv (per-device
             // w8), CPU segments i8_gemv - same plan shape both partitions

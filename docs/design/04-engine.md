@@ -387,8 +387,15 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
   `pc_serialize_block`/`pc_deserialize_block` 经 `engine::kv_layer_ptrs` 把每个全局注意力层解析到所属
   设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。整模型 `pf8`（SIn w8 预留）
   不建，但两条 int8 都可用：
-  - **prefill**：GPU 分区走 oneDNN int8（`dnnl_dev_`，每 GPU 后端一份，只转该设备的层；
+  - **prefill（按块）**：GPU 分区走 oneDNN int8（`dnnl_dev_`，每 GPU 后端一份，只转该设备的层；
     `PF_GEMM_DNNL=0` 关掉）；CPU 分区层走直读 GGUF 块的 i8 路径（与单设备 CPU 行为相同）。
+  - **prefill（整块 mode-2）**：`build_plans` 额外产出 `plan_pfb_` + 行偏移副本 `d_segs_pfb`，
+    `batched_prefill_fit` 对多设备返回 64..512，调度器走 `prefill_batch`（不再 throw）：`record_forward
+    (2, ...)` 直接把一个 prompt 的所有 32-token 块合并进单次前向。GPU 分区可转换权重组走 oneDNN
+    int8——`add_weight` 对 M=32..512 全部预建原语、`acc_cap` 覆盖最宽 N，`dnnl_call` 成立且
+    `D->gemm` 在 M=批 token 数上命中；CPU 分区层走 `i8_gemm` 网格；其余没有 oneDNN 调用的小张量
+    （非 K-quant / 无 call_xq）每组合并成一次 fp32 网格分发（`mode == 2 && !single` 分支），省掉
+    mode 1 按行重复调度的开销。整块 batch 内 int8 GEMM ~3.9s、fp32 旁路 ~0.27s（PF_PROF 实测）。
   - **decode**：每 GPU 后端为分区层各建一份 SIn w8（`w8_dev_`）；单序列 decode（`plan_dec8_`）GPU 层
     走 `dp4a_gemv`、CPU 层走 `i8_gemv`、LM head 也 int8（`PF_DP4A_DEC=0` 关掉，回到 fp32 GEMV；批式
     decode n>1 目前仍是 fp32，与单设备一致）。

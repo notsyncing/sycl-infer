@@ -15,52 +15,57 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
     const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
     const int n_real = nreal_arg > 0 ? nreal_arg : info->n_real;
     const int pc_on = info->pc_active;
-    for (int r = 0; r < n_rows; r++) {
+    // Every (row, head) recurrence chain is independent: it owns its slice of
+    // `state` (slot[rr], head), writes disjoint attn_out rows/tokens, and its
+    // prefix-cache snapshot (same slot/head) — so the head axis is dispatched
+    // across the worker pool.  The per-32-token block snapshot lands once we
+    // have finished all columns of the head (no cross-task aliasing).
+    par(n_rows * n_heads, [&](int id) {
+        const int r = id / n_heads;
+        const int head = id - r * n_heads;
         const int rr = row0 + r;
         if (rr >= info->n_rows || !info->active[rr]) {
-            continue;
+            return;
         }
         const int pbase = info->pos[rr];
-        for (int head = 0; head < n_heads; head++) {
-            const float A = ssm_a[head];
-            float * st =
-                state + (size_t)info->slot[rr] * n_heads * head_dim * head_dim + (size_t)head * head_dim * head_dim;
-            const float * cor = conv_out + (size_t)rr * tpb * conv_dim;
-            const float * alr = alpha + (size_t)rr * tpb * n_heads;
-            const float * ber = beta + (size_t)rr * tpb * n_heads;
-            for (int t = 0; t < n_real; t++) {
-                const float * qv = cor + (size_t)t * conv_dim + q_off + (size_t)head * head_dim;
-                const float * kv = cor + (size_t)t * conv_dim + k_off + (size_t)head * head_dim;
-                const float bt = cpu_sigmoid(ber[t * n_heads + head]);
-                const float sp = std::log(1.0f + std::exp(alr[t * n_heads + head] + dt_bias[head]));
-                const float g = std::exp(A * sp);
-                for (int col = 0; col < head_dim; col++) {
-                    float * s = st + (size_t)col * head_dim;
-                    const float vval = cor[(size_t)t * conv_dim + v_off + (size_t)head * head_dim + col];
-                    float kvv = 0.0f;
-                    for (int i = 0; i < head_dim; i++) {
-                        kvv += s[i] * kv[i];
-                    }
-                    const float del = (vval - g * kvv) * bt;
-                    float atn = 0.0f;
-                    for (int i = 0; i < head_dim; i++) {
-                        s[i] = g * s[i] + kv[i] * del;
-                        atn += s[i] * qv[i];
-                    }
-                    attn_out[((size_t)rr * tpb + t) * n_heads * head_dim + (size_t)head * head_dim + col] = atn * scale;
+        const float A = ssm_a[head];
+        float * st = state + (size_t)info->slot[rr] * n_heads * head_dim * head_dim +
+                     (size_t)head * head_dim * head_dim;
+        const float * cor = conv_out + (size_t)rr * tpb * conv_dim;
+        const float * alr = alpha + (size_t)rr * tpb * n_heads;
+        const float * ber = beta + (size_t)rr * tpb * n_heads;
+        for (int t = 0; t < n_real; t++) {
+            const float * qv = cor + (size_t)t * conv_dim + q_off + (size_t)head * head_dim;
+            const float * kv = cor + (size_t)t * conv_dim + k_off + (size_t)head * head_dim;
+            const float bt = cpu_sigmoid(ber[t * n_heads + head]);
+            const float sp = std::log(1.0f + std::exp(alr[t * n_heads + head] + dt_bias[head]));
+            const float g = std::exp(A * sp);
+            for (int col = 0; col < head_dim; col++) {
+                float * s = st + (size_t)col * head_dim;
+                const float vval = cor[(size_t)t * conv_dim + v_off + (size_t)head * head_dim + col];
+                float kvv = 0.0f;
+                for (int i = 0; i < head_dim; i++) {
+                    kvv += s[i] * kv[i];
                 }
-                // prefix cache: this token completes a 32-token block -> snapshot
-                if (pc_on && (pbase + t + 1) % kCpuBlk == 0) {
-                    const int stt = info->pc_row_slot[(pbase + t + 1) / kCpuBlk];
-                    if (stt >= 0) {
-                        float * dst =
-                            snap.base + (size_t)stt * snap.stride + snap.layer_off + (size_t)head * head_dim * head_dim;
-                        std::memcpy(dst, st, (size_t)head_dim * head_dim * 4);
-                    }
+                const float del = (vval - g * kvv) * bt;
+                float atn = 0.0f;
+                for (int i = 0; i < head_dim; i++) {
+                    s[i] = g * s[i] + kv[i] * del;
+                    atn += s[i] * qv[i];
+                }
+                attn_out[((size_t)rr * tpb + t) * n_heads * head_dim + (size_t)head * head_dim + col] = atn * scale;
+            }
+            // prefix cache: this token completes a 32-token block -> snapshot
+            if (pc_on && (pbase + t + 1) % kCpuBlk == 0) {
+                const int stt = info->pc_row_slot[(pbase + t + 1) / kCpuBlk];
+                if (stt >= 0) {
+                    float * dst =
+                        snap.base + (size_t)stt * snap.stride + snap.layer_off + (size_t)head * head_dim * head_dim;
+                    std::memcpy(dst, st, (size_t)head_dim * head_dim * 4);
                 }
             }
         }
-    }
+    });
 }
 
 } // namespace si

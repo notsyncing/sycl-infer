@@ -276,7 +276,10 @@ struct engine {
         if (cpu_mode) {
             return 0; // CPU uses the chunked prefill path
         }
-        if (use_dnnl) {
+        // single-GPU oneDNN and multi-device (per-device oneDNN on the GPU
+        // partitions + i8 on CPU) both replay mode 2 directly, where every
+        // multiple of kMaxT up to kMaxB*kMaxT is a valid batch size
+        if (use_dnnl || (multi_dev && dnnl_any_dev())) {
             int n = (rem / kMaxT) * kMaxT;
             if (n > kMaxB * kMaxT) {
                 n = kMaxB * kMaxT;
@@ -343,9 +346,11 @@ struct engine {
     // process `n` tokens of one sequence starting at `start` (n <= kMaxT); the
     // sequence's KV blocks must already be assigned in its table row `slot`
     void prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head = true);
-    // experimental (dev/bench_pfb*): chunk-batched prefill, one row per kMaxT
-    // chunk.  Correct only via the direct (PF_NOGRAPH) path and currently
-    // slower than the chunked path - kept as the basis for an M-tiled GEMM.
+    // chunk-batched prefill: one row per kMaxT chunk, all chunks of one prompt
+    // in a single forward (GEMMs segment-major, weights L2-hot).  Replayed
+    // directly (mode 2): recorded graphs on single-device dp4a, oneDNN direct
+    // on single-GPU PF_GEMM_DNNL, and per-device oneDNN + i8_gemm on the GPU/CPU
+    // partitions of multi-device (batched_prefill_fit() enables it there).
     void prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0);
     // one decode step for up to kMaxB sequences; returns the logits rows
     void decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows);

@@ -13,47 +13,51 @@ void cpu_conv_l2(const float * qkv_raw, float * conv_state, const float * conv_w
     const int n_groups = conv_dim / group_dim;
     const int n_norm_groups = 2 * n_k_heads;
     const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
-    for (int r = 0; r < n_rows; r++) {
+    // The per-(row, token) taps are independent in both call shapes used by the
+    // engine: batched prefill runs n_rows=1 with tpb=the whole stream, decode
+    // runs n_real=1 over the batch.  Flattening (row, token) lets one dispatch
+    // cover either, keeping the per-channel norm sequential inside a token.
+    par(n_rows * n_real, [&](int id) {
+        const int r = id / n_real;
+        const int t = id - r * n_real;
         const int rr = row0 + r;
         if (rr >= info->n_rows || !info->active[rr]) {
-            continue;
+            return;
         }
         float * cstate = conv_state + (size_t)info->slot[rr] * 3 * conv_dim;
-        for (int t = 0; t < n_real; t++) {
-            const int row = rr * tpb + t;
-            for (int grp = 0; grp < n_groups; grp++) {
-                const int cb = grp * group_dim;
-                for (int lane = 0; lane < group_dim; lane++) {
-                    const int ch = cb + lane;
-                    float v = 0.0f;
-                    for (int i = 0; i < 4; i++) {
-                        const float wv = conv_w[(size_t)i + (size_t)kernel_size * ch];
-                        const int p = t + i - (kernel_size - 1);
-                        const int gp = cross_row ? (rr * tpb + p) : p;
-                        const int qi = cross_row ? gp : (rr * tpb + p);
-                        if (gp >= 0) {
-                            v += wv * qkv_raw[(size_t)qi * conv_dim + ch];
-                        } else {
-                            v += wv * cstate[(size_t)(gp + kernel_size - 1) * conv_dim + ch];
-                        }
+        const int row = rr * tpb + t;
+        for (int grp = 0; grp < n_groups; grp++) {
+            const int cb = grp * group_dim;
+            for (int lane = 0; lane < group_dim; lane++) {
+                const int ch = cb + lane;
+                float v = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const float wv = conv_w[(size_t)i + (size_t)kernel_size * ch];
+                    const int p = t + i - (kernel_size - 1);
+                    const int gp = cross_row ? (rr * tpb + p) : p;
+                    const int qi = cross_row ? gp : (rr * tpb + p);
+                    if (gp >= 0) {
+                        v += wv * qkv_raw[(size_t)qi * conv_dim + ch];
+                    } else {
+                        v += wv * cstate[(size_t)(gp + kernel_size - 1) * conv_dim + ch];
                     }
-                    v = cpu_silu(v);
-                    conv_out[(size_t)row * conv_dim + ch] = v;
                 }
-                if (grp < n_norm_groups) {
-                    float ss = 0.0f;
-                    for (int lane = 0; lane < group_dim; lane++) {
-                        const float v = conv_out[(size_t)row * conv_dim + cb + lane];
-                        ss += v * v;
-                    }
-                    const float inv = 1.0f / std::fmax(std::sqrt(ss), eps);
-                    for (int lane = 0; lane < group_dim; lane++) {
-                        conv_out[(size_t)row * conv_dim + cb + lane] *= inv;
-                    }
+                v = cpu_silu(v);
+                conv_out[(size_t)row * conv_dim + ch] = v;
+            }
+            if (grp < n_norm_groups) {
+                float ss = 0.0f;
+                for (int lane = 0; lane < group_dim; lane++) {
+                    const float v = conv_out[(size_t)row * conv_dim + cb + lane];
+                    ss += v * v;
+                }
+                const float inv = 1.0f / std::fmax(std::sqrt(ss), eps);
+                for (int lane = 0; lane < group_dim; lane++) {
+                    conv_out[(size_t)row * conv_dim + cb + lane] *= inv;
                 }
             }
         }
-    }
+    });
 }
 
 void cpu_conv_state_update(const float * qkv_raw, float * conv_state, const cpu_step_info * info, int conv_dim,

@@ -358,9 +358,14 @@ micro-batch（单序列/单批），不做跨设备重叠。具体地：
 * 多设备路径直接重放计划（无图）、激活走主机 USM；**前缀缓存可用**——block id 全局、递归状态检查点
    在共享主机 USM，`pc_serialize_block`/`pc_deserialize_block` 经 `kv_layer_ptrs` 按设备解析每层的池。
    整模型 SIn w8 预留不建，但两条 int8 都可用：
-  - **prefill**：每 GPU 后端各持有一份 `dnnl_gemm`（`dnnl_dev_`，绑该设备的队列），只转换该设备
-    分区的层权重，prefill 以 pf8 风格整块计划在 GPU 层上跑 int8 GEMM、CPU 分区层走直读 GGUF 块的 i8
-    路径（`PF_GEMM_DNNL=0` 或 `PF_DP4A=0` 关掉这种多设备 oneDNN）；
+  - **prefill（按块）**：每 GPU 后端各持有一份 `dnnl_gemm`（`dnnl_dev_`，绑该设备的队列），只转换该
+    设备分区的层权重，小块（≤32 token）以 pf8 风格计划在 GPU 层上跑 int8 GEMM、CPU 分区层走直读
+    GGUF 块的 i8 路径（`PF_GEMM_DNNL=0` 或 `PF_DP4A=0` 关掉这种多设备 oneDNN）；
+  - **prefill（整块 mode-2）**：`plan_pfb_` + 行偏移段副本 `d_segs_pfb`，一个长 prompt 的所有
+    32-token 块合并进单个前向（`batched_prefill_fit` 对多设备返回 64..512），GPU 分区可转换权重组走
+    oneDNN int8（M=批 token 数）、CPU 分区层走 i8_gemm 网格，其余无 oneDNN 调用的小张量每组合并成
+    一次 fp32 网格分发（实测 400-token prefill 从 ~5.75s/13 次前向降到 ~5.0s/2 次前向，batch 内
+    int8 ~3.9s / fp32 旁路 ~0.27s，并避开首个请求的一次性 oneDNN 建原语开销）；
   - **decode**：每 GPU 后端为它分区里的层各建一份 SIn w8 副本（`w8_dev_`，也是绑该设备的队列），
     单序列 decode 走 `plan_dec8_`：GPU 层 `dp4a_gemv`、CPU 层 `i8_gemv`、LM head（主设备）也 int8；
     `PF_DP4A_DEC=0` 关掉，仍走 fp32 GEMV（批式 decode n>1 目前仍是 fp32，与单设备一致）。

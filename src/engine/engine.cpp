@@ -929,8 +929,8 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // variants (see build_graphs); callers pick it with batched_prefill_fit().
 void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0) {
     const int NCH = n / kMaxT;
-    if (cpu_mode || multi_dev) {
-        throw std::runtime_error("prefill_batch: not supported on the CPU/multi-device backend");
+    if (cpu_mode) {
+        throw std::runtime_error("prefill_batch: not supported on the CPU backend");
     }
     static const bool dbg_pfb = getenv("PF_DBG_PFB") != nullptr;
     pc_capture_begin(slot, toks, start, pos0, n);
@@ -955,13 +955,21 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     }
     static const bool nog = getenv("PF_NOGRAPH") != nullptr;
     // oneDNN primitives cannot be recorded into a SYCL command graph, so the
-    // PF_GEMM_DNNL path always uses the direct (non-graph) replay of mode 2
-    if ((nog || use_dnnl) && !plan_pfb_.segs.empty()) {
+    // PF_GEMM_DNNL path always uses the direct (non-graph) replay of mode 2.
+    // Multi-device has no recorded graphs at all, so it also always goes direct:
+    // the GPU partition runs oneDNN int8 at the batch M (add_weight pre-builds
+    // every M in 32..512 and acc_cap covers the widest N), the CPU partition
+    // i8_gemm, and the small non-convertible tensors one fp32 grid dispatch.
+    if ((nog || use_dnnl || multi_dev) && !plan_pfb_.segs.empty()) {
         if (dbg_pfb) {
             fprintf(stderr, "[pfb] direct record_forward(2)\n");
         }
         record_forward(2, plan_pfb_, d_segs_pfb, n, d_segs_pfb);
-        q.wait();
+        if (multi_dev) {
+            sync_all();
+        } else {
+            q.wait();
+        }
         d_info->pc_active = 0;
         return;
     }
