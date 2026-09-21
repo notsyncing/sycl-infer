@@ -298,6 +298,13 @@ KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射�
    decode 时 `info->pos` 是 token 计数，RoPE 位置由 `step_info::mrope` 携带（`mrope_on`）。
 7. **图像 token 不经过 `tok_embd`**：embed kernel 直接拷贝 `step_info::img_embd[img_row[t]]`。
 8. **多模态路径绕过前缀缓存**，使用单序列 `engine::generate_mm`。
+9. **plan 是设备指针快照**。`build_plan` 把构建时的 `d_x*` 成员写进 `gemv_seg`；multi-device 下
+   `bind_acts(dev)` 会把成员切到各设备的缓冲（`as_[dev]`）且**不会**回头修改已构建的 plan。因此
+   "固定在 primary 上执行"的段（LM head，`dev = 0`）必须在 `bind_acts(0)` 之后构建，否则会捕获最后一层
+   所在设备的激活缓冲。见 [design/04-engine.md](design/04-engine.md) §4.2。
+10. **解码与前向必须数值一致**。同一序列"单 token decode"与"重新 prefill"的结果必须一致（
+   `test_decode_vs_prefill`）；任何只影响单 token 路径的改动都要用该测试验证——纯 prefill 的测试对
+   解码路径是盲区。见 [design/12-build-and-testing.md](design/12-build-and-testing.md) §7。
 
 ---
 

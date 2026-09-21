@@ -24,6 +24,10 @@ const char * ggml_type_name(uint32_t t) {
     case GGML_TYPE_Q5_K: return "Q5_K";
     case GGML_TYPE_Q6_K: return "Q6_K";
     case GGML_TYPE_Q8_K: return "Q8_K";
+    case GGML_TYPE_IQ3_XXS: return "IQ3_XXS";
+    case GGML_TYPE_IQ4_NL: return "IQ4_NL";
+    case GGML_TYPE_IQ3_S: return "IQ3_S";
+    case GGML_TYPE_IQ4_XS: return "IQ4_XS";
     case GGML_TYPE_BF16: return "BF16";
     default: return "?";
     }
@@ -45,7 +49,11 @@ size_t ggml_blck_size(uint32_t t) {
     case GGML_TYPE_Q4_K:
     case GGML_TYPE_Q5_K:
     case GGML_TYPE_Q6_K:
-    case GGML_TYPE_Q8_K: return 256;
+    case GGML_TYPE_Q8_K:
+    case GGML_TYPE_IQ3_XXS:
+    case GGML_TYPE_IQ3_S:
+    case GGML_TYPE_IQ4_XS: return 256;
+    case GGML_TYPE_IQ4_NL: return 32;
     default: throw std::runtime_error("unsupported ggml type");
     }
 }
@@ -67,6 +75,10 @@ size_t ggml_type_size(uint32_t t) {
     case GGML_TYPE_Q5_K: return 4 + 12 + 32 + 128;
     case GGML_TYPE_Q6_K: return 2 + 16 + 128 + 64;
     case GGML_TYPE_Q8_K: return 4 + 256 + 32;
+    case GGML_TYPE_IQ3_XXS: return 2 + 32 + 64; // 2 + QK_K/8 + QK_K/4
+    case GGML_TYPE_IQ4_NL: return 2 + 16; // 2 + 16
+    case GGML_TYPE_IQ3_S: return 2 + 64 + 32 + 8 + 4; // 2 + QK_K/4 + QK_K/8 + QK_K/32 + 4
+    case GGML_TYPE_IQ4_XS: return 2 + 2 + 128 + 4; // 2 + 2 + QK_K/2 + QK_K/64
     default: throw std::runtime_error("unsupported ggml type size");
     }
 }

@@ -147,7 +147,7 @@ static bool w8_force4() {
 }
 
 uint32_t w8_effective_type(uint32_t type) {
-    return w8_force4() ? 12u : type;
+    return (w8_force4() || w8_requant_type(type)) ? 12u : type;
 }
 
 size_t w8_vals_bytes(uint32_t type, int K, int N) {
@@ -198,13 +198,15 @@ bool w8_repack(uint32_t type, const void * src, int K, int N, uint8_t * vals_out
     if (K % 32 != 0) {
         return false;
     }
-    if (type != 12 && type != 13 && type != 14) {
+    if (type != 12 && type != 13 && type != 14 && !w8_requant_type(type)) {
         return false;
     }
     // PF_SI4=1 re-quantizes every tensor to 4-bit asymmetric groups of 32
-    // (halves the bytes again at some quality cost); default keeps the GGUF
-    // bit width and values exactly.
+    // (halves the bytes again at some quality cost); the IQ/Q3_K codebook
+    // formats have no native SIn packing and always take this generic path.
+    // Default keeps the GGUF bit width and values exactly.
     const bool force4 = w8_force4();
+    const bool requant = force4 || w8_requant_type(type);
     const int G = force4 ? 32 : w8_group_size(type);
     const int gb = force4 ? 16 : w8_group_bytes(type);
     const int MG = K / G;
@@ -212,20 +214,20 @@ bool w8_repack(uint32_t type, const void * src, int K, int N, uint8_t * vals_out
     const size_t row_bytes = quant_row_bytes(type, K);
     const char * base = (const char *)src;
     std::vector<float> frow;
-    if (force4) {
+    if (requant) {
         frow.resize(K);
     }
 
     for (int r = 0; r < N; r++) {
         const int rb = r / kRB, ri = r % kRB;
         const char * row = base + (size_t)r * row_bytes;
-        if (force4) {
+        if (requant) {
             dequantize_row(type, row, frow.data(), K);
         }
         for (int g = 0; g < MG; g++) {
             uint8_t q[32];
             float s, m;
-            if (force4) {
+            if (requant) {
                 // asymmetric 4-bit: w = s*q - m over the 32-value group
                 float lo = frow[(size_t)g * 32], hi = lo;
                 for (int i = 1; i < 32; i++) {

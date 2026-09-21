@@ -69,10 +69,10 @@
 | 缓冲 | 大小 |
 |---|---|
 | `d_x`, `d_xnorm` | `R * n_embd` |
-| `d_qkv` | `R * 3*d_inner` |
+| `d_qkv` | `R * qkv_dim()`（`2*n_group*d_state + dt_rank*d_state`，**不是 `3*d_inner`**） |
 | `d_z` | `R * d_inner` |
 | `d_beta`, `d_alpha` | `R * dt_rank` |
-| `d_conv_out` | `R * 3*d_inner` |
+| `d_conv_out` | `R * qkv_dim()` |
 | `d_attn_pre`, `d_attn_merged` | `R * d_inner` |
 | `d_qbuf` | `R * n_head * 2 * head_dim`（第二半是 gate） |
 | `d_kbuf`, `d_vbuf` | `R * n_head_kv * head_dim` |
@@ -139,8 +139,16 @@
 | 3-4 | 与 GDN 相同的 FFN call |
 
 **head**（仅当 `with_head || head_batched`）：`begin_call(head_batched ? tb : 1, n_embd/256)`，
-`tok_embd` GEMV；`x = head_batched ? d_xnorm : d_last_hidden`，`out = d_logits`。仅 batched decode
-（`use_w8 && head_batched && tok_embd8`）走 int8。prefill 保持 fp32（只需一行）。
+**`m.output`** GEMV（不是 `m.tok_embd`：27B 的 LM head 是独立的 `output.weight`）；`x = head_batched ?
+d_xnorm : d_last_hidden`，`out = d_logits`。仅 batched decode（`use_w8 && head_batched && output8.vals`，
+即 head 有 SIn 副本时）走 int8，同时注册 `set_xq(d_xnorm)`；prefill 保持 fp32（只需一行）。
+
+⚠️ **head 段必须在 `bind_acts(0)` 之后构建**（`build_plan` 里确实这么做了）。`build_plan` 的逐层循环对每层
+调用 `bind_acts(layer_dev_[il])`（见 §3），把 `d_xnorm`/`d_x8`/`d_last_hidden` 等成员指向**该层所在设备**
+的缓冲；循环结束后如果没有重新绑回 primary，head 段就会捕获**最后一层设备**的缓冲，而运行时
+`record_forward` 在 `bind_acts(0)` 之后把 rmsnorm 结果写进 **primary** 的 `d_xnorm`——于是 batch-1 decode
+的 head 读到一块本 step 从未被写入的缓冲，logits（进而采样）全错，而 prefill 走 `run_head()`（读
+`d_last_hidden`）却完全正常。症状是"decode 与前向不一致、只吐 1–2 个 token、且对所有内核开关免疫"。
 
 因此每个 plan 有 `n_layer*4` 个 call，加可选的一个 head call。
 
@@ -157,6 +165,11 @@
 
 `head_batched=true`（decode）写 `d_logits[B][vocab]` 并读 `d_xnorm`；`false`（prefill）写一行、读
 `d_last_hidden`（由 `copy_row` 产生）。
+
+**plan 是"指针快照"**：`build_plan` 在构建时把当时的 `d_x*` 成员指针写进 `gemv_seg`。multi-device 下
+`bind_acts(dev)` 会把这些成员切到各设备的缓冲（`as_[dev]`），因此**一个 plan 的段指针全部属于构建它时
+最后绑定的那个设备**；`bind_acts()` 不会回头修改已构建的 plan。凡是"固定在 primary 上跑"的东西（目前
+只有 head，`s.dev = 0`）都必须在构建其段之前 `bind_acts(0)`，否则会拿错设备的激活缓冲。
 
 ---
 
@@ -207,8 +220,12 @@ for il in 0..n_layer-1:
     gemv()                                       # call4 ffn_down
 rmsnorm(d_x, output_norm → d_xnorm)
 if mode != 0: copy_row(d_xnorm → d_last_hidden, row=-1)
-gemv_at(call_offsets.size()-1)                   # LM head
+gemv_at(call_offsets.size()-1)                   # LM head（固定在 primary 设备）
 ```
+
+`rmsnorm`/`copy_row`/head 都在 `cur_be = backend()`（primary）上执行，且在此之前的 `bind_acts(0)` 把成员
+指针切回 primary；head 段的指针也必须来自那次绑定（见 §4.2 的 ⚠️）。decode（`mode == 0`）不写
+`d_last_hidden`，所以 head 段读的是 `d_xnorm`（`head_batched=true`）。
 
 `record_forward` 的 call 顺序必须与 `build_plan` 同步。
 
@@ -301,7 +318,8 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 
 * `eval(tokens)`（`engine.cpp:638-666`）：加锁、`reset_single`、按 `kBlockSize` 分配块、`set_table`、
   以 32 token 分块 `prefill_chunk`、`run_head`、释放块、返回最后一个 token 的 logits。无前缀缓存、无采样。
-* `run_head()`（`engine.cpp:616-636`）：为 `tok_embd` 构造一个 aux `gemv_seg`（`d_last_hidden → d_logits`），
+* `run_head()`（`engine.cpp:616-636`）：为 **`m.output`**（LM head；GGUF 无 `output.weight` 时加载器把它
+  指向 `tok_embd`）构造一个 aux `gemv_seg`（`d_last_hidden → d_logits`），
   用 `gemv_group_launch` 启动，拷回主机。注意它会重算最终 prefill chunk 已由 `e_pf8` 写好的 head。
 * `generate(prompt, gp, cb, first_logits)` / `generate_mm(p, gp, cb, first_logits)`：加锁后调
   `generate_impl`。
@@ -335,7 +353,7 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 |---|---|
 | `PF_DP4A` / `PF_DP4A_DEC` | int8 计算路径开关 |
 | `PF_GEMM_DNNL` / `PF_DNNL_NOWARM` / `PF_DNNL_TIME` | oneDNN 路径 |
-| `PF_META` / `PF_SI4` | 权重旁路数组 / 4-bit 重化 |
+| `PF_META` / `PF_SI4` / `PF_W4` | 权重旁路数组 / 4-bit 重化 / 原生 4-bit（u4）权重路径 |
 | `PF_ATTN_SPLIT` / `PF_ATTN_SPLIT_KEYS` / `PF_ATTN_FUSE` / `PF_DEC_SPLIT` / `PF_DEC_GROUP` / `PF_ATTN_VEC` | attention |
 | `PF_GDN_COLS` / `PF_GDN_WG` / `PF_GDN_VEC` / `PF_GDN_FUSE` / `PF_GDN_DBG` | GDN |
 | `PF_GEMV_*` / `PF_GEMM_*` / `PF_MT_*` / `GEMV_*` | GEMV/GEMM 调优 |
@@ -383,6 +401,10 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
   分给它的层（`weight_maps_` 逐张量上传），不持有整份 GGUF 副本。
 * `layer_attn_local_[il]` 给出该层在**所属设备**注意力层里的序号；`kv_setup` 为每个设备分配只含
   其注意力层的 paged KV 池，block id 全局一致（同一张 block table，见 [05-kv-cache.md](05-kv-cache.md)）。
+* `bind_acts(dev)` 把引擎的激活成员（`d_x`/`d_xnorm`/`d_x8`/…）切到该设备的 `as_[dev]` 缓冲；
+  plan 在构建时把这些成员"快照"进 `gemv_seg`，而 `bind_acts` 不会回头改已构建的 plan。因此固定在
+  primary 上执行的段（LM head）必须在其段被构建前 `bind_acts(0)`，否则会捕获最后一层所在设备的缓冲
+  （见 §4.2 的 ⚠️，这是 27B decode 出错的原因）。
 * 多设备支持前缀缓存：block id 全局、递归状态检查点在共享主机 USM 中按全局 GDN 层序号索引；
   `pc_serialize_block`/`pc_deserialize_block` 经 `engine::kv_layer_ptrs` 把每个全局注意力层解析到所属
   设备的池（局部序号 `layer_attn_local_[il]`，块内偏移与单设备布局一致）。整模型 `pf8`（SIn w8 预留）

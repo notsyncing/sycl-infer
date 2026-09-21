@@ -187,6 +187,20 @@ static int gemv_env_cfg(const char * name) {
         }                                                                                                              \
     } while (0)
 
+// dispatch a type over the four token-block widths
+#define GEMV_TB_SWITCH(QT)                                                                                             \
+    do {                                                                                                               \
+        if (TB == 1) {                                                                                                 \
+            GEMV_DISPATCH_TB(QT, 1);                                                                                   \
+        } else if (TB == 8) {                                                                                          \
+            GEMV_DISPATCH_TB(QT, 8);                                                                                   \
+        } else if (TB == 16) {                                                                                         \
+            GEMV_DISPATCH_TB(QT, 16);                                                                                  \
+        } else {                                                                                                       \
+            GEMV_DISPATCH_TB(QT, 32);                                                                                  \
+        }                                                                                                              \
+    } while (0)
+
 // ---------------------------------------------------------------------------
 // Single-token GEMV for Q4_K / Q5_K with a vectorized dequant mapping.
 //
@@ -336,6 +350,10 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
     case 12: GEMV_DISPATCH_CFG(12, TB_, CFG); break;                                                                   \
     case 13: GEMV_DISPATCH_CFG(13, TB_, CFG); break;                                                                   \
     case 14: GEMV_DISPATCH_CFG(14, TB_, CFG); break;                                                                   \
+    case 11: GEMV_DISPATCH_CFG(11, TB_, CFG); break;                                                                   \
+    case 20: GEMV_DISPATCH_CFG(20, TB_, CFG); break;                                                                   \
+    case 21: GEMV_DISPATCH_CFG(21, TB_, CFG); break;                                                                   \
+    case 23: GEMV_DISPATCH_CFG(23, TB_, CFG); break;                                                                   \
     case 8: GEMV_DISPATCH_CFG(8, TB_, CFG); break;                                                                     \
     default: GEMV_DISPATCH_CFG(0, TB_, CFG); break;                                                                    \
     }
@@ -383,6 +401,18 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
         } else {
             GEMV_DISPATCH_TB(14, 32);
         }
+        break;
+    case 11:
+        GEMV_TB_SWITCH(11);
+        break;
+    case 20:
+        GEMV_TB_SWITCH(20);
+        break;
+    case 21:
+        GEMV_TB_SWITCH(21);
+        break;
+    case 23:
+        GEMV_TB_SWITCH(23);
         break;
     case 8:
         if (TB == 1) {

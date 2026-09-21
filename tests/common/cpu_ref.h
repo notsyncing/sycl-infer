@@ -40,11 +40,14 @@ struct cpu_ref {
         const int T = kMaxT;
         x.resize((size_t)T * hp.n_embd);
         xn.resize((size_t)T * hp.n_embd);
-        qkv.resize((size_t)T * 3 * hp.d_inner);
+        // the qkv projection / conv channel count is hp.qkv_dim(), not 3*d_inner:
+        // those coincide only when n_group == dt_rank (the 0.8B reference), while
+        // Qwen3.8-27B projects 2*16*128 + 48*128 = 10240 vs 3*6144 = 18432.
+        qkv.resize((size_t)T * hp.qkv_dim());
         z.resize((size_t)T * hp.d_inner);
         beta.resize((size_t)T * hp.dt_rank);
         alpha.resize((size_t)T * hp.dt_rank);
-        conv_out.resize((size_t)T * 3 * hp.d_inner);
+        conv_out.resize((size_t)T * hp.qkv_dim());
         attn_pre.resize((size_t)T * hp.d_inner);
         attn_merged.resize((size_t)T * hp.d_inner);
         qbuf.resize((size_t)T * hp.n_head * 2 * hp.head_dim);
@@ -65,7 +68,7 @@ struct cpu_ref {
         kcache.resize((size_t)n_attn * hp.n_head_kv * max_seq * hp.head_dim, 0.f);
         vcache.resize((size_t)n_attn * hp.n_head_kv * max_seq * hp.head_dim, 0.f);
         gdn_state.assign((size_t)n_gdn * hp.dt_rank * hp.d_state * hp.d_state, 0.f);
-        conv_state.assign((size_t)n_gdn * 3 * 3 * hp.d_inner, 0.f);
+        conv_state.assign((size_t)n_gdn * 3 * hp.qkv_dim(), 0.f);
     }
 
     static float silu(float v) {
@@ -97,37 +100,6 @@ struct cpu_ref {
         }
     }
 
-    void conv_layer(int gidx, const layer_t & L, int t, const float * in, float * out) {
-        const int cd = 3 * hp.d_inner;
-        float * st = conv_state.data() + (size_t)gidx * 3 * cd;
-        const float * cw = L.ssm_conv1d;
-        for (int c = 0; c < cd; c++) {
-            float v = cw[3 * cd + c] * in[c];
-            for (int i = 0; i < 3; i++) {
-                v += cw[(size_t)i * cd + c] * st[(size_t)i * cd + c];
-            }
-            out[c] = silu(v);
-        }
-        // l2 norm over q and k groups
-        for (int grp = 0; grp < 2 * hp.n_group; grp++) {
-            const int cb = grp * hp.d_state;
-            double ss = 0;
-            for (int i = 0; i < hp.d_state; i++) {
-                ss += (double)out[cb + i] * out[cb + i];
-            }
-            const float sc = 1.0f / std::fmax(std::sqrt((float)ss), hp.rms_eps);
-            for (int i = 0; i < hp.d_state; i++) {
-                out[cb + i] *= sc;
-            }
-        }
-        // update state (oldest first)
-        for (int c = 0; c < cd; c++) {
-            float v2 = in[c];
-            float v1 = (t >= 1) ? (st + 3 * cd - cd)[c] * 0 + v2 * 0 + 0 : 0; // placeholder
-            (void)v1;
-        }
-    }
-
     void forward(const std::vector<int> & tokens) {
         const int n = (int)tokens.size();
         n_tokens = n;
@@ -151,7 +123,7 @@ struct cpu_ref {
                     snap("attn_norm-0", xnt, hp.n_embd);
                 }
                 if (L.recurrent) {
-                    float * qkvt = qkv.data() + (size_t)t * 3 * hp.d_inner;
+                    float * qkvt = qkv.data() + (size_t)t * hp.qkv_dim();
                     float * zt = z.data() + (size_t)t * hp.d_inner;
                     float * bt = beta.data() + (size_t)t * hp.dt_rank;
                     float * at = alpha.data() + (size_t)t * hp.dt_rank;
@@ -160,11 +132,11 @@ struct cpu_ref {
                     matvec(L.ssm_beta, xnt, bt);
                     matvec(L.ssm_alpha, xnt, at);
                     if (il == 0) {
-                        snap("raw_wqkv-0", qkvt, 3 * hp.d_inner);
+                        snap("raw_wqkv-0", qkvt, hp.qkv_dim());
                         snap("raw_wgate-0", zt, hp.d_inner);
                     }
                     if (il == 0) {
-                        snap("linear_attn_qkv_mixed-0", qkvt, 3 * hp.d_inner);
+                        snap("linear_attn_qkv_mixed-0", qkvt, hp.qkv_dim());
                     }
                     if (il == 0) {
                         snap("beta-0", bt, hp.dt_rank);
@@ -177,8 +149,8 @@ struct cpu_ref {
                         snap("a_softplus-0", at, hp.dt_rank);
                         snap("z-0", zt, hp.d_inner);
                     }
-                    // conv
-                    const int cd = 3 * hp.d_inner;
+                    // conv over the qkv projection, then l2 norm on the q/k part
+                    const int cd = hp.qkv_dim();
                     float * st = conv_state.data() + (size_t)gidx * 3 * cd;
                     float * co = conv_out.data() + (size_t)t * cd;
                     for (int c = 0; c < cd; c++) {
@@ -205,24 +177,28 @@ struct cpu_ref {
                     if (il == 0) {
                         snap("q_conv_predelta-0", co, hp.n_group * hp.d_state);
                         snap("k_conv_predelta-0", co + hp.n_group * hp.d_state, hp.n_group * hp.d_state);
-                        snap("v_conv_predelta-0", co + 2 * hp.n_group * hp.d_state, hp.n_group * hp.d_state);
+                        snap("v_conv_predelta-0", co + 2 * hp.n_group * hp.d_state, hp.dt_rank * hp.d_state);
                     }
                     // state shift: st[0]=x[t-3], st[1]=x[t-2], st[2]=x[t-1]
                     float *st0 = st, *st1 = st + cd, *st2 = st + 2 * cd;
                     std::memcpy(st0, st1, cd * 4);
                     std::memcpy(st1, st2, cd * 4);
                     std::memcpy(st2, qkvt, cd * 4);
-                    // gdn recurrence
-                    const int H = hp.dt_rank, D = hp.d_state;
+                    // gdn recurrence.  q/k carry n_group key heads, v carries
+                    // dt_rank value heads; v head h is paired with key head
+                    // h % n_group (the reference tiles q/k with ggml_repeat_4d,
+                    // whose repetition is modulo/interleaved - not blocked).
+                    const int H = hp.dt_rank, D = hp.d_state, Hk = hp.n_group;
                     float * statep = gdn_state.data() + (size_t)gidx * H * D * D;
                     float * ap = attn_pre.data() + (size_t)t * hp.d_inner;
                     for (int h = 0; h < H; h++) {
                         float * S = statep + (size_t)h * D * D; // S[col][row]: col = v dim, row = k dim
                         const float g = std::exp(at[h] * L.ssm_a[h]);
                         const float bv = bt[h];
-                        const float * qv = co + h * D;
-                        const float * kv = co + H * D + h * D;
-                        const float * vv = co + 2 * H * D + h * D;
+                        const int kk = h % Hk;
+                        const float * qv = co + kk * D;
+                        const float * kv = co + Hk * D + kk * D;
+                        const float * vv = co + 2 * Hk * D + h * D;
                         for (int col = 0; col < D; col++) {
                             float kvv = 0;
                             for (int i = 0; i < D; i++) {
@@ -424,7 +400,9 @@ struct cpu_ref {
         const int t = n_tokens - 1;
         std::vector<float> hn(hp.n_embd);
         rmsnorm(&x[(size_t)t * hp.n_embd], m.output_norm, hn.data(), hp.n_embd, hp.rms_eps);
-        matvec(m.tok_embd, hn.data(), logits.data());
+        // m.output, not m.tok_embd: the loader aliases them when the GGUF has no
+        // untied output.weight (0.8B), but Qwen3.8-27B ships its own q6_K LM head
+        matvec(m.output, hn.data(), logits.data());
     }
 };
 

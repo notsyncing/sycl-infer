@@ -67,7 +67,7 @@ store 也做同样校验。
 
 `d_pc_states` 是 `[pc_max_states][pc_state_floats]` 设备内存。`pc_state_floats = n_gdn *
 (gdn_per_slot() + conv_per_slot())`，其中 `gdn_per_slot = dt_rank*d_state*d_state`、
-`conv_per_slot = (conv_k-1)*3*d_inner`（约 19 MB/检查点）。
+`conv_per_slot = (conv_k-1)*qkv_dim()`（**不是 `3*d_inner`**；27B 上 `qkv_dim()=10240`）。
 
 槽记账：`pc_state_owner[st]`（节点 idx 或 -1）、`pc_state_free`（空闲栈）、`pc_state_stamp[st]`（LRU）。
 

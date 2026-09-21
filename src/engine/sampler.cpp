@@ -118,6 +118,16 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
         }
     }
     std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    if (cand.empty()) {
+        // all logits were non-finite (e.g. a broken model): fall back to argmax
+        int best = 0;
+        for (int i = 1; i < n_vocab; i++) {
+            if (lg[i] > lg[best]) {
+                best = i;
+            }
+        }
+        return best;
+    }
 
     // softmax over candidates
     double sum = 0.0;

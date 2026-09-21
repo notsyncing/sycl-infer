@@ -122,6 +122,13 @@ template <> inline const uint8_t * kv_row_data<uint8_t>(const uint8_t * base, si
     return base + (unit * kBlockSize + ko) * (size_t)(head_dim / 2);
 }
 
+// Real token count of row `r`: mode 2 may have a partial last row; 0 in
+// n_real_row means "use the uniform n_real" (mode 0/1, graph replay).
+inline int row_nr(const step_info * info, int r) {
+    const int nr = info->n_real_row[r];
+    return nr > 0 ? nr : info->n_real;
+}
+
 inline float fast_h2f(uint16_t h) {
     const uint32_t exp = (h >> 10) & 0x1Fu;
     if (exp == 0 || exp == 31) {
@@ -152,9 +159,132 @@ template <uint32_t QT> inline void w8_sw_mw(const char * meta, size_t idx, int m
     mw = fast_h2f((uint16_t)(m >> 16));
 }
 
+// Q3_K scales are 16 packed 6-bit values; unpack into 16 int8s (ggml layout).
+inline void unpack_q3k_scales(const block_q3_K * x, int8_t * scales) {
+    const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    __builtin_memcpy(aux, x->scales, 12);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    __builtin_memcpy(scales, aux, 16);
+}
+
+// one element (0..255) of an IQ/Q3_K 256-element super-block; element index
+// e = 32*b + lane matches the SIn lane mapping so the lane kernels below can
+// share the same indexing.
+inline float dequant_elem_iq(uint32_t type, const char * sb, int e) {
+    const int b = e / 32, lane = e % 32;
+    switch (type) {
+    case 11: { // Q3_K
+        const auto * x = (const block_q3_K *)sb;
+        int8_t scales[16];
+        unpack_q3k_scales(x, scales);
+        const int half = b / 4, j = b % 4;
+        const uint8_t q = x->qs[half * 32 + lane];
+        const int val = (int)((q >> (2 * j)) & 3) - ((x->hmask[lane] & (1u << (half * 4 + j))) ? 0 : 4);
+        const int is = (half * 4 + j) * 2 + (lane >= 16 ? 1 : 0);
+        return fast_h2f(x->d) * (float)(scales[is] - 32) * (float)val;
+    }
+    case 20: { // IQ4_NL
+        const auto * blk = (const block_iq4_nl *)(sb + b * (int)sizeof(block_iq4_nl));
+        const uint8_t byte = blk->qs[lane & 15];
+        const int nib = (lane < 16) ? (byte & 0xf) : (byte >> 4);
+        return fast_h2f(blk->d) * (float)kvalues_iq4nl[nib];
+    }
+    case 21: { // IQ3_S
+        const auto * x = (const block_iq3_s *)sb;
+        const int pi = b / 2, part = b % 2;
+        const float db = fast_h2f(x->d) * (1.0f + 2.0f * (float)(part ? (x->scales[pi] >> 4) : (x->scales[pi] & 0xf)));
+        const int l = lane / 8, k = lane % 8;
+        const uint8_t * qs = x->qs + pi * 16 + part * 8;
+        const uint8_t * sg = x->signs + pi * 8 + part * 4;
+        const int qhb = x->qh[pi * 2 + part];
+        int gidx, gi;
+        if (k < 4) {
+            gidx = qs[2 * l + 0] | ((qhb << (8 - 2 * l)) & 256);
+            gi = k;
+        } else {
+            gidx = qs[2 * l + 1] | ((qhb << (7 - 2 * l)) & 256);
+            gi = k - 4;
+        }
+        const float s = (sg[l] & kmask_iq2xs[k]) ? -1.f : 1.f;
+        return db * (float)((const uint8_t *)(iq3s_grid + gidx))[gi] * s;
+    }
+    case 23: { // IQ4_XS
+        const auto * x = (const block_iq4_xs *)sb;
+        const int ls = ((x->scales_l[b / 2] >> (4 * (b % 2))) & 0xf) | (((x->scales_h >> (2 * b)) & 3) << 4);
+        const uint8_t byte = x->qs[16 * b + (lane & 15)];
+        const int nib = (lane < 16) ? (byte & 0xf) : (byte >> 4);
+        return fast_h2f(x->d) * (float)(ls - 32) * (float)kvalues_iq4nl[nib];
+    }
+    default: return 0.f;
+    }
+}
+
 // typed variant (compile-time dispatch)
 template <uint32_t TYPE> inline void dequant_sb_lane_typed(const char * sb, int lane, float w[8]) {
     switch (TYPE) {
+    case 11: { // Q3_K
+        const auto * x = (const block_q3_K *)sb;
+        int8_t scales[16];
+        unpack_q3k_scales(x, scales);
+        const float d = fast_h2f(x->d);
+        const uint8_t hm = x->hmask[lane];
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const int half = b / 4, j = b % 4;
+            const uint8_t q = x->qs[half * 32 + lane];
+            const int val = (int)((q >> (2 * j)) & 3) - ((hm & (1u << (half * 4 + j))) ? 0 : 4);
+            const int is = (half * 4 + j) * 2 + (lane >= 16 ? 1 : 0);
+            w[b] = d * (float)(scales[is] - 32) * (float)val;
+        }
+    } break;
+    case 20: { // IQ4_NL: 8 independent 32-element blocks
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const auto * blk = (const block_iq4_nl *)(sb + b * (int)sizeof(block_iq4_nl));
+            const uint8_t byte = blk->qs[lane & 15];
+            const int nib = (lane < 16) ? (byte & 0xf) : (byte >> 4);
+            w[b] = fast_h2f(blk->d) * (float)kvalues_iq4nl[nib];
+        }
+    } break;
+    case 21: { // IQ3_S
+        const auto * x = (const block_iq3_s *)sb;
+        const float d = fast_h2f(x->d);
+        const int l = lane / 8, k = lane % 8;
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const int pi = b / 2, part = b % 2;
+            const float db = d * (1.0f + 2.0f * (float)(part ? (x->scales[pi] >> 4) : (x->scales[pi] & 0xf)));
+            const uint8_t * qs = x->qs + pi * 16 + part * 8;
+            const uint8_t * sg = x->signs + pi * 8 + part * 4;
+            const int qhb = x->qh[pi * 2 + part];
+            int gidx, gi;
+            if (k < 4) {
+                gidx = qs[2 * l + 0] | ((qhb << (8 - 2 * l)) & 256);
+                gi = k;
+            } else {
+                gidx = qs[2 * l + 1] | ((qhb << (7 - 2 * l)) & 256);
+                gi = k - 4;
+            }
+            const float s = (sg[l] & kmask_iq2xs[k]) ? -1.f : 1.f;
+            w[b] = db * (float)((const uint8_t *)(iq3s_grid + gidx))[gi] * s;
+        }
+    } break;
+    case 23: { // IQ4_XS
+        const auto * x = (const block_iq4_xs *)sb;
+        const float d = fast_h2f(x->d);
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const int ls = ((x->scales_l[b / 2] >> (4 * (b % 2))) & 0xf) | (((x->scales_h >> (2 * b)) & 3) << 4);
+            const uint8_t byte = x->qs[16 * b + (lane & 15)];
+            const int nib = (lane < 16) ? (byte & 0xf) : (byte >> 4);
+            w[b] = d * (float)(ls - 32) * (float)kvalues_iq4nl[nib];
+        }
+    } break;
     case 12: { // Q4_K
         auto * blk = (const block_q4_K *)sb;
         const float d = fast_h2f(blk->d);
@@ -236,9 +366,13 @@ template <uint32_t TYPE> inline void dequant_sb_lane_typed(const char * sb, int 
 // weights of one 256-element superblock for lane `lane` (lane <-> element 32*b + lane)
 inline void dequant_sb_lane(uint32_t type, const char * sb, int lane, float w[8]) {
     switch (type) {
+    case 11: dequant_sb_lane_typed<11>(sb, lane, w); break;
     case 12: dequant_sb_lane_typed<12>(sb, lane, w); break;
     case 13: dequant_sb_lane_typed<13>(sb, lane, w); break;
     case 14: dequant_sb_lane_typed<14>(sb, lane, w); break;
+    case 20: dequant_sb_lane_typed<20>(sb, lane, w); break;
+    case 21: dequant_sb_lane_typed<21>(sb, lane, w); break;
+    case 23: dequant_sb_lane_typed<23>(sb, lane, w); break;
     case 8: dequant_sb_lane_typed<8>(sb, lane, w); break;
     default: dequant_sb_lane_typed<0>(sb, lane, w); break;
     }
@@ -247,6 +381,10 @@ inline void dequant_sb_lane(uint32_t type, const char * sb, int lane, float w[8]
 // element `e` (0..255) of a 256-element superblock
 inline float dequant_elem_sb(uint32_t type, const char * sb, int e) {
     switch (type) {
+    case 11:
+    case 20:
+    case 21:
+    case 23: return dequant_elem_iq(type, sb, e);
     case 12: {
         auto * b = (const block_q4_K *)sb;
         const int chunk = e / 64, l = e % 64; // 4 chunks x 64 elems
@@ -304,6 +442,10 @@ inline float dequant_elem_sb(uint32_t type, const char * sb, int e) {
 // weight for lane `lane` of sub-block `b` within a 256-elem superblock
 inline float dequant_lane_w(uint32_t type, const char * sb, int b, int lane) {
     switch (type) {
+    case 11:
+    case 20:
+    case 21:
+    case 23: return dequant_elem_iq(type, sb, 32 * b + lane);
     case 12: {
         auto * blk = (const block_q4_K *)sb;
         const int chunk = b / 2, part = b % 2;
@@ -356,9 +498,13 @@ inline float dequant_lane_w(uint32_t type, const char * sb, int b, int lane) {
 
 inline int superblock_bytes(uint32_t type) {
     switch (type) {
+    case 11: return 110;
     case 12: return 144;
     case 13: return 176;
     case 14: return 210;
+    case 20: return 8 * 18;
+    case 21: return 110;
+    case 23: return 136;
     case 8: return 8 * 34;
     case 0: return 256 * 4;
     default: return 0;

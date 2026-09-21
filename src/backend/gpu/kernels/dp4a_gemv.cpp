@@ -124,4 +124,137 @@ void dp4a_gemv_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     }
 }
 
+// ---------------------------------------------------------------------------
+// Single-token decode GEMV over a row-major int8 weight [N][K] + per-row scale
+// (the oneDNN conversion's layout).  The oneDNN primitive itself is dominated
+// by per-call overhead at M=1, so the decode path reads its weight buffer
+// directly.  One workgroup per output row, 256 lanes reducing over K.
+// ---------------------------------------------------------------------------
+void i8_row_gemv_launch(sycl::queue & q, const int8_t * w, const float * sw, const int8_t * xq, const float * sx_dev,
+                        float * out, int K, int N, const float * residual, float alpha) {
+    // one 256-thread workgroup per output row: every lane reduces over K
+    // (coalesced int8 loads), then a workgroup reduction.  The single
+    // activation row is shared by all workgroups (L1/L2 resident).
+    constexpr int WG = 256;
+    q.parallel_for(nd_range<1>((size_t)N * WG, WG), [=](nd_item<1> it) {
+        const int n = (int)it.get_group(0);
+        const int lane = (int)it.get_local_id(0);
+        const float sx = sx_dev[0]; // device-side read (USM)
+        const int8_t * wr = w + (size_t)n * K;
+        int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        int k = lane;
+        for (; k + 3 * WG < K; k += 4 * WG) {
+            a0 += (int)wr[k] * (int)xq[k];
+            a1 += (int)wr[k + WG] * (int)xq[k + WG];
+            a2 += (int)wr[k + 2 * WG] * (int)xq[k + 2 * WG];
+            a3 += (int)wr[k + 3 * WG] * (int)xq[k + 3 * WG];
+        }
+        for (; k < K; k += WG) {
+            a0 += (int)wr[k] * (int)xq[k];
+        }
+        int acc = a0 + a1 + a2 + a3;
+        acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<int>());
+        if (lane == 0) {
+            float v = alpha * sx * sw[n] * (float)acc;
+            if (residual) {
+                v += residual[n];
+            }
+            out[n] = v;
+        }
+    });
+}
+
+// R rows per sub-group: the 32 lanes split into R groups of 32/R lanes, each
+// group streaming one weight row.  More rows per sub-group => fewer lanes per
+// row => a deeper per-lane K loop (10 -> 40 iterations at R=4), which is what
+// hides DRAM latency for this shallow GEMV.  Weights are XOR-biased to unsigned
+// for dp4a and the 128*bias is removed once per row via the activation sum.
+template <int R>
+static void i8_row_gemv_multi_impl(queue & q, const gemv_seg * segs, int n_segs, int total_rows, const int8_t * xq,
+                                   const float * sx_dev, const int32_t * xsum_dev) {
+    constexpr int WG = 256;
+    constexpr int SG = 32;
+    constexpr int LPR = SG / R; // lanes per row
+    constexpr int ROWS_PER_WG = (WG / SG) * R;
+    const int n_wg = (total_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
+    q.parallel_for(nd_range<1>((size_t)n_wg * WG, WG), [=](nd_item<1> it) {
+        const int lane = (int)it.get_local_id(0) % SG;
+        const int sgl = (int)it.get_local_id(0) / SG;
+        const int r = lane / LPR;      // row within the sub-group
+        const int ll = lane % LPR;     // lane within the row
+        const int g = (int)it.get_group(0) * ROWS_PER_WG + sgl * R + r;
+        if (g >= total_rows) {
+            return;
+        }
+        const float sx = sx_dev[0];
+        const int corr = xsum_dev ? xsum_dev[0] * 128 : 0;
+        int s = 0, b = 0, nr = segs[0].n_rows;
+        while (g >= b + nr && s + 1 < n_segs) {
+            b += nr;
+            s++;
+            nr = segs[s].n_rows;
+        }
+        const gemv_seg & sgx = segs[s];
+        const int row = g - b;
+        const int K = sgx.K;
+        const int8_t * wr = sgx.wi8 + (size_t)row * K;
+        int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        // software pipelining: load the next iteration's 16-byte chunks while
+        // the current four dp4a chains run, so the shallow K loop keeps enough
+        // loads in flight to hide DRAM latency (no extra memory / layout).
+        constexpr int stride = LPR * 16;
+        const uint4 * xrow = reinterpret_cast<const uint4 *>(xq);
+        const uint4 * wrow = reinterpret_cast<const uint4 *>(wr);
+        constexpr int cs = LPR;   // chunk stride (16-byte units)
+        const int nchunk = (K + 15) / 16;
+        int ci = (ll < nchunk) ? ll : 0; // guard: short rows must not over-read
+        uint4 xv = xrow[ci];
+        uint4 wv = wrow[ci];
+        for (int k = ll * 16; k < K; k += stride) {
+            uint4 xn, wn;
+            const bool more = (k + stride) < K;
+            if (more) {
+                xn = xrow[ci + cs];
+                wn = wrow[ci + cs];
+            }
+            a0 = dp4a_s8u8((int32_t)xv.x(), wv.x() ^ 0x80808080u, a0);
+            a1 = dp4a_s8u8((int32_t)xv.y(), wv.y() ^ 0x80808080u, a1);
+            a2 = dp4a_s8u8((int32_t)xv.z(), wv.z() ^ 0x80808080u, a2);
+            a3 = dp4a_s8u8((int32_t)xv.w(), wv.w() ^ 0x80808080u, a3);
+            if (more) {
+                xv = xn;
+                wv = wn;
+            }
+            ci += cs;
+        }
+        int acc = a0 + a1 + a2 + a3;
+        acc = sycl::reduce_over_group(it.get_sub_group(), acc, sycl::plus<int>());
+        if (lane == 0) {
+            float v = sgx.alpha * sx * sgx.wsc[row] * (float)(acc - corr);
+            if (sgx.residual) {
+                v += sgx.residual[row];
+            }
+            sgx.out[row] = v;
+        }
+    });
+}
+
+void i8_row_gemv_multi_launch(sycl::queue & q, const gemv_seg * segs, int n_segs, int total_rows, const int8_t * xq,
+                              const float * sx_dev, const int32_t * xsum_dev) {
+    static const int rows = [] {
+        const char * e = getenv("PF_DEC_R");
+        const int v = e ? atoi(e) : 1;
+        return v == 1 ? 1 : (v == 2 ? 2 : (v == 4 ? 4 : 8));
+    }();
+    if (rows == 1) {
+        i8_row_gemv_multi_impl<1>(q, segs, n_segs, total_rows, xq, sx_dev, xsum_dev);
+    } else if (rows == 2) {
+        i8_row_gemv_multi_impl<2>(q, segs, n_segs, total_rows, xq, sx_dev, xsum_dev);
+    } else if (rows == 4) {
+        i8_row_gemv_multi_impl<4>(q, segs, n_segs, total_rows, xq, sx_dev, xsum_dev);
+    } else {
+        i8_row_gemv_multi_impl<8>(q, segs, n_segs, total_rows, xq, sx_dev, xsum_dev);
+    }
+}
+
 } // namespace si

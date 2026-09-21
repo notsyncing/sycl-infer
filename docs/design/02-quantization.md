@@ -11,6 +11,7 @@
 
 | 路径 | 权重格式 | 激活 | 启用 | 适用 |
 |---|---|---|---|---|
+| **u4 原生 4-bit**（GPU，Q4_K） | `w4t`（原生 q + 每 32 组 (step, offset)） | 每 32 组对称 int8（`act_quant_grp_launch`） | `PF_W4=1`（默认，且张量是 Q4_K） | Q4_K 的 prefill GEMM + decode GEMV，见 §9 |
 | **SIn + DP4A**（GPU） | `w8t`（GGUF 整数原值，按位宽打包） | 运行时对称 int8（`xq_launch`） | `PF_DP4A=1`（默认） | prefill GEMM + decode GEMV |
 | **CPU 整数**（`backend/cpu/kernels/i8.cpp`） | 直接读 GGUF block，AVX2 提 4/5/6-bit | 运行时对称 int8（`cpu_xq`） | `PF_DP4A=1`（默认） | Q4_K/Q5_K/Q6_K 的 prefill/decode |
 | **oneDNN int8** | 主机转成行主序 int8 `[N][K]` + 每行 scale | 每行对称 int8，按 call 量化一次 | `PF_GEMM_DNNL=1`（默认） | 模式 2 chunk-batched prefill，以及模式 1 |
@@ -199,10 +200,12 @@ d = dp4a(x_signed, w_unsigned, acc)
 
 ### 6.2 权重转换
 
-每个 GGUF K-quant 张量在主机侧逐行反量化，重化为**行主序 int8 `[N][K]`**，每输出行一个对称 scale，
-对应 oneDNN 的 `"ba"` 权重布局（GPU int8 matmul 全速读取）。`add_weight`（`dnnl_gemm.cpp:233-317`）：
+每个 GGUF K-quant 张量在主机侧逐行反量化，重化为**行主序 int8 `[N][K]`**，权重 scale 是
+**每 32 值一组**的 f16 `[K/32][N]`（对应 oneDNN 的 grouped WEIGHTS scale，`mask=1, groups={32,1}`，
+`"ba"` 权重布局 + f32 dst）——与 K-quant 原生网格一致，比原来的每行 scale 精度高得多。
+`add_weight`（`dnnl_gemm.cpp:233-317`）：
 
-* 拒绝非 12/13/14、`K<=0`、`N<=0`、`K%32!=0`、`K > kActMaxK=4096`；
+* 拒绝非 12/13/14、`K<=0`、`N<=0`、`K%32!=0`、`K > kActMaxK=32768`（27B 的 `n_ff=17408`）；
 * 用 `hardware_concurrency` 个线程并行反量化/量化；
 * 上传设备并创建 `"ba"` memory；
 * 预先为 `M = kMaxT..cap_M`（步长 `kMaxT`）创建所有 primitive，标记 `w.ok` 以便引擎在不支持时回退。
@@ -247,6 +250,7 @@ oneDNN primitive 无法被 SYCL command graph 捕获。因此：
 | `PF_DP4A_DEC` | on | `0` 只把 decode 退回 fp32（prefill 仍 int8） |
 | `PF_META` | off | 构建 Q4_K/Q5_K 的 fp32 `(scale,min)` 旁路数组（实测净损失，约 260 MB） |
 | `PF_SI4` | off | 全部重化为 4-bit SIn，副本减半、精度略降 |
+| `PF_W4` | on | Q4_K 走原生 4-bit 权重路径（§9）；`0` 恢复纯 int8（每 32 组权重 scale 仍生效） |
 | `PF_GEMM_DNNL` | on | `0` 关闭 oneDNN，改用 DP4A chunk-batched |
 
 ### `PF_META` fp32 side array
@@ -260,9 +264,72 @@ oneDNN primitive 无法被 SYCL command graph 捕获。因此：
 
 ## 8. 精度与正确性说明
 
-* **权重值**默认与 GGUF 整数逐位一致，只有 scale/min 的表示被重新量化到 fp16。
+* **权重值**默认与 GGUF 整数逐位一致，只有 scale/min 的表示被重新量化到 fp16（u4 路径同样如此，
+  见 §9：唯一的误差来源是 f16 元数据，实测每行相对 L2 **0.077%**，而 int8 的每行重化是 **0.98%**）。
 * **激活**是对称 int8，每 32 值两个额外量：fp32 scale 与每 16 值整数和；round 为 half-to-away，
   clamp 到 `[-127,127]`。
 * **DP4A vs oneDNN**：数值上不同（DP4A 用每 32 值激活 scale + 精确整数 dp4a 累加；oneDNN 用每行
   scale + 精确 s32 matmul + fp32 epilogue）。引擎把 `PF_GEMM_DNNL=0` 当作 DP4A 验证配置。
 * 严格 kernel/端到端测试通过 `setenv("PF_DP4A","0",1)` 验证 fp32 路径。
+
+---
+
+## 9. 原生 4-bit（u4）权重路径（`w4.{h,cpp}`、`w4_gemv.cpp`）
+
+### 9.1 动机
+
+GGUF 的 K-quant 已经把每个权重放在**每 32 值一组**的均匀网格上：`w = step_g*q - offset_g`，
+`q` 是该类型的原生位宽，`(step_g, offset_g) = (d*sc_j, dmin*m_j)` 直接来自 super-block。因此
+**保留 `(q, step_g, offset_g)` 是无损的**，而且比 int8 小 1.6 倍（`K*N/2 + (K/32)*N*4` 字节 vs
+`K*N`）。实测每行相对 L2（模型自身反量化值为基准）：
+
+| 表示 | rel L2 |
+|---|---|
+| int8 per-row（原转换） | 0.98 % |
+| u4 + 重算每组 min/max | 4.39 % |
+| **u4 + 原生 `(step, offset)`，f16 元数据** | **0.077 %** |
+| u4 + 原生 `(step, offset)`，f32 元数据 | 0 |
+
+也就是说 4-bit 不只是省内存，**精度还严格优于 int8**：它不引入重化误差，只是把元数据舍入到 f16。
+27B 的 Q4_K 占多数，这是它能塞进两张 A770 的关键。
+
+### 9.2 布局（`w4t`，`w4.h`）
+
+| 平面 | 布局 |
+|---|---|
+| `vals` | `vals[(n*K + k) >> 1]` 的 nibble（`k & 1`），u4、K 为内层、低 nibble 在前 |
+| `scale` | `scale[g*N + n]` f16 = `step`，`g = k/32` |
+| `off` | `off[g*N + n]` f16 = `offset`（修正系数） |
+
+两个独立的 f16 平面：oneDNN 的 grouped-scale memory 必须是恰好这个顺序的连续 f16 张量（已实测验证），
+而修正项把 `off` 当作 `{NG,N}` 的 f16 矩阵读取。
+
+### 9.3 prefill：oneDNN u4 GEMM + 修正项
+
+权重作为 `{K,N}` `format_tag::ba`，配 grouped f16 WEIGHTS scale（= `step`，mask 在 K、
+`groups={32,1}`）与 grouped f16 SRC scale（mask 在 K、`groups={1,32}`），**dst 为 f32**：
+
+```
+out = oneDNN(u4 weights, grouped f16 scales = step) + correction
+correction[m][n] = Σ_g off[n][g] * XS[m][g]        # XS[m][g] = 该组 32 个激活之和
+```
+
+因为 `w = offset + step*q`，零点被移进一个小的 `M × (K/32) × N` 项，而不必使用 oneDNN 的 grouped
+zero-points（其布局未通过验证）。`w4_xs_launch` 算 `XS`，修正由 `w4_epilogue_launch` 完成。
+
+### 9.4 decode：u4 GEMV（`w4_gemv.cpp`）
+
+`w4_split_act_launch`（按偶/奇 k 拆分激活，供 4-bit 交错布局使用）+
+`w4_gemv_launch`（把 `(g,n)` 的 `step`/`off` 分阶段进 SLM、16 字节 nibble 载入、`dp4a` 累加）。
+
+### 9.5 与 int8 / SIn 的关系
+
+* **只有 Q4_K 走 u4**。Q5_K/Q6_K 是 5/6-bit、IQ* 是 codebook（非线性），都无法无损进 u4/oneDNN，
+  它们继续走 SIn/DP4A 或 fp32——27B 是混合量化，所以每个张量各自选路径（启动日志会打印
+  `device N weights: X on the u4 path, Y on int8`）。
+* **激活量化也按 32 值一组**（`act_quant_grp_launch`）：只有整行一个 scale 时，激活的 ~0.9% 误差会
+  盖过 4-bit 权重的精度优势。int8 的 oneDNN matmul 只接受每行一个 SRC scale，所以每行版本仍然保留
+  （一次 call 可能混有 u4 与 int8 段）。
+* `PF_W4=0` 恢复纯 int8（每 32 组的权重 scale 仍然生效，那不是 u4 专有的）。
+* 各类型的实际损失用 `test_quant_audit` 逐类型度量；u4 打包往返用 `test_w4`，u4 vs int8 的逐张量
+  差异用 `test_w4_vs_i8`，u4 GEMM vs 真实反量化权重用 `test_w4_gemm`。

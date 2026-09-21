@@ -32,6 +32,7 @@ static long prof_calls = 0;
 // row * tpb, the quantized activation views by row * (K*32) bytes
 static gemv_seg row_offset_seg(const gemv_seg & s, int r, int tpb) {
     gemv_seg c = s;
+    c.dev = s.dev;
     const size_t off = (size_t)r * tpb;
     c.x = s.x + off * s.x_stride;
     if (s.act_up) {
@@ -49,7 +50,7 @@ static gemv_seg row_offset_seg(const gemv_seg & s, int r, int tpb) {
     return c;
 }
 // ---------------------------------------------------------------------------
-seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool with_head) const {
+seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool with_head) {
     seg_plan plan;
     const hparams & hp = m.hp;
     const int n_slices = use_w8 ? 1 : (T + tb - 1) / tb;
@@ -74,6 +75,26 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     // partition (w8_dev_) when the int8 decode path is on - prefill then runs
     // oneDNN on it, single-token decode dp4a_gemv - and the CPU partitions set
     // `i8`; otherwise the segments stay shaped for the fp32/oneDNN paths.
+    // weight key/pointer for a segment: the device copy when it was uploaded,
+    // otherwise the host weight pointer, which is the oneDNN int8 weight key
+    // (the converter skips the raw upload of every tensor it converted).
+    // Resolve exactly like wptr(): a single-device run goes through the model's
+    // one uploaded blob, and only multi-device keeps a per-device host->device
+    // map.  (Indexing that empty map used to be out-of-bounds, which both
+    // segfaulted the CPU backend and - with the fp32 path, where a segment's
+    // `w` is dereferenced on the device - silently fed the kernels host
+    // pointers, so the logits were garbage.)
+    auto wkey = [&](int dev, const void * host) -> const void * {
+        if (!host) {
+            return nullptr;
+        }
+        if (!multi_dev) {
+            return wptr(dev, host); // single device: the one uploaded blob
+        }
+        const auto & mp = weight_maps_[(size_t)dev];
+        auto it = mp.find(host);
+        return it != mp.end() ? it->second : host;
+    };
     auto add8 = [&](int dev, const wt & w, const w8t & w8, const float * x, int xs, float * out, int os,
                     const float * res) {
         w8t w8v = w8;
@@ -84,7 +105,16 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
             }
         }
         gemv_seg c{};
-        c.w = wptr(dev, w.data);
+        c.dev = dev;
+        // with a SIn copy the raw device weight is not uploaded: key the
+        // segment on the packed buffer (oneDNN/fallback paths use w8.vals too)
+        c.w = w8v.vals ? (const void *)w8v.vals : wkey(dev, w.data);
+        if (md_xmx && !c.w8.vals) {
+            if (dnnl_gemm * D = dnnl_for(dev)) {
+                c.wi8 = D->weight_data(c.w);
+                c.wsc = D->weight_scales(c.w);
+            }
+        }
         c.type = w.type;
         c.K = w.K;
         c.n_rows = w.N;
@@ -105,7 +135,16 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     };
     auto mk = [&](int dev, const wt & w, const float * x, int xs, float * out, int os, const float * res) {
         gemv_seg s{};
-        s.w = wptr(dev, w.data);
+        s.dev = dev;
+        s.w = wkey(dev, w.data);
+        if (md_xmx) {
+            // decode reads the oneDNN int8 buffer directly (M=1 has too much
+            // per-call overhead through the primitive)
+            if (dnnl_gemm * D = dnnl_for(dev)) {
+                s.wi8 = D->weight_data(s.w);
+                s.wsc = D->weight_scales(s.w);
+            }
+        }
         s.meta32 = meta32_of(w.data);
         s.type = w.type;
         s.K = w.K;
@@ -122,16 +161,17 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     for (int il = 0; il < hp.n_layer; il++) {
         const layer_t & L = m.layers[il];
         const int dev = multi_dev ? layer_dev_[il] : 0;
+        bind_acts(dev); // per-device activations: the plan captures dev's buffers
         if (L.recurrent) {
             plan.begin_call(tb, hp.n_embd / 256);
             if (use_w8) {
-                add8(dev, L.wqkv, L.wqkv8, d_xnorm, hp.n_embd, d_qkv, 3 * hp.d_inner, nullptr);
+                add8(dev, L.wqkv, L.wqkv8, d_xnorm, hp.n_embd, d_qkv, hp.qkv_dim(), nullptr);
                 add8(dev, L.wgate, L.wgate8, d_xnorm, hp.n_embd, d_z, hp.d_inner, nullptr);
                 plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
                 add_sliced(mk(dev, L.ssm_beta, d_xnorm, hp.n_embd, d_beta, hp.dt_rank, nullptr));
                 add_sliced(mk(dev, L.ssm_alpha, d_xnorm, hp.n_embd, d_alpha, hp.dt_rank, nullptr));
             } else {
-                add_sliced(mk(dev, L.wqkv, d_xnorm, hp.n_embd, d_qkv, 3 * hp.d_inner, nullptr));
+                add_sliced(mk(dev, L.wqkv, d_xnorm, hp.n_embd, d_qkv, hp.qkv_dim(), nullptr));
                 add_sliced(mk(dev, L.wgate, d_xnorm, hp.n_embd, d_z, hp.d_inner, nullptr));
                 add_sliced(mk(dev, L.ssm_beta, d_xnorm, hp.n_embd, d_beta, hp.dt_rank, nullptr));
                 add_sliced(mk(dev, L.ssm_alpha, d_xnorm, hp.n_embd, d_alpha, hp.dt_rank, nullptr));
@@ -175,9 +215,13 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         }
         plan.begin_call(tb, hp.n_ff / 256);
         if (use_w8) {
-            // ffn_down: activations are silu(gate)*up, applied during quantization
+            // ffn_down: activations are silu(gate)*up.  The quantizer applies it
+            // from call_xq.up; the fp32 GEMV (and the oneDNN fallback) apply it
+            // from the segment's act_up, so that must be set here as well -
+            // otherwise the fp32 path multiplies by the raw gate.
             add8(dev, L.ffn_down, L.ffn_down8, d_ffn, ffn_stride, d_x, hp.n_embd, d_x);
             plan.set_xq(d_ffn, d_ffn + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
+            plan.set_act_up(d_ffn + hp.n_ff, d_ffn);
         } else {
             gemv_seg s = mk(dev, L.ffn_down, d_ffn, ffn_stride, d_x, hp.n_embd, d_x);
             s.act_up = d_ffn + hp.n_ff;
@@ -189,10 +233,21 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     // Skipped entirely for non-final prefill chunks (with_head == false).
     plan.has_head = with_head || head_batched;
     if (with_head || head_batched) {
+        // The head always runs on the primary backend, and bind_acts() only
+        // rebinds the engine's members - the plan has already captured the
+        // *last layer's* device buffers above (d_xnorm/d_x8/... belong to
+        // layer_dev_[n_layer-1]).  Rebind to device 0 here so the head segment
+        // captures the primary's buffers, which is where record_forward's
+        // rmsnorm (after its own bind_acts(0)) writes them.  Without this the
+        // batch-1 decode head read a buffer no kernel had written for that
+        // step, so the decode's logits (and thus its sampling) were wrong
+        // while the prefill - which goes through run_head() - stayed correct.
+        bind_acts(0);
         plan.begin_call(head_batched ? tb : 1, hp.n_embd / 256);
         gemv_seg s{};
-        s.w = wptr(0, m.tok_embd.data);
-        s.type = m.tok_embd.type;
+        s.dev = 0;
+        s.w = wptr(0, m.output.data);
+        s.type = m.output.type;
         s.K = hp.n_embd;
         s.n_rows = hp.n_vocab;
         s.x = head_batched ? d_xnorm : d_last_hidden;
@@ -206,9 +261,9 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
             // batch-1 decode: run the LM head (45% of the decode weights) on the
             // int8 GEMV path as well.  The head always runs on the primary
             // device (backend 0); multi-device uses that device's w8 copy.
-            w8t t8 = m.tok_embd8;
+            w8t t8 = m.output8;
             if (multi_dev && w8_dev_.size()) {
-                auto it = w8_dev_[0].find(m.tok_embd.data);
+                auto it = w8_dev_[0].find(m.output.data);
                 if (it != w8_dev_[0].end()) {
                     t8 = it->second;
                 }
@@ -225,6 +280,74 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     }
     return plan;
 }
+// PF_DUMP_SEGS: fingerprint of one GEMV segment's whole field set plus its
+// output row, so the int8 / u4 / fp32 weight paths can be diffed tensor by
+// tensor and field by field inside a layer.  Diagnostic only.
+static void dbg_dump_seg(sycl::queue & q, const gemv_seg & sg, int call, int tb, int nsb, int nch, int up_stride,
+                         int xq_up_stride, int xq_x_stride) {
+    const int n = std::min(sg.out_stride, 2048);
+    static std::vector<float> h;
+    if ((int)h.size() < n) {
+        h.resize((size_t)n);
+    }
+    q.memcpy(h.data(), sg.out, (size_t)n * 4).wait();
+    double s0 = 0, s1 = 0;
+    float mx = 0;
+    for (int i = 0; i < n; i++) {
+        const double v = h[i];
+        s0 += v;
+        s1 += v * v;
+        mx = sycl::fmax(mx, sycl::fabs((float)v));
+    }
+    fprintf(stderr,
+            "[seg] call=%2d type=%-2u K=%-5d rows=%-5d x_stride=%-6d out_stride=%-6d alpha=%.2f res=%d "
+            "up=%d up_stride=%-6d xq_xs=%-6d xq_us=%-6d tb=%-2d nsb=%-4d nch=%d | sum=%12.6f sumsq=%14.6f max=%.6f\n",
+            call, sg.type, sg.K, sg.n_rows, sg.x_stride, sg.out_stride, (double)sg.alpha, sg.residual ? 1 : 0,
+            sg.act_up ? 1 : 0, up_stride, xq_x_stride, xq_up_stride, tb, nsb, nch, s0, s1, mx);
+}
+
+// PF_DUMP_LAYERS: fingerprint of one device activation buffer, printed so two
+// weight paths (int8 / u4 / fp32) can be compared layer by layer to see where
+// they start to differ.  Diagnostic only, off unless PF_DUMP_LAYERS is set.
+static void dbg_dump_fp(sycl::queue & q, const float * d, int n, const char * tag, int il, int dev) {
+    static std::vector<float> h;
+    if ((int)h.size() < n) {
+        h.resize((size_t)n);
+    }
+    q.memcpy(h.data(), d, (size_t)n * 4).wait();
+    double s0 = 0, s1 = 0;
+    float mx = 0;
+    int am = 0;
+    for (int i = 0; i < n; i++) {
+        const double v = h[i];
+        s0 += v;
+        s1 += v * v;
+        if (std::fabs((float)v) > mx) {
+            mx = std::fabs((float)v);
+            am = i;
+        }
+    }
+    fprintf(stderr, "[dump] %-5s il=%2d dev=%d sum=%.6f sumsq=%.6f max=%.6f@%d\n", tag, il, dev, s0, s1, mx, am);
+}
+
+// PF_DUMP_RAW=<prefix>: write the full activation vector of one layer to
+// <prefix>.ilNN.w<which>.bin, so a decode and a prefill run can be diffed
+// element by element (the printed sum/sumsq fingerprints cannot see a change of
+// direction, only of magnitude).
+static void dbg_dump_raw(sycl::queue & q, const float * d, int n, const char * prefix, int call, int il, int which) {
+    static std::vector<float> h;
+    if ((int)h.size() < n) {
+        h.resize((size_t)n);
+    }
+    q.memcpy(h.data(), d, (size_t)n * 4).wait();
+    char path[512];
+    snprintf(path, sizeof(path), "%s.c%d.il%02d.w%d.bin", prefix, call, il, which);
+    if (FILE * fp = fopen(path, "wb")) {
+        fwrite(h.data(), 4, (size_t)n, fp);
+        fclose(fp);
+    }
+}
+
 void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows,
                             int at_nsp_hint) {
     // mode 2: chunk-batched prefill. `rows` is the total token count, split into
@@ -236,11 +359,22 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // backend index of the layer currently processed (multi-device): the
     // gemv_at closure reads it to pick the device's oneDNN instance
     int cur_dev = 0;
+    int dbg_layer = -1; // current layer index for the PF_DUMP_SEGS diagnostic
     const bool prof = prof_on();
     auto tnow = [] { return std::chrono::high_resolution_clock::now(); };
     auto tms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto pt0 = tnow();
     double c_embed = 0, c_gemv = 0, c_head = 0, c_attn = 0, c_gdn = 0, c_norm = 0;
+    static const bool dbg_dump = [] {
+        const char * e = getenv("PF_DUMP_LAYERS");
+        return e && atoi(e) != 0;
+    }();
+    // PF_DUMP_SEGS=<layer>: dump that layer's per-segment fields + output
+    // fingerprint (-1 = every layer, noisy).  Diagnostic only.
+    static const int dbg_segs = [] {
+        const char * e = getenv("PF_DUMP_SEGS");
+        return e ? atoi(e) : -2;
+    }();
     double c_g8 = 0, c_gf = 0; // w8 GEMM vs fp32/side GEMV time inside gemv
     size_t ci = 0;
     static const bool dbg_pfb2 = getenv("PF_DBG_PFB") != nullptr;
@@ -288,7 +422,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         // single-device instance, or the device's own in multi-device mode)
         dnnl_gemm * D = dnnl_for(cur_dev);
         const bool dnnl_call = [&]() -> bool {
-            if (!D || mode == 0 || single) {
+            // single-device decode keeps the dp4a GEMV; multi-device without a
+            // SIn copy routes decode through oneDNN too (M=1, via the custom
+            // i8_row_gemv), so all of the layer linears live in one int8
+            // representation for both phases
+            if (!D || (mode == 0 && !multi_dev) || (single && !(mode == 0 && multi_dev))) {
                 return false;
             }
             if (idx >= plan.call_xq.size() || !plan.call_xq[idx].x) {
@@ -307,7 +445,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     // multi-device has no w8 view: every segment of the call is
                     // routed to oneDNN, so all of them must be convertible
                     const bool need = sj.w8.vals || multi_dev;
-                    if (need && (!D->has_weight(key) || kk != plan.call_xq[idx].K)) {
+                    if (need && (!(D->has_weight(key) || D->has_weight_w4(key)) || kk != plan.call_xq[idx].K)) {
                         return false;
                     }
                 }
@@ -407,9 +545,57 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 // verified every segment of the call is convertible; a gemm
                 // failure (unexpected) falls the whole group back to fp32.
                 bool dnnl_done = true;
-                for (int j = 0; j < gr.n; j++) {
-                    const gemv_seg & sj = plan.segs[gr.off + j];
-                    if (!D->gemm(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
+                const int8_t * aq = D->act_data();
+                const float * asc = D->act_scales();
+                bool decoded = false;
+                if (mode == 0 && aq && asc) {
+                    // all segments of the call share the activation row: one
+                    // GEMV launch covers the whole call
+                    bool all = true;
+                    int tot = 0;
+                    for (int j = 0; j < gr.n; j++) {
+                        const gemv_seg & sj = plan.segs[gr.off + j];
+                        if (!sj.wi8 || !sj.wsc) {
+                            all = false;
+                            break;
+                        }
+                        tot += sj.n_rows;
+                    }
+                    if (all) {
+                        static const bool nogemv = getenv("PF_ABL_NOGEMV") != nullptr;
+                        if (!nogemv) {
+                            cur_be->i8_row_gemv_multi(d_segs + gr.off, gr.n, tot, aq, asc, D->act_sum());
+                        }
+                        decoded = true;
+                    }
+                }
+                if (!decoded) {
+                    for (int j = 0; j < gr.n; j++) {
+                        const gemv_seg & sj = plan.segs[gr.off + j];
+                        // 4-bit weights first (u4 + grouped step scales + offset
+                        // correction); gemm() returns false for those keys, and
+                        // gemm_w4() returns false for int8 keys - so either
+                        // order works, try the 4-bit one first.
+                        static long c_w4 = 0, c_i8 = 0, c_fb = 0;
+                        static const bool w4dbg = [] {
+                            const char * e = getenv("PF_W4_DEBUG");
+                            return e && atoi(e) != 0;
+                        }();
+                        if (D->gemm_w4(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
+                            c_w4++;
+                            continue;
+                        }
+                        if (D->gemm(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
+                            c_i8++;
+                            continue;
+                        }
+                        c_fb++;
+                        static int nrep = 0;
+                        if (w4dbg && nrep++ < 3) {
+                            fprintf(stderr,
+                                    "[w4] segment fell through: w4=%ld i8=%ld fb=%ld (mode=%d M=%d K=%d w4key=%d)\n",
+                                    c_w4, c_i8, c_fb, mode, tbm, sj.K, (int)D->has_weight_w4(sj.w));
+                        }
                         dnnl_done = false;
                         break;
                     }
@@ -428,6 +614,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 for (int r = 0; r < nb; r++) {
                     const gemv_seg * segs_r = (nb > 1 && d_segs_rows) ? d_segs_rows + (size_t)r * NSEG : d_segs;
                     cur_be->gemv_group(gr.type, segs_r + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx], 0);
+                }
+            }
+            if (dbg_segs != -2 && (dbg_segs < 0 || dbg_segs == dbg_layer)) {
+                for (int j = 0; j < gr.n; j++) {
+                    const gemv_seg & sj = plan.segs[gr.off + j];
+                    const seg_plan::xq_t & xq0 = plan.call_xq[idx];
+                    dbg_dump_seg(dev_queue(cur_dev), sj, idx, tb, plan.call_nsb[idx], NCH,
+                                 sj.act_up ? sj.x_stride : 0, xq0.x_stride, xq0.up_stride);
                 }
             }
             if (prof) {
@@ -473,11 +667,20 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
 
     {
         const auto a = tnow();
+        // the plan builders leave the members bound to the last layer's device;
+        // the embedding always runs on the primary device, so bind its buffers
+        // before writing d_x (otherwise device 0 reads the other partition's USM)
+        if (multi_dev) {
+            bind_acts(0);
+        }
         cur_be = &backend();
         cur_be->embed(wptr(0, m.tok_embd.data), m.tok_embd.type, d_info, d_x, hp.n_embd, m.tok_embd_row_bytes);
         if (prof) {
             q.wait();
             c_embed += tms(a, tnow());
+        }
+        if (dbg_dump) {
+            dbg_dump_fp(dev_queue(0), d_x, hp.n_embd, "embed", -1, 0);
         }
         if (dbg_mid == 4) {
             return;
@@ -488,9 +691,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const char * e = getenv("STOP_AFTER_LAYER");
         return e ? atoi(e) : -1;
     }();
-    int prev_dev = -1;
+    int prev_dev = 0; // embedding runs on the primary device
     // debug: 1 = after the first sub-layer of a layer, 2 = after post-attn
     // norm, 3 = after the first FFN GEMM, 4 = right after the embedding
+    static int dbg_call_no = -1;
     for (int il = 0; il < hp.n_layer; il++) {
         const layer_t & L = m.layers[il];
         // multi-device: pick this layer's backend; synchronize the previous
@@ -500,10 +704,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         cur_be = &LB;
         const int dev = multi_dev ? layer_dev_[il] : 0;
         cur_dev = dev;
+        dbg_layer = il;
         if (multi_dev && dev != prev_dev) {
-            if (prev_dev >= 0) {
-                backends_[(size_t)prev_dev]->synchronize();
-            }
+            handoff_x(prev_dev, dev);
+            bind_acts(dev);
             prev_dev = dev;
         }
         static const bool nogdn = [] {
@@ -519,11 +723,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         stamp(c_norm, a_n);
         if (L.recurrent) {
             gemv();
-            const size_t conv_per = (size_t)(hp.conv_k - 1) * 3 * hp.d_inner;    // per slot
+            const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();      // per slot
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state; // per slot
             const int gi = m.gdn_layer_index[il];
-            float * cs = d_conv_state + (size_t)gi * kMaxB * conv_per; // [layer][slot][3][conv_dim]
-            float * gs = d_gdn_state + (size_t)gi * kMaxB * gdn_per;   // [layer][slot][rank][S][S]
+            // multi-device: each partition owns only its own GDN layers' state
+            // (local index); the state never crosses the boundary, only d_x does
+            const int gl = multi_dev ? layer_gdn_local_[(size_t)il] : gi;
+            float * cs = d_conv_state + (size_t)gl * kMaxB * conv_per; // [layer][slot][3][conv_dim]
+            float * gs = d_gdn_state + (size_t)gl * kMaxB * gdn_per;   // [layer][slot][rank][S][S]
             // prefix cache: per-layer slice of a checkpoint slot (see pc_snap)
             pc_snap snap{};
             if (d_pc_states && pc_enabled) {
@@ -553,11 +760,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const auto a_g = tnow();
             auto a_sub = tnow();
             if (mode == 2 && fuse_gdn >= 1 && !nogdn) {
-                cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, d_info, 3 * hp.d_inner, hp.conv_k,
+                cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, d_info, hp.qkv_dim(), hp.conv_k,
                                hp.d_state, hp.n_group, hp.rms_eps, NCH, kMaxT, 0, kMaxT, /*cross_row=*/true);
                 stamp(prof_acc[11], a_sub);
                 a_sub = tnow();
-                cur_be->conv_state_update(d_qkv, cs, d_info, 3 * hp.d_inner, hp.conv_k, NCH, 0, kMaxT, kMaxT,
+                cur_be->conv_state_update(d_qkv, cs, d_info, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT,
                                          /*last_row_only=*/true, snap);
                 stamp(prof_acc[12], a_sub);
                 a_sub = tnow();
@@ -568,8 +775,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     }
                     const auto t0 = tnow();
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
-                               d_info, hp.d_state, hp.dt_rank, 3 * hp.d_inner, 1.0f / std::sqrt((float)hp.d_state),
-                               kMaxB, 1, 0, T, T, snap);
+                               d_info, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
+                               1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, 0, T, T, snap);
                     if (tdbg && !g_capturing) {
                         q.wait();
                         fprintf(stderr, "[t] layer %d gdn=%.2f ms\n", il, tms(t0, tnow()));
@@ -577,7 +784,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 } else {
                     for (int r0 = 0; r0 < NCH; r0++) {
                         cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs,
-                                   d_attn_pre, d_info, hp.d_state, hp.dt_rank, 3 * hp.d_inner,
+                                   d_attn_pre, d_info, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
                                    1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, r0, -1, -1, snap);
                     }
                 }
@@ -594,13 +801,13 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                                 "active=%d tpb=%d\n",
                                 mode, r0, rr0, rn, gdn_nr, d_info->n_rows, d_info->active[rr0], d_info->tpb);
                     }
-                    cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, d_info, 3 * hp.d_inner, hp.conv_k,
+                    cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, d_info, hp.qkv_dim(), hp.conv_k,
                                    hp.d_state, hp.n_group, hp.rms_eps, rn, gdn_nr, rr0, -1, false);
-                    cur_be->conv_state_update(d_qkv, cs, d_info, 3 * hp.d_inner, hp.conv_k, rn, rr0, -1, -1, false,
+                    cur_be->conv_state_update(d_qkv, cs, d_info, hp.qkv_dim(), hp.conv_k, rn, rr0, -1, -1, false,
                                              snap);
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
-                               d_info, hp.d_state, hp.dt_rank, 3 * hp.d_inner, 1.0f / std::sqrt((float)hp.d_state),
-                               kMaxB, rn, rr0, -1, -1, snap);
+                               d_info, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
+                               1.0f / std::sqrt((float)hp.d_state), kMaxB, rn, rr0, -1, -1, snap);
                 }
                 stamp(prof_acc[13], a_sub);
                 a_sub = tnow();
@@ -730,12 +937,49 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             break;
         }
         gemv();
+        // PF_DUMP_LAYERS: per-layer hidden-state fingerprint, to check that the
+        // u4 and int8 paths diverge smoothly across layers (amplification)
+        // rather than jumping at one layer (a wiring bug).
+        if (dbg_dump) {
+            if (il == 0) {
+                dbg_call_no++;
+                fprintf(stderr, "[dump] call=%d extents mode=%d rows=%d nrows=%d nreal=%d NCH=%d\n", dbg_call_no, mode,
+                        rows, nrows, nreal, NCH);
+            }
+            dbg_dump_fp(dev_queue(cur_dev), d_x, hp.n_embd, "layer", il, cur_dev);
+            // also fingerprint the *last real* token slot: mode 2 lays a chunk
+            // out as [NCH][kMaxT][n_embd] with only d_info->n_real_row[r] slots
+            // live, mode 0/1 keep their tokens in row 0 - the token a following
+            // decode continues from must be fingerprinted on both sides
+            const int last_slot = (mode == 2) ? (NCH - 1) * kMaxT + (int)d_info->n_real_row[NCH - 1] - 1
+                                              : nreal - 1;
+            if (last_slot > 0) {
+                dbg_dump_fp(dev_queue(cur_dev), d_x + (size_t)last_slot * hp.n_embd, hp.n_embd, "layerlast", il,
+                            cur_dev);
+            }
+            if (const char * rp = getenv("PF_DUMP_RAW")) {
+                dbg_dump_raw(dev_queue(cur_dev), d_x, hp.n_embd, rp, dbg_call_no, il, 0);
+                if (last_slot > 0) {
+                    dbg_dump_raw(dev_queue(cur_dev), d_x + (size_t)last_slot * hp.n_embd, hp.n_embd, rp, dbg_call_no, il,
+                                 1);
+                }
+            }
+        }
         if (il == stop_layer) {
             break;
         }
     }
 
     const auto a_out = tnow();
+    // The last partition wrote d_x on its own queue: wait for it before the
+    // primary device reads the hidden state for the output norm / LM head.
+    // Without this the head races the last device (the earlier pipeline only
+    // synchronized when the device changed, i.e. never after the final range).
+    if (multi_dev) {
+        // move the final hidden state back to the primary device for the head
+        handoff_x(prev_dev, 0);
+        bind_acts(0);
+    }
     // global tensors (output norm, LM head) live on the primary device
     cur_be = &backend();
     cur_be->rmsnorm(d_x, out_norm, d_xnorm, T, hp.n_embd, hp.rms_eps);
@@ -801,23 +1045,26 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     }
 }
 void engine::build_plans() {
+    const bool w8_skip_raw = multi_dev && md_int8;
     // CPU backend: build the same segment plans the GPU records, but keep them
     // host-side and replay them directly (no SYCL command graph can be encoded
     // by the host kernels).
+    if (!w8_skip_raw) {
     plan_pf_ = build_plan(kMaxT, 8, false);
     plan_pf_.finalize();
     if (plan_pf_.segs.size() > 4096) {
         throw std::runtime_error("segment buffer too small");
     }
     q.memcpy(d_segs_pf, plan_pf_.segs.data(), plan_pf_.segs.size() * sizeof(gemv_seg)).wait();
+    }
     // per-token-count prefill plans: the fp32 plan is sliced by kPfSlice, so T
     // rows are T/8 slices.  A prompt shorter than the chunk only pays for its
     // rounded-up token count instead of a full kMaxT chunk.
-    for (int i = 0; i < kPfSlots; i++) {
+    for (int i = 0; !w8_skip_raw && i < kPfSlots; i++) {
         const int T = (i + 1) * kPfSlice;
         plan_pf_slot[i] = build_plan(T, kPfSlice, false);
         plan_pf_slot[i].finalize();
-        if (plan_pf_slot[i].segs.size() > 1024) {
+        if (plan_pf_slot[i].segs.size() > 2048) {
             throw std::runtime_error("segment buffer too small");
         }
         d_segs_pf_slot[i] = alloc_elems<gemv_seg>(plan_pf_slot[i].segs.size());
@@ -830,8 +1077,11 @@ void engine::build_plans() {
                  plan_pf_nh_slot[i].segs.size() * sizeof(gemv_seg))
             .wait();
     }
-    if (pf8 || (multi_dev && (dnnl_any_dev() || md_int8))) {
-        if (pf8 || (multi_dev && dnnl_any_dev())) {
+    if (pf8 || multi_dev) {
+        // multi-device has no recorded graphs and always replays these plans
+        // directly, so build them even without oneDNN (the w8 copies may be
+        // absent, in which case the fp32 GEMV path handles each segment)
+        if (pf8 || multi_dev) {
             plan_pf8_ = build_plan(kMaxT, kMaxT, false, true, true);
             plan_pf8_.finalize();
             q.memcpy(d_segs_pf8, plan_pf8_.segs.data(), plan_pf8_.segs.size() * sizeof(gemv_seg)).wait();
@@ -843,7 +1093,7 @@ void engine::build_plans() {
             d_segs_pf8_nh = alloc_elems<gemv_seg>(plan_pf8_nh_.segs.size());
             q.memcpy(d_segs_pf8_nh, plan_pf8_nh_.segs.data(), plan_pf8_nh_.segs.size() * sizeof(gemv_seg)).wait();
         }
-        if (multi_dev && dnnl_any_dev()) {
+        if (multi_dev) {
             // chunk-batched (mode 2) prefill: same plan shape as plan_pf8_ (one
             // row per kMaxT-token chunk), replayed directly with `rows` = total
             // tokens so all of one prompt's chunks run GEMMs segment-major /
@@ -864,7 +1114,7 @@ void engine::build_plans() {
             }
             q.memcpy(d_segs_pfb, h.data(), h.size() * sizeof(gemv_seg)).wait();
         }
-        if (pf8_dec || (multi_dev && md_int8)) {
+        if (pf8_dec || (multi_dev && (md_int8 || md_xmx))) {
             // single-token decode on int8: GPU segments dp4a_gemv (per-device
             // w8), CPU segments i8_gemv - same plan shape both partitions
             plan_dec8_ = build_plan(1, 1, true, true, true);
@@ -877,12 +1127,16 @@ void engine::build_plans() {
         }
     }
     for (auto & b : buckets_) {
-        b.plan = build_plan(b.tb, b.tb, true);
+        b.plan = build_plan(b.tb, b.tb, true, multi_dev || md_int8);
         b.plan.finalize();
         if (b.plan.segs.size() > 1024) {
             throw std::runtime_error("segment buffer too small");
         }
         q.memcpy(b.d_segs, b.plan.segs.data(), b.plan.segs.size() * sizeof(gemv_seg)).wait();
+    }
+    // leave the members on the primary device for any runtime use
+    if (multi_dev) {
+        bind_acts(0);
     }
 }
 

@@ -16,7 +16,7 @@ size_t engine::gdn_per_slot() const {
 
 size_t engine::conv_per_slot() const {
     const hparams & hp = m.hp;
-    return (size_t)(hp.conv_k - 1) * 3 * hp.d_inner;
+    return (size_t)(hp.conv_k - 1) * hp.qkv_dim();
 }
 
 // FNV-1a over the block's token ids, chained onto the parent hash
@@ -121,18 +121,20 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
     for (int l = 0; l < na; l++) {
         const char * kp, * vp, * ksc, * vsc;
         kv_layer_ptrs(l, kp, vp, ksc, vsc);
-        q.memcpy(blob.data() + off, kp + (size_t)block * kb, kb);
+        // multi-device: the layer's pool may live on another device's queue
+        sycl::queue & qd = dev_queue(attn_dev(l));
+        qd.memcpy(blob.data() + off, kp + (size_t)block * kb, kb);
         off += kb;
-        q.memcpy(blob.data() + off, vp + (size_t)block * kb, kb);
+        qd.memcpy(blob.data() + off, vp + (size_t)block * kb, kb);
         off += kb;
         if (sb) {
-            q.memcpy(blob.data() + off, ksc + (size_t)block * sb, sb);
+            qd.memcpy(blob.data() + off, ksc + (size_t)block * sb, sb);
             off += sb;
-            q.memcpy(blob.data() + off, vsc + (size_t)block * sb, sb);
+            qd.memcpy(blob.data() + off, vsc + (size_t)block * sb, sb);
             off += sb;
         }
     }
-    q.wait();
+    sync_all();
 }
 
 void engine::pc_deserialize_block(const uint8_t * blob, int block) {
@@ -145,19 +147,20 @@ void engine::pc_deserialize_block(const uint8_t * blob, int block) {
     for (int l = 0; l < na; l++) {
         const char * kp, * vp, * ksc, * vsc;
         kv_layer_ptrs(l, kp, vp, ksc, vsc);
-        q.memcpy((void *)(kp + (size_t)block * kb), blob + off, kb);
+        sycl::queue & qd = dev_queue(attn_dev(l));
+        qd.memcpy((void *)(kp + (size_t)block * kb), blob + off, kb);
         off += kb;
-        q.memcpy((void *)(vp + (size_t)block * kb), blob + off, kb);
+        qd.memcpy((void *)(vp + (size_t)block * kb), blob + off, kb);
         off += kb;
         if (sb) {
-            q.memcpy((void *)(ksc + (size_t)block * sb), blob + off, sb);
+            qd.memcpy((void *)(ksc + (size_t)block * sb), blob + off, sb);
             off += sb;
-            q.memcpy((void *)(vsc + (size_t)block * sb), blob + off, sb);
+            qd.memcpy((void *)(vsc + (size_t)block * sb), blob + off, sb);
             off += sb;
         }
     }
     // the caller's blob is a temporary: the copies must complete before it dies
-    q.wait();
+    sync_all();
 }
 
 void engine::pc_serialize_state(int st, std::vector<float> & out) {
@@ -470,14 +473,27 @@ void engine::pc_restore_state(int slot, int st) {
     const hparams & hp = m.hp;
     const size_t gp = gdn_per_slot(), cp = conv_per_slot(), per = gp + cp;
     const float * src = d_pc_states + (size_t)st * pc_state_floats;
-    int gi = 0;
     for (int il = 0; il < hp.n_layer; il++) {
         if (!hp.is_recr(il)) {
             continue;
         }
+        const int gi = m.gdn_layer_index[il];
+        if (multi_dev) {
+            // device-resident per-partition state: copy into the owning device
+            // (host d_pc_states -> device USM), then wait before the forward
+            const int dev = layer_dev_[(size_t)il];
+            const int gl = layer_gdn_local_[(size_t)il];
+            sycl::queue & qd = dev_queue(dev);
+            qd.memcpy(as_[(size_t)dev].gdn_state + ((size_t)gl * kMaxB + slot) * gp, src + (size_t)gi * per, gp * 4);
+            qd.memcpy(as_[(size_t)dev].conv_state + ((size_t)gl * kMaxB + slot) * cp, src + (size_t)gi * per + gp,
+                      cp * 4);
+            continue;
+        }
         q.memcpy(d_gdn_state + ((size_t)gi * kMaxB + slot) * gp, src + (size_t)gi * per, gp * 4);
         q.memcpy(d_conv_state + ((size_t)gi * kMaxB + slot) * cp, src + (size_t)gi * per + gp, cp * 4);
-        gi++;
+    }
+    if (multi_dev) {
+        sync_all();
     }
 }
 

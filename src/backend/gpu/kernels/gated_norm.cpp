@@ -21,7 +21,7 @@ void gated_norm_launch(queue & q, const float * attn, const float * z, const flo
             const int head = gid % n_heads;
             const int lane = it.get_local_id(0);
             const int rr = row0 + r;
-            if (rr >= info->n_rows || t >= info->n_real || !info->active[rr]) {
+            if (rr >= info->n_rows || t >= row_nr(info, rr) || !info->active[rr]) {
                 return;
             }
             const int row = rr * info->tpb + t;

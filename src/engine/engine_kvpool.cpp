@@ -129,6 +129,21 @@ void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char
     vsc = d_vscales ? (const char *)d_vscales + (size_t)a * kv_scale_stride : nullptr;
 }
 
+int engine::attn_dev(int a) const {
+    if (!multi_dev) {
+        return 0;
+    }
+    int na = 0;
+    for (int t = 0; t < m.hp.n_layer; t++) {
+        if (!m.hp.is_recr(t)) {
+            if (na++ == a) {
+                return layer_dev_[(size_t)t];
+            }
+        }
+    }
+    return 0;
+}
+
 void engine::kv_setup(int n_attn, int initial_blocks) {
     const size_t block_bytes = kv_block_bytes();
     if (multi_dev) {
@@ -159,11 +174,13 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
             if (na <= 0) {
                 continue;
             }
-            dev_kpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
-            dev_vpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
+            size_t kpool_bytes = (size_t)n_blocks * block_bytes * (size_t)na;
+            dev_kpool_[(size_t)d] = dev_alloc_on(d, kpool_bytes);
+            dev_vpool_[(size_t)d] = dev_alloc_on(d, kpool_bytes);
             if (kv_dtype_has_scales(kv_dtype())) {
-                dev_kscales_[(size_t)d] = dev_alloc_on(d, kv_scale_stride * (size_t)na);
-                dev_vscales_[(size_t)d] = dev_alloc_on(d, kv_scale_stride * (size_t)na);
+                size_t scale_bytes = kv_scale_stride * (size_t)na;
+                dev_kscales_[(size_t)d] = dev_alloc_on(d, scale_bytes);
+                dev_vscales_[(size_t)d] = dev_alloc_on(d, scale_bytes);
             }
         }
         block_used_.assign(n_blocks, 0);
@@ -392,31 +409,26 @@ void engine::kv_shrink() {
 
 void engine::kv_release_pool() {
     if (multi_dev) {
-        // per-device pools (device USM on the GPU, host USM on the CPU)
-        for (void * p : dev_kpool_) {
-            if (p) {
-                sycl::free(p, q);
+        // per-device pools are device USM on the GPU (freed on that device's
+        // own queue) and host USM on a CPU partition (freed on the primary q)
+        const int ndev = (int)backends_.size();
+        auto rel = [&](std::vector<void *> & v) {
+            for (int d = 0; d < ndev && d < (int)v.size(); d++) {
+                if (!v[(size_t)d]) {
+                    continue;
+                }
+                if (dev_kind_[(size_t)d] == 1 || (size_t)d >= dev_queues_.size() || !dev_queues_[(size_t)d]) {
+                    sycl::free(v[(size_t)d], q);
+                } else {
+                    sycl::free(v[(size_t)d], *dev_queues_[(size_t)d]);
+                }
             }
-        }
-        for (void * p : dev_vpool_) {
-            if (p) {
-                sycl::free(p, q);
-            }
-        }
-        for (void * p : dev_kscales_) {
-            if (p) {
-                sycl::free(p, q);
-            }
-        }
-        for (void * p : dev_vscales_) {
-            if (p) {
-                sycl::free(p, q);
-            }
-        }
-        dev_kpool_.clear();
-        dev_vpool_.clear();
-        dev_kscales_.clear();
-        dev_vscales_.clear();
+            v.clear();
+        };
+        rel(dev_kpool_);
+        rel(dev_vpool_);
+        rel(dev_kscales_);
+        rel(dev_vscales_);
         return;
     }
     if (kv_virtual) {
@@ -522,7 +534,15 @@ void engine::set_table(int slot, const std::vector<int> & blocks) {
     for (size_t i = 0; i < blocks.size() && i < (size_t)max_blocks; i++) {
         h_tables[(size_t)slot * max_blocks + i] = blocks[i];
     }
-    q.memcpy(d_tables + (size_t)slot * max_blocks, h_tables.data() + (size_t)slot * max_blocks, (size_t)max_blocks * 4);
+    // multi-device: the block table is host USM read by every queue, so write
+    // it on the host instead of enqueuing a copy on the primary queue (which
+    // the second device would not be ordered against)
+    if (host_act) {
+        std::memcpy(d_tables + (size_t)slot * max_blocks, h_tables.data() + (size_t)slot * max_blocks,
+                    (size_t)max_blocks * 4);
+    } else {
+        q.memcpy(d_tables + (size_t)slot * max_blocks, h_tables.data() + (size_t)slot * max_blocks, (size_t)max_blocks * 4);
+    }
 }
 
 } // namespace si

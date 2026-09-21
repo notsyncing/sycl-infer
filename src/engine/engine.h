@@ -72,12 +72,24 @@ struct seg_plan {
         call_counts.back()++;
         call_total_rows.back() += s.n_rows;
     }
+    // ffn_down's activation is silu(gate)*up.  The quantizer path applies that
+    // from call_xq.up; every other consumer of these segments (the fp32 GEMV
+    // and the oneDNN fallback) reads the raw gate from seg.x and must apply it
+    // itself, which it does when act_up is set.  Patch the segments added by
+    // the current call, preserving any per-slice x offset.
+    void set_act_up(const float * up_base, const float * x_base) {
+        for (size_t i = (size_t)call_offsets.back(); i < segs.size(); i++) {
+            segs[i].act_up = up_base + (segs[i].x - x_base);
+        }
+    }
     void finalize() {
         for (size_t ci = 0; ci < call_offsets.size(); ci++) {
             const int off = (int)call_offsets[ci];
             const int n = call_counts[ci];
             std::stable_sort(segs.begin() + off, segs.begin() + off + n,
-                             [](const gemv_seg & a, const gemv_seg & b) { return a.type < b.type; });
+                             [](const gemv_seg & a, const gemv_seg & b) {
+                                 return (a.dev < b.dev) || (a.dev == b.dev && a.type < b.type);
+                             });
             call_group_begin.push_back((int)groups.size());
             int i = 0;
             while (i < n) {
@@ -99,6 +111,10 @@ struct engine {
     model m;
     tokenizer tk;
     int device_req = -1; // resolved device request (0 = gpu, 1 = cpu)
+    // A pipeline-parallel run over several GPUs shares one SYCL context: USM
+    // host allocations are context-scoped, so without this the host-USM
+    // activations are not valid on the second device (intermittent faults).
+    std::shared_ptr<sycl::context> md_ctx_;
     sycl::queue q;
     // compute backend: one for the single-device path; multi-device runs keep
     // one backend per layer partition (see layer_dev_ / backends_)
@@ -133,6 +149,11 @@ struct engine {
     // on i8_gemv; empty vector when int8 decode is disabled (PF_DP4A /
     // PF_DP4A_DEC=0).
     bool md_int8 = false;
+    // multi-device XMX path: oneDNN int8 weights built per device (used when
+    // the device supports the int8 matmul primitive); falls back to the w8/dp4a
+    // path when oneDNN is unavailable for the device (PF_GEMM_DNNL=0)
+    bool md_xmx = false;
+    bool setup_md_dnnl();
     std::vector<std::unordered_map<const void *, w8t>> w8_dev_;
     std::vector<int> layer_dev_;                           // layer -> backend index
     std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)
@@ -214,6 +235,34 @@ struct engine {
     sycl::float2 * d_xmeta = nullptr; // activation scales (fp32)
     int32_t * d_xsumq = nullptr;
 
+    // Pipeline parallel: one activation set per backend, allocated in that
+    // device's own USM.  The GEMMs then read activations (especially the huge
+    // per-group x8 scratch) from VRAM instead of re-reading host-USM over PCIe.
+    // `as_` is empty on the single-device path, which keeps the members above.
+    struct act_set {
+        float * x = nullptr, *xnorm = nullptr, *qkv = nullptr, *z = nullptr, *beta = nullptr, *alpha = nullptr;
+        float * conv_out = nullptr, *attn_pre = nullptr, *attn_merged = nullptr, *qbuf = nullptr, *kbuf = nullptr;
+        float * vbuf = nullptr, *attn_out = nullptr, *ffn = nullptr, *partials = nullptr, *partials_dec = nullptr;
+        int8_t * x8 = nullptr;
+        sycl::float2 * xmeta = nullptr;
+        int32_t * xsumq = nullptr;
+        // this partition's recurrent state (its own GDN layers only; the state
+        // never crosses a partition boundary, only the hidden activation does)
+        float * gdn_state = nullptr;
+        float * conv_state = nullptr;
+    };
+    std::vector<act_set> as_;
+    // global layer -> index of its GDN layer within its own partition
+    std::vector<int> layer_gdn_local_;
+    std::vector<int> n_gdn_dev_;
+    act_set alloc_act_set(int dev);
+    // point the d_* members at backend `dev`'s buffers (no-op single-device)
+    void bind_acts(int dev);
+    // hand the hidden state from backend `from` to `to` (device-to-device via a
+    // host staging buffer, blocking on `from`)
+    void handoff_x(int from, int to);
+    void * h_handoff = nullptr;
+
     gemv_seg * d_segs_dec = nullptr;
     gemv_seg * d_segs_dec8 = nullptr; // CPU SI8 decode plan (no command graph)
     gemv_seg * d_segs_pf = nullptr;
@@ -279,12 +328,17 @@ struct engine {
         // single-GPU oneDNN and multi-device (per-device oneDNN on the GPU
         // partitions + i8 on CPU) both replay mode 2 directly, where every
         // multiple of kMaxT up to kMaxB*kMaxT is a valid batch size
-        if (use_dnnl || (multi_dev && dnnl_any_dev())) {
-            int n = (rem / kMaxT) * kMaxT;
-            if (n > kMaxB * kMaxT) {
-                n = kMaxB * kMaxT;
+        if (use_dnnl || (multi_dev && (dnnl_any_dev() || md_int8))) {
+            // direct replay: any batch size up to kMaxB*kMaxT is valid (the
+            // last row may be partial, see step_info::n_real_row)
+            if (getenv("PF_NO_PFB_PARTIAL")) { // A/B: old multiple-of-kMaxT only
+                int n = (rem / kMaxT) * kMaxT;
+                if (n > kMaxB * kMaxT) {
+                    n = kMaxB * kMaxT;
+                }
+                return n >= 2 * kMaxT ? n : 0;
             }
-            return n >= 2 * kMaxT ? n : 0;
+            return std::min(rem, kMaxB * kMaxT);
         }
         int best = 0;
         for (const auto & v : pfb_vars_) {
@@ -346,11 +400,17 @@ struct engine {
     // process `n` tokens of one sequence starting at `start` (n <= kMaxT); the
     // sequence's KV blocks must already be assigned in its table row `slot`
     void prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head = true);
+    // Prefill a whole text prompt with the fastest available path: the
+    // chunk-batched mode 2 for every full kMaxT multiple it supports and the
+    // chunked mode 1 only for the <kMaxT tail (or when no batched variant
+    // exists, e.g. the CPU backend).  The sequence's KV blocks must already be
+    // assigned in table row `slot`.
+    void prefill_text(const std::vector<int> & toks, int slot, int n);
     // chunk-batched prefill: one row per kMaxT chunk, all chunks of one prompt
     // in a single forward (GEMMs segment-major, weights L2-hot).  Replayed
-    // directly (mode 2): recorded graphs on single-device dp4a, oneDNN direct
-    // on single-GPU PF_GEMM_DNNL, and per-device oneDNN + i8_gemm on the GPU/CPU
-    // partitions of multi-device (batched_prefill_fit() enables it there).
+    // directly (mode 2): recorded graphs on single-device dp4a, oneDNN direct on
+    // single-GPU PF_GEMM_DNNL, per-device oneDNN + i8_gemm on the multi-device
+    // GPU/CPU partitions (batched_prefill_fit() enables it there).
     void prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0);
     // one decode step for up to kMaxB sequences; returns the logits rows
     void decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows);
@@ -490,7 +550,7 @@ private:
     template <typename T> T * alloc_elems(size_t n) {
         return (T *)alloc_bytes(n * sizeof(T));
     }
-    seg_plan build_plan(int T, int tb, bool head_batched, bool use_w8 = false, bool with_head = true) const;
+    seg_plan build_plan(int T, int tb, bool head_batched, bool use_w8 = false, bool with_head = true);
     void record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows = nullptr,
                         int at_nsp_hint = 0);
 
@@ -529,6 +589,16 @@ private:
     // path, the owning device's pool in multi-device mode (block ids are global,
     // so `block` offsets within each device's local layer stride are the same)
     void kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const;
+    // backend index that owns global attention layer `a` (0 when single-device)
+    int attn_dev(int a) const;
+    // queue whose device owns backend `d` (falls back to the primary queue for
+    // CPU partitions and the single-device path)
+    sycl::queue & dev_queue(int d) {
+        if (multi_dev && d >= 0 && d < (int)dev_queues_.size() && dev_queues_[(size_t)d] && dev_kind_[(size_t)d] == 0) {
+            return *dev_queues_[(size_t)d];
+        }
+        return q;
+    }
 
     // prefix cache internals
     struct pc_node {

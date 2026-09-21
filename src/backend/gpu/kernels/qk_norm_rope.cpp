@@ -28,7 +28,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                 const int gid = it.get_group(0);
                 const int r = gid / n_real;
                 const int t = gid % n_real;
-                if (r >= info->n_rows || t >= info->n_real || !info->active[r]) {
+                if (r >= info->n_rows || t >= row_nr(info, r) || !info->active[r]) {
                     return;
                 }
                 const int tid = it.get_local_id(0);

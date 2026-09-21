@@ -30,6 +30,15 @@ struct hparams {
     bool is_recr(int il) const {
         return (il + 1) % full_attn_interval != 0;
     }
+
+    // GDN qkv projection/output width: q and k each carry `n_group` heads of
+    // `d_state`, v carries `dt_rank` heads of `d_state` (= d_inner).  The
+    // reference 0.8B has n_group == dt_rank, which is where the historical
+    // 3*d_inner shortcut came from; larger models (Qwen3.8-27B: 16 vs 48)
+    // separate the key and value head counts.
+    int qkv_dim() const {
+        return 2 * n_group * d_state + dt_rank * d_state;
+    }
 };
 
 struct layer_t {
@@ -61,9 +70,11 @@ struct model {
     std::vector<layer_t> layers;
     std::vector<int> gdn_layer_index; // layer id -> sequential index among GDN layers (-1)
     wt tok_embd;
+    // LM-head weight: `output.weight` when the GGUF is untied, else tok_embd
+    wt output;
     const float * output_norm = nullptr;
     size_t tok_embd_row_bytes = 0;
-    w8t tok_embd8;
+    w8t output8;
 
     // device copy of all weights (one blob)
     void * dev_weights = nullptr;

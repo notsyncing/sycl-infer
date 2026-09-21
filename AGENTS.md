@@ -69,12 +69,49 @@ cmake --build build -j$(nproc)
 
 * `icpx` is required; CMake sets `CMAKE_CXX_COMPILER` to it and links with `-fsycl`.
 * oneDNN is expected at `/opt/intel/oneapi/dnnl/2026.0` (`-DDNNL_ROOT=` to override).
-* `-DSYCL_INFER_AOT=ON` AOT-compiles the device image for `adl-p`.
+* `-DSYCL_INFER_AOT=ON` AOT-compiles the device image for `adl-p`
+  (`-DSYCL_INFER_AOT_DEVICE=` overrides the target).  The device lowering
+  (`llvm-foreach -> ocloc`/IGC) only runs at the **final link**, never at `-c`,
+  so `make -j` does not parallelise it; by default it is one serial `ocloc`
+  process over every device image and takes minutes per kernel.  See the AOT
+  notes below.
 * **Debug builds force `-O2` for device code** (see CMakeLists comments).  At
   `-O0` the IGC device image of `src/backend/gpu/kernels/*` becomes huge and its
   translation takes minutes (looks like a hang) — do not remove that.
 * Source files are listed explicitly in `CMakeLists.txt` (no globbing).  Add new
   `.cpp` files there.
+
+### AOT builds (`SYCL_INFER_AOT`)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSYCL_INFER_AOT=ON -DSYCL_INFER_AOT_JOBS=6
+cmake --build build --target sycl-infer -j$(nproc)   # only the binary, not every test
+```
+
+* AOT lowering is the expensive step: `icpx` emits one device image per kernel,
+  then `llvm-foreach` runs `ocloc` (IGC) on each.  It happens at the **final
+  link of each executable**, so the ~20 test binaries each re-lower the device
+  code they pull in.  Build a single target (`--target sycl-infer`) unless the
+  tests really need AOT.
+* The post-link device step is **serial by default** (a single `ocloc`
+  process); that is not a `make -j` problem.  `CMakeLists.txt` now passes
+  `-fsycl-max-parallel-link-jobs=N`, so `-DSYCL_INFER_AOT_JOBS=N` runs N IGC
+  translations at once (default `nproc`).  RAM scales with N, lower it on a
+  memory-constrained host.
+* `CMakeLists.txt` also passes `-fsycl-device-code-split=per_kernel`: the
+  default (`auto`) merges a whole module into one image, which serialises the
+  lowering; per-kernel images can run in parallel and be skipped individually.
+* Use `-DCMAKE_BUILD_TYPE=Release`.  A Debug build's `-g` adds device debug
+  info that makes each image several times larger and slower to lower (measured
+  ~2.3x and 4.4x the binary size on one GEMV TU); the forced `-O2` does not
+  remove it.
+* The `ocloc` compiler cache is **not usable** here: `-allow_caching` /
+  `-cache_dir` (and `NEO_CACHE_DIR`) create the directory but write no entries
+  and give no speedup on the distro `intel-ocloc` 26.27.1.  The working
+  alternative is the runtime JIT cache (`SYCL_CACHE_PERSISTENT=1`,
+  `SYCL_CACHE_DIR=...`, entries under `~/.cache/neo_compiler_cache/*.l0_cache`),
+  which caches JIT-compiled kernels across runs and avoids the AOT build
+  entirely; `ccache` does not help because device lowering is a link step.
 
 ## Run
 
@@ -94,8 +131,8 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2
 `main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --kv-type
 --port --host --device --cpu-threads --layer-map --mmproj --audio-mmproj`, and
 for `gen`:
-`--prompt --max-tokens --temp --top-p --top-k --raw --image --video --audio
---max-video-frames --max-video-side`).  `--device cpu|gpu|auto`
+`--prompt --max-tokens --temp --top-p --top-k --raw --thinking --image --video
+--audio --max-video-frames --max-video-side`).  `--device cpu|gpu|auto`
 selects the compute backend; `--cpu-threads N` (or `PF_CPU_THREADS`) sets the
 host worker count;
 `--layer-map 0-11:gpu,12-23:cpu` places closed layer ranges on devices (each
@@ -113,22 +150,33 @@ GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
                               # encoders (host + device), positions (CPU+GPU)
 ./build/test_compare       # CPU reference vs llama.cpp dumps (CPU only)
 ./build/test_cpuref        # CPU reference head (CPU only)
+./build/test_cpu_gdn       # cpu_gdn with an *asymmetric* head count (CPU only)
+./build/test_cpu_gemv      # host GEMV/RMSNorm vs dequant reference (CPU only)
 ./build/test_gpu_stages    # every kernel vs the CPU reference (GPU)
 ./build/test_gemv          # GEMV vs CPU dequant reference (GPU)
 ./build/test_dp4a          # SIn repack + DP4A GEMM vs CPU reference (GPU)
+./build/test_iq_dequant    # IQ*/Q3_K GPU dequant vs host reference (GPU, 27B)
+./build/test_quant_audit   # int8(oneDNN) GEMM loss per ggml type (GPU)
+./build/test_w4*           # native-width u4 packing / GEMM / vs int8 (CPU+GPU)
 ./build/test_gpu_vs_ref    # end-to-end logits vs CPU reference (GPU)
 ./build/test_forward       # end-to-end logits / top-k (GPU)
+./build/test_decode_vs_prefill  # single-token decode == re-prefill (GPU)
 ```
 
 Always run at least `test_gpu_stages`, `test_gpu_vs_ref` and `test_forward`
 after touching kernels/engine, and confirm they still pass (they print
-`all stages OK`, `argmax ... SAME`, a stable `last_id`).
+`all stages OK`, `argmax ... SAME`, a stable `last_id`).  **Any change that can
+affect the single-token path must also run `test_decode_vs_prefill`**: the three
+tests above are prefill-only and are blind to a decode-only bug (that is how the
+fixed head-segment binding bug stayed invisible).
 
 ## Repository layout
 
 ```
 src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
-                int8 weight format/repack), dp4a.h (portable dp4a helper),
+                int8 weight format/repack), w4.{h,cpp} (native-width u4 packing
+                for Q4_K: u4 plane + separate f16 scale/off planes),
+                dp4a.h (portable dp4a helper),
                 cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch)
 src/backend/    backend.h (compute_backend abstraction), dnnl_gemm.{h,cpp}
                 (optional oneDNN int8 matmul, PF_GEMM_DNNL),
@@ -145,6 +193,7 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 and one .cpp per kernel: rmsnorm, embed, copy_row, gemv,
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
+                w4_gemv (u4 decode GEMV: act split + SLM-staged 4-bit GEMV),
                 vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
                 bidirectional attention), at (audio tower helpers: at_conv1d,
                 at_rope1d)
@@ -172,7 +221,9 @@ src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
 src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
-                + <kernel>_stage.cpp (one per GPU kernel)
+                + <kernel>_stage.cpp (one per GPU kernel), plus the weight-path
+                audits: test_w4_gemm.cpp, test_w4_vs_i8.cpp, test_gemv_stride.cpp,
+                test_iq_dequant.cpp, test_quant_audit.cpp
 tests/backend/gpu/  test_forward.cpp, test_gpu_vs_ref.cpp,
                 test_pc_gpu.cpp (disk spill + promote round-trip),
                 test_pc_ram_gpu.cpp (VRAM->RAM->VRAM round-trip)
@@ -180,10 +231,16 @@ tests/backend/cpu/  test_cpuref.cpp, test_pc_cpu.cpp (paged attention + disk
                 tier on the host backend), test_pc_disk.cpp / test_pc_ram.cpp
                 (tier stores)
 tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
-                host reference; run PF_CPU_ISA=scalar|avx2|avx512 to pin a variant)
-tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp
+                host reference; run PF_CPU_ISA=scalar|avx2|avx512 to pin a variant),
+                test_cpu_gdn.cpp (cpu_gdn with an asymmetric head count)
+tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp,
+                test_w4.cpp (u4 packing round-trip)
 tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter)
-tests/engine/   test_sampler.cpp (logit_bias + logprob reporting)
+tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
+                test_decode_vs_prefill.cpp (single-token decode vs re-prefill),
+                test_w4_vs_cpuref.cpp / test_w4_topk.cpp (u4 logits vs the fp32
+                reference; TEST_LAYER_MAP runs the 27B split across devices),
+                test_27b_prefill.cpp (27B prefill bring-up probe)
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
                 prompts, audio kernels, positions)
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
@@ -357,7 +414,14 @@ partial or not).
 * The `src/` and `tests/` trees are parallel: one file per kernel/kernel-stage.
 * Keep CMake source lists updated; there is no globbing.
 * Do not edit `third_party/`; suppress warnings from vendored code via
-  `set_source_files_properties(... COMPILE_OPTIONS ...)` in CMake.
+  `set_source_files_properties(... COMPILE_OPTIONS ...)` in CMake.  One
+  documented exception: `third_party/minja/minja.hpp` carries a 2-line local
+  patch adding Jinja's `is undefined` test (`is defined` was implemented,
+  `undefined` was not).  Our copy is byte-identical to upstream HEAD, which has
+  the same gap, and the Qwen3.8-27B chat template opens with
+  `{%- if enable_thinking is undefined or ... %}` - without the test the whole
+  template throws and the built-in ChatML fallback produces a prompt the model
+  was not trained on (chat answers degrade to a single token).
 * The compile database is `build/compile_commands.json`; `.clangd` adds the SYCL
   include dir and drops `-fsycl` so upstream clangd parses as host.  Lint policy:
   `Diagnostics.UnusedIncludes: Strict` must stay clean — check with
@@ -381,7 +445,9 @@ overrides it), `PF_KV_F32`, `PF_KV_BF16`,
 `PF_CPU_THREADS` (CPU backend worker threads, default = physical cores, else hardware concurrency),
 `PF_DP4A` (int8 GEMM, default on: the GPU packs SIn w8 copies, the CPU's
 integer kernel reads the GGUF blocks directly and does not build w8),
-`PF_DP4A_DEC` (int8 decode, default on),
+`PF_DP4A_DEC` (int8 decode, default on), `PF_W4` (native-width u4 weights for
+Q4_K, default on; `PF_W4=0` restores pure int8 - the per-32-group int8 weight
+scales always apply),
 `PF_GEMM_DNNL` (oneDNN prefill GEMM, default on), `PF_DNNL_NOWARM`, `PF_DNNL_TIME`.
 
 **Attention**
@@ -421,9 +487,16 @@ path, default `ffmpeg`).
 **Diagnostics**
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
 `PF_TIME`, `PF_DBG_MID` (stop after embedding/norm/attn/ffn), `PF_DBG_GEMV`,
-`PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`, `PF_CHAT_TMPL_DEBUG`
-(log why a GGUF chat template fell back to the built-in renderer), `SCHED_DEBUG`,
-`STOP_AFTER_LAYER`, `PF_ABL_NOATTN`, `PF_ABL_NOGDN`.
+`PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`,
+`PF_CHAT_TMPL_DEBUG` (log why a GGUF chat template fell back to the built-in
+renderer), `SCHED_DEBUG`, `STOP_AFTER_LAYER`, `PF_ABL_NOATTN`, `PF_ABL_NOGDN`,
+`PF_DUMP_LAYERS` (per-layer hidden-state fingerprints; `layerlast` = the last
+real token slot; `PF_DUMP_RAW=<prefix>` writes the whole activation vector so a
+decode run can be diffed element-wise against a prefill),
+`PF_DUMP_LOGITS`/`PF_DUMP_DEC_LOGITS=<path>` (sampler logits; the latter per
+step), `PF_DUMP_PROMPT` (the exact ids - and, for a chat prompt, the rendered
+text - the model is conditioned on), `PF_DUMP_GEN` (the decode loop's sampled id
+and stop decisions).
 
 ## Invariants and gotchas
 
@@ -432,6 +505,23 @@ path, default `ffmpeg`).
   must be read from the host-USM `step_info` *inside* the kernel body, never on
   the host.  `engine::record_forward`'s call order must stay in sync with
   `engine::build_plan` (the plan encodes the segment/call layout it replays).
+* **A plan is a device-pointer snapshot**.  `build_plan` writes the *then
+  current* `d_x*` member pointers into each `gemv_seg`, and multi-device
+  `bind_acts(dev)` only rebinds those members (it never rewrites a built plan).
+  So anything pinned to the primary device (today: the LM head) must be built
+  *after* `bind_acts(0)`, otherwise it captures the last layer's device buffers
+  and the batch-1 decode head reads a buffer no kernel wrote for that step -
+  while the prefill (which goes through `run_head()`) stays correct.
+* **GDN head pairing is modulo, attention GQA is blocked** - do not unify them.
+  `gdn.cpp` pairs value head `h` with q/k head `h % n_group` (the reference
+  tiles q/k with `ggml_repeat_4d`, whose repetition is modulo/interleaved),
+  while `attn.cpp` expands GQA with `kvh = h*n_head_kv/n_head` (HF
+  `repeat_kv`).  They agree only when the head counts are equal, which is
+  exactly the 0.8B reference model (`n_group == dt_rank == 16`), so a mistake
+  here is invisible on 0.8B and fatal on the 27B (16 vs 48).
+* **`qkv_dim()` is not `3*d_inner`** and `m.output` is not always
+  `m.tok_embd`: both assumptions hold on the 0.8B only.  Use `hp.qkv_dim()`
+  for the GDN qkv/conv width and `m.output` for the LM head.
 * **oneDNN cannot be recorded** into a SYCL graph; the `PF_GEMM_DNNL` path
   replays mode-2 prefill directly (`prefill_batch`).
 * Do not include `sycl/ext/oneapi/dot_product.hpp` from several TUs (its
@@ -467,8 +557,19 @@ cmake --build build -j$(nproc)          # must be warning-free (except the linke
 ./build/test_gpu_stages                 # all stages OK
 ./build/test_gpu_vs_ref                 # argmax SAME
 ./build/test_forward                    # stable last_id
+./build/test_decode_vs_prefill          # decode == re-prefill (any single-token change)
 clang-tidy -p build -checks='-*,misc-include-cleaner' <changed files>
 ```
+
+For the 27B (needs the layer split - it does not fit on one card), also run:
+
+```bash
+TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref     # argmax SAME
+TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill # OK
+```
+
+If a build seems to ignore your edit, remember `rsync -a` preserves source
+mtimes: `find src tests -name '*.cpp' -o -name '*.h' | xargs touch` first.
 
 See [`docs/design/12-build-and-testing.md`](docs/design/12-build-and-testing.md)
 for the full build/test matrix and the `docs/` index at

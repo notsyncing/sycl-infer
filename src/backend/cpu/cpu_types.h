@@ -105,8 +105,8 @@ void cpu_conv_state_update(const float * qkv_raw, float * conv_state, const cpu_
                            cpu_pc_snap snap);
 void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias, const float * ssm_a,
              const float * beta, float * state, float * attn_out, const cpu_step_info * info, int head_dim,
-             int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg, int nreal_arg,
-             cpu_pc_snap snap);
+             int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg,
+             int nreal_arg, cpu_pc_snap snap);
 void cpu_gated_norm(const float * attn, const float * z, const float * weight, float * out, const cpu_step_info * info,
                     int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0);
 

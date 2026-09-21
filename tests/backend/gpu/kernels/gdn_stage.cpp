@@ -12,7 +12,7 @@ void stage_gdn(stage_env & env) {
     const hparams & hp = env.e.m.hp;
     const layer_t & L0 = env.e.m.layers[0];
     const int T = env.T;
-    const int cd = 3 * hp.d_inner;
+    const int cd = hp.qkv_dim();
 
     // conv output is the GDN input
     auto raw = env.get("raw_wqkv-0");
@@ -44,7 +44,7 @@ void stage_gdn(stage_env & env) {
     env.e.q.memset(env.e.d_gdn_state, 0, (size_t)kMaxB * hp.dt_rank * hp.d_state * hp.d_state * 4);
 
     gdn_launch(env.e.q, env.e.d_conv_out, env.e.d_alpha, env.e.m.dev_f32(L0.ssm_dt), env.e.m.dev_f32(L0.ssm_a),
-               env.e.d_beta, env.e.d_gdn_state, env.e.d_attn_pre, env.e.d_info, hp.d_state, hp.dt_rank, cd,
+               env.e.d_beta, env.e.d_gdn_state, env.e.d_attn_pre, env.e.d_info, hp.d_state, hp.n_group, hp.dt_rank, cd,
                1.0f / std::sqrt((float)hp.d_state), kMaxB, 1);
     std::vector<float> hb((size_t)T * hp.d_inner);
     env.e.q.memcpy(hb.data(), env.e.d_attn_pre, hb.size() * 4).wait();

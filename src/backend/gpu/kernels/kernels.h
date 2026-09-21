@@ -35,6 +35,7 @@ struct gemv_seg {
     uint32_t type;   // ggml type of w
     int32_t K;       // input length
     int32_t n_rows;  // number of output rows
+    int32_t dev = 0; // backend device index (multi-device grouping)
     const float * x; // input activations, row stride x_stride
     int32_t x_stride;
     const float * act_up; // if non-null: x is activated as silu(x)*act_up
@@ -54,6 +55,12 @@ struct gemv_seg {
     // CPU-only: run the integer GEMV straight from the GGUF blocks in `w`
     // (type/K/n_rows are the real tensor geometry), no SIn packing needed.
     bool i8 = false;
+    // XMX/decode path: int8 oneDNN weight, row-major [n_rows][K] with one fp32
+    // scale per row in `wsc` (`wi8` points into the oneDNN weight buffer).  The
+    // decode GEMV reads this instead of the oneDNN primitive (M=1 is dominated
+    // by per-call overhead there).
+    const int8_t * wi8 = nullptr;
+    const float * wsc = nullptr;
 };
 
 // scalar state shared between kernels of one step (device memory)
@@ -62,6 +69,10 @@ struct step_info {
     int32_t n_real;                // tokens per row (prefill chunk length or 1)
     int32_t tpb;                   // token slots per row buffer (row = r*tpb + t)
     int32_t pos[kMaxB];            // first position of each row
+    // Per-row real token count for chunk-batched prefill (mode 2): the last
+    // row of a batch may be partial when the prompt is not a multiple of
+    // kMaxT.  0 means "use n_real" (mode 0/1 and graph-replay callers).
+    int32_t n_real_row[kMaxB];
     int32_t slot[kMaxB];           // state slot / KV block-table row per row
     int32_t active[kMaxB];         // 1 if the row participates
     int32_t tokens[kMaxB * kMaxT]; // token ids (row * kMaxT + t)
@@ -104,6 +115,16 @@ void rmsnorm_launch(sycl::queue & q, const float * x, const float * w, float * o
 void copy_row_launch(sycl::queue & q, const float * src, float * dst, const step_info * info, int n, int row = -1);
 void embed_launch(sycl::queue & q, const void * table, uint32_t type, const step_info * info, float * out, int n_embd,
                   size_t row_bytes);
+// 4-bit (u4) decode GEMV (M == 1) and the even/odd activation split it needs.
+// See src/backend/gpu/kernels/w4_gemv.cpp and common/w4.h.
+void w4_split_act_launch(sycl::queue & q, const int8_t * axg, int8_t * axe, int8_t * axo, int M, int K);
+void i8_grp_gemv_launch(sycl::queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                        const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
+                        int N);
+void w4_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                    const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
+                    int out_stride, const float * residual, float alpha, int K, int N);
+
 void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
                        int nsb, int n_tok_blocks = 0);
 // kscales/vscales: the int8/int4 per-32 fp16 scale planes (nullptr for the
@@ -131,8 +152,8 @@ void conv_state_update_launch(sycl::queue & q, const float * qkv_raw, float * co
                               int nreal_arg = -1, bool last_row_only = false, pc_snap snap = {});
 void gdn_launch(sycl::queue & q, const float * conv_out, const float * alpha, const float * dt_bias,
                 const float * ssm_a, const float * beta, float * state, float * attn_out, const step_info * info,
-                int head_dim, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0 = 0,
-                int tpb_arg = -1, int nreal_arg = -1, pc_snap snap = {});
+                int head_dim, int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows,
+                int row0 = 0, int tpb_arg = -1, int nreal_arg = -1, pc_snap snap = {});
 void gated_norm_launch(sycl::queue & q, const float * attn, const float * z, const float * weight, float * out,
                        const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real,
                        int row0 = 0);
@@ -154,6 +175,18 @@ void xq_launch(sycl::queue & q, const float * x, const float * up, int x_stride,
 // activation group (16 bytes) and its scale/sum are broadcast.
 void dp4a_gemv_launch(sycl::queue & q, const w8t & w, const int8_t * x8, const sycl::float2 * xmeta,
                       const int32_t * xsumq, float * out, const float * residual, float alpha, int n_rows_out);
+
+// i8_row_gemv_launch: single-token decode GEMV over a row-major [N][K] int8
+// weight with one fp32 scale per row (the oneDNN weight buffer). `xq` is the
+// row-quantized activation (K int8 values) and `sx_dev` a device pointer to its
+// scale (read inside the kernel).
+void i8_row_gemv_launch(sycl::queue & q, const int8_t * w, const float * sw, const int8_t * xq, const float * sx_dev,
+                        float * out, int K, int N, const float * residual, float alpha);
+
+// One launch for all segments of a decode call: `segs` (device array, n_segs
+// entries) share the activation row `xq`/`sx_dev`.  total_rows = sum(n_rows).
+void i8_row_gemv_multi_launch(sycl::queue & q, const gemv_seg * segs, int n_segs, int total_rows, const int8_t * xq,
+                              const float * sx_dev, const int32_t * xsum_dev);
 
 // dp4a_gemm_launch: out[t][row] = alpha * sum_k w[row][k] * x[t][k] (+ residual)
 // with w in SI8 and x quantized as above.  One workgroup covers 256 rows, each

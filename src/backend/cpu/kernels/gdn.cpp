@@ -6,12 +6,12 @@
 namespace si {
 
 void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias, const float * ssm_a, const float * beta,
-             float * state, float * attn_out, const cpu_step_info * info, int head_dim, int n_heads, int conv_dim,
-             float scale, int n_slots, int n_rows, int row0, int tpb_arg, int nreal_arg, cpu_pc_snap snap) {
+             float * state, float * attn_out, const cpu_step_info * info, int head_dim, int n_k_heads, int n_heads,
+             int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg, int nreal_arg, cpu_pc_snap snap) {
     (void)n_slots;
     const int q_off = 0;
-    const int k_off = n_heads * head_dim;
-    const int v_off = 2 * n_heads * head_dim;
+    const int k_off = n_k_heads * head_dim;
+    const int v_off = 2 * n_k_heads * head_dim;
     const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
     const int n_real = nreal_arg > 0 ? nreal_arg : info->n_real;
     const int pc_on = info->pc_active;
@@ -29,14 +29,19 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
         }
         const int pbase = info->pos[rr];
         const float A = ssm_a[head];
+        // v head -> q/k head is modulo (interleaved): the reference expands the
+        // q/k head axis with ggml_repeat_4d, which tiles by modulo.  Blocked
+        // (head * n_k_heads / n_heads) coincides only when the model has as
+        // many key heads as value heads (0.8B), not for the 27B (16 vs 48).
+        const int qk_head = head % n_k_heads;
         float * st = state + (size_t)info->slot[rr] * n_heads * head_dim * head_dim +
                      (size_t)head * head_dim * head_dim;
         const float * cor = conv_out + (size_t)rr * tpb * conv_dim;
         const float * alr = alpha + (size_t)rr * tpb * n_heads;
         const float * ber = beta + (size_t)rr * tpb * n_heads;
         for (int t = 0; t < n_real; t++) {
-            const float * qv = cor + (size_t)t * conv_dim + q_off + (size_t)head * head_dim;
-            const float * kv = cor + (size_t)t * conv_dim + k_off + (size_t)head * head_dim;
+            const float * qv = cor + (size_t)t * conv_dim + q_off + (size_t)qk_head * head_dim;
+            const float * kv = cor + (size_t)t * conv_dim + k_off + (size_t)qk_head * head_dim;
             const float bt = cpu_sigmoid(ber[t * n_heads + head]);
             const float sp = std::log(1.0f + std::exp(alr[t * n_heads + head] + dt_bias[head]));
             const float g = std::exp(A * sp);

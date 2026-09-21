@@ -37,6 +37,18 @@ struct dnnl_gemm {
     bool add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
     bool has_weight(const void * key) const;
 
+    // ---- 4-bit (u4) weights (see common/w4.h) -----------------------------
+    // Native-width packing of a Q4_K tensor: u4 values [N][K] plus per-32-group
+    // f16 step/offset planes.  Lossless within the f16 metadata (0.077% error
+    // vs the int8 conversion's 0.98%) at 0.625 bytes/weight instead of 1.0.
+    // The matmul keeps oneDNN's grouped f16 weight scales (= step) and moves
+    // the offset (zero-point) into a separate correction term, because
+    // oneDNN's grouped zero-point descriptors do not validate.
+    bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
+    bool has_weight_w4(const void * key) const;
+    // Same contract as gemm(); out = alpha*sx[m]*(acc4 + correction) + residual.
+    bool gemm_w4(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
+
     // Quantize one call's activations: x is token-major [M][x_stride]; if up is
     // non-null the value is silu(x)*up (ffn_down).  The result stays valid
     // until the next quantize() call.
@@ -55,7 +67,15 @@ struct dnnl_gemm {
     const int8_t * weight_data(const void * key) const;
     const float * weight_scales(const void * key) const;
     const int8_t * act_data() const;
+    // u4 path: the per-32-group quantized activations and their f16 scales
+    // (device pointers), produced alongside the per-row form when a u4 weight
+    // has been registered.
+    const int8_t * act_grp_data() const;
+    const uint16_t * act_grp_scales() const;
     const float * act_scales() const;
+    // per-row sum of the quantized activations (int32, device memory) used by
+    // the dp4a decode GEMV's weight bias correction
+    const int32_t * act_sum() const;
 
 private:
     struct impl;

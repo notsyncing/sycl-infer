@@ -22,7 +22,9 @@ void embed_launch(queue & q, const void * table, uint32_t type, const step_info 
         const int t = g / n_sb;
         const int sb = g % n_sb;
         const int tid = it.get_local_id(0);
-        if (t >= info->n_rows * info->n_real) {
+        // per-row real count: a chunk-batched row may be partial
+        const int row = t / info->tpb;
+        if (row >= info->n_rows || (t - row * info->tpb) >= row_nr(info, row)) {
             return;
         }
         // multimodal: tokens whose embedding was produced by the vision encoder

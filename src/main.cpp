@@ -81,6 +81,7 @@ static void usage(const char * prog) {
             "gen:\n"
             "  --prompt \"...\"               prompt text (chat-templated unless --raw)\n"
             "  --raw                        encode the prompt verbatim (no chat template)\n"
+            "  --thinking                   chat template `enable_thinking` (default off)\n"
             "  --image <file>               attach an image (repeatable; needs --mmproj)\n"
             "  --video <file>               attach a video (repeatable; needs --mmproj)\n"
             "  --audio <file>               attach audio (repeatable; needs --audio-mmproj)\n"
@@ -130,6 +131,7 @@ int main(int argc, char ** argv) {
     float top_p = 0.95f;
     int top_k = 40;
     bool raw = false;
+    bool thinking = false; // --thinking: chat template `enable_thinking`
     std::string mmproj_path;
     std::string audio_mmproj_path;
     std::vector<std::string> image_paths;
@@ -190,6 +192,8 @@ int main(int argc, char ** argv) {
             top_k = atoi(next().c_str());
         } else if (a == "--raw") {
             raw = true;
+        } else if (a == "--thinking" || a == "--enable-thinking") {
+            thinking = true;
         } else if (a == "--mmproj") {
             mmproj_path = next();
         } else if (a == "--audio-mmproj") {
@@ -345,7 +349,11 @@ int main(int argc, char ** argv) {
             gp.top_p = top_p;
             gp.top_k = top_k;
             utf8_stream_buffer ub;
+            const bool dump_gen = getenv("PF_DUMP_GEN") != nullptr;
             auto emit = [&](int tok) {
+                if (dump_gen) {
+                    fprintf(stderr, "[gen] id=%d '%s'\n", tok, e.tk.token_piece(tok).c_str());
+                }
                 fputs(ub.push(e.tk.token_piece(tok)).c_str(), stdout);
                 fflush(stdout);
                 return true;
@@ -450,7 +458,8 @@ int main(int argc, char ** argv) {
                     m.parts.push_back(std::move(cp));
                 }
                 m.parts.push_back(std::move(tpart));
-                const std::string rendered = render_chat(e.m.chat_template, {m}, /*add_generation_prompt=*/true, false);
+                const std::string rendered =
+                    render_chat(e.m.chat_template, {m}, /*add_generation_prompt=*/true, thinking);
                 mm_prompt mp = mm_build_prompt_mixed_device(vm, am, e.q, e.tk, rendered, imgs, vids, auds, order,
                                                             e.m.hp.n_embd, e.d_img_embd, max_video_frames);
                 e.generate_mm(mp, gp, emit);
@@ -463,7 +472,21 @@ int main(int argc, char ** argv) {
                 toks = e.tk.encode(prompt, /*parse_special=*/true);
             } else {
                 std::vector<chat_msg> msgs = {{"user", prompt}};
-                toks = e.tk.encode(render_chat(e.m.chat_template, msgs, true, false));
+                toks = e.tk.encode(render_chat(e.m.chat_template, msgs, true, thinking));
+            }
+            // PF_DUMP_PROMPT: dump the exact prompt the model is conditioned on
+            // (the rendered chat text and/or the token ids) - the fastest way to
+            // tell a bad chat template from a bad forward pass.
+            if (getenv("PF_DUMP_PROMPT")) {
+                if (!raw) {
+                    std::vector<chat_msg> msgs = {{"user", prompt}};
+                    fprintf(stderr, "[prompt] %s\n", render_chat(e.m.chat_template, msgs, true, thinking).c_str());
+                }
+                fprintf(stderr, "[prompt ids]");
+                for (int tkv : toks) {
+                    fprintf(stderr, " %d", tkv);
+                }
+                fprintf(stderr, "\n");
             }
             e.generate(toks, gp, emit);
             fputs(ub.flush().c_str(), stdout);

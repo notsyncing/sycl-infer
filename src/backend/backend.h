@@ -59,8 +59,8 @@ struct compute_backend {
                                    bool last_row_only, pc_snap snap) = 0;
     virtual void gdn(const float * conv_out, const float * alpha, const float * dt_bias, const float * ssm_a,
                      const float * beta, float * state, float * attn_out, const step_info * info, int head_dim,
-                     int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg,
-                     int nreal_arg, pc_snap snap) = 0;
+                     int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0,
+                     int tpb_arg, int nreal_arg, pc_snap snap) = 0;
     virtual void gated_norm(const float * attn, const float * z, const float * weight, float * out,
                             const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real,
                             int row0) = 0;
@@ -77,6 +77,13 @@ struct compute_backend {
     // set s.i8 and may fall back to the fp32 segments.
     virtual void i8_gemv(const gemv_seg & s) = 0;
     virtual void i8_gemm(const gemv_seg & s, int TB) = 0;
+    // XMX decode: single-token GEMV over the segment's row-major int8 weight
+    // (s.wi8/s.wsc), using the activation row `xq` (K values) and a device
+    // pointer to its scale.
+    virtual void i8_row_gemv(const gemv_seg & s, const int8_t * xq, const float * sx) = 0;
+    // decode: all segments of a call in one launch (shared activation row)
+    virtual void i8_row_gemv_multi(const gemv_seg * segs, int n_segs, int total_rows, const int8_t * xq,
+                                   const float * sx, const int32_t * xsum) = 0;
 
     virtual void synchronize() = 0;
 };

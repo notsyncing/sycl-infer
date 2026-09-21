@@ -12,8 +12,8 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
 ## Features
 
 * **GGUF models** — memory-mapped load, one device blob, no conversion step.
-  Weight types Q4_K / Q5_K / Q6_K / Q8_0 / F32 are dequantized on the fly inside
-  the kernels.
+  Weight types Q4_K / Q5_K / Q6_K / Q3_K / IQ4_XS / IQ4_NL / IQ3_S / Q8_0 / F32
+  are dequantized on the fly inside the kernels.
 * **Pluggable architectures** — the model type is read from
   `general.architecture` and dispatched to a per-architecture loader (one source
   file plus one registry entry); `qwen35` (hybrid Gated DeltaNet + full
@@ -27,12 +27,17 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
   integer int8 GEMV straight from the GGUF blocks on the CPU, plus an optional
   oneDNN int8 GEMM path for prefill; KV cache stored as int8 (default), bf16,
   f16 or f32.
+* **Native 4-bit (u4) weights** — Q4_K keeps the GGUF's own `(q, step, offset)`
+  grid, which is lossless (0.077% vs 0.98% relative L2 for the int8 conversion)
+  and 1.6x smaller, so a 27B-class Q4_K model fits two 16 GB cards.  `PF_W4=0`
+  restores the pure int8 path.
 * **Device selection** — `--device cpu|gpu|auto`; the CPU backend has its own
   AVX2 / AVX-VNNI / AVX-512 kernels, picks the variant at run time, and keeps
   the paged KV in host RAM.
 * **Multi-device (pipeline parallel)** — `--layer-map 0-11:gpu,12-23:cpu` places
   contiguous layer ranges on devices; each device owns the paged KV of its
-  attention layers.
+  attention layers.  A 27B-class model needs this (it does not fit on one card);
+  see [Multi-GPU](#multi-gpu-pipeline-parallel) below.
 * **SYCL command graphs** — the full forward step is captured per shape and
   replayed, keeping per-token launch overhead minimal (GPU only).
 * **OpenAI-compatible API** — streaming and non-streaming chat/completions with
@@ -51,7 +56,7 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
 | | |
 |---|---|
 | file format | GGUF (memory-mapped, single file) |
-| weight quantization | Q4_K, Q5_K, Q6_K, Q8_0, F32 |
+| weight quantization | Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, IQ3_S, Q8_0, F32; Q4_K uses the native 4-bit (u4) path by default |
 | architecture registry | selected via `general.architecture`; `qwen35` implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry |
 | KV cache dtype | `i8` (default), `bf16`, `f16`, `f32` |
 | tokenizer | GPT-2 byte-level BPE from the GGUF vocabulary + special tokens / chat template |
@@ -65,9 +70,11 @@ Adding an architecture is a single new file under `src/model/` — see
 * Intel oneAPI DPC++ compiler (`icpx`) — tested with oneAPI 2026.1
 * oneDNN 2026.0 (optional prefill path; `/opt/intel/oneapi/dnnl/2026.0`,
   override with `-DDNNL_ROOT=`)
-* An Intel GPU with SYCL support (developed against Iris Xe-LP).  The CPU
-  backend (`--device cpu`) runs without a GPU, using the AVX2 / AVX-VNNI /
-  AVX-512 kernel variants selected at run time.
+* An Intel GPU with SYCL support (developed against Iris Xe-LP; 27B-class models
+  were run on two Arc A770).  The CPU backend (`--device cpu`) runs without a
+  GPU, using the AVX2 / AVX-VNNI / AVX-512 kernel variants selected at run time.
+* Two or more Intel GPUs for the pipeline-parallel split (`--layer-map`, see
+  [Multi-GPU](#multi-gpu-pipeline-parallel)) - `sycl-ls` lists what is visible.
 
 ## Build
 
@@ -93,6 +100,10 @@ Optional: AOT-compile the device image with `-DSYCL_INFER_AOT=ON` (defaults to
 # multimodal: describe an image (needs the matching mmproj GGUF)
 ./build/sycl-infer --model /path/to/model.gguf --mmproj /path/to/mmproj.gguf \
     gen --image photo.png --prompt "Describe this image."
+
+# a 27B-class model does not fit on one card: split the layers over two GPUs
+./build/sycl-infer --model /path/to/Qwen3.8-27B-UD-Q4_K_M.gguf --ctx 4096 \
+    --layer-map 0-31:gpu.0,32-63:gpu.1 gen --prompt "Hello"
 ```
 
 Common flags:
@@ -116,11 +127,14 @@ Common flags:
 | `--host H` / `--port N` | 0.0.0.0 / 8080 | server bind address |
 | `--max-tokens` / `--temp` / `--top-p` / `--top-k` | 256 / 0.7 / 0.95 / 40 | `gen` sampling |
 | `--raw` | off | `gen`: send the prompt verbatim (no chat template) |
+| `--thinking` | off | `gen`: set the chat template `enable_thinking` (reasoning on); the server takes this from each request instead |
 
 HTTP endpoints:
 
 * `POST /v1/chat/completions` — OpenAI chat API (streaming + non-streaming;
-  `stop`, `ignore_eos`, `stream_options.include_usage`, `n`, `reasoning_content`,
+  `stop`, `ignore_eos`, `stream_options.include_usage`, `n`, `reasoning_content`
+  (`chat_template_kwargs.enable_thinking` / `enable_thinking` / `thinking` /
+  `reasoning_effort`),
   `tools`/`tool_choice` + `tool_calls`/`tool` results, `logit_bias`, `logprobs`/
   `top_logprobs`, image parts)
 * `POST /v1/completions` — raw text completion (string/string[]/token-id prompt,
@@ -151,6 +165,62 @@ RAM, then the VRAM checkpoint count).  When it is not given, the configured thre
 tiers define the budget themselves.  The device KV pool reservation is always
 made large enough to hold the VRAM tier.
 
+### Multi-GPU (pipeline parallel)
+
+`--layer-map` splits the model into contiguous layer ranges and runs each range
+on its own device.  Every device holds only its own layers' weights and owns the
+paged KV of the attention layers in its range; at each range boundary the hidden
+state is handed to the next device.  This is what makes a 27B-class Q4_K model
+fit on two 16 GB cards.
+
+```
+--layer-map <begin-end>:<device>[,<begin-end>:<device>...]
+    <device> = gpu | gpu.N | cpu
+```
+
+* `begin-end` is an **inclusive** layer range; entries are applied in order and
+  must tile `[0, n_layer)` with no gaps (otherwise startup fails with
+  `--layer-map must cover every layer without gaps` / `... must end at the model's
+  layer count`).
+* `gpu` is the first enumerated GPU, `gpu.N` the N-th one in
+  `sycl::device::get_devices(sycl::info::device_type::gpu)` order (the order
+  `sycl-ls` prints).  `cpu` (or `host`) puts that range on the AVX host backend,
+  so GPU + CPU splits work too.
+* Backend 0 - the first GPU in the map, or the CPU when the map has no GPU - runs
+  the global tensors and the LM head.  `--device` is not needed: the map fully
+  determines placement.  Distinct GPUs in the map share one SYCL context, so the
+  host-USM activations stay valid across devices.
+
+```bash
+# 27B on two Arc GPUs: layers 0-31 on the first, 32-63 on the second
+./build/sycl-infer --model Qwen3.8-27B-UD-Q4_K_M.gguf --ctx 4096 \
+    --layer-map 0-31:gpu.0,32-63:gpu.1 gen --prompt "Hello"
+
+# split a small model between one GPU and the CPU
+./build/sycl-infer --model model.gguf --layer-map 0-11:gpu,12-23:cpu serve
+```
+
+The startup log reports what a map resolved to - the quickest way to check the
+wiring:
+
+```
+[dev] backend 0 -> gpu.0 (Intel(R) Arc(TM) A770 Graphics)
+[dev] backend 1 -> gpu.1 (Intel(R) Arc(TM) A770 Graphics)
+[dev] device 0 weights: 59 on the u4 path, 189 on int8
+[dev] multi-device weight path: oneDNN int8 (XMX)
+[dev] multi-device layer map: 0-31:gpu.0,32-63:gpu.1 (2 backends)
+```
+
+Notes:
+
+* every device needs room for its share of the weights **plus its own paged KV**
+  for the attention layers it holds, so VRAM grows with `--ctx` on each device
+  (for the 27B above: ~12.4 GB of weights and ~17 KB per token per card);
+* multi-device replays the recorded segment plans directly instead of using SYCL
+  command graphs, and the per-device weight path (oneDNN int8 / DP4A SIn / u4 /
+  fp32) is selected automatically;
+* continuous batching, the prefix cache and the OpenAI API work unchanged.
+
 ## Configuration
 
 Runtime behavior is controlled by environment variables.  The most useful ones:
@@ -172,6 +242,7 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_GEMM_DNNL` | on | `0` disables oneDNN int8 GEMM and uses the DP4A path |
 | `PF_DP4A` | on | `0` forces the fp32 path |
 | `PF_DP4A_DEC` | on | `0` forces fp32 decode |
+| `PF_W4` | on | native 4-bit (u4) weights for Q4_K; `0` falls back to pure int8 |
 
 The full tuning/diagnostics knob list and internals are documented in
 [`AGENTS.md`](AGENTS.md).

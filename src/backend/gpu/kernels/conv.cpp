@@ -30,7 +30,7 @@ void conv_l2_launch(queue & q, const float * qkv_raw, float * conv_state, const 
             const int grp = g % n_groups;
             const int lane = it.get_local_id(0);
             const int rr = row0 + r;
-            if (rr >= info->n_rows || t >= n_real || !info->active[rr]) {
+            if (rr >= info->n_rows || t >= row_nr(info, rr) || !info->active[rr]) {
                 return;
             }
             const int row = rr * tpb + t;
@@ -86,7 +86,7 @@ void conv_state_update_launch(queue & q, const float * qkv_raw, float * conv_sta
         if (rr >= info->n_rows || !info->active[rr]) {
             return;
         }
-        const int n = nreal_arg > 0 ? nreal_arg : info->n_real;
+        const int n = row_nr(info, rr); // mode 2 may have a partial last row
         // prefix cache: this row ends a 32-token block -> checkpoint it
         const int end_tok = info->pos[rr] + n;
         const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[end_tok / kBlockSize] : -1;
@@ -95,12 +95,22 @@ void conv_state_update_launch(queue & q, const float * qkv_raw, float * conv_sta
             return;
         }
         float * cstate = conv_state + (size_t)info->slot[rr] * 3 * conv_dim;
-        const float * raw = qkv_raw + (size_t)rr * tpb * conv_dim;
         const float old1 = cstate[(size_t)1 * conv_dim + i];
         const float old2 = cstate[(size_t)2 * conv_dim + i];
-        const float v2 = raw[(size_t)(n - 1) * conv_dim + i];
-        const float v1 = (n >= 2) ? raw[(size_t)(n - 2) * conv_dim + i] : old2;
-        const float v0 = (n >= 3) ? raw[(size_t)(n - 3) * conv_dim + i] : ((n == 2) ? old2 : old1);
+        // Absolute token index of the newest value; the two older taps come from
+        // this forward's qkv_raw when it holds contiguous rows (mode 2, i.e.
+        // last_row_only), which is also what makes a *partial* last row correct:
+        // a row shorter than conv_k-1 must reach back into the previous row
+        // instead of the (not yet updated) state.
+        const int base = rr * tpb;
+        const int a = base + n - 1;
+        const float v2 = qkv_raw[(size_t)a * conv_dim + i];
+        const int a1 = a - 1;
+        const float v1 = (a1 >= base) ? qkv_raw[(size_t)a1 * conv_dim + i]
+                                      : ((last_row_only && a1 >= 0) ? qkv_raw[(size_t)a1 * conv_dim + i] : old2);
+        const int a0 = a - 2;
+        const float v0 = (a0 >= base) ? qkv_raw[(size_t)a0 * conv_dim + i]
+                                      : ((last_row_only && a0 >= 0) ? qkv_raw[(size_t)a0 * conv_dim + i] : old1);
         if (!last_row_only || is_last) {
             cstate[(size_t)0 * conv_dim + i] = v0;
             cstate[(size_t)1 * conv_dim + i] = v1;

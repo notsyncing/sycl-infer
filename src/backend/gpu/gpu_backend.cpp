@@ -68,11 +68,11 @@ struct gpu_backend : compute_backend {
                                  last_row_only, snap);
     }
     void gdn(const float * conv_out, const float * alpha, const float * dt_bias, const float * ssm_a,
-             const float * beta, float * state, float * attn_out, const step_info * info, int head_dim, int n_heads,
-             int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg, int nreal_arg,
-             pc_snap snap) override {
-        gdn_launch(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads, conv_dim, scale,
-                   n_slots, n_rows, row0, tpb_arg, nreal_arg, snap);
+             const float * beta, float * state, float * attn_out, const step_info * info, int head_dim,
+             int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg,
+             int nreal_arg, pc_snap snap) override {
+        gdn_launch(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
+                   conv_dim, scale, n_slots, n_rows, row0, tpb_arg, nreal_arg, snap);
     }
     void gated_norm(const float * attn, const float * z, const float * weight, float * out, const step_info * info,
                     int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0) override {
@@ -97,6 +97,13 @@ struct gpu_backend : compute_backend {
     }
     void i8_gemm(const gemv_seg & s, int TB) override {
         gemv_group_launch(q, s.type, &s, 1, s.n_rows, TB, s.K / 256, 0);
+    }
+    void i8_row_gemv(const gemv_seg & s, const int8_t * xq, const float * sx) override {
+        i8_row_gemv_launch(q, s.wi8, s.wsc, xq, sx, s.out, s.K, s.n_rows, s.residual, s.alpha);
+    }
+    void i8_row_gemv_multi(const gemv_seg * segs, int n_segs, int total_rows, const int8_t * xq, const float * sx,
+                           const int32_t * xsum) override {
+        i8_row_gemv_multi_launch(q, segs, n_segs, total_rows, xq, sx, xsum);
     }
     void synchronize() override {
         q.wait();

@@ -54,7 +54,7 @@ static void attn_group_kernel(queue & q, const float * qbuf, const KV * kp_base,
         float * part0 =
             partials + (((size_t)r * info->tpb + t) * n_head + h0) * n_splits * pstride + (size_t)s * pstride;
 
-        if (r >= info->n_rows || t >= info->n_real || !info->active[r]) {
+        if (r >= info->n_rows || t >= row_nr(info, r) || !info->active[r]) {
 #pragma unroll
             for (int j = 0; j < HPG; j++) {
                 float * part = part0 + (size_t)j * n_splits * pstride;
@@ -192,7 +192,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
             float * part =
                 partials + (((size_t)r * info->tpb + t) * n_head + h) * n_splits * pstride + (size_t)s * pstride;
 
-            if (r >= info->n_rows || t >= info->n_real || !info->active[r]) {
+            if (r >= info->n_rows || t >= row_nr(info, r) || !info->active[r]) {
                 if (lane == 0) {
                     part[0] = -INFINITY;
                     part[1] = 0.f;
@@ -394,7 +394,7 @@ void attn_combine_launch(queue & q, const float * partials, const float * gate, 
         const int t = (gid / n_head) % n_real;
         const int h = gid % n_head;
         const int d = it.get_local_id(0);
-        if (r >= info->n_rows || t >= info->n_real || !info->active[r]) {
+        if (r >= info->n_rows || t >= row_nr(info, r) || !info->active[r]) {
             return;
         }
         const int row = r * info->tpb + t;

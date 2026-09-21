@@ -18,14 +18,14 @@ using namespace si::kd;
 template <int C, int WPW = 8>
 static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, const float * dt_bias,
                        const float * ssm_a, const float * beta, float * state, float * attn_out, const step_info * info,
-                       int head_dim, int n_heads, int conv_dim, float scale, int n_rows, int row0, int tpb_arg,
-                       int nreal_arg, pc_snap snap) {
+                       int head_dim, int n_k_heads, int n_heads, int conv_dim, float scale, int n_rows, int row0,
+                       int tpb_arg, int nreal_arg, pc_snap snap) {
     const int col_groups = head_dim / C;
     const int total_warps = n_heads * col_groups;
     const int n_wg = (total_warps * n_rows + WPW - 1) / WPW;
     const int q_off = 0;
-    const int k_off = n_heads * head_dim;
-    const int v_off = 2 * n_heads * head_dim;
+    const int k_off = n_k_heads * head_dim;
+    const int v_off = 2 * n_k_heads * head_dim;
     q.parallel_for(
         nd_range<1>((size_t)n_wg * WPW * 32, WPW * 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const int gid = it.get_group(0) * WPW + it.get_local_id(0) / 32;
@@ -38,11 +38,18 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
             }
             const int head = wid / col_groups;
             const int col0 = (wid % col_groups) * C;
+            // q/k carry n_k_heads heads, v carries n_heads; every v head is
+            // paired with q/k head (head % n_k_heads).  The reference expands
+            // the q/k head axis with ggml_repeat_4d, whose tiling is modulo
+            // (interleaved), not blocked - the two agree only when
+            // n_k_heads == n_heads (the 0.8B reference); Qwen3.8-27B has
+            // 16 key heads against 48 value heads.
+            const int qk_head = head % n_k_heads;
             const sub_group sgg = it.get_sub_group();
             // hoist the step_info fields: reloading them from host USM inside the
             // token loop costs more than the arithmetic (they alias our writes)
             const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
-            const int n_real = nreal_arg > 0 ? nreal_arg : info->n_real;
+            const int n_real = row_nr(info, rr);
             const int pc_on = info->pc_active;
             const int pbase = info->pos[rr];
 
@@ -63,8 +70,8 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
             const float * ber = beta + (size_t)rr * tpb * n_heads;
 
             for (int t = 0; t < n_real; t++) {
-                const float * qv = cor + (size_t)t * conv_dim + q_off + head * head_dim;
-                const float * kv = cor + (size_t)t * conv_dim + k_off + head * head_dim;
+                const float * qv = cor + (size_t)t * conv_dim + q_off + qk_head * head_dim;
+                const float * kv = cor + (size_t)t * conv_dim + k_off + qk_head * head_dim;
                 const float bt = sigmoid_f(ber[t * n_heads + head]);
                 const float sp = sycl::log(1.0f + sycl::exp(alr[t * n_heads + head] + dt_bias[head]));
                 const float g = sycl::exp(A * sp);
@@ -134,14 +141,14 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
 template <int C, int WPW = 8>
 static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha, const float * dt_bias,
                           const float * ssm_a, const float * beta, float * state, float * attn_out,
-                          const step_info * info, int head_dim, int n_heads, int conv_dim, float scale, int n_rows,
-                          int row0, int tpb_arg, int nreal_arg, pc_snap snap) {
+                          const step_info * info, int head_dim, int n_k_heads, int n_heads, int conv_dim, float scale,
+                          int n_rows, int row0, int tpb_arg, int nreal_arg, pc_snap snap) {
     const int col_groups = head_dim / C;
     const int total_warps = n_heads * col_groups;
     const int n_wg = (total_warps * n_rows + WPW - 1) / WPW;
     const int q_off = 0;
-    const int k_off = n_heads * head_dim;
-    const int v_off = 2 * n_heads * head_dim;
+    const int k_off = n_k_heads * head_dim;
+    const int v_off = 2 * n_k_heads * head_dim;
     q.parallel_for(
         nd_range<1>((size_t)n_wg * WPW * 32, WPW * 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const int gid = it.get_group(0) * WPW + it.get_local_id(0) / 32;
@@ -154,10 +161,12 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
             }
             const int head = wid / col_groups;
             const int col0 = (wid % col_groups) * C;
+            // modulo (interleaved) q/k head pairing, as in the scalar kernel
+            const int qk_head = head % n_k_heads;
             const sub_group sgg = it.get_sub_group();
             const int j0 = 4 * lane;
             const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
-            const int n_real = nreal_arg > 0 ? nreal_arg : info->n_real;
+            const int n_real = row_nr(info, rr);
             const int pc_on = info->pc_active;
             const int pbase = info->pos[rr];
 
@@ -175,8 +184,8 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
             const float * ber = beta + (size_t)rr * tpb * n_heads;
 
             for (int t = 0; t < n_real; t++) {
-                const float * qv = cor + (size_t)t * conv_dim + q_off + head * head_dim;
-                const float * kv = cor + (size_t)t * conv_dim + k_off + head * head_dim;
+                const float * qv = cor + (size_t)t * conv_dim + q_off + qk_head * head_dim;
+                const float * kv = cor + (size_t)t * conv_dim + k_off + qk_head * head_dim;
                 const float4 k4 = *(const float4 *)(kv + j0);
                 const float4 q4 = *(const float4 *)(qv + j0);
                 const float bt = sigmoid_f(ber[t * n_heads + head]);
@@ -222,9 +231,9 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
 }
 
 void gdn_launch(queue & q, const float * conv_out, const float * alpha, const float * dt_bias, const float * ssm_a,
-                const float * beta, float * state, float * attn_out, const step_info * info, int head_dim, int n_heads,
-                int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg, int nreal_arg,
-                pc_snap snap) {
+                const float * beta, float * state, float * attn_out, const step_info * info, int head_dim,
+                int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0,
+                int tpb_arg, int nreal_arg, pc_snap snap) {
     (void)n_slots;
     // PF_GDN_COLS=2/4/8: state rows per warp (default 4; 1 = original mapping)
     static const int cols = [] {
@@ -254,26 +263,26 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
         if (wpw == 2) {
             switch (c) {
             case 1:
-                gdn_f4_kernel<1, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+                gdn_f4_kernel<1, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                                     conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
                 return;
             default:
-                gdn_f4_kernel<2, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+                gdn_f4_kernel<2, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                                     conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
                 return;
             }
         }
         switch (c) {
         case 1:
-            gdn_f4_kernel<1, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_f4_kernel<1, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                                 conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             return;
         case 2:
-            gdn_f4_kernel<2, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_f4_kernel<2, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                                 conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             return;
         default:
-            gdn_f4_kernel<4, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_f4_kernel<4, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                                 conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             return;
         }
@@ -281,11 +290,11 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     if (wpw == 1) {
         switch (c) {
         case 1:
-            gdn_kernel<1, 1>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<1, 1>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         default:
-            gdn_kernel<2, 1>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<2, 1>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         }
@@ -294,11 +303,11 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     if (wpw == 2) {
         switch (c) {
         case 1:
-            gdn_kernel<1, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<1, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         default:
-            gdn_kernel<2, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<2, 2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         }
@@ -307,15 +316,15 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     if (wpw == 4) {
         switch (c) {
         case 2:
-            gdn_kernel<2, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<2, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         case 4:
-            gdn_kernel<4, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<4, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         default:
-            gdn_kernel<1, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads,
+            gdn_kernel<1, 4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads,
                              conv_dim, scale, n_rows, row0, tpb_arg, nreal_arg, snap);
             break;
         }
@@ -323,19 +332,19 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     }
     switch (c) {
     case 1:
-        gdn_kernel<1>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads, conv_dim,
+        gdn_kernel<1>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads, conv_dim,
                       scale, n_rows, row0, tpb_arg, nreal_arg, snap);
         break;
     case 4:
-        gdn_kernel<4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads, conv_dim,
+        gdn_kernel<4>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads, conv_dim,
                       scale, n_rows, row0, tpb_arg, nreal_arg, snap);
         break;
     case 8:
-        gdn_kernel<8>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads, conv_dim,
+        gdn_kernel<8>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads, conv_dim,
                       scale, n_rows, row0, tpb_arg, nreal_arg, snap);
         break;
     default:
-        gdn_kernel<2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_heads, conv_dim,
+        gdn_kernel<2>(q, conv_out, alpha, dt_bias, ssm_a, beta, state, attn_out, info, head_dim, n_k_heads, n_heads, conv_dim,
                       scale, n_rows, row0, tpb_arg, nreal_arg, snap);
         break;
     }

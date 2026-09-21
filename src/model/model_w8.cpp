@@ -18,7 +18,7 @@ namespace si {
 // every tensor to 4-bit asymmetric groups instead.  See w8.h for the format.
 static void build_w8_tensor(sycl::queue & q, const wt & t, w8t & out, bool host) {
     out = w8t{};
-    if (t.type != 12 && t.type != 13 && t.type != 14) {
+    if (t.type != 12 && t.type != 13 && t.type != 14 && !w8_requant_type(t.type)) {
         return;
     }
     const size_t vals_bytes = w8_vals_bytes(t.type, t.K, t.N);
@@ -71,7 +71,7 @@ static void free_w8_tensor(sycl::queue & q, w8t & t) {
 }
 
 void model::free_w8(sycl::queue & q) {
-    free_w8_tensor(q, tok_embd8);
+    free_w8_tensor(q, output8);
     for (auto & L : layers) {
         free_w8_tensor(q, L.ffn_gate8);
         free_w8_tensor(q, L.ffn_up8);
@@ -94,7 +94,7 @@ void model::build_w8_one(sycl::queue & q, const wt & t, w8t & out) {
 }
 
 void model::build_w8(sycl::queue & q, bool host) {
-    build_w8_tensor(q, tok_embd, tok_embd8, host);
+    build_w8_tensor(q, output, output8, host);
     for (auto & L : layers) {
         build_w8_tensor(q, L.ffn_gate, L.ffn_gate8, host);
         build_w8_tensor(q, L.ffn_up, L.ffn_up8, host);

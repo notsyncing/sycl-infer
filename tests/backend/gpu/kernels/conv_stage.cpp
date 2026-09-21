@@ -11,7 +11,9 @@ void stage_conv(stage_env & env) {
     const hparams & hp = env.e.m.hp;
     const layer_t & L0 = env.e.m.layers[0];
     const int T = env.T;
-    const int cd = 3 * hp.d_inner;
+    const int cd = hp.qkv_dim();
+    const int qk = hp.n_group * hp.d_state;
+    const int vd = hp.dt_rank * hp.d_state;
 
     auto raw = env.get("raw_wqkv-0");
     env.set_info(T, 0, 1);
@@ -23,11 +25,9 @@ void stage_conv(stage_env & env) {
         auto qq = env.get("q_conv_predelta-0"), kk = env.get("k_conv_predelta-0"), vv = env.get("v_conv_predelta-0");
         std::vector<float> expect((size_t)T * cd);
         for (int t = 0; t < T; t++) {
-            std::memcpy(&expect[(size_t)t * cd], &qq[(size_t)t * hp.n_group * hp.d_state], hp.n_group * hp.d_state * 4);
-            std::memcpy(&expect[(size_t)t * cd + hp.n_group * hp.d_state], &kk[(size_t)t * hp.n_group * hp.d_state],
-                        hp.n_group * hp.d_state * 4);
-            std::memcpy(&expect[(size_t)t * cd + 2 * hp.n_group * hp.d_state], &vv[(size_t)t * hp.n_group * hp.d_state],
-                        hp.n_group * hp.d_state * 4);
+            std::memcpy(&expect[(size_t)t * cd], &qq[(size_t)t * qk], qk * 4);
+            std::memcpy(&expect[(size_t)t * cd + qk], &kk[(size_t)t * qk], qk * 4);
+            std::memcpy(&expect[(size_t)t * cd + 2 * qk], &vv[(size_t)t * vd], vd * 4);
         }
         std::vector<float> hb(raw.size());
         env.e.q.memcpy(hb.data(), env.e.d_conv_out, hb.size() * 4).wait();

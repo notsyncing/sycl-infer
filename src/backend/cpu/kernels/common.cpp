@@ -569,9 +569,13 @@ void cpu_par(int n, const std::function<void(int)> & fn) {
 // ------------------------------------------------------------- weight dequant
 int sb_bytes(uint32_t type) {
     switch (type) {
+    case 11: return 110;
     case 12: return 144;
     case 13: return 176;
     case 14: return 210;
+    case 20: return 8 * 18; // 8 IQ4_NL blocks per 256-value superblock
+    case 21: return 110;
+    case 23: return 136;
     case 8: return 8 * 34; // 8 Q8_0 blocks per 256-value superblock
     case 0: return 1024;
     default: return 0;
@@ -599,6 +603,20 @@ int dequant_sb(uint32_t type, const char * p, float * dst) {
             dequantize_block_q8_0((const block_q8_0 *)(p + b * 34), dst + b * 32);
         }
         return 256;
+    case 11:
+        dequantize_block_q3_K((const block_q3_K *)p, dst);
+        return 256;
+    case 20:
+        for (int b = 0; b < 8; b++) {
+            dequantize_block_iq4_nl((const block_iq4_nl *)(p + b * 18), dst + b * 32);
+        }
+        return 256;
+    case 21:
+        dequantize_block_iq3_s((const block_iq3_s *)p, dst);
+        return 256;
+    case 23:
+        dequantize_block_iq4_xs((const block_iq4_xs *)p, dst);
+        return 256;
     case 0:
         std::memcpy(dst, p, 256 * 4);
         return 256;
@@ -620,7 +638,9 @@ void gemv_row(uint32_t type, const char * wrow, const float * x, const float * u
     float tmp[256];
     float xa[256];
     const bool need_act = (up != nullptr);
-    const bool fused = (isa().qgemv_sb != nullptr);
+    // the fused single-pass dot only knows the K-quant/native types; the
+    // IQ/Q3_K formats fall back to dequantize + fp32 dot
+    const bool fused = (isa().qgemv_sb != nullptr) && (type == 12 || type == 13 || type == 14 || type == 8);
     for (int off = 0; off < K; off += step) {
         const char * wp = wrow + (size_t)(off / step) * bytes;
         const float * xr;

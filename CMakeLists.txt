@@ -31,18 +31,40 @@ set(CMAKE_CXX_COMPILER ${ICXX})
 add_compile_options(-fsycl)
 add_link_options(-fsycl)
 
-option(SYCL_INFER_AOT "AOT compile for Intel Iris Xe (adl-p)" OFF)
+option(SYCL_INFER_AOT "AOT compile for the target GPU (avoids runtime JIT)" OFF)
+set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (e.g. adl-p, acm-g10)")
 if(SYCL_INFER_AOT)
-    add_compile_options(-fsycl-targets=spir64_gen -Xs "-device adl-p")
-    add_link_options(-fsycl-targets=spir64_gen -Xs "-device adl-p")
+    add_compile_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
+    add_link_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
+    # AOT lowering (llvm-foreach -> ocloc/IGC) runs once per device image at the
+    # final link and costs minutes of IGC work per image.  The default code split
+    # (`auto`) merges a whole module into one image, which serialises that work;
+    # `per_kernel` emits one image per kernel so they can be lowered in parallel
+    # (and skipped individually if the ocloc cache is usable).
+    add_link_options(-fsycl-device-code-split=per_kernel)
+    # The post-link device step defaults to a single ocloc process even on a
+    # many-core host; this is what makes an AOT build look serial.  Each job is a
+    # separate IGC translation, so RAM use scales with the count.
+    set(SYCL_INFER_AOT_JOBS "" CACHE STRING
+        "Parallel ocloc/IGC jobs for the SYCL_INFER_AOT device-link step (default: nproc)")
+    if(NOT SYCL_INFER_AOT_JOBS)
+        include(ProcessorCount)
+        ProcessorCount(SYCL_INFER_AOT_JOBS)
+    endif()
+    if(SYCL_INFER_AOT_JOBS LESS 1)
+        set(SYCL_INFER_AOT_JOBS 1)
+    endif()
+    add_link_options(-fsycl-max-parallel-link-jobs=${SYCL_INFER_AOT_JOBS})
+    # NOTE: `-g` (a Debug build) makes each device image several times larger and
+    # slower to lower; configure with `-DCMAKE_BUILD_TYPE=Release` for AOT.
 endif()
-
 # ---------------------------------------------------------------- core library
 add_library(sycl_infer_core STATIC
     third_party/unicode.cpp
     third_party/unicode-data.cpp
     # common: quantization formats and shared low-level helpers
     src/common/w8.cpp
+    src/common/w4.cpp
     # common: host ISA detection (compiled without -fsycl, see below)
     src/common/cpu_isa.cpp
     # backend: the shared interface plus the GPU and CPU implementations
@@ -69,6 +91,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/embed.cpp
     src/backend/gpu/kernels/copy_row.cpp
     src/backend/gpu/kernels/gemv.cpp
+    src/backend/gpu/kernels/w4_gemv.cpp
     src/backend/gpu/kernels/qk_norm_rope.cpp
     src/backend/gpu/kernels/attn.cpp
     src/backend/gpu/kernels/conv.cpp
@@ -139,7 +162,9 @@ set(SI_CPU_SOURCES
     src/backend/cpu/kernels/dp4a.cpp
     src/backend/cpu/kernels/i8.cpp
 )
-set_source_files_properties(${SI_CPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+if(NOT SYCL_INFER_AOT)
+    set_source_files_properties(${SI_CPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+endif()
 
 # The vendored llama.cpp Unicode tables keep one intentionally-unused helper;
 # silence the warning here instead of editing third_party (clangd reads this
@@ -188,6 +213,7 @@ si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_response_parser tests/server/test_response_parser.cpp)
 si_add_test(test_sampler tests/engine/test_sampler.cpp)
+si_add_test(test_27b_prefill tests/engine/test_27b_prefill.cpp)
 si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)
 si_add_test(test_pc_disk     tests/backend/cpu/test_pc_disk.cpp)
@@ -195,11 +221,21 @@ si_add_test(test_pc_ram      tests/backend/cpu/test_pc_ram.cpp)
 si_add_test(test_cpuref      tests/backend/cpu/test_cpuref.cpp)
 si_add_test(test_pc_cpu      tests/backend/cpu/test_pc_cpu.cpp)
 si_add_test(test_cpu_gemv    tests/backend/cpu/kernels/test_cpu_gemv.cpp)
+si_add_test(test_cpu_gdn     tests/backend/cpu/kernels/test_cpu_gdn.cpp)
 si_add_test(test_forward     tests/backend/gpu/test_forward.cpp)
 si_add_test(test_gpu_vs_ref  tests/backend/gpu/test_gpu_vs_ref.cpp)
 si_add_test(test_pc_gpu      tests/backend/gpu/test_pc_gpu.cpp)
 si_add_test(test_pc_ram_gpu  tests/backend/gpu/test_pc_ram_gpu.cpp)
 si_add_test(test_gemv        tests/backend/gpu/kernels/test_gemv.cpp)
+si_add_test(test_iq_dequant  tests/backend/gpu/kernels/test_iq_dequant.cpp)
+si_add_test(test_gemv_stride tests/backend/gpu/kernels/test_gemv_stride.cpp)
+si_add_test(test_quant_audit tests/backend/gpu/kernels/test_quant_audit.cpp)
+si_add_test(test_w4          tests/model/test_w4.cpp)
+si_add_test(test_w4_gemm     tests/backend/gpu/kernels/test_w4_gemm.cpp)
+si_add_test(test_w4_vs_i8    tests/backend/gpu/kernels/test_w4_vs_i8.cpp)
+si_add_test(test_w4_vs_cpuref tests/engine/test_w4_vs_cpuref.cpp)
+si_add_test(test_w4_topk     tests/engine/test_w4_topk.cpp)
+si_add_test(test_decode_vs_prefill tests/engine/test_decode_vs_prefill.cpp)
 si_add_test(test_dp4a        tests/backend/gpu/kernels/test_dp4a_gemm.cpp)
 
 si_add_test(test_gpu_stages

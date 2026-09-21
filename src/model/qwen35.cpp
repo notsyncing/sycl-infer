@@ -2,6 +2,7 @@
 // layers.  Every `full_attention_interval`-th layer is a grouped-query
 // attention layer, the rest run the gated delta-net recurrence.
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -16,7 +17,9 @@ void load_qwen35(model & m) {
     auto key = [&](const char * k) { return arch + "." + k; };
 
     auto & hp = m.hp;
-    hp.n_layer = (int)f.get_u32(key("block_count"));
+    uint32_t block_count = f.get_u32(key("block_count"));
+    uint32_t n_layer_nextn = f.get_u32(key("nextn_predict_layers"), 0);
+    hp.n_layer = (int)(block_count - n_layer_nextn);
     hp.n_embd = (int)f.get_u32(key("embedding_length"));
     hp.n_ff = (int)f.get_u32(key("feed_forward_length"));
     hp.n_head = (int)f.get_u32(key("attention.head_count"));
@@ -42,6 +45,13 @@ void load_qwen35(model & m) {
     hp.n_vocab = toks ? (int)toks->arr.size() : 0;
 
     m.tok_embd = bind_tensor(f, "token_embd.weight");
+    // Qwen3.8 ships an untied LM head (`output.weight`); fall back to the
+    // embedding matrix when it is absent (tied embeddings)
+    if (f.find("output.weight")) {
+        m.output = bind_tensor(f, "output.weight");
+    } else {
+        m.output = m.tok_embd;
+    }
     m.output_norm = bind_f32(f, "output_norm.weight");
     m.tok_embd_row_bytes = ggml_row_bytes(m.tok_embd.type, hp.n_embd);
 

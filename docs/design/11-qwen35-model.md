@@ -46,6 +46,23 @@ GDN。参考模型 Qwen3.5-0.8B 用这一配置。
 
 `attn_scale = 1/sqrt(head_dim)`；`rope_sections` 全零表示普通 RoPE，非零时启用文本模型的交错 M-RoPE。
 
+**派生宽度**（`hparams` 的成员函数，不要在别处手写）：
+
+| 派生量 | 定义 | 0.8B | 27B |
+|---|---|---|---|
+| `qkv_dim()` | `2*n_group*d_state + dt_rank*d_state` | 6144 | **10240** |
+| `d_inner` | `dt_rank*d_state`（= ssm_out 的 K） | 2048 | 6144 |
+| Q 宽度 | `n_head*2*head_dim`（第二半是 gate） | 4096 | 12288 |
+| K/V 宽度 | `n_head_kv*head_dim` | 512 | 1024 |
+| RoPE 覆盖 | `n_rot` 对（`n_rot <= head_dim`，**部分旋转**） | 64 / 256 | 64 / 256 |
+
+⚠️ **`n_group == dt_rank` 只在 0.8B 成立**（16 == 16）。27B 是 **16 vs 48**，于是出现两个"只在 0.8B
+上恒等、在 27B 上崩坏"的陷阱，见 §4.1 与 [03-kernels.md §9](03-kernels.md)：
+
+1. `qkv_dim()` **不等于** `3*d_inner`（27B：10240 vs 18432）——历史上曾用 `3*d_inner` 当 qkv/conv 宽度。
+2. q/k 的 head 数（`n_group`）**不等于** v 的 head 数（`dt_rank`）——value head `h` 只能配对到
+   **`h % n_group`**（取模），不是分块。
+
 ---
 
 ## 3. 加载器张量绑定（`qwen35.cpp`）
@@ -91,15 +108,24 @@ GDN。参考模型 Qwen3.5-0.8B 用这一配置。
 
 ```
 gemv: wqkv -> d_qkv, wgate -> d_z, ssm_beta -> d_beta, ssm_alpha -> d_alpha
-conv_l2(d_qkv, conv_state, ssm_conv1d -> d_conv_out)        # depthwise 4-tap + q/k L2 norm
+conv_l2(d_qkv, conv_state, ssm_conv1d -> d_conv_out)        # depthwise 4-tap + silu + q/k L2 norm
 conv_state_update(写回滑窗 + 可选检查点)
 gdn(d_conv_out, alpha, dt_bias, ssm_a, beta, state -> d_attn_pre)
 gated_norm(d_attn_pre, d_z, ssm_norm -> d_attn_merged)
 gemv: ssm_out -> d_x (+ residual d_x)
 ```
 
-* q/k/v 打包进 `d_conv_out`：q 在偏移 0，k 在 `n_heads*head_dim`，v 在 `2*n_heads*head_dim`。
-* `gdn_launch` 调用参数：`head_dim = d_state`、`n_heads = dt_rank`、`scale = 1/sqrt(d_state)`。
+* `d_qkv` / `d_conv_out` 的宽度是 `hp.qkv_dim()`（**不是 `3*d_inner`**，见 §2）。
+* q/k/v 打包（**q/k 段用 `n_group` 个 head，v 段用 `dt_rank` 个 head**）：
+  q 在偏移 0（`n_group*d_state`）、k 在 `n_group*d_state`、v 在 `2*n_group*d_state`；
+  `conv_l2` 只对前 `2*n_group` 组（q 和 k，组宽 `d_state`）做 L2 归一化，v 段不做。
+* **value head `h` 的 q/k 来自 head `h % n_group`（取模/交错）**。参考实现用 `ggml_repeat_4d` 展开 q/k
+  的 head 轴，其平铺是取模；写成分块 `h*n_group/dt_rank` 会在 `n_group != dt_rank` 时彻底配错
+  （0.8B 上两种写法等价，所以这个 bug 曾长期不可见——见 [12-build-and-testing.md](12-build-and-testing.md) §7 的教训）。
+* `gdn_launch` 调用参数：`head_dim = d_state`、`n_k_heads = n_group`、`n_heads = dt_rank`、
+  `scale = 1/sqrt(d_state)`；`gated_norm` 用 `n_heads = dt_rank`、`head_dim = d_state`（`ssm_norm`
+  只有 `d_state` 个元素，按 value head 复用）。
+* `wqkv` 的 N 是 `qkv_dim()`，`wgate`/`ssm_out` 的 N/K 是 `d_inner`。
 * `gdn` 的 delta 规则（见 [03-kernels.md](03-kernels.md)）：
   `g = exp(A*softplus(alpha+dt_bias))`、`del = (v - g*(S·k))*sigmoid(beta)`、
   `S = g*S + k⊗del`、`out = (S·q)*scale`。
@@ -134,7 +160,7 @@ gemv: ffn_down (SiLU 门控)
 ## 5. 递归状态缓冲
 
 * `d_gdn_state`：每 GDN 层一个 `[dt_rank][d_state][d_state]` 矩阵，每序列一份 slot。
-* `d_conv_state`：每 GDN 层 `(conv_k-1) * 3*d_inner` 的滑窗。
+* `d_conv_state`：每 GDN 层 `(conv_k-1) * qkv_dim()` 的滑窗（**不是 `3*d_inner`**）。
 * 分配按 layer-major（`engine.cpp:432-433`），索引 `[n_gdn][kMaxB][...]`。
 * 前缀缓存检查点按层切分为 `[GDN gdn_per][conv conv_per]`，见
   [06-prefix-cache.md](06-prefix-cache.md)。
@@ -155,8 +181,14 @@ gemv: ffn_down (SiLU 门控)
 ## 7. 权重与量化
 
 * 线性层通常是 Q4_K/Q5_K/Q6_K，norm/SSM 标量为 F32。
-* `PF_DP4A` 时 `build_w8` 为 token embedding、FFN 三线性、GDN 的 `wqkv/wgate/ssm_out`、attention 的
-  `wq/wk/wv/wo` 构建 SIn int8 副本；`ssm_beta`/`ssm_alpha`/norm 不复制。
+* `PF_DP4A` 时 `build_w8` 为 **`output`（LM head）**、token embedding、FFN 三线性、GDN 的
+  `wqkv/wgate/ssm_out`、attention 的 `wq/wk/wv/wo` 构建 SIn int8 副本；`ssm_beta`/`ssm_alpha`/norm
+  不复制。`output` 的 SIn 副本只有 8-bit 类型可精确表示，5/6-bit（Q5_K/Q6_K）与 codebook 型
+  （IQ*）的精度损失见 [02-quantization.md](02-quantization.md)。
+* **`m.output` 与 `m.tok_embd` 未必是同一张量**：GGUF 没有 `output.weight` 时加载器把 `m.output`
+  指向 `tok_embd`（0.8B），27B 则自带独立的 Q6_K `output.weight`。任何算 logits 的地方都必须用
+  `m.output`——用 `m.tok_embd` 在 0.8B 上看不出差别，但 27B 的 logits 会全错（这正是
+  `tests/common/cpu_ref.h` 曾经的问题，见 [12-build-and-testing.md](12-build-and-testing.md) §7）。
 * 见 [02-quantization.md](02-quantization.md)。
 
 ---
@@ -168,5 +200,36 @@ gemv: ffn_down (SiLU 门控)
 * `test_gpu_vs_ref`：整模型 GPU logits vs `tests/common/cpu_ref.h`。
 * `test_forward`：端到端 logits/top-k。
 * `test_cpuref`：CPU 参考头输出。
+* `test_cpu_gdn`：**CPU 的 `cpu_gdn` 用非对称 head 数**（`n_k_heads=2, n_heads=6`）对照测试内标量参考，
+  覆盖 `head % n_k_heads` 配对与状态写回。0.8B 的真实维度是恒等映射，测不出这个 bug，所以必须显式造
+  非对称维度（该测试已做反向验证：改回分块映射会 `MISMATCH`）。
+* `test_w4*` / `test_quant_audit`：u4/SIn 打包与权重路径的正确性、量化误差。
+* `test_27b_prefill` / `test_w4_vs_cpuref`（配 `TEST_LAYER_MAP`）：27B 分卡 prefill 的 logits vs
+  fp32 CPU 参考——**27B 专属的线数/宽度问题只在这里暴露**。
+* `test_decode_vs_prefill`：单 token decode 与"同序列重新 prefill"必须给出同一预测。**纯 prefill 的
+  测试对解码路径是盲区**，这个测试是发现 head 段缓冲绑定 bug 的唯一手段（见
+  [12-build-and-testing.md](12-build-and-testing.md) §7）。
 
 详见 [12-build-and-testing.md](12-build-and-testing.md)。
+
+---
+
+## 9. Qwen3.8-27B：非退化情形
+
+27B 与 0.8B 的结构参数几乎相同（`head_dim=256`、`n_rot=64`、`rope_sections=[11,11,10,0]`、
+`conv_k=4`、`d_state=128`、`n_group=16`），差别在**规模与两处非退化**：
+
+| 参数 | 0.8B | 27B | 影响 |
+|---|---|---|---|
+| `n_layer` | 24（23 主 + 1 MTP） | 65（64 主 + 1 MTP，blk.64 忽略） | full attention 层 = `(il+1)%4==0` → 3,7,…,63 共 16 层有 KV |
+| `n_head` / `n_head_kv` | 8 / 2 | 24 / 4 | GQA 比例 4 vs 6 |
+| `dt_rank` | 16 | 48 | **`n_group != dt_rank`**，见 §4.1 |
+| `d_inner` | 2048 | 6144 | — |
+| `qkv_dim()` | 6144 | 10240 | `qkv_dim() != 3*d_inner` |
+| LM head | 与 `tok_embd` 共享 | 独立 `output.weight`（Q6_K） | 见 §7 |
+
+模型几何可从 GGUF 直接核对（`python3 gguf_tensors.py` 风格的张量形状 dump，见
+[12-build-and-testing.md](12-build-and-testing.md) §7）：`blk.0.attn_qkv.weight = [5120, 10240]`
+（= `2*16*128 + 48*128`）、`blk.0.ssm_out.weight = [6144, 5120]`、
+`blk.3.attn_q.weight = [5120, 12288]`（= `24*2*256`）、`blk.0.ssm_norm.weight = [128]`。
+核对张量形状是发现"宽度假设写错"最快的方式。

@@ -20,6 +20,10 @@ enum ggml_type : uint32_t {
     GGML_TYPE_Q5_K = 13,
     GGML_TYPE_Q6_K = 14,
     GGML_TYPE_Q8_K = 15,
+    GGML_TYPE_IQ3_XXS = 18,
+    GGML_TYPE_IQ4_NL = 20,
+    GGML_TYPE_IQ3_S = 21,
+    GGML_TYPE_IQ4_XS = 23,
     GGML_TYPE_BF16 = 30,
     GGML_TYPE_COUNT,
 };

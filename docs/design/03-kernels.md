@@ -238,7 +238,9 @@ n_head == 4*n_head_kv` 时选中。否则走经典 kernel，按 KV dtype 特化�
 * partial 指针 `partials + ((r*tpb + t)*n_head + h)*n_splits*pstride + s*pstride`；inactive 行写
   `m=-inf, l=0`。
 * **因果**：`n_kv = pos+1`；键范围切成 `n_splits` 段，`t0 = s*chunk`，`t1 = min(t0+chunk, n_kv)`。
-* **GQA**：`kvh = (h*n_head_kv)/n_head`。
+* **GQA**：`kvh = (h*n_head_kv)/n_head`（**分块**：连续 `n_head/n_head_kv` 个 query head 共享同一个 KV 头，
+  对应 HF 的 `repeat_kv`/`repeat_interleave`）。注意 GDN 的 q/k↔value 配对是**取模**（见 §9）：同一个
+  模型里两种约定并存，不要想当然地统一，它们只在 head 数相等时才一致。
 * **向量化路径 `avec`**（默认，`PF_ATTN_VEC=0` 关闭）：每 lane 两个 4 维块 `d0=lane*4`、
   `d1=d0+HD/2`，Q/K/V 合并访问。非量化 `dot = dot4(qa,ka)+dot4(qb,kb4)`；int8/int4 时两块落在量化 block
   `lane/8` 与 `4+lane/8`，各自乘 scale（i4 用 `i4_ld4` 解包 nibble）。在线 softmax：
@@ -288,10 +290,22 @@ Gated DeltaNet 递归。两个数学等价的实现：`gdn_kernel<C,WPW>`（标�
 （float4）。
 
 * `C` = 一个 warp 拥有的状态列（行）数；`col_groups = head_dim/C`；`total_warps = n_heads*col_groups`。
-* q/k/v 在 `conv_out` 中打包：`k_off = n_heads*head_dim`、`v_off = 2*n_heads*head_dim`。调用时
-  `head_dim = d_state`、`n_heads = dt_rank`、`scale = 1/sqrt(d_state)`。
+* q/k/v 在 `conv_out` 中打包（**q/k 用 key head 数，v 用 value head 数，两者一般不相等**）：
+  `k_off = n_k_heads*head_dim`、`v_off = 2*n_k_heads*head_dim`。调用时 `head_dim = d_state`、
+  `n_k_heads = n_group`、`n_heads = dt_rank`、`scale = 1/sqrt(d_state)`。
+  `n_heads` 必须是 `n_k_heads` 的整数倍。
+* **value head `h` 配对到 q/k 头 `h % n_k_heads`（取模/交错）**：
+  `const int qk_head = head % n_k_heads;`。参考实现用 `ggml_repeat_4d` 展开 q/k 的 head 轴，其平铺语义
+  是取模（`dst[i1*ne01 + k1] = src[k1]`），不是分块（`head*n_k_heads/n_heads`）。
+  **两者的陷阱**：`n_group == dt_rank` 时（参考模型 Qwen3.5-0.8B，16 == 16）取模与分块**都是恒等映射**，
+  错误实现完全不可见；Qwen3.8-27B 是 16 vs 48，分块会把 48 个 value 头与 q/k 配错，输出退化为重复
+  （实测：模型只吐 1–2 个 token）。GPU 的 `gdn_kernel` 与 `gdn_f4_kernel`、CPU 的 `cpu_gdn`、
+  以及 `tests/common/cpu_ref.h` 三处必须同步。
+  注意这与 attention 的 GQA 展开**不同**：`attn.cpp` 用分块 `kvh = h*n_head_kv/n_head`（对应 HF 的
+  `repeat_kv`/`repeat_interleave`）。两者不可互换。
 * 状态布局 `state + slot*n_heads*head_dim*head_dim + (head*head_dim + col0)*head_dim`，即
-  `[slot][head][row][col]`，每 head 一个 `head_dim×head_dim` 矩阵。warp 拥有 `C` 个连续行。
+  `[slot][value head][row][col]`，每 value head 一个 `head_dim×head_dim` 矩阵。warp 拥有 `C` 个连续行。
+  `alpha`/`beta`/`ssm_a`/`ssm_dt` 都是**每 value head 一个标量**（共 `n_heads` 个）。
 * 每 token 每 head：
 
 ```

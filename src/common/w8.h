@@ -86,6 +86,12 @@ size_t w8_meta_bytes(uint32_t type, int K, int N, bool scale_only = false);
 // the layout type the kernels must use (12 = 4-bit G=32 when PF_SI4 is set)
 uint32_t w8_effective_type(uint32_t type);
 
+// IQ/Q3_K types have no native SIn packing: they are dequantized to fp32 and
+// re-quantized to 4-bit asymmetric groups of 32 (effective type 12).
+static inline constexpr bool w8_requant_type(uint32_t type) {
+    return type == 11 || type == 20 || type == 21 || type == 23;
+}
+
 // values per group (the meta granularity) and bytes of packed values per group
 static inline constexpr int w8_group_size(uint32_t type) {
     return type == 14 ? 16 : 32;
@@ -95,7 +101,7 @@ static inline constexpr int w8_group_bytes(uint32_t type) {
     if (type == 13) {
         return 24;
     }
-    const int k = type == 12 ? 4 : 6;
+    const int k = (type == 12 || w8_requant_type(type)) ? 4 : 6;
     return w8_group_size(type) * k / 8;
 }
 static inline constexpr int w8_meta_per_row(uint32_t type, int K) {
