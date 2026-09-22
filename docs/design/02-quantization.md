@@ -450,6 +450,9 @@ w  = d·sc_j · q5 − dmin·m_j          （每 32 个一组，6-bit (sc,m) 由
 * **decode**：`k5_gemv_launch`（`w4_gemv.cpp`），0.75 B/w 直接读，无展开。
 * **prefill**：oneDNN 只认 `u4`/`s8`，所以 `k5_expand_launch` 把两个平面重排成元素序 int8
   写进与 cb4 共享的 scratch（~89 MB），再跑**已有的分组 scale int8 primitive**；
+  （**L2 分块已实测为负收益**：把 GEMM 按 N 切块让展开 tile 留在 L2，在 M=512 与 M=41
+  两种区间都比整张慢 22-326 %——M=512 的 GEMM 是算力受限、tile 在不在 L2 无关，而每次
+  `execute` 有 ~67 µs 的 GPU 固定开销、展开本身也更慢；见报告 §21。）
   `off` 项用 u4 的修正 epilogue（`w4_epilogue_launch`）加回。代价是每 pass
   多 0.625（读）+ 1.0（写）B/w 的**串行**流量（M=512 时 GEMM 自身的权重读被算力掩盖，
   展开流量则不能），实测 pp512 −15..−20 %；`PF_K5_NOCORR=1` 可去掉修正项做二分定位
