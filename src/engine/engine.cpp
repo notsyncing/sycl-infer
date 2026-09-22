@@ -15,7 +15,14 @@ namespace si {
 // 0/1 = gpu/cpu.  Kept independent of the queue so a CPU build on a machine
 // without a SYCL CPU device still reports cpu while using a GPU context purely
 // for host-USM allocation.
-static int resolve_device(int device) {
+static int resolve_device(int device, const std::string & layer_map) {
+    // an all-cpu --layer-map is just the CPU backend: without this the primary
+    // queue would be a GPU queue while every layer (and the head/embed) runs on
+    // the CPU backend, which corrupts the decode path (the prefill happened to
+    // survive, the single-token decode did not)
+    if (!layer_map.empty() && layer_map.find("gpu") == std::string::npos) {
+        return 1;
+    }
     if (device >= 0) {
         return device ? 1 : 0;
     }
@@ -83,7 +90,7 @@ static std::shared_ptr<sycl::context> make_md_context(const std::string & layer_
 engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb,
                const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb,
                int device, const std::string & layer_map)
-    : device_req(resolve_device(device)), md_ctx_(make_md_context(layer_map)), q(make_queue(device_req, md_ctx_.get())),
+    : device_req(resolve_device(device, layer_map)), md_ctx_(make_md_context(layer_map)), q(make_queue(device_req, md_ctx_.get())),
       max_seq(max_seq_), n_splits(n_splits_), n_blocks(n_blocks_) {
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;

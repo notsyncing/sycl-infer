@@ -594,6 +594,14 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   for the GDN qkv/conv width and `m.output` for the LM head.
 * **oneDNN cannot be recorded** into a SYCL graph; the `PF_GEMM_DNNL` path
   replays mode-2 prefill directly (`prefill_batch`).
+* **A partial mode-2 batch requires the oneDNN weight path.**
+  `batched_prefill_fit` only allows a last row with `n_real_row < kMaxT` when
+  `use_dnnl` or a multi-device GPU partition has oneDNN (`dnnl_any_dev()`); the
+  md_int8 fallback's dp4a GEMM is only correct for a full `kMaxT` row, so it
+  uses the recorded multiples-of-kMaxT variants plus the chunked tail.  Letting
+  md_int8 take a partial batch silently corrupts the hidden state (a 2-GPU
+  md_int8 decode-vs-prefill mismatch).  Likewise an **all-`cpu` `--layer-map`**
+  must select the CPU queue (`resolve_device`), not the default GPU one.
 * Do not include `sycl/ext/oneapi/dot_product.hpp` from several TUs (its
   functions are not `inline` in this toolchain) — use `src/common/dp4a.h`.
 * `kMaxT` = max prefill chunk (32), `kMaxB` = max batched sequences (16),

@@ -348,10 +348,16 @@ struct engine {
         if (cpu_mode) {
             return 0; // CPU uses the chunked prefill path
         }
-        // single-GPU oneDNN and multi-device (per-device oneDNN on the GPU
-        // partitions + i8 on CPU) both replay mode 2 directly, where every
-        // multiple of kMaxT up to kMaxB*kMaxT is a valid batch size
-        if (use_dnnl || (multi_dev && (dnnl_any_dev() || md_int8))) {
+        // single-GPU oneDNN and multi-device with a oneDNN GPU partition both
+        // replay mode 2 directly, where every batch size up to kMaxB*kMaxT is
+        // valid (the last row may be partial, see step_info::n_real_row).
+        // The md_int8 fallback must NOT take partial batches: its dp4a GEMM
+        // (and the per-device w8/x8 layout) is only correct for a full
+        // kMaxT-token row, so a partial mode-2 batch silently corrupts the
+        // hidden state (visible as a decode-vs-prefill mismatch on 2-GPU
+        // md_int8).  Fall through to the recorded multiples-of-kMaxT variants
+        // and the chunked path for the tail, exactly like the fp32 path.
+        if (use_dnnl || (multi_dev && dnnl_any_dev())) {
             // direct replay: any batch size up to kMaxB*kMaxT is valid (the
             // last row may be partial, see step_info::n_real_row)
             if (getenv("PF_NO_PFB_PARTIAL")) { // A/B: old multiple-of-kMaxT only
