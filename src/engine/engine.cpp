@@ -659,13 +659,20 @@ void engine::bind_acts(int dev) {
     d_conv_state = a.conv_state;
 }
 
-void engine::handoff_x(int from, int to) {
+void engine::handoff_x(int from, int to, size_t rows) {
     if (from == to) {
         return;
     }
-    const size_t bytes = (size_t)kMaxB * kMaxT * m.hp.n_embd * sizeof(float);
+    const size_t cap = (size_t)kMaxB * kMaxT;
+    if (rows > cap) {
+        rows = cap;
+    }
+    if (rows == 0) {
+        return;
+    }
+    const size_t bytes = rows * m.hp.n_embd * sizeof(float);
     if (!h_handoff) {
-        h_handoff = sycl::malloc_host(bytes, q);
+        h_handoff = sycl::malloc_host(cap * m.hp.n_embd * sizeof(float), q);
         if (!h_handoff) {
             throw std::runtime_error("handoff staging allocation failed");
         }
@@ -767,7 +774,8 @@ void engine::upload_device_weights(int dev) {
             continue;
         }
         if (dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
-            && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data))) {
+            && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data)
+                || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
             // the oneDNN int8 (XMX) copy - or the u4 (4-bit) copy - replaces the
             // raw device copy.  This must cover the 4-bit path too: otherwise the
             // raw fp32 weight gets uploaded, wkey() starts returning the device
@@ -775,7 +783,17 @@ void engine::upload_device_weights(int dev) {
             // drops the call to the fp32 gemv_group path.
             continue;
         }
-        void * g = sycl::malloc_device(t.nbytes(), qd);
+        // The embedding table is only ever read as a few rows per step (one row
+        // per token, 20 KB for this model), so it lives in *host* USM instead of
+        // device memory: host USM is device-accessible through the shared
+        // multi-device context, the PCIe traffic is ~3.5 us/token, and it frees
+        // ~0.7 GB of device memory per card for the KV cache.
+        void * g = nullptr;
+        if (dev == 0 && t.data == m.tok_embd.data) {
+            g = sycl::malloc_host(t.nbytes(), qd);
+        } else {
+            g = sycl::malloc_device(t.nbytes(), qd);
+        }
         if (!g) {
             throw std::runtime_error("multi-device weight upload failed (out of device memory)");
         }
@@ -783,6 +801,7 @@ void engine::upload_device_weights(int dev) {
         mp[t.data] = g;
         bytes += t.nbytes();
         n++;
+
     }
     fprintf(stderr, "[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
             (double)bytes / (1024.0 * 1024.0));
@@ -834,7 +853,12 @@ bool engine::setup_md_dnnl() {
             const char * e = getenv("PF_W4");
             return !e || atoi(e) != 0;
         }();
-        int n_w4 = 0, n_i8 = 0;
+        int n_w4 = 0, n_i8 = 0, n_cb = 0;
+        // PF_CB4=0 keeps IQ4_XS/IQ4_NL on the int8 conversion (A/B knob)
+        static const bool add_cb = [] {
+            const char * e = getenv("PF_CB4");
+            return !e || atoi(e) != 0;
+        }();
         auto add = [&](const wt & t) {
             if (!t.data) {
                 return;
@@ -844,11 +868,26 @@ bool engine::setup_md_dnnl() {
                 n_w4++;
                 return;
             }
+            if (add_cb && D->add_weight_cb4(t.data, t.data, t.type, t.K, t.N)) {
+                dev_ok = true;
+                n_cb++;
+                return;
+            }
             if (D->add_weight(t.data, t.data, t.type, t.K, t.N)) {
                 dev_ok = true;
                 n_i8++;
             }
         };
+        if (d == 0) {
+            // The LM head is a global pinned to backend 0.  Convert it here -
+            // *before* upload_device_weights - keyed by its host pointer, which
+            // makes the upload skip its raw 1.0 GB device copy exactly like the
+            // converted layer tensors.  gemv_at then needs its oneDNN branch for
+            // the head in *both* phases (build_plan keys the segment through
+            // wkey(), which returns this host key); see the single-token
+            // relaxation in record_forward.
+            add(m.output);
+        }
         for (int il = 0; il < m.hp.n_layer; il++) {
             if (layer_dev_[(size_t)il] != (int)d) {
                 continue;
@@ -871,7 +910,8 @@ bool engine::setup_md_dnnl() {
             }
         }
         if (dev_ok) {
-            fprintf(stderr, "[dev] device %zu weights: %d on the u4 path, %d on int8\n", d, n_w4, n_i8);
+            fprintf(stderr, "[dev] device %zu weights: %d u4, %d codebook, %d int8, %.1f MiB on device\n", d, n_w4,
+                    n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
             const char * envw = getenv("PF_DNNL_NOWARM");
             if (!(envw && atoi(envw) != 0)) {
                 D->warmup();
@@ -1429,8 +1469,14 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
     }
     if (multi_dev && (md_int8 || md_xmx) && n_rows == 1 && d_segs_dec8) {
         // single-token decode on the per-device weight copies: the GPU layers
-        // run dp4a_gemv (SIn) or the oneDNN int8 GEMM (XMX)
-        record_forward(0, plan_dec8_, d_segs_dec8, 1);
+        // run dp4a_gemv (SIn) or the oneDNN int8 GEMM (XMX).  With the
+        // per-partition command graphs each partition's ~350 kernels go out in
+        // one submission instead of one per kernel.
+        if (md_dec_ok) {
+            replay_md_dec_graphs();
+        } else {
+            record_forward(0, plan_dec8_, d_segs_dec8, 1);
+        }
         sync_all();
         return;
     }
@@ -1480,6 +1526,25 @@ std::vector<float> engine::run_head() {
     // d_last_hidden already holds the post-output_norm hidden state of the last
     // token (the prefill graph writes it via copy_row).
     const hparams & hp = m.hp;
+    // Prefer the primary device's int8 head.  The raw Q6_K device copy is *not*
+    // uploaded when the head was converted (upload_device_weights consults
+    // has_weight(host)), so wptr() would throw here; also, the fp32 gemv_group
+    // this used to run is the same slow path the decode head had.  Fall back to
+    // the fp32 group only when there is no oneDNN head at all.
+    bool head_done = false;
+    if (dnnl_gemm * D = dnnl_for(0)) {
+        // wkey: the host (oneDNN) key when the head was converted, the uploaded
+        // device pointer otherwise
+        const void * hk = wkey(0, m.output.data);
+        if (hk && D->quantize(d_last_hidden, nullptr, hp.n_embd, hp.n_embd, 1, hp.n_embd)) {
+            head_done = D->gemm_w4(hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab)
+                        || D->gemm(hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab);
+        }
+    }
+    if (head_done) {
+        q.memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
+        return std::vector<float>(h_logits, h_logits + hp.n_vocab);
+    }
     gemv_seg s{};
     s.w = wptr(0, m.output.data);
     s.type = m.output.type;

@@ -354,14 +354,54 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 | `PF_DP4A` / `PF_DP4A_DEC` | int8 计算路径开关 |
 | `PF_GEMM_DNNL` / `PF_DNNL_NOWARM` / `PF_DNNL_TIME` | oneDNN 路径 |
 | `PF_META` / `PF_SI4` / `PF_W4` | 权重旁路数组 / 4-bit 重化 / 原生 4-bit（u4）权重路径 |
+| `PF_CB4` / `PF_W4_ALL` / `PF_W4_RB` | IQ4_XS/IQ4_NL 码本 4-bit（默认开）/ 全类型重化到 u4（有损）/ 解码 GEMV 的 rows-per-workgroup（默认 16） |
 | `PF_ATTN_SPLIT` / `PF_ATTN_SPLIT_KEYS` / `PF_ATTN_FUSE` / `PF_DEC_SPLIT` / `PF_DEC_GROUP` / `PF_ATTN_VEC` | attention |
 | `PF_GDN_COLS` / `PF_GDN_WG` / `PF_GDN_VEC` / `PF_GDN_FUSE` / `PF_GDN_DBG` | GDN |
 | `PF_GEMV_*` / `PF_GEMM_*` / `PF_MT_*` / `GEMV_*` | GEMV/GEMM 调优 |
-| `PF_NOGRAPH` / `PF_PROF` / `PF_TIME` / `PF_DBG_*` / `PF_PROF` | 诊断/回退 |
+| `PF_NOGRAPH` / `PF_PROF` / `PF_PROF_ALL` / `PF_TIME` / `PF_DBG_*` / `PF_ROWACT` | 诊断/回退（`PF_PROF_ALL` dump 全部 call group；`PF_ROWACT` 恢复已死的按行激活量化器） |
+| `PF_MD_GRAPH_DEV` | 多设备 decode command graph 只给设备 N 录（`99` = 不录） |
 | `PF_KV_TYPE` / `PF_KV_F32` / `PF_KV_BF16` / `PF_KV_CAP_MB` / `PF_KV_GROW` | KV |
 | `PF_PREFIX_CACHE` / `PF_PC_*` | 前缀缓存 |
 
 ---
+
+## 9.1 多设备 decode 的 command graph
+
+多设备路径直接重放 `record_forward`，单 token decode 每步约 700 次 kernel 提交。`build_md_dec_graphs`
+按 layer 循环里**连续的设备段**各录一张图（0-31/32-63 映射下 3 张：`[dev0 层+embed]`、`[dev1 层]`、
+`[dev0 out_norm+head]`），回放时用现有的 host staging handoff 串起来。`PF_MD_GRAPH_DEV=N` 只给设备 N
+录（`99` = 都不录，用于 A/B），`PF_NOGRAPH` 关闭。
+
+**关键不变量**：`ci`（call 游标）索引 plan **全局**的 `call_tb`/`call_xq`/`call_group_*`，所以一个
+phase 必须从它首层的 call 下标开始——用 `seg_plan::layer_c0`（层 → 首个 call，末尾附 head 的 call）。
+从 0 重新计数会让后面的分区读到**第 0 层**的 call 元数据（激活指针、K）而执行自己的 segment：
+`dnnl_call` 变假、整组退回 fp32 `gemv_group`、层静默不写（一个重复 token，慢 6 倍）。
+
+实测收益只有 ~1-2 ms/token，说明**逐 kernel 提交开销不是层 GEMV 效率差距的主因**。
+
+## 9.2 LM head 与 oneDNN（`wkey` / `dnnl_call`）
+
+head 是固定在 backend 0 的全局张量，由 `setup_md_dnnl`（在上传之前、只走层张量）转不了，所以在
+上传后按**上传后的设备指针**加进该设备的 oneDNN 表，并给它的 plan call 补一个 `xq` 条目、
+在最终 `handoff_x` 把 `cur_dev` 重置为 0（`gemv_at` 读 `dnnl_for(cur_dev)`）。漏掉任一项，head 会
+静默退回 fp32 反量化 GEMV：12.3 vs 3.4 ms/token。
+
+`gemv_at` 的 oneDNN 分支现在也覆盖 **decode 之外的 single-token call**（prefill 的 head 原来走
+fp32 `gemv_group`，是同一个慢路径的 prefill 孪生）。`run_head()` 也改走 oneDNN int8，prefill
+head 因此与 decode head 数值一致（pp512 1420 → ~1520 t/s）。
+
+**head 的原始 GGUF 拷贝（dev0 上 1.0 GB）是冗余的**，但不能直接删：prefill head 走 fp32
+`gemv_group`，它把 segment 指针当设备指针解引用。干净修法是让 plan 的 head 也走 oneDNN
+（`dnnl_call` 放开 single-token）并用 `wkey()`（转换后=host key，未转换=设备指针）——试过一半、
+把 prefill logits 弄坏后回滚，见报告 §14。
+
+## 9.3 codebook prefill 的 scratch 与 embed 的 host USM
+
+* codebook（§10 of 02-quantization.md）在 prefill 时把索引展开成 int8 到 `dnnl_gemm` 的**复用
+  scratch**（按最大单张量 ~89 MB），再跑已有 int8 primitive。oneDNN 每次 execute 重读权重 memory
+  （已验证），所以不需要持久 int8 拷贝——显存反而省 2.46 GB/card。
+* `upload_device_weights` 把 `tok_embd` 用 `sycl::malloc_host` 放在 host USM（每 token 只读一行
+  20 KB，PCIe ~3.5 us），省 0.72 GB/card；共享 context 内设备可直接访问。
 
 ## 10. 已知细节与注意点
 

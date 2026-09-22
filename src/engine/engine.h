@@ -44,6 +44,11 @@ struct seg_plan {
     std::vector<group_t> groups;
     std::vector<int> call_group_begin;
     std::vector<int> call_group_count;
+    // first call index of each layer, plus a final entry for the LM head call.
+    // The call-group metadata arrays are plan-global and indexed by call order,
+    // so a partial (per-device) replay must start its call cursor at the phase's
+    // first layer instead of at 0.
+    std::vector<int> layer_c0;
     // DP4A path: activation quantization needed before each call
     struct xq_t {
         const float * x = nullptr;
@@ -165,6 +170,21 @@ struct engine {
     }
     void sync_all();
     const void * wptr(int dev, const void * host) const;
+    // Resolve a weight key the way build_plan's wkey does: the uploaded device
+    // pointer when the tensor was copied to that partition, otherwise the host
+    // pointer - which is the tensor's oneDNN key when it was converted (the
+    // upload skips the raw copy of every converted tensor).
+    const void * wkey(int dev, const void * host) const {
+        if (!host) {
+            return nullptr;
+        }
+        if (!multi_dev) {
+            return wptr(dev, host);
+        }
+        const auto & mp = weight_maps_[(size_t)dev];
+        auto it = mp.find(host);
+        return it != mp.end() ? it->second : host;
+    }
     const float * wf32(int dev, const float * host) const;
     int max_seq;                 // max tokens per sequence (limited by the block pool)
     int n_splits;                // prefill K-split ceiling (PF_ATTN_SPLIT overrides)
@@ -259,8 +279,11 @@ struct engine {
     // point the d_* members at backend `dev`'s buffers (no-op single-device)
     void bind_acts(int dev);
     // hand the hidden state from backend `from` to `to` (device-to-device via a
-    // host staging buffer, blocking on `from`)
-    void handoff_x(int from, int to);
+    // host staging buffer, blocking on `from`).  `rows` is the number of flat
+    // token rows the forward actually uses - the activation layout is
+    // [token][n_embd], so copy only those instead of the full kMaxB*kMaxT
+    // staging buffer (single-token decode needs 1 row, not 512).
+    void handoff_x(int from, int to, size_t rows);
     void * h_handoff = nullptr;
 
     gemv_seg * d_segs_dec = nullptr;
@@ -551,8 +574,35 @@ private:
         return (T *)alloc_bytes(n * sizeof(T));
     }
     seg_plan build_plan(int T, int tb, bool head_batched, bool use_w8 = false, bool with_head = true);
+
+    // ---- multi-device decode command graphs --------------------------------
+    // The multi-device path replays record_forward directly, so a single-token
+    // decode pays the per-kernel dispatch latency of ~700 submissions per step
+    // (measured ~9 ms of a 62 ms step).  The single-device path hides that
+    // behind a SYCL command graph; this does the same per partition: one graph
+    // per contiguous device run of the layer loop, plus the embedding on the
+    // first phase and the output norm + LM head on a final primary-device
+    // phase, replayed in order with the existing host-staged handoff between
+    // them.  Only the batch-1 decode plan is graphed; batched decode and
+    // prefill keep the direct replay.
+    struct md_phase {
+        int dev = 0;
+        int l0 = 0, l1 = 0; // layer range [l0, l1)
+        bool embed = false; // embedding first (primary device)
+        bool head = false;  // output norm + LM head after (primary device)
+    };
+    struct md_cmd_graph {
+        md_phase ph;
+        std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g;
+        std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e;
+    };
+    std::vector<md_cmd_graph> md_dec_;
+    bool md_dec_ok = false;
+    void build_md_dec_graphs();
+    void replay_md_dec_graphs();
+
     void record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows = nullptr,
-                        int at_nsp_hint = 0);
+                        int at_nsp_hint = 0, const md_phase * ph = nullptr);
 
     std::vector<float> run_head();
 

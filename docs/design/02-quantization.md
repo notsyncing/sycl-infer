@@ -321,15 +321,83 @@ zero-points（其布局未通过验证）。`w4_xs_launch` 算 `XS`，修正由 
 
 `w4_split_act_launch`（按偶/奇 k 拆分激活，供 4-bit 交错布局使用）+
 `w4_gemv_launch`（把 `(g,n)` 的 `step`/`off` 分阶段进 SLM、16 字节 nibble 载入、`dp4a` 累加）。
+`XS` 与偶/奇拆分不再由独立 kernel 产生：`act_quant_grp_launch` 在同一个 kernel 里一并写出
+`axg`/`asa`/`XS`/`axe`/`axo`（每 32 lane 一个 (行,组)，max 用子组归约），所以一次 call 只发一个
+激活 kernel 而不是三个。SLM 里的 scale 分块按 **g 外/行内** 索引（相邻 lane 读相邻 `n`），
+对 u4 的 `ffn_down` 形状实测 `174 -> 288 GB/s`。
 
 ### 9.5 与 int8 / SIn 的关系
 
-* **只有 Q4_K 走 u4**。Q5_K/Q6_K 是 5/6-bit、IQ* 是 codebook（非线性），都无法无损进 u4/oneDNN，
-  它们继续走 SIn/DP4A 或 fp32——27B 是混合量化，所以每个张量各自选路径（启动日志会打印
-  `device N weights: X on the u4 path, Y on int8`）。
+* **Q4_K 走 u4，IQ4_XS/IQ4_NL 走 codebook u4（见 §10）**。Q5_K/Q6_K 是 5/6-bit、IQ3_S 是
+  codebook 但位宽不同，都无法无损进 u4/oneDNN，它们继续走 SIn/DP4A 或 fp32——27B 是混合量化，
+  所以每个张量各自选路径（启动日志会打印 `device N weights: X u4, Y codebook, Z int8`）。
 * **激活量化也按 32 值一组**（`act_quant_grp_launch`）：只有整行一个 scale 时，激活的 ~0.9% 误差会
   盖过 4-bit 权重的精度优势。int8 的 oneDNN matmul 只接受每行一个 SRC scale，所以每行版本仍然保留
   （一次 call 可能混有 u4 与 int8 段）。
 * `PF_W4=0` 恢复纯 int8（每 32 组的权重 scale 仍然生效，那不是 u4 专有的）。
 * 各类型的实际损失用 `test_quant_audit` 逐类型度量；u4 打包往返用 `test_w4`，u4 vs int8 的逐张量
   差异用 `test_w4_vs_i8`，u4 GEMM vs 真实反量化权重用 `test_w4_gemm`。
+
+## 10. codebook 4-bit（IQ4_XS / IQ4_NL，`PF_CB4`，默认开）
+
+### 10.1 动机
+
+IQ4_XS / IQ4_NL **不是网格**：它们的值是
+
+```
+w = d * (ls - 32) * kvalues_iq4nl[q]        # q 是 4-bit 索引
+```
+
+其中 `kvalues_iq4nl[16]` 是固定的 int8 码本（`quant.h:218`），`d` 是每 256 值的 f16，
+`ls` 是每 32 值的 6-bit scale。所以**只要存 4-bit 索引 + 每 (行,组) 的 f16 `d*(ls-32)`，
+native 值就是精确的**——不是重化（requant），只是换存储。
+
+| 表示 | 字节/权重 | dev0 占用 |
+|---|---|---|
+| int8（原转换） | 1.0625 | 12155 MiB |
+| **codebook u4** | **0.5625** | **9638 MiB（−2.46 GB）** |
+
+（dev1 11219 → 9354 MiB。）注：IQ4_XS 的 native 值本身就是 int8 网格上的精确点
+（`dl*lut` 是 `dl` 的整数倍），所以原来的 int8 转换对它几乎无损（~0.05% f16 舍入）——
+**这条路的收益是字节数，不是精度**（`test_w4_vs_cpuref` 的 `mean|diff|` 0.0375 → 0.0479，
+两者 argmax 都 SAME）。
+
+### 10.2 布局（`cb4t`，`w4.h`）
+
+| 平面 | 布局 |
+|---|---|
+| `idx` | `idx[(n*(K/2)) + g*16 + b]`，每 32 值一组 16 字节；**native 元素序**：元素 `e<16` 是 byte `e` 的低 nibble，`e>=16` 是 byte `e-16` 的高 nibble |
+| `scale` | `scale[g*N + n]` f16 = `d*(ls-32)`，与 u4 的 step 平面同构（oneDNN grouped scale 直接用） |
+
+`cb4_pack` 只做重排（`memcpy` 每组的 16 字节 nibble + 抽取 scale），不碰任何数值。
+
+### 10.3 decode：LUT 展开的 dp4a GEMV（`cb4_gemv_launch`）
+
+结构同 `i8_grp_gemv`（g 外/行内 SLM staging、`asa`/`XS`/XOR 偏差校正），只是权重字由
+nibble 经 16 项 SLM LUT 展开成 int8 再 `dp4a`：`w[j]` 取 byte `j*4..j*4+3` 的低 nibble、
+`w[4+j]` 取它们的高 nibble（位移是 `8b` 与 `8b+4`，写错会被"全 nibble 相同"的测试掩盖）。
+实测每张量比 int8 GEMV 快 11-20%（head 3.31→2.63 ms），但有效 GB/s 更低
+（272 vs 408），因为它 read 一半字节却受 ALU/延迟限制更多。
+
+### 10.4 prefill：展开到复用 scratch + 现有 int8 primitive
+
+oneDNN 只认线性 `u4` 或 `s8`（`dnnl_common_types.h` 里有 `s4/u4/f4_e2m1/f4_e3m0`，**没有 u5/u6**），
+所以 codebook 的 prefill 只能喂 int8。做法是**把该张量的索引经同一 LUT 展开成 int8，写进一块
+按最大单张量分配的 scratch（~89 MB）**，再用**已有的 int8 primitive**：
+
+* 前提已验证：覆盖权重缓冲后重新 `execute`，结果跟着变（2→64、3→96、4→128），
+  即 **oneDNN 每次 execute 都重读用户权重 memory**，不做内部 reorder 缓存。
+* 代价是每 pass 多一遍展开流量（读 0.5625 + 写 1.0 B/w，IQ4_XS+NL 合计 ~13.3 GB → ~31 ms/pass）。
+  第一版逐字节标量写让 prefill 掉到 940 t/s，改成"16 字节载入 + 两个 16 字节写出"后回到 ~1340 t/s。
+* `cb4_expand_launch` 的元素序必须与 §10.2 一致（`w[0..3]` 是元素 0..15、`w[4..7]` 是 16..31）。
+
+### 10.5 实测
+
+| | `PF_CB4=0` | `PF_CB4=1` |
+|---|---:|---:|
+| tg128 | 12.82 t/s | **13.49（+5.2 %）** |
+| pp512 | ~1500 t/s | **~1290（−13 %）** |
+| argmax vs fp32 参考 | SAME | SAME |
+
+`PF_CB4=0` 退回 int8 转换（A/B 用）。tg 收益受限于 LUT kernel 是半 ALU/延迟受限，
+以及 codebook 类型只占每 token 字节的 19 %。

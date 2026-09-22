@@ -162,6 +162,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         const layer_t & L = m.layers[il];
         const int dev = multi_dev ? layer_dev_[il] : 0;
         bind_acts(dev); // per-device activations: the plan captures dev's buffers
+        plan.layer_c0.push_back((int)plan.call_tb.size());
         if (L.recurrent) {
             plan.begin_call(tb, hp.n_embd / 256);
             if (use_w8) {
@@ -232,6 +233,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     // (the DP4A path keeps the head on the fp32 GEMV: only one row is needed)
     // Skipped entirely for non-final prefill chunks (with_head == false).
     plan.has_head = with_head || head_batched;
+    plan.layer_c0.push_back((int)plan.call_tb.size()); // the head call index
     if (with_head || head_batched) {
         // The head always runs on the primary backend, and bind_acts() only
         // rebinds the engine's members - the plan has already captured the
@@ -246,7 +248,13 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         plan.begin_call(head_batched ? tb : 1, hp.n_embd / 256);
         gemv_seg s{};
         s.dev = 0;
-        s.w = wptr(0, m.output.data);
+        // wkey, not wptr: `wkey` returns the (not-uploaded) host pointer for a
+        // converted head, which is its oneDNN key - and gemv_at's oneDNN branch
+        // now covers single-token calls in every mode, so the fp32 gemv_group
+        // (which would dereference that pointer on the device) is never reached.
+        // A head that could not be converted is still uploaded and wkey returns
+        // its device pointer, keeping the fp32 fallback valid.
+        s.w = wkey(0, m.output.data);
         s.type = m.output.type;
         s.K = hp.n_embd;
         s.n_rows = hp.n_vocab;
@@ -275,6 +283,15 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
                 s.xsumq = d_xsumq;
                 plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
             }
+        }
+        // multi-device oneDNN weight path: without an xq entry gemv_at cannot
+        // take the dnnl_call branch, so the head fell through to the fp32
+        // dequant GEMV - 12.3 ms per token vs 3.7 ms for the int8 grouped GEMV
+        // (measured on the 27B, 2x A770).  `head_batched` selects the activation
+        // the segment points at: the batch-1 decode head reads d_xnorm, the
+        // single-token prefill head reads d_last_hidden (see s.x above).
+        if (md_xmx && !plan.call_xq.back().x) {
+            plan.set_xq(head_batched ? d_xnorm : d_last_hidden, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
         }
         plan.add(s);
     }
@@ -349,7 +366,7 @@ static void dbg_dump_raw(sycl::queue & q, const float * d, int n, const char * p
 }
 
 void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows,
-                            int at_nsp_hint) {
+                            int at_nsp_hint, const md_phase * ph) {
     // mode 2: chunk-batched prefill. `rows` is the total token count, split into
     // rows/kMaxT chunk rows; GEMM calls are executed segment-major (all chunk
     // rows of one tensor back to back) so the weights stay L2-hot.
@@ -359,6 +376,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // backend index of the layer currently processed (multi-device): the
     // gemv_at closure reads it to pick the device's oneDNN instance
     int cur_dev = 0;
+    // Phased recording (multi-device decode graphs): one phase covers a
+    // contiguous run of layers on one device, with no device switch inside it,
+    // so the handoff (a host round trip) stays outside the graph.
+    const bool phased = (ph != nullptr);
     int dbg_layer = -1; // current layer index for the PF_DUMP_SEGS diagnostic
     const bool prof = prof_on();
     auto tnow = [] { return std::chrono::high_resolution_clock::now(); };
@@ -378,10 +399,21 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     double c_g8 = 0, c_gf = 0; // w8 GEMM vs fp32/side GEMV time inside gemv
     size_t ci = 0;
     static const bool dbg_pfb2 = getenv("PF_DBG_PFB") != nullptr;
-    // per-group timing under PF_PROF (PF_NOGRAPH mode only: waits serialize)
+    // Per-group timing under PF_PROF (PF_NOGRAPH mode only: waits serialize).
+    // Multi-device runs each partition on its own queue, so the wait must target
+    // the queue the current layer was enqueued on - waiting on `q` (the primary
+    // queue, which is a *different* queue object in multi-device mode) returned
+    // immediately and reported enqueue-only times.
+    auto sync_cur = [&]() {
+        if (multi_dev) {
+            dev_queue(cur_dev).wait();
+        } else {
+            q.wait();
+        }
+    };
     auto stamp = [&](double & acc, const std::chrono::high_resolution_clock::time_point & a) {
         if (prof) {
-            q.wait();
+            sync_cur();
             acc += tms(a, tnow());
         }
     };
@@ -426,7 +458,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             // SIn copy routes decode through oneDNN too (M=1, via the custom
             // i8_row_gemv), so all of the layer linears live in one int8
             // representation for both phases
-            if (!D || (mode == 0 && !multi_dev) || (single && !(mode == 0 && multi_dev))) {
+            // `single` calls outside decode used to be excluded, which sent the
+            // *prefill* LM head to the fp32 dequant gemv_group - the same slow
+            // path the decode head had (10.1 vs 3.3 ms).  Now that the head's
+            // weight is only a oneDNN entry (its raw device copy is skipped when
+            // it was converted), that fallback would also dereference a host
+            // pointer, so the oneDNN branch must cover it.  The remaining checks
+            // still require an xq entry and a convertible weight per segment.
+            if (!D || (mode == 0 && !multi_dev)) {
                 return false;
             }
             if (idx >= plan.call_xq.size() || !plan.call_xq[idx].x) {
@@ -445,7 +484,9 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     // multi-device has no w8 view: every segment of the call is
                     // routed to oneDNN, so all of them must be convertible
                     const bool need = sj.w8.vals || multi_dev;
-                    if (need && (!(D->has_weight(key) || D->has_weight_w4(key)) || kk != plan.call_xq[idx].K)) {
+                    if (need
+                        && (!(D->has_weight(key) || D->has_weight_w4(key) || D->has_weight_cb4(key))
+                            || kk != plan.call_xq[idx].K)) {
                         return false;
                     }
                 }
@@ -455,9 +496,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         if (dnnl_call) {
             const seg_plan::xq_t & xq = plan.call_xq[idx];
             const auto a2 = tnow();
-            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K);
+            // decode reads the even/odd split in the u4 GEMV; prefill does not
+            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K, /*do_split=*/mode == 0);
             if (prof_on()) {
-                q.wait();
+                sync_cur();
                 prof_acc[5] += tms(a2, tnow());
             }
         } else if (idx < plan.call_xq.size() && plan.call_xq[idx].x) {
@@ -477,7 +519,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 }
             }
             if (p2) {
-                q.wait();
+                sync_cur();
                 prof_acc[5] += tms(a2, tnow());
             }
         }
@@ -625,7 +667,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 }
             }
             if (prof) {
-                q.wait();
+                sync_cur();
                 const double dt = tms(a_g2, tnow());
                 if (s0.w8.vals || s0.i8 || (multi_dev && dnnl_call)) {
                     c_g8 += dt;
@@ -642,7 +684,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const int my_ci = (int)ci;
         ci++;
         if (prof) {
-            q.wait();
+            sync_cur();
             const double dt = tms(a, tnow());
             c_gemv += dt;
             if (my_ci < 256) {
@@ -665,7 +707,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         return e ? atoi(e) : 0;
     }();
 
-    {
+    if (!phased || ph->embed) {
         const auto a = tnow();
         // the plan builders leave the members bound to the last layer's device;
         // the embedding always runs on the primary device, so bind its buffers
@@ -676,13 +718,13 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         cur_be = &backend();
         cur_be->embed(wptr(0, m.tok_embd.data), m.tok_embd.type, d_info, d_x, hp.n_embd, m.tok_embd_row_bytes);
         if (prof) {
-            q.wait();
+            sync_cur();
             c_embed += tms(a, tnow());
         }
         if (dbg_dump) {
             dbg_dump_fp(dev_queue(0), d_x, hp.n_embd, "embed", -1, 0);
         }
-        if (dbg_mid == 4) {
+        if (dbg_mid == 4 && !phased) {
             return;
         }
     }
@@ -692,10 +734,24 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         return e ? atoi(e) : -1;
     }();
     int prev_dev = 0; // embedding runs on the primary device
+    // The members must be bound to the phase's device before its kernels are
+    // recorded.
+    if (phased && multi_dev) {
+        bind_acts(ph->dev);
+        prev_dev = ph->dev;
+        cur_dev = ph->dev; // gemv_at reads dnnl_for(cur_dev)
+    }
+    const int il_beg = phased ? ph->l0 : 0;
+    const int il_end = phased ? ph->l1 : hp.n_layer;
+    if (phased && (size_t)hp.n_layer + 1 <= plan.layer_c0.size()) {
+        // a phase starts at its first layer's call, not at call 0
+        const bool head_only = ph->head && ph->l0 == ph->l1;
+        ci = (size_t)plan.layer_c0[head_only ? (size_t)hp.n_layer : (size_t)il_beg];
+    }
     // debug: 1 = after the first sub-layer of a layer, 2 = after post-attn
     // norm, 3 = after the first FFN GEMM, 4 = right after the embedding
     static int dbg_call_no = -1;
-    for (int il = 0; il < hp.n_layer; il++) {
+    for (int il = il_beg; il < il_end; il++) {
         const layer_t & L = m.layers[il];
         // multi-device: pick this layer's backend; synchronize the previous
         // device at a partition boundary so its writes to the shared host-USM
@@ -705,8 +761,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const int dev = multi_dev ? layer_dev_[il] : 0;
         cur_dev = dev;
         dbg_layer = il;
-        if (multi_dev && dev != prev_dev) {
-            handoff_x(prev_dev, dev);
+        if (!phased && multi_dev && dev != prev_dev) {
+            handoff_x(prev_dev, dev, (size_t)nrows * (size_t)nreal);
             bind_acts(dev);
             prev_dev = dev;
         }
@@ -975,10 +1031,18 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // primary device reads the hidden state for the output norm / LM head.
     // Without this the head races the last device (the earlier pipeline only
     // synchronized when the device changed, i.e. never after the final range).
-    if (multi_dev) {
+    if (!phased && multi_dev) {
         // move the final hidden state back to the primary device for the head
-        handoff_x(prev_dev, 0);
+        handoff_x(prev_dev, 0, (size_t)nrows * (size_t)nreal);
         bind_acts(0);
+        // the head is pinned to backend 0, and gemv_at reads dnnl_for(cur_dev),
+        // so reset it here: after the loop cur_dev is the *last layer's* device,
+        // whose oneDNN table has no entry for the primary's head weight and
+        // would silently drop the head to the fp32 dequant GEMV.
+        cur_dev = 0;
+    }
+    if (phased && !ph->head) {
+        return; // this phase ends before the output norm / head
     }
     // global tensors (output norm, LM head) live on the primary device
     cur_be = &backend();
@@ -991,12 +1055,12 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const auto a = tnow();
         gemv_at(plan.call_offsets.size() - 1); // head is the last call group
         if (prof) {
-            q.wait();
+            dev_queue(0).wait(); // the head is pinned to the primary device
             c_head += tms(a, tnow());
         }
     }
     if (prof) {
-        q.wait();
+        dev_queue(0).wait();
         const double c_total = tms(pt0, tnow());
         prof_acc[0] += c_embed;
         prof_acc[2] += c_gemv + c_head;
@@ -1022,24 +1086,33 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
             c_g8 = c_gf = 0;
             prof_calls = 0;
-            // top call groups by accumulated time
+            // PF_PROF_ALL: dump every call group (ms/step = ms/call * calls/step)
+            static const bool prof_all = getenv("PF_PROF_ALL") != nullptr;
             int idx[256];
             for (int i = 0; i < 256; i++) {
                 idx[i] = i;
             }
             std::sort(idx, idx + 256, [](int a, int b) { return prof_ci_t[a] > prof_ci_t[b]; });
-            for (int k = 0; k < 8; k++) {
+            const int top = prof_all ? 256 : 8;
+            double gemv_sum = 0;
+            for (int k = 0; k < top; k++) {
                 const int i = idx[k];
                 if (prof_ci_t[i] <= 0 || prof_ci_n[i] == 0) {
                     continue;
                 }
                 const seg_plan::xq_t & xq = plan.call_xq[i];
                 const gemv_seg & s0 = plan.segs[plan.groups[plan.call_group_begin[i]].off];
-                printf("   ci=%2d %8.2f ms/call  n=%ld  K=%d N=%d type=%s nr=%d os=%d xq=%d\n", i,
-                       prof_ci_t[i] / prof_ci_n[i], prof_ci_n[i], xq.K, s0.w8.ok() ? s0.w8.N : 0,
-                       ggml_type_name(s0.w8.ok() ? s0.w8.type : s0.type), s0.n_rows, s0.out_stride, xq.x ? 1 : 0);
+                const double per_step = prof_ci_t[i] / (double)every;
+                gemv_sum += per_step;
+                printf("   ci=%3d %7.3f ms/call  %5.1f calls/step  %6.2f ms/step  K=%-6d N=%-6d type=%-7s nr=%d xq=%d\n", i,
+                       prof_ci_t[i] / prof_ci_n[i], (double)prof_ci_n[i] / (double)every, per_step, xq.K,
+                       s0.w8.ok() ? s0.w8.N : s0.n_rows, ggml_type_name(s0.w8.ok() ? s0.w8.type : s0.type), s0.n_rows,
+                       xq.x ? 1 : 0);
                 prof_ci_t[i] = 0;
                 prof_ci_n[i] = 0;
+            }
+            if (prof_all) {
+                printf("   [sum of call groups = %.2f ms/step]\n", gemv_sum);
             }
         }
     }
@@ -1140,9 +1213,112 @@ void engine::build_plans() {
     }
 }
 
+void engine::build_md_dec_graphs() {
+    static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    if (!multi_dev || !(md_int8 || md_xmx) || !d_segs_dec8 || m.hp.n_layer <= 0 || nog) {
+        return; // PF_NOGRAPH=1 keeps the direct replay (diagnostics/PF_PROF)
+    }
+    // Split the layer loop into contiguous device runs.  The embedding always
+    // runs on the primary device and the output norm + head after the loop do
+    // too, so the first phase carries the embedding and the last one the head.
+    std::vector<md_phase> phs;
+    md_phase p{};
+    p.dev = 0;
+    p.embed = true;
+    int il = 0;
+    while (il < m.hp.n_layer) {
+        const int d = layer_dev_[(size_t)il];
+        int j = il;
+        while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
+            j++;
+        }
+        if (p.l0 == p.l1 && p.dev == d) {
+            p.l1 = j; // the embedding-only phase continues into this run
+        } else {
+            phs.push_back(p);
+            md_phase q{};
+            q.dev = d;
+            q.l0 = il;
+            q.l1 = j;
+            p = q;
+        }
+        il = j;
+    }
+    if (p.dev == 0) {
+        p.head = true;
+        phs.push_back(p);
+    } else {
+        phs.push_back(p);
+        md_phase h{};
+        h.dev = 0;
+        h.head = true;
+        phs.push_back(h);
+    }
+
+    // a CPU partition runs host code, not kernels on a queue, so it cannot be
+    // recorded; fall back to the direct replay for any mixed map
+    for (const md_phase & ph : phs) {
+        if (ph.dev < 0 || (size_t)ph.dev >= dev_kind_.size() || dev_kind_[(size_t)ph.dev] != 0) {
+            fprintf(stderr, "[md] decode command graphs: skipped (device %d is not a GPU partition)\n", ph.dev);
+            return;
+        }
+    }
+
+    // PF_MD_GRAPH_DEV: which devices get a recorded graph (default: all GPU
+    // partitions).  Diagnostic/A-B knob while bringing the multi-device graphs
+    // up - a phase without a graph falls back to the direct replay.
+    static const int graph_dev = [] {
+        const char * e = getenv("PF_MD_GRAPH_DEV");
+        return e ? atoi(e) : -1; // -1 = every phase
+    }();
+    capture_guard cg;
+    md_dec_.clear();
+    md_dec_.reserve(phs.size());
+    for (const md_phase & ph : phs) {
+        md_cmd_graph mg;
+        mg.ph = ph;
+        if (graph_dev < 0 || ph.dev == graph_dev) {
+            sycl::queue & qd = dev_queue(ph.dev);
+            mg.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(qd.get_context(), qd.get_device());
+            mg.g->begin_recording(qd);
+            record_forward(0, plan_dec8_, d_segs_dec8, 1, nullptr, 0, &ph);
+            mg.g->end_recording();
+            mg.e = std::make_unique<sx::command_graph<sx::graph_state::executable>>(mg.g->finalize());
+        }
+        md_dec_.push_back(std::move(mg));
+    }
+    md_dec_ok = true;
+    // leave the members on the primary device for any runtime use
+    bind_acts(0);
+    fprintf(stderr, "[md] decode command graphs: %zu phase(s) over %zu backend(s)\n", md_dec_.size(), backends_.size());
+}
+
+void engine::replay_md_dec_graphs() {
+    for (size_t i = 0; i < md_dec_.size(); i++) {
+        const md_phase & ph = md_dec_[i].ph;
+        if (md_dec_[i].e) {
+            dev_queue(ph.dev).ext_oneapi_graph(*md_dec_[i].e);
+        } else {
+            // no graph for this phase: replay it directly on its own queue
+            record_forward(0, plan_dec8_, d_segs_dec8, 1, nullptr, 0, &ph);
+        }
+        if (i + 1 < md_dec_.size() && md_dec_[i + 1].ph.dev != ph.dev) {
+            // hand the activation to the next phase's device; handoff_x waits on
+            // the producing queue and stages through host memory (no P2P)
+            handoff_x(ph.dev, md_dec_[i + 1].ph.dev, 1);
+        }
+    }
+    // the head phase wrote d_logits on the primary device; rebind the members so
+    // fetch_logits()/run_head() read the right buffers
+    bind_acts(0);
+}
+
 void engine::build_graphs() {
     if (cpu_mode || multi_dev) {
         build_plans();
+        if (multi_dev) {
+            build_md_dec_graphs();
+        }
         return;
     }
     capture_guard cg;

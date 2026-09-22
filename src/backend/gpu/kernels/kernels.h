@@ -125,6 +125,17 @@ void w4_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scal
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int K, int N);
 
+// Codebook 4-bit (IQ4_XS / IQ4_NL) decode GEMV (M == 1) and the index->int8
+// expansion the prefill matmul needs.  See common/w4.h and w4_gemv.cpp.
+//   y[n] = sum_g asa[g] * scale[g][n] * QDOT_g[n],  QDOT from the 16-entry int8
+//   table `lut` indexed by the packed nibbles (so the native values are exact).
+void cb4_gemv_launch(sycl::queue & q, const uint8_t * idx, const int8_t * lut, const uint16_t * scale, const int8_t * xq,
+                     const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
+                     int N);
+// expand the nibble indices into int8 weights (for the oneDNN prefill matmul):
+// out[n*K + k] = lut[nibble], the same element order as cb4t::idx
+void cb4_expand_launch(sycl::queue & q, const uint8_t * idx, const int8_t * lut, int8_t * out, int K, int N);
+
 void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
                        int nsb, int n_tok_blocks = 0);
 // kscales/vscales: the int8/int4 per-32 fp16 scale planes (nullptr for the

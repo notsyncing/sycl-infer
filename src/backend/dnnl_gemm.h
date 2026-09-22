@@ -46,13 +46,29 @@ struct dnnl_gemm {
     // oneDNN's grouped zero-point descriptors do not validate.
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
     bool has_weight_w4(const void * key) const;
+
+    // ---- codebook 4-bit weights (IQ4_XS / IQ4_NL, see common/w4.h) ---------
+    // The native nibble indices plus one f16 scale per (32-value group, row):
+    // 0.5625 B/weight instead of the int8 conversion's 1.0625, with the native
+    // values kept exactly.  Decode expands the 16-entry table in-kernel;
+    // prefill expands the indices to int8 into a reused scratch (the biggest
+    // tensor, ~95 MB) and runs the ordinary int8 primitive over it.
+    bool add_weight_cb4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
+    bool has_weight_cb4(const void * key) const;
+    // diagnostics: total device bytes held by this instance's weight tables
+    // (int8 + u4 + codebook + the codebook prefill scratch)
+    size_t weight_bytes() const;
     // Same contract as gemm(); out = alpha*sx[m]*(acc4 + correction) + residual.
     bool gemm_w4(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
 
     // Quantize one call's activations: x is token-major [M][x_stride]; if up is
     // non-null the value is silu(x)*up (ffn_down).  The result stays valid
     // until the next quantize() call.
-    bool quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K);
+    // do_split also produces the even/odd k deinterleave of the grouped
+    // activation (the u4 decode GEMV's operands); prefill only needs xq + asa +
+    // xs, so it passes false and skips the extra stores.
+    bool quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
+                  bool do_split = true);
     // out[m][row] = alpha * sx[m]*sw[row]*acc[m][row] + residual[m][row]
     // (acc from the oneDNN matmul of the currently quantized activations).
     // Returns false and writes nothing when the tensor/shape is unsupported.

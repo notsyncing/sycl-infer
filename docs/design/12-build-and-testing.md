@@ -163,6 +163,7 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 | `kv_bf16_splits.md` | bf16 KV split 调优 |
 | `longctx_16k.md` / `longctx_decode.md` | 长上下文 prefill / decode |
 | `prefix_cache.md` | 前缀缓存设计与测量 |
+| `tg128_20tps_evaluation.md` | 双 A770 上 27B 的 tg128 优化与 20 tps 可行性（含带宽/collective 实测） |
 | `vtune_profile.md` | VTune profile |
 | `bugfix_hang.md` | 挂起问题修复记录 |
 

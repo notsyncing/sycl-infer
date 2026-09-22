@@ -92,54 +92,60 @@ void act_quant_launch(sycl::queue & q, const float * x, const float * up, int x_
 // scale per row.  This is what removes the dominant quantization error: with a
 // per-row scale the activation error (~0.9%) swamped the 4-bit weight error.
 void act_quant_grp_launch(sycl::queue & q, const float * x, const float * up, int x_stride, int up_stride, int8_t * xq,
-                          uint16_t * sasc, int M, int K) {
+                          uint16_t * sasc, float * xs, int8_t * axe, int8_t * axo, bool do_split, int M, int K) {
     const int ng = K / kW4Group;
-    q.parallel_for(sycl::range<1>((size_t)M * ng), [=](sycl::id<1> i) {
-        const int m = (int)(i / ng);
-        const int g = (int)(i % ng);
+    const size_t kh = (size_t)K / 2;
+    // One 32-lane workgroup per (row, group): each lane owns exactly one value,
+    // so the row max is a sub-group reduction and the value never leaves a
+    // register between the max pass and the store.  The previous form was one
+    // *thread* per group (M*ng threads, i.e. 544 for K=17408) which was latency
+    // bound: 12.6 us/call x 320 calls = 4 ms of a 27B decode step.
+    //
+    // The same launch also produces the two derived views the GEMVs need - the
+    // group sums xs (one sub-group reduction of the just-computed quantized
+    // values) and, when do_split, the even/odd k deinterleave of xq - so a call
+    // costs one kernel instead of three (measured ~5 ms/token of launch
+    // overhead in a 27B multi-device decode).
+    q.parallel_for(sycl::nd_range<1>((size_t)M * ng * kW4Group, kW4Group), [=](sycl::nd_item<1> it) {
+        const int gid = (int)it.get_group(0);
+        const int m = gid / ng;
+        const int g = gid % ng;
+        const int lane = (int)it.get_local_id(0);
         const float * xr = x + (size_t)m * x_stride + (size_t)g * kW4Group;
-        const float * ur = up ? up + (size_t)m * up_stride + (size_t)g * kW4Group : nullptr;
-        float mx = 0.f;
-        for (int j = 0; j < kW4Group; j++) {
-            float v = xr[j];
-            if (ur) {
-                v = silu_act(v) * ur[j];
-            }
-            mx = sycl::fmax(mx, sycl::fabs(v));
+        float v = xr[lane];
+        if (up) {
+            v = silu_act(v) * up[(size_t)m * up_stride + (size_t)g * kW4Group + lane];
         }
+        const float mx = sycl::reduce_over_group(it.get_sub_group(), sycl::fabs(v), sycl::maximum<float>());
         const float sc = mx > 0.f ? mx / 127.0f : 1.0f;
         const float inv = 1.0f / sc;
-        int8_t * o = xq + (size_t)m * K + (size_t)g * kW4Group;
-        for (int j = 0; j < kW4Group; j++) {
-            float v = xr[j];
-            if (ur) {
-                v = silu_act(v) * ur[j];
+        const int qi = (int)sycl::round(v * inv);
+        const int8_t q8 = (int8_t)sycl::max(-127, sycl::min(127, qi));
+        xq[(size_t)m * K + (size_t)g * kW4Group + lane] = q8;
+        if (do_split) {
+            // nibble-pair k with k+1 lives in one byte, so the u4 GEMV wants the
+            // even/odd k planes: axe[j] = xq[2j], axo[j] = xq[2j+1]
+            const size_t half = (size_t)m * kh + (size_t)g * (kW4Group / 2) + (size_t)(lane >> 1);
+            if ((lane & 1) == 0) {
+                axe[half] = q8;
+            } else {
+                axo[half] = q8;
             }
-            const int qi = (int)sycl::round(v * inv);
-            o[j] = (int8_t)sycl::max(-127, sycl::min(127, qi));
         }
-        sycl::half h(sc);
-        uint16_t bits;
-        __builtin_memcpy((void *)&bits, &h, sizeof(h));
-        sasc[(size_t)m * ng + g] = bits;
-    });
-}
-
-// ---- 4-bit (u4) weight path ----------------------------------------------
-// xs[m][g] = sum of the 32 int8 activations of group g of row m.  The offset
-// (zero-point) part of a u4 weight contributes +offset[g][n]*xs[m][g] on top
-// of oneDNN's step-scaled matmul; see common/w4.h for the derivation.
-void w4_xs_launch(sycl::queue & q, const int8_t * xq, float * xs, int M, int K) {
-    const int ng = K / kW4Group;
-    q.parallel_for(sycl::range<1>((size_t)M * ng), [=](sycl::id<1> i) {
-        const int m = (int)(i / ng);
-        const int g = (int)(i % ng);
-        const int8_t * p = xq + (size_t)m * K + (size_t)g * kW4Group;
-        int s = 0;
-        for (int j = 0; j < kW4Group; j++) {
-            s += (int)p[j];
+        if (lane == 0) {
+            sycl::half h(sc);
+            uint16_t bits;
+            __builtin_memcpy((void *)&bits, &h, sizeof(h));
+            sasc[(size_t)m * ng + g] = bits;
         }
-        xs[(size_t)m * ng + g] = (float)s;
+        if (xs) {
+            // a sub-group collective, so every lane must execute it (a divergent
+            // call is UB and produced garbage xs - the u4 correction term)
+            const int s = sycl::reduce_over_group(it.get_sub_group(), (int)q8, sycl::plus<int>());
+            if (lane == 0) {
+                xs[(size_t)m * ng + g] = (float)s;
+            }
+        }
     });
 }
 
@@ -331,6 +337,22 @@ struct dnnl_gemm::impl {
         bool ok = false;
     };
     std::unordered_map<const void *, w4_entry> w4weights;
+
+    // Codebook 4-bit (IQ4_XS / IQ4_NL): the native nibble indices plus the
+    // per-(g,n) f16 scale, i.e. w = scale[g][n] * kvalues_iq4nl[q].  Decode
+    // expands the table in-kernel (cb4_gemv_launch); prefill expands the
+    // indices to int8 into cb4_scratch and feeds the *existing* int8 primitive,
+    // which re-reads the weight memory at every execute (verified).
+    struct cb4_entry {
+        int K = 0, N = 0, ng = 0;
+        uint8_t * idx = nullptr;     // [N][K/2] nibble indices, native order
+        uint16_t * scales = nullptr; // [ng][N] f16, oneDNN grouped scale layout
+        bool ok = false;
+    };
+    std::unordered_map<const void *, cb4_entry> cb4weights;
+    int8_t * lut = nullptr;          // kvalues_iq4nl on the device
+    int8_t * cb4_scratch = nullptr;  // shared int8 expansion for prefill
+    size_t cb4_scratch_cap = 0;
 
     struct prim4_entry {
         matmul prim;
@@ -615,6 +637,85 @@ bool dnnl_gemm::has_weight(const void * key) const {
     return it != p->weights.end() && it->second.ok;
 }
 
+size_t dnnl_gemm::weight_bytes() const {
+    size_t n = 0;
+    for (const auto & kv : p->weights) {
+        n += (size_t)kv.second.K * kv.second.N + (size_t)kv.second.ng * kv.second.N * 2;
+    }
+    for (const auto & kv : p->w4weights) {
+        n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)(kv.second.K / kW4Group) * kv.second.N * 4;
+    }
+    for (const auto & kv : p->cb4weights) {
+        n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)kv.second.ng * kv.second.N * 2;
+    }
+    n += p->cb4_scratch_cap;
+    return n;
+}
+
+bool dnnl_gemm::has_weight_cb4(const void * key) const {
+    auto it = p->cb4weights.find(key);
+    return it != p->cb4weights.end() && it->second.ok;
+}
+
+bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N) {
+    if (!key || !host_data || !si::cb4_supported(ggml_type)) {
+        return false;
+    }
+    if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+        return false;
+    }
+    auto found = p->cb4weights.find(key);
+    if (found != p->cb4weights.end()) {
+        return found->second.ok;
+    }
+    si::cb4t b;
+    if (!si::cb4_pack(ggml_type, host_data, K, N, b)) {
+        return false;
+    }
+    impl::cb4_entry e;
+    e.K = K;
+    e.N = N;
+    e.ng = K / kW4Group;
+    e.idx = sycl::malloc_device<uint8_t>(b.idx.size(), p->q);
+    e.scales = sycl::malloc_device<uint16_t>(b.scale.size(), p->q);
+    if (!e.idx || !e.scales) {
+        if (e.idx) {
+            sycl::free(e.idx, p->q);
+        }
+        if (e.scales) {
+            sycl::free(e.scales, p->q);
+        }
+        return false;
+    }
+    p->q.memcpy(e.idx, b.idx.data(), b.idx.size()).wait();
+    p->q.memcpy(e.scales, b.scale.data(), b.scale.size() * sizeof(uint16_t)).wait();
+    if (!p->lut) {
+        p->lut = sycl::malloc_device<int8_t>(16, p->q);
+        if (!p->lut) {
+            return false;
+        }
+        p->q.memcpy(p->lut, kvalues_iq4nl, 16).wait();
+    }
+    // the prefill expansion needs the int8-sized scratch; grow it to the widest
+    // converted tensor (the biggest is ffn_gate/up, ~95 MB, not the full model)
+    const size_t need = (size_t)K * (size_t)N;
+    if (need > p->cb4_scratch_cap) {
+        if (p->cb4_scratch) {
+            sycl::free(p->cb4_scratch, p->q);
+            p->cb4_scratch = nullptr;
+            p->cb4_scratch_cap = 0;
+        }
+        p->cb4_scratch = sycl::malloc_device<int8_t>(need, p->q);
+        if (!p->cb4_scratch) {
+            return false;
+        }
+        p->cb4_scratch_cap = need;
+    }
+    e.ok = true;
+    auto ins = p->cb4weights.emplace(key, std::move(e));
+    return ins.first->second.ok;
+}
+
 // Convert one tensor to the 4-bit form (see common/w4.h): u4 values plus the
 // per-32-group f16 step/offset planes.  Returns false for unsupported types,
 // which keep their int8 conversion.
@@ -773,7 +874,7 @@ int dnnl_gemm::warmup() {
     float * dout = sycl::malloc_device<float>((size_t)WM * WN, p->q);
     if (dx && dsw && dout) {
         act_quant_launch(p->q, dx, nullptr, WK, WK, p->ax, p->axs, p->axsum, WM, WK);
-        act_quant_grp_launch(p->q, dx, nullptr, WK, WK, p->axg, p->asa, WM, WK);
+        act_quant_grp_launch(p->q, dx, nullptr, WK, WK, p->axg, p->asa, p->xs, p->axe, p->axo, true, WM, WK);
         epilogue_f32_launch(p->q, p->accf, dout, WN, nullptr, 1.f, WM, WN);
         p->q.wait();
     }
@@ -789,15 +890,33 @@ int dnnl_gemm::warmup() {
     return n;
 }
 
-bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K) {
+bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
+                         bool do_split) {
     p->acts_valid = false;
     if (!x || M <= 0 || M > p->cap_M || K <= 0 || K > p->cap_K) {
         return false;
     }
-    act_quant_launch(p->q, x, up, x_stride, up_stride, p->ax, p->axs, p->axsum, M, K);
-    // both weight paths consume the per-32-group form now (oneDNN grouped SRC
-    // scales and the grouped GEMVs); the per-row form stays for dp4a/SIn
-    act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, M, K);
+    // The per-row int8 form (ax/axs/axsum) is no longer consumed: both weight
+    // paths read the per-32-group form (axg + asa for the oneDNN matmul's
+    // grouped SRC scales, and axg/xs for the decode GEMVs).  The only caller of
+    // act_data()/act_scales()/act_sum() is a dead branch (it also requires a
+    // per-row weight scale, which weight_scales() no longer returns), so this
+    // kernel was pure per-call latency: it runs one 256-thread workgroup over
+    // the whole row and cost ~13 ms/token across the 320 calls of a 27B decode.
+    // PF_ROWACT=1 restores it for A/B.
+    static const bool row_act = [] {
+        const char * e = getenv("PF_ROWACT");
+        return e && atoi(e) != 0;
+    }();
+    if (row_act) {
+        act_quant_launch(p->q, x, up, x_stride, up_stride, p->ax, p->axs, p->axsum, M, K);
+    }
+    // Both weight paths consume the per-32-group form now (oneDNN grouped SRC
+    // scales and the grouped GEMVs); the per-row form stays for dp4a/SIn.  The
+    // same launch produces the group sums (needed by the u4 GEMV and the u4
+    // prefill epilogue) and, for decode, the even/odd k split the u4 GEMV
+    // reads, so no separate view kernels are needed.
+    act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, p->xs, p->axe, p->axo, do_split, M, K);
     p->cur_M = M;
     p->cur_K = K;
     p->acts_valid = true;
@@ -807,6 +926,47 @@ bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up
 bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride) {
     if (!p->acts_valid || M != p->cur_M || K != p->cur_K) {
         return false;
+    }
+    if (auto cit = p->cb4weights.find(key); cit != p->cb4weights.end() && cit->second.ok) {
+        impl::cb4_entry & e = cit->second;
+        if (e.K != K || !p->acts_valid || M != p->cur_M || K != p->cur_K) {
+            return false;
+        }
+        if (M == 1) {
+            // decode: expand the codebook in-kernel (half the weight bytes)
+            cb4_gemv_launch(p->q, e.idx, p->lut, e.scales, p->axg, p->asa, p->xs, out, residual, alpha, K, e.N);
+            return true;
+        }
+        // prefill: materialize this tensor's indices as int8 into the shared
+        // scratch, then run the ordinary int8 primitive over it.  oneDNN reads
+        // the weight memory at every execute (verified), so the scratch can be
+        // reused by every codebook tensor in turn.
+        if (!p->cb4_scratch || (size_t)K * (size_t)e.N > p->cb4_scratch_cap) {
+            return false;
+        }
+        impl::prim_entry * pe = nullptr;
+        try {
+            pe = p->make_prim(M, K, e.N);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (!pe) {
+            return false;
+        }
+        cb4_expand_launch(p->q, e.idx, p->lut, p->cb4_scratch, K, e.N);
+        auto wmem = sycl_interop::make_memory(
+            memory::desc({K, e.N}, memory::data_type::s8, memory::format_tag::ba), p->eng,
+            sycl_interop::memory_kind::usm, (void *)p->cb4_scratch);
+        auto scmem = sycl_interop::make_memory(
+            memory::desc({1, e.ng * e.N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
+            sycl_interop::memory_kind::usm, (void *)e.scales);
+        pe->prim.execute(p->st, {{DNNL_ARG_SRC, pe->src},
+                                 {DNNL_ARG_WEIGHTS, wmem},
+                                 {DNNL_ARG_DST, pe->dst},
+                                 {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scmem},
+                                 {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe->sscales}});
+        epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, e.N);
+        return true;
     }
     auto it = p->weights.find(key);
     if (it == p->weights.end() || !it->second.ok) {
@@ -838,7 +998,6 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
             return e && atoi(e) != 0;
         }();
         if (!no_gemv) {
-            w4_xs_launch(p->q, p->axg, p->xs, M, K);
             i8_grp_gemv_launch(p->q, w.dev, w.scales, p->axg, p->asa, p->xs, out, residual, alpha, K, w.N);
             return true;
         }
@@ -913,8 +1072,6 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
             return e && atoi(e) != 0;
         }();
         if (!no_gemv) {
-            w4_split_act_launch(p->q, p->axg, p->axe, p->axo, M, K);
-            w4_xs_launch(p->q, p->axg, p->xs, M, K);
             w4_gemv_launch(p->q, w.vals, w.scales, w.off, p->axe, p->axo, p->asa, p->xs, out, out_stride, residual,
                            alpha, K, w.N);
             return true;
@@ -934,9 +1091,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
         const char * e = getenv("PF_W4_NOCORR");
         return e && atoi(e) != 0;
     }();
-    if (!nocorr) {
-        w4_xs_launch(p->q, p->axg, p->xs, M, K);
-    }
+    // xs was produced by quantize() (same launch as the grouped activation)
     w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : w.off, p->asa, out, out_stride, residual, alpha, M, N,
                        ng);
     return true;

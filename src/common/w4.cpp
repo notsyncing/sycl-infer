@@ -2,13 +2,31 @@
 
 #include "quant.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace si {
 
+bool w4_all_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("PF_W4_ALL");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
 bool w4_supported(uint32_t ggml_type) {
     // Q4_K: q in [0,15] on a per-32-group grid (d*sc_j, dmin*m_j).
-    return ggml_type == 12;
+    if (ggml_type == 12) {
+        return true;
+    }
+    // PF_W4_ALL: every other quant type is re-quantized onto the same 4-bit
+    // grid (see w4_all_enabled).  F32/F16 have no row_bytes entry.
+    return w4_all_enabled() && ggml_type != 0 && ggml_type != 1;
 }
 
 // Q4_K: a 256-element super-block holds 8 groups of 32; the scale/min pair of
@@ -61,6 +79,104 @@ static bool pack_q4_K(const void * src, int K, int N, w4t & out) {
     return true;
 }
 
+// Generic re-quantization onto the u4 grid (PF_W4_ALL): dequantize the row with
+// the type's own reference dequantizer, then fit one affine (step, offset) per
+// 32-group by min/max and round to a nibble.  This is the "cheap bytes" path:
+// 0.625 B/weight instead of int8's 1.0625 for every non-Q4_K type, at the cost
+// of the type's native resolution.  `off` is the *additive* constant (w ~=
+// step*q + off) so it slots straight into the u4 GEMV's `step*qdot + off*xs`.
+// Mirrors w8.cpp's PF_SI4 generic requant.
+static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
+    if (!w4_all_enabled() || (K % kW4Group) != 0) {
+        return false;
+    }
+    const size_t row_bytes = quant_row_bytes(ggml_type, K);
+    if (row_bytes == 0) {
+        return false;
+    }
+    const int ng = K / kW4Group;
+    out.vals.assign((size_t)N * K / 2, 0);
+    out.scale.assign((size_t)ng * N, 0);
+    out.off.assign((size_t)ng * N, 0);
+    std::vector<float> row((size_t)K);
+    for (int n = 0; n < N; n++) {
+        dequantize_row(ggml_type, (const char *)src + (size_t)n * row_bytes, row.data(), K);
+        for (int g = 0; g < ng; g++) {
+            const float * w = row.data() + (size_t)g * kW4Group;
+            float mn = w[0], mx = w[0];
+            for (int j = 1; j < kW4Group; j++) {
+                mn = std::min(mn, w[j]);
+                mx = std::max(mx, w[j]);
+            }
+            float step = (mx - mn) / 15.0f;
+            if (!(step > 0.f)) {
+                step = 1.f;
+            }
+            const float inv = 1.0f / step;
+            out.scale[(size_t)g * N + n] = ggml_float_to_half(step);
+            out.off[(size_t)g * N + n] = ggml_float_to_half(mn);
+            const size_t base = (size_t)n * K + (size_t)g * kW4Group;
+            for (int j = 0; j < kW4Group; j++) {
+                int q = (int)std::lround((w[j] - mn) * inv);
+                q = std::max(0, std::min(15, q));
+                const size_t ia = base + j;
+                out.vals[ia >> 1] |= (uint8_t)(q << ((ia & 1) * 4));
+            }
+        }
+    }
+    out.K = K;
+    out.N = N;
+    out.bits = 4;
+    return true;
+}
+
+bool cb4_supported(uint32_t ggml_type) {
+    return ggml_type == 23 || ggml_type == 20; // IQ4_XS, IQ4_NL
+}
+
+bool cb4_pack(uint32_t ggml_type, const void * src, int K, int N, cb4t & out) {
+    if (!src || !cb4_supported(ggml_type) || K <= 0 || N <= 0 || (K % 32) != 0) {
+        return false;
+    }
+    const int ng = K / 32;
+    const size_t row_bytes = quant_row_bytes(ggml_type, K);
+    if (row_bytes == 0) {
+        return false;
+    }
+    out.idx.assign((size_t)N * (size_t)(K / 2), 0);
+    out.scale.assign((size_t)ng * N, 0);
+    for (int n = 0; n < N; n++) {
+        const char * row = (const char *)src + (size_t)n * row_bytes;
+        uint8_t * irow = out.idx.data() + (size_t)n * (K / 2);
+        if (ggml_type == 23) {
+            // 136-byte super-block of 256: f16 d, u16 scales_h, u8 scales_l[4],
+            // u8 qs[128]; per 32 values ls = scales_l/h[ib] and dl = d*(ls-32)
+            for (int sb = 0; sb < K / QK_K; sb++) {
+                const block_iq4_xs * blk = (const block_iq4_xs *)(row + (size_t)sb * sizeof(block_iq4_xs));
+                const float d = ggml_half_to_float(blk->d);
+                for (int ib = 0; ib < QK_K / 32; ib++) {
+                    const int ls = ((blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf)
+                                   | (((blk->scales_h >> (2 * ib)) & 3) << 4);
+                    const int g = sb * (QK_K / 32) + ib;
+                    out.scale[(size_t)g * N + n] = ggml_float_to_half(d * (float)(ls - 32));
+                    std::memcpy(irow + (size_t)g * 16, blk->qs + (size_t)ib * 16, 16);
+
+                }
+            }
+        } else {
+            // 18-byte block of 32: f16 d, u8 qs[16]; a single scale per group
+            for (int g = 0; g < ng; g++) {
+                const block_iq4_nl * blk = (const block_iq4_nl *)(row + (size_t)g * sizeof(block_iq4_nl));
+                out.scale[(size_t)g * N + n] = blk->d;
+                std::memcpy(irow + (size_t)g * 16, blk->qs, 16);
+            }
+        }
+    }
+    out.K = K;
+    out.N = N;
+    return true;
+}
+
 bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
     if (!src || K <= 0 || N <= 0) {
         return false;
@@ -69,7 +185,7 @@ bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
     case 12:
         return pack_q4_K(src, K, N, out);
     default:
-        return false;
+        return pack_generic(ggml_type, src, K, N, out);
     }
 }
 

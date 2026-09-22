@@ -175,7 +175,9 @@ fixed head-segment binding bug stayed invisible).
 ```
 src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
                 int8 weight format/repack), w4.{h,cpp} (native-width u4 packing
-                for Q4_K: u4 plane + separate f16 scale/off planes),
+                for Q4_K: u4 plane + separate f16 scale/off planes; and the
+                codebook 4-bit store for IQ4_XS/IQ4_NL: 4-bit index plane +
+                per-32 f16 scale, `cb4t`/`cb4_pack`),
                 dp4a.h (portable dp4a helper),
                 cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch)
 src/backend/    backend.h (compute_backend abstraction), dnnl_gemm.{h,cpp}
@@ -193,7 +195,8 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 and one .cpp per kernel: rmsnorm, embed, copy_row, gemv,
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
-                w4_gemv (u4 decode GEMV: act split + SLM-staged 4-bit GEMV),
+                w4_gemv (u4/int8/codebook decode GEMV: g-major SLM-staged 4-bit
+                GEMV, LUT-expanding codebook GEMV and its prefill expansion),
                 vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
                 bidirectional attention), at (audio tower helpers: at_conv1d,
                 at_rope1d)
@@ -496,7 +499,25 @@ decode run can be diffed element-wise against a prefill),
 `PF_DUMP_LOGITS`/`PF_DUMP_DEC_LOGITS=<path>` (sampler logits; the latter per
 step), `PF_DUMP_PROMPT` (the exact ids - and, for a chat prompt, the rendered
 text - the model is conditioned on), `PF_DUMP_GEN` (the decode loop's sampled id
-and stop decisions).
+and stop decisions), `PF_ROWACT` (restore the now-unused per-row activation
+quantizer for A/B; it is dead because oneDNN reads the per-32-group form, and
+cost ~13 ms/token in a 27B multi-device decode), `PF_W4_RB` (decode GEMV rows
+per workgroup, default 16), `PF_CB4` (`0` keeps IQ4_XS/IQ4_NL on the int8
+conversion instead of the native codebook store), `PF_MD_GRAPH_DEV` (record the multi-device decode
+command graph only for device N; `99` = none, for A/B against the direct
+replay), `PF_PROF_ALL` (with `PF_PROF`: dump every call group's ms/step instead
+of the top 8).
+
+**Weight representation**
+`PF_W4` (native u4 for Q4_K, default on), `PF_CB4` (store IQ4_XS/IQ4_NL as native 4-bit codebook indices + a per-32 f16
+scale, 0.5625 B/weight and lossless, decoded by a LUT-expanding GEMV; prefill
+expands each tensor to int8 in a reused scratch - see
+[`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+`PF_W4_ALL` (`1` re-quantizes every
+other type onto the same 4-bit grid: 16.0 vs 24.5 GB read per 27B decode token,
+measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32,
+see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+`PF_SI4` (SIn 4-bit), `PF_META`.
 
 ## Invariants and gotchas
 
@@ -512,6 +533,30 @@ and stop decisions).
   *after* `bind_acts(0)`, otherwise it captures the last layer's device buffers
   and the batch-1 decode head reads a buffer no kernel wrote for that step -
   while the prefill (which goes through `run_head()`) stays correct.
+* **The multi-device LM head must reach the primary device's oneDNN table, and
+  `cur_dev` must be reset to 0 before it.**  The head is a *global* tensor, so
+  `setup_md_dnnl` (which runs before the weight upload and only walks the layer
+  tensors) does not convert it; the engine adds it afterwards keyed by its
+  *uploaded* device pointer, and gives its plan call an `xq` entry (without one
+  `gemv_at` cannot take its `dnnl_call` branch).  `gemv_at` reads
+  `dnnl_for(cur_dev)` and `cur_dev` is the last layer's device after the layer
+  loop, so it is reset to 0 at the final `handoff_x`.  Miss any of these and the
+  head silently falls through to the fp32 dequant GEMV: 12.3 vs 3.4 ms/token.
+* **`handoff_x` copies only the live rows** (`nrows * nreal`, the activation
+  layout is `[token][n_embd]`).  The old full `kMaxB*kMaxT` copy moved 10.5 MB
+  per handoff - twice per token - for a single-token decode.
+* **A partial (per-device) `record_forward` must start its call cursor at the
+  phase's first layer.**  `ci` indexes the plan's *global* `call_tb`/`call_xq`/
+  `call_group_*` arrays, so `build_md_dec_graphs` uses `seg_plan::layer_c0`
+  (layer -> first call, plus a final entry for the head) to seed it.  Restarting
+  at 0 makes the later partition read the first layer's call metadata (activation
+  pointer, K) while executing its own segments: `dnnl_call` goes false, the group
+  falls back to the fp32 `gemv_group`, and the layers silently write nothing
+  (one repeated token, ~6x slower from the NaN-heavy hidden state).
+* **Multi-device decode is graphed per partition** (`build_md_dec_graphs`, one
+  graph per contiguous device run, replayed with the host handoff between them;
+  `PF_MD_GRAPH_DEV=N` limits it to device N for A/B).  It is worth ~1-2 ms/token
+  only, so per-kernel dispatch is *not* the layer GEMV's main inefficiency.
 * **GDN head pairing is modulo, attention GQA is blocked** - do not unify them.
   `gdn.cpp` pairs value head `h` with q/k head `h % n_group` (the reference
   tiles q/k with `ggml_repeat_4d`, whose repetition is modulo/interleaved),
@@ -564,9 +609,16 @@ clang-tidy -p build -checks='-*,misc-include-cleaner' <changed files>
 For the 27B (needs the layer split - it does not fit on one card), also run:
 
 ```bash
-TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref     # argmax SAME
-TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill # OK
+M=/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf
+TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref      # argmax SAME
+TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill "$M"  # OK
 ```
+
+`test_decode_vs_prefill` defaults to the 0.8B, so it needs the model path
+explicitly; `test_w4_vs_cpuref` defaults to the 27B.  The multi-device decode
+cost breakdown (and the 20 tps feasibility analysis) is in
+[`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md), with
+the `STOP_AFTER_LAYER` sweep and the decode-GEMV microbenchmarks in `dev/`.
 
 If a build seems to ignore your edit, remember `rsync -a` preserves source
 mtimes: `find src tests -name '*.cpp' -o -name '*.h' | xargs touch` first.

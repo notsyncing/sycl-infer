@@ -57,8 +57,34 @@ struct w4t {
 // True when this ggml type has a native-width linear grid here.
 bool w4_supported(uint32_t ggml_type);
 
+// PF_W4_ALL=1 re-quantizes every convertible type onto the same 4-bit grid
+// instead of keeping int8.  u4 is 0.625 B/weight against int8's 1.0625, so a 27B
+// decode reads 16.3 GB/token instead of 24.5 - but only Q4_K has a native 4-bit
+// grid, so the other types lose their native resolution (measured ~4% relative
+// L2 on the weights, against 0.98% for the int8 conversion).  Off by default.
+bool w4_all_enabled();
+
 // Pack one GGUF tensor at its native width.  Returns false (and leaves `out`
 // untouched) for unsupported types, which keep the int8 conversion.
 bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out);
+
+// ---- codebook 4-bit (IQ4_XS / IQ4_NL) --------------------------------------
+// These types are NOT a linear 4-bit grid: their values are
+//   w = scale[row][k/32] * kvalues_iq4nl[q],  q a 4-bit index
+// with the 16-entry int8 table `kvalues_iq4nl` (common/quant.h).  Storing the
+// index plane plus the per-32 f16 scale keeps the *native* values exactly (no
+// re-quantization), needs 0.5625 B/weight instead of the int8 conversion's
+// 1.0625, and - because oneDNN only knows linear u4 or s8 weights - lets prefill
+// expand the indices to int8 through the same table.
+//
+// The index plane keeps the native element order: element e of a 32-group is the
+// low nibble of byte e for e < 16 and the high nibble of byte e-16 otherwise.
+struct cb4t {
+    std::vector<uint8_t> idx;    // N*K/2 nibble indices, native order
+    std::vector<uint16_t> scale; // ng*N f16 per-32 scale, [g][n]
+    int K = 0, N = 0;
+};
+bool cb4_supported(uint32_t ggml_type); // IQ4_XS (23) / IQ4_NL (20)
+bool cb4_pack(uint32_t ggml_type, const void * src, int K, int N, cb4t & out);
 
 } // namespace si

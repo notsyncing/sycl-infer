@@ -31,6 +31,12 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
   grid, which is lossless (0.077% vs 0.98% relative L2 for the int8 conversion)
   and 1.6x smaller, so a 27B-class Q4_K model fits two 16 GB cards.  `PF_W4=0`
   restores the pure int8 path.
+* **Codebook 4-bit (IQ4_XS / IQ4_NL)** — these are a 16-entry int8 codebook times
+  a per-32 f16 scale, so the engine stores the 4-bit indices plus that scale
+  (0.5625 B/weight instead of int8's 1.0625) and expands the table in the decode
+  GEMV; prefill expands each tensor to int8 in a small reused scratch.  The
+  native values are kept exactly.  Worth ~+5% tg128 and 2.5 GB/card of device
+  memory; `PF_CB4=0` disables it.
 * **Device selection** — `--device cpu|gpu|auto`; the CPU backend has its own
   AVX2 / AVX-VNNI / AVX-512 kernels, picks the variant at run time, and keeps
   the paged KV in host RAM.
@@ -243,6 +249,7 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_DP4A` | on | `0` forces the fp32 path |
 | `PF_DP4A_DEC` | on | `0` forces fp32 decode |
 | `PF_W4` | on | native 4-bit (u4) weights for Q4_K; `0` falls back to pure int8 |
+| `PF_CB4` | on | store IQ4_XS/IQ4_NL as native codebook 4-bit; `0` keeps int8 |
 
 The full tuning/diagnostics knob list and internals are documented in
 [`AGENTS.md`](AGENTS.md).

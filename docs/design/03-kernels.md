@@ -171,6 +171,45 @@ partial 布局 `ws[((s*TB_T + t)*N) + row]`，reduce 内核求和后应用 alpha
 注释中的实测：row 映射在同一数据上约 12 GB/s，tiled 约 4 GB/s；row kernel 需要约 16k 输出行才能填满
 机器，因此小张量切 K；更小的 WG 提升常驻 warp 数。
 
+### 5.4 分组 scale 解码 GEMV（`w4_gemv.cpp`）
+
+multi-device 的单 token 解码走这两个 kernel（`dnnl_gemm::gemm_w4` / `gemm` 在 `M==1` 时调用；只
+有它们才知道每个权重张量的 oneDNN 分组 scale）：
+
+| kernel | 权重布局 | 公式 |
+|---|---|---|
+| `w4_gemv_launch` | u4 nibble 平面（K 内层、低 nibble 在前）+ `[g][n]` f16 step/off 平面 | `y[n]=Σ_g asa[g]·(step[g][n]·QDOT_g[n] + off[g][n]·XS[g])` |
+| `i8_grp_gemv_launch` | int8 行（K 内层）+ `[g][n]` f16 scale 平面 | `y[n]=Σ_g asa[g]·step[g][n]·QDOT_g[n]` |
+
+- 一个子组（32 lane）= 一个输出行 `n`；lane `l` 处理组 `g=l, l+32, …`。u4 的一个组恰好 16 连续
+  字节（一次 `uint4` 载入），int8 是 32 字节（两次 `uint4`）；激活侧 int8 用
+  `dp4a_s8u8(x, w^0x80808080, acc)`（XOR 把有符号权重变无符号，再用 `128·Σx` 校正，`Σx` 即
+  `XS`，由 `w4_xs_launch` 一次算出、同一 call 的所有张量共享）。
+- **scale staging 是这里的关键**：oneDNN 要求 scale 平面按 `[g][n]`（组在外），对逐行 GEMV 就是
+  跨 `N` 的步长访问——每个 scale 一条 cache line。因此每个 workgroup 先把 `RB` 行的 scale
+  stage 进 SLM，索引取 **g 外 / 行内**（`g=i/RB, r=i%RB`），让相邻 lane 读相邻 `n`（一次
+  64 B line 覆盖 32 个 f16），SLM 存 f16（u4 两个平面也能用 `RB=16`）。实测：int8 +10-17 %，
+  u4 最高 **-39 %**（`ffn_down` K=17408 N=5120：174 → 288 GB/s）；输出与改前逐位一致
+  （`dev/bench_decgemv_eq.cpp`）。`RB` 依 `K` 在 16/8 间回退以守住 48 KB SLM。
+- 调优细节与整机 tg128 的结果见 [`reports/tg128_20tps_evaluation.md`](../../reports/tg128_20tps_evaluation.md)。
+
+### 5.5 codebook 4-bit（IQ4_XS / IQ4_NL，`cb4_*`，`w4_gemv.cpp`）
+
+值不是网格而是 `scale[g][n] * kvalues_iq4nl[q]`（16 项 int8 码本 × 每 (行,组) f16 scale），
+所以权重存 4-bit 索引 + scale（0.5625 B/w vs int8 1.0625），**native 值精确**。
+
+* `cb4_gemv_launch`（decode，M=1）：结构与 §5.4 的 int8 GEMV 相同（g 外/行内 SLM staging、
+  `asa`/`XS`/XOR 偏差校正），差别只在权重字由 16 字节 nibble 经 **16 项 SLM LUT** 展开：
+  `w[j]` 取 byte `4j..4j+3` 的低 nibble，`w[4+j]` 取它们的高 nibble（位移 `8b` / `8b+4`）。
+  实测每张量比 int8 GEMV 快 11-20 %（head 3.31→2.63 ms），但有效 GB/s 更低（272 vs 408）。
+* `cb4_expand_launch`（prefill 用）：把索引展开成 int8 到 `dnnl_gemm` 的复用 scratch，再跑
+  已有的 int8 primitive（oneDNN 每次 execute 重读权重 memory，已验证）。向量化：一个
+  work-item 处理一组（16 字节载入 + 两个 16 字节写出）；标量版会让 prefill 从 ~1500 掉到 940 t/s。
+* 元素序（§10.2 of 02-quantization.md）：每组 16 字节，`e<16` 是 byte `e` 的低 nibble、
+  `e>=16` 是 byte `e-16` 的高 nibble——`cb4_pack`、GEMV、展开三处必须一致。
+* 逐位对拍：`dev/bench_cb4.cpp` 同时算 host 公式、kernel 逻辑的 CPU 仿真、GPU 三者
+  （随机 nibble，max rel 0.000000）。
+
 ---
 
 ## 6. `qk_norm_rope_launch`（`qk_norm_rope.cpp:14-171`）
