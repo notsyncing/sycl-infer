@@ -210,6 +210,23 @@ multi-device 的单 token 解码走这两个 kernel（`dnnl_gemm::gemm_w4` / `ge
 * 逐位对拍：`dev/bench_cb4.cpp` 同时算 host 公式、kernel 逻辑的 CPU 仿真、GPU 三者
   （随机 nibble，max rel 0.000000）。
 
+### 5.6 原生 5-bit（Q5_K，`k5_*`，`w4_gemv.cpp`）
+
+* `k5_gemv_launch`（decode，M=1）：与 `w4_gemv_launch` 同构（同 `RB=16`、同 g 外/行内 f16
+  SLM scale staging、同 `asa`/`XS`/修正公式），权重侧多一个平面：`vals` 的 uint4
+  给出 32 个 nibble，`hi`（每 32 组 4 字节）按 split 序取第 5 位，`lt[16]` 把 4 bit 展开成
+  4 字节 0/1，`l0 |= lt[…] << 4` 后与 §5.4 一样 8 次 `dp4a_s8u8`。4 条独立累加链
+  （单链慢 ~3 %）。实测 400-443 GB/s（405 GB/s 上限的 99-109 %）。
+* `k5_expand_launch`（prefill）：元素序 int8 = `lo4 | (bit << 4)`。偶/奇两半各自用
+  `bit_lut` 展开成字节后按 4 字节字内交错（`p = (ev & 0x00FF00FF) | ((od & 0x00FF00FF) << 8)`，
+  `t` 同理），每 8 值 2 个 `uint4` 存储。`bit_lut` 由 `dnnl_gemm` 持有（16×uint32，设备内存）。
+  写必须是 `uint4`：8 次 32-bit 分散写把内核压到 200 GB/s（指令/存储受限），
+  改向量写后 425 GB/s。
+* 元素序不变量（`k5_pack`、GEMV、展开三处）：`vals` 交错（byte k = 2k/2k+1），`hi` split
+  （bit i = 偶元素 2i，bit 16+i = 奇元素 2i+1）。逐位校验：`test_k5_gemv`
+  用真实模型的 Q5_K 张量，与 `dequantize_block_q5_K` 的 native q5 对拍，
+  实测 max rel 5.7e-08（float32 舍入）。
+
 ---
 
 ## 6. `qk_norm_rope_launch`（`qk_norm_rope.cpp:14-171`）

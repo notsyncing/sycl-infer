@@ -31,6 +31,13 @@ Qwen3.5-0.8B (Q4_K_M) on Intel Iris Xe-LP; the engine itself is not tied to it.
   grid, which is lossless (0.077% vs 0.98% relative L2 for the int8 conversion)
   and 1.6x smaller, so a 27B-class Q4_K model fits two 16 GB cards.  `PF_W4=0`
   restores the pure int8 path.
+* **Native 5-bit (Q5_K)** — Q5_K's grid is `q5 = lo4 | (hi1 << 4)` with a
+  per-32 `(step, offset)` pair, so the engine keeps the 4-bit nibble plane plus
+  a separate 1-bit plane (0.75 B/weight against int8's 1.125) and recombines
+  them with one OR in the decode GEMV.  Q5_K is 35% of a UD-Q4_K_M model's
+  weights, so this is the largest single per-token byte saving available, and
+  the native values are kept exactly.  Worth ~+6% tg128 and 2.1 GB/card of
+  device memory; `PF_K5=0` disables it.
 * **Codebook 4-bit (IQ4_XS / IQ4_NL)** — these are a 16-entry int8 codebook times
   a per-32 f16 scale, so the engine stores the 4-bit indices plus that scale
   (0.5625 B/weight instead of int8's 1.0625) and expands the table in the decode
@@ -250,6 +257,7 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_DP4A_DEC` | on | `0` forces fp32 decode |
 | `PF_W4` | on | native 4-bit (u4) weights for Q4_K; `0` falls back to pure int8 |
 | `PF_CB4` | on | store IQ4_XS/IQ4_NL as native codebook 4-bit; `0` keeps int8 |
+| `PF_K5` | on | store Q5_K as the native 5-bit (nibble + bit) planes; `0` keeps int8 |
 
 The full tuning/diagnostics knob list and internals are documented in
 [`AGENTS.md`](AGENTS.md).

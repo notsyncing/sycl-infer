@@ -47,6 +47,17 @@ struct dnnl_gemm {
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
     bool has_weight_w4(const void * key) const;
 
+    // ---- native-width 5-bit weights (Q5_K, see common/w4.h) ---------------
+    // The 4-bit nibble plane plus a 1-bit fifth-bit plane and the same two
+    // per-(g,n) f16 planes the u4 path uses: 0.75 B/weight against the int8
+    // conversion's 1.125, with the native values kept exactly (no tensor is
+    // re-quantized).  Decode recombines the planes in-kernel (k5_gemv_launch,
+    // measured at the card's read ceiling); prefill expands q5 to int8 into the
+    // shared scratch and runs the grouped-scale int8 primitive with the u4
+    // offset-correction epilogue.
+    bool add_weight_k5(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
+    bool has_weight_k5(const void * key) const;
+
     // ---- codebook 4-bit weights (IQ4_XS / IQ4_NL, see common/w4.h) ---------
     // The native nibble indices plus one f16 scale per (32-value group, row):
     // 0.5625 B/weight instead of the int8 conversion's 1.0625, with the native

@@ -775,7 +775,7 @@ void engine::upload_device_weights(int dev) {
         }
         if (dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
             && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data)
-                || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
+                || dnnl_dev_[(size_t)dev]->has_weight_k5(t.data) || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
             // the oneDNN int8 (XMX) copy - or the u4 (4-bit) copy - replaces the
             // raw device copy.  This must cover the 4-bit path too: otherwise the
             // raw fp32 weight gets uploaded, wkey() starts returning the device
@@ -853,7 +853,12 @@ bool engine::setup_md_dnnl() {
             const char * e = getenv("PF_W4");
             return !e || atoi(e) != 0;
         }();
-        int n_w4 = 0, n_i8 = 0, n_cb = 0;
+        int n_w4 = 0, n_i8 = 0, n_cb = 0, n_k5 = 0;
+        // PF_K5=0 keeps Q5_K on the int8 conversion (A/B knob)
+        static const bool add_k5 = [] {
+            const char * e = getenv("PF_K5");
+            return !e || atoi(e) != 0;
+        }();
         // PF_CB4=0 keeps IQ4_XS/IQ4_NL on the int8 conversion (A/B knob)
         static const bool add_cb = [] {
             const char * e = getenv("PF_CB4");
@@ -866,6 +871,12 @@ bool engine::setup_md_dnnl() {
             if (w4_on && D->add_weight_w4(t.data, t.data, t.type, t.K, t.N)) {
                 dev_ok = true;
                 n_w4++;
+                return;
+            }
+            // PF_K5=0 keeps Q5_K on the int8 conversion (A/B knob)
+            if (add_k5 && D->add_weight_k5(t.data, t.data, t.type, t.K, t.N)) {
+                dev_ok = true;
+                n_k5++;
                 return;
             }
             if (add_cb && D->add_weight_cb4(t.data, t.data, t.type, t.K, t.N)) {
@@ -910,8 +921,8 @@ bool engine::setup_md_dnnl() {
             }
         }
         if (dev_ok) {
-            fprintf(stderr, "[dev] device %zu weights: %d u4, %d codebook, %d int8, %.1f MiB on device\n", d, n_w4,
-                    n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
+            fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
+                    n_w4, n_k5, n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
             const char * envw = getenv("PF_DNNL_NOWARM");
             if (!(envw && atoi(envw) != 0)) {
                 D->warmup();

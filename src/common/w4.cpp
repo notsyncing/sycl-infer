@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 
 namespace si {
@@ -175,6 +177,93 @@ bool cb4_pack(uint32_t ggml_type, const void * src, int K, int N, cb4t & out) {
     out.K = K;
     out.N = N;
     return true;
+}
+
+// Q5_K: 256-element super-block, 8 groups of 32; per group q5 = (qs nibble) |
+// (qh bit << 4) and w = d*sc*q5 - dmin*m, with the 6-bit (sc, m) pair read by
+// get_scale_min_k4.  The native qs layout is split-half (the low nibble of
+// qs[l] is element j+l, the high nibble element j+32+l), while the decode GEMV
+// wants the interleaved u4 layout, so the nibbles are repacked here; the fifth
+// bits (one per element, strided across qh) become the separate `hi` plane in
+// the split-plane element order the kernel reads.
+static bool pack_q5_K(const void * src, int K, int N, k5t & out) {
+    if (K % QK_K != 0) {
+        return false;
+    }
+    const int ng = K / kW4Group;
+    out.vals.assign((size_t)N * K / 2, 0);
+    out.hi.assign((size_t)N * (K / 8), 0);
+    out.scale.assign((size_t)ng * N, 0);
+    out.off.assign((size_t)ng * N, 0);
+    const size_t row_bytes = quant_row_bytes(13, K);
+    for (int n = 0; n < N; n++) {
+        const uint8_t * row = (const uint8_t *)src + (size_t)n * row_bytes;
+        uint8_t * vrow = out.vals.data() + (size_t)n * (K / 2);
+        uint8_t * hrow = out.hi.data() + (size_t)n * (K / 8);
+        for (int b = 0; b < K / QK_K; b++) {
+            const block_q5_K * x = (const block_q5_K *)row + b;
+            const float d = ggml_half_to_float(x->d);
+            const float mn = ggml_half_to_float(x->dmin);
+            const uint8_t * qs = x->qs;
+            const uint8_t * qh = x->qh;
+            int is = 0;
+            int p = 0; // bit position of this 64-block's pair inside qh[]
+            for (int j = 0; j < QK_K; j += 64) {
+                uint8_t sc0, m0, sc1, m1;
+                get_scale_min_k4(is + 0, x->scales, &sc0, &m0);
+                get_scale_min_k4(is + 1, x->scales, &sc1, &m1);
+                const int g = (b * QK_K + j) / kW4Group; // +0 = low nibbles, +1 = high
+                out.scale[(size_t)g * N + n] = ggml_float_to_half(d * sc0);
+                out.off[(size_t)g * N + n] = (uint16_t)ggml_float_to_half(-mn * m0);
+                out.scale[(size_t)(g + 1) * N + n] = ggml_float_to_half(d * sc1);
+                out.off[(size_t)(g + 1) * N + n] = (uint16_t)ggml_float_to_half(-mn * m1);
+                uint16_t ev0 = 0, od0 = 0, ev1 = 0, od1 = 0;
+                for (int l = 0; l < 32; l++) {
+                    const size_t e0 = (size_t)b * QK_K + j + l; // group g, element l
+                    const size_t e1 = e0 + 32;                   // group g+1
+                    vrow[e0 >> 1] |= (uint8_t)((qs[l] & 0xF) << ((e0 & 1) * 4));
+                    vrow[e1 >> 1] |= (uint8_t)(((qs[l] >> 4) & 0xF) << ((e1 & 1) * 4));
+                    const int b0 = (qh[l] >> p) & 1;
+                    const int b1 = (qh[l] >> (p + 1)) & 1;
+                    if (l & 1) {
+                        od0 |= (uint16_t)(b0 << (l >> 1));
+                        od1 |= (uint16_t)(b1 << (l >> 1));
+                    } else {
+                        ev0 |= (uint16_t)(b0 << (l >> 1));
+                        ev1 |= (uint16_t)(b1 << (l >> 1));
+                    }
+                }
+                // 4 bytes per group: even-element bits then odd-element bits
+                uint8_t * h0 = hrow + (size_t)g * 4;
+                uint8_t * h1 = h0 + 4;
+                h0[0] = (uint8_t)(ev0 & 0xFF);
+                h0[1] = (uint8_t)(ev0 >> 8);
+                h0[2] = (uint8_t)(od0 & 0xFF);
+                h0[3] = (uint8_t)(od0 >> 8);
+                h1[0] = (uint8_t)(ev1 & 0xFF);
+                h1[1] = (uint8_t)(ev1 >> 8);
+                h1[2] = (uint8_t)(od1 & 0xFF);
+                h1[3] = (uint8_t)(od1 >> 8);
+                qs += 32;
+                is += 2;
+                p += 2;
+            }
+        }
+    }
+    out.K = K;
+    out.N = N;
+    return true;
+}
+
+bool k5_supported(uint32_t ggml_type) {
+    return ggml_type == 13; // Q5_K
+}
+
+bool k5_pack(uint32_t ggml_type, const void * src, int K, int N, k5t & out) {
+    if (!src || !k5_supported(ggml_type) || K <= 0 || N <= 0 || (K % QK_K) != 0) {
+        return false;
+    }
+    return pack_q5_K(src, K, N, out);
 }
 
 bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {

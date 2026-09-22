@@ -245,6 +245,153 @@ void i8_grp_gemv_launch(queue & q, const int8_t * w8, const uint16_t * wsc, cons
 }
 
 
+// ---- native-width 5-bit (Q5_K) ---------------------------------------------
+// The weights are the u4 nibble plane (so the even/odd activation split above is
+// reused unchanged) plus a 1-bit fifth-bit plane, recombined as lo4 | (bit << 4)
+// - an OR, exact since lo4 < 16.  That is the whole extra cost over the u4
+// kernel: 8 SLM LUT loads + 16 ALU per 32 values, against reading 0.75 B/weight
+// instead of the int8 conversion's 1.125 and keeping the native values exactly.
+// Measured at the card's ~405 GB/s read ceiling (the int8 GEMV reaches 92% of
+// it), so the unpack is entirely hidden - see dev/bench_native56.cpp.
+//
+// The `hi` plane is 4 bytes per 32-group, laid out in the *split-plane* element
+// order so that one nibble of an expanded mask covers exactly the four elements
+// of one dp4a operand: bits 0-15 are the even elements (2i -> bit i), bits 16-31
+// the odd ones (2i+1 -> bit i).  The 16-entry SLM table maps such a nibble to
+// four bytes of 0/1 in one load.
+static constexpr int kK5RB = 16;
+
+template <int RB>
+static void k5_gemv_impl(queue & q, const uint8_t * vals, const uint8_t * hi, const uint16_t * scale,
+                         const uint16_t * off, const int8_t * axe, const int8_t * axo, const uint16_t * asa,
+                         const float * xs, float * out, const float * residual, float alpha, int K, int N) {
+    const int ng = K / 32;
+    constexpr int TX = RB * 32;
+    const int nwg = (N + RB - 1) / RB;
+    q.submit([&](handler & h) {
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        local_accessor<uint32_t, 1> lt(16, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            const int n0 = (int)it.get_group(0) * RB;
+            if (lid < 16) {
+                lt[lid] = (uint32_t)((lid >> 0) & 1) | ((uint32_t)((lid >> 1) & 1) << 8)
+                          | ((uint32_t)((lid >> 2) & 1) << 16) | ((uint32_t)((lid >> 3) & 1) << 24);
+            }
+            // g-major / row-inner scale staging (see the file header)
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int r = i % RB;
+                const int n = n0 + r;
+                const bool ok = n < N;
+                const size_t src = (size_t)g * N + n;
+                meta[i] = ok ? scale[src] : (uint16_t)0;
+                meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int n = n0 + sg;
+            if (n >= N) {
+                return;
+            }
+            const uint8_t * lrow = vals + (size_t)n * (size_t)(K / 2);
+            const uint8_t * hrow = hi + (size_t)n * (size_t)(K / 8);
+            float acc = 0.f;
+            for (int g = lane; g < ng; g += 32) {
+                const uint4 wv = *reinterpret_cast<const uint4 *>(lrow + (size_t)g * 16);
+                uint32_t l0 = wv.x() & 0x0F0F0F0Fu, l1 = wv.y() & 0x0F0F0F0Fu;
+                uint32_t l2 = wv.z() & 0x0F0F0F0Fu, l3 = wv.w() & 0x0F0F0F0Fu;
+                uint32_t h0 = (wv.x() >> 4) & 0x0F0F0F0Fu, h1 = (wv.y() >> 4) & 0x0F0F0F0Fu;
+                uint32_t h2 = (wv.z() >> 4) & 0x0F0F0F0Fu, h3 = (wv.w() >> 4) & 0x0F0F0F0Fu;
+                const uint32_t hb = *reinterpret_cast<const uint32_t *>(hrow + (size_t)g * 4);
+                l0 |= lt[(hb >> 0) & 0xFu] << 4;
+                l1 |= lt[(hb >> 4) & 0xFu] << 4;
+                l2 |= lt[(hb >> 8) & 0xFu] << 4;
+                l3 |= lt[(hb >> 12) & 0xFu] << 4;
+                h0 |= lt[(hb >> 16) & 0xFu] << 4;
+                h1 |= lt[(hb >> 20) & 0xFu] << 4;
+                h2 |= lt[(hb >> 24) & 0xFu] << 4;
+                h3 |= lt[(hb >> 28) & 0xFu] << 4;
+                const uint32_t * xe = reinterpret_cast<const uint32_t *>(axe + (size_t)g * 16);
+                const uint32_t * xo = reinterpret_cast<const uint32_t *>(axo + (size_t)g * 16);
+                // four independent accumulator chains: the serial one costs ~3%
+                int32_t q0 = dp4a_s8u8(xe[0], l0, 0);
+                q0 = dp4a_s8u8(xe[1], l1, q0);
+                int32_t q1 = dp4a_s8u8(xe[2], l2, 0);
+                q1 = dp4a_s8u8(xe[3], l3, q1);
+                int32_t q2 = dp4a_s8u8(xo[0], h0, 0);
+                q2 = dp4a_s8u8(xo[1], h1, q2);
+                int32_t q3 = dp4a_s8u8(xo[2], h2, 0);
+                q3 = dp4a_s8u8(xo[3], h3, q3);
+                const int32_t qd = (q0 + q1) + (q2 + q3);
+                const float sa = w4_h2f(asa[g]);
+                const size_t mo = (size_t)g * RB + sg;
+                acc += sa * (w4_h2f(meta[mo]) * (float)qd + w4_h2f(meta[(size_t)RB * ng + mo]) * xs[g]);
+            }
+            const sub_group sgg = it.get_sub_group();
+            const float tot = reduce_over_group(sgg, acc, plus<float>());
+            if (lane == 0) {
+                float v = alpha * tot;
+                if (residual) {
+                    v += residual[n];
+                }
+                out[n] = v;
+            }
+        });
+    });
+}
+
+void k5_gemv_launch(queue & q, const uint8_t * vals, const uint8_t * hi, const uint16_t * scale, const uint16_t * off,
+                    const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
+                    const float * residual, float alpha, int K, int N) {
+    const int ng = K / 32;
+    const auto fits = [&](int rb) { return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) + 64 <= 48 * 1024; };
+    if (fits(kK5RB)) {
+        k5_gemv_impl<kK5RB>(q, vals, hi, scale, off, axe, axo, asa, xs, out, residual, alpha, K, N);
+    } else {
+        k5_gemv_impl<8>(q, vals, hi, scale, off, axe, axo, asa, xs, out, residual, alpha, K, N);
+    }
+}
+
+// Expand the (nibble, fifth-bit) planes into plain int8 q5 values in [0,31] for
+// the prefill matmul:  out[n*K + k] = lo4 | (bit << 4).  Element order matters
+// here (oneDNN's s8 weights are [N][K] row-major), while both source planes are
+// stored in the split order, so the two halves are re-interleaved with a byte
+// spread.  `bit_lut` is the 16-entry table the decode kernel builds in SLM
+// (4 bits -> 4 bytes of 0/1), shared here through device memory.
+void k5_expand_launch(queue & q, const uint8_t * vals, const uint8_t * hi, const uint32_t * bit_lut, int8_t * out, int K,
+                      int N) {
+    const int ng = K / 32;
+    if (ng <= 0 || N <= 0) {
+        return;
+    }
+    q.parallel_for(range<1>((size_t)N * ng), [=](id<1> i) {
+        const int n = (int)(i / (size_t)ng);
+        const int g = (int)(i % (size_t)ng);
+        const uint8_t * vrow = vals + (size_t)n * (K / 2) + (size_t)g * 16;
+        const uint32_t hb = *reinterpret_cast<const uint32_t *>(hi + (size_t)n * (K / 8) + (size_t)g * 4);
+        uint32_t w[8];
+        // Per 4 input bytes: the even and odd halves are rebuilt as 4-byte words,
+        // then interleaved into element order.  A 64-bit byte-spread here costs
+        // ~40 instructions per 8 values and capped this kernel at 200 GB/s (49%
+        // of the read ceiling, instruction-bound); the 32-bit form below is ~12.
+#pragma unroll
+        for (int q4 = 0; q4 < 4; q4++) {
+            const uint32_t v = *reinterpret_cast<const uint32_t *>(vrow + 4 * q4);
+            const uint32_t ev = (v & 0x0F0F0F0Fu) | (bit_lut[(hb >> (4 * q4)) & 0xFu] << 4);
+            const uint32_t od = ((v >> 4) & 0x0F0F0F0Fu) | (bit_lut[(hb >> (16 + 4 * q4)) & 0xFu] << 4);
+            const uint32_t p = (ev & 0x00FF00FFu) | ((od & 0x00FF00FFu) << 8);
+            const uint32_t t = ((ev >> 8) & 0x00FF00FFu) | (((od >> 8) & 0x00FF00FFu) << 8);
+            w[2 * q4] = (p & 0xFFFFu) | (t << 16);
+            w[2 * q4 + 1] = (p >> 16) | (t & 0xFFFF0000u);
+        }
+        uint32_t * dw = reinterpret_cast<uint32_t *>(out + (size_t)n * K + (size_t)g * 32);
+        *reinterpret_cast<uint4 *>(dw) = uint4(w[0], w[1], w[2], w[3]);
+        *reinterpret_cast<uint4 *>(dw + 4) = uint4(w[4], w[5], w[6], w[7]);
+    });
+}
+
 // ---- codebook 4-bit (IQ4_XS / IQ4_NL) --------------------------------------
 // The weights are 4-bit indices into the 16-entry int8 table `lut` plus a per-32
 // f16 scale per row.  Expanding the indices through the table inside the kernel

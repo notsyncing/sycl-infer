@@ -401,3 +401,58 @@ oneDNN 只认线性 `u4` 或 `s8`（`dnnl_common_types.h` 里有 `s4/u4/f4_e2m1/
 
 `PF_CB4=0` 退回 int8 转换（A/B 用）。tg 收益受限于 LUT kernel 是半 ALU/延迟受限，
 以及 codebook 类型只占每 token 字节的 19 %。
+
+## 11. 原生 5-bit（Q5_K，`PF_K5`，默认开）
+
+Q5_K 的原生栅格是
+
+```
+q5 = (qs nibble) | (qh bit << 4)   ∈ [0,31]
+w  = d·sc_j · q5 − dmin·m_j          （每 32 个一组，6-bit (sc,m) 由 get_scale_min_k4 取出）
+```
+
+它**不是** 4-bit 栅格：UD-Q4_K_M 里 Q5_K 占 7.03 G 权重（本模型权重的 35 %），
+曾经只能 int8 转换（1.0625 B/w）。丢掉第 5 位（`PF_W4_ALL` 的 u4 重化）会损失该类型的
+原生分辨率（~5 % 相对误差），所以这里**保留 5 位**，只换布局：
+
+| 平面 | 布局 | 大小 |
+|---|---|---|
+| `vals` | 4-bit nibble，**交错**（byte k = 元素 2k 低 nibble / 2k+1 高 nibble） | K/2 |
+| `hi` | 第 5 位，**按 split 元素序**：每 32 组 4 字节，bit 0-15 = 偶元素 2i→bit i，bit 16-31 = 奇元素 2i+1→bit i | K/8 |
+| `scale` / `off` | `[g][n]` f16 step = d·sc、off = −dmin·m（与 u4 同一约定） | 各 K/32·N·2 |
+
+即 0.5 + 0.125 + 0.125 = **0.75 B/w，native 值精确**（只有 step/off 的 f16 舍入，
+与 u4 路径同量级）。
+
+为什么 `hi` 用 split 序而不是元素序：解码 GEMV 复用 u4 的 **偶/奇激活平面**
+（`axe`/`axo`），一个 dp4a 操作数的 4 个元素正好是同一 split 序的相邻 4 位——
+于是 4 bit 经 16 项 SLM LUT 展开成 4 字节掩码后，`q5 = lo4 | (mask << 4)`
+（OR 即加，lo4 < 16），代价只有每 32 值 8 次 LUT 读 + 8 次 OR + 8 次 shift，
+**内核仍纯带宽受限**：实测每张量 400-443 GB/s（100-109 % 的 405 GB/s 上限），
+而 int8 GEMV 只有 82-92 %；同形状比 int8 快 1.5x（`dev/bench_native56.cpp`）。
+
+### 11.1 decode / prefill 两条路
+
+* **decode**：`k5_gemv_launch`（`w4_gemv.cpp`），0.75 B/w 直接读，无展开。
+* **prefill**：oneDNN 只认 `u4`/`s8`，所以 `k5_expand_launch` 把两个平面重排成元素序 int8
+  写进与 cb4 共享的 scratch（~89 MB），再跑**已有的分组 scale int8 primitive**；
+  `off` 项用 u4 的修正 epilogue（`w4_epilogue_launch`）加回。代价是每 pass
+  多 0.625（读）+ 1.0（写）B/w 的**串行**流量（M=512 时 GEMM 自身的权重读被算力掩盖，
+  展开流量则不能），实测 pp512 −15..−20 %；`PF_K5_NOCORR=1` 可去掉修正项做二分定位
+  （约占其中 5 %）。
+* 展开内核本身必须是**向量写**：早期版本每 work-item 8 次 32-bit 分散存储只能到
+  200 GB/s（纯指令/存储受限），改成两个 `uint4` 存储后 425 GB/s（上限的 105 %）。
+  注意 2D `range` 会打乱 work-item→数据映射，反而更慢（98 GB/s），保持一维。
+
+### 11.2 实测（27B，2×A770，`--layer-map 0-31:gpu.0,32-63:gpu.1`）
+
+| | `PF_K5=0` | `PF_K5=1` |
+|---|---:|---:|
+| tg128 | 13.48 t/s | **14.34（+6.4 %）** |
+| pp512 | 1438 t/s | ~1140（−20 %） |
+| dev0 dnnl 权重 | 9637.7 MiB | **9072.1** |
+| dev1 dnnl 权重 | 9354.1 MiB | **7824.5** |
+| vs fp32 参考 mean\|diff\| | 0.0375 | **0.0354**（更准） |
+
+精度反而更好（保留 native 值），设备显存合计 −2.1 GB。pp 的代价是展开流量，
+`--kv-type i4` 或后续把展开分块进 L2 才能收回。

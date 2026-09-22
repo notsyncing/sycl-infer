@@ -503,7 +503,10 @@ and stop decisions), `PF_ROWACT` (restore the now-unused per-row activation
 quantizer for A/B; it is dead because oneDNN reads the per-32-group form, and
 cost ~13 ms/token in a 27B multi-device decode), `PF_W4_RB` (decode GEMV rows
 per workgroup, default 16), `PF_CB4` (`0` keeps IQ4_XS/IQ4_NL on the int8
-conversion instead of the native codebook store), `PF_MD_GRAPH_DEV` (record the multi-device decode
+conversion instead of the native codebook store), `PF_K5` (`0` keeps Q5_K on
+the int8 conversion instead of the native 5-bit store; the prefill cost below is
+what it buys), `PF_K5_NOCORR` (drop the prefill offset correction - diagnostic
+bisection for the k5 prefill cost), `PF_MD_GRAPH_DEV` (record the multi-device decode
 command graph only for device N; `99` = none, for A/B against the direct
 replay), `PF_PROF_ALL` (with `PF_PROF`: dump every call group's ms/step instead
 of the top 8).
@@ -512,6 +515,13 @@ of the top 8).
 `PF_W4` (native u4 for Q4_K, default on), `PF_CB4` (store IQ4_XS/IQ4_NL as native 4-bit codebook indices + a per-32 f16
 scale, 0.5625 B/weight and lossless, decoded by a LUT-expanding GEMV; prefill
 expands each tensor to int8 in a reused scratch - see
+[`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+`PF_K5` (store Q5_K as the native 5-bit grid: 4-bit nibble plane + 1-bit plane
++ per-(g,n) f16 step/offset, 0.75 B/weight and lossless, recombined with one OR
+in the decode GEMV; prefill expands q5 to int8 in the shared scratch and runs
+the grouped-scale int8 primitive with the u4 offset-correction epilogue - i.e.
+it costs ~1.6 B/weight of *serial* prefill traffic per pass, measured -15..-20%
+pp512 for +6% tg128 and -2.1 GB/card; see
 [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
 `PF_W4_ALL` (`1` re-quantizes every
 other type onto the same 4-bit grid: 16.0 vs 24.5 GB read per 27B decode token,

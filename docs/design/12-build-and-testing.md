@@ -64,6 +64,7 @@ SYCL device pass 之外。新增 CPU 内核要同时加入该列表。
 | `test_gemv` | GPU | 每个真实 GGUF 张量的 GEMV vs CPU 反量化参考，多 TB |
 | `test_dp4a` | GPU | SIn 重排 + DP4A GEMM vs 同量化输入的 CPU 参考，报告相对 fp32 的量化误差 |
 | `test_w4_gemm` | GPU | u4 prefill GEMM（`dnnl_gemm::gemm_w4`）vs 真实反量化权重的 fp32 参考（残差应只含权重表示误差 ~0.08%） |
+| `test_k5_gemv` | GPU | 原生 5-bit（Q5_K）decode GEMV vs `dequantize_block_q5_K` 的 native q5 参考（应精确到 f32 舍入，实测 max rel 5.7e-08） |
 | `test_w4_vs_i8` | GPU | 同一批量化激活下 u4 GEMM vs int8 GEMM 的逐张量比较，用于定位 u4 打包/元数据的偏差 |
 | `test_gemv_stride` | GPU | `gemv_group` 在引擎真实参数组合下的探针：`x_stride == K` vs `2*K`（gate/up 交错）、`residual == nullptr` vs `out`（原地残差） |
 | `test_iq_dequant` | GPU | IQ*/Q3_K 的 GPU 反量化/GEMV vs `quant.h` 主机参考（用 27B 混合量化模型；缺失张量跳过） |

@@ -485,7 +485,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     // routed to oneDNN, so all of them must be convertible
                     const bool need = sj.w8.vals || multi_dev;
                     if (need
-                        && (!(D->has_weight(key) || D->has_weight_w4(key) || D->has_weight_cb4(key))
+                        && (!(D->has_weight(key) || D->has_weight_w4(key) || D->has_weight_k5(key)
+                              || D->has_weight_cb4(key))
                             || kk != plan.call_xq[idx].K)) {
                         return false;
                     }

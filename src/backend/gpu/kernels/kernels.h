@@ -125,6 +125,18 @@ void w4_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scal
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int K, int N);
 
+// Native-width 5-bit (Q5_K) decode GEMV (M == 1): the nibble plane is the u4
+// one, so the even/odd activation split is reused; the fifth bit comes from the
+// `hi` plane and is recombined with one OR per dp4a operand.  See common/w4.h.
+//   y[n] = sum_g asa[g] * ( step[g][n]*QDOT_g[n] + off[g][n]*XS[g] )
+void k5_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint8_t * hi, const uint16_t * scale,
+                    const uint16_t * off, const int8_t * axe, const int8_t * axo, const uint16_t * asa,
+                    const float * xs, float * out, const float * residual, float alpha, int K, int N);
+// expand the two 5-bit planes into int8 q5 in element order, for the prefill
+// matmul: out[n*K + k] = lo4 | (bit << 4), in [0,31]
+void k5_expand_launch(sycl::queue & q, const uint8_t * vals, const uint8_t * hi, const uint32_t * bit_lut, int8_t * out,
+                      int K, int N);
+
 // Codebook 4-bit (IQ4_XS / IQ4_NL) decode GEMV (M == 1) and the index->int8
 // expansion the prefill matmul needs.  See common/w4.h and w4_gemv.cpp.
 //   y[n] = sum_g asa[g] * scale[g][n] * QDOT_g[n],  QDOT from the 16-entry int8

@@ -355,6 +355,7 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 | `PF_GEMM_DNNL` / `PF_DNNL_NOWARM` / `PF_DNNL_TIME` | oneDNN 路径 |
 | `PF_META` / `PF_SI4` / `PF_W4` | 权重旁路数组 / 4-bit 重化 / 原生 4-bit（u4）权重路径 |
 | `PF_CB4` / `PF_W4_ALL` / `PF_W4_RB` | IQ4_XS/IQ4_NL 码本 4-bit（默认开）/ 全类型重化到 u4（有损）/ 解码 GEMV 的 rows-per-workgroup（默认 16） |
+| `PF_K5` / `PF_K5_NOCORR` | Q5_K 原生 5-bit（nibble + 第 5 位平面，默认开）/ 预填充去掉修正 epilogue（诊断二分，会算错） |
 | `PF_ATTN_SPLIT` / `PF_ATTN_SPLIT_KEYS` / `PF_ATTN_FUSE` / `PF_DEC_SPLIT` / `PF_DEC_GROUP` / `PF_ATTN_VEC` | attention |
 | `PF_GDN_COLS` / `PF_GDN_WG` / `PF_GDN_VEC` / `PF_GDN_FUSE` / `PF_GDN_DBG` | GDN |
 | `PF_GEMV_*` / `PF_GEMM_*` / `PF_MT_*` / `GEMV_*` | GEMV/GEMM 调优 |

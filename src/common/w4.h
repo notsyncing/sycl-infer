@@ -68,6 +68,40 @@ bool w4_all_enabled();
 // untouched) for unsupported types, which keep the int8 conversion.
 bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out);
 
+// ---- native-width 5-bit (Q5_K) ---------------------------------------------
+// Q5_K sits on a 5-bit grid,  q5 = lo4 | (hi1 << 4),  w = d*sc*q5 - dmin*m  per
+// 32-group.  Keeping the fifth bit in its own plane - rather than re-quantizing
+// onto the 4-bit grid - keeps the *native* values exactly (no Q5_K tensor loses
+// resolution) and reads 0.75 B/weight against the int8 conversion's 1.125.
+// Q5_K is 35% of this model's weights, so that is the single largest per-token
+// byte saving available, and it applies to every Q5_K tensor (attn_qkv,
+// attn_gate, ssm_out, ffn gate/up/down).
+//
+// Layout: `vals` is the same interleaved nibble plane the u4 path builds (byte k
+// holds elements 2k low-nibble / 2k+1 high-nibble), so the decode GEMV's
+// even/odd activation split is reused unchanged; `hi` carries the fifth bit in
+// the *element order of the split planes* so that one nibble of an expanded
+// mask word covers exactly the four elements of one dp4a operand:
+//   per 32-group 4 bytes, bits 0-15 = even elements 2i -> bit i,
+//   bits 16-31 = odd elements 2i+1 -> bit i.
+// The kernel recombines with a single OR (exact: lo4 < 16, so OR is +) and stays
+// purely bandwidth-bound - measured at the card's ~405 GB/s read ceiling, where
+// the int8 GEMV runs at 92% of it.
+struct k5t {
+    std::vector<uint8_t> vals;   // [N][K/2] nibbles, interleaved (u4 layout)
+    std::vector<uint8_t> hi;     // [N][K/8] fifth bit, 4 bytes per 32-group
+    std::vector<uint16_t> scale; // [ng][N] f16 step = d*sc
+    std::vector<uint16_t> off;   // [ng][N] f16 additive constant = -dmin*m
+    int K = 0;
+    int N = 0;
+    bool ok() const {
+        return !vals.empty() && !hi.empty() && !scale.empty() && !off.empty();
+    }
+};
+
+bool k5_supported(uint32_t ggml_type); // Q5_K (13)
+bool k5_pack(uint32_t ggml_type, const void * src, int K, int N, k5t & out);
+
 // ---- codebook 4-bit (IQ4_XS / IQ4_NL) --------------------------------------
 // These types are NOT a linear 4-bit grid: their values are
 //   w = scale[row][k/32] * kvalues_iq4nl[q],  q a 4-bit index

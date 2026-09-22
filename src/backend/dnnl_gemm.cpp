@@ -338,6 +338,22 @@ struct dnnl_gemm::impl {
     };
     std::unordered_map<const void *, w4_entry> w4weights;
 
+    // Native-width 5-bit (Q5_K): the u4 nibble plane, a 1-bit fifth-bit plane
+    // and the same two per-(g,n) f16 planes the u4 path keeps.  Decode
+    // recombines the planes in-kernel; prefill expands q5 to int8 into
+    // cb4_scratch and runs the grouped-scale int8 primitive with the u4
+    // offset-correction epilogue (off = -dmin*m).
+    struct k5_entry {
+        int K = 0, N = 0, ng = 0;
+        uint8_t * vals = nullptr;    // [N][K/2] nibbles, interleaved
+        uint8_t * hi = nullptr;      // [N][K/8] fifth bit, 4 bytes per 32-group
+        uint16_t * scales = nullptr; // [ng][N] f16 step = d*sc
+        uint16_t * off = nullptr;    // [ng][N] f16 additive constant = -dmin*m
+        bool ok = false;
+    };
+    std::unordered_map<const void *, k5_entry> k5weights;
+    uint32_t * bit_lut = nullptr; // 16 x (4 bits -> 4 bytes of 0/1), for k5_expand
+
     // Codebook 4-bit (IQ4_XS / IQ4_NL): the native nibble indices plus the
     // per-(g,n) f16 scale, i.e. w = scale[g][n] * kvalues_iq4nl[q].  Decode
     // expands the table in-kernel (cb4_gemv_launch); prefill expands the
@@ -512,6 +528,20 @@ dnnl_gemm::~dnnl_gemm() {
             sycl::free(it.second.off, p->q);
         }
     }
+    for (auto & it : p->k5weights) {
+        if (it.second.vals) {
+            sycl::free(it.second.vals, p->q);
+        }
+        if (it.second.hi) {
+            sycl::free(it.second.hi, p->q);
+        }
+        if (it.second.scales) {
+            sycl::free(it.second.scales, p->q);
+        }
+        if (it.second.off) {
+            sycl::free(it.second.off, p->q);
+        }
+    }
 }
 
 // Host-side conversion of one tensor: GGUF K-quant rows -> int8 + one
@@ -648,8 +678,81 @@ size_t dnnl_gemm::weight_bytes() const {
     for (const auto & kv : p->cb4weights) {
         n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)kv.second.ng * kv.second.N * 2;
     }
+    for (const auto & kv : p->k5weights) {
+        n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)kv.second.K * kv.second.N / 8
+             + (size_t)kv.second.ng * kv.second.N * 4;
+    }
     n += p->cb4_scratch_cap;
     return n;
+}
+
+bool dnnl_gemm::has_weight_k5(const void * key) const {
+    auto it = p->k5weights.find(key);
+    return it != p->k5weights.end() && it->second.ok;
+}
+
+// The 16-entry table mapping 4 bits to 4 bytes of 0/1 (see k5_expand_launch).
+bool dnnl_gemm::add_weight_k5(const void * key, const void * host_data, uint32_t ggml_type, int K, int N) {
+    if (!key || !host_data || !si::k5_supported(ggml_type)) {
+        return false;
+    }
+    if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+        return false;
+    }
+    auto found = p->k5weights.find(key);
+    if (found != p->k5weights.end()) {
+        return found->second.ok;
+    }
+    si::k5t b;
+    if (!si::k5_pack(ggml_type, host_data, K, N, b)) {
+        return false;
+    }
+    impl::k5_entry e;
+    e.K = K;
+    e.N = N;
+    e.ng = K / kW4Group;
+    e.vals = sycl::malloc_device<uint8_t>(b.vals.size(), p->q);
+    e.hi = sycl::malloc_device<uint8_t>(b.hi.size(), p->q);
+    e.scales = sycl::malloc_device<uint16_t>(b.scale.size(), p->q);
+    e.off = sycl::malloc_device<uint16_t>(b.off.size(), p->q);
+    if (!e.vals || !e.hi || !e.scales || !e.off) {
+        return false;
+    }
+    // blocking: `b` is a local and the async copies would outlive it
+    p->q.memcpy(e.vals, b.vals.data(), b.vals.size()).wait();
+    p->q.memcpy(e.hi, b.hi.data(), b.hi.size()).wait();
+    p->q.memcpy(e.scales, b.scale.data(), b.scale.size() * sizeof(uint16_t)).wait();
+    p->q.memcpy(e.off, b.off.data(), b.off.size() * sizeof(uint16_t)).wait();
+    if (!p->bit_lut) {
+        // the same table the decode kernel builds in SLM
+        uint32_t host[16];
+        for (int i = 0; i < 16; i++) {
+            host[i] = (uint32_t)((i >> 0) & 1) | ((uint32_t)((i >> 1) & 1) << 8) | ((uint32_t)((i >> 2) & 1) << 16)
+                      | ((uint32_t)((i >> 3) & 1) << 24);
+        }
+        p->bit_lut = sycl::malloc_device<uint32_t>(16, p->q);
+        if (!p->bit_lut) {
+            return false;
+        }
+        p->q.memcpy(p->bit_lut, host, sizeof(host)).wait();
+    }
+    // the prefill expansion needs the int8-sized scratch (shared with cb4)
+    const size_t need = (size_t)K * (size_t)N;
+    if (need > p->cb4_scratch_cap) {
+        if (p->cb4_scratch) {
+            sycl::free(p->cb4_scratch, p->q);
+            p->cb4_scratch = nullptr;
+            p->cb4_scratch_cap = 0;
+        }
+        p->cb4_scratch = sycl::malloc_device<int8_t>(need, p->q);
+        if (!p->cb4_scratch) {
+            return false;
+        }
+        p->cb4_scratch_cap = need;
+    }
+    e.ok = true;
+    auto ins = p->k5weights.emplace(key, std::move(e));
+    return ins.first->second.ok;
 }
 
 bool dnnl_gemm::has_weight_cb4(const void * key) const {
@@ -926,6 +1029,56 @@ bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up
 bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride) {
     if (!p->acts_valid || M != p->cur_M || K != p->cur_K) {
         return false;
+    }
+    if (auto kit = p->k5weights.find(key); kit != p->k5weights.end() && kit->second.ok) {
+        impl::k5_entry & e = kit->second;
+        if (e.K != K || !p->acts_valid || M != p->cur_M || K != p->cur_K) {
+            return false;
+        }
+        if (M == 1) {
+            // decode: recombine the two 5-bit planes in-kernel (0.75 B/weight)
+            k5_gemv_launch(p->q, e.vals, e.hi, e.scales, e.off, p->axe, p->axo, p->asa, p->xs, out, residual, alpha, K,
+                           e.N);
+            return true;
+        }
+        // prefill: expand q5 to int8 into the shared scratch, then the ordinary
+        // grouped-scale int8 primitive with the u4 offset-correction epilogue
+        // (the step plane is already in the grouped [g][N] f16 layout oneDNN
+        // wants, so only the values need materializing).
+        if (!p->cb4_scratch || (size_t)K * (size_t)e.N > p->cb4_scratch_cap) {
+            return false;
+        }
+        impl::prim_entry * pe = nullptr;
+        try {
+            pe = p->make_prim(M, K, e.N);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (!pe) {
+            return false;
+        }
+        k5_expand_launch(p->q, e.vals, e.hi, p->bit_lut, p->cb4_scratch, K, e.N);
+        auto wmem = sycl_interop::make_memory(
+            memory::desc({K, e.N}, memory::data_type::s8, memory::format_tag::ba), p->eng,
+            sycl_interop::memory_kind::usm, (void *)p->cb4_scratch);
+        auto scmem = sycl_interop::make_memory(
+            memory::desc({1, e.ng * e.N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
+            sycl_interop::memory_kind::usm, (void *)e.scales);
+        pe->prim.execute(p->st, {{DNNL_ARG_SRC, pe->src},
+                                 {DNNL_ARG_WEIGHTS, wmem},
+                                 {DNNL_ARG_DST, pe->dst},
+                                 {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scmem},
+                                 {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe->sscales}});
+        // PF_K5_NOCORR (diagnostic): drop the offset correction, keeping only the
+        // step-scaled matmul - tells whether the prefill cost is the expansion
+        // kernel or the u4-style correction epilogue.
+        static const bool nocorr = [] {
+            const char * ev = getenv("PF_K5_NOCORR");
+            return ev && atoi(ev) != 0;
+        }();
+        w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : e.off, p->asa, out, out_stride, residual, alpha, M,
+                           e.N, e.ng);
+        return true;
     }
     if (auto cit = p->cb4weights.find(key); cit != p->cb4weights.end() && cit->second.ok) {
         impl::cb4_entry & e = cit->second;
