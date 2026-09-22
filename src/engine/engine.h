@@ -570,6 +570,10 @@ private:
     // the global tensors that always run on the primary device) into that
     // backend's weight_maps_ entry, so the GPU memory holds just its partition
     void upload_device_weights(int dev);
+    // after every weight tensor has been copied/converted to its device, drop
+    // the GGUF mmap's host-resident pages from this process (the mapping stays
+    // valid; CPU partitions keep theirs because their kernels read the mmap)
+    void release_host_weight_pages();
     template <typename T> T * alloc_elems(size_t n) {
         return (T *)alloc_bytes(n * sizeof(T));
     }

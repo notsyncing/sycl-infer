@@ -180,23 +180,35 @@ gguf_file::~gguf_file() {
     if (map_base) {
         munmap(map_base, map_size);
     }
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+void gguf_file::drop_cache(size_t off, size_t len) const {
+    if (fd < 0 || len == 0) {
+        return;
+    }
+    posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
 }
 
 void gguf_file::load(const std::string & path) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    int f = open(path.c_str(), O_RDONLY);
+    if (f < 0) {
         throw std::runtime_error("cannot open " + path);
     }
     struct stat st;
-    if (fstat(fd, &st) != 0) {
+    if (fstat(f, &st) != 0) {
+        close(f);
         throw std::runtime_error("fstat failed");
     }
     map_size = (size_t)st.st_size;
-    map_base = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
+    map_base = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, f, 0);
     if (map_base == MAP_FAILED) {
+        close(f);
         throw std::runtime_error("mmap failed");
     }
+    fd = f; // kept open for drop_cache(); closed in ~gguf_file
 
     reader r{(const uint8_t *)map_base, (const uint8_t *)map_base + map_size};
     uint32_t magic = r.read<uint32_t>();

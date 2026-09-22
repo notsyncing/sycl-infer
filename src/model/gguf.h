@@ -92,9 +92,16 @@ struct gguf_file {
     std::map<std::string, size_t> tensor_index;
     std::map<std::string, gguf_kv> kv;
     uint32_t version = 0;
+    // kept open after load() so drop_cache() can issue posix_fadvise; closed in
+    // the destructor
+    int fd = -1;
 
     ~gguf_file();
     void load(const std::string & path);
+    // Hint the kernel to drop the page cache backing file bytes [off, off+len).
+    // Only pages not currently mapped are dropped, so a range that still has a
+    // live host mapping (e.g. a CPU partition's weights) is left alone.
+    void drop_cache(size_t off, size_t len) const;
 
     const gguf_tensor_info * find(const std::string & name) const {
         auto it = tensor_index.find(name);

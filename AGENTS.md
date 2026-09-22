@@ -531,6 +531,16 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
 
 ## Invariants and gotchas
 
+* **The GGUF mmap is paged out of the host after the weights reach a device.**
+  `model::page_out_host` does `madvise(MADV_DONTNEED)` + `posix_fadvise` on the
+  tensor's file range; `setup_md_dnnl`'s `add` releases each tensor right after
+  its conversion and `upload_device_weights` right after its raw copy (the final
+  `engine::release_host_weight_pages` sweeps the rest).  The mapping stays valid
+  (device pointers use `map_base` only for arithmetic), but **any new host read
+  of a weight after `engine` construction re-faults from disk** - correctness is
+  preserved, throughput is not.  CPU partitions keep their pages (their kernels
+  read the mmap directly), so a hybrid map's CPU tensors must stay in the
+  `keep` set of `release_host_weight_pages`.
 * **Graph capture**: a value read on the host during `record_forward` is frozen
   into the graph.  Per-step state (positions, token ids, `n_real`, active rows)
   must be read from the host-USM `step_info` *inside* the kernel body, never on

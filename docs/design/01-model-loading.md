@@ -143,8 +143,26 @@ const void * dev_ptr(const void * host_ptr) const {
 `model::upload(q, host)`（`model.h:60-63`）的 `host=true` 分支 **不做拷贝**：`dev_weights = nullptr`，
 `dev_ptr` 退化为恒等（直接返回 mmap 指针），这就是 CPU 后端的模式——权重留在 mmap 里，主机内核
 直接读（见 [architecture.md §11](../architecture.md)）。多设备（`--layer-map`）不复用单一
-`dev_weights`：`engine::setup_multi_device` 为每个 GPU 后端各拷贝一份整文件，`engine::wptr(dev, host)`
-按层解析出该设备的指针（CPU 后端仍返回 mmap 指针）。
+`dev_weights`：`engine::setup_multi_device` 只把每个 GPU 后端 **自己分区** 的张量（外加始终落在
+主设备上的 `tok_embd` / `output` / `output_norm`）拷到该设备，`engine::wptr(dev, host)` 按层解析出
+该设备的指针（CPU 后端仍返回 mmap 指针）。
+
+### 4.3 释放主机的 mmap 常驻页
+
+mmap 只在上传/转换阶段被读；GPU 分区一旦落到设备，主机就不再需要这些页，但内核会一直把它们算进
+进程 RSS（27B 的文件有 15.7 GB）。`model::page_out_host` 对一段映射先 `madvise(MADV_DONTNEED)`
+（把页从进程摘掉，映射本身仍有效，日后误读只会重新缺页），再 `posix_fadvise(POSIX_FADV_DONTNEED)`
+（此时 PTE 已摘除，内核可真正回收 page cache；仍被映射的 CPU 分区页会被内核跳过）。
+
+释放时机有两处：
+
+* `engine::setup_md_dnnl` 的 `add` 回调在每个张量 **转换成功**（w4/k5/cb4/int8，主机读取已完成）
+  后立刻释放该张量——上传阶段会跳过已转换的张量，所以不会再次读取；
+* `engine::upload_device_weights` 在把每个原始张量拷到设备后释放它（只对 GPU 分区调用）。
+
+构造函数末尾的 `engine::release_host_weight_pages` 是兜底：释放未被任何分区引用的张量（如未绑定的
+`nextn` 张量）、以及没有 CPU 分区时的 GGUF 头。CPU 分区的张量永远保留，因为它们的宿主内核每 token
+都直接读 mmap。效果（27B + 双 A770）：稳态 RSS 16.2 GB → 474 MB，加载峰值 16.2 GB → 2.7 GB。
 
 `build_meta32`（`engine.cpp:303-351`）也用主机张量指针作为 `meta32_` 的 key（见
 [02-quantization.md](02-quantization.md)）。

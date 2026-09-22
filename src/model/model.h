@@ -90,6 +90,18 @@ struct model {
     // (a non-K-quant tensor yields an empty w8t)
     void build_w8_one(sycl::queue & q, const wt & t, w8t & out);
     void free_w8(sycl::queue & q);
+    // Drop this process's resident pages backing [p, p+len) of the GGUF mmap.
+    // The MAP_PRIVATE mapping stays valid, so a later host read simply re-faults
+    // from the file; used once a tensor has been copied to a device so the
+    // process RSS does not keep the whole (16 GB for the 27B) file resident.
+    void page_out_host(const void * p, size_t len);
+    // byte length of a bound tensor (row bytes * rows)
+    static size_t tensor_bytes(const wt & t) {
+        return ggml_row_bytes(t.type, (uint64_t)t.K * (uint64_t)t.N);
+    }
+    void page_out_tensor(const wt & t) {
+        page_out_host(t.data, tensor_bytes(t));
+    }
     const void * dev_ptr(const void * host_ptr) const {
         if (!dev_weights) {
             return host_ptr; // CPU backend: weights stay in the mmap

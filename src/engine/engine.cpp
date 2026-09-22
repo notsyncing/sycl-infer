@@ -389,6 +389,9 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     n_blocks = pool_cap;
     alloc_buffers();
     build_graphs();
+    // all weights are on their devices now: release the host pages of the GGUF
+    // so the process does not carry the whole file in its RSS
+    release_host_weight_pages();
 }
 
 engine::~engine() {
@@ -801,6 +804,10 @@ void engine::upload_device_weights(int dev) {
         mp[t.data] = g;
         bytes += t.nbytes();
         n++;
+        // the raw device copy is complete and this is a GPU partition's tensor,
+        // so the host pages are dead: drop them now to keep the load peak low
+        // (the final release_host_weight_pages() covers anything left over)
+        m.page_out_host(t.data, t.nbytes());
 
     }
     fprintf(stderr, "[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
@@ -809,6 +816,71 @@ void engine::upload_device_weights(int dev) {
 
 const float * engine::wf32(int dev, const float * host) const {
     return (const float *)wptr(dev, host);
+}
+
+// Once every weight tensor has been copied (or converted) onto its device, the
+// host mmap is dead weight for a GPU-only run: the 27B keeps 15.7 GB of file
+// pages resident in the process RSS forever even though no kernel reads them
+// from the host.  Drop those pages with MADV_DONTNEED.  The mapping stays valid
+// (plain device-pointer arithmetic still uses gguf.map_base), so a stray host
+// read just re-faults from the file.  CPU partitions are the exception: their
+// host kernels read the mmap on every token, so their tensors' pages stay.
+void engine::release_host_weight_pages() {
+    if (!m.gguf.map_base || cpu_mode) {
+        return;
+    }
+    std::unordered_set<const void *> keep;
+    if (multi_dev) {
+        for (int il = 0; il < m.hp.n_layer; il++) {
+            const int d = layer_dev_[(size_t)il];
+            if (d < 0 || d >= (int)dev_kind_.size() || dev_kind_[(size_t)d] != 1) {
+                continue; // GPU (or unassigned) layer: device-only
+            }
+            const layer_t & L = m.layers[(size_t)il];
+            auto kp = [&](const void * p) {
+                if (p) {
+                    keep.insert(p);
+                }
+            };
+            kp(L.attn_norm);
+            kp(L.post_attn_norm);
+            kp(L.ffn_gate.data);
+            kp(L.ffn_up.data);
+            kp(L.ffn_down.data);
+            if (L.recurrent) {
+                kp(L.wqkv.data);
+                kp(L.wgate.data);
+                kp(L.ssm_beta.data);
+                kp(L.ssm_alpha.data);
+                kp(L.ssm_out.data);
+                kp(L.ssm_a);
+                kp(L.ssm_dt);
+                kp(L.ssm_norm);
+                kp(L.ssm_conv1d);
+            } else {
+                kp(L.wq.data);
+                kp(L.wk.data);
+                kp(L.wv.data);
+                kp(L.wo.data);
+                kp(L.q_norm);
+                kp(L.k_norm);
+            }
+        }
+    }
+    size_t dropped = 0;
+    for (const auto & t : m.gguf.tensors) {
+        if (keep.count(t.data)) {
+            continue;
+        }
+        m.page_out_host(t.data, t.nbytes());
+        dropped += t.nbytes();
+    }
+    if (keep.empty()) {
+        // no host consumer at all: the header (already parsed into the kv map /
+        // token strings) is dead too
+        m.page_out_host(m.gguf.map_base, m.gguf.data_offset);
+    }
+    fprintf(stderr, "[mem] released %.1f MB of host-resident GGUF pages (RSS)\n", (double)dropped / (1024.0 * 1024.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -868,25 +940,33 @@ bool engine::setup_md_dnnl() {
             if (!t.data) {
                 return;
             }
+            bool converted = false;
             if (w4_on && D->add_weight_w4(t.data, t.data, t.type, t.K, t.N)) {
                 dev_ok = true;
                 n_w4++;
-                return;
+                converted = true;
             }
             // PF_K5=0 keeps Q5_K on the int8 conversion (A/B knob)
-            if (add_k5 && D->add_weight_k5(t.data, t.data, t.type, t.K, t.N)) {
+            else if (add_k5 && D->add_weight_k5(t.data, t.data, t.type, t.K, t.N)) {
                 dev_ok = true;
                 n_k5++;
-                return;
-            }
-            if (add_cb && D->add_weight_cb4(t.data, t.data, t.type, t.K, t.N)) {
+                converted = true;
+            } else if (add_cb && D->add_weight_cb4(t.data, t.data, t.type, t.K, t.N)) {
                 dev_ok = true;
                 n_cb++;
-                return;
-            }
-            if (D->add_weight(t.data, t.data, t.type, t.K, t.N)) {
+                converted = true;
+            } else if (D->add_weight(t.data, t.data, t.type, t.K, t.N)) {
                 dev_ok = true;
                 n_i8++;
+                converted = true;
+            }
+            if (converted) {
+                // the host read is done and the tensor lives on the device now,
+                // so drop its file pages immediately: this keeps the load-time
+                // peak at one tensor's worth instead of the whole GGUF (the
+                // upload pass below skips converted tensors, so nothing re-reads
+                // them from the host)
+                m.page_out_tensor(t);
             }
         };
         if (d == 0) {

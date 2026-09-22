@@ -1,5 +1,9 @@
 #include "model.h"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -93,6 +97,34 @@ void model::upload(sycl::queue & q, bool host) {
         throw std::runtime_error("device allocation failed");
     }
     q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
+}
+
+// MADV_DONTNEED over the page-aligned range covering [p, p+len) clipped to the
+// mapping.  Only *resident* pages drop out of the process RSS; the mapping and
+// its file contents are untouched, so this is safe even if a host reader shows
+// up later (it just faults the page back in).
+void model::page_out_host(const void * p, size_t len) {
+    if (!gguf.map_base || !p || len == 0) {
+        return;
+    }
+    const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t base = (uintptr_t)gguf.map_base;
+    const uintptr_t end = base + gguf.map_size;
+    uintptr_t a = (uintptr_t)p & ~(pg - 1);
+    uintptr_t b = ((uintptr_t)p + len + pg - 1) & ~(pg - 1);
+    if (a < base) {
+        a = base;
+    }
+    if (b > end) {
+        b = end;
+    }
+    if (b > a) {
+        madvise((void *)a, (size_t)(b - a), MADV_DONTNEED);
+        // now that the PTEs are gone, let the kernel drop the page cache too so
+        // the memory is actually freed rather than just unmapped from the
+        // process (a still-mapped CPU-partition range is skipped by the kernel)
+        gguf.drop_cache((size_t)(a - base), (size_t)(b - a));
+    }
 }
 
 } // namespace si
