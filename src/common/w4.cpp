@@ -132,6 +132,28 @@ static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t
     return true;
 }
 
+
+// Both IQ4_XS and IQ4_NL store a 32-value group's 4-bit codebook indices as
+// "element j = low nibble of byte j, element 16+j = high nibble of byte j" (see
+// the reference dequantizers).  The GEMV wants the *interleaved* order the u4
+// and k5 planes use - byte k = elements 2k (low) / 2k+1 (high) - because then
+// one 256-entry uint16 lookup turns an index byte into the two codebook values
+// of one dp4a half-word, halving the LUT traffic per 4 weights (see the kernel
+// comment).  This is a pure permutation: no value is touched.
+static void interleave_group(const uint8_t * src, uint8_t * dst) {
+    for (int k = 0; k < 16; k++) {
+        uint8_t lo, hi;
+        if (k < 8) {
+            lo = (uint8_t)(src[2 * k] & 0xF);
+            hi = (uint8_t)(src[2 * k + 1] & 0xF);
+        } else {
+            lo = (uint8_t)((src[2 * k - 16] >> 4) & 0xF);
+            hi = (uint8_t)((src[2 * k - 15] >> 4) & 0xF);
+        }
+        dst[k] = (uint8_t)(lo | (hi << 4));
+    }
+}
+
 bool cb4_supported(uint32_t ggml_type) {
     return ggml_type == 23 || ggml_type == 20; // IQ4_XS, IQ4_NL
 }
@@ -161,8 +183,7 @@ bool cb4_pack(uint32_t ggml_type, const void * src, int K, int N, cb4t & out) {
                                    | (((blk->scales_h >> (2 * ib)) & 3) << 4);
                     const int g = sb * (QK_K / 32) + ib;
                     out.scale[(size_t)g * N + n] = ggml_float_to_half(d * (float)(ls - 32));
-                    std::memcpy(irow + (size_t)g * 16, blk->qs + (size_t)ib * 16, 16);
-
+                    interleave_group(blk->qs + (size_t)ib * 16, irow + (size_t)g * 16);
                 }
             }
         } else {
@@ -170,7 +191,7 @@ bool cb4_pack(uint32_t ggml_type, const void * src, int K, int N, cb4t & out) {
             for (int g = 0; g < ng; g++) {
                 const block_iq4_nl * blk = (const block_iq4_nl *)(row + (size_t)g * sizeof(block_iq4_nl));
                 out.scale[(size_t)g * N + n] = blk->d;
-                std::memcpy(irow + (size_t)g * 16, blk->qs, 16);
+                interleave_group(blk->qs, irow + (size_t)g * 16);
             }
         }
     }

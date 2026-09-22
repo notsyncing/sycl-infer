@@ -396,35 +396,37 @@ void k5_expand_launch(queue & q, const uint8_t * vals, const uint8_t * hi, const
 // The weights are 4-bit indices into the 16-entry int8 table `lut` plus a per-32
 // f16 scale per row.  Expanding the indices through the table inside the kernel
 // keeps the *native* values (nothing is re-quantized) while reading half the
-// bytes the int8 conversion needed.  The index plane keeps the native element
-// order: element e of a 32-group is the low nibble of byte e for e < 16 and the
-// high nibble of byte e - 16 after that, so `raw[j]`'s low nibbles are elements
-// 4j..4j+3 and its high nibbles are elements 16+4j..16+4j+3.
-void cb4_expand_launch(queue & q, const uint8_t * idx, const int8_t * lut, int8_t * out, int K, int N) {
+// bytes the int8 conversion needed.
+//
+// The index plane is interleaved (byte k = elements 2k / 2k+1), so a *pair* of
+// index bytes covers 4 consecutive elements = one dp4a operand, and a 256-entry
+// uint16 table `lut16[b] = value(b & 0xF) | value(b >> 4) << 8` turns the pair
+// into that operand with one shift and one OR.  That is the whole difference
+// from the previous form, which needed four byte lookups plus three shifts and
+// three ORs per operand (32 LUT loads + 24 ALU per 32 values, measured 49-67%
+// of the card's read ceiling - i.e. instruction-bound).  `lut16` is built in
+// SLM for the decode kernel and from a device copy for the prefill expansion.
+//   y[n] = sum_g asa[g] * scale[g][n] * QDOT_g[n]
+void cb4_expand_launch(queue & q, const uint8_t * idx, const uint16_t * lut16_dev, int8_t * out, int K, int N) {
     const int ng = K / 32;
     if (ng <= 0 || N <= 0) {
         return;
     }
-    // one work-item per 32-value group, widened: a 16-byte nibble load in, two
-    // 16-byte int8 stores out (the scalar per-byte form made prefill ~1.5x slower)
+    // one work-item per 32-value group: a 16-byte index load in, two 16-byte
+    // int8 stores out (the scalar per-byte form made prefill ~1.5x slower, and
+    // the 8 x 32-bit store form of the k5 expansion capped at half the ceiling)
     q.parallel_for(range<1>((size_t)N * ng), [=](id<1> i) {
         const int n = (int)(i / (size_t)ng);
         const int g = (int)(i % (size_t)ng);
         const uint8_t * src = idx + (size_t)n * (size_t)(K / 2) + (size_t)g * 16;
-        const uint4 nv = *reinterpret_cast<const uint4 *>(src);
-        const uint32_t raw[4] = {nv.x(), nv.y(), nv.z(), nv.w()};
+        const uint4 iv = *reinterpret_cast<const uint4 *>(src);
+        const uint32_t raw[4] = {iv.x(), iv.y(), iv.z(), iv.w()};
         uint32_t w[8];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             const uint32_t v = raw[j];
-            // low nibble of byte b is (v >> 8b); w[0..3] are elements 0..15,
-            // w[4..7] are elements 16..31 (the native order)
-            w[j] = (uint32_t)(uint8_t)lut[(v >> 0) & 0x0F] | ((uint32_t)(uint8_t)lut[(v >> 8) & 0x0F] << 8)
-                   | ((uint32_t)(uint8_t)lut[(v >> 16) & 0x0F] << 16)
-                   | ((uint32_t)(uint8_t)lut[(v >> 24) & 0x0F] << 24);
-            w[4 + j] = (uint32_t)(uint8_t)lut[(v >> 4) & 0x0F] | ((uint32_t)(uint8_t)lut[(v >> 12) & 0x0F] << 8)
-                       | ((uint32_t)(uint8_t)lut[(v >> 20) & 0x0F] << 16)
-                       | ((uint32_t)(uint8_t)lut[(v >> 28) & 0x0F] << 24);
+            w[2 * j] = (uint32_t)lut16_dev[(v >> 0) & 0xFF] | ((uint32_t)lut16_dev[(v >> 8) & 0xFF] << 16);
+            w[2 * j + 1] = (uint32_t)lut16_dev[(v >> 16) & 0xFF] | ((uint32_t)lut16_dev[(v >> 24) & 0xFF] << 16);
         }
         int8_t * dst = out + (size_t)n * K + (size_t)g * 32;
         *reinterpret_cast<uint4 *>(dst) = uint4(w[0], w[1], w[2], w[3]);
@@ -433,7 +435,7 @@ void cb4_expand_launch(queue & q, const uint8_t * idx, const int8_t * lut, int8_
 }
 
 template <int RB>
-static void cb4_gemv_impl(queue & q, const uint8_t * idx, const int8_t * lut, const uint16_t * scale,
+static void cb4_gemv_impl(queue & q, const uint8_t * idx, const uint16_t * lut16, const uint16_t * scale,
                           const int8_t * xq, const uint16_t * asa, const float * xs, float * out, const float * residual,
                           float alpha, int K, int N) {
     const int ng = K / 32;
@@ -441,14 +443,15 @@ static void cb4_gemv_impl(queue & q, const uint8_t * idx, const int8_t * lut, co
     const int nwg = (N + RB - 1) / RB;
     q.submit([&](handler & h) {
         local_accessor<uint16_t, 1> meta((size_t)RB * ng, h);
-        local_accessor<int8_t, 1> lt(16, h);
+        local_accessor<uint16_t, 1> lt(256, h);
         h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const int lid = (int)it.get_local_id(0);
             const int sg = lid / 32;
             const int lane = lid % 32;
             const int n0 = (int)it.get_group(0) * RB;
-            if (lid < 16) {
-                lt[lid] = lut[lid];
+            // expand the 16-entry codebook into the 256-entry byte-pair table
+            for (int i = lid; i < 256; i += TX) {
+                lt[i] = lut16[i];
             }
             // g-major / row-inner scale staging (see the file header)
             for (int i = lid; i < RB * ng; i += TX) {
@@ -471,16 +474,9 @@ static void cb4_gemv_impl(queue & q, const uint8_t * idx, const int8_t * lut, co
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     const uint32_t v = raw[j];
-                    // the low nibble of byte b is (v >> 8b)
-                    w[j] = (uint32_t)(uint8_t)lt[(v >> 0) & 0x0F]
-                           | ((uint32_t)(uint8_t)lt[(v >> 8) & 0x0F] << 8)
-                           | ((uint32_t)(uint8_t)lt[(v >> 16) & 0x0F] << 16)
-                           | ((uint32_t)(uint8_t)lt[(v >> 24) & 0x0F] << 24);
-                    // the high nibble of byte b is (v >> (8b + 4))
-                    w[4 + j] = (uint32_t)(uint8_t)lt[(v >> 4) & 0x0F]
-                               | ((uint32_t)(uint8_t)lt[(v >> 12) & 0x0F] << 8)
-                               | ((uint32_t)(uint8_t)lt[(v >> 20) & 0x0F] << 16)
-                               | ((uint32_t)(uint8_t)lt[(v >> 28) & 0x0F] << 24);
+                    // 2 index bytes -> 4 codebook bytes (elements in order)
+                    w[2 * j] = (uint32_t)lt[(v >> 0) & 0xFF] | ((uint32_t)lt[(v >> 8) & 0xFF] << 16);
+                    w[2 * j + 1] = (uint32_t)lt[(v >> 16) & 0xFF] | ((uint32_t)lt[(v >> 24) & 0xFF] << 16);
                 }
                 const uint4 x0 = *reinterpret_cast<const uint4 *>(xq + (size_t)g * 32);
                 const uint4 x1 = *reinterpret_cast<const uint4 *>(xq + (size_t)g * 32 + 16);
@@ -509,15 +505,15 @@ static void cb4_gemv_impl(queue & q, const uint8_t * idx, const int8_t * lut, co
     });
 }
 
-void cb4_gemv_launch(queue & q, const uint8_t * idx, const int8_t * lut, const uint16_t * scale, const int8_t * xq,
+void cb4_gemv_launch(queue & q, const uint8_t * idx, const uint16_t * lut16, const uint16_t * scale, const int8_t * xq,
                      const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
                      int N) {
     const int ng = K / 32;
-    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) + 16 <= 48 * 1024; };
+    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) + 256 * 2 <= 48 * 1024; };
     if (fits(kW4RB)) {
-        cb4_gemv_impl<kW4RB>(q, idx, lut, scale, xq, asa, xs, out, residual, alpha, K, N);
+        cb4_gemv_impl<kW4RB>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
     } else {
-        cb4_gemv_impl<8>(q, idx, lut, scale, xq, asa, xs, out, residual, alpha, K, N);
+        cb4_gemv_impl<8>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
     }
 }
 

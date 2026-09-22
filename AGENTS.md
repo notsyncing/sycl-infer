@@ -176,8 +176,8 @@ fixed head-segment binding bug stayed invisible).
 src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
                 int8 weight format/repack), w4.{h,cpp} (native-width u4 packing
                 for Q4_K: u4 plane + separate f16 scale/off planes; and the
-                codebook 4-bit store for IQ4_XS/IQ4_NL: 4-bit index plane +
-                per-32 f16 scale, `cb4t`/`cb4_pack`),
+                codebook 4-bit store for IQ4_XS/IQ4_NL: 4-bit index plane in the
+                interleaved nibble order + per-32 f16 scale, `cb4t`/`cb4_pack`),
                 dp4a.h (portable dp4a helper),
                 cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch)
 src/backend/    backend.h (compute_backend abstraction), dnnl_gemm.{h,cpp}

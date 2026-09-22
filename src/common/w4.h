@@ -111,10 +111,14 @@ bool k5_pack(uint32_t ggml_type, const void * src, int K, int N, k5t & out);
 // 1.0625, and - because oneDNN only knows linear u4 or s8 weights - lets prefill
 // expand the indices to int8 through the same table.
 //
-// The index plane keeps the native element order: element e of a 32-group is the
-// low nibble of byte e for e < 16 and the high nibble of byte e-16 otherwise.
+// The index plane is stored in the same *interleaved* order as the u4/k5 nibble
+// planes (byte k = elements 2k low-nibble / 2k+1 high-nibble) rather than the
+// native split order: that lets one 256-entry uint16 lookup produce the two
+// codebook values of a dp4a half-word, which halves the LUT loads per group
+// (the kernel is instruction-bound, not bandwidth-bound, at 49-67% of the read
+// ceiling).  cb4_pack permutes the native nibbles and nothing else.
 struct cb4t {
-    std::vector<uint8_t> idx;    // N*K/2 nibble indices, native order
+    std::vector<uint8_t> idx;    // N*K/2 nibble indices, interleaved
     std::vector<uint16_t> scale; // ng*N f16 per-32 scale, [g][n]
     int K = 0, N = 0;
 };

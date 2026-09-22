@@ -367,6 +367,7 @@ struct dnnl_gemm::impl {
     };
     std::unordered_map<const void *, cb4_entry> cb4weights;
     int8_t * lut = nullptr;          // kvalues_iq4nl on the device
+    uint16_t * lut16 = nullptr;      // 256-entry byte-pair table over it (see cb4_gemv_launch)
     int8_t * cb4_scratch = nullptr;  // shared int8 expansion for prefill
     size_t cb4_scratch_cap = 0;
 
@@ -798,6 +799,17 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
             return false;
         }
         p->q.memcpy(p->lut, kvalues_iq4nl, 16).wait();
+        // the byte-pair table the kernels consume: one 256-entry lookup turns an
+        // interleaved index byte (two nibbles) into two codebook values
+        uint16_t h16[256];
+        for (int b = 0; b < 256; b++) {
+            h16[b] = (uint16_t)((uint8_t)kvalues_iq4nl[b & 0xF] | ((uint16_t)(uint8_t)kvalues_iq4nl[b >> 4] << 8));
+        }
+        p->lut16 = sycl::malloc_device<uint16_t>(256, p->q);
+        if (!p->lut16) {
+            return false;
+        }
+        p->q.memcpy(p->lut16, h16, sizeof(h16)).wait();
     }
     // the prefill expansion needs the int8-sized scratch; grow it to the widest
     // converted tensor (the biggest is ffn_gate/up, ~95 MB, not the full model)
@@ -1087,7 +1099,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         }
         if (M == 1) {
             // decode: expand the codebook in-kernel (half the weight bytes)
-            cb4_gemv_launch(p->q, e.idx, p->lut, e.scales, p->axg, p->asa, p->xs, out, residual, alpha, K, e.N);
+            cb4_gemv_launch(p->q, e.idx, p->lut16, e.scales, p->axg, p->asa, p->xs, out, residual, alpha, K, e.N);
             return true;
         }
         // prefill: materialize this tensor's indices as int8 into the shared
@@ -1106,7 +1118,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         if (!pe) {
             return false;
         }
-        cb4_expand_launch(p->q, e.idx, p->lut, p->cb4_scratch, K, e.N);
+        cb4_expand_launch(p->q, e.idx, p->lut16, p->cb4_scratch, K, e.N);
         auto wmem = sycl_interop::make_memory(
             memory::desc({K, e.N}, memory::data_type::s8, memory::format_tag::ba), p->eng,
             sycl_interop::memory_kind::usm, (void *)p->cb4_scratch);

@@ -205,8 +205,10 @@ multi-device 的单 token 解码走这两个 kernel（`dnnl_gemm::gemm_w4` / `ge
 * `cb4_expand_launch`（prefill 用）：把索引展开成 int8 到 `dnnl_gemm` 的复用 scratch，再跑
   已有的 int8 primitive（oneDNN 每次 execute 重读权重 memory，已验证）。向量化：一个
   work-item 处理一组（16 字节载入 + 两个 16 字节写出）；标量版会让 prefill 从 ~1500 掉到 940 t/s。
-* 元素序（§10.2 of 02-quantization.md）：每组 16 字节，`e<16` 是 byte `e` 的低 nibble、
-  `e>=16` 是 byte `e-16` 的高 nibble——`cb4_pack`、GEMV、展开三处必须一致。
+* 元素序（§10.2 of 02-quantization.md）：每组 16 字节**交错序**（byte k = 元素 2k 低 nibble /
+  2k+1 高 nibble）——`cb4_pack`、GEMV、展开三处必须一致；native 序在 pack 里转成交错序。
+  GEMV/展开都用 **256 项 `lut16`**（`value(b&0xF) | value(b>>4)<<8`，GEMV 里在 SLM、
+  展开里用设备副本）：一个索引字节 → 半个 dp4a 操作数。
 * 逐位对拍：`dev/bench_cb4.cpp` 同时算 host 公式、kernel 逻辑的 CPU 仿真、GPU 三者
   （随机 nibble，max rel 0.000000）。
 

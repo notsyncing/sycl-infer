@@ -366,18 +366,25 @@ native 值就是精确的**——不是重化（requant），只是换存储。
 
 | 平面 | 布局 |
 |---|---|
-| `idx` | `idx[(n*(K/2)) + g*16 + b]`，每 32 值一组 16 字节；**native 元素序**：元素 `e<16` 是 byte `e` 的低 nibble，`e>=16` 是 byte `e-16` 的高 nibble |
+| `idx` | `idx[(n*(K/2)) + g*16 + b]`，每 32 值一组 16 字节；**交错序**（与 u4/k5 的 nibble 平面同一约定）：byte `k` = 元素 `2k` 的低 nibble / `2k+1` 的高 nibble |
 | `scale` | `scale[g*N + n]` f16 = `d*(ls-32)`，与 u4 的 step 平面同构（oneDNN grouped scale 直接用） |
 
-`cb4_pack` 只做重排（`memcpy` 每组的 16 字节 nibble + 抽取 scale），不碰任何数值。
+`cb4_pack` 只做重排（把 native 的"元素 `e<16` = byte `e` 低 nibble / `e>=16` = byte `e-16`
+高 nibble"转成交错序）+ 抽取 scale，不碰任何数值。**为什么用交错序**：一个索引字节的
+两个 nibble 正好是同一 dp4a 操作数里的两个相邻元素，于是 256 项 uint16 表
+`lut16[b] = value(b&0xF) | value(b>>4)<<8` 一次查表就给出一半的操作数（2 个值），
+一个权重字（4 值）只要 2 次查表 + 1 次 shift + 1 次 or；native 序则需要 4 次字节查表
++ 3 shift + 3 or（每 32 值 32 次查表 + 24 次 ALU，实测只有带宽上限的 49-67 %，
+即指令受限）。改交错序后 74-84 %（head 270→341 GB/s、ffn_gate 243→301）。
 
 ### 10.3 decode：LUT 展开的 dp4a GEMV（`cb4_gemv_launch`）
 
 结构同 `i8_grp_gemv`（g 外/行内 SLM staging、`asa`/`XS`/XOR 偏差校正），只是权重字由
-nibble 经 16 项 SLM LUT 展开成 int8 再 `dp4a`：`w[j]` 取 byte `j*4..j*4+3` 的低 nibble、
-`w[4+j]` 取它们的高 nibble（位移是 `8b` 与 `8b+4`，写错会被"全 nibble 相同"的测试掩盖）。
-实测每张量比 int8 GEMV 快 11-20%（head 3.31→2.63 ms），但有效 GB/s 更低
-（272 vs 408），因为它 read 一半字节却受 ALU/延迟限制更多。
+索引经 **256 项 `lut16`（SLM）** 展开：`w[2j] = lt[b_2j] | (lt[b_2j+1] << 16)`，
+即一个权重字（4 值）2 次查表 + 1 shift + 1 or（§10.2 的交错序是前提）。
+实测每张量比 int8 GEMV 快 11-26 %（同形状 243→301 GB/s、head 270→341），
+但有效 GB/s 仍低于 int8（上限的 56-84 %），因为读一半字节却多两次查表 + XOR 偏差校正
+（在真机整步里这点差异被聚合带宽吃掉，见 §20.2 of the report）。
 
 ### 10.4 prefill：展开到复用 scratch + 现有 int8 primitive
 
@@ -389,7 +396,9 @@ oneDNN 只认线性 `u4` 或 `s8`（`dnnl_common_types.h` 里有 `s4/u4/f4_e2m1/
   即 **oneDNN 每次 execute 都重读用户权重 memory**，不做内部 reorder 缓存。
 * 代价是每 pass 多一遍展开流量（读 0.5625 + 写 1.0 B/w，IQ4_XS+NL 合计 ~13.3 GB → ~31 ms/pass）。
   第一版逐字节标量写让 prefill 掉到 940 t/s，改成"16 字节载入 + 两个 16 字节写出"后回到 ~1340 t/s。
-* `cb4_expand_launch` 的元素序必须与 §10.2 一致（`w[0..3]` 是元素 0..15、`w[4..7]` 是 16..31）。
+* `cb4_expand_launch` 的元素序必须与 §10.2 一致：一个 uint4 索引（16 字节）→ 8 个权重字
+  （每个 = 2 次 `lut16` 查表 + shift/or），两个 `uint4` 写出。与 k5 展开同样的教训：
+  分散的 32-bit 写会把内核压到带宽上限的一半，必须向量写。
 
 ### 10.5 实测
 
@@ -401,6 +410,11 @@ oneDNN 只认线性 `u4` 或 `s8`（`dnnl_common_types.h` 里有 `s4/u4/f4_e2m1/
 
 `PF_CB4=0` 退回 int8 转换（A/B 用）。tg 收益受限于 LUT kernel 是半 ALU/延迟受限，
 以及 codebook 类型只占每 token 字节的 19 %。
+
+把 LUT 改成 256 项 uint16（交错索引序，§10.2）后，单内核从上限的 49-67 % 提到
+56-84 %，但整步 tg128 不变（14.35 t/s）：`PF_PROF=1 PF_NOGRAPH=1` 显示 27B 一步
+75.9 ms 里 `gemv=66.5 ms`，而两张卡合计每步 ~22 GB 权重 → 聚合 ~330 GB/s，
+已是可达 DRAM 速率（405 GB/s）的 82 %，单核再快也不落在关键路径上。
 
 ## 11. 原生 5-bit（Q5_K，`PF_K5`，默认开）
 

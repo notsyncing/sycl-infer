@@ -141,12 +141,16 @@ void k5_expand_launch(sycl::queue & q, const uint8_t * vals, const uint8_t * hi,
 // expansion the prefill matmul needs.  See common/w4.h and w4_gemv.cpp.
 //   y[n] = sum_g asa[g] * scale[g][n] * QDOT_g[n],  QDOT from the 16-entry int8
 //   table `lut` indexed by the packed nibbles (so the native values are exact).
-void cb4_gemv_launch(sycl::queue & q, const uint8_t * idx, const int8_t * lut, const uint16_t * scale, const int8_t * xq,
-                     const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
-                     int N);
-// expand the nibble indices into int8 weights (for the oneDNN prefill matmul):
-// out[n*K + k] = lut[nibble], the same element order as cb4t::idx
-void cb4_expand_launch(sycl::queue & q, const uint8_t * idx, const int8_t * lut, int8_t * out, int K, int N);
+// `lut16` is the 256-entry byte-pair table lut16[b] = value(b & 0xF) |
+// value(b >> 4) << 8 over the 16 codebook values (see cb4_pack).  The index
+// plane is interleaved (byte k = elements 2k/2k+1), so one index byte gives the
+// two codebook values of a dp4a half-word.
+void cb4_gemv_launch(sycl::queue & q, const uint8_t * idx, const uint16_t * lut16, const uint16_t * scale,
+                     const int8_t * xq, const uint16_t * asa, const float * xs, float * out, const float * residual,
+                     float alpha, int K, int N);
+// expand the index plane into int8 weights (for the oneDNN prefill matmul):
+// out[n*K + k] = the codebook value of index k, in element order
+void cb4_expand_launch(sycl::queue & q, const uint8_t * idx, const uint16_t * lut16, int8_t * out, int K, int N);
 
 void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
                        int nsb, int n_tok_blocks = 0);
