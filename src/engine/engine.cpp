@@ -702,10 +702,14 @@ const void * engine::wptr(int dev, const void * host) const {
     if (!multi_dev) {
         return m.dev_ptr(host);
     }
-    const auto & mp = weight_maps_[(size_t)dev];
-    if (mp.empty()) {
-        return host; // CPU partition: weights stay in the host mmap
+    // Decide by backend kind, not by an empty weight map: a GPU partition's map
+    // is never empty (every layer has f32 norms that are uploaded raw), and
+    // treating an empty map as "CPU" could silently hand a GPU kernel a host
+    // pointer.  A CPU partition reads the mmap directly.
+    if (dev >= 0 && dev < (int)dev_kind_.size() && dev_kind_[(size_t)dev] == 1) {
+        return host;
     }
+    const auto & mp = weight_maps_[(size_t)dev];
     const auto it = mp.find(host);
     if (it == mp.end()) {
         throw std::runtime_error("multi-device: weight tensor not uploaded to this device's partition");
@@ -806,8 +810,12 @@ void engine::upload_device_weights(int dev) {
         n++;
         // the raw device copy is complete and this is a GPU partition's tensor,
         // so the host pages are dead: drop them now to keep the load peak low
-        // (the final release_host_weight_pages() covers anything left over)
-        m.page_out_host(t.data, t.nbytes());
+        // (the final release_host_weight_pages() covers anything left over).  A
+        // tied LM head still needs the embedding's host rows to build its oneDNN
+        // conversion after the upload, so keep those pages for now.
+        if (!(md_xmx && m.output.data == m.tok_embd.data && t.data == m.tok_embd.data)) {
+            m.page_out_host(t.data, t.nbytes());
+        }
 
     }
     fprintf(stderr, "[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
@@ -831,6 +839,15 @@ void engine::release_host_weight_pages() {
     }
     std::unordered_set<const void *> keep;
     if (multi_dev) {
+        // The global tensors (embedding, LM head, output norm) are pinned to
+        // backend 0.  When that backend is a CPU partition (an all-`cpu`
+        // --layer-map) their host kernels read the mmap directly, so they must
+        // be kept like the CPU layers below.
+        if (!dev_kind_.empty() && dev_kind_[0] == 1) {
+            keep.insert(m.tok_embd.data);
+            keep.insert(m.output.data);
+            keep.insert(m.output_norm);
+        }
         for (int il = 0; il < m.hp.n_layer; il++) {
             const int d = layer_dev_[(size_t)il];
             if (d < 0 || d >= (int)dev_kind_.size() || dev_kind_[(size_t)d] != 1) {
@@ -969,7 +986,7 @@ bool engine::setup_md_dnnl() {
                 m.page_out_tensor(t);
             }
         };
-        if (d == 0) {
+        if (d == 0 && m.output.data != m.tok_embd.data) {
             // The LM head is a global pinned to backend 0.  Convert it here -
             // *before* upload_device_weights - keyed by its host pointer, which
             // makes the upload skip its raw 1.0 GB device copy exactly like the
@@ -977,6 +994,12 @@ bool engine::setup_md_dnnl() {
             // the head in *both* phases (build_plan keys the segment through
             // wkey(), which returns this host key); see the single-token
             // relaxation in record_forward.
+            //
+            // A *tied* head (no `output.weight`, e.g. the 0.8B) shares
+            // token_embd's storage, so it cannot replace the raw embedding: the
+            // embed kernel reads the GGUF-quantized rows.  It is converted
+            // after the upload, keyed by the uploaded device pointer - see
+            // setup_multi_device.
             add(m.output);
         }
         for (int il = 0; il < m.hp.n_layer; il++) {
@@ -1213,6 +1236,18 @@ void engine::setup_multi_device(const std::string & layer_map) {
     }
     for (size_t i = 0; i < gpu_indices.size(); i++) {
         upload_device_weights((int)i);
+    }
+    // A tied LM head shares token_embd's storage, so the raw embedding had to be
+    // uploaded for the embed kernel and cannot be replaced by the int8 head
+    // copy.  Build the head's oneDNN conversion here and key it by the *uploaded
+    // device pointer*: wkey(0, output.data) then resolves to that pointer (the
+    // raw copy is in weight_maps_), so gemv_at / run_head find the int8 weights
+    // while the embed kernel keeps reading the GGUF rows.
+    if (md_xmx && !dnnl_dev_.empty() && dnnl_dev_[0] && m.output.data == m.tok_embd.data) {
+        const void * dkey = wptr(0, m.output.data);
+        if (dnnl_dev_[0]->add_weight(dkey, m.output.data, m.output.type, m.output.K, m.output.N)) {
+            fprintf(stderr, "[dev] tied LM head: oneDNN int8 conversion keyed by its device copy\n");
+        }
     }
     // CPU partitions keep weight_maps_ empty: wptr() then returns the host mmap
     // pointer directly (their weights are never copied to a device)

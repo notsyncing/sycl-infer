@@ -540,7 +540,9 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   of a weight after `engine` construction re-faults from disk** - correctness is
   preserved, throughput is not.  CPU partitions keep their pages (their kernels
   read the mmap directly), so a hybrid map's CPU tensors must stay in the
-  `keep` set of `release_host_weight_pages`.
+  `keep` set of `release_host_weight_pages` - including the globals
+  (`tok_embd` / `output` / `output_norm`) when backend 0 is a CPU partition (an
+  all-`cpu` map, where they are never uploaded).
 * **Graph capture**: a value read on the host during `record_forward` is frozen
   into the graph.  Per-step state (positions, token ids, `n_real`, active rows)
   must be read from the host-USM `step_info` *inside* the kernel body, never on
@@ -554,14 +556,17 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   and the batch-1 decode head reads a buffer no kernel wrote for that step -
   while the prefill (which goes through `run_head()`) stays correct.
 * **The multi-device LM head must reach the primary device's oneDNN table, and
-  `cur_dev` must be reset to 0 before it.**  The head is a *global* tensor, so
-  `setup_md_dnnl` (which runs before the weight upload and only walks the layer
-  tensors) does not convert it; the engine adds it afterwards keyed by its
-  *uploaded* device pointer, and gives its plan call an `xq` entry (without one
-  `gemv_at` cannot take its `dnnl_call` branch).  `gemv_at` reads
-  `dnnl_for(cur_dev)` and `cur_dev` is the last layer's device after the layer
-  loop, so it is reset to 0 at the final `handoff_x`.  Miss any of these and the
-  head silently falls through to the fp32 dequant GEMV: 12.3 vs 3.4 ms/token.
+  `cur_dev` must be reset to 0 before it.**  `gemv_at` reads `dnnl_for(cur_dev)`
+  and `cur_dev` is the last layer's device after the layer loop, so it is reset
+  to 0 at the final `handoff_x`, and the head's plan call gets an `xq` entry
+  (without one `gemv_at` cannot take its `dnnl_call` branch).  Miss any of these
+  and the head silently falls through to the fp32 dequant GEMV: 12.3 vs 3.4
+  ms/token.  The head's oneDNN key is the host pointer for an **untied** head
+  (`output.weight` exists; `setup_md_dnnl` converts it before the upload, so the
+  raw copy is skipped and `wkey` returns the host key) but the **uploaded device
+  pointer** for a **tied** head (0.8B: `m.output == m.tok_embd`), which must keep
+  its raw GGUF rows for the embed kernel and is therefore converted after the
+  upload - see `setup_multi_device`.
 * **`handoff_x` copies only the live rows** (`nrows * nreal`, the activation
   layout is `[token][n_embd]`).  The old full `kMaxB*kMaxT` copy moved 10.5 MB
   per handoff - twice per token - for a single-token decode.
@@ -632,6 +637,15 @@ For the 27B (needs the layer split - it does not fit on one card), also run:
 M=/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref      # argmax SAME
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill "$M"  # OK
+```
+
+The 0.8B is the **tied-embedding** (`output.weight` absent) reference, and the
+only model that exercises the tied multi-device LM head; check it with a split
+(and a `cpu` partition for the hybrid path):
+
+```bash
+TEST_LAYER_MAP=0-11:gpu.0,12-23:gpu.1 ./build/test_decode_vs_prefill  # OK
+TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 ```
 
 `test_decode_vs_prefill` defaults to the 0.8B, so it needs the model path
