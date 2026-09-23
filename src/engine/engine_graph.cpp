@@ -365,6 +365,33 @@ static void dbg_dump_raw(sycl::queue & q, const float * d, int n, const char * p
     }
 }
 
+// PF_DUMP_KV=<dir>: append the live tokens' post-norm+RoPE K and V (f32) of
+// every full-attention layer to <dir>/{k,v}_LL.bin, so KV quantization schemes
+// can be studied offline.  Diagnostic only; skipped while a command graph is
+// being recorded (a host read/wait inside a recording is illegal).
+static void dbg_dump_kv(sycl::queue & q, const float * kbuf, const float * vbuf, int mode, int nrows, int nreal,
+                        int n_head_kv, int head_dim, int il) {
+    const int tp = (mode == 2) ? kMaxT : nreal;
+    const size_t per = (size_t)n_head_kv * head_dim;
+    const size_t total = (size_t)nrows * tp * per;
+    static std::vector<float> hk, hv;
+    hk.resize(total);
+    hv.resize(total);
+    q.memcpy(hk.data(), kbuf, total * 4).wait();
+    q.memcpy(hv.data(), vbuf, total * 4).wait();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/k_%02d.bin", getenv("PF_DUMP_KV"), il);
+    if (FILE * fp = fopen(path, "ab")) {
+        fwrite(hk.data(), 4, total, fp);
+        fclose(fp);
+    }
+    snprintf(path, sizeof(path), "%s/v_%02d.bin", getenv("PF_DUMP_KV"), il);
+    if (FILE * fp = fopen(path, "ab")) {
+        fwrite(hv.data(), 4, total, fp);
+        fclose(fp);
+    }
+}
+
 void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows,
                             int at_nsp_hint, const md_phase * ph) {
     // mode 2: chunk-batched prefill. `rows` is the total token count, split into
@@ -968,6 +995,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             cur_be->qk_norm_rope(d_qbuf, d_kbuf, d_vbuf, wf32(dev, L.q_norm), wf32(dev, L.k_norm), kp, vp, d_tables,
                                 d_info, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
                                 max_blocks, nrows, nreal, ksc, vsc);
+            static const bool dbg_kv = getenv("PF_DUMP_KV") != nullptr;
+            if (dbg_kv && !g_capturing && mode != 0) {
+                dbg_dump_kv(dev_queue(cur_dev), d_kbuf, d_vbuf, mode, nrows, nreal, hp.n_head_kv, hp.head_dim, il);
+            }
             const bool at_fused = (nsp == 1 && at_fuse);
             cur_be->attn(d_qbuf, d_qbuf, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, d_info,
                         hp.attn_scale, max_blocks, nrows, nreal, at_fused ? d_attn_out : nullptr, -1, ksc, vsc);

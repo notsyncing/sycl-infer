@@ -240,7 +240,7 @@ mmap 只在上传/转换阶段被读；GPU 分区一旦落到设备，主机就�
 | `--ctx N` / `--ctx full` | 最大序列长度 | `PF_CTX` 或 20480 |
 | `--blocks N` | 启动时提交的 KV 块 | 512（lazy）或按 ctx 计算 |
 | `--kv-cap-mb N` | KV 池上限，同时限制三层缓存预算之和 | auto |
-| `--kv-type T` | KV 存储类型 `i4\|i8\|bf16\|f16\|f32`（覆盖 `PF_KV_TYPE`） | i8 |
+| `--kv-type T` | KV 存储类型 `i4\|i8\|bf16\|f16\|f32`，或 `K:V` 分别指定（如 `i4:i8`）（覆盖 `PF_KV_TYPE`） | i8 |
 | `--device cpu\|gpu\|auto` | 计算后端（`auto` 读 `PF_DEVICE`，否则 gpu） | auto |
 | `--cpu-threads N` | CPU worker 线程数（0 = 物理核，回退硬件并发） | auto |
 | `--layer-map L:dev,...` | 多设备层放置（pipeline parallel，闭区间无缝隙覆盖） | 空 |

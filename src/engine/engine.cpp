@@ -369,11 +369,13 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
             n_attn += !m.hp.is_recr(il);
         }
         const size_t block_bytes = kv_block_bytes();
+        // a block holds a K block and a V block, which may differ (--kv-type K:V)
+        const size_t blk_pair = block_bytes + kv_v_block_bytes();
         // kv_cap_mb < 0 = auto: reserve exactly what max_seq needs (the pool
         // still commits memory lazily in extents, so the extra range is only
         // virtual address space)
         const int cap_blocks = kv_cap_mb > 0
-                                   ? (int)(((int64_t)kv_cap_mb * 1024 * 1024) / ((int64_t)block_bytes * n_attn))
+                                   ? (int)(((int64_t)kv_cap_mb * 1024 * 1024) / ((int64_t)blk_pair * n_attn))
                                    : (kv_cap_mb < 0 ? max_blocks : 0);
         pool_cap = std::max(n_blocks_, cap_blocks);
         // the VRAM cache tier lives in this pool: the reservation must be able

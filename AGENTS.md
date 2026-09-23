@@ -138,6 +138,15 @@ host worker count;
 `--layer-map 0-11:gpu,12-23:cpu` places closed layer ranges on devices (each
 range must cover the layer list without gaps).
 
+`--kv-type K:V` sizes the K and V caches independently (only the scale-carrying
+i4/i8 may be mixed).  The attention error is dominated by V, not K: on the 27B
+`--kv-type i4:i8` (4-bit keys, 8-bit values) measures mean|diff| 0.061 against
+the fp32 CPU reference, versus 0.035 for i8 and 0.183 for i4, at 24 KB/token
+(i8 is 32, i4 is 16) - so it fits a 262144-token context on 2x A770 with
+near-i8 accuracy.  `i8:i4` is the mirror image and is *worse* than i4/i4
+(mean|diff| 1.49), confirming V is the sensitive side.  See
+[`reports/turboquant_and_perf.md`](reports/turboquant_and_perf.md).
+
 ## Testing
 
 The tests default to `/path/to/Qwen3.5-0.8B-Q4_K_M.gguf` and require the
@@ -439,7 +448,8 @@ kernel variants, so performance numbers must state the env used.
 **Model / memory**
 `PF_CTX`, `PF_KV_CAP_MB`, `PF_KV_GROW` (pool growth step, default 64 blocks),
 `PF_KV_TYPE` (`i4`|`int4`|`i8`|`bf16`|`f16`|`f32`, default `i8`; `--kv-type`
-overrides it), `PF_KV_F32`, `PF_KV_BF16`,
+overrides it; `K:V` sizes K and V independently, e.g. `i4:i8`), `PF_KV_F32`,
+`PF_KV_BF16`,
 `PF_SI4` (re-quantize weights to 4-bit SIn), `PF_META` (fp32 side scales).
 
 **Compute path**
@@ -501,7 +511,10 @@ step), `PF_DUMP_PROMPT` (the exact ids - and, for a chat prompt, the rendered
 text - the model is conditioned on), `PF_DUMP_GEN` (the decode loop's sampled id
 and stop decisions), `PF_ROWACT` (restore the now-unused per-row activation
 quantizer for A/B; it is dead because oneDNN reads the per-32-group form, and
-cost ~13 ms/token in a 27B multi-device decode), `PF_W4_RB` (decode GEMV rows
+cost ~13 ms/token in a 27B multi-device decode), `PF_DUMP_KV=<dir>` (append the
+live tokens' post-norm+RoPE f32 K and V of every full-attention layer to
+`<dir>/{k,v}_LL.bin`, for offline KV-quantization studies; skipped while a
+command graph is being recorded, so it only fires on the direct prefill paths), `PF_W4_RB` (decode GEMV rows
 per workgroup, default 16), `PF_CB4` (`0` keeps IQ4_XS/IQ4_NL on the int8
 conversion instead of the native codebook store), `PF_K5` (`0` keeps Q5_K on
 the int8 conversion instead of the native 5-bit store; the prefill cost below is

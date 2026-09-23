@@ -10,7 +10,7 @@ namespace si {
 void cpu_attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
               const cpu_step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out,
-              cpu_kv_dtype kv, const void * kscales, const void * vscales) {
+              cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales) {
     (void)gate;
     const int qstride = n_head * 2 * head_dim;
     const int pstride = 2 + head_dim;
@@ -43,9 +43,12 @@ void cpu_attn(const float * qbuf, const float * gate, const void * kpool, const 
                 const int kb = table[kk / kCpuBlk];
                 const int ko = kk % kCpuBlk;
                 const size_t unit = (size_t)kb * n_head_kv + kvh;
-                const size_t off = kv_row_off(unit, ko, head_dim);
+                const size_t off =
+                    kkv == cpu_kv_dtype::i4 ? kv_row_off_i4(unit, ko, head_dim) : kv_row_off(unit, ko, head_dim);
+                const size_t offv =
+                    vkv == cpu_kv_dtype::i4 ? kv_row_off_i4(unit, ko, head_dim) : kv_row_off(unit, ko, head_dim);
                 float dot = 0.0f;
-                if (kv == cpu_kv_dtype::i8) {
+                if (kkv == cpu_kv_dtype::i8) {
                     const uint16_t * ks = (const uint16_t *)kscales + kv_scale_off(unit, ko, head_dim);
                     for (int i = 0; i < hd / kCpuI8Q; i++) {
                         const float sc = ggml_half_to_float(ks[i]);
@@ -55,17 +58,17 @@ void cpu_attn(const float * qbuf, const float * gate, const void * kpool, const 
                         }
                         dot += sub * sc;
                     }
-                } else if (kv == cpu_kv_dtype::i4) {
+                } else if (kkv == cpu_kv_dtype::i4) {
                     const uint16_t * ks = (const uint16_t *)kscales + kv_scale_off(unit, ko, head_dim);
                     for (int i = 0; i < hd / kCpuI8Q; i++) {
                         const float sc = ggml_half_to_float(ks[i]);
                         for (int d = 0; d < kCpuI8Q; d++) {
-                            dot += q[i * kCpuI8Q + d] * kv_load(kv, kpool, off + i * kCpuI8Q + d) * sc;
+                            dot += q[i * kCpuI8Q + d] * kv_load(kkv, kpool, off + i * kCpuI8Q + d) * sc;
                         }
                     }
                 } else {
                     for (int d = 0; d < hd; d++) {
-                        dot += q[d] * kv_load(kv, kpool, off + d);
+                        dot += q[d] * kv_load(kkv, kpool, off + d);
                     }
                 }
                 dot *= scale;
@@ -73,27 +76,27 @@ void cpu_attn(const float * qbuf, const float * gate, const void * kpool, const 
                 const float e = std::exp(dot - mnew);
                 const float corr = std::exp(m - mnew);
                 l = l * corr + e;
-                if (kv == cpu_kv_dtype::i8) {
+                if (vkv == cpu_kv_dtype::i8) {
                     const uint16_t * vs = (const uint16_t *)vscales + kv_scale_off(unit, ko, head_dim);
                     for (int i = 0; i < hd / kCpuI8Q; i++) {
                         const float sc = ggml_half_to_float(vs[i]);
                         for (int d = 0; d < kCpuI8Q; d++) {
                             acc[i * kCpuI8Q + d] = acc[i * kCpuI8Q + d] * corr
-                                                   + e * (float)((const int8_t *)vpool)[off + i * kCpuI8Q + d] * sc;
+                                                   + e * (float)((const int8_t *)vpool)[offv + i * kCpuI8Q + d] * sc;
                         }
                     }
-                } else if (kv == cpu_kv_dtype::i4) {
+                } else if (vkv == cpu_kv_dtype::i4) {
                     const uint16_t * vs = (const uint16_t *)vscales + kv_scale_off(unit, ko, head_dim);
                     for (int i = 0; i < hd / kCpuI8Q; i++) {
                         const float sc = ggml_half_to_float(vs[i]);
                         for (int d = 0; d < kCpuI8Q; d++) {
                             acc[i * kCpuI8Q + d] =
-                                acc[i * kCpuI8Q + d] * corr + e * kv_load(kv, vpool, off + i * kCpuI8Q + d) * sc;
+                                acc[i * kCpuI8Q + d] * corr + e * kv_load(vkv, vpool, offv + i * kCpuI8Q + d) * sc;
                         }
                     }
                 } else {
                     for (int d = 0; d < hd; d++) {
-                        acc[d] = acc[d] * corr + e * kv_load(kv, vpool, off + d);
+                        acc[d] = acc[d] * corr + e * kv_load(vkv, vpool, offv + d);
                     }
                 }
                 m = mnew;

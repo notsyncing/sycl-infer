@@ -90,11 +90,11 @@ void cpu_gemv_group(uint32_t type, const cpu_gemv_seg * segs, int n_segs, int to
 void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm, void * kpool,
                       void * vpool, const int32_t * tables, const cpu_step_info * info, int n_head, int n_head_kv,
                       int head_dim, int n_rot, float rope_base, float eps, int max_blocks, int n_rows, int n_real,
-                      cpu_kv_dtype kv, const void * kscales, const void * vscales);
+                      cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales);
 void cpu_attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
               const cpu_step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out,
-              cpu_kv_dtype kv, const void * kscales, const void * vscales);
+              cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales);
 void cpu_attn_combine(const float * partials, const float * gate, float * out, const cpu_step_info * info, int n_head,
                       int head_dim, int n_splits, int n_rows, int n_real);
 void cpu_conv_l2(const float * qkv_raw, float * conv_state, const float * conv_w, float * conv_out,

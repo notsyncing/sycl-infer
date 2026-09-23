@@ -192,7 +192,9 @@ struct engine {
     int ffn_stride;              // 2 * n_ff
     int n_blocks;                // reserved KV blocks (virtual address range size)
     int max_blocks;              // block table size per sequence
-    size_t kv_layer_stride;
+    size_t kv_layer_stride;      // K pool bytes per attention layer
+    size_t kv_v_layer_stride = 0; // V pool bytes per attention layer (== kv_layer_stride
+                                  // unless --kv-type K:V mixes i4 with i8)
 
     // activation buffers, [kMaxRows][...]
     float * d_x = nullptr;
@@ -224,7 +226,8 @@ struct engine {
     // indexing, allocated with the same block count as the pools
     void * d_kscales = nullptr;
     void * d_vscales = nullptr;
-    size_t kv_scale_stride = 0;   // bytes per attention layer in a scale plane
+    size_t kv_scale_stride = 0;   // bytes per attention layer in a scale plane (K)
+    size_t kv_v_scale_stride = 0; // ... and V (== kv_scale_stride unless mixed)
     int32_t * d_tables = nullptr; // [kMaxB][max_blocks]
     std::vector<int32_t> h_tables;
 
@@ -247,6 +250,7 @@ struct engine {
     bool kv_map2 = false; // extents are 2 MB aligned (Level Zero requirement)
     uintptr_t kv_vbase = 0, kv_vbase_v = 0;
     size_t kv_reserve_bytes = 0;
+    size_t kv_reserve_bytes_v = 0;
 
     step_info * d_info = nullptr; // host USM
 
@@ -500,17 +504,18 @@ struct engine {
         return pool_blocks - (int)free_blocks_.size();
     }
     void pool_print(const char * tag) const;
-    // K bytes of one block in one attention layer (element-size aware)
+    // bytes of one block in one attention layer, per side (element-size aware)
     size_t kv_block_bytes() const;
+    size_t kv_v_block_bytes() const;
     size_t kv_elem_bytes() const {
-        return (size_t)kv_dtype_bytes(kv_dtype());
+        return (size_t)kv_dtype_bytes(kv_k_dtype());
     }
     // committed and reserved K+V bytes over all attention layers
     size_t kv_bytes_total() const {
-        return kv_block_bytes() * (size_t)attn_layers() * 2 * pool_blocks;
+        return (kv_block_bytes() + kv_v_block_bytes()) * (size_t)attn_layers() * pool_blocks;
     }
     size_t kv_bytes_cap() const {
-        return kv_block_bytes() * (size_t)attn_layers() * 2 * pool_cap;
+        return (kv_block_bytes() + kv_v_block_bytes()) * (size_t)attn_layers() * pool_cap;
     }
     // copy `n` elements of one KV vector out of the pool into fp32 (converts
     // the storage type; used by the stage tests)
@@ -641,7 +646,8 @@ private:
     struct kv_extent {
         int first = 0; // first block id covered
         int count = 0; // blocks covered
-        size_t map_bytes = 0;
+        size_t map_bytes = 0;   // K mapping size
+        size_t map_v_bytes = 0; // V mapping size (== map_bytes unless --kv-type K:V mixed)
         // one physical allocation per (attention layer, K/V): a physical_mem
         // object can only be mapped once
         std::vector<std::unique_ptr<sx::physical_mem>> phys_k, phys_v;

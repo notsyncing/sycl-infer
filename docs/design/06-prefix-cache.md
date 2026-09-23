@@ -174,7 +174,7 @@ flags(4) hash(8) depth(4) blob_bytes(4) state_bytes(4) toks(32*4)
 初始化 `lru` 与 `lru_clock_`，重建 `index_`/`bytes_`。**目录即索引**，无独立索引文件。
 
 **模型指纹**：`pc_disk_init` 对模型身份与所有影响序列化布局的形状做哈希（字面量 `"sycl-infer-pc"`、
-磁盘格式 generation、`kv_dtype`、`kBlockSize`、所有 hparams、`rope_sections`、`gguf.map_size`、
+磁盘格式 generation、`kv_k_dtype`/`kv_v_dtype`、`kBlockSize`、所有 hparams、`rope_sections`、`gguf.map_size`、
 `general.architecture/name/file_type`），结果作为 `pc_dir` 下的子目录。两个模型可安全共享一个基目录。
 
 ### 5.4 层的调度（`engine_prefix_cache.cpp`）

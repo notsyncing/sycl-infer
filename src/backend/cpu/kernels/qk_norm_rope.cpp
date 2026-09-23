@@ -9,7 +9,7 @@ namespace si {
 void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm, void * kpool,
                       void * vpool, const int32_t * tables, const cpu_step_info * info, int n_head, int n_head_kv,
                       int head_dim, int n_rot, float rope_base, float eps, int max_blocks, int n_rows, int n_real,
-                      cpu_kv_dtype kv, const void * kscales, const void * vscales) {
+                      cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales) {
     (void)max_blocks;
     const int qstride = n_head * 2 * head_dim;
     const int kvstride = n_head_kv * head_dim;
@@ -69,7 +69,7 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
             const int kb = table[pos / kCpuBlk];
             const int ko = pos % kCpuBlk;
             const size_t unit = (size_t)kb * n_head_kv + h;
-            if (kv == cpu_kv_dtype::i8) {
+            if (kkv == cpu_kv_dtype::i8) {
                 int8_t * krow = (int8_t *)kpool + kv_row_off(unit, ko, head_dim);
                 uint16_t * ksc = (uint16_t *)kscales + kv_scale_off(unit, ko, head_dim);
                 const int nq = head_dim / kCpuI8Q;
@@ -85,7 +85,7 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                     }
                     ksc[i] = ggml_float_to_half(sc);
                 }
-            } else if (kv == cpu_kv_dtype::i4) {
+            } else if (kkv == cpu_kv_dtype::i4) {
                 uint8_t * krow = (uint8_t *)kpool + kv_row_off_i4(unit, ko, head_dim);
                 uint16_t * ksc = (uint16_t *)kscales + kv_scale_off(unit, ko, head_dim);
                 const int nq = head_dim / kCpuI8Q;
@@ -106,7 +106,7 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                 }
             } else {
                 for (int d = 0; d < head_dim; d++) {
-                    kv_store(kv, kpool, kv_row_off(unit, ko, head_dim) + d, khp[d]);
+                    kv_store(kkv, kpool, kv_row_off(unit, ko, head_dim) + d, khp[d]);
                 }
             }
         }
@@ -115,7 +115,7 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
             const int vb = table[pos / kCpuBlk];
             const int ko = pos % kCpuBlk;
             const size_t unit = (size_t)vb * n_head_kv + h;
-            if (kv == cpu_kv_dtype::i8) {
+            if (vkv == cpu_kv_dtype::i8) {
                 int8_t * vrow = (int8_t *)vpool + kv_row_off(unit, ko, head_dim);
                 uint16_t * vsc = (uint16_t *)vscales + kv_scale_off(unit, ko, head_dim);
                 const int nq = head_dim / kCpuI8Q;
@@ -131,7 +131,7 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                     }
                     vsc[i] = ggml_float_to_half(sc);
                 }
-            } else if (kv == cpu_kv_dtype::i4) {
+            } else if (vkv == cpu_kv_dtype::i4) {
                 uint8_t * vrow = (uint8_t *)vpool + kv_row_off_i4(unit, ko, head_dim);
                 uint16_t * vsc = (uint16_t *)vscales + kv_scale_off(unit, ko, head_dim);
                 const int nq = head_dim / kCpuI8Q;
@@ -152,7 +152,7 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                 }
             } else {
                 for (int d = 0; d < head_dim; d++) {
-                    kv_store(kv, vpool, kv_row_off(unit, ko, head_dim) + d, vhp[d]);
+                    kv_store(vkv, vpool, kv_row_off(unit, ko, head_dim) + d, vhp[d]);
                 }
             }
         }

@@ -71,7 +71,10 @@ cpu_pc_snap to_cpu_snap(const pc_snap & s) {
 }
 
 cpu_kv_dtype to_cpu_kv() {
-    return static_cast<cpu_kv_dtype>((int)kv_dtype());
+    return static_cast<cpu_kv_dtype>((int)kv_k_dtype());
+}
+cpu_kv_dtype to_cpu_vkv() {
+    return static_cast<cpu_kv_dtype>((int)kv_v_dtype());
 }
 
 struct cpu_backend : compute_backend {
@@ -111,7 +114,7 @@ struct cpu_backend : compute_backend {
                       int n_real, const void * kscales, const void * vscales) override {
         const cpu_step_info ci = to_cpu_info(info);
         cpu_qk_norm_rope(qbuf, kbuf, vbuf, q_norm, k_norm, kpool, vpool, tables, &ci, n_head, n_head_kv, head_dim,
-                         n_rot, rope_base, eps, max_blocks, n_rows, n_real, to_cpu_kv(), kscales, vscales);
+                         n_rot, rope_base, eps, max_blocks, n_rows, n_real, to_cpu_kv(), to_cpu_vkv(), kscales, vscales);
     }
     void attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits, const step_info * info,
@@ -120,7 +123,7 @@ struct cpu_backend : compute_backend {
         (void)group;
         const cpu_step_info ci = to_cpu_info(info);
         cpu_attn(qbuf, gate, kpool, vpool, partials, tables, n_head, n_head_kv, head_dim, n_splits, &ci, scale,
-                 max_blocks, n_rows, n_real, out, to_cpu_kv(), kscales, vscales);
+                 max_blocks, n_rows, n_real, out, to_cpu_kv(), to_cpu_vkv(), kscales, vscales);
     }
     void attn_combine(const float * partials, const float * gate, float * out, const step_info * info, int n_head,
                       int head_dim, int n_splits, int n_rows, int n_real) override {

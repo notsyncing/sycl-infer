@@ -406,10 +406,22 @@ enum class kv_dtype_t : int { f32=0, bf16=1, f16=2, i8=3, i4=4 };
 
 解析优先级（`kv_type.cpp`）：
 
-1. `--kv-type T`（`kv_dtype_set`，在 engine 构造前生效）；
+1. `--kv-type T`（`kv_dtype_set_kv`，在 engine 构造前生效）；`T` 可以是单个名字（K、V 同型）
+   或 `K:V`（K、V 独立，如 `i4:i8`）；
 2. `PF_KV_F32 != 0` 或 `PF_KV_BF16 == 0` → f32；
 3. `PF_KV_TYPE` 未设/空 → i8（默认）；
-4. `PF_KV_TYPE = f32|fp32|0 / f16|fp16 / bf16 / i8|int8|q8 / i4|int4|q4`；未知 → 警告 + i8。
+4. `PF_KV_TYPE = f32|fp32|0 / f16|fp16 / bf16 / i8|int8|q8 / i4|int4|q4`，或 `K:V`；未知 → 警告 + i8。
+
+K 与 V 由 `kv_k_dtype()` / `kv_v_dtype()` 分别给出（`kv_dtype()` 是 K 的兼容别名），
+`kv_dtype_mix_ok` 只允许混合两种带 scale 的类型（i4/i8）——它们的行字节数不同
+（`head_dim` vs `head_dim/2`）但共用同一个 per-32 fp16 scale 平面。engine 的 pool 因此有
+`kv_block_bytes()`/`kv_v_block_bytes()`、`kv_layer_stride`/`kv_v_layer_stride` 两套几何，
+虚拟内存映射和 prefix-cache blob 也按 K/V 分别计算；`--kv-cap-mb` 的换算用两者之和。
+
+**精度**：attention 的误差由 V 主导，不是 K。27B 对 fp32 CPU 参考的 mean|diff|：i8 0.035、
+`i4:i8`（K=i4/V=i8）0.061、i4 0.183、`i8:i4` 1.49。所以 `--kv-type i4:i8` 用 i8 的 75% 字节
+拿到接近 i8 的精度，并能装下 262144 上下文。详见
+[`reports/turboquant_and_perf.md`](../../reports/turboquant_and_perf.md)。
 
 i8 几何：`[block][kv head]` 单元内是 `kBlockSize` 行 × `head_dim` int8，后接独立的
 `kBlockSize × (head_dim/32)` fp16 scale 平面。成本 3 KB/token/layer（K+V）对比 bf16 的 6、f32 的 12。
@@ -417,6 +429,8 @@ i8 几何：`[block][kv head]` 单元内是 `kBlockSize` 行 × `head_dim` int8�
 i4 几何相同，但每个字节打包两个有符号 4-bit 值（低 nibble = 偶数 head dim，值域 `[-7,7]`，二补码），
 一行是 `head_dim/2` 字节，scale 平面与 i8 一致；成本 1.5 KB/token/layer。`kv_dtype_bits` /
 `kv_dtype_row_bytes` 给出每元素位数与行字节数，`kv_dtype_has_scales` 判断是否有独立 scale 平面。
+混合时两个 kernel 都按 K 的类型实例化、在内部按 V 的类型分派（`attn.cpp`/`qk_norm_rope.cpp`
+的 `with_k` lambda）。
 
 `kv_ld_host` 是主机侧元素读取；i8/i4 返回反量化后的值（i4 用元素下标定位 nibble），
 pool 的 scale 处理在 `engine::kv_read_vec`。

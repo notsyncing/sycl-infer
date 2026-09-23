@@ -70,7 +70,9 @@ static void usage(const char * prog) {
             "                               then RAM, then VRAM.\n"
             "  --mmproj <mmproj.gguf>       vision projector needed by --image/--video\n"
             "  --audio-mmproj <gguf>        audio tower needed by --audio\n"
-            "  --kv-type T                  KV cache storage type: i4|i8|bf16|f16|f32\n"
+            "  --kv-type T                  KV cache storage type: i4|i8|bf16|f16|f32,\n"
+            "                               or K:V to size K and V independently\n"
+            "                               (e.g. i4:i8: 4-bit keys, 8-bit values)\n"
             "                               (default i8; overrides PF_KV_TYPE; all math\n"
             "                               stays fp32, i4 packs two values per byte)\n"
             "\n"
@@ -220,12 +222,13 @@ int main(int argc, char ** argv) {
             pc_vram_mb = atoi(next().c_str());
         } else if (a == "--kv-type") {
             const std::string v = next();
-            kv_dtype_t kt;
-            if (!kv_dtype_parse(v.c_str(), kt)) {
-                fprintf(stderr, "error: --kv-type expects i4|i8|bf16|f16|f32\n");
+            kv_dtype_t kt, vt;
+            if (!kv_dtype_parse_pair(v.c_str(), kt, vt)) {
+                fprintf(stderr, "error: --kv-type expects i4|i8|bf16|f16|f32, or K:V "
+                                "(e.g. i8:i4)\n");
                 return 1;
             }
-            kv_dtype_set(kt);
+            kv_dtype_set_kv(kt, vt);
         } else if (a == "--layer-map") {
             layer_map = next();
         } else if (a == "--device") {
@@ -314,11 +317,17 @@ int main(int argc, char ** argv) {
             const double per_tok_kb =
                 e.pool_blocks > 0 ? (double)e.kv_bytes_total() / (double)((size_t)e.pool_blocks * kBlockSize) / 1024.0
                                   : 0.0;
+            char kvname[32];
+            if (kv_k_dtype() == kv_v_dtype()) {
+                snprintf(kvname, sizeof(kvname), "%s", kv_dtype_name(kv_k_dtype()));
+            } else {
+                snprintf(kvname, sizeof(kvname), "%s:%s", kv_dtype_name(kv_k_dtype()), kv_dtype_name(kv_v_dtype()));
+            }
             fprintf(stderr,
                     "[ctx] max_seq=%d tokens%s, kv_blocks=%d (%d tokens), kv_pool=%.0f MB, "
                     "kv_cap=%d blocks (%.0f MB, %s), kv_type=%s (%.0f KB/token)\n",
                     e.max_seq, ctx_full ? " (full)" : (ctx_auto ? " (auto)" : ""), n_blocks, n_blocks * kBlockSize,
-                    kv_mb, e.pool_cap, cap_mb, e.kv_virtual ? "virtual USM" : "fixed", kv_dtype_name(kv_dtype()),
+                    kv_mb, e.pool_cap, cap_mb, e.kv_virtual ? "virtual USM" : "fixed", kvname,
                     per_tok_kb);
             // device memory report (best effort: the free_memory aspect is not
             // implemented by every backend)

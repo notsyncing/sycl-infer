@@ -30,14 +30,24 @@ namespace si {
 enum class kv_dtype_t : int { f32 = 0, bf16 = 1, f16 = 2, i8 = 3, i4 = 4 };
 
 // selected from --kv-type, else once per process from PF_KV_TYPE / PF_KV_F32 /
-// PF_KV_BF16
-kv_dtype_t kv_dtype();
+// PF_KV_BF16.  `--kv-type K:V` (or PF_KV_TYPE=K:V) selects the K and V storage
+// independently; a single name sets both.  Mixed types are supported for the
+// two scale-carrying types (i4/i8) and for the different-width fp types.
+kv_dtype_t kv_dtype();    // the K type (legacy single-type callers)
+kv_dtype_t kv_k_dtype();
+kv_dtype_t kv_v_dtype();
 const char * kv_dtype_name(kv_dtype_t t);
 // Return false and print nothing when `spec` is not a known KV type name.
 bool kv_dtype_parse(const char * spec, kv_dtype_t & out);
+// `K:V` or a single name -> k and v.  Returns false for an unknown name or an
+// unsupported mix.
+bool kv_dtype_parse_pair(const char * spec, kv_dtype_t & k, kv_dtype_t & v);
 // Override the process-wide KV type (CLI --kv-type).  Must be called before the
 // engine (and thus kv_setup) is constructed.
 void kv_dtype_set(kv_dtype_t t);
+void kv_dtype_set_kv(kv_dtype_t k, kv_dtype_t v);
+// True when K and V may use `k`/`v`: the scale-carrying i4/i8 pair, or equal.
+bool kv_dtype_mix_ok(kv_dtype_t k, kv_dtype_t v);
 
 inline int kv_dtype_bytes(kv_dtype_t t) {
     return t == kv_dtype_t::f32 ? 4 : (t == kv_dtype_t::i8 ? 1 : (t == kv_dtype_t::i4 ? 1 : 2));

@@ -154,9 +154,9 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
     const int n_wg = n_rows * n_real * n_head * n_splits;
     const int grp = group >= 0 ? group : dec_group_env();
     // the grouped kernel has no int8/int4 path (it reuses kv_ld4 on a full row)
-    if (grp && !kv_dtype_has_scales(kv_dtype()) && !fuse && head_dim == HD && n_head_kv > 0 && n_head % n_head_kv == 0
-        && n_head / n_head_kv == 4) {
-        switch (kv_dtype()) {
+    if (grp && !kv_dtype_has_scales(kv_k_dtype()) && !kv_dtype_has_scales(kv_v_dtype()) && !fuse && head_dim == HD
+        && n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv == 4) {
+        switch (kv_k_dtype()) {
         case kv_dtype_t::f32:
             attn_group_kernel<4>(q, qbuf, (const float *)kpool, (const float *)vpool, partials, tables, n_head,
                                  n_head_kv, head_dim, n_splits, info, scale, max_blocks, n_rows, n_real);
@@ -177,8 +177,11 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
     auto launch = [&](const auto * kp_base, const auto * vp_base, const sycl::half * ksc_base,
                       const sycl::half * vsc_base) {
         using KV = std::remove_cv_t<std::remove_pointer_t<decltype(kp_base)>>;
+        using VV = std::remove_cv_t<std::remove_pointer_t<decltype(vp_base)>>;
         constexpr bool I8 = std::is_same_v<KV, int8_t>;
         constexpr bool I4 = std::is_same_v<KV, uint8_t>;
+        constexpr bool V8 = std::is_same_v<VV, int8_t>;
+        constexpr bool V4 = std::is_same_v<VV, uint8_t>;
         q.parallel_for(nd_range<1>((size_t)n_wg * 32, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const int gid = it.get_group(0);
             const int r = gid / (n_real * n_head * n_splits);
@@ -235,11 +238,14 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     if constexpr (I4) {
                         ka = i4_ld4(kp, d0);
                         kb4 = i4_ld4(kp, d1);
-                        va = i4_ld4(vp, d0);
-                        vb = i4_ld4(vp, d1);
                     } else {
                         ka = kv_ld4(kp + d0);
                         kb4 = kv_ld4(kp + d1);
+                    }
+                    if constexpr (V4) {
+                        va = i4_ld4(vp, d0);
+                        vb = i4_ld4(vp, d1);
+                    } else {
                         va = kv_ld4(vp + d0);
                         vb = kv_ld4(vp + d1);
                     }
@@ -259,7 +265,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     const float e = sycl::exp(dot - mnew);
                     const float corr = sycl::exp(m - mnew);
                     l = l * corr + e;
-                    if constexpr (I8 || I4) {
+                    if constexpr (V8 || V4) {
                         const auto * vs = kv_row_scales(vsc_base, unit, ko, head_dim);
                         aa = fma4(va, e * (float)vs[lane / 8], mul4(aa, corr));
                         ab = fma4(vb, e * (float)vs[4 + lane / 8], mul4(ab, corr));
@@ -330,12 +336,12 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 const float e = sycl::exp(dot - mnew);
                 const float corr = sycl::exp(m - mnew);
                 l = l * corr + e;
-                if constexpr (I8 || I4) {
+                if constexpr (V8 || V4) {
                     const auto * vs = kv_row_scales(vsc_base, unit, ko, head_dim);
 #pragma unroll
                     for (int i = 0; i < HD / 32; i++) {
                         float vv;
-                        if constexpr (I4) {
+                        if constexpr (V4) {
                             vv = i4_ld(vp, lane + 32 * i);
                         } else {
                             vv = kv_ld(vp + lane + 32 * i);
@@ -372,15 +378,24 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
     };
     const sycl::half * ksc = (const sycl::half *)kscales;
     const sycl::half * vsc = (const sycl::half *)vscales;
-    switch (kv_dtype()) {
-    case kv_dtype_t::f32: launch((const float *)kpool, (const float *)vpool, nullptr, nullptr); break;
-    case kv_dtype_t::bf16:
-        launch((const sycl::ext::oneapi::bfloat16 *)kpool, (const sycl::ext::oneapi::bfloat16 *)vpool, nullptr,
-               nullptr);
-        break;
-    case kv_dtype_t::f16: launch((const sycl::half *)kpool, (const sycl::half *)vpool, nullptr, nullptr); break;
-    case kv_dtype_t::i8: launch((const int8_t *)kpool, (const int8_t *)vpool, ksc, vsc); break;
-    case kv_dtype_t::i4: launch((const uint8_t *)kpool, (const uint8_t *)vpool, ksc, vsc); break;
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    // K picks the launch instantiation, V is dispatched inside it, so
+    // --kv-type K:V can mix the two scale-carrying types (i4/i8).
+    auto with_k = [&](const auto * kp, const sycl::half * ksc_p) {
+        switch (kv_v_dtype()) {
+        case kv_dtype_t::f32: launch(kp, (const float *)vpool, ksc_p, nullptr); break;
+        case kv_dtype_t::bf16: launch(kp, (const bf16 *)vpool, ksc_p, nullptr); break;
+        case kv_dtype_t::f16: launch(kp, (const sycl::half *)vpool, ksc_p, nullptr); break;
+        case kv_dtype_t::i8: launch(kp, (const int8_t *)vpool, ksc_p, vsc); break;
+        case kv_dtype_t::i4: launch(kp, (const uint8_t *)vpool, ksc_p, vsc); break;
+        }
+    };
+    switch (kv_k_dtype()) {
+    case kv_dtype_t::f32: with_k((const float *)kpool, nullptr); break;
+    case kv_dtype_t::bf16: with_k((const bf16 *)kpool, nullptr); break;
+    case kv_dtype_t::f16: with_k((const sycl::half *)kpool, nullptr); break;
+    case kv_dtype_t::i8: with_k((const int8_t *)kpool, ksc); break;
+    case kv_dtype_t::i4: with_k((const uint8_t *)kpool, ksc); break;
     }
 }
 

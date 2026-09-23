@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 
 namespace si {
@@ -26,11 +27,15 @@ static void * dalloc_bytes(sycl::queue & q, size_t bytes, bool host) {
 // has no virtual USM support the pool falls back to a plain fixed allocation
 // of the initial size.
 size_t engine::kv_block_bytes() const {
-    return (size_t)m.hp.n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_dtype(), m.hp.head_dim);
+    return (size_t)m.hp.n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_k_dtype(), m.hp.head_dim);
+}
+
+size_t engine::kv_v_block_bytes() const {
+    return (size_t)m.hp.n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_v_dtype(), m.hp.head_dim);
 }
 
 void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
-    const kv_dtype_t dt = kv_dtype();
+    const kv_dtype_t dt = which ? kv_v_dtype() : kv_k_dtype();
     const int esz = kv_dtype_bytes(dt);
     const void * base = which ? d_vpool : d_kpool;
     if (!base || !dst || n <= 0) {
@@ -118,15 +123,15 @@ void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char
         const int d = layer_dev_[(size_t)il];
         const int la = layer_attn_local_[(size_t)il];
         kp = (const char *)dev_kpool_[(size_t)d] + (size_t)la * kv_layer_stride;
-        vp = (const char *)dev_vpool_[(size_t)d] + (size_t)la * kv_layer_stride;
+        vp = (const char *)dev_vpool_[(size_t)d] + (size_t)la * kv_v_layer_stride;
         ksc = dev_kscales_[(size_t)d] ? (const char *)dev_kscales_[(size_t)d] + (size_t)la * kv_scale_stride : nullptr;
-        vsc = dev_vscales_[(size_t)d] ? (const char *)dev_vscales_[(size_t)d] + (size_t)la * kv_scale_stride : nullptr;
+        vsc = dev_vscales_[(size_t)d] ? (const char *)dev_vscales_[(size_t)d] + (size_t)la * kv_v_scale_stride : nullptr;
         return;
     }
     kp = (const char *)d_kpool + (size_t)a * kv_layer_stride;
-    vp = (const char *)d_vpool + (size_t)a * kv_layer_stride;
+    vp = (const char *)d_vpool + (size_t)a * kv_v_layer_stride;
     ksc = d_kscales ? (const char *)d_kscales + (size_t)a * kv_scale_stride : nullptr;
-    vsc = d_vscales ? (const char *)d_vscales + (size_t)a * kv_scale_stride : nullptr;
+    vsc = d_vscales ? (const char *)d_vscales + (size_t)a * kv_v_scale_stride : nullptr;
 }
 
 int engine::attn_dev(int a) const {
@@ -146,6 +151,8 @@ int engine::attn_dev(int a) const {
 
 void engine::kv_setup(int n_attn, int initial_blocks) {
     const size_t block_bytes = kv_block_bytes();
+    const size_t v_block_bytes = kv_v_block_bytes();
+    const bool has_scales = kv_dtype_has_scales(kv_k_dtype()) || kv_dtype_has_scales(kv_v_dtype());
     if (multi_dev) {
         // One committed pool per device, holding only the attention layers that
         // device computes.  Block ids are global, so the same block table works
@@ -154,6 +161,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         n_blocks = pool_cap;
         kv_virtual = false;
         kv_layer_stride = (size_t)n_blocks * block_bytes;
+        kv_v_layer_stride = (size_t)n_blocks * v_block_bytes;
         const int ndev = (int)backends_.size();
         std::vector<int> local_attn((size_t)ndev, 0);
         for (int il = 0; il < m.hp.n_layer; il++) {
@@ -165,22 +173,22 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         dev_vpool_.assign((size_t)ndev, nullptr);
         dev_kscales_.assign((size_t)ndev, nullptr);
         dev_vscales_.assign((size_t)ndev, nullptr);
-        if (kv_dtype_has_scales(kv_dtype())) {
+        if (has_scales) {
             kv_scale_stride =
                 (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
+            kv_v_scale_stride = kv_scale_stride;
         }
         for (int d = 0; d < ndev; d++) {
             const int na = local_attn[(size_t)d];
             if (na <= 0) {
                 continue;
             }
-            size_t kpool_bytes = (size_t)n_blocks * block_bytes * (size_t)na;
-            dev_kpool_[(size_t)d] = dev_alloc_on(d, kpool_bytes);
-            dev_vpool_[(size_t)d] = dev_alloc_on(d, kpool_bytes);
-            if (kv_dtype_has_scales(kv_dtype())) {
-                size_t scale_bytes = kv_scale_stride * (size_t)na;
+            dev_kpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * block_bytes * (size_t)na);
+            dev_vpool_[(size_t)d] = dev_alloc_on(d, (size_t)n_blocks * v_block_bytes * (size_t)na);
+            if (has_scales) {
+                const size_t scale_bytes = kv_scale_stride * (size_t)na;
                 dev_kscales_[(size_t)d] = dev_alloc_on(d, scale_bytes);
-                dev_vscales_[(size_t)d] = dev_alloc_on(d, scale_bytes);
+                dev_vscales_[(size_t)d] = dev_alloc_on(d, kv_v_scale_stride * (size_t)na);
             }
         }
         block_used_.assign(n_blocks, 0);
@@ -199,11 +207,13 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         kv_virtual = false;
         n_blocks = initial_blocks;
         kv_layer_stride = (size_t)n_blocks * block_bytes;
-        if (kv_dtype_has_scales(kv_dtype())) {
+        kv_v_layer_stride = (size_t)n_blocks * v_block_bytes;
+        if (has_scales) {
             kv_scale_stride =
                 (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
+            kv_v_scale_stride = kv_scale_stride;
             d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn, true);
-            d_vscales = dalloc_bytes(q, kv_scale_stride * n_attn, true);
+            d_vscales = dalloc_bytes(q, kv_v_scale_stride * n_attn, true);
             if (!d_kscales || !d_vscales) {
                 throw std::runtime_error("int8 KV scale planes failed");
             }
@@ -214,7 +224,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         pool_initial = initial_blocks;
         pool_blocks = 0;
         d_kpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, true);
-        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, true);
+        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * v_block_bytes * n_attn, true);
         kv_grow(initial_blocks);
         return;
     }
@@ -222,8 +232,12 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
     // Level Zero requires mappings of >= 2 MB to be 2 MB aligned, so the whole
     // layout (layer stride and extent starts) is kept on 2 MB boundaries.
     // With fp32 KV a block is 64 KB (32 blocks = 2 MB); a 2-byte element type
-    // halves that, so the granule is derived from the block size.
-    const int align = (int)std::max<size_t>(1, (mb2 + block_bytes - 1) / block_bytes);
+    // halves that, so the granule is derived from the block size.  K and V may
+    // have different block sizes (--kv-type i4:i8), so the granule is the common
+    // multiple of the two.
+    const int align_k = (int)std::max<size_t>(1, (mb2 + block_bytes - 1) / block_bytes);
+    const int align_v = (int)std::max<size_t>(1, (mb2 + v_block_bytes - 1) / v_block_bytes);
+    const int align = align_k / (int)std::gcd(align_k, align_v) * align_v;
     kv_align_blocks = align;
     if (pool_cap < align) {
         pool_cap = align;
@@ -242,15 +256,17 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
     }
 
     bool ok = false;
+    const size_t k_reserve = (((size_t)pool_cap * block_bytes * n_attn) + (size_t)(1 << 20) - 1) / (size_t)(1 << 20) * (size_t)(1 << 20);
+    const size_t v_reserve = (((size_t)pool_cap * v_block_bytes * n_attn) + (size_t)(1 << 20) - 1) / (size_t)(1 << 20) * (size_t)(1 << 20);
     try {
         const size_t gran = sx::get_mem_granularity(q.get_device(), q.get_context());
-        kv_vbase = sx::reserve_virtual_mem((((size_t)pool_cap * block_bytes * n_attn) + gran - 1) / gran * gran,
-                                           q.get_context());
-        kv_vbase_v = sx::reserve_virtual_mem((((size_t)pool_cap * block_bytes * n_attn) + gran - 1) / gran * gran,
-                                             q.get_context());
-        kv_reserve_bytes = (((size_t)pool_cap * block_bytes * n_attn) + gran - 1) / gran * gran;
+        kv_vbase = sx::reserve_virtual_mem((k_reserve + gran - 1) / gran * gran, q.get_context());
+        kv_vbase_v = sx::reserve_virtual_mem((v_reserve + gran - 1) / gran * gran, q.get_context());
+        kv_reserve_bytes = (k_reserve + gran - 1) / gran * gran;
+        kv_reserve_bytes_v = (v_reserve + gran - 1) / gran * gran;
         ok = kv_vbase != 0 && kv_vbase_v != 0;
-        kv_map2 = ok && kv_vbase % mb2 == 0 && kv_vbase_v % mb2 == 0 && ((size_t)pool_cap * block_bytes) % mb2 == 0;
+        kv_map2 = ok && kv_vbase % mb2 == 0 && kv_vbase_v % mb2 == 0 && ((size_t)pool_cap * block_bytes) % mb2 == 0
+                  && ((size_t)pool_cap * v_block_bytes) % mb2 == 0;
     } catch (const std::exception & ex) {
         fprintf(stderr, "[kv] virtual USM unavailable (%s)\n", ex.what());
     }
@@ -269,17 +285,20 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         pool_cap = initial_blocks;
         n_blocks = initial_blocks; // kv_layer_stride / reservation shrink with it
         kv_layer_stride = (size_t)n_blocks * kv_block_bytes();
+        kv_v_layer_stride = (size_t)n_blocks * kv_v_block_bytes();
     } else {
         n_blocks = pool_cap;
         kv_layer_stride = (size_t)n_blocks * kv_block_bytes();
+        kv_v_layer_stride = (size_t)n_blocks * kv_v_block_bytes();
     }
-    // int8: separate fp16 scale planes, indexed like the data pool (one plane
+    // int8/i4: separate fp16 scale planes, indexed like the data pool (one plane
     // per layer for K and V).  They are tiny (head_dim/32 halves per row) and
     // do not participate in the virtual-memory growth.
-    if (kv_dtype_has_scales(kv_dtype())) {
+    if (has_scales) {
         kv_scale_stride = (size_t)n_blocks * m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half);
+        kv_v_scale_stride = kv_scale_stride;
         d_kscales = dalloc_bytes(q, kv_scale_stride * n_attn, cpu_mode);
-        d_vscales = dalloc_bytes(q, kv_scale_stride * n_attn, cpu_mode);
+        d_vscales = dalloc_bytes(q, kv_v_scale_stride * n_attn, cpu_mode);
         if (!d_kscales || !d_vscales) {
             throw std::runtime_error("int8 KV scale planes failed");
         }
@@ -291,7 +310,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
     pool_blocks = 0;
     if (!kv_virtual) {
         d_kpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, cpu_mode);
-        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, cpu_mode);
+        d_vpool = dalloc_bytes(q, (size_t)initial_blocks * v_block_bytes * n_attn, cpu_mode);
         kv_grow(initial_blocks);
         return;
     }
@@ -321,19 +340,24 @@ bool engine::kv_grow(int want) {
     const int count = std::min(want, pool_cap - pool_blocks);
     const int first = pool_blocks;
     const size_t bytes = (size_t)count * kv_block_bytes();
+    const size_t v_bytes = (size_t)count * kv_v_block_bytes();
     size_t map_bytes = bytes;
+    size_t map_v_bytes = v_bytes;
     try {
         const size_t gran = sx::get_mem_granularity(q.get_device(), q.get_context());
         map_bytes = ((bytes + gran - 1) / gran) * gran;
+        map_v_bytes = ((v_bytes + gran - 1) / gran) * gran;
     } catch (...) {
     }
     kv_extent ex;
     ex.first = first;
     ex.count = count;
     ex.map_bytes = map_bytes;
+    ex.map_v_bytes = map_v_bytes;
     try {
         if (kv_virtual) {
             const size_t layer_bytes = (size_t)n_blocks * kv_block_bytes();
+            const size_t layer_bytes_v = (size_t)n_blocks * kv_v_block_bytes();
             const int na = attn_layers();
             ex.phys_k.reserve(na);
             ex.phys_v.reserve(na);
@@ -342,8 +366,9 @@ bool engine::kv_grow(int want) {
                 auto pk = std::make_unique<sx::physical_mem>(q, map_bytes);
                 pk->map(kv_vbase + off, map_bytes, sx::address_access_mode::read_write);
                 ex.phys_k.push_back(std::move(pk));
-                auto pv = std::make_unique<sx::physical_mem>(q, map_bytes);
-                pv->map(kv_vbase_v + off, map_bytes, sx::address_access_mode::read_write);
+                const uintptr_t offv = (uintptr_t)il * layer_bytes_v + (uintptr_t)first * kv_v_block_bytes();
+                auto pv = std::make_unique<sx::physical_mem>(q, map_v_bytes);
+                pv->map(kv_vbase_v + offv, map_v_bytes, sx::address_access_mode::read_write);
                 ex.phys_v.push_back(std::move(pv));
             }
         }
@@ -388,11 +413,13 @@ void engine::kv_shrink() {
             free_blocks_.push(b);
         }
         const size_t layer_bytes = (size_t)n_blocks * kv_block_bytes();
+        const size_t layer_bytes_v = (size_t)n_blocks * kv_v_block_bytes();
         const int na = attn_layers();
         for (int il = 0; il < na && il < (int)ex.phys_k.size(); il++) {
             const uintptr_t off = (uintptr_t)il * layer_bytes + (uintptr_t)ex.first * kv_block_bytes();
+            const uintptr_t offv = (uintptr_t)il * layer_bytes_v + (uintptr_t)ex.first * kv_v_block_bytes();
             sx::unmap((void *)(kv_vbase + off), ex.map_bytes, q.get_context());
-            sx::unmap((void *)(kv_vbase_v + off), ex.map_bytes, q.get_context());
+            sx::unmap((void *)(kv_vbase_v + offv), ex.map_v_bytes, q.get_context());
         }
         ex.phys_k.clear();
         ex.phys_v.clear();
@@ -433,12 +460,14 @@ void engine::kv_release_pool() {
     }
     if (kv_virtual) {
         const size_t layer_bytes = (size_t)n_blocks * kv_block_bytes();
+        const size_t layer_bytes_v = (size_t)n_blocks * kv_v_block_bytes();
         const int na = attn_layers();
         for (auto & ex : kv_extents_) {
             for (int il = 0; il < na && il < (int)ex.phys_k.size(); il++) {
                 const uintptr_t off = (uintptr_t)il * layer_bytes + (uintptr_t)ex.first * kv_block_bytes();
+                const uintptr_t offv = (uintptr_t)il * layer_bytes_v + (uintptr_t)ex.first * kv_v_block_bytes();
                 sx::unmap((void *)(kv_vbase + off), ex.map_bytes, q.get_context());
-                sx::unmap((void *)(kv_vbase_v + off), ex.map_bytes, q.get_context());
+                sx::unmap((void *)(kv_vbase_v + offv), ex.map_v_bytes, q.get_context());
             }
             ex.phys_k.clear();
             ex.phys_v.clear();
@@ -448,7 +477,7 @@ void engine::kv_release_pool() {
             sx::free_virtual_mem(kv_vbase, kv_reserve_bytes, q.get_context());
         }
         if (kv_vbase_v) {
-            sx::free_virtual_mem(kv_vbase_v, kv_reserve_bytes, q.get_context());
+            sx::free_virtual_mem(kv_vbase_v, kv_reserve_bytes_v, q.get_context());
         }
         kv_vbase = kv_vbase_v = 0;
     } else {
@@ -471,7 +500,7 @@ void engine::kv_release_pool() {
 
 void engine::pool_print(const char * tag) const {
     const double mb = 1024.0 * 1024.0;
-    const double block_mb = (double)kv_block_bytes() * attn_layers() * 2.0 / mb;
+    const double block_mb = (double)(kv_block_bytes() + kv_v_block_bytes()) * attn_layers() / mb;
     fprintf(stderr,
             "[kv] %s: pool=%d blocks (%.0f MB), cap=%d (%.0f MB), in_use=%d, peak=%llu, "
             "grows=%llu shrinks=%llu%s\n",

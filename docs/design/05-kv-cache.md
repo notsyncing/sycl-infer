@@ -17,13 +17,16 @@
 
 ## 2. 字节几何
 
-* `kv_block_bytes()`（`engine_kvpool.cpp:30-32`）：一个 attention 层中一个块 **K 的字节数**
-  `n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_dtype(), head_dim)`；V 同尺寸。
-* `kv_layer_stride`：每 attention 层的字节数 = `n_blocks * kv_block_bytes()`。三处设置：
+* `kv_block_bytes()`（`engine_kvpool.cpp:30-36`）：一个 attention 层中一个块 **K 的字节数**
+  `n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_k_dtype(), head_dim)`；V 用
+  `kv_v_block_bytes()`（`--kv-type K:V` 时两者不同，否则相等）。
+* `kv_layer_stride` / `kv_v_layer_stride`：每 attention 层 K / V 的字节数 =
+  `n_blocks * kv_block_bytes()` / `n_blocks * kv_v_block_bytes()`。三处设置：
   `kv_setup` 的两条分支与 `alloc_buffers`（`engine.cpp:390`）。这里的 `n_blocks` 是**预留**大小，这
   正是池增长时图基址仍然有效的原因。
-* `kv_scale_stride`（`engine_kvpool.cpp`）：仅 i8/i4，`n_blocks * n_head_kv * kBlockSize *
-  (head_dim/kI8Q) * sizeof(half)`。scale 平面是普通 `malloc_device`（不是虚拟内存），按完整预留分配。
+* `kv_scale_stride` / `kv_v_scale_stride`（`engine_kvpool.cpp`）：仅 i8/i4，`n_blocks *
+  n_head_kv * kBlockSize * (head_dim/kI8Q) * sizeof(half)`（K/V 同型时相等）。scale 平面是普通
+  `malloc_device`（不是虚拟内存），按完整预留分配。
 * `attn_layers()` 统计非递归（full attention）层；GDN 层不占 KV。
 
 `kv_bytes_total()` / `kv_bytes_cap()` 报告已提交/预留的 K+V 总字节。
@@ -142,4 +145,7 @@
 
 int8/int4 的量化与反量化在 kernel 内完成（`qk_norm_rope` 写、`attn` 读），中间算术保持 fp32。
 KV 类型通过 `--kv-type`（CLI）或 `PF_KV_TYPE`（env）选择，见 [03-kernels.md](03-kernels.md#11-kv-存储类型kv_typeh)。
-i4 的精度/性能测量见 [`reports/int4_kv.md`](../../reports/int4_kv.md)：端到端与 i8 持平，收益是容量。
+`--kv-type K:V` 可分别指定 K 与 V（仅 i4/i8 可混）。i4 的精度/性能测量见
+[`reports/int4_kv.md`](../../reports/int4_kv.md)：端到端与 i8 持平，收益是容量。误差由 V 主导，
+所以 `i4:i8`（K 用 i4、V 用 i8）用 i8 的 75% 字节拿到接近 i8 的精度，并装得下 262144 上下文；
+见 [`reports/turboquant_and_perf.md`](../../reports/turboquant_and_perf.md)。
