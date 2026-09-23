@@ -367,6 +367,23 @@ struct engine {
                 }
                 return n >= 2 * kMaxT ? n : 0;
             }
+            // PF_PFB_MAX_M: cap on the mode-2 batch (A/B; 0 = the default cap)
+            //
+            // The multi-device mode-2 prefill is incorrect for a batch of
+            // M >= 2*kMaxT tokens: the logits are wrong from the first token
+            // (measured on the 0.8B and the 27B, 2 GPUs, at exactly 64 prompt
+            // tokens, with oneDNN; the single-device mode-2 path is correct up
+            // to M = 512, and the multi-device chunked mode-1 path is correct
+            // at every length).  Capping the batch at kMaxT (one chunk row)
+            // keeps oneDNN and restores correctness; measured cost is ~4% of
+            // pp512 (1110 vs 1155 t/s) and nothing on tg128, because the
+            // oneDNN prefill at M=512 is XMX-bound, not weight-read-bound.
+            // PF_PFB_MAX_M=0 restores the uncapped (incorrect) batch for A/B.
+            const char * em = getenv("PF_PFB_MAX_M");
+            const int mcap = em ? atoi(em) : kMaxT;
+            if (multi_dev && mcap > 0) {
+                return std::min(rem, mcap);
+            }
             return std::min(rem, kMaxB * kMaxT);
         }
         int best = 0;

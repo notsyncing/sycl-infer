@@ -509,7 +509,9 @@ what it buys), `PF_K5_NOCORR` (drop the prefill offset correction - diagnostic
 bisection for the k5 prefill cost), `PF_MD_GRAPH_DEV` (record the multi-device decode
 command graph only for device N; `99` = none, for A/B against the direct
 replay), `PF_PROF_ALL` (with `PF_PROF`: dump every call group's ms/step instead
-of the top 8).
+of the top 8), `PF_PFB_MAX_M` (cap on the multi-device mode-2 prefill batch,
+default `kMaxT`; `0` disables the cap and restores the *incorrect* uncapped
+batch, see the multi-device prefill gotcha below).
 
 **Weight representation**
 `PF_W4` (native u4 for Q4_K, default on), `PF_CB4` (store IQ4_XS/IQ4_NL as native 4-bit codebook indices + a per-32 f16
@@ -602,6 +604,20 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   md_int8 take a partial batch silently corrupts the hidden state (a 2-GPU
   md_int8 decode-vs-prefill mismatch).  Likewise an **all-`cpu` `--layer-map`**
   must select the CPU queue (`resolve_device`), not the default GPU one.
+* **The multi-device mode-2 prefill is wrong for a batch of `M >= 2*kMaxT`
+  (64) tokens.**  Measured on the 0.8B and the 27B, 2 GPUs, with oneDNN: a
+  prompt of 63 tokens answers correctly and 64 does not (wrong, nearly flat
+  logits), independent of the KV type; a GPU+CPU hybrid map reproduces it, the
+  single-device mode-2 path is correct up to `M=512` (`dev/cmp_pfb 512`), and
+  the multi-device mode-1 (chunked) path is correct at every length.  It is not
+  the fused attention (`PF_ATTN_FUSE=0`), the split (`PF_ATTN_SPLIT=16`), a
+  single weight path (`PF_W4=0`/`PF_K5=0`/`PF_CB4=0`) or the oneDNN warmup
+  (`PF_DNNL_NOWARM=1`).  `batched_prefill_fit` therefore caps the
+  multi-device mode-2 batch at `kMaxT` (`PF_PFB_MAX_M`, default 32; `0` restores
+  the uncapped incorrect batch for A/B).  The cap costs ~5% pp512 and nothing on
+  tg128 (the oneDNN prefill at large M is XMX-bound, not weight-read-bound).
+  The existing 27B gates use <32-token prompts and do not cover this — any test
+  that prefills >=64 tokens (e.g. a long-context logit probe) will catch it.
 * Do not include `sycl/ext/oneapi/dot_product.hpp` from several TUs (its
   functions are not `inline` in this toolchain) — use `src/common/dp4a.h`.
 * `kMaxT` = max prefill chunk (32), `kMaxB` = max batched sequences (16),
