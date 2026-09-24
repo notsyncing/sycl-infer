@@ -94,6 +94,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/w4_gemv.cpp
     src/backend/gpu/kernels/qk_norm_rope.cpp
     src/backend/gpu/kernels/attn.cpp
+    src/backend/gpu/kernels/attn_xmx.cpp
     src/backend/gpu/kernels/conv.cpp
     src/backend/gpu/kernels/gdn.cpp
     src/backend/gpu/kernels/gated_norm.cpp

@@ -784,12 +784,13 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
 // state at each marked boundary straight into the checkpoint pool.  pc_commit
 // links the slots to the cache nodes afterwards.
 void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_off, int pos0, int n) {
+    step_info * inf = pf_info_ ? pf_info_ : d_info;
     // a previous forward's pending reservations (no commit) must not leak
     for (auto & p : pc_pending_) {
         pc_state_release(p.second);
     }
     pc_pending_.clear();
-    d_info->pc_active = 0;
+    inf->pc_active = 0;
     if (!pc_enabled || slot < 0 || slot >= kMaxB) {
         return;
     }
@@ -811,7 +812,7 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
         return;
     }
     for (int b = first + 1; b <= last; b++) {
-        d_info->pc_row_slot[b] = -1;
+        inf->pc_row_slot[b] = -1;
     }
 
     // find the boundaries whose node cannot be resumed yet
@@ -846,20 +847,20 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
             break;
         }
         pc_state_stamp[st] = ++pc_clock;
-        d_info->pc_row_slot[need[k].b] = st;
+        inf->pc_row_slot[need[k].b] = st;
         pc_pending_.push_back({need[k].h, st});
     }
     if (pc_pending_.empty()) {
         return;
     }
-    d_info->pc_base = d_pc_states;
-    d_info->pc_stride = (int32_t)pc_state_floats;
-    d_info->pc_active = 1;
+    inf->pc_base = d_pc_states;
+    inf->pc_stride = (int32_t)pc_state_floats;
+    inf->pc_active = 1;
 }
 
 void engine::pc_commit(int slot, const std::vector<int> & toks, const std::vector<int> & blocks, int done) {
+    step_info * inf = pf_info_ ? pf_info_ : d_info;
     static const bool pcdbg = getenv("PF_PC_DEBUG") != nullptr;
-    d_info->pc_active = 0; // the captured forward is over
     if (!pc_enabled || slot < 0 || slot >= kMaxB) {
         for (auto & p : pc_pending_) {
             pc_state_release(p.second);

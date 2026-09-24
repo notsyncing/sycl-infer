@@ -253,6 +253,17 @@ struct engine {
     size_t kv_reserve_bytes_v = 0;
 
     step_info * d_info = nullptr; // host USM
+    // multi-device prefill pipeline: a second step_info so the chunk on device 0
+    // and the previous chunk on device 1 can be in flight together
+    step_info * d_info2_ = nullptr;
+    // pipeline state: the chunk whose device-0 phase has been enqueued but whose
+    // device-1 phase has not
+    bool pf_pipe_pending_ = false;
+    int pf_pipe_parity_ = 0;
+    int pf_pipe_rows_ = 0;
+    bool pf_pipe_head_ = false;
+    // per-chunk step_info used by pc_capture_begin/pc_commit during the pipeline
+    step_info * pf_info_ = nullptr;
 
     // SI8 DP4A scratch: quantized activations of the current call (kMaxT rows)
     int8_t * d_x8 = nullptr;
@@ -287,8 +298,11 @@ struct engine {
     // token rows the forward actually uses - the activation layout is
     // [token][n_embd], so copy only those instead of the full kMaxB*kMaxT
     // staging buffer (single-token decode needs 1 row, not 512).
-    void handoff_x(int from, int to, size_t rows);
+    void handoff_x(int from, int to, size_t rows, void * staging = nullptr);
     void * h_handoff = nullptr;
+    // second staging buffer so the pipelined prefill can enqueue the device-1
+    // copy of chunk i while the host stages chunk i+1
+    void * h_handoff2_ = nullptr;
 
     gemv_seg * d_segs_dec = nullptr;
     gemv_seg * d_segs_dec8 = nullptr; // CPU SI8 decode plan (no command graph)
@@ -371,20 +385,19 @@ struct engine {
                 }
                 return n >= 2 * kMaxT ? n : 0;
             }
-            // PF_PFB_MAX_M: cap on the mode-2 batch (A/B; 0 = the default cap)
+            // PF_PFB_MAX_M: optional cap on the mode-2 batch (A/B; 0 = no cap)
             //
-            // The multi-device mode-2 prefill is incorrect for a batch of
-            // M >= 2*kMaxT tokens: the logits are wrong from the first token
-            // (measured on the 0.8B and the 27B, 2 GPUs, at exactly 64 prompt
-            // tokens, with oneDNN; the single-device mode-2 path is correct up
-            // to M = 512, and the multi-device chunked mode-1 path is correct
-            // at every length).  Capping the batch at kMaxT (one chunk row)
-            // keeps oneDNN and restores correctness; measured cost is ~4% of
-            // pp512 (1110 vs 1155 t/s) and nothing on tg128, because the
-            // oneDNN prefill at M=512 is XMX-bound, not weight-read-bound.
-            // PF_PFB_MAX_M=0 restores the uncapped (incorrect) batch for A/B.
+            // The old default capped the multi-device batch at kMaxT because a
+            // batch of M >= 2*kMaxT produced wrong logits.  The real cause was
+            // the fully-fused GDN kernel (PF_GDN_FUSE=2) ignoring `nreal_arg`:
+            // the fused mode-2 call passes one row of T tokens, but the kernel
+            // used row_nr(info, 0) = kMaxT, so only the first chunk row got the
+            // recurrence and every later row saw a stale state.  gdn.cpp now
+            // honors nreal_arg (like cpu_gdn), so mode-2 is correct at any M
+            // and the cap is gone.  Keeping it at kMaxT cost ~7x on multi-device
+            // pp512 (mode-1 chunked, ~91 t/s vs ~660 t/s mode-2 on 2x A770).
             const char * em = getenv("PF_PFB_MAX_M");
-            const int mcap = em ? atoi(em) : kMaxT;
+            const int mcap = em ? atoi(em) : 0;
             if (multi_dev && mcap > 0) {
                 return std::min(rem, mcap);
             }
@@ -462,6 +475,10 @@ struct engine {
     // single-GPU PF_GEMM_DNNL, per-device oneDNN + i8_gemm on the multi-device
     // GPU/CPU partitions (batched_prefill_fit() enables it there).
     void prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0);
+    // Multi-device prefill pipeline helpers (see prefill_batch).
+    void pf_pipe_finish(bool head);
+    void prefill_flush();
+    static void setup_pf_info(step_info * inf, const std::vector<int> & toks, int start, int n, int slot, int pos0);
     // one decode step for up to kMaxB sequences; returns the logits rows
     void decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows);
     // copy the logits of row r to the host
@@ -630,11 +647,20 @@ private:
     };
     std::vector<md_cmd_graph> md_dec_;
     bool md_dec_ok = false;
+
+    // Multi-device prefill pipeline: the layer split into contiguous device runs
+    // (device 0 with the embedding, device 1, device 0 with the head).  When the
+    // map is exactly this two-GPU-partition shape, prefill_batch overlaps chunk
+    // i+1 on device 0 with chunk i on device 1 instead of running them strictly
+    // one after the other (T0+T1 -> max(T0,T1)).
+    std::vector<md_phase> md_pf_phases_;
+    bool pf_pipe_ok_ = false;
+    int pf_pipe_count_ = 0; // parity source for the double-buffered step_info
     void build_md_dec_graphs();
     void replay_md_dec_graphs();
 
     void record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows = nullptr,
-                        int at_nsp_hint = 0, const md_phase * ph = nullptr);
+                        int at_nsp_hint = 0, const md_phase * ph = nullptr, const step_info * info = nullptr);
 
     std::vector<float> run_head();
 

@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include <oneapi/dnnl/dnnl.hpp>
@@ -292,6 +294,11 @@ struct dnnl_gemm::impl {
     sycl::queue q;
     engine eng;
     stream st;
+    // Separate stream for the XMX attention matmuls.  Both streams wrap the
+    // same in-order SYCL queue, so submissions stay ordered, but waiting on
+    // this stream no longer drains the dense GEMMs queued on `st` (which is
+    // what made attention syncs cost tens of ms and serialised prefill).
+    stream st_a;
     // activation scratch: row-major [M][K] int8 + one scale per row
     int8_t * ax = nullptr;
     float * axs = nullptr;
@@ -387,6 +394,56 @@ struct dnnl_gemm::impl {
         return ((uint64_t)M << 42) | ((uint64_t)K << 21) | (uint64_t)N;
     }
 
+    // ---- XMX attention GEMMs (PF_ATTN_XMX) --------------------------------
+    // Plain int8 matmuls (no scale attributes) over caller-owned USM buffers.
+    // QK reads K stored [N, K] (per key row of head_dim), hence "ba".
+    struct attn_prim {
+        matmul prim;
+        bool ok = false;
+    };
+    std::unordered_map<uint64_t, attn_prim> attn_qk_prims;
+    std::unordered_map<uint64_t, attn_prim> attn_pv_prims;
+
+    const attn_prim * attn_qk_prim(int M, int K, int N) {
+        const uint64_t k = pkey(M, K, N);
+        auto it = attn_qk_prims.find(k);
+        if (it != attn_qk_prims.end()) {
+            return &it->second;
+        }
+        attn_prim e;
+        try {
+            auto xmd = memory::desc({M, K}, memory::data_type::s8, memory::format_tag::ab);
+            auto wmd = memory::desc({K, N}, memory::data_type::s8, memory::format_tag::ba);
+            auto dmd = memory::desc({M, N}, memory::data_type::s32, memory::format_tag::ab);
+            e.prim = matmul(matmul::primitive_desc(eng, xmd, wmd, dmd));
+            e.ok = true;
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "[dnnl] attn_qk_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+        }
+        auto ins = attn_qk_prims.emplace(k, std::move(e));
+        return &ins.first->second;
+    }
+
+    const attn_prim * attn_pv_prim(int M, int K, int N) {
+        const uint64_t k = pkey(M, K, N);
+        auto it = attn_pv_prims.find(k);
+        if (it != attn_pv_prims.end()) {
+            return &it->second;
+        }
+        attn_prim e;
+        try {
+            auto xmd = memory::desc({M, K}, memory::data_type::u8, memory::format_tag::ab);
+            auto wmd = memory::desc({K, N}, memory::data_type::s8, memory::format_tag::ab);
+            auto dmd = memory::desc({M, N}, memory::data_type::s32, memory::format_tag::ab);
+            e.prim = matmul(matmul::primitive_desc(eng, xmd, wmd, dmd));
+            e.ok = true;
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "[dnnl] attn_pv_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+        }
+        auto ins = attn_pv_prims.emplace(k, std::move(e));
+        return &ins.first->second;
+    }
+
     // 4-bit variant of make_prim: u4 weights, grouped f16 scales, f32 dst
     prim4_entry * make_prim4(int M, int K, int N) {
         auto it = prims4.find(pkey(M, K, N));
@@ -456,6 +513,7 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     p->q = q;
     p->eng = sycl_interop::make_engine(q.get_device(), q.get_context());
     p->st = sycl_interop::make_stream(p->eng, q);
+    p->st_a = sycl_interop::make_stream(p->eng, q);
     p->cap_M = kMaxB * kMaxT; // max rows of one chunk-batched prefill
     p->cap_K = kActMaxK;
     p->ax = sycl::malloc_device<int8_t>((size_t)p->cap_M * p->cap_K, q);
@@ -1295,5 +1353,99 @@ const float * dnnl_gemm::act_scales() const {
 const int32_t * dnnl_gemm::act_sum() const {
     return p->acts_valid ? p->axsum : nullptr;
 }
+
+// ---------------------------------------------------------------------------
+// XMX attention GEMMs.  Operands and dst are the caller's USM buffers; only
+// the primitive is cached.
+// The attention matmuls are submitted to `st_a`, which wraps the same in-order
+// queue as the softmax/accumulate kernels, so the following SYCL kernel is
+// ordered after the matmul without an explicit wait.  PF_ATTN_WAIT=1 restores
+// a per-matmul stream wait for A/B.
+static bool attn_wait_env() {
+    static const bool v = [] {
+        const char * e = getenv("PF_ATTN_WAIT");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+bool dnnl_gemm::attn_qk(int M, int blk, const int8_t * q_kmajor, const int8_t * k_keymajor, int32_t * dst) {
+    const auto * e = p->attn_qk_prim(M, /*K=*/256, blk);
+    if (!e->ok) {
+        return false;
+    }
+    // `st_a` wraps the same in-order queue as the engine's SYCL work, so the
+    // matmul is ordered after the Q-quantize / K-gather kernels without a
+    // queue drain; waiting only `st_a` avoids draining the dense GEMMs queued
+    // on the main stream (a queue-wide wait here serialised the whole prefill).
+    auto xm = sycl_interop::make_memory(memory::desc({M, 256}, memory::data_type::s8, memory::format_tag::ab), p->eng,
+                                        sycl_interop::memory_kind::usm, (void *)q_kmajor);
+    auto wm = sycl_interop::make_memory(memory::desc({256, blk}, memory::data_type::s8, memory::format_tag::ba), p->eng,
+                                        sycl_interop::memory_kind::usm, (void *)k_keymajor);
+    auto dm = sycl_interop::make_memory(memory::desc({M, blk}, memory::data_type::s32, memory::format_tag::ab), p->eng,
+                                        sycl_interop::memory_kind::usm, (void *)dst);
+    e->prim.execute(p->st_a, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+    if (attn_wait_env()) {
+        p->st_a.wait();
+    }
+    return true;
+}
+
+bool dnnl_gemm::attn_pv(int M, int blk, const uint8_t * p_major, const int8_t * v_keymajor, int32_t * dst) {
+    const auto * e = p->attn_pv_prim(M, blk, /*N=*/256);
+    if (!e->ok) {
+        return false;
+    }
+    auto xm = sycl_interop::make_memory(memory::desc({M, blk}, memory::data_type::u8, memory::format_tag::ab), p->eng,
+                                        sycl_interop::memory_kind::usm, (void *)p_major);
+    auto wm = sycl_interop::make_memory(memory::desc({blk, 256}, memory::data_type::s8, memory::format_tag::ab), p->eng,
+                                        sycl_interop::memory_kind::usm, (void *)v_keymajor);
+    auto dm = sycl_interop::make_memory(memory::desc({M, 256}, memory::data_type::s32, memory::format_tag::ab), p->eng,
+                                        sycl_interop::memory_kind::usm, (void *)dst);
+    e->prim.execute(p->st_a, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+    if (attn_wait_env()) {
+        p->st_a.wait();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Queue -> dnnl_gemm registry (see dnnl_gemm.h).  A small vector with a mutex;
+// engines are constructed one at a time and the lookups are on the attention
+// hot path, so a linear scan of a handful of entries is fine.
+namespace {
+struct qreg {
+    std::mutex mtx;
+    std::vector<std::pair<sycl::queue *, dnnl_gemm *>> v;
+};
+qreg & qregistry() {
+    static qreg r;
+    return r;
+}
+} // namespace
+
+void dnnl_register_queue(sycl::queue & q, dnnl_gemm * g) {
+    qreg & r = qregistry();
+    std::lock_guard<std::mutex> lk(r.mtx);
+    for (auto & e : r.v) {
+        if (e.first == &q) {
+            e.second = g;
+            return;
+        }
+    }
+    r.v.emplace_back(&q, g);
+}
+
+dnnl_gemm * dnnl_for_queue(sycl::queue & q) {
+    qreg & r = qregistry();
+    std::lock_guard<std::mutex> lk(r.mtx);
+    for (auto & e : r.v) {
+        if (e.first == &q) {
+            return e.second;
+        }
+    }
+    return nullptr;
+}
+
 
 } // namespace si

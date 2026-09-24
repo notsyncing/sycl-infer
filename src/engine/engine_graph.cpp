@@ -393,7 +393,10 @@ static void dbg_dump_kv(sycl::queue & q, const float * kbuf, const float * vbuf,
 }
 
 void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows,
-                            int at_nsp_hint, const md_phase * ph) {
+                            int at_nsp_hint, const md_phase * ph, const step_info * info) {
+    // Per-chunk step_info (multi-device prefill pipeline: two chunks can be in
+    // flight on the two devices at once, so the shared d_info cannot be used).
+    const step_info * inf = info ? info : d_info;
     // mode 2: chunk-batched prefill. `rows` is the total token count, split into
     // rows/kMaxT chunk rows; GEMM calls are executed segment-major (all chunk
     // rows of one tensor back to back) so the weights stay L2-hot.
@@ -535,7 +538,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const bool p2 = prof_on();
             const auto a2 = tnow();
             if (mode == 2 && !single) {
-                cur_be->xq(xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, d_info, tbm, xq.K);
+                cur_be->xq(xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, inf, tbm, xq.K);
             } else {
                 for (int r = 0; r < nb; r++) {
                     const float * xr = xq.x + (size_t)r * kMaxT * xq.x_stride;
@@ -543,7 +546,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     // TB must be the call's token count (kMaxT for prefill chunks,
                     // the batch size for decode) - it sets the x8 group stride
                     cur_be->xq(xr, ur, xq.x_stride, xq.up_stride, d_x8 + (size_t)r * (size_t)xq.K * tb,
-                              d_xmeta + (size_t)r * (xq.K / 32), d_xsumq + (size_t)r * (xq.K / 16), d_info, tb, xq.K);
+                              d_xmeta + (size_t)r * (xq.K / 32), d_xsumq + (size_t)r * (xq.K / 16), inf, tb, xq.K);
                 }
             }
             if (p2) {
@@ -589,7 +592,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         // the dp4a x8 quantization the dnnl_call branch skipped
                         if (dnnl_call) {
                             const seg_plan::xq_t & xq = plan.call_xq[idx];
-                            cur_be->xq(xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, d_info, tbm,
+                            cur_be->xq(xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, inf, tbm,
                                       xq.K);
                         }
                         cur_be->dp4a_gemm(sj.w8, sj.x8, sj.xmeta, sj.xsumq, sj.out, sj.out_stride, sj.residual, sj.alpha, tbm);
@@ -744,7 +747,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             bind_acts(0);
         }
         cur_be = &backend();
-        cur_be->embed(wptr(0, m.tok_embd.data), m.tok_embd.type, d_info, d_x, hp.n_embd, m.tok_embd_row_bytes);
+        cur_be->embed(wptr(0, m.tok_embd.data), m.tok_embd.type, inf, d_x, hp.n_embd, m.tok_embd_row_bytes);
         if (prof) {
             sync_cur();
             c_embed += tms(a, tnow());
@@ -844,11 +847,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const auto a_g = tnow();
             auto a_sub = tnow();
             if (mode == 2 && fuse_gdn >= 1 && !nogdn) {
-                cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, d_info, hp.qkv_dim(), hp.conv_k,
+                cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
                                hp.d_state, hp.n_group, hp.rms_eps, NCH, kMaxT, 0, kMaxT, /*cross_row=*/true);
                 stamp(prof_acc[11], a_sub);
                 a_sub = tnow();
-                cur_be->conv_state_update(d_qkv, cs, d_info, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT,
+                cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT,
                                          /*last_row_only=*/true, snap);
                 stamp(prof_acc[12], a_sub);
                 a_sub = tnow();
@@ -859,7 +862,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     }
                     const auto t0 = tnow();
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
-                               d_info, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
+                               inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
                                1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, 0, T, T, snap);
                     if (tdbg && !g_capturing) {
                         q.wait();
@@ -868,7 +871,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 } else {
                     for (int r0 = 0; r0 < NCH; r0++) {
                         cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs,
-                                   d_attn_pre, d_info, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
+                                   d_attn_pre, inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
                                    1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, r0, -1, -1, snap);
                     }
                 }
@@ -883,14 +886,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         fprintf(stderr,
                                 "[gdn] mode=%d r0=%d rr0=%d rn=%d gdn_nr=%d info_n_rows=%d "
                                 "active=%d tpb=%d\n",
-                                mode, r0, rr0, rn, gdn_nr, d_info->n_rows, d_info->active[rr0], d_info->tpb);
+                                mode, r0, rr0, rn, gdn_nr, inf->n_rows, inf->active[rr0], inf->tpb);
                     }
-                    cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, d_info, hp.qkv_dim(), hp.conv_k,
+                    cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
                                    hp.d_state, hp.n_group, hp.rms_eps, rn, gdn_nr, rr0, -1, false);
-                    cur_be->conv_state_update(d_qkv, cs, d_info, hp.qkv_dim(), hp.conv_k, rn, rr0, -1, -1, false,
+                    cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, rn, rr0, -1, -1, false,
                                              snap);
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
-                               d_info, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
+                               inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
                                1.0f / std::sqrt((float)hp.d_state), kMaxB, rn, rr0, -1, -1, snap);
                 }
                 stamp(prof_acc[13], a_sub);
@@ -898,7 +901,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
             // gated_norm has no state dependency on the row order, so all chunk
             // rows run in one dispatch (batched it is ~4x cheaper than NCH calls)
-            cur_be->gated_norm(d_attn_pre, d_z, wf32(dev, L.ssm_norm), d_attn_merged, d_info, hp.dt_rank, hp.d_state,
+            cur_be->gated_norm(d_attn_pre, d_z, wf32(dev, L.ssm_norm), d_attn_merged, inf, hp.dt_rank, hp.d_state,
                               hp.rms_eps, mode == 2 ? NCH : nrows, gdn_nr, 0);
             stamp(prof_acc[14], a_sub);
             a_sub = tnow();
@@ -971,7 +974,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 } else {
                     int max_nkv = 0;
                     for (int r = 0; r < nrows; r++) {
-                        max_nkv = std::max(max_nkv, d_info->pos[r] + nreal);
+                        max_nkv = std::max(max_nkv, inf->pos[r] + nreal);
                     }
                     nsp = (max_nkv + at_split_keys - 1) / at_split_keys;
                 }
@@ -993,19 +996,19 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const void * ksc = ksc0;
             const void * vsc = vsc0;
             cur_be->qk_norm_rope(d_qbuf, d_kbuf, d_vbuf, wf32(dev, L.q_norm), wf32(dev, L.k_norm), kp, vp, d_tables,
-                                d_info, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
+                                inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
                                 max_blocks, nrows, nreal, ksc, vsc);
             static const bool dbg_kv = getenv("PF_DUMP_KV") != nullptr;
             if (dbg_kv && !g_capturing && mode != 0) {
                 dbg_dump_kv(dev_queue(cur_dev), d_kbuf, d_vbuf, mode, nrows, nreal, hp.n_head_kv, hp.head_dim, il);
             }
             const bool at_fused = (nsp == 1 && at_fuse);
-            cur_be->attn(d_qbuf, d_qbuf, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, d_info,
+            cur_be->attn(d_qbuf, d_qbuf, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
                         hp.attn_scale, max_blocks, nrows, nreal, at_fused ? d_attn_out : nullptr, -1, ksc, vsc);
             // n_splits == 1 (batched prefill): the attention kernel writes the
             // gated output directly and the combine kernel is skipped
             if (!at_fused) {
-                cur_be->attn_combine(part, d_qbuf, d_attn_out, d_info, hp.n_head, hp.head_dim, nsp, nrows, nreal);
+                cur_be->attn_combine(part, d_qbuf, d_attn_out, inf, hp.n_head, hp.head_dim, nsp, nrows, nreal);
             }
             stamp(c_attn, a_a);
             gemv();
@@ -1036,10 +1039,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
             dbg_dump_fp(dev_queue(cur_dev), d_x, hp.n_embd, "layer", il, cur_dev);
             // also fingerprint the *last real* token slot: mode 2 lays a chunk
-            // out as [NCH][kMaxT][n_embd] with only d_info->n_real_row[r] slots
+            // out as [NCH][kMaxT][n_embd] with only inf->n_real_row[r] slots
             // live, mode 0/1 keep their tokens in row 0 - the token a following
             // decode continues from must be fingerprinted on both sides
-            const int last_slot = (mode == 2) ? (NCH - 1) * kMaxT + (int)d_info->n_real_row[NCH - 1] - 1
+            const int last_slot = (mode == 2) ? (NCH - 1) * kMaxT + (int)inf->n_real_row[NCH - 1] - 1
                                               : nreal - 1;
             if (last_slot > 0) {
                 dbg_dump_fp(dev_queue(cur_dev), d_x + (size_t)last_slot * hp.n_embd, hp.n_embd, "layerlast", il,
@@ -1080,7 +1083,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     cur_be = &backend();
     cur_be->rmsnorm(d_x, out_norm, d_xnorm, T, hp.n_embd, hp.rms_eps);
     if (mode != 0) {
-        cur_be->copy_row(d_xnorm, d_last_hidden, d_info, hp.n_embd, -1);
+        cur_be->copy_row(d_xnorm, d_last_hidden, inf, hp.n_embd, -1);
     }
     stamp(c_norm, a_out);
     if (plan.has_head) {

@@ -114,6 +114,9 @@ bool scheduler::admit(std::shared_ptr<sequence> & s) {
 
 void scheduler::retire(std::shared_ptr<sequence> & s, const char * reason) {
     s->finish_reason = reason;
+    // a pending pipelined prefill chunk (device 1 not yet run) must complete
+    // before its blocks are freed
+    e.prefill_flush();
     e.pc_retire(s->slot, s->blocks);
     s->blocks.clear();
     {
@@ -165,13 +168,18 @@ void scheduler::loop() {
                 }
                 if (s->prompt_pos < (int)s->prompt.size()) {
                     const int rem = (int)s->prompt.size() - s->prompt_pos;
-                    // chunk-batched prefill: the recorded mode-2 graphs cover
-                    // 64/128/256/512 tokens in one forward (weights read ~once
-                    // instead of once per 32-token chunk); pick the largest
-                    // size that fits the remaining prompt and the block pool
+                    // chunk-batched prefill: one forward covers the whole batch
+                    // (weights read ~once instead of once per 32-token chunk);
+                    // pick the largest size that fits the remaining prompt and
+                    // the block pool.  The tail used to fall back to mode 1
+                    // because mode-2 was only trusted for >= 2*kMaxT; now that
+                    // the fused-GDN mode-2 bug is fixed any M is correct, and
+                    // mode-2 handles the tail too (a mode-1 chunk costs ~0.3 ms
+                    // of handoff/sync per 32 tokens, so a 41-token tail was
+                    // ~0.7 s of a 553-token prefill).
                     int n = 0;
                     bool batch_pf = false;
-                    for (int cand = e.batched_prefill_fit(rem); cand >= 2 * kMaxT; cand -= kMaxT) {
+                    for (int cand = e.batched_prefill_fit(rem); cand >= kMaxT; cand -= kMaxT) {
                         const int need = (s->prompt_pos + cand + kBlockSize - 1) / kBlockSize;
                         bool ok = true;
                         while ((int)s->blocks.size() < need) {
@@ -224,6 +232,11 @@ void scheduler::loop() {
                     const auto t_pf1 = std::chrono::steady_clock::now();
                     if (tdbg) {
                         s->pf_ms += dms(t_pf0, t_pf1);
+                        // Per-chunk prefill time: a single long prompt then yields
+                        // the marginal prefill throughput at every depth (the
+                        // chunk at pos P is pp<n>@P).  Host-only diagnostic.
+                        fprintf(stderr, "[srv] chunk pos=%d n=%d ms=%.2f\n", s->prompt_pos, n,
+                                dms(t_pf0, t_pf1));
                     }
                     s->n_chunks++;
                     if (dbg()) {
@@ -237,7 +250,10 @@ void scheduler::loop() {
                     did_work = true;
                     // if this completes the prompt, fetch the first token's logits
                     if (s->prompt_pos >= (int)s->prompt.size()) {
-                        // the prefill graph produced logits into d_logits row 0
+                        // the prefill graph produced logits into d_logits row 0;
+                        // the pipelined multi-device prefill still owes the last
+                        // chunk's device-1 phase (and the head)
+                        e.prefill_flush();
                         const auto t_fl0 = std::chrono::steady_clock::now();
                         e.fetch_logits(0, logits.data());
                         s->recent = s->prompt;

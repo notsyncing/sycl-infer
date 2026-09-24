@@ -206,9 +206,10 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
                 w4_gemv (u4/int8/codebook decode GEMV: g-major SLM-staged 4-bit
                 GEMV, LUT-expanding codebook GEMV and its prefill expansion),
-                vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
-                bidirectional attention), at (audio tower helpers: at_conv1d,
-                at_rope1d)
+                 vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
+                 bidirectional attention), at (audio tower helpers: at_conv1d,
+                 at_rope1d), attn_xmx (oneDNN int8 XMX prefill attention, see
+                 PF_ATTN_XMX below)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
                 model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
                 tokenizer.{h,cpp}
@@ -466,7 +467,11 @@ scales always apply),
 **Attention**
 `PF_ATTN_SPLIT`, `PF_ATTN_SPLIT_KEYS` (default 512), `PF_ATTN_VEC` (default on),
 `PF_ATTN_FUSE` (default on), `PF_DEC_SPLIT` (default 64, cap 256),
-`PF_DEC_GROUP` (grouped decode attention, default off).
+`PF_DEC_GROUP` (grouped decode attention, default off), `PF_ATTN_XMX` (oneDNN
+int8 XMX prefill attention, **default on**; `0` restores the classic kernel),
+`PF_ATTN_XMX_MIN` (minimum key count for XMX, default 2048 - below it the
+classic kernel is faster), `PF_ATTN_WAIT` (force a per-attention-matmul oneDNN
+stream wait; default off, the in-order queue already orders them).
 
 **GEMV / GEMM tuning**
 `PF_GEMV_SPLIT`, `GEMV_DEC_VEC`, `GEMV_VEC12`, `GEMV_VEC13`, `GEMV_CFG1/8/16/32`,
@@ -522,9 +527,9 @@ what it buys), `PF_K5_NOCORR` (drop the prefill offset correction - diagnostic
 bisection for the k5 prefill cost), `PF_MD_GRAPH_DEV` (record the multi-device decode
 command graph only for device N; `99` = none, for A/B against the direct
 replay), `PF_PROF_ALL` (with `PF_PROF`: dump every call group's ms/step instead
-of the top 8), `PF_PFB_MAX_M` (cap on the multi-device mode-2 prefill batch,
-default `kMaxT`; `0` disables the cap and restores the *incorrect* uncapped
-batch, see the multi-device prefill gotcha below).
+of the top 8), `PF_PFB_MAX_M` (optional cap on the multi-device mode-2 prefill
+batch; `0` = no cap, the default — the cap is no longer needed, see the
+fused-GDN mode-2 fix below).
 
 **Weight representation**
 `PF_W4` (native u4 for Q4_K, default on), `PF_CB4` (store IQ4_XS/IQ4_NL as native 4-bit codebook indices + a per-32 f16
@@ -609,6 +614,34 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   for the GDN qkv/conv width and `m.output` for the LM head.
 * **oneDNN cannot be recorded** into a SYCL graph; the `PF_GEMM_DNNL` path
   replays mode-2 prefill directly (`prefill_batch`).
+* **XMX prefill attention (`attn_xmx.cpp`, `PF_ATTN_XMX`, default on above 2048
+  keys)**: QK^T and PV run as plain oneDNN int8 matmuls over the paged KV
+  gathered into a contiguous scratch.  Three things are load-bearing:
+  (1) a plain int8 matmul sums over k, so a per-key scale cannot be applied
+  after it - K and V each carry ONE block-wide scale, folded in at gather time;
+  (2) the query tile stacks every HPG query head sharing a kv head, so the
+  matmul width is `HPG * tokens` and the KV is read once per kv head, not once
+  per query head; (3) the matmuls always run at the FIXED width `kBlk = 2048`
+  (zero-padded), because oneDNN primitive creation is ~15 ms per new shape and
+  a per-chunk `N` made prims never reusable - that alone was a 12x regression.
+  The attention scratch is per-queue (`xmx_get` keys on the queue address): a
+  function-local static was shared across the two `--layer-map` devices and the
+  cross-device USM access cost another ~12x.  The matmuls use a dedicated
+  oneDNN stream (`st_a`) on the same in-order queue so waiting on attention
+  does not drain the dense GEMMs queued on the main stream (a queue-wide wait
+  serialised the whole prefill).  The softmax is one work-group per query row
+  with a single vectorized `exp` pass.  The per-row index arrays (`orow` /
+  `oh` / `olim`) are built by a device kernel from `info`, **not** by host
+  `q.memcpy`: three host->device copies per kv head kept the host pinned to the
+  GPU (and raced with the reused host vector) and cost ~2x.  Measured marginals
+  on the deepest full 512-token mode-2 chunk (27B / 2x A770, i8 KV,
+  `PF_PREFIX_CACHE=0`, `--layer-map`): pp512@16k 296 -> 911 t/s, pp512@64k 93 ->
+  540 t/s (both above the OpenVINO targets of 640 / 362).  Below the key
+  threshold the classic kernel still wins (4k: 718 vs 649 t/s), hence the gate.
+  Scope: i8 KV, head_dim 256, `n_real > 1`; other cases fall back.
+* **`st_a` is an XMX-only stream.**  The dense `PF_GEMM_DNNL` GEMMs still use
+  `p->st`; `attn_qk`/`attn_pv` submit to `p->st_a` and wait only that stream.
+  Do not move the dense path onto `st_a`.
 * **A partial mode-2 batch requires the oneDNN weight path.**
   `batched_prefill_fit` only allows a last row with `n_real_row < kMaxT` when
   `use_dnnl` or a multi-device GPU partition has oneDNN (`dnnl_any_dev()`); the
@@ -617,20 +650,31 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   md_int8 take a partial batch silently corrupts the hidden state (a 2-GPU
   md_int8 decode-vs-prefill mismatch).  Likewise an **all-`cpu` `--layer-map`**
   must select the CPU queue (`resolve_device`), not the default GPU one.
-* **The multi-device mode-2 prefill is wrong for a batch of `M >= 2*kMaxT`
-  (64) tokens.**  Measured on the 0.8B and the 27B, 2 GPUs, with oneDNN: a
-  prompt of 63 tokens answers correctly and 64 does not (wrong, nearly flat
-  logits), independent of the KV type; a GPU+CPU hybrid map reproduces it, the
-  single-device mode-2 path is correct up to `M=512` (`dev/cmp_pfb 512`), and
-  the multi-device mode-1 (chunked) path is correct at every length.  It is not
-  the fused attention (`PF_ATTN_FUSE=0`), the split (`PF_ATTN_SPLIT=16`), a
-  single weight path (`PF_W4=0`/`PF_K5=0`/`PF_CB4=0`) or the oneDNN warmup
-  (`PF_DNNL_NOWARM=1`).  `batched_prefill_fit` therefore caps the
-  multi-device mode-2 batch at `kMaxT` (`PF_PFB_MAX_M`, default 32; `0` restores
-  the uncapped incorrect batch for A/B).  The cap costs ~5% pp512 and nothing on
-  tg128 (the oneDNN prefill at large M is XMX-bound, not weight-read-bound).
-  The existing 27B gates use <32-token prompts and do not cover this — any test
-  that prefills >=64 tokens (e.g. a long-context logit probe) will catch it.
+* **The fully-fused mode-2 GDN call used to process only the first chunk row**
+  (fixed).  `record_forward` mode 2 (chunk-batched prefill) runs the GDN
+  recurrence once over the whole batch (`PF_GDN_FUSE=2`) with `n_rows=1` and
+  `tpb_arg = nreal_arg = <total tokens>`, but the GPU `gdn_kernel` /
+  `gdn_f4_kernel` ignored `nreal_arg` and used `row_nr(info, rr)`, so only row 0
+  (`kMaxT` tokens) got the recurrence and every later chunk row read a stale
+  state.  The CPU `cpu_gdn` already honoured `nreal_arg`, so a GPU+CPU hybrid map
+  behaved differently.  It hit *single-device* mode-2 as well; it was invisible
+  only because the multi-device cap (`PF_PFB_MAX_M`, old default `kMaxT`) forced
+  the scheduler onto the mode-1 chunked path, and because `dev/cmp_pfb` compares
+  hidden-state cosines (0.998) rather than the first token.  Symptom: a prompt of
+  >=64 tokens produced wrong logits (63 was correct — the scheduler used mode 1
+  for `rem < 2*kMaxT`).  Fixed in `gdn.cpp` (both kernels now use
+  `nreal_arg > 0 ? nreal_arg : row_nr(info, rr)`), the cap default is removed,
+  and `PF_GDN_FUSE=1` is a working fallback.  Measured on 27B / 2x A770: pp512
+  91 -> 566 t/s at depth 0 and 63 -> 329 t/s at 4k; 2+2 answers correctly at
+  614/1396 tokens.  The `PF_PFB_MAX_M=32` mode-1 fallback remains available for
+  A/B.
+* **The scheduler now lets mode-2 prefill the tail** (`>= kMaxT` instead of
+  `>= 2*kMaxT`).  A mode-1 chunk costs ~0.26 ms of handoff/sync *per token
+  slot* on 2x A770 (a 41-token tail was ~0.34 s), so a 553-token prompt used to
+  pay a full extra mode-2-sized forward.  Correctness is unchanged because the
+  fused-GDN bug above is fixed; measured cold pp512 of a 553-token prompt went
+  327 -> 399 t/s.  Mode-2 still costs ~0.26 s of *fixed* weight-stream per
+  forward, so a 512-token batch is the efficient unit.
 * Do not include `sycl/ext/oneapi/dot_product.hpp` from several TUs (its
   functions are not `inline` in this toolchain) — use `src/common/dp4a.h`.
 * `kMaxT` = max prefill chunk (32), `kMaxB` = max batched sequences (16),

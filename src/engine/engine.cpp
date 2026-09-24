@@ -102,9 +102,20 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     if (!multi_dev) {
         be = cpu_mode ? make_cpu_backend() : make_gpu_backend(q);
     }
-    if (cpu_mode || multi_dev) {
+    if (cpu_mode) {
         n_splits = 1;
         dec_splits = 1;
+    } else if (multi_dev) {
+        // The layer-split path historically disabled the attention K-split
+        // (n_splits = dec_splits = 1), which caps a multi-device prefill at one
+        // warp per (token, head) looping over the whole key range, and a decode
+        // at one warp per token with no key parallelism.  PF_MD_SPLITS=1 opts
+        // back into the split path for A/B.
+        const char * emd = getenv("PF_MD_SPLITS");
+        if (!(emd && atoi(emd) != 0)) {
+            n_splits = 1;
+            dec_splits = 1;
+        }
     }
     // upload weights after setup_multi_device so multi-device can skip the
     // full-blob device copy and instead upload only each partition's tensors
@@ -263,6 +274,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     use_dnnl = !cpu_mode && !multi_dev && pf8 && dnnl_gemm_enabled();
     if (use_dnnl) {
         dnnl = std::make_unique<dnnl_gemm>(q);
+        dnnl_register_queue(q, dnnl.get());
         auto add = [&](const wt & t, const w8t & w8) {
             if (w8.vals) {
                 dnnl->add_weight(w8.vals, t.data, t.type, t.K, t.N);
@@ -354,6 +366,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
                 D->warmup();
             }
             dnnl_dev_[d] = std::move(D);
+            dnnl_register_queue(*dev_queues_[d], dnnl_dev_[d].get());
         }
     }
     ffn_stride = 2 * m.hp.n_ff;
@@ -404,6 +417,12 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
 }
 
 engine::~engine() {
+    // complete a pending pipelined prefill chunk and drain the device queues
+    // before freeing their buffers
+    if (multi_dev) {
+        prefill_flush();
+        sync_all();
+    }
     // graceful shutdown: persist the VRAM/RAM tiers to disk (runs while the
     // device pools and checkpoint slots are still alive)
     pc_flush_to_disk();
@@ -459,6 +478,14 @@ engine::~engine() {
     if (h_handoff) {
         sycl::free(h_handoff, q);
         h_handoff = nullptr;
+    }
+    if (h_handoff2_) {
+        sycl::free(h_handoff2_, q);
+        h_handoff2_ = nullptr;
+    }
+    if (d_info2_) {
+        sycl::free(d_info2_, q);
+        d_info2_ = nullptr;
     }
     f(d_tables);
     f(d_info);
@@ -671,7 +698,7 @@ void engine::bind_acts(int dev) {
     d_conv_state = a.conv_state;
 }
 
-void engine::handoff_x(int from, int to, size_t rows) {
+void engine::handoff_x(int from, int to, size_t rows, void * staging) {
     if (from == to) {
         return;
     }
@@ -683,18 +710,28 @@ void engine::handoff_x(int from, int to, size_t rows) {
         return;
     }
     const size_t bytes = rows * m.hp.n_embd * sizeof(float);
-    if (!h_handoff) {
-        h_handoff = sycl::malloc_host(cap * m.hp.n_embd * sizeof(float), q);
+    void * buf = staging;
+    if (!buf) {
         if (!h_handoff) {
-            throw std::runtime_error("handoff staging allocation failed");
+            h_handoff = sycl::malloc_host(cap * m.hp.n_embd * sizeof(float), q);
         }
+        buf = h_handoff;
+    } else if (buf == (void *)1) {
+        // the pipelined prefill's second staging buffer
+        if (!h_handoff2_) {
+            h_handoff2_ = sycl::malloc_host(cap * m.hp.n_embd * sizeof(float), q);
+        }
+        buf = h_handoff2_;
+    }
+    if (!buf) {
+        throw std::runtime_error("handoff staging allocation failed");
     }
     sycl::queue & qf = dev_queue(from);
     // wait for the producing device's enqueued layers, then stage through host
     qf.wait();
-    qf.memcpy(h_handoff, as_[(size_t)from].x, bytes).wait();
+    qf.memcpy(buf, as_[(size_t)from].x, bytes).wait();
     // the destination copies before its own kernels (in-order queue)
-    dev_queue(to).memcpy(as_[(size_t)to].x, h_handoff, bytes);
+    dev_queue(to).memcpy(as_[(size_t)to].x, buf, bytes);
 }
 
 void engine::sync_all() {
@@ -1040,6 +1077,7 @@ bool engine::setup_md_dnnl() {
                 D->warmup();
             }
             dnnl_dev_[d] = std::move(D);
+            dnnl_register_queue(*dev_queues_[d], dnnl_dev_[d].get());
             any = true;
         } else {
             fprintf(stderr, "[dev] oneDNN: device %zu has no convertible layer weights\n", d);
@@ -1194,6 +1232,60 @@ void engine::setup_multi_device(const std::string & layer_map) {
     use_dnnl = false;
     cpu_mode = false;
 
+    // ---- multi-device prefill pipeline phases ----
+    // The layer loop split into contiguous device runs, exactly like the decode
+    // graphs.  The prefill pipeline is only enabled for the plain two-GPU-
+    // partition split (device 0 with the embedding, device 1, device 0 with the
+    // head); anything else keeps the synchronous path.
+    {
+        std::vector<md_phase> phs;
+        md_phase p{};
+        p.dev = 0;
+        p.embed = true;
+        int il = 0;
+        while (il < m.hp.n_layer) {
+            const int d = layer_dev_[(size_t)il];
+            int j = il;
+            while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
+                j++;
+            }
+            if (p.l0 == p.l1 && p.dev == d) {
+                p.l1 = j;
+            } else {
+                phs.push_back(p);
+                md_phase q{};
+                q.dev = d;
+                q.l0 = il;
+                q.l1 = j;
+                p = q;
+            }
+            il = j;
+        }
+        if (p.dev == 0) {
+            p.head = true;
+            phs.push_back(p);
+        } else {
+            phs.push_back(p);
+            md_phase h{};
+            h.dev = 0;
+            h.head = true;
+            phs.push_back(h);
+        }
+        bool gpu_only = true;
+        for (const md_phase & ph : phs) {
+            if (ph.dev < 0 || (size_t)ph.dev >= dev_kind_.size() || dev_kind_[(size_t)ph.dev] != 0) {
+                gpu_only = false;
+            }
+        }
+        const bool two_phase = phs.size() == 3 && phs[0].dev == 0 && phs[0].embed && !phs[0].head
+                               && phs[1].dev == 1 && !phs[1].head && phs[2].dev == 0 && phs[2].head;
+        const char * epp = getenv("PF_PF_PIPE");
+        const bool pipe_env = !(epp && atoi(epp) == 0);
+        md_pf_phases_ = phs;
+        pf_pipe_ok_ = two_phase && gpu_only && pipe_env;
+        fprintf(stderr, "[md] prefill pipeline: %s (%zu phases)\n", pf_pipe_ok_ ? "on" : "off", phs.size());
+    }
+
     // Per-device weight representation.  Preference order, gated by device
     // support: oneDNN int8 (XMX, both prefill and decode) -> SIn/w8 dp4a (when
     // oneDNN is unavailable or PF_GEMM_DNNL=0) -> raw fp32 (PF_DP4A=0).
@@ -1317,6 +1409,10 @@ void engine::alloc_buffers() {
     h_logits = (float *)malloc((size_t)kMaxB * hp.n_vocab * 4);
     d_info = sycl::malloc_host<step_info>(1, q);
     std::memset(d_info, 0, sizeof(step_info));
+    // second step_info for the multi-device prefill pipeline (two chunks in
+    // flight on the two devices at once)
+    d_info2_ = sycl::malloc_host<step_info>(1, q);
+    std::memset(d_info2_, 0, sizeof(step_info));
     d_segs_dec = alloc_elems<gemv_seg>(1024);
     d_segs_pf = alloc_elems<gemv_seg>(4096);
     d_segs_pf8 = alloc_elems<gemv_seg>(4096);
@@ -1436,6 +1532,13 @@ void engine::reset_single() {
 }
 // ---------------------------------------------------------------------------
 void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head) {
+    // a pending pipelined mode-2 chunk must complete (and its device-1 phase be
+    // done) before a mode-1 chunk reuses the shared step_info
+    if (pf_pipe_pending_) {
+        pf_pipe_finish(false);
+        sync_all();
+    }
+    pf_info_ = nullptr;
     pc_capture_begin(slot, toks, start, start, n);
     d_info->n_rows = 1;
     d_info->tpb = kMaxT;
@@ -1508,39 +1611,99 @@ void engine::prefill_text(const std::vector<int> & toks, int slot, int n) {
     }
 }
 
+// Fill one chunk's step_info (mode-2 layout).  The multi-device prefill
+// pipeline keeps two of these live at once (d_info / d_info2_), because chunk i
+// on device 1 runs concurrently with chunk i+1 on device 0.
+void engine::setup_pf_info(step_info * inf, const std::vector<int> & toks, int start, int n, int slot, int pos0) {
+    const int NCH = (n + kMaxT - 1) / kMaxT;
+    inf->n_rows = NCH;
+    inf->tpb = kMaxT;
+    inf->n_real = kMaxT; // grid extent; the per-row count refines it
+    for (int r = 0; r < NCH; r++) {
+        const int rem = std::min(kMaxT, n - r * kMaxT);
+        inf->n_real_row[r] = rem;
+        inf->pos[r] = pos0 + r * kMaxT;
+        inf->slot[r] = slot;
+        inf->active[r] = 1;
+        for (int t = 0; t < rem; t++) {
+            inf->tokens[r * kMaxT + t] = toks[start + r * kMaxT + t];
+        }
+        for (int t = rem; t < kMaxT; t++) {
+            inf->tokens[r * kMaxT + t] = 0; // padding, never processed
+        }
+    }
+    for (int r = NCH; r < kMaxB; r++) {
+        inf->n_real_row[r] = 0;
+        inf->pos[r] = 0;
+        inf->slot[r] = slot;
+        inf->active[r] = 0;
+    }
+    inf->pc_active = 0;
+}
+
+// Finish the chunk whose device-0 phase is already enqueued: hand the activation
+// to device 1 and enqueue its layer phase (and, for the final chunk, hand back
+// and run the output norm + LM head).  The handoff's host copy waits only on
+// device 0, and its H2D lands on q1 behind the previous chunk's device-1 phase,
+// so the two devices overlap.
+void engine::pf_pipe_finish(bool head) {
+    if (!pf_pipe_pending_) {
+        return;
+    }
+    const int rows = pf_pipe_rows_;
+    step_info * inf = pf_pipe_parity_ ? d_info2_ : d_info;
+    const int NCH = (rows + kMaxT - 1) / kMaxT;
+    void * stage = pf_pipe_parity_ ? (void *)1 : nullptr;
+    handoff_x(0, 1, (size_t)NCH * kMaxT, stage);
+    record_forward(2, plan_pfb_, d_segs_pfb, rows, d_segs_pfb, 0, &md_pf_phases_[1], inf);
+    if (head) {
+        handoff_x(1, 0, (size_t)NCH * kMaxT, stage);
+        record_forward(2, plan_pfb_, d_segs_pfb, rows, d_segs_pfb, 0, &md_pf_phases_[2], inf);
+        sync_all();
+    }
+    pf_pipe_pending_ = false;
+}
+
+void engine::prefill_flush() {
+    pf_pipe_finish(true);
+}
+
 void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0) {
     // ceil: the last row may be partial (any n up to kMaxB*kMaxT), encoded in
-    // d_info->n_real_row so the kernels process only its real tokens
+    // n_real_row so the kernels process only its real tokens
     const int NCH = (n + kMaxT - 1) / kMaxT;
     if (cpu_mode) {
         throw std::runtime_error("prefill_batch: not supported on the CPU backend");
     }
     static const bool dbg_pfb = getenv("PF_DBG_PFB") != nullptr;
+    if (multi_dev && pf_pipe_ok_) {
+        // Pipelined: finish the previous chunk's device-1 phase, then enqueue
+        // this chunk's device-0 phase, so the two devices run different chunks
+        // at the same time.  The chunk-to-chunk dependency is device-local
+        // (GDN/conv state and the append-only KV/block table), so device 0's
+        // chunk i+1 does not depend on device 1's chunk i.
+        pf_pipe_finish(false);
+        const int parity = pf_pipe_count_++ & 1;
+        step_info * inf = parity ? d_info2_ : d_info;
+        setup_pf_info(inf, toks, start, n, slot, pos0);
+        // pc_capture_begin/pc_commit must target this chunk's step_info; it stays
+        // set until the scheduler commits the chunk (device 1 has not run yet).
+        pf_info_ = inf;
+        pc_capture_begin(slot, toks, start, pos0, n);
+        if (dbg_pfb) {
+            fprintf(stderr, "[pfb] pipe n=%d NCH=%d parity=%d\n", n, NCH, parity);
+        }
+        record_forward(2, plan_pfb_, d_segs_pfb, n, d_segs_pfb, 0, &md_pf_phases_[0], inf);
+        pf_pipe_pending_ = true;
+        pf_pipe_parity_ = parity;
+        pf_pipe_rows_ = n;
+        return;
+    }
+    pf_info_ = nullptr;
+    setup_pf_info(d_info, toks, start, n, slot, pos0);
     pc_capture_begin(slot, toks, start, pos0, n);
     if (dbg_pfb) {
         fprintf(stderr, "[pfb] n=%d NCH=%d segs=%zu x8=%p\n", n, NCH, plan_pfb_.segs.size(), (void *)d_x8);
-    }
-    d_info->n_rows = NCH;
-    d_info->tpb = kMaxT;
-    d_info->n_real = kMaxT; // grid extent; the per-row count refines it
-    for (int r = 0; r < NCH; r++) {
-        const int rem = std::min(kMaxT, n - r * kMaxT);
-        d_info->n_real_row[r] = rem;
-        d_info->pos[r] = pos0 + r * kMaxT;
-        d_info->slot[r] = slot;
-        d_info->active[r] = 1;
-        for (int t = 0; t < rem; t++) {
-            d_info->tokens[r * kMaxT + t] = toks[start + r * kMaxT + t];
-        }
-        for (int t = rem; t < kMaxT; t++) {
-            d_info->tokens[r * kMaxT + t] = 0; // padding, never processed
-        }
-    }
-    for (int r = NCH; r < kMaxB; r++) {
-        d_info->n_real_row[r] = 0;
-        d_info->pos[r] = 0;
-        d_info->slot[r] = slot;
-        d_info->active[r] = 0;
     }
     static const bool nog = getenv("PF_NOGRAPH") != nullptr;
     // oneDNN primitives cannot be recorded into a SYCL command graph, so the
@@ -1581,6 +1744,9 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
 }
 
 void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows) {
+    // any pending pipelined prefill chunk must be finished before decode
+    prefill_flush();
+    pf_info_ = nullptr;
     d_info->pc_active = 0; // decode never captures checkpoints
     d_info->n_rows = n_rows;
     d_info->tpb = 1;
@@ -1658,6 +1824,9 @@ void engine::forward_plain_dec(int rows) {
     }
 }
 std::vector<float> engine::run_head() {
+    // the pipelined multi-device prefill may still owe the last chunk's device-1
+    // phase (and the head, which writes d_last_hidden)
+    prefill_flush();
     // d_last_hidden already holds the post-output_norm hidden state of the last
     // token (the prefill graph writes it via copy_row).
     const hparams & hp = m.hp;

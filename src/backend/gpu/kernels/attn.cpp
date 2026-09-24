@@ -129,6 +129,162 @@ static void attn_group_kernel(queue & q, const float * qbuf, const KV * kp_base,
     });
 }
 
+// ---------------------------------------------------------------------------
+// Flash-style tiled prefill attention (i8/i4 KV, opt-in via PF_ATTN_FLASH=1).
+//
+// The classic kernel gives one warp one (row, token, query head, split), so
+// every K/V row is read once per query head (HPG-fold redundancy, 6x on the
+// 27B) and once per query token; at 16k that is ~1.66 TB of K/V reads per
+// 512-token chunk at ~613 GB/s, i.e. bandwidth-bound.  This kernel keeps the
+// per-key online softmax but stages a BK-key K/V block in SLM once and reuses
+// it across a query tile of BQ tokens and all HPG query heads of the kv head
+// (BQ*HPG-fold traffic cut).  One work-group = (row r, query tile qt, kv head,
+// split s); one warp owns one (query, head) pair.  The partials layout is
+// unchanged, so attn_combine_launch still merges it.
+template <int HPG, typename KV>
+static void attn_flash_kernel(queue & q, const float * qbuf, const KV * kp_base, const KV * vp_base,
+                              const sycl::half * ksc_base, const sycl::half * vsc_base, float * partials,
+                              const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
+                              const step_info * info, float scale, int max_blocks, int n_rows, int n_real) {
+    constexpr int HD = 256;
+    constexpr int BQ = 4;  // query tokens per work-group
+    constexpr int BK = 64; // keys staged per SLM block
+    constexpr bool I4 = std::is_same_v<KV, uint8_t>;
+    constexpr int ROW = I4 ? HD / 2 : HD; // pool elements per KV row
+    constexpr int NSC = HD / 32;          // fp16 block scales per row
+    const int qstride = n_head * 2 * head_dim;
+    const int pstride = 2 + head_dim;
+    const int n_qt = (kMaxT + BQ - 1) / BQ;
+    const int n_wg = n_rows * n_qt * n_head_kv * n_splits;
+    const int wg = BQ * HPG * 32;
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<KV, 1> s_k((size_t)BK * ROW, h);
+        sycl::local_accessor<KV, 1> s_v((size_t)BK * ROW, h);
+        sycl::local_accessor<sycl::half, 1> s_ks((size_t)BK * NSC, h);
+        sycl::local_accessor<sycl::half, 1> s_vs((size_t)BK * NSC, h);
+        h.parallel_for(nd_range<1>((size_t)n_wg * wg, wg), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int gid = it.get_group(0);
+            const int r = gid / (n_qt * n_head_kv * n_splits);
+            const int rem0 = gid % (n_qt * n_head_kv * n_splits);
+            const int qt = rem0 / (n_head_kv * n_splits);
+            const int rem = rem0 % (n_head_kv * n_splits);
+            const int kvh = rem / n_splits;
+            const int s = rem % n_splits;
+            const int h0 = kvh * HPG;
+            const int tid = it.get_local_linear_id();
+            const int warp = tid / 32;
+            const int lane = tid % 32;
+            const int ql = warp / HPG; // query token inside the tile
+            const int j = warp % HPG;  // query head inside the kv group
+            const int t = qt * BQ + ql;
+            const sub_group sgg = it.get_sub_group();
+            const bool valid = (t < row_nr(info, r)) && info->active[r];
+            const int pos = valid ? info->pos[r] + t : -1;
+            // Uniform key range for the whole work-group (barriers must be hit
+            // the same number of times by every warp): the split covers
+            // [0, max_nkv) of the tile's largest position, and each warp masks
+            // the keys beyond its own causal bound below.
+            const int tmax = info->active[r] ? sycl::min(qt * BQ + BQ, row_nr(info, r)) : 0;
+            const int max_nkv = tmax > 0 ? info->pos[r] + tmax : 0;
+            const int chunk = (max_nkv + n_splits - 1) / n_splits;
+            const int t0 = s * chunk;
+            const int t1 = sycl::min(t0 + chunk, max_nkv);
+            const int32_t * table = tables + (size_t)info->slot[r] * max_blocks;
+            const int d0 = lane * 4;
+            const int d1 = d0 + HD / 2;
+            const int row = r * info->tpb + t;
+            float * part = partials + (((size_t)r * info->tpb + t) * n_head + h0 + j) * n_splits * pstride
+                           + (size_t)s * pstride;
+            sycl::float4 qa(0.f, 0.f, 0.f, 0.f), qb(0.f, 0.f, 0.f, 0.f);
+            sycl::float4 aa(0.f, 0.f, 0.f, 0.f), ab(0.f, 0.f, 0.f, 0.f);
+            float m = -INFINITY, l = 0.f;
+            if (valid) {
+                const float * qh = qbuf + (size_t)row * qstride + (size_t)(h0 + j) * 2 * head_dim;
+                qa = *reinterpret_cast<const sycl::float4 *>(qh + d0);
+                qb = *reinterpret_cast<const sycl::float4 *>(qh + d1);
+            }
+            for (int k0 = t0; k0 < t1; k0 += BK) {
+                const int nk = sycl::min(BK, t1 - k0);
+                for (int i = tid; i < nk * ROW; i += wg) {
+                    const int k = i / ROW, jj = i % ROW;
+                    const int kk = k0 + k;
+                    const int kb = table[kk / kBlockSize];
+                    const int ko = kk % kBlockSize;
+                    const size_t unit = (size_t)kb * n_head_kv + kvh;
+                    s_k[i] = kv_row_data(kp_base, unit, ko, head_dim)[jj];
+                    s_v[i] = kv_row_data(vp_base, unit, ko, head_dim)[jj];
+                }
+                for (int i = tid; i < nk * NSC; i += wg) {
+                    const int k = i / NSC, jj = i % NSC;
+                    const int kk = k0 + k;
+                    const int kb = table[kk / kBlockSize];
+                    const int ko = kk % kBlockSize;
+                    const size_t unit = (size_t)kb * n_head_kv + kvh;
+                    s_ks[i] = kv_row_scales(ksc_base, unit, ko, head_dim)[jj];
+                    s_vs[i] = kv_row_scales(vsc_base, unit, ko, head_dim)[jj];
+                }
+                it.barrier();
+                if (valid) {
+                    for (int k = 0; k < nk; k++) {
+                        if (k0 + k > pos) {
+                            break; // causal
+                        }
+                        sycl::float4 ka, kb4, va, vb;
+                        if constexpr (I4) {
+                            ka = i4_ld4(&s_k[k * ROW], d0);
+                            kb4 = i4_ld4(&s_k[k * ROW], d1);
+                            va = i4_ld4(&s_v[k * ROW], d0);
+                            vb = i4_ld4(&s_v[k * ROW], d1);
+                        } else {
+                            ka = kv_ld4(&s_k[k * ROW] + d0);
+                            kb4 = kv_ld4(&s_k[k * ROW] + d1);
+                            va = kv_ld4(&s_v[k * ROW] + d0);
+                            vb = kv_ld4(&s_v[k * ROW] + d1);
+                        }
+                        const float sA = (float)s_ks[k * NSC + lane / 8];
+                        const float sB = (float)s_ks[k * NSC + 4 + lane / 8];
+                        const float vsA = (float)s_vs[k * NSC + lane / 8];
+                        const float vsB = (float)s_vs[k * NSC + 4 + lane / 8];
+                        float dot = dot4(qa, ka) * sA + dot4(qb, kb4) * sB;
+                        dot = sg_sum(dot, sgg) * scale;
+                        const float mnew = sycl::max(m, dot);
+                        const float e = sycl::exp(dot - mnew);
+                        const float corr = sycl::exp(m - mnew);
+                        l = l * corr + e;
+                        aa = fma4(va, e * vsA, mul4(aa, corr));
+                        ab = fma4(vb, e * vsB, mul4(ab, corr));
+                        m = mnew;
+                    }
+                }
+                it.barrier();
+            }
+            if (valid) {
+                if (lane == 0) {
+                    part[0] = m;
+                    part[1] = l;
+                }
+                *reinterpret_cast<sycl::float4 *>(part + 2 + d0) = aa;
+                *reinterpret_cast<sycl::float4 *>(part + 2 + d1) = ab;
+            }
+        });
+    });
+}
+
+// PF_ATTN_FLASH=1 enables the flash tiled prefill attention.  It is opt-in
+// (default off): the prototype stages K/V in SLM and does FA-2 sub-blocks, but
+// measured on 2x A770 it is *not* faster than the classic kernel (96 vs 140
+// t/s pp512 at 16k), because the classic is bound by the per-score arithmetic
+// (the 32-lane dot + sub-group reduction + exp chain), not by the redundant
+// K/V traffic that the tiling removes.  Beating it needs the dot in int8/dp4a
+// and a key-per-lane mapping, not just tiling.
+static inline bool attn_flash_env() {
+    static const bool v = [] {
+        const char * e = getenv("PF_ATTN_FLASH");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 // PF_DEC_GROUP=1 enables the grouped kernel; it is opt-in because on the Iris
 // Xe the classic kernel is measurably faster (it has 4x the warps: the K/V
 // redundancy is served by L2 and the extra parallelism wins).  The grouped path
@@ -152,6 +308,44 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
     const int pstride = 2 + head_dim;
     const bool fuse = out != nullptr && n_splits == 1;
     const int n_wg = n_rows * n_real * n_head * n_splits;
+    // XMX (oneDNN int8) attention: the fused mode-2 shape and the non-fused
+    // (partials) mode-1/tail shape.  Opt-in: PF_ATTN_XMX=1.
+    if (n_real > 1 && head_dim == HD) {
+        if (attn_xmx_launch(q, qbuf, gate, kpool, vpool, partials, tables, n_head, n_head_kv, head_dim, n_splits,
+                            info, scale, max_blocks, n_rows, n_real, out, kscales, vscales)) {
+            return;
+        }
+    }
+    // flash tiled prefill attention for i8/i4 KV (see attn_flash_kernel).
+    // n_real > 1 restricts it to the prefill path: the single-token decode
+    // keeps the dedicated classic/grouped kernels.
+    if (!fuse && n_real > 1 && attn_flash_env() && head_dim == HD && n_head_kv > 0 && n_head % n_head_kv == 0
+        && (n_head / n_head_kv == 4 || n_head / n_head_kv == 6) && kv_k_dtype() == kv_v_dtype()
+        && kv_dtype_has_scales(kv_k_dtype())) {
+        const int hpg = n_head / n_head_kv;
+        static const bool dbg = getenv("PF_ATTN_DBG") != nullptr;
+        if (dbg) {
+            fprintf(stderr, "[attn] flash kernel: hpg=%d n_splits=%d n_rows=%d n_real=%d\n", hpg, n_splits, n_rows,
+                    n_real);
+        }
+        const sycl::half * ksc = (const sycl::half *)kscales;
+        const sycl::half * vsc = (const sycl::half *)vscales;
+        auto fk = [&](const auto * kp, const auto * vp) {
+            if (hpg == 4) {
+                attn_flash_kernel<4>(q, qbuf, kp, vp, ksc, vsc, partials, tables, n_head, n_head_kv, head_dim, n_splits,
+                                     info, scale, max_blocks, n_rows, n_real);
+            } else {
+                attn_flash_kernel<6>(q, qbuf, kp, vp, ksc, vsc, partials, tables, n_head, n_head_kv, head_dim, n_splits,
+                                     info, scale, max_blocks, n_rows, n_real);
+            }
+        };
+        if (kv_k_dtype() == kv_dtype_t::i8) {
+            fk((const int8_t *)kpool, (const int8_t *)vpool);
+        } else {
+            fk((const uint8_t *)kpool, (const uint8_t *)vpool);
+        }
+        return;
+    }
     const int grp = group >= 0 ? group : dec_group_env();
     // the grouped kernel has no int8/int4 path (it reuses kv_ld4 on a full row)
     if (grp && !kv_dtype_has_scales(kv_k_dtype()) && !kv_dtype_has_scales(kv_v_dtype()) && !fuse && head_dim == HD

@@ -49,7 +49,13 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
             // hoist the step_info fields: reloading them from host USM inside the
             // token loop costs more than the arithmetic (they alias our writes)
             const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
-            const int n_real = row_nr(info, rr);
+            // nreal_arg overrides the row's token count for the fully-fused
+            // chunk-batched prefill (PF_GDN_FUSE=2): one row of `nreal_arg`
+            // tokens walks the whole batch and carries the recurrence state,
+            // exactly like cpu_gdn.  Without the override the kernel processed
+            // only row 0 (kMaxT tokens) and left every later chunk row with a
+            // stale state - the mode-2 prefill bug.
+            const int n_real = nreal_arg > 0 ? nreal_arg : row_nr(info, rr);
             const int pc_on = info->pc_active;
             const int pbase = info->pos[rr];
 
@@ -166,7 +172,8 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
             const sub_group sgg = it.get_sub_group();
             const int j0 = 4 * lane;
             const int tpb = tpb_arg > 0 ? tpb_arg : info->tpb;
-            const int n_real = row_nr(info, rr);
+            // see the scalar kernel: nreal_arg is the fused mode-2 batch length
+            const int n_real = nreal_arg > 0 ? nreal_arg : row_nr(info, rr);
             const int pc_on = info->pc_active;
             const int pbase = info->pos[rr];
 

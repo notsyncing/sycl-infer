@@ -104,9 +104,29 @@ struct dnnl_gemm {
     // the dp4a decode GEMV's weight bias correction
     const int32_t * act_sum() const;
 
+    // ---- XMX (int8) attention GEMMs (PF_ATTN_XMX, see attn.cpp) -----------
+    // Plain int8 matmuls with an s32 accumulator for the two attention GEMMs:
+    //   QK: [M, K=256] s8  x  [K, N=blk] s8 -> [M, N] s32
+    //   PV: [M, K=blk] u8  x  [K, N=256] s8 -> [M, N] s32
+    // The K operand of QK is stored [N, K] (per-key row of head_dim), so it is
+    // read with a "ba" (transposed) weight descriptor.  No scales attribute:
+    // the attention path rescales K/V/i8 to a single per-row scale at gather
+    // time and applies the remaining scales in its own epilogue.  Shapes are
+    // cached; the caller owns the operand/dst USM buffers.  Returns false when
+    // the shape is unsupported (the caller falls back to the classic kernel).
+    bool attn_qk(int M, int blk, const int8_t * q_kmajor, const int8_t * k_keymajor, int32_t * dst);
+    bool attn_pv(int M, int blk, const uint8_t * p_major, const int8_t * v_keymajor, int32_t * dst);
+
 private:
     struct impl;
     std::unique_ptr<impl> p;
 };
+
+// Queue -> dnnl_gemm registry: the attention kernels (src/backend/gpu/kernels/
+// attn_xmx.cpp) are launched through the backend abstraction, which does not
+// carry the engine's per-device dnnl_gemm table, so the engine registers each
+// instance here at construction and the XMX attention looks it up by queue.
+void dnnl_register_queue(sycl::queue & q, dnnl_gemm * g);
+dnnl_gemm * dnnl_for_queue(sycl::queue & q);
 
 } // namespace si

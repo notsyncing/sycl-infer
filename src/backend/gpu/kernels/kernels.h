@@ -171,6 +171,15 @@ void attn_launch(sycl::queue & q, const float * qbuf, const float * gate, const 
 // out == nullptr (a fused n_splits == 1 call keeps the classic kernel).
 void attn_combine_launch(sycl::queue & q, const float * partials, const float * gate, float * out,
                          const step_info * info, int n_head, int head_dim, int n_splits, int n_rows, int n_real);
+// XMX (oneDNN int8 matmul) prefill attention - default on, PF_ATTN_XMX=0
+// disables, see attn_xmx.cpp.
+// Fills the split-partials layout; returns false if the call is out of scope
+// (i8 KV, head_dim 256, oneDNN available), in which case the caller runs the
+// classic kernel.
+bool attn_xmx_launch(sycl::queue & q, const float * qbuf, const float * gate, const void * kpool, const void * vpool,
+                     float * partials, const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
+                     const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out,
+                     const void * kscales, const void * vscales);
 void conv_l2_launch(sycl::queue & q, const float * qkv_raw, float * conv_state, const float * conv_w, float * conv_out,
                     const step_info * info, int conv_dim, int kernel_size, int head_k_dim, int n_k_heads, float eps,
                     int n_rows, int n_real, int row0 = 0, int tpb_arg = -1, bool cross_row = false);
