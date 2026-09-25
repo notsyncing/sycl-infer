@@ -7,6 +7,7 @@
 #include "quant.h"
 #include "w4.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -42,6 +43,7 @@ int main(int argc, char ** argv) {
         if (N < 4096) {
             continue; // want the real prefill shapes
         }
+        // (rate probe inserted after the weight registration below)
         const char * base = (const char *)f.map_base + f.data_offset + t.offset;
         const void * key = base;
         // register the int8 conversion too, so both paths can be measured
@@ -56,7 +58,48 @@ int main(int argc, char ** argv) {
             printf("  %-30s K=%5d N=%5d  SKIP (not u4-eligible)\n", t.name.c_str(), K, N);
             continue;
         }
-        for (int M : {1, 32, 512}) {
+        // ---- optional kernel rate probe (PF_W4_RATE=1): runs before the slow
+        // host reference and exits, so kernel tuning iterates in ~20 s -------
+        static const bool rate = getenv("PF_W4_RATE") != nullptr;
+        if (rate && N >= 4096) {
+            const int iters = 200;
+            const size_t wbytes = (size_t)N * (size_t)K / 2;
+            std::vector<float> xg((size_t)8 * K);
+            for (auto & v : xg) {
+                v = (float)((int)(rng() % 2001) - 1000) / 1000.f;
+            }
+            for (int MR : {1, 2, 3, 4, 5}) {
+                float * xr = sycl::malloc_device<float>((size_t)MR * K, q);
+                float * orr = sycl::malloc_device<float>((size_t)MR * N, q);
+                q.memcpy(xr, xg.data(), (size_t)MR * K * 4).wait();
+                if (!D.quantize(xr, nullptr, K, 0, MR, K)) {
+                    sycl::free(xr, q);
+                    sycl::free(orr, q);
+                    continue;
+                }
+                D.gemm_w4(key, nullptr, 1.f, MR, K, orr, N);
+                q.wait();
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (int it = 0; it < iters; it++) {
+                    D.gemm_w4(key, nullptr, 1.f, MR, K, orr, N);
+                }
+                q.wait();
+                auto t1 = std::chrono::high_resolution_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+                printf("  RATE %-22s K=%5d N=%6zu M=%d  %.3f ms  %.1f GB/s\n", t.name.c_str(), K, (size_t)N, MR, ms,
+                       wbytes / 1e9 / (ms / 1e3));
+                sycl::free(xr, q);
+                sycl::free(orr, q);
+            }
+        }
+
+        static int rate_tensors = 0;
+        if (rate) {
+            if (++rate_tensors >= 3) {
+                return 0;
+            }
+        }
+        for (int M : {1, 5, 6, 7, 8, 32, 512}) {
         // random activations in [-1,1], then the same quantization the engine uses
         std::vector<float> x((size_t)M * K);
         for (auto & v : x) {
@@ -87,6 +130,50 @@ int main(int argc, char ** argv) {
         }
         std::vector<float> out((size_t)M * N);
         q.memcpy(out.data(), od, (size_t)M * N * 4).wait();
+        // ---- batched (M>1) u4 GEMM vs the M=1 u4 GEMV -------------------------
+        // The MTP verify runs the batched kernel where the plain decode runs the
+        // M=1 GEMV, so the two must agree to the last bit (or at least well
+        // inside the argmax margin) or the speculative token stream drifts.
+        {
+            const int MB = (int)std::min<size_t>(M, 8);
+            std::vector<float> gb((size_t)MB * N), gg((size_t)MB * N);
+            // M=1 reference: re-quantize each row alone (the group scales are
+            // per row, so this is the same quantization the M=MB run sees)
+            float * x1 = sycl::malloc_device<float>((size_t)K, q);
+            float * o1 = sycl::malloc_device<float>((size_t)N, q);
+            for (int m = 0; m < MB; m++) {
+                q.memcpy(x1, x.data() + (size_t)m * K, (size_t)K * 4).wait();
+                if (!D.quantize(x1, nullptr, K, 0, 1, K)) {
+                    break;
+                }
+                if (!D.gemm_w4(key, nullptr, 1.f, 1, K, o1, N)) {
+                    break;
+                }
+                q.memcpy(gb.data() + (size_t)m * N, o1, (size_t)N * 4).wait();
+            }
+            sycl::free(x1, q);
+            sycl::free(o1, q);
+            if (D.quantize(xd, nullptr, K, 0, MB, K) && D.gemm_w4(key, nullptr, 1.f, MB, K, od, N)) {
+                q.memcpy(gg.data(), od, (size_t)MB * N * 4).wait();
+                double mx = 0, ref = 0;
+                int bad = 0;
+                for (size_t i = 0; i < (size_t)MB * N; i++) {
+                    const double d = std::fabs(gg[i] - gb[i]);
+                    mx = std::max(mx, d);
+                    ref = std::max(ref, (double)std::fabs(gb[i]));
+                    if (d > 1e-3 * std::fmax(1.0, (double)std::fabs(gb[i]))) {
+                        bad++;
+                    }
+                }
+                printf("  %-30s K=%5d N=%5d M=%d  batched-vs-gemv maxdiff=%.3e |ref|=%.3f bad=%d\n",
+                       t.name.c_str(), K, N, MB, mx, ref, bad);
+                if (!D.quantize(xd, nullptr, K, 0, M, K)) {
+                    printf("requantize failed\n");
+                    return 1;
+                }
+            }
+        }
+
         sycl::free(xd, q);
         sycl::free(od, q);
 

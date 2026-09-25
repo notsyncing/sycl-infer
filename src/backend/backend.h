@@ -39,6 +39,12 @@ struct compute_backend {
     virtual void copy_row(const float * src, float * dst, const step_info * info, int n, int row) = 0;
     virtual void embed(const void * table, uint32_t type, const step_info * info, float * out, int n_embd,
                        size_t row_bytes) = 0;
+    // MTP (NextN) draft head input preparation, see kernels.h
+    // MTP: copy the post-output-norm hidden rows into the draft head's buffer
+    virtual void mtp_capture(const float * src, float * dst, int n_rows, int n) = 0;
+    virtual void mtp_concat(const void * table, uint32_t type, size_t row_bytes, const float * enorm,
+                            const float * hnorm, const float * h, const float * h_prev, const step_info * info,
+                            float * out, int n_embd, float eps) = 0;
     virtual void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                             int n_tok_blocks) = 0;
     virtual void qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm,

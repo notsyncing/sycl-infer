@@ -33,6 +33,14 @@ struct gpu_backend : compute_backend {
                size_t row_bytes) override {
         embed_launch(q, table, type, info, out, n_embd, row_bytes);
     }
+    void mtp_capture(const float * src, float * dst, int n_rows, int n) override {
+        mtp_capture_launch(q, src, dst, n_rows, n);
+    }
+    void mtp_concat(const void * table, uint32_t type, size_t row_bytes, const float * enorm, const float * hnorm,
+                    const float * h, const float * h_prev, const step_info * info, float * out, int n_embd,
+                    float eps) override {
+        mtp_concat_launch(q, table, type, row_bytes, enorm, hnorm, h, h_prev, info, out, n_embd, eps);
+    }
     void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                     int n_tok_blocks) override {
         gemv_group_launch(q, type, segs, n_segs, total_rows, TB, nsb, n_tok_blocks);

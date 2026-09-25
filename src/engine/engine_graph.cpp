@@ -528,7 +528,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const seg_plan::xq_t & xq = plan.call_xq[idx];
             const auto a2 = tnow();
             // decode reads the even/odd split in the u4 GEMV; prefill does not
-            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K, /*do_split=*/mode == 0);
+            // do_split also feeds the native-u4 GEMM's even/odd activation planes,
+            // which the MTP speculative verify (a mode-2 batch) uses.
+            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K,
+                        /*do_split=*/mode == 0 || inf->mtp_dry != 0);
             if (prof_on()) {
                 sync_cur();
                 prof_acc[5] += tms(a2, tnow());
@@ -827,6 +830,26 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 snap.gdn_per = (int32_t)gdn_per;
                 snap.conv_per = (int32_t)conv_per;
             }
+            // MTP spec verify: redirect the per-token snapshots into this
+            // partition's GDN-state history (device-local, dense layer layout)
+            if (getenv("PF_MTP_INFOCHK") != nullptr && inf->pc_active) {
+                static int cnt = 0;
+                if (cnt++ < 4) {
+                    fprintf(stderr, "[mtp] infochk rf: mtp_dt=%d pc_active=%d dev=%d nhist=%zu hist=%p\n", inf->mtp_dt,
+                            inf->pc_active, dev, d_mtp_hist_.size(), (void *)d_mtp_hist_[(size_t)dev]);
+                }
+            }
+            if (inf->mtp_dt && (size_t)dev < d_mtp_hist_.size() && d_mtp_hist_[(size_t)dev] != nullptr) {
+                // Same [slot][layer][gdn|conv] layout the prefix-cache checkpoints
+                // use: conv_state_update writes at layer_off + gdn_per, so the
+                // conv plane must exist per layer or it would land in the NEXT
+                // layer's GDN snapshot and corrupt the rollback state.
+                snap.base = d_mtp_hist_[(size_t)dev];
+                snap.stride = (int64_t)n_gdn_dev_[(size_t)dev] * ((int64_t)gdn_per + (int64_t)conv_per);
+                snap.layer_off = (int64_t)gl * ((int64_t)gdn_per + (int64_t)conv_per);
+                snap.gdn_per = (int32_t)gdn_per;
+                snap.conv_per = (int32_t)conv_per;
+            }
             // the GDN recurrence is sequential over tokens.  In chunk-batched
             // prefill the whole batch is *materialized* (qkv), so one call per
             // kernel can cover all chunk rows: the conv reads cross-row taps
@@ -898,6 +921,21 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 }
                 stamp(prof_acc[13], a_sub);
                 a_sub = tnow();
+            }
+            if (inf->mtp_dt && (size_t)dev < d_mtp_rin_.size() && d_mtp_rin_[(size_t)dev] != nullptr) {
+                // MTP spec verify: keep this layer's per-token recurrence inputs
+                // so the commit can replay the accepted tokens on the restored
+                // state (the engine's per-token state snapshot is not reliable).
+                const int nsv = std::min(T, mtp_nsnap);
+                const int cvd = hp.qkv_dim();
+                const int dtr = hp.dt_rank;
+                const size_t st = (size_t)mtp_nsnap;
+                float * rb = d_mtp_rin_[(size_t)dev] + (size_t)gl * st * (size_t)(cvd + 2 * dtr);
+                float * qs = d_mtp_qsave_[(size_t)dev] + (size_t)gl * st * (size_t)cvd;
+                cur_be->mtp_capture(d_qkv, qs, 1, nsv * cvd);
+                cur_be->mtp_capture(d_conv_out, rb, 1, nsv * cvd);
+                cur_be->mtp_capture(d_alpha, rb + st * (size_t)cvd, 1, nsv * dtr);
+                cur_be->mtp_capture(d_beta, rb + st * (size_t)(cvd + dtr), 1, nsv * dtr);
             }
             // gated_norm has no state dependency on the row order, so all chunk
             // rows run in one dispatch (batched it is ~4x cheaper than NCH calls)
@@ -1082,6 +1120,12 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // global tensors (output norm, LM head) live on the primary device
     cur_be = &backend();
     cur_be->rmsnorm(d_x, out_norm, d_xnorm, T, hp.n_embd, hp.rms_eps);
+    if (mtp_on && d_mtp_main_h) {
+        // the MTP head applies its own hnorm to the *pre*-output-norm trunk
+        // hidden (llama.cpp: t_h_pre_norm), so capture d_x here, on the device
+        // and in order, before any other kernel can reuse the scratch.
+        cur_be->mtp_capture(d_x, d_mtp_main_h, T, hp.n_embd);
+    }
     if (mode != 0) {
         cur_be->copy_row(d_xnorm, d_last_hidden, inf, hp.n_embd, -1);
     }
@@ -1245,6 +1289,20 @@ void engine::build_plans() {
     // leave the members on the primary device for any runtime use
     if (multi_dev) {
         bind_acts(0);
+    }
+    if (mtp_on) {
+        // MTP verify: the main model over n = mtp_k+1 tokens (mode 2, one chunk
+        // row) with the LM head batched over every row, so d_logits gets the
+        // per-draft-position distributions the acceptance compares.
+        plan_vf_ = build_plan(kMaxT, kMaxT, /*head_batched=*/true, /*use_w8=*/true, /*with_head=*/true);
+        plan_vf_.finalize();
+        if (plan_vf_.segs.size() > 4096) {
+            throw std::runtime_error("segment buffer too small (verify plan)");
+        }
+        d_segs_vf = alloc_elems<gemv_seg>(plan_vf_.segs.size());
+        q.memcpy(d_segs_vf, plan_vf_.segs.data(), plan_vf_.segs.size() * sizeof(gemv_seg)).wait();
+        bind_acts(0);
+        build_mtp_plan();
     }
 }
 

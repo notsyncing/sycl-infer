@@ -69,6 +69,13 @@ static void usage(const char * prog) {
             "                               the three prefix-cache tiers, shrinking disk,\n"
             "                               then RAM, then VRAM.\n"
             "  --mmproj <mmproj.gguf>       vision projector needed by --image/--video\n"
+            "  --mtp N                      MTP (NextN) speculative draft length: run\n"
+            "                               the model's draft head N times per verify\n"
+            "                               (0/absent = off; env PF_MTP; needs 2+ GPUs)\n"
+            "  --mtp-device N               device partition the MTP draft layer (and\n"
+            "                               its KV slice) runs on (default 0; env\n"
+            "                               PF_MTP_DEV).  The MTP slice counts toward\n"
+            "                               --kv-cap-mb and all prefix-cache tiers.\n"
             "  --audio-mmproj <gguf>        audio tower needed by --audio\n"
             "  --kv-type T                  KV cache storage type: i4|i8|bf16|f16|f32,\n"
             "                               or K:V to size K and V independently\n"
@@ -150,6 +157,8 @@ int main(int argc, char ** argv) {
     int pc_vram_mb = -1;
     int device = -1; // -1 auto (PF_DEVICE), 0 gpu, 1 cpu
     std::string layer_map; // multi-device: "0-13:gpu,14-27:cpu"
+    int mtp_k = -1;        // MTP draft length (0/absent = off, env PF_MTP)
+    int mtp_dev = 0;       // device partition the MTP draft layer runs on
     std::string cmd;
     bool bad_arg = false;
 
@@ -231,6 +240,10 @@ int main(int argc, char ** argv) {
             kv_dtype_set_kv(kt, vt);
         } else if (a == "--layer-map") {
             layer_map = next();
+        } else if (a == "--mtp") {
+            mtp_k = std::atoi(next().c_str());
+        } else if (a == "--mtp-device") {
+            mtp_dev = std::atoi(next().c_str());
         } else if (a == "--device") {
             const std::string v = next();
             if (v == "cpu" || v == "host") {
@@ -300,8 +313,11 @@ int main(int argc, char ** argv) {
             n_blocks = need_blocks;
         }
 
+        if (mtp_dev > 0) {
+            setenv("PF_MTP_DEV", std::to_string(mtp_dev).c_str(), 1);
+        }
         engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb, pc_dir, pc_disk_mb, pc_mem_mb,
-                 pc_ram_mb, pc_vram_mb, device, layer_map);
+                 pc_ram_mb, pc_vram_mb, device, layer_map, mtp_k);
         {
             const char * isa = cpu_isa_spec();
             if (e.cpu_mode) {

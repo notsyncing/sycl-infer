@@ -104,11 +104,38 @@ int engine::attn_layers() const {
     for (int il = 0; il < m.hp.n_layer; il++) {
         n += !m.hp.is_recr(il);
     }
+    // The MTP draft head is a full-attention layer with its own paged KV slice,
+    // stored last (index n-1).  Keeping it inside attn_layers() makes the pool
+    // sizing, the prefix-cache block blob and its serialize/deserialize loops
+    // cover it with no extra plumbing.
+    if (mtp_on) {
+        n += 1;
+    }
+    return n;
+}
+
+// number of full-attention layers of the *main* model (without the MTP layer)
+static int main_attn_layers(const hparams & hp) {
+    int n = 0;
+    for (int il = 0; il < hp.n_layer; il++) {
+        n += !hp.is_recr(il);
+    }
     return n;
 }
 
 void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const {
     if (multi_dev) {
+        if (mtp_on && a == main_attn_layers(m.hp)) {
+            // the MTP draft layer's KV lives on its own backend (--mtp-device),
+            // as that partition's last attention slice
+            const size_t md = (mtp_dev >= 0 && (size_t)mtp_dev < dev_kpool_.size()) ? (size_t)mtp_dev : 0;
+            const int la = mtp_attn_local_;
+            kp = (const char *)dev_kpool_[md] + (size_t)la * kv_layer_stride;
+            vp = (const char *)dev_vpool_[md] + (size_t)la * kv_v_layer_stride;
+            ksc = dev_kscales_[md] ? (const char *)dev_kscales_[md] + (size_t)la * kv_scale_stride : nullptr;
+            vsc = dev_vscales_[md] ? (const char *)dev_vscales_[md] + (size_t)la * kv_v_scale_stride : nullptr;
+            return;
+        }
         // global attention layer `a` is stored in the pool of the device that
         // computes its layer, at that device's local attention index
         int il = -1, na = 0;
@@ -137,6 +164,9 @@ void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char
 int engine::attn_dev(int a) const {
     if (!multi_dev) {
         return 0;
+    }
+    if (mtp_on && a == main_attn_layers(m.hp)) {
+        return mtp_dev;
     }
     int na = 0;
     for (int t = 0; t < m.hp.n_layer; t++) {
@@ -168,6 +198,13 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
             if (!m.hp.is_recr(il)) {
                 local_attn[(size_t)layer_dev_[il]]++;
             }
+        }
+        if (mtp_on) {
+            // the MTP draft layer's KV lives on --mtp-device, after that
+            // partition's own attention layers
+            const int md = (mtp_dev >= 0 && mtp_dev < ndev) ? mtp_dev : 0;
+            mtp_attn_local_ = local_attn[(size_t)md];
+            local_attn[(size_t)md]++;
         }
         dev_kpool_.assign((size_t)ndev, nullptr);
         dev_vpool_.assign((size_t)ndev, nullptr);

@@ -89,18 +89,73 @@ static std::shared_ptr<sycl::context> make_md_context(const std::string & layer_
 
 engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb,
                const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb,
-               int device, const std::string & layer_map)
+               int device, const std::string & layer_map, int mtp_k_arg)
     : device_req(resolve_device(device, layer_map)), md_ctx_(make_md_context(layer_map)), q(make_queue(device_req, md_ctx_.get())),
       max_seq(max_seq_), n_splits(n_splits_), n_blocks(n_blocks_) {
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     tk.load(m.gguf);
+    // MTP draft length: --mtp N (0/absent = off), PF_MTP as an env override.
+    mtp_k = mtp_k_arg;
+    if (const char * em = getenv("PF_MTP")) {
+        const int v = atoi(em);
+        if (v >= 0) {
+            mtp_k = v;
+        }
+    }
+    if (mtp_k > 0 && !m.has_mtp) {
+        fprintf(stderr, "[mtp] model has no NextN (blk.%d.nextn.*) layer - MTP disabled\n", m.hp.n_layer);
+        mtp_k = 0;
+    }
+    if (mtp_k > 12) {
+        mtp_k = 12; // d_logits / step_info bounds: n = mtp_k+1 <= kMaxB
+    }
+    mtp_on = mtp_k > 0;
+    if (mtp_on && getenv("PF_MTP_EXPERIMENTAL") == nullptr) {
+        // The speculative loop is now numerically exact (greedy MTP == greedy
+        // decode, verified token-for-token), but it is not yet a speedup: the
+        // batched verify runs the oneDNN int8 weight path (~24.5 GB/pass at
+        // ~130 GB/s) while the plain decode's u4 GEMV streams 16 GB at ~315 GB/s,
+        // so a verify costs ~3.7 decode passes and the drafts only buy ~2.2
+        // accepted tokens/cycle.  Reaching >1x needs a batched u4 (native-width)
+        // GEMM for the verify so it costs about one decode pass; until then the
+        // path stays opt-in.
+        fprintf(stderr,
+                "[mtp] MTP is experimental (correct, but not yet faster than plain decode);"
+                " set PF_MTP_EXPERIMENTAL=1 to enable\n");
+        mtp_on = false;
+        mtp_k = 0;
+    }
+    if (mtp_on) {
+        // The native q5/cb4 weight stores store prefill the tensor back to int8 in
+        // a per-pass scratch, which a multi-token speculative verify pays on every
+        // cycle (~110 ms/cycle on the 27B, measured): force the plain int8/SIn
+        // copies for the batched path unless the user asked otherwise.
+        setenv("PF_CB4", "0", 0);
+        setenv("PF_K5", "0", 0);
+    }
+    if (const char * ed = getenv("PF_MTP_DEV")) {
+        mtp_dev = atoi(ed);
+    }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
     }
     if (!multi_dev) {
         be = cpu_mode ? make_cpu_backend() : make_gpu_backend(q);
+    }
+    if (mtp_on && !(multi_dev && md_xmx)) {
+        // The draft head needs the oneDNN int8 row-major weight path (the same
+        // one the multi-device decode uses); everything else would fall back to
+        // a much slower per-call GEMM chain.
+        fprintf(stderr, "[mtp] MTP needs a multi-device oneDNN int8 partition (%s) - disabled\n",
+                multi_dev ? (md_xmx ? "ok" : "no XMX") : "single device");
+        mtp_on = false;
+        mtp_k = 0;
+    }
+    if (mtp_on && (mtp_dev < 0 || mtp_dev >= (int)backends_.size())) {
+        fprintf(stderr, "[mtp] --mtp-device %d out of range (%zu device(s)) - using 0\n", mtp_dev, backends_.size());
+        mtp_dev = 0;
     }
     if (cpu_mode) {
         n_splits = 1;
@@ -381,6 +436,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         for (int il = 0; il < m.hp.n_layer; il++) {
             n_attn += !m.hp.is_recr(il);
         }
+        n_attn += mtp_on ? 1 : 0; // the MTP layer owns one KV slice too
         const size_t block_bytes = kv_block_bytes();
         // a block holds a K block and a V block, which may differ (--kv-type K:V)
         const size_t blk_pair = block_bytes + kv_v_block_bytes();
@@ -779,10 +835,41 @@ void engine::upload_device_weights(int dev) {
     // global tensors (embedding, LM head, output norm) always run on the
     // primary device: only device 0 carries them, which matters because
     // tok_embd + output are ~10 GB for a large-vocab model
+    if (dev == (multi_dev ? mtp_dev : 0) && mtp_on) {
+        // the MTP layer's F32 norms ride on its own device; tok_embd stays on
+        // device 0 (host USM, reachable from every backend in the context)
+        const mtp_layer_t & M = m.mtp;
+        addp(M.attn_norm);
+        addp(M.post_attn_norm);
+        addp(M.q_norm);
+        addp(M.k_norm);
+        addp(M.enorm);
+        addp(M.hnorm);
+        addp(M.shared_head_norm);
+    }
     if (dev == 0) {
         addp(m.tok_embd.data);
         addp(m.output.data);
         addp(m.output_norm);
+        if (mtp_on) {
+            const mtp_layer_t & M = m.mtp;
+            addp(M.attn_norm);
+            addp(M.post_attn_norm);
+            addp(M.q_norm);
+            addp(M.k_norm);
+            addp(M.enorm);
+            addp(M.hnorm);
+            addp(M.shared_head_norm);
+            addp(M.eh_proj.data);
+            addp(M.wq.data);
+            addp(M.wk.data);
+            addp(M.wv.data);
+            addp(M.wo.data);
+            addp(M.ffn_gate.data);
+            addp(M.ffn_up.data);
+            addp(M.ffn_down.data);
+            addp(M.shared_head.data);
+        }
     }
     int needed_by_layer = 0;
     for (int il = 0; il < m.hp.n_layer; il++) {
@@ -1032,6 +1119,20 @@ bool engine::setup_md_dnnl() {
                 m.page_out_tensor(t);
             }
         };
+        if ((int)d == mtp_dev && mtp_on) {
+            // The MTP draft layer runs on --mtp-device, so its linears (and the
+            // eh_proj input projection) are converted into that partition's
+            // oneDNN table, keyed by their host pointers.
+            const mtp_layer_t & M = m.mtp;
+            add(M.eh_proj);
+            add(M.wq);
+            add(M.wk);
+            add(M.wv);
+            add(M.wo);
+            add(M.ffn_gate);
+            add(M.ffn_up);
+            add(M.ffn_down);
+        }
         if (d == 0 && m.output.data != m.tok_embd.data) {
             // The LM head is a global pinned to backend 0.  Convert it here -
             // *before* upload_device_weights - keyed by its host pointer, which
@@ -1294,8 +1395,12 @@ void engine::setup_multi_device(const std::string & layer_map) {
         const bool dp4a_env_off = env && atoi(env) == 0;
         md_xmx = has_gpu && !dp4a_env_off && setup_md_dnnl();
         md_int8 = has_gpu && !dp4a_env_off && !md_xmx;
+        // md_xmx means "oneDNN int8 weights are available", not that the XMX
+        // arrays are used: for the grouped-scale shapes here oneDNN selects
+        // jit:gemm:any (and ocl:ref:any with a blocked layout), so name the
+        // path for what it is.
         fprintf(stderr, "[dev] multi-device weight path: %s\n",
-                md_xmx ? "oneDNN int8 (XMX)" : (md_int8 ? "SIn int8 (dp4a)" : "fp32"));
+                md_xmx ? "oneDNN int8 matmul (jit:gemm:any)" : (md_int8 ? "SIn int8 (dp4a)" : "fp32"));
     }
     // Per-device oneDNN int8 weights (XMX) were built above before the upload;
     // converted tensors skip their raw device copy.  The SIn/w8 fallback built
@@ -1437,6 +1542,84 @@ void engine::alloc_buffers() {
         }
     }
     d_segs_aux = alloc_elems<gemv_seg>(8);
+    if (mtp_on) {
+        // MTP draft-head activations live on the primary device (the MTP layer
+        // always runs there); the per-token recurrent-state history is split
+        // per partition so the GDN kernels snapshot into their own device USM.
+        mtp_nsnap = mtp_k + 1;
+        auto ab = [&](size_t n) -> float * {
+            return (float *)(multi_dev ? dev_alloc_on(mtp_dev, n * 4) : alloc_bytes(n * 4));
+        };
+        const int R = kMaxB * kMaxT;
+        d_mtp_cat = ab((size_t)R * 2 * hp.n_embd);
+        d_mtp_x = ab((size_t)R * hp.n_embd);
+        d_mtp_xnorm = ab((size_t)R * hp.n_embd);
+        d_mtp_qbuf = ab((size_t)R * hp.n_head * 2 * hp.head_dim);
+        d_mtp_kbuf = ab((size_t)R * hp.n_head_kv * hp.head_dim);
+        d_mtp_vbuf = ab((size_t)R * hp.n_head_kv * hp.head_dim);
+        d_mtp_attn_out = ab((size_t)R * hp.n_head * hp.head_dim);
+        d_mtp_ffn = ab((size_t)R * ffn_stride);
+        d_mtp_hnorm = ab((size_t)R * hp.n_embd);
+        d_mtp_hprev = ab((size_t)kMaxB * hp.n_embd);
+        // host USM: written by the primary device's capture and read by the
+        // MTP layer wherever --mtp-device put it
+        d_mtp_main_h = alloc_elems<float>((size_t)kMaxB * kMaxT * hp.n_embd);
+        d_mtp_hnorm0 = (mtp_dev == 0) ? d_mtp_hnorm : (float *)dev_alloc_on(0, (size_t)kMaxB * hp.n_embd * 4);
+        d_mtp_raw = (float *)dev_alloc_on(mtp_dev, (size_t)kMaxT * hp.n_embd * 4);
+        d_mtp_rin_.assign(as_.size(), nullptr);
+        d_mtp_qsave_.assign(as_.size(), nullptr);
+        d_mtp_ssave_.assign(as_.size(), nullptr);
+        const int dtr = hp.dt_rank;
+        const int cvd = hp.qkv_dim();
+        for (size_t d = 0; d < as_.size(); d++) {
+            const int ng = n_gdn_dev_.empty() ? 0 : n_gdn_dev_[d];
+            if (ng <= 0) {
+                continue;
+            }
+            d_mtp_rin_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * mtp_nsnap * (cvd + 2 * dtr) * 4);
+            d_mtp_qsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * mtp_nsnap * (size_t)cvd * 4);
+            d_mtp_ssave_[d] =
+                (float *)dev_alloc_on((int)d, (size_t)ng * (size_t)hp.dt_rank * hp.d_state * hp.d_state * 4);
+        }
+        d_mtp_rinfo = sycl::malloc_host<step_info>(1, q);
+        std::memset(d_mtp_rinfo, 0, sizeof(step_info));
+        d_mtp_info = sycl::malloc_host<step_info>(1, q);
+        std::memset(d_mtp_info, 0, sizeof(step_info));
+        std::memcpy(d_mtp_info->mrope_sections, hp.rope_sections, sizeof(hp.rope_sections));
+        d_mtp_hist_.assign(as_.size(), nullptr);
+        d_mtp_convsave_.assign(as_.size(), nullptr);
+        const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
+        const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
+        for (size_t d = 0; d < as_.size(); d++) {
+            const int ng = n_gdn_dev_.empty() ? 0 : n_gdn_dev_[d];
+            if (ng <= 0) {
+                continue;
+            }
+            if (getenv("PF_MTP_MEM") != nullptr) {
+                auto ty = [&](void * p) {
+                    switch (sycl::get_pointer_type(p, q.get_context())) {
+                        case sycl::usm::alloc::host: return "host";
+                        case sycl::usm::alloc::device: return "device";
+                        case sycl::usm::alloc::shared: return "shared";
+                        default: return "unknown";
+                    }
+                };
+                fprintf(stderr, "[mtp] mem: q_dev=%s dev0=%s mtp_dev=%d\n",
+                        q.get_device().get_info<sycl::info::device::name>().c_str(),
+                        dev_queues_.empty() || !dev_queues_[0] ? "-"
+                                                              : dev_queues_[0]->get_device().get_info<sycl::info::device::name>().c_str(),
+                        mtp_dev);
+                fprintf(stderr, "[mtp] mem: main_h=%s last_hidden=%s xnorm0=%s hprev=%s hist=%s\n", ty(d_mtp_main_h),
+                        ty(d_last_hidden), ty(as_[0].xnorm), ty(d_mtp_hprev), ty(d_mtp_hist_[d]));
+            }
+            d_mtp_hist_[d] =
+                (float *)dev_alloc_on((int)d, (size_t)mtp_nsnap * (size_t)ng * (gdn_per + conv_per) * 4);
+            // zero it so a missing per-token snapshot shows up as zeros, not as
+            // whatever the allocator handed back
+            dev_queue((int)d).memset(d_mtp_hist_[d], 0, (size_t)mtp_nsnap * (size_t)ng * (gdn_per + conv_per) * 4);
+            d_mtp_convsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * 2 * conv_per * 4);
+        }
+    }
     for (int tb : {1, 2, 4, 8, 16}) {
         dec_bucket b;
         b.tb = tb;
@@ -1907,6 +2090,12 @@ std::vector<int> engine::generate_mm(const mm_prompt & p, const gen_params & gp,
 
 std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm_prompt * mm, const gen_params & gp,
                                        const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
+    // MTP speculative decoding: greedy requests only (the acceptance test is an
+    // equality against the target's own next token; a sampled target would need
+    // rejection sampling to stay exact).  Multimodal prompts bypass it too.
+    if (mtp_on && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
+        return generate_mtp(prompt, gp, cb, first_logits);
+    }
     reset_single();
     const hparams & hp = m.hp;
     sampler_state ss;

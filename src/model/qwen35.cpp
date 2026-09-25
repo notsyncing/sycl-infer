@@ -20,6 +20,7 @@ void load_qwen35(model & m) {
     uint32_t block_count = f.get_u32(key("block_count"));
     uint32_t n_layer_nextn = f.get_u32(key("nextn_predict_layers"), 0);
     hp.n_layer = (int)(block_count - n_layer_nextn);
+    hp.n_mtp = (int)n_layer_nextn;
     hp.n_embd = (int)f.get_u32(key("embedding_length"));
     hp.n_ff = (int)f.get_u32(key("feed_forward_length"));
     hp.n_head = (int)f.get_u32(key("attention.head_count"));
@@ -86,6 +87,34 @@ void load_qwen35(model & m) {
             L.q_norm = bind_f32(f, pre + "attn_q_norm.weight");
             L.k_norm = bind_f32(f, pre + "attn_k_norm.weight");
         }
+    }
+
+    // MTP / NextN draft layer: blk.<n_layer>.* follows the main blocks.  It is a
+    // full-attention Qwen3.5 block plus the nextn projection/norm tensors and a
+    // shared output norm.  Loaded only when the GGUF declares one; the engine
+    // keeps it out of the main forward.
+    if (hp.n_mtp > 0) {
+        const std::string pre = "blk." + std::to_string(hp.n_layer) + ".";
+        mtp_layer_t & M = m.mtp;
+        M.attn_norm = bind_f32(f, pre + "attn_norm.weight");
+        M.post_attn_norm = bind_f32(f, pre + "post_attention_norm.weight");
+        M.wq = bind_tensor(f, pre + "attn_q.weight");
+        M.wk = bind_tensor(f, pre + "attn_k.weight");
+        M.wv = bind_tensor(f, pre + "attn_v.weight");
+        M.wo = bind_tensor(f, pre + "attn_output.weight");
+        M.q_norm = bind_f32(f, pre + "attn_q_norm.weight");
+        M.k_norm = bind_f32(f, pre + "attn_k_norm.weight");
+        M.ffn_gate = bind_tensor(f, pre + "ffn_gate.weight");
+        M.ffn_up = bind_tensor(f, pre + "ffn_up.weight");
+        M.ffn_down = bind_tensor(f, pre + "ffn_down.weight");
+        M.eh_proj = bind_tensor(f, pre + "nextn.eh_proj.weight");
+        M.enorm = bind_f32(f, pre + "nextn.enorm.weight");
+        M.hnorm = bind_f32(f, pre + "nextn.hnorm.weight");
+        M.shared_head_norm = bind_f32(f, pre + "nextn.shared_head_norm.weight");
+        if (f.find(pre + "nextn.shared_head_head.weight")) {
+            M.shared_head = bind_tensor(f, pre + "nextn.shared_head_head.weight");
+        }
+        m.has_mtp = true;
     }
 }
 

@@ -205,7 +205,9 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
                 w4_gemv (u4/int8/codebook decode GEMV: g-major SLM-staged 4-bit
-                GEMV, LUT-expanding codebook GEMV and its prefill expansion),
+                GEMV, LUT-expanding codebook GEMV and its prefill expansion, plus
+                the opt-in batched u4 GEMM `w4_gemm_launch`), mtp (mtp_concat /
+                mtp_capture for the NextN draft head),
                  vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
                  bidirectional attention), at (audio tower helpers: at_conv1d,
                  at_rope1d), attn_xmx (oneDNN int8 XMX prefill attention, see
@@ -219,7 +221,8 @@ src/mm/         image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
                 audio.{h,cpp} (audio decode: WAV native / ffmpeg fallback +
                 log-mel), audio_model.{h,cpp} (AuT audio tower: host + device),
                 multimodal.{h,cpp} (prompt expansion + M-RoPE positions)
-src/engine/     engine.{h,cpp} (orchestration), engine_graph.cpp (seg_plan,
+src/engine/     engine.{h,cpp} (orchestration), engine_mtp.cpp (MTP plan/forward/
+                verify/rollback + the speculative loop), engine_graph.cpp (seg_plan,
                 record_forward, build_graphs), engine_kvpool.cpp (dynamic KV
                 pool), engine_prefix_cache.cpp (VRAM tier + tier demotion),
                 pc_ram.{h,cpp} (host-RAM tier: LRU record store),
@@ -396,6 +399,67 @@ CLI: `gen --image FILE` / `--video FILE` / `--audio FILE` (each repeatable, all
 mixable), `--audio-mmproj`, `--max-video-frames`, `--max-video-side`.  Server:
 OpenAI-style `image_url`/`video_url`/`input_audio`/`audio_url` parts in
 `/v1/chat/completions`, streaming and not.
+
+### Multi-token prediction (MTP / NextN) speculative decoding
+
+`--mtp N` drafts up to `N` tokens with the model's own NextN head and verifies
+them against the target in one batched forward, emitting exactly the tokens a
+plain greedy decode would.  Requires a GGUF that bundles the head: the 27B
+reference model has `qwen35.nextn_predict_layers == 1` with `blk.<n_layer>.nextn.*`
+(`eh_proj`, `enorm`, `hnorm`, `attn_norm`, q/k/v/wo/ffn, optional
+`shared_head_norm`/`shared_head_head`); the 0.8B has none, so `--mtp` there is a
+no-op.  The MTP layer is a full-attention Qwen3.5 block, so it owns one extra
+attention KV slice (`attn_layers() - 1`) in the same paged pool and is counted in
+`--kv-cap-mb` and by all three prefix-cache tiers.
+
+Semantics, all required for the emitted stream to stay bit-equal to a plain
+greedy decode:
+
+* the head consumes the trunk hidden **before** `output_norm` (`t_h_pre_norm`)
+  and applies its own `enorm`/`hnorm`; a draft row pairs `emb(t_p)` with
+  `h_{p-1}`, matching llama.cpp's right-shift;
+* the verify is one batched forward of `[last_committed, draft0..draft_{k-1}]`
+  at consecutive positions, and acceptance is `target_argmax(row i) == draft[i]`
+  plus a bonus token from row `j`;
+* the verify is **dry** (`step_info::mtp_dry`): it computes the forward but does
+  not write the GDN/conv state, and it snapshots the per-token state into
+  `d_mtp_hist_` so the commit rewinds the recurrent state to the last accepted
+  row (llama.cpp's `n_rs_seq`); the conv window is rebuilt from the raw taps
+  saved in `d_mtp_qsave_`;
+* the prefix cache is supported: `generate_mtp` calls `pc_admit` for the prompt
+  (which restores the matched chain's KV *and* recurrent state) and `pc_commit`
+  after the prefill.
+
+The path is opt-in (`--mtp 0`/absent is the plain decode, byte-identical output)
+and currently gated behind `PF_MTP_EXPERIMENTAL=1` because it is **not yet a
+speedup**: at k=6 it measures ~67-73 ms/token against the plain decode's
+50.6 ms/token.  The gap is entirely the verify's batch GEMM - the engine's
+small-M batched path runs oneDNN's `jit:gemm:any` at ~63 GB/s/card while the
+decode's own u4/cb4/k5 GEMVs stream the same weights at ~220-250 GB/s/card, i.e.
+one verify costs ~4 decode passes while the drafts only buy ~2.6 accepted
+tokens/cycle.  `--mtp N` also disables the q5/cb4 native stores for the
+speculative path (they would expand to int8 on every verify pass).
+
+Reaching >1x needs a batched native-layout GEMM at the decode's per-byte rate.
+Measured so far on the 27B: the weight stream itself is nearly free (removing
+the per-`(row,group)` activation/scale loads from the batched kernel reaches
+219 GB/s = the GEMV's own rate); the hand-written batched u4 kernels in
+`w4_gemv.cpp` are bit-exact against the M=1 GEMV but reach only 43 GB/s at M=5
+(accumulator spilling was the first 3x, fixed by expanding the row bodies with
+`if constexpr`; every column-tiled variant then collapses ~10x), and forcing
+oneDNN onto a blocked int8 weight layout makes it pick `ocl:ref:any` rather than
+an XMX kernel - so neither the XMX route nor the current hand-written kernels
+beat `jit:gemm:any` on this stack yet.
+
+Diagnostics (all env-gated, `0`/unset = off unless noted): `PF_MTP` (draft
+length, `--mtp` overrides), `PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms),
+`PF_MTP_DEBUG`/`PF_MTP_DUMP`, `PF_MTP_VERIFY_PAD`/`PF_MTP_VERIFY_M32` (pad the
+verify's GEMM M), `PF_MTP_VERIFYN`, `PF_MTP_DECCHK` (verify row 0 vs a plain
+decode of the same token), `PF_MTP_LSTAT`, `PF_MTP_DECODE_H`, `PF_MTP_NOACCEPT`,
+`PF_MTP_NOMTPFWD`, `PF_MTP_NORB`, `PF_MTP_DBG_RB`.  Batch-GEMM knobs:
+`PF_W4_GEMM_MAXM` (default 1 = the oneDNN matmul; 2..8 routes the u4 tensors to
+`w4_gemm_launch`), `PF_W4_GEMM_U` (accumulator sets), `PF_W4_GEMM_TN`
+(0 = row-expanded, 2/3/4 = the tiled experiments), `PF_DNNL_BLOCKED`.
 
 ### OpenAI-compatible API
 

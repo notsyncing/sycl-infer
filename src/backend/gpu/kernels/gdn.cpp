@@ -116,8 +116,10 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
                     }
                 }
                 // prefix cache: this token completes a 32-token block -> snapshot
-                if (pc_on && (pbase + t + 1) % kBlockSize == 0) {
-                    const int stt = info->pc_row_slot[(pbase + t + 1) / kBlockSize];
+                // MTP spec verify (info->mtp_dt): snapshot after EVERY token so
+                // the recurrence can be rolled back to the accepted draft length.
+                if (pc_on && (info->mtp_dt || (pbase + t + 1) % kBlockSize == 0)) {
+                    const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kBlockSize];
                     if (stt >= 0) {
                         float * dst = snap.base + (size_t)stt * snap.stride + snap.layer_off
                                       + ((size_t)head * head_dim + col0) * head_dim;
@@ -131,11 +133,13 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
                     }
                 }
             }
+            if (!info->mtp_dry) {
 #pragma unroll
-            for (int c = 0; c < C; c++) {
+                for (int c = 0; c < C; c++) {
 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    st[(size_t)c * head_dim + lane + 32 * j] = s[c][j];
+                    for (int j = 0; j < 4; j++) {
+                        st[(size_t)c * head_dim + lane + 32 * j] = s[c][j];
+                    }
                 }
             }
         });
@@ -218,8 +222,9 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
                     }
                 }
                 // prefix cache: this token completes a 32-token block -> snapshot
-                if (pc_on && (pbase + t + 1) % kBlockSize == 0) {
-                    const int stt = info->pc_row_slot[(pbase + t + 1) / kBlockSize];
+                // (see the scalar kernel: info->mtp_dt snapshots every token)
+                if (pc_on && (info->mtp_dt || (pbase + t + 1) % kBlockSize == 0)) {
+                    const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kBlockSize];
                     if (stt >= 0) {
                         float * dst = snap.base + (size_t)stt * snap.stride + snap.layer_off
                                       + ((size_t)head * head_dim + col0) * head_dim;
@@ -230,9 +235,11 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
                     }
                 }
             }
+            if (!info->mtp_dry) {
 #pragma unroll
-            for (int c = 0; c < C; c++) {
-                *(float4 *)(st + (size_t)c * head_dim + j0) = s[c];
+                for (int c = 0; c < C; c++) {
+                    *(float4 *)(st + (size_t)c * head_dim + j0) = s[c];
+                }
             }
         });
 }

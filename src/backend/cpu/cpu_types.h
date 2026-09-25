@@ -38,6 +38,8 @@ struct cpu_step_info {
     int32_t slot[16];
     int32_t active[16];
     int32_t tokens[16 * 32];
+    int32_t mtp_dt;
+    int32_t mtp_dry;
     int32_t pc_active;
     int32_t pc_stride;
     float * pc_base;

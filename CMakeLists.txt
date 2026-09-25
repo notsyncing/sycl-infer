@@ -99,6 +99,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/gdn.cpp
     src/backend/gpu/kernels/gated_norm.cpp
     src/backend/gpu/kernels/xq.cpp
+    src/backend/gpu/kernels/mtp.cpp
     src/backend/gpu/kernels/dp4a_common.cpp
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp
@@ -120,6 +121,7 @@ add_library(sycl_infer_core STATIC
     # engine: forward execution, graph capture, KV pool, prefix cache
     src/engine/engine.cpp
     src/engine/engine_graph.cpp
+    src/engine/engine_mtp.cpp
     src/engine/engine_kvpool.cpp
     src/engine/engine_prefix_cache.cpp
     src/engine/pc_disk.cpp

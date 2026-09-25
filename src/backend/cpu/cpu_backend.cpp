@@ -26,6 +26,8 @@ cpu_step_info to_cpu_info(const step_info * in) {
     std::memcpy(c.slot, in->slot, sizeof(c.slot));
     std::memcpy(c.active, in->active, sizeof(c.active));
     std::memcpy(c.tokens, in->tokens, sizeof(c.tokens));
+    c.mtp_dt = in->mtp_dt;
+    c.mtp_dry = in->mtp_dry;
     c.pc_active = in->pc_active;
     c.pc_stride = in->pc_stride;
     c.pc_base = in->pc_base;
@@ -99,6 +101,14 @@ struct cpu_backend : compute_backend {
                size_t row_bytes) override {
         const cpu_step_info ci = to_cpu_info(info);
         cpu_embed(table, type, &ci, out, n_embd, row_bytes);
+    }
+    void mtp_capture(const float * src, float * dst, int n_rows, int n) override {
+        std::memcpy(dst, src, (size_t)n_rows * (size_t)n * sizeof(float));
+    }
+    void mtp_concat(const void * table, uint32_t, size_t, const float *, const float *, const float *, const float *,
+                    const step_info *, float *, int, float) override {
+        (void)table;
+        throw std::runtime_error("mtp_concat: the MTP draft head is GPU-only");
     }
     void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                     int n_tok_blocks) override {

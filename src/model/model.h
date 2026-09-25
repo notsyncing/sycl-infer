@@ -24,6 +24,9 @@ struct hparams {
     float rope_base = 0.f, rms_eps = 0.f, attn_scale = 0.f;
     int d_state = 0, n_group = 0, dt_rank = 0, d_inner = 0, conv_k = 0;
     int full_attn_interval = 4;
+    // number of MTP (NextN) layers shipped after the main blocks
+    // (`qwen35.nextn_predict_layers`); their weights live in blk.<n_layer>.*
+    int n_mtp = 0;
     // M-RoPE pair counts per section (t, h, w, e); all-zero = plain RoPE
     int rope_sections[4] = {0, 0, 0, 0};
 
@@ -62,6 +65,28 @@ struct layer_t {
     w8t wqkv8, wgate8, ssm_out8;
 };
 
+// Multi-token prediction (NextN) layer: one full-attention decoder block whose
+// input is `eh_proj(concat(enorm(emb(t_p)), hnorm(h_{p-1})))` instead of the
+// previous layer's output, followed by a shared output norm + LM head.  Used as
+// a speculative-draft head: its logits at MTP row p predict token p+1 while the
+// main model's hidden at p-1 conditions it.
+struct mtp_layer_t {
+    const float * attn_norm = nullptr;
+    const float * post_attn_norm = nullptr;
+    wt wq, wk, wv, wo;
+    const float * q_norm = nullptr;
+    const float * k_norm = nullptr;
+    wt ffn_gate, ffn_up, ffn_down;
+    // NextN extras
+    wt eh_proj;                  // [2*n_embd][K=2*n_embd] -> n_embd
+    const float * enorm = nullptr;
+    const float * hnorm = nullptr;
+    const float * shared_head_norm = nullptr;
+    wt shared_head;              // optional; empty -> model::output
+    // per-device SIn int8 copies (GPU decode path)
+    w8t wq8, wk8, wv8, wo8, ffn_gate8, ffn_up8, ffn_down8, eh_proj8;
+};
+
 struct model {
     gguf_file gguf;
     hparams hp;
@@ -75,6 +100,10 @@ struct model {
     const float * output_norm = nullptr;
     size_t tok_embd_row_bytes = 0;
     w8t output8;
+
+    // MTP (NextN) draft layer; has_mtp is false when the GGUF ships none
+    mtp_layer_t mtp;
+    bool has_mtp = false;
 
     // device copy of all weights (one blob)
     void * dev_weights = nullptr;

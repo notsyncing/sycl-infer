@@ -85,7 +85,7 @@ void cpu_conv_state_update(const float * qkv_raw, float * conv_state, const cpu_
             const float v2 = raw[(size_t)(n - 1) * conv_dim + i];
             const float v1 = (n >= 2) ? raw[(size_t)(n - 2) * conv_dim + i] : old2;
             const float v0 = (n >= 3) ? raw[(size_t)(n - 3) * conv_dim + i] : ((n == 2) ? old2 : old1);
-            if (!last_row_only || is_last) {
+            if ((!last_row_only || is_last) && !info->mtp_dry) {
                 cstate[(size_t)0 * conv_dim + i] = v0;
                 cstate[(size_t)1 * conv_dim + i] = v1;
                 cstate[(size_t)2 * conv_dim + i] = v2;

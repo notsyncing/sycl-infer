@@ -36,6 +36,14 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
         const int qk_head = head % n_k_heads;
         float * st = state + (size_t)info->slot[rr] * n_heads * head_dim * head_dim +
                      (size_t)head * head_dim * head_dim;
+        // MTP spec verify: run the recurrence on a copy so the batch leaves the
+        // live state untouched (the commit replays only the accepted tokens).
+        std::vector<float> st_local;
+        if (info->mtp_dry) {
+            st_local.assign((size_t)head_dim * head_dim, 0.0f);
+            std::memcpy(st_local.data(), st, (size_t)head_dim * head_dim * 4);
+            st = st_local.data();
+        }
         const float * cor = conv_out + (size_t)rr * tpb * conv_dim;
         const float * alr = alpha + (size_t)rr * tpb * n_heads;
         const float * ber = beta + (size_t)rr * tpb * n_heads;
@@ -61,8 +69,8 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
                 attn_out[((size_t)rr * tpb + t) * n_heads * head_dim + (size_t)head * head_dim + col] = atn * scale;
             }
             // prefix cache: this token completes a 32-token block -> snapshot
-            if (pc_on && (pbase + t + 1) % kCpuBlk == 0) {
-                const int stt = info->pc_row_slot[(pbase + t + 1) / kCpuBlk];
+            if (pc_on && (info->mtp_dt || (pbase + t + 1) % kCpuBlk == 0)) {
+                const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kCpuBlk];
                 if (stt >= 0) {
                     float * dst =
                         snap.base + (size_t)stt * snap.stride + snap.layer_off + (size_t)head * head_dim * head_dim;

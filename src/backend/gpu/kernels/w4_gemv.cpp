@@ -517,4 +517,514 @@ void cb4_gemv_launch(queue & q, const uint8_t * idx, const uint16_t * lut16, con
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Batched (M > 1) native-u4 GEMM: the M-row counterpart of w4_gemv_impl.
+//
+// Same lane mapping as the M=1 GEMV (one sub-group per output column, lane = one
+// K-partition stepping g += 32, so the 32 lanes read 512 B of consecutive weight
+// words) so the arithmetic is bit-identical to it and the weight stream stays
+// coalesced.  Measured lessons that shaped this version:
+//   * a runtime row index (float acc[MM] + for m<M) demoted the accumulators to
+//     local memory: 20 GB/s;
+//   * a compile-time M with array/vec accumulators still spilled via the row
+//     loop: 38.8 GB/s at M=2 (a hand-written straight-line M=2 body: 119.6);
+//   * so every row is expanded with `if constexpr` and accumulated into a
+//     constant-index slot, which keeps them in registers.
+// Formula, identical to w4_gemv_impl (verified bit-equal by test_w4_gemm):
+//   out[m*out_stride + n] = alpha * sum_g sa[m][g] * ( scale[g][n]*qd[m][g]
+//                                                      + off[g][n]*xs[m][g] )
+#define W4_GEMM_ROW(m)                                                                                  \
+    do {                                                                                                \
+        const uint4 ev = *reinterpret_cast<const uint4 *>(axe + (size_t)(m) * kh + (size_t)g * 16);     \
+        const uint4 ov = *reinterpret_cast<const uint4 *>(axo + (size_t)(m) * kh + (size_t)g * 16);     \
+        int32_t qd = 0;                                                                                 \
+        qd = dp4a_s8u8(ev.x(), l0, qd);                                                                 \
+        qd = dp4a_s8u8(ev.y(), l1, qd);                                                                 \
+        qd = dp4a_s8u8(ev.z(), l2, qd);                                                                 \
+        qd = dp4a_s8u8(ev.w(), l3, qd);                                                                 \
+        qd = dp4a_s8u8(ov.x(), h0, qd);                                                                 \
+        qd = dp4a_s8u8(ov.y(), h1, qd);                                                                 \
+        qd = dp4a_s8u8(ov.z(), h2, qd);                                                                 \
+        qd = dp4a_s8u8(ov.w(), h3, qd);                                                                 \
+        acc[u][(m)] += w4_h2f(asa[(size_t)(m) * ng + g]) *                                             \
+                       (sc_w * (float)qd + of_w * xs[(size_t)(m) * ng + g]);                            \
+    } while (0)
+
+template <int M, int U = 2, int RB = 16>
+static void w4_gemm_batched(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                            const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs,
+                            float * out, int out_stride, const float * residual, float alpha, int K, int N) {
+    const int ng = K / 32;
+    const int kh = K / 2;
+    constexpr int TX = RB * 32;
+    const int nwg = (N + RB - 1) / RB;
+    q.submit([&](handler & h) {
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            const int n0 = (int)it.get_group(0) * RB;
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int r = i % RB;
+                const int n = n0 + r;
+                const bool ok = n < N;
+                const size_t src = (size_t)g * N + n;
+                meta[i] = ok ? scale[src] : (uint16_t)0;
+                meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int n = n0 + sg;
+            if (n >= N) {
+                return;
+            }
+            const uint8_t * wrow = vals + (size_t)n * (size_t)kh;
+            float acc[U][M];
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+#pragma unroll
+                for (int m = 0; m < M; m++) {
+                    acc[u][m] = 0.f;
+                }
+            }
+            for (int base = lane; base < ng; base += 32 * U) {
+#pragma unroll
+                for (int u = 0; u < U; u++) {
+                    const int g = base + 32 * u;
+                    if (g >= ng) {
+                        continue;
+                    }
+                    const uint4 wv = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 16);
+                    const uint32_t l0 = wv.x() & 0x0F0F0F0Fu, l1 = wv.y() & 0x0F0F0F0Fu;
+                    const uint32_t l2 = wv.z() & 0x0F0F0F0Fu, l3 = wv.w() & 0x0F0F0F0Fu;
+                    const uint32_t h0 = (wv.x() >> 4) & 0x0F0F0F0Fu, h1 = (wv.y() >> 4) & 0x0F0F0F0Fu;
+                    const uint32_t h2 = (wv.z() >> 4) & 0x0F0F0F0Fu, h3 = (wv.w() >> 4) & 0x0F0F0F0Fu;
+                    const float sc_w = w4_h2f(meta[(size_t)g * RB + sg]);
+                    const float of_w = w4_h2f(meta[(size_t)RB * ng + (size_t)g * RB + sg]);
+                    if constexpr (M >= 1) {
+                        W4_GEMM_ROW(0);
+                    }
+                    if constexpr (M >= 2) {
+                        W4_GEMM_ROW(1);
+                    }
+                    if constexpr (M >= 3) {
+                        W4_GEMM_ROW(2);
+                    }
+                    if constexpr (M >= 4) {
+                        W4_GEMM_ROW(3);
+                    }
+                    if constexpr (M >= 5) {
+                        W4_GEMM_ROW(4);
+                    }
+                    if constexpr (M >= 6) {
+                        W4_GEMM_ROW(5);
+                    }
+                    if constexpr (M >= 7) {
+                        W4_GEMM_ROW(6);
+                    }
+                    if constexpr (M >= 8) {
+                        W4_GEMM_ROW(7);
+                    }
+                }
+            }
+            const sub_group sgg = it.get_sub_group();
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+                float s = 0.f;
+#pragma unroll
+                for (int u = 0; u < U; u++) {
+                    s += acc[u][m];
+                }
+                const float tot = reduce_over_group(sgg, s, plus<float>());
+                if (lane == 0) {
+                    float v = alpha * tot;
+                    if (residual) {
+                        v += residual[(size_t)m * out_stride + n];
+                    }
+                    out[(size_t)m * out_stride + n] = v;
+                }
+            }
+        });
+    });
+}
+#undef W4_GEMM_ROW
+
+// Column-tiled variant: each sub-group covers TN output columns, so the per-row
+// activations and per-(row,group) scales/sums (which dominate the traffic: the
+// row-expanded kernel falls off as 1/M because they are re-read once per output
+// column) are amortised over TN columns.  Everything is expanded with
+// `if constexpr` so every accumulator index is a literal and stays in registers
+// - a runtime index here cost 3x before.
+#define W4_TN_ACC(c, m, u)                                                                              \
+    do {                                                                                                \
+        const uint4 ev = *reinterpret_cast<const uint4 *>(axe + (size_t)(m) * kh + (size_t)g * 16);     \
+        const uint4 ov = *reinterpret_cast<const uint4 *>(axo + (size_t)(m) * kh + (size_t)g * 16);     \
+        int32_t qd = 0;                                                                                 \
+        qd = dp4a_s8u8(ev.x(), l0, qd);                                                                 \
+        qd = dp4a_s8u8(ev.y(), l1, qd);                                                                 \
+        qd = dp4a_s8u8(ev.z(), l2, qd);                                                                 \
+        qd = dp4a_s8u8(ev.w(), l3, qd);                                                                 \
+        qd = dp4a_s8u8(ov.x(), h0, qd);                                                                 \
+        qd = dp4a_s8u8(ov.y(), h1, qd);                                                                 \
+        qd = dp4a_s8u8(ov.z(), h2, qd);                                                                 \
+        qd = dp4a_s8u8(ov.w(), h3, qd);                                                                 \
+        acc[(u)][(m)][(c)] += w4_h2f(asa[(size_t)(m) * ng + g]) *                                       \
+                              (sc_w[(c)] * (float)qd + of_w[(c)] * xs[(size_t)(m) * ng + g]);           \
+    } while (0)
+
+#define W4_TN_COL(c)                                                                                    \
+    do {                                                                                                \
+        const uint4 wv = wvv[(c)];                                                                      \
+        const uint32_t l0 = wv.x() & 0x0F0F0F0Fu, l1 = wv.y() & 0x0F0F0F0Fu;                            \
+        const uint32_t l2 = wv.z() & 0x0F0F0F0Fu, l3 = wv.w() & 0x0F0F0F0Fu;                            \
+        const uint32_t h0 = (wv.x() >> 4) & 0x0F0F0F0Fu, h1 = (wv.y() >> 4) & 0x0F0F0F0Fu;              \
+        const uint32_t h2 = (wv.z() >> 4) & 0x0F0F0F0Fu, h3 = (wv.w() >> 4) & 0x0F0F0F0Fu;              \
+        if constexpr (M >= 1) {                                                                         \
+            W4_TN_ACC(c, 0, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 2) {                                                                         \
+            W4_TN_ACC(c, 1, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 3) {                                                                         \
+            W4_TN_ACC(c, 2, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 4) {                                                                         \
+            W4_TN_ACC(c, 3, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 5) {                                                                         \
+            W4_TN_ACC(c, 4, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 6) {                                                                         \
+            W4_TN_ACC(c, 5, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 7) {                                                                         \
+            W4_TN_ACC(c, 6, u);                                                                         \
+        }                                                                                               \
+        if constexpr (M >= 8) {                                                                         \
+            W4_TN_ACC(c, 7, u);                                                                         \
+        }                                                                                               \
+    } while (0)
+
+template <int M, int TN, int RB = 16>
+static void w4_gemm_tn(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                       const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
+                       int out_stride, const float * residual, float alpha, int K, int N) {
+    static_assert(RB % TN == 0, "RB must be a multiple of TN");
+    constexpr int NG_SG = RB / TN;
+    constexpr int TX = NG_SG * 32;
+    const int ng = K / 32;
+    const int kh = K / 2;
+    const int nwg = (N + RB - 1) / RB;
+    q.submit([&](handler & h) {
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            const int nb = (int)it.get_group(0) * RB;
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int r = i % RB;
+                const int n = nb + r;
+                const bool ok = n < N;
+                const size_t src = (size_t)g * N + n;
+                meta[i] = ok ? scale[src] : (uint16_t)0;
+                meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int n0 = nb + sg * TN;
+            float acc[1][M][TN];
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    acc[0][m][c] = 0.f;
+                }
+            }
+            for (int g = lane; g < ng; g += 32) {
+                constexpr int u = 0;
+                uint4 wvv[TN];
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    const int n = n0 + c;
+                    wvv[c] = (n < N) ? *reinterpret_cast<const uint4 *>(vals + (size_t)n * (size_t)kh
+                                                                       + (size_t)g * 16)
+                                     : uint4(0, 0, 0, 0);
+                }
+                float sc_w[TN], of_w[TN];
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    sc_w[c] = w4_h2f(meta[(size_t)g * RB + (sg * TN + c)]);
+                    of_w[c] = w4_h2f(meta[(size_t)RB * ng + (size_t)g * RB + (sg * TN + c)]);
+                }
+                if constexpr (TN >= 1) {
+                    W4_TN_COL(0);
+                }
+                if constexpr (TN >= 2) {
+                    W4_TN_COL(1);
+                }
+                if constexpr (TN >= 4) {
+                    W4_TN_COL(2);
+                    W4_TN_COL(3);
+                }
+            }
+            const sub_group sgg = it.get_sub_group();
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+#pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    const int n = n0 + c;
+                    if (n >= N) {
+                        continue;
+                    }
+                    const float tot = reduce_over_group(sgg, acc[0][m][c], plus<float>());
+                    if (lane == 0) {
+                        float v = alpha * tot;
+                        if (residual) {
+                            v += residual[(size_t)m * out_stride + n];
+                        }
+                        out[(size_t)m * out_stride + n] = v;
+                    }
+                }
+            }
+        });
+    });
+}
+#undef W4_TN_COL
+#undef W4_TN_ACC
+
+// Two columns per sub-group, but *without* shrinking the grid: the work-group
+// still holds 16 sub-groups (TX = 512, RB = 32 columns), each sub-group owning
+// two adjacent columns.  The earlier tiled attempt kept RB = 16 and halved the
+// sub-group count, which cost 10x.  Here the per-row activations and the
+// per-(row,group) scales/sums are loaded once per (lane, group) and reused for
+// both columns (that traffic is what made the row-expanded kernel fall off as
+// 1/M); the masks are hoisted per column and all accumulators are literal-index.
+#define W4C2_R(m, c0, c1)                                                                               \
+    do {                                                                                                \
+        const uint4 ev = *reinterpret_cast<const uint4 *>(axe + (size_t)(m) * kh + (size_t)g * 16);      \
+        const uint4 ov = *reinterpret_cast<const uint4 *>(axo + (size_t)(m) * kh + (size_t)g * 16);      \
+        const float sam = w4_h2f(asa[(size_t)(m) * ng + g]);                                             \
+        const float xsm = xs[(size_t)(m) * ng + g];                                                      \
+        {                                                                                               \
+            int32_t qd = 0;                                                                             \
+            qd = dp4a_s8u8(ev.x(), l0a, qd);                                                            \
+            qd = dp4a_s8u8(ev.y(), l1a, qd);                                                            \
+            qd = dp4a_s8u8(ev.z(), l2a, qd);                                                            \
+            qd = dp4a_s8u8(ev.w(), l3a, qd);                                                            \
+            qd = dp4a_s8u8(ov.x(), h0a, qd);                                                            \
+            qd = dp4a_s8u8(ov.y(), h1a, qd);                                                            \
+            qd = dp4a_s8u8(ov.z(), h2a, qd);                                                            \
+            qd = dp4a_s8u8(ov.w(), h3a, qd);                                                            \
+            acc[(m)][(c0)] += sam * (sca * (float)qd + ofa * xsm);                                       \
+        }                                                                                               \
+        {                                                                                               \
+            int32_t qd = 0;                                                                             \
+            qd = dp4a_s8u8(ev.x(), l0b, qd);                                                            \
+            qd = dp4a_s8u8(ev.y(), l1b, qd);                                                            \
+            qd = dp4a_s8u8(ev.z(), l2b, qd);                                                            \
+            qd = dp4a_s8u8(ev.w(), l3b, qd);                                                            \
+            qd = dp4a_s8u8(ov.x(), h0b, qd);                                                            \
+            qd = dp4a_s8u8(ov.y(), h1b, qd);                                                            \
+            qd = dp4a_s8u8(ov.z(), h2b, qd);                                                            \
+            qd = dp4a_s8u8(ov.w(), h3b, qd);                                                            \
+            acc[(m)][(c1)] += sam * (scb * (float)qd + ofb * xsm);                                       \
+        }                                                                                               \
+    } while (0)
+
+template <int M, int RB = 32>
+static void w4_gemm_c2(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                       const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
+                       int out_stride, const float * residual, float alpha, int K, int N) {
+    constexpr int TX = 16 * 32;
+    const int ng = K / 32;
+    const int kh = K / 2;
+    const int nwg = (N + RB - 1) / RB;
+    q.submit([&](handler & h) {
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            const int nb = (int)it.get_group(0) * RB;
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int r = i % RB;
+                const int n = nb + r;
+                const bool ok = n < N;
+                const size_t src = (size_t)g * N + n;
+                meta[i] = ok ? scale[src] : (uint16_t)0;
+                meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int na = nb + sg * 2;
+            const int nc = na + 1;
+            float acc[M][2];
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+                acc[m][0] = 0.f;
+                acc[m][1] = 0.f;
+            }
+            const uint8_t * wa = vals + (size_t)na * (size_t)kh;
+            const uint8_t * wb = vals + (size_t)nc * (size_t)kh;
+            for (int g = lane; g < ng; g += 32) {
+                const uint4 va = *reinterpret_cast<const uint4 *>(wa + (size_t)g * 16);
+                const uint4 vb = *reinterpret_cast<const uint4 *>(wb + (size_t)g * 16);
+                const uint32_t l0a = va.x() & 0x0F0F0F0Fu, l1a = va.y() & 0x0F0F0F0Fu;
+                const uint32_t l2a = va.z() & 0x0F0F0F0Fu, l3a = va.w() & 0x0F0F0F0Fu;
+                const uint32_t h0a = (va.x() >> 4) & 0x0F0F0F0Fu, h1a = (va.y() >> 4) & 0x0F0F0F0Fu;
+                const uint32_t h2a = (va.z() >> 4) & 0x0F0F0F0Fu, h3a = (va.w() >> 4) & 0x0F0F0F0Fu;
+                const uint32_t l0b = vb.x() & 0x0F0F0F0Fu, l1b = vb.y() & 0x0F0F0F0Fu;
+                const uint32_t l2b = vb.z() & 0x0F0F0F0Fu, l3b = vb.w() & 0x0F0F0F0Fu;
+                const uint32_t h0b = (vb.x() >> 4) & 0x0F0F0F0Fu, h1b = (vb.y() >> 4) & 0x0F0F0F0Fu;
+                const uint32_t h2b = (vb.z() >> 4) & 0x0F0F0F0Fu, h3b = (vb.w() >> 4) & 0x0F0F0F0Fu;
+                const float sca = w4_h2f(meta[(size_t)g * RB + sg * 2]);
+                const float ofa = w4_h2f(meta[(size_t)RB * ng + (size_t)g * RB + sg * 2]);
+                const float scb = w4_h2f(meta[(size_t)g * RB + sg * 2 + 1]);
+                const float ofb = w4_h2f(meta[(size_t)RB * ng + (size_t)g * RB + sg * 2 + 1]);
+                if constexpr (M >= 1) {
+                    W4C2_R(0, 0, 1);
+                }
+                if constexpr (M >= 2) {
+                    W4C2_R(1, 0, 1);
+                }
+                if constexpr (M >= 3) {
+                    W4C2_R(2, 0, 1);
+                }
+                if constexpr (M >= 4) {
+                    W4C2_R(3, 0, 1);
+                }
+                if constexpr (M >= 5) {
+                    W4C2_R(4, 0, 1);
+                }
+                if constexpr (M >= 6) {
+                    W4C2_R(5, 0, 1);
+                }
+                if constexpr (M >= 7) {
+                    W4C2_R(6, 0, 1);
+                }
+                if constexpr (M >= 8) {
+                    W4C2_R(7, 0, 1);
+                }
+            }
+            const sub_group sgg = it.get_sub_group();
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+#pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    const int n = na + c;
+                    if (n >= N) {
+                        continue;
+                    }
+                    const float tot = reduce_over_group(sgg, acc[m][c], plus<float>());
+                    if (lane == 0) {
+                        float v = alpha * tot;
+                        if (residual) {
+                            v += residual[(size_t)m * out_stride + n];
+                        }
+                        out[(size_t)m * out_stride + n] = v;
+                    }
+                }
+            }
+        });
+    });
+}
+#undef W4C2_R
+
+void w4_gemm_launch(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                    const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
+                    int out_stride, const float * residual, float alpha, int M, int K, int N) {
+    // PF_W4_GEMM_U: independent accumulator sets (latency hiding).
+    static const int u = [] {
+        const char * e = getenv("PF_W4_GEMM_U");
+        const int v = e ? atoi(e) : 1;
+        return (v == 1 || v == 2 || v == 4) ? v : 1;
+    }();
+#define W4_GEMM_CASE(mm)                                                                                \
+    case mm:                                                                                            \
+        if (u == 2) {                                                                                   \
+            w4_gemm_batched<mm, 2>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual,   \
+                                   alpha, K, N);                                                        \
+        } else if (u == 4) {                                                                            \
+            w4_gemm_batched<mm, 4>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual,   \
+                                   alpha, K, N);                                                        \
+        } else {                                                                                        \
+            w4_gemm_batched<mm, 1>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual,   \
+                                   alpha, K, N);                                                        \
+        }                                                                                               \
+        return;
+    // Default 0: use the row-expanded kernel (the column-tiled variants measured
+    // 4-10x slower - the sub-group-covering-TN-columns mapping is a poor fit
+    // here; PF_W4_GEMM_TN=2|4 selects them for further experiments).
+    static const int tn_env = [] {
+        const char * e = getenv("PF_W4_GEMM_TN");
+        const int v = e ? atoi(e) : 0;
+        return (v == 0 || v == 2 || v == 3 || v == 4) ? v : 0;
+    }();
+#define W4_GEMM_TN_CASE(mm)                                                                             \
+    case mm:                                                                                            \
+        if (tn_env == 4) {                                                                              \
+            w4_gemm_tn<mm, 4>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, \
+                              K, N);                                                                    \
+        } else if (tn_env == 2) {                                                                       \
+            w4_gemm_tn<mm, 2>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, \
+                              K, N);                                                                    \
+        } else {                                                                                        \
+            w4_gemm_batched<mm, 1>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual,   \
+                                   alpha, K, N);                                                        \
+        }                                                                                               \
+        return;
+#define W4_GEMM_C2_CASE(mm)                                                                             \
+    case mm:                                                                                            \
+        w4_gemm_c2<mm>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);  \
+        return;
+    static const int c2_env = [] {
+        const char * e = getenv("PF_W4_GEMM_TN");
+        return e ? atoi(e) : 0;
+    }();
+    if (c2_env == 3) {
+        switch (M) {
+            W4_GEMM_C2_CASE(2)
+            W4_GEMM_C2_CASE(3)
+            W4_GEMM_C2_CASE(4)
+            W4_GEMM_C2_CASE(5)
+            W4_GEMM_C2_CASE(6)
+            W4_GEMM_C2_CASE(7)
+            W4_GEMM_C2_CASE(8)
+        default:
+            break;
+        }
+    }
+#undef W4_GEMM_C2_CASE
+    if (tn_env != 0) {
+        switch (M) {
+            W4_GEMM_TN_CASE(2)
+            W4_GEMM_TN_CASE(3)
+            W4_GEMM_TN_CASE(4)
+            W4_GEMM_TN_CASE(5)
+            W4_GEMM_TN_CASE(6)
+            W4_GEMM_TN_CASE(7)
+            W4_GEMM_TN_CASE(8)
+        default:
+            break;
+        }
+    }
+#undef W4_GEMM_TN_CASE
+    switch (M) {
+        W4_GEMM_CASE(2)
+        W4_GEMM_CASE(3)
+        W4_GEMM_CASE(4)
+        W4_GEMM_CASE(5)
+        W4_GEMM_CASE(6)
+        W4_GEMM_CASE(7)
+        W4_GEMM_CASE(8)
+    default:
+        break;
+    }
+#undef W4_GEMM_CASE
+    w4_gemm_batched<5, 1>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
+}
+
 } // namespace si

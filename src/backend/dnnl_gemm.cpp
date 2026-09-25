@@ -488,7 +488,19 @@ struct dnnl_gemm::impl {
             return nullptr;
         }
         auto xmd = memory::desc({M, K}, memory::data_type::s8, memory::format_tag::ab);
-        auto wmd = memory::desc({K, N}, memory::data_type::s8, memory::format_tag::ba);
+        // PF_DNNL_BLOCKED: force a blocked (XMX-friendly) weight layout instead of
+        // oneDNN's plain ba.  Diagnostic: the weight buffer is not reordered into
+        // it, so results are wrong - the point is to see via DNNL_VERBOSE whether
+        // oneDNN then selects an XMX kernel for this small-M int8 matmul.
+        static const int blocked = [] {
+            const char * e = getenv("PF_DNNL_BLOCKED");
+            return e ? atoi(e) : 0;
+        }();
+        auto wmd = memory::desc({K, N}, memory::data_type::s8,
+                                blocked == 1   ? memory::format_tag::Ab4a
+                                : blocked == 2 ? memory::format_tag::Ab4a
+                                : blocked == 3 ? memory::format_tag::Ab8a
+                                               : memory::format_tag::ba);
         // f32 dst: oneDNN applies the grouped weight/activation scales in float,
         // so the accumulator can no longer stay int32
         auto dmd = memory::desc({M, N}, memory::data_type::f32, memory::format_tag::ab);
@@ -690,7 +702,16 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
     }
     p->q.memcpy(w.dev, hw.data(), nvals).wait();
     p->q.memcpy(w.scales, hs.data(), (size_t)ng * N * 2).wait();
-    w.wmem = sycl_interop::make_memory(memory::desc({K, N}, memory::data_type::s8, memory::format_tag::ba), p->eng,
+    static const int blocked = [] {
+        const char * e = getenv("PF_DNNL_BLOCKED");
+        return e ? atoi(e) : 0;
+    }();
+    w.wmem = sycl_interop::make_memory(memory::desc({K, N}, memory::data_type::s8,
+                                                    blocked == 1   ? memory::format_tag::Ab4a
+                                                    : blocked == 2 ? memory::format_tag::Ab4a
+                                                    : blocked == 3 ? memory::format_tag::Ab8a
+                                                                   : memory::format_tag::ba),
+                                       p->eng,
                                        sycl_interop::memory_kind::usm, (void *)w.dev);
     w.scmem = sycl_interop::make_memory(memory::desc({1, ng * N}, memory::data_type::f16, memory::format_tag::ab),
                                         p->eng, sycl_interop::memory_kind::usm, (void *)w.scales);
@@ -1287,16 +1308,34 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
                     K, w.N, hist[0], hist[1], hist[2], hist[3]);
         }
     }
+    static const bool no_gemv = [] {
+        const char * e = getenv("PF_W4_NOGEMV");
+        return e && atoi(e) != 0;
+    }();
     if (M == 1) {
         // decode: one row, so the oneDNN matmul is all per-call overhead.  Run
         // the dedicated u4 GEMV instead (same formula, 16-byte nibble loads).
-        static const bool no_gemv = [] {
-            const char * e = getenv("PF_W4_NOGEMV");
-            return e && atoi(e) != 0;
-        }();
         if (!no_gemv) {
             w4_gemv_launch(p->q, w.vals, w.scales, w.off, p->axe, p->axo, p->asa, p->xs, out, out_stride, residual,
                            alpha, K, w.N);
+            return true;
+        }
+    } else {
+        // Small batch (MTP speculative verify, short prefill tail): keep the
+        // native u4 weights and stream them once for all M rows.  oneDNN's
+        // grouped int8 matmul reads a different (1.5x larger) weight set at
+        // ~1/4 the rate, so this is the difference between the verify costing
+        // one decode pass and costing four.  Opt-in via PF_W4_GEMM_MAXM until
+        // it beats the matmul on a given shape.
+        static const int gemm_max_m = [] {
+            const char * e = getenv("PF_W4_GEMM_MAXM");
+            return e ? atoi(e) : 1;
+        }();
+        // the kernel is instantiated for M <= 9 (the MTP verify range); larger
+        // batches keep the oneDNN matmul
+        if (M >= 2 && M <= 8 && M <= gemm_max_m && !no_gemv && p->axe && p->axo && p->asa && p->xs) {
+            w4_gemm_launch(p->q, w.vals, w.scales, w.off, p->axe, p->axo, p->asa, p->xs, out, out_stride, residual,
+                           alpha, M, K, w.N);
             return true;
         }
     }

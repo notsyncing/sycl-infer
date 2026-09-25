@@ -441,6 +441,61 @@ struct engine {
 
     seg_plan plan_dec_, plan_pf_, plan_pf8_, plan_dec8_;
 
+    // ------------------------------------------------------------------
+    // MTP (NextN) speculative draft head.  Enabled when the GGUF ships a
+    // blk.<n_layer> NextN block and the caller asked for it (--mtp N).  The MTP
+    // layer is a full-attention qwen35 block that runs on the primary device and
+    // owns its own paged KV slice (attention layer index attn_layers()-1), so it
+    // shares the block table, the prefix cache and the KV storage type.
+    // ------------------------------------------------------------------
+    bool mtp_on = false;
+    int mtp_dev = 0; // backend index the MTP layer runs on (its KV follows)
+    int mtp_k = 0;      // draft predictions per verify cycle
+    int mtp_nsnap = 0;  // per-token recurrent-state snapshots kept (k+1)
+    int mtp_attn_local_ = -1; // MTP layer index inside the primary device's pool
+    size_t mtp_hist_floats = 0; // per device: nsnap * n_local_gdn * gdn_per
+    std::vector<float *> d_mtp_hist_;    // [dev] per-token GDN state snapshots
+    std::vector<float *> d_mtp_convsave_; // [dev] conv rows (1,2) before the verify
+    float * d_mtp_cat = nullptr;       // [R][2*n_embd] concat(enorm(emb), hnorm(h))
+    float * d_mtp_x = nullptr;         // [R][n_embd]
+    float * d_mtp_xnorm = nullptr;     // [R][n_embd]
+    float * d_mtp_qbuf = nullptr;      // [R][n_head*2*head_dim]
+    float * d_mtp_kbuf = nullptr;      // [R][n_head_kv*head_dim]
+    float * d_mtp_vbuf = nullptr;      // [R][n_head_kv*head_dim]
+    float * d_mtp_attn_out = nullptr;  // [R][n_head*head_dim]
+    float * d_mtp_ffn = nullptr;       // [R][2*n_ff]
+    float * d_mtp_hnorm = nullptr;
+    float * d_mtp_raw = nullptr; // MTP hidden before shared_head_norm (AR seed)     // [R][n_embd] shared-head-normalized hidden
+    float * d_mtp_main_h = nullptr;    // [kMaxB*kMaxT][n_embd] main hidden capture
+    std::vector<float> h_save_;        // PF_MTP_STATECHK: pre-verify recurrent state
+    // MTP rollback by recurrence replay: the verify saves each GDN layer's
+    // per-token (conv_out, alpha, beta) plus the pre-verify GDN state, and the
+    // commit restores the state and replays those tokens.
+    std::vector<float *> d_mtp_rin_;
+    std::vector<float *> d_mtp_qsave_; // per-layer raw GDN conv taps of the verify rows    // [dev] ng * mtp_nsnap * (conv_dim + 2*dt_rank)
+    std::vector<float *> d_mtp_ssave_;  // [dev] ng * gdn_per
+    step_info * d_mtp_rinfo = nullptr;  // step_info for the replay launches
+    void mtp_rollback(int j);
+    float * d_mtp_hnorm0 = nullptr;    // primary-device copy feeding the shared LM head
+    float * d_mtp_hprev = nullptr;     // [kMaxB][n_embd] main hidden before the row
+    step_info * d_mtp_info = nullptr;  // host USM step_info for the MTP layer
+    seg_plan plan_vf_;                 // verify forward: mode 2 with a batched head
+    gemv_seg * d_segs_vf = nullptr;
+    seg_plan plan_mtp_;                // the MTP layer's own calls
+    gemv_seg * d_segs_mtp = nullptr;
+    void build_mtp_plan();
+    void mtp_gemv(int ci, int M);
+    // run the MTP layer over `n` tokens at positions pos0.. (mode 1 layout:
+    // row 0, n <= kMaxT).  `h` is the main model's hidden [token][n_embd] for the
+    // same tokens (h_{-1} comes from hprev), extra_writes the KV and the head.
+    void mtp_forward(const int32_t * toks, const float * h, const float * hprev, int n, int slot, int pos0,
+                     bool with_head);
+    // verify forward: main model over `n` tokens at pos0..; logits land in
+    // d_logits rows 0..n-1.  Also fills d_mtp_hprev with the hidden at each row.
+    void mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0);
+    std::vector<int> generate_mtp(const std::vector<int> & prompt, const gen_params & gp,
+                                  const std::function<bool(int)> & cb, std::vector<float> * first_logits);
+
     // fp32 (scale, min) side arrays for Q4_K/Q5_K, keyed by the tensor's host data pointer
     std::unordered_map<const void *, sycl::float2 *> meta32_;
     bool use_meta32 = false;
@@ -454,7 +509,8 @@ struct engine {
 
     engine(const std::string & model_path, int max_seq = 8192, int n_splits = 16, int n_blocks = 512,
            int kv_cap_mb = 0, const std::string & pc_dir = "", int pc_disk_mb = -1, int pc_mem_mb = -1,
-           int pc_ram_mb = -1, int pc_vram_mb = -1, int device = -1, const std::string & layer_map = "");
+           int pc_ram_mb = -1, int pc_vram_mb = -1, int device = -1, const std::string & layer_map = "",
+           int mtp_k = 0);
     ~engine();
 
     void reset_state();

@@ -111,7 +111,7 @@ void conv_state_update_launch(queue & q, const float * qkv_raw, float * conv_sta
         const int a0 = a - 2;
         const float v0 = (a0 >= base) ? qkv_raw[(size_t)a0 * conv_dim + i]
                                       : ((last_row_only && a0 >= 0) ? qkv_raw[(size_t)a0 * conv_dim + i] : old1);
-        if (!last_row_only || is_last) {
+        if ((!last_row_only || is_last) && !info->mtp_dry) {
             cstate[(size_t)0 * conv_dim + i] = v0;
             cstate[(size_t)1 * conv_dim + i] = v1;
             cstate[(size_t)2 * conv_dim + i] = v2;

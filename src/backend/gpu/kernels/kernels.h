@@ -86,6 +86,16 @@ struct step_info {
     int32_t pc_stride;              // floats per checkpoint slot
     float * pc_base;                // checkpoint pool (device USM)
     int32_t pc_row_slot[kPcMapLen]; // boundary -> checkpoint slot or -1
+    // When `mtp_dt` is set a *tracked* forward snapshots the recurrent state
+    // after EVERY token instead of at 32-token boundaries: the GDN kernel writes
+    // state(t) into pc_base + pc_row_slot[t]*pc_stride.  The MTP spec-decode
+    // verify uses this to roll the state back to the accepted draft length.
+    int32_t mtp_dt;
+    // MTP spec verify: compute the forward but do NOT store the recurrent state
+    // (GDN state / conv window) back.  The verify's batch must leave the live
+    // state untouched so the commit can advance it by exactly the accepted
+    // tokens; a dry verify also disables the per-token snapshots.
+    int32_t mtp_dry;
 
     // ---- multimodal input (images) ----------------------------------------
     // When `mrope_on` is set the attention RoPE reads a full 4-section position
@@ -112,6 +122,19 @@ struct pc_snap {
 };
 
 void rmsnorm_launch(sycl::queue & q, const float * x, const float * w, float * out, int n_rows, int n, float eps);
+// MTP (NextN) draft head preparation: for every live token of `info` compute
+//   out[i] = [ rmsnorm(enorm, emb(tok_i)) ; rmsnorm(hnorm, h_{i-1}) ]
+// (2*n_embd wide, embedding half first - the order blk.N.nextn.eh_proj expects).
+// `h` holds the main model's hidden states [token][n_embd] for the same batch;
+// token i takes h[i-1] and the first token of each row takes `h_prev[r]` (the
+// main hidden at the position before the row's first token).
+// MTP draft head: copy the main model's post-output-norm hidden rows into a
+// dedicated buffer right after the forward that produced them, so the draft
+// head never reads the shared activation scratch (which later kernels reuse).
+void mtp_capture_launch(sycl::queue & q, const float * src, float * dst, int n_rows, int n);
+void mtp_concat_launch(sycl::queue & q, const void * table, uint32_t type, size_t row_bytes, const float * enorm,
+                       const float * hnorm, const float * h, const float * h_prev, const step_info * info,
+                       float * out, int n_embd, float eps);
 void copy_row_launch(sycl::queue & q, const float * src, float * dst, const step_info * info, int n, int row = -1);
 void embed_launch(sycl::queue & q, const void * table, uint32_t type, const step_info * info, float * out, int n_embd,
                   size_t row_bytes);
@@ -121,6 +144,9 @@ void w4_split_act_launch(sycl::queue & q, const int8_t * axg, int8_t * axe, int8
 void i8_grp_gemv_launch(sycl::queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
                         const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
                         int N);
+void w4_gemm_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                    const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
+                    int out_stride, const float * residual, float alpha, int M, int K, int N);
 void w4_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int K, int N);
