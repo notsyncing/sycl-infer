@@ -69,9 +69,10 @@ static void usage(const char * prog) {
             "                               the three prefix-cache tiers, shrinking disk,\n"
             "                               then RAM, then VRAM.\n"
             "  --mmproj <mmproj.gguf>       vision projector needed by --image/--video\n"
-            "  --mtp N                      MTP (NextN) speculative draft length: run\n"
+            "  --mtp [N]                    MTP (NextN) speculative draft length: run\n"
             "                               the model's draft head N times per verify\n"
-            "                               (0/absent = off; env PF_MTP; needs 2+ GPUs)\n"
+            "                               (0 = off; N defaults to 4, the measured\n"
+            "                               optimum; env PF_MTP).  Needs 2+ GPUs.\n"
             "  --mtp-device N               device partition the MTP draft layer (and\n"
             "                               its KV slice) runs on (default 0; env\n"
             "                               PF_MTP_DEV).  The MTP slice counts toward\n"
@@ -241,7 +242,24 @@ int main(int argc, char ** argv) {
         } else if (a == "--layer-map") {
             layer_map = next();
         } else if (a == "--mtp") {
-            mtp_k = std::atoi(next().c_str());
+            // The draft length is optional: a bare `--mtp` uses the measured
+            // optimum and never swallows the next flag (`--mtp gen ...`).  k=4
+            // minimizes ms/token (a sweep with the u4 draft head over two
+            // prompts gives k=2..8 -> 40.2/38.1/38.1/39.0/40.6/47.6 ms/token on
+            // a technical prompt and 41.1/40.8/43.1/52.7 for k=3/4/6/8 on
+            // another): each extra draft costs ~5.4 ms and each extra verify row
+            // ~5.7 ms, while the marginal acceptance past k=4 is only 0.1-0.2.
+            mtp_k = 4;
+            if (i + 1 < argc) {
+                const char * nv = argv[i + 1];
+                bool num = nv[0] != '\0';
+                for (const char * c = nv; *c && num; c++) {
+                    num = *c >= '0' && *c <= '9';
+                }
+                if (num) {
+                    mtp_k = std::atoi(argv[++i]);
+                }
+            }
         } else if (a == "--mtp-device") {
             mtp_dev = std::atoi(next().c_str());
         } else if (a == "--device") {

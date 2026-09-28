@@ -1027,4 +1027,592 @@ void w4_gemm_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
     w4_gemm_batched<5, 1>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
 }
 
+// ---------------------------------------------------------------------------
+// Batched native-width GEMM for the MTP speculative verify (M = 2..13).
+//
+// The M=1 GEMVs above give one sub-group per output column, so each lane reads
+// the whole activation row once per column: the activation traffic is ~N*K*M
+// bytes, N/RB times the weight stream, which is why the row-expanded
+// w4_gemm_batched falls off as 1/M (43 GB/s at M=5).  This kernel keeps the same
+// lane = group / sub-group = column mapping but stages the K-tile's activations
+// in SLM once per workgroup, so the weight stream is read exactly once for all
+// M rows and the activation re-reads stay inside SLM.
+//
+// Measured on the 27B shapes (K=5120, N=17408, M=7, A770): the oneDNN
+// grouped-scale matmul this replaces runs the int8 weight path at ~120 GB/s
+// end to end (the 27B verify cost 196 ms); this kernel reaches ~106 GB/s (u4),
+// 131 (k5), 115 (cb4) and 241 (int8) per tensor.  It is *instruction-issue*
+// bound, not bandwidth bound: dp4a consumes 4 B of each operand per
+// instruction, so the floor is ~0.5 instructions/MAC and the int8 variant (2x
+// the weight bytes for the same MAC count) is the only one that reaches the
+// card's ~300 GB/s read path.  The win over oneDNN is therefore mostly the
+// fused scale/offset/residual epilogue and the removal of oneDNN's per-call
+// execute + scratch traffic, not raw bandwidth.
+//
+// Details that matter:
+//   * SG=16: a SIMD32 float costs 4 GRFs and the M*C accumulators must all stay
+//     live; SIMD32 spilled the whole accumulator set (18-23 KB/thread) and ran
+//     4-5x slower.  SG=16 halves the per-variable GRF cost.
+//   * C=1: one column per sub-group.  C>1 reuses one activation load across
+//     columns, but the extra accumulators cost more than the saved loads.
+//   * the activation is read as two uint4 (16-byte) loads rather than eight
+//     4-byte ones; the slot is padded to APAD=48 bytes so both are 16-byte
+//     aligned (the 48-byte stride gives a 2-way SLM bank conflict, which is
+//     cheaper than 8 extra issue slots).
+//   * FMT: 0 = u4 (Q4_K), 1 = k5 (Q5_K), 2 = cb4 (IQ4_XS/NL), 3 = grouped int8.
+//     u4/k5 read the even/odd activation split (axe/axo), cb4/int8 the grouped
+//     activations (axg); all consume asa (per-group act scale) and xs (signed
+//     group sum), which act_quant_grp_launch already produces for any M.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Batched native-width GEMM for the MTP verify (M = 2..13).  See the header
+// comment above for the contract.  Template knobs for tuning:
+//   C     output columns owned by one sub-group (activation reuse across them)
+//   KT    K-tile (weight groups) staged per barrier
+//   SG    sub-group size (16 keeps the accumulator set in registers)
+//   ORDER 0 = c-outer/m-inner (one activation reload per column),
+//         1 = m-outer/c-inner (activation loaded once per row, C columns reuse)
+//   TX    work-group size
+// All orders accumulate each (m,n) over groups in the same ascending order and
+// reduce over the sub-group identically, so results are bit-identical.
+// ---------------------------------------------------------------------------
+// Split a packed u4 dword into its low/high nibble planes.  OPQ=1 repacks
+// bit 3 of each nibble into bit 4 (an OR of shifted masks) instead of a plain
+// mask; the value is unchanged, but the shape mirrors the k5 path that IGC
+// recognises as a hardware dp4a.
+template <int OPQ>
+static inline void u4_split(uint32_t v, uint32_t & lo, uint32_t & hi) {
+    if constexpr (OPQ == 1) {
+        lo = (v & 0x07070707u) | ((v << 1) & 0x10101010u);
+        hi = ((v >> 4) & 0x07070707u) | ((v >> 3) & 0x10101010u);
+    } else {
+        lo = v & 0x0F0F0F0Fu;
+        hi = (v >> 4) & 0x0F0F0F0Fu;
+    }
+}
+
+template <int FMT, int M, int C, int KT, int SG, int ORDER, int TX, int OPQ = 0, int TREE = 0, int ABL = 0,
+          int VECST = 0, int VECA = 0, int NOX = 0, int DIRECT = 0>
+static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, const int8_t * w8,
+                          const uint16_t * scale, const uint16_t * off, const uint16_t * lut16,
+                          const uint32_t * bit_lut, const int8_t * axe, const int8_t * axo, const int8_t * axg,
+                          const uint16_t * asa, const float * xs, float * out, int out_stride, const float * residual,
+                          float alpha, int K, int N) {
+    constexpr int NSG = TX / SG;
+    constexpr int RB = NSG * C;
+    // APAD: 16-byte-aligned slot per staged activation group, so a group's 32
+    // bytes read back as two uint4.  32 (not 48) is the better trade here: it
+    // shrinks act_s (the largest SLM array), and measured at M=7 on the A770
+    // that wins ~1% for u4 and ~4-7% for k5/cb4 (occupancy, not fewer bank
+    // conflicts).  Exception: at M>=12 the u4 kernel's larger accumulator set
+    // wants the 48-byte stride back (u4 M=12: 0.572 -> 0.549 ms); u4 is the
+    // only format that regresses there.
+    constexpr int APAD = (FMT == 0 && M >= 12) ? 48 : 32;
+    const int ng = K / 32;
+    const int kh = K / 2;
+    const int nwg = (N + RB - 1) / RB;
+    q.submit([&](handler & h) {
+        local_accessor<int8_t, 1> act_s((size_t)M * KT * APAD, h);
+        local_accessor<uint16_t, 1> asa_s((size_t)M * KT, h);
+        local_accessor<float, 1> xs_s((size_t)M * KT, h);
+        local_accessor<uint16_t, 1> sc_s((size_t)KT * RB, h);
+        local_accessor<uint16_t, 1> of_s((size_t)KT * RB, h);
+        local_accessor<uint16_t, 1> lt16_s(256, h);
+        local_accessor<uint32_t, 1> lt_s(16, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / SG;
+            const int lane = lid % SG;
+            const int n0 = (int)it.get_group(0) * RB;
+            int8_t * act_p = act_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            uint16_t * asa_p = asa_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            float * xs_p = xs_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            uint16_t * sc_p = sc_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            uint16_t * of_p = of_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            uint16_t * lt16_p = lt16_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            uint32_t * lt_p = lt_s.get_multi_ptr<sycl::access::decorated::no>().get();
+            if constexpr (FMT == 1) {
+                for (int i = lid; i < 16; i += TX) {
+                    lt_p[i] = bit_lut[i];
+                }
+            } else if constexpr (FMT == 2) {
+                for (int i = lid; i < 256; i += TX) {
+                    lt16_p[i] = lut16[i];
+                }
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            float acc[M * C];
+#pragma unroll
+            for (int i = 0; i < M * C; i++) {
+                acc[i] = 0.f;
+            }
+            for (int g0 = 0; g0 < ng; g0 += KT) {
+                const int kt = (ng - g0 < KT) ? (ng - g0) : KT;
+                for (int i = lid; i < kt * M; i += TX) {
+                    const int m = i / kt;
+                    const int gt = i - m * kt;
+                    int8_t * dst = act_p + ((size_t)m * KT + gt) * APAD;
+                    if constexpr (DIRECT == 1) {
+                        asa_p[i] = asa[(size_t)m * ng + (g0 + gt)];
+                        xs_p[i] = xs[(size_t)m * ng + (g0 + gt)];
+                        continue;
+                    }
+                    if constexpr (FMT <= 1) {
+                        const int8_t * e = axe + (size_t)m * kh + (size_t)(g0 + gt) * 16;
+                        const int8_t * o = axo + (size_t)m * kh + (size_t)(g0 + gt) * 16;
+                        if constexpr (VECA == 1) {
+                            *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(e);
+                            *reinterpret_cast<uint4 *>(dst + 16) = *reinterpret_cast<const uint4 *>(o);
+                        } else {
+                            for (int j = 0; j < 16; j++) {
+                                dst[j] = e[j];
+                                dst[16 + j] = o[j];
+                            }
+                        }
+                    } else {
+                        const int8_t * xg = axg + (size_t)m * K + (size_t)(g0 + gt) * 32;
+                        if constexpr (VECA == 1) {
+                            *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(xg);
+                            *reinterpret_cast<uint4 *>(dst + 16) = *reinterpret_cast<const uint4 *>(xg + 16);
+                        } else {
+                            for (int j = 0; j < 32; j++) {
+                                dst[j] = xg[j];
+                            }
+                        }
+                    }
+                    asa_p[i] = asa[(size_t)m * ng + (g0 + gt)];
+                    xs_p[i] = xs[(size_t)m * ng + (g0 + gt)];
+                }
+                if constexpr (VECST == 1) {
+                    for (int i = lid * 8; i < kt * RB; i += TX * 8) {
+                        const int gt = i / RB;
+                        const int r = i - gt * RB;
+                        const int n = n0 + r;
+                        const size_t s = (size_t)(g0 + gt) * N + n;
+                        if (n + 8 <= N) {
+                            *reinterpret_cast<uint4 *>(&sc_p[i]) =
+                                *reinterpret_cast<const uint4 *>(&scale[s]);
+                            if constexpr (FMT <= 1) {
+                                *reinterpret_cast<uint4 *>(&of_p[i]) =
+                                    *reinterpret_cast<const uint4 *>(&off[s]);
+                            }
+                        } else {
+                            for (int j = 0; j < 8 && i + j < kt * RB; j++) {
+                                const int nn = n + j;
+                                sc_p[i + j] = nn < N ? scale[s + j] : (uint16_t)0;
+                                if constexpr (FMT <= 1) {
+                                    of_p[i + j] = nn < N ? off[s + j] : (uint16_t)0;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (int i = lid; i < kt * RB; i += TX) {
+                        const int gt = i / RB;
+                        const int r = i - gt * RB;
+                        const int n = n0 + r;
+                        const bool ok = n < N;
+                        const size_t s = (size_t)(g0 + gt) * N + n;
+                        sc_p[i] = ok ? scale[s] : (uint16_t)0;
+                        if constexpr (FMT <= 1) {
+                            of_p[i] = ok ? off[s] : (uint16_t)0;
+                        }
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                if constexpr (ORDER == 1) {
+                    // Group-loop body; the per-format unroll is chosen below.
+                    auto nat_gt = [&](int gt) {
+                        const int g = g0 + gt;
+                        const int8_t * ag = act_p + (size_t)gt * APAD;
+                        uint32_t wl[C][4];
+                        uint32_t wh[C][4];
+                        float scw[C];
+                        float ofw[C];
+#pragma unroll
+                        for (int c = 0; c < C; c++) {
+                            const int n = n0 + sg * C + c;
+                            const bool ok = n < N;
+                            const int nn = ok ? n : 0;
+                            scw[c] = w4_h2f(sc_p[gt * RB + sg * C + c]);
+                            ofw[c] = 0.f;
+                            if constexpr (FMT <= 1) {
+                                ofw[c] = w4_h2f(of_p[gt * RB + sg * C + c]);
+                            }
+                            if constexpr (FMT <= 1) {
+                                const uint4 wv = ok ? *reinterpret_cast<const uint4 *>(w0 + (size_t)nn * kh
+                                                                                       + (size_t)g * 16)
+                                                    : uint4(0, 0, 0, 0);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.x(), wl[c][0], wh[c][0]);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.y(), wl[c][1], wh[c][1]);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.z(), wl[c][2], wh[c][2]);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.w(), wl[c][3], wh[c][3]);
+                                if constexpr (FMT == 1) {
+                                    const uint32_t hb =
+                                        ok ? *reinterpret_cast<const uint32_t *>(w1 + (size_t)nn * (K / 8)
+                                                                                  + (size_t)g * 4)
+                                           : 0u;
+                                    wl[c][0] |= lt_p[(hb >> 0) & 0xF] << 4;
+                                    wl[c][1] |= lt_p[(hb >> 4) & 0xF] << 4;
+                                    wl[c][2] |= lt_p[(hb >> 8) & 0xF] << 4;
+                                    wl[c][3] |= lt_p[(hb >> 12) & 0xF] << 4;
+                                    wh[c][0] |= lt_p[(hb >> 16) & 0xF] << 4;
+                                    wh[c][1] |= lt_p[(hb >> 20) & 0xF] << 4;
+                                    wh[c][2] |= lt_p[(hb >> 24) & 0xF] << 4;
+                                    wh[c][3] |= lt_p[(hb >> 28) & 0xF] << 4;
+                                }
+                            } else if constexpr (FMT == 2) {
+                                const uint4 nv = ok ? *reinterpret_cast<const uint4 *>(w0 + (size_t)nn * kh
+                                                                                       + (size_t)g * 16)
+                                                    : uint4(0, 0, 0, 0);
+                                const uint32_t rw[4] = {nv.x(), nv.y(), nv.z(), nv.w()};
+                                uint32_t tmp[8];
+#pragma unroll
+                                for (int j = 0; j < 4; j++) {
+                                    const uint32_t v = rw[j];
+                                    tmp[2 * j] = (uint32_t)lt16_p[(v >> 0) & 0xFF]
+                                                 | ((uint32_t)lt16_p[(v >> 8) & 0xFF] << 16);
+                                    tmp[2 * j + 1] = (uint32_t)lt16_p[(v >> 16) & 0xFF]
+                                                     | ((uint32_t)lt16_p[(v >> 24) & 0xFF] << 16);
+                                }
+                                wl[c][0] = tmp[0];
+                                wl[c][1] = tmp[1];
+                                wl[c][2] = tmp[2];
+                                wl[c][3] = tmp[3];
+                                wh[c][0] = tmp[4];
+                                wh[c][1] = tmp[5];
+                                wh[c][2] = tmp[6];
+                                wh[c][3] = tmp[7];
+                            } else {
+                                const uint4 a0 = ok ? *reinterpret_cast<const uint4 *>(w8 + (size_t)nn * K
+                                                                                       + (size_t)g * 32)
+                                                    : uint4(0, 0, 0, 0);
+                                const uint4 a1 = ok ? *reinterpret_cast<const uint4 *>(w8 + (size_t)nn * K
+                                                                                       + (size_t)g * 32 + 16)
+                                                    : uint4(0, 0, 0, 0);
+                                wl[c][0] = a0.x();
+                                wl[c][1] = a0.y();
+                                wl[c][2] = a0.z();
+                                wl[c][3] = a0.w();
+                                wh[c][0] = a1.x();
+                                wh[c][1] = a1.y();
+                                wh[c][2] = a1.z();
+                                wh[c][3] = a1.w();
+                            }
+#pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                if constexpr (FMT >= 2 || NOX == 0) {
+                                    wl[c][j] ^= 0x80808080u;
+                                    wh[c][j] ^= 0x80808080u;
+                                }
+                            }
+                        }
+#pragma unroll
+                        for (int m = 0; m < M; m++) {
+                            const int8_t * amp = ag + (size_t)m * KT * APAD;
+                            uint4 xe, xo;
+                            if constexpr (ABL == 2) {
+                                xe = uint4(1, 2, 3, 4);
+                                xo = uint4(5, 6, 7, 8);
+                            } else if constexpr (DIRECT == 1) {
+                                if constexpr (FMT <= 1) {
+                                    const int8_t * e0 = axe + (size_t)m * kh + (size_t)g * 16;
+                                    const int8_t * o0 = axo + (size_t)m * kh + (size_t)g * 16;
+                                    xe = *reinterpret_cast<const uint4 *>(e0);
+                                    xo = *reinterpret_cast<const uint4 *>(o0);
+                                } else {
+                                    const int8_t * xg0 = axg + (size_t)m * K + (size_t)g * 32;
+                                    xe = *reinterpret_cast<const uint4 *>(xg0);
+                                    xo = *reinterpret_cast<const uint4 *>(xg0 + 16);
+                                }
+                            } else {
+                                xe = *reinterpret_cast<const uint4 *>(amp);
+                                xo = *reinterpret_cast<const uint4 *>(amp + 16);
+                            }
+                            const float sa = w4_h2f(asa_p[m * KT + gt]);
+                            const float xsm = xs_p[m * KT + gt];
+                            const int32_t xcorr = -128 * (int32_t)xsm;
+#pragma unroll
+                            for (int c = 0; c < C; c++) {
+                                uint32_t a0 = wl[c][0], a1 = wl[c][1], a2 = wl[c][2], a3 = wl[c][3];
+                                uint32_t b0 = wh[c][0], b1 = wh[c][1], b2 = wh[c][2], b3 = wh[c][3];
+                                if constexpr (ABL == 3) {
+                                    a0 = a1 = a2 = a3 = b0 = b1 = b2 = b3 = 0x80808080u;
+                                }
+                                int32_t qd;
+                                if constexpr (TREE == 1) {
+                                    int32_t q = 0;
+                                    q = dp4a_s8u8((int32_t)xe.x(), a0, q);
+                                    q = dp4a_s8u8((int32_t)xe.y(), a1, q);
+                                    q = dp4a_s8u8((int32_t)xe.z(), a2, q);
+                                    q = dp4a_s8u8((int32_t)xe.w(), a3, q);
+                                    q = dp4a_s8u8((int32_t)xo.x(), b0, q);
+                                    q = dp4a_s8u8((int32_t)xo.y(), b1, q);
+                                    q = dp4a_s8u8((int32_t)xo.z(), b2, q);
+                                    q = dp4a_s8u8((int32_t)xo.w(), b3, q);
+                                    qd = (FMT >= 2 || NOX == 0) ? q + xcorr : q;
+                                } else {
+                                    int32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+                                    q0 = dp4a_s8u8((int32_t)xe.x(), a0, q0);
+                                    q0 = dp4a_s8u8((int32_t)xe.y(), a1, q0);
+                                    q1 = dp4a_s8u8((int32_t)xe.z(), a2, q1);
+                                    q1 = dp4a_s8u8((int32_t)xe.w(), a3, q1);
+                                    q2 = dp4a_s8u8((int32_t)xo.x(), b0, q2);
+                                    q2 = dp4a_s8u8((int32_t)xo.y(), b1, q2);
+                                    q3 = dp4a_s8u8((int32_t)xo.z(), b2, q3);
+                                    q3 = dp4a_s8u8((int32_t)xo.w(), b3, q3);
+                                    qd = (FMT >= 2 || NOX == 0) ? ((q0 + q1) + (q2 + q3)) + xcorr
+                                                                 : ((q0 + q1) + (q2 + q3));
+                                }
+                                if constexpr (ABL == 1) {
+                                    acc[m * C + c] += (float)qd;
+                                } else {
+                                    acc[m * C + c] += sa * (scw[c] * (float)qd + ofw[c] * xsm);
+                                }
+                            }
+                        }
+                    };
+                    // Per-format group-loop unroll.  u4 keeps two iterations in
+                    // flight: the second group's weight loads issue while the
+                    // first group's dp4a chain runs, covering the load latency
+                    // (u4's decode is only masks, so it has registers to spare).
+                    // k5/cb4/i8 keep more decoded words live, and unrolling
+                    // them once measured better (M=7: k5 0.248 -> 0.237, cb4
+                    // 0.276 -> 0.259 ms) because the lower register pressure
+                    // raises occupancy.
+                    if constexpr (FMT == 0) {
+#pragma unroll 2
+                        for (int gt = lane; gt < kt; gt += SG) {
+                            nat_gt(gt);
+                        }
+                    } else {
+#pragma unroll 1
+                        for (int gt = lane; gt < kt; gt += SG) {
+                            nat_gt(gt);
+                        }
+                    }
+                } else {
+                    for (int gt = lane; gt < kt; gt += SG) {
+                        const int g = g0 + gt;
+                        const int8_t * ag = act_p + (size_t)gt * APAD;
+#pragma unroll
+                        for (int c = 0; c < C; c++) {
+                            const int n = n0 + sg * C + c;
+                            const bool ok = n < N;
+                            const int nn = ok ? n : 0;
+                            const float scw = w4_h2f(sc_p[gt * RB + sg * C + c]);
+                            float ofw = 0.f;
+                            if constexpr (FMT <= 1) {
+                                ofw = w4_h2f(of_p[gt * RB + sg * C + c]);
+                            }
+                            uint32_t l0, l1, l2, l3, h0, h1, h2, h3;
+                            if constexpr (FMT <= 1) {
+                                const uint4 wv = ok ? *reinterpret_cast<const uint4 *>(w0 + (size_t)nn * kh
+                                                                                       + (size_t)g * 16)
+                                                    : uint4(0, 0, 0, 0);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.x(), l0, h0);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.y(), l1, h1);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.z(), l2, h2);
+                                u4_split<FMT == 0 ? OPQ : 0>(wv.w(), l3, h3);
+                                if constexpr (FMT == 1) {
+                                    const uint32_t hb =
+                                        ok ? *reinterpret_cast<const uint32_t *>(w1 + (size_t)nn * (K / 8)
+                                                                                  + (size_t)g * 4)
+                                           : 0u;
+                                    l0 |= lt_p[(hb >> 0) & 0xF] << 4;
+                                    l1 |= lt_p[(hb >> 4) & 0xF] << 4;
+                                    l2 |= lt_p[(hb >> 8) & 0xF] << 4;
+                                    l3 |= lt_p[(hb >> 12) & 0xF] << 4;
+                                    h0 |= lt_p[(hb >> 16) & 0xF] << 4;
+                                    h1 |= lt_p[(hb >> 20) & 0xF] << 4;
+                                    h2 |= lt_p[(hb >> 24) & 0xF] << 4;
+                                    h3 |= lt_p[(hb >> 28) & 0xF] << 4;
+                                }
+                            } else if constexpr (FMT == 2) {
+                                const uint4 nv = ok ? *reinterpret_cast<const uint4 *>(w0 + (size_t)nn * kh
+                                                                                       + (size_t)g * 16)
+                                                    : uint4(0, 0, 0, 0);
+                                const uint32_t rw[4] = {nv.x(), nv.y(), nv.z(), nv.w()};
+                                uint32_t tmp[8];
+#pragma unroll
+                                for (int j = 0; j < 4; j++) {
+                                    const uint32_t v = rw[j];
+                                    tmp[2 * j] = (uint32_t)lt16_p[(v >> 0) & 0xFF]
+                                                 | ((uint32_t)lt16_p[(v >> 8) & 0xFF] << 16);
+                                    tmp[2 * j + 1] = (uint32_t)lt16_p[(v >> 16) & 0xFF]
+                                                     | ((uint32_t)lt16_p[(v >> 24) & 0xFF] << 16);
+                                }
+                                l0 = tmp[0];
+                                l1 = tmp[1];
+                                l2 = tmp[2];
+                                l3 = tmp[3];
+                                h0 = tmp[4];
+                                h1 = tmp[5];
+                                h2 = tmp[6];
+                                h3 = tmp[7];
+                            } else {
+                                const uint4 a0 = ok ? *reinterpret_cast<const uint4 *>(w8 + (size_t)nn * K
+                                                                                       + (size_t)g * 32)
+                                                    : uint4(0, 0, 0, 0);
+                                const uint4 a1 = ok ? *reinterpret_cast<const uint4 *>(w8 + (size_t)nn * K
+                                                                                       + (size_t)g * 32 + 16)
+                                                    : uint4(0, 0, 0, 0);
+                                l0 = a0.x();
+                                l1 = a0.y();
+                                l2 = a0.z();
+                                l3 = a0.w();
+                                h0 = a1.x();
+                                h1 = a1.y();
+                                h2 = a1.z();
+                                h3 = a1.w();
+                            }
+                            l0 ^= 0x80808080u; l1 ^= 0x80808080u;
+                            l2 ^= 0x80808080u; l3 ^= 0x80808080u;
+                            h0 ^= 0x80808080u; h1 ^= 0x80808080u;
+                            h2 ^= 0x80808080u; h3 ^= 0x80808080u;
+                            const int8_t * ap = ag;
+                            const uint16_t * sap = asa_p + gt;
+                            const float * xsp = xs_p + gt;
+#pragma unroll
+                            for (int m = 0; m < M; m++) {
+                                const uint4 xe = *reinterpret_cast<const uint4 *>(ap);
+                                const uint4 xo = *reinterpret_cast<const uint4 *>(ap + 16);
+                                int32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+                                q0 = dp4a_s8u8((int32_t)xe.x(), l0, q0);
+                                q0 = dp4a_s8u8((int32_t)xe.y(), l1, q0);
+                                q1 = dp4a_s8u8((int32_t)xe.z(), l2, q1);
+                                q1 = dp4a_s8u8((int32_t)xe.w(), l3, q1);
+                                q2 = dp4a_s8u8((int32_t)xo.x(), h0, q2);
+                                q2 = dp4a_s8u8((int32_t)xo.y(), h1, q2);
+                                q3 = dp4a_s8u8((int32_t)xo.z(), h2, q3);
+                                q3 = dp4a_s8u8((int32_t)xo.w(), h3, q3);
+                                const int32_t qd = ((q0 + q1) + (q2 + q3)) - 128 * (int32_t)(*xsp);
+                                acc[m * C + c] += w4_h2f(*sap) * (scw * (float)qd + ofw * (*xsp));
+                                ap += KT * APAD;
+                                sap += KT;
+                                xsp += KT;
+                            }
+                        }
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+            const sub_group sgg = it.get_sub_group();
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+#pragma unroll
+                for (int c = 0; c < C; c++) {
+                    const int n = n0 + sg * C + c;
+                    if (n >= N) {
+                        continue;
+                    }
+                    const float tot = reduce_over_group(sgg, acc[m * C + c], plus<float>());
+                    if (lane == 0) {
+                        float v = alpha * tot;
+                        if (residual) {
+                            v += residual[(size_t)m * out_stride + n];
+                        }
+                        out[(size_t)m * out_stride + n] = v;
+                    }
+                }
+            }
+        });
+    });
+}
+
+template <int FMT>
+static void nat_gemm_pick(queue & q, const uint8_t * w0, const uint8_t * w1, const int8_t * w8,
+                          const uint16_t * scale, const uint16_t * off, const uint16_t * lut16,
+                          const uint32_t * bit_lut, const int8_t * axe, const int8_t * axo, const int8_t * axg,
+                          const uint16_t * asa, const float * xs, float * out, int out_stride, const float * residual,
+                          float alpha, int M, int K, int N) {
+    // Tuned on the 27B MTP verify shape (M=7, K=5120, N=17408, A770).
+    //   C=2      two output columns per sub-group, so an activation load is
+    //            amortised over two columns
+    //   ORDER=1  m-outer / c-inner: the activation group for (row m, group g)
+    //            is loaded once and reused across the C columns.  This is the
+    //            change that matters: it also lets IGC form the hardware dp4a
+    //            for the u4 nibble decode (the c-outer form scalarises it).
+    //   SG=8     SIMD8 sub-groups (a SIMD16 accumulator set costs 2 GRF/var)
+    //   TX=128   NSG=16, RB=32
+    //   TREE=1   one dp4a accumulator chain per column (no 4-way combine tree)
+    //   VECST=1  scale/offset staged with 16-byte loads
+    //   VECA=1   activation staged with 16-byte loads (K%32==0 guarantees the
+    //            16-byte alignment of every row/group offset)
+    //   NOX=0    keep the original u4/k5 arithmetic (no sign-flip, no in-loop
+    //            correction); results are bit-identical to the old kernel
+    // PF_NAT=0 (in nat_gemm_launch) still disables the whole path.
+#ifndef NAT_TX
+#define NAT_TX 128
+#endif
+#ifndef NAT_C
+#define NAT_C 2
+#endif
+#ifndef NAT_SG
+#define NAT_SG 8
+#endif
+#define NAT_M(mm)                                                                                          \
+    nat_gemm_impl<FMT, mm, NAT_C, 32, NAT_SG, 1, NAT_TX, 0, 1, 0, 1, 1, 0>(q, w0, w1, w8, scale, off,    \
+                                                                        lut16, bit_lut, axe, axo, axg,    \
+                                                                        asa, xs, out, out_stride,         \
+                                                                        residual, alpha, K, N)
+    switch (M) {
+    case 2: NAT_M(2); return;
+    case 3: NAT_M(3); return;
+    case 4: NAT_M(4); return;
+    case 5: NAT_M(5); return;
+    case 6: NAT_M(6); return;
+    case 7: NAT_M(7); return;
+    case 8: NAT_M(8); return;
+    case 9: NAT_M(9); return;
+    case 10: NAT_M(10); return;
+    case 11: NAT_M(11); return;
+    case 12: NAT_M(12); return;
+    case 13: NAT_M(13); return;
+    default: return;
+    }
+#undef NAT_M
+}
+
+bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const int8_t * w8,
+                     const uint16_t * scale, const uint16_t * off, const uint16_t * lut16, const uint32_t * bit_lut,
+                     const int8_t * axe, const int8_t * axo, const int8_t * axg, const uint16_t * asa,
+                     const float * xs, float * out, int out_stride, const float * residual, float alpha, int M, int K,
+                     int N) {
+    if (M < 2 || M > 13 || (K % 32) != 0) {
+        return false;
+    }
+    // PF_NAT=0 disables the batched native GEMM everywhere (fall back to the
+    // oneDNN grouped-scale matmul + epilogue), for A/B and as an escape hatch.
+    static const bool nat_on = [] {
+        const char * e = getenv("PF_NAT");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (!nat_on) {
+        return false;
+    }
+    const uint8_t * b0 = (const uint8_t *)w0;
+    const uint8_t * b1 = (const uint8_t *)w1;
+    switch (fmt) {
+    case 0:
+        nat_gemm_pick<0>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                         residual, alpha, M, K, N);
+        return true;
+    case 1:
+        nat_gemm_pick<1>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                         residual, alpha, M, K, N);
+        return true;
+    case 2:
+        nat_gemm_pick<2>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                         residual, alpha, M, K, N);
+        return true;
+    case 3:
+        nat_gemm_pick<3>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                         residual, alpha, M, K, N);
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace si

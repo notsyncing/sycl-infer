@@ -44,7 +44,8 @@ struct dnnl_gemm {
     // The matmul keeps oneDNN's grouped f16 weight scales (= step) and moves
     // the offset (zero-point) into a separate correction term, because
     // oneDNN's grouped zero-point descriptors do not validate.
-    bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
+    bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
+                       bool any_type = false);
     bool has_weight_w4(const void * key) const;
 
     // ---- native-width 5-bit weights (Q5_K, see common/w4.h) ---------------

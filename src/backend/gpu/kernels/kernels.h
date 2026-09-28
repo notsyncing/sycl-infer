@@ -150,6 +150,18 @@ void w4_gemm_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scal
 void w4_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int K, int N);
+// Batched (M = 2..13) native-width GEMM for the MTP speculative verify: the
+// activation tile is staged in SLM once per workgroup and reused across 16*C
+// output columns, so the weight stream is read once for all M rows.  `fmt` is
+// 0 = u4, 1 = k5, 2 = cb4, 3 = grouped int8; w0/w1 are the format's value
+// planes (u4 vals / k5 vals+hi / cb4 idx / int8 w8), lut16/bit_lut the cb4/k5
+// lookups, and scale/off the per-(g,n) f16 planes (off unused for cb4/int8).
+// Returns false (caller must fall back) for M outside 2..13 or K % 32 != 0.
+bool nat_gemm_launch(sycl::queue & q, int fmt, const void * w0, const void * w1, const int8_t * w8,
+                     const uint16_t * scale, const uint16_t * off, const uint16_t * lut16, const uint32_t * bit_lut,
+                     const int8_t * axe, const int8_t * axo, const int8_t * axg, const uint16_t * asa,
+                     const float * xs, float * out, int out_stride, const float * residual, float alpha, int M, int K,
+                     int N);
 
 // Native-width 5-bit (Q5_K) decode GEMV (M == 1): the nibble plane is the u4
 // one, so the even/odd activation split is reused; the fifth bit comes from the

@@ -483,6 +483,18 @@ struct engine {
     gemv_seg * d_segs_vf = nullptr;
     seg_plan plan_mtp_;                // the MTP layer's own calls
     gemv_seg * d_segs_mtp = nullptr;
+    // PF_MTP_HEAD_W4: a draft-only u4 copy of the LM head, registered under a
+    // private key (the target keeps its exact int8 head, so only the drafts -
+    // and hence acceptance, never the emitted stream - can move).
+    float * d_mtp_partials = nullptr; // the MTP's own attention partials (see mtp_splits)
+    bool mtp_head_w4_ = false;
+    char mtp_head_w4_key_[1] = {0};
+    // The MTP draft is a single-token decode over the MTP layer's KV, so it gets
+    // the decode's key-parallel split count - *not* n_splits, which the
+    // --layer-map path pins to 1 (its split path is opt-in) and which left a
+    // 1-row attention with n_head workgroups each looping the whole KV: 2451 vs
+    // 183 ms/cycle at 128k.  PF_MTP_SPLITS overrides (1 = the old behaviour).
+    int mtp_splits = kMaxDecSplits;
     void build_mtp_plan();
     void mtp_gemv(int ci, int M);
     // run the MTP layer over `n` tokens at positions pos0.. (mode 1 layout:

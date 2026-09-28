@@ -306,6 +306,10 @@ struct dnnl_gemm::impl {
     int cap_M = 0, cap_K = 0; // scratch capacity
     int cur_M = 0, cur_K = 0; // currently quantized activations
     bool acts_valid = false;
+    // whether the current activations include the even/odd k split (axe/axo)
+    // that the native batched u4/k5 GEMM reads; false for the plain prefill
+    // quantizer (PF_GEMM_DNNL mode-2), which skips the extra stores.
+    bool split_valid = false;
     // integer matmul output [M][N] s32
     int32_t * acc = nullptr;
     size_t acc_cap = 0;
@@ -913,8 +917,9 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // Convert one tensor to the 4-bit form (see common/w4.h): u4 values plus the
 // per-32-group f16 step/offset planes.  Returns false for unsupported types,
 // which keep their int8 conversion.
-bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N) {
-    if (!key || !host_data || !si::w4_supported(ggml_type)) {
+bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
+                              bool any_type) {
+    if (!key || !host_data || !(any_type || si::w4_supported(ggml_type))) {
         return false;
     }
     if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
@@ -925,7 +930,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
         return found->second.ok;
     }
     si::w4t w;
-    if (!si::w4_pack(ggml_type, host_data, K, N, w)) {
+    if (!(any_type ? si::w4_pack_any(ggml_type, host_data, K, N, w) : si::w4_pack(ggml_type, host_data, K, N, w))) {
         return false;
     }
     const int ng = K / kW4Group;
@@ -964,29 +969,36 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     // back to the fp32 path, which needs the raw device weight that converted
     // tensors never upload - that would read garbage.  cap_M = kMaxB*kMaxT is
     // the largest M any plan uses, so requiring it covers every call.
-    if ((size_t)p->cap_M * (size_t)N > p->acc_cap) {
-        sycl::free(e.vals, p->q);
-        sycl::free(e.scales, p->q);
-        sycl::free(e.off, p->q);
-        return false;
-    }
-    bool any = false;
-    // M=1 is the decode shape (the 4-bit path has no dedicated GEMV yet, so the
-    // oneDNN matmul runs at M=1); the rest is the prefill ladder.
+    //
+    // `any_type` (the draft-only LM head) is consumed by the M=1 u4 GEMV and
+    // the M <= 13 native GEMM, neither of which touches the oneDNN f32
+    // accumulator scratch or needs a prim4 - and a 248k-wide head can never
+    // have one, which is why the target head is int8.  Register it GEMV-only.
+    bool any = any_type;
     const int ladder[] = {1, kMaxT, 2 * kMaxT, 3 * kMaxT, 4 * kMaxT, 8 * kMaxT, 16 * kMaxT};
-    for (int M : ladder) {
-        if (M > p->cap_M || (size_t)M * N > p->acc_cap) {
-            continue;
+    if (!any_type) {
+        if ((size_t)p->cap_M * (size_t)N > p->acc_cap) {
+            sycl::free(e.vals, p->q);
+            sycl::free(e.scales, p->q);
+            sycl::free(e.off, p->q);
+            return false;
         }
-        try {
-            if (p->make_prim4(M, K, N)) {
-                any = true;
+        // M=1 is the decode shape (the 4-bit path has no dedicated GEMV yet, so the
+        // oneDNN matmul runs at M=1); the rest is the prefill ladder.
+        for (int M : ladder) {
+            if (M > p->cap_M || (size_t)M * N > p->acc_cap) {
+                continue;
             }
-        } catch (const std::exception & ex) {
-            static bool once = true;
-            if (once) {
-                once = false;
-                fprintf(stderr, "[dnnl] make_prim4 M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+            try {
+                if (p->make_prim4(M, K, N)) {
+                    any = true;
+                }
+            } catch (const std::exception & ex) {
+                static bool once = true;
+                if (once) {
+                    once = false;
+                    fprintf(stderr, "[dnnl] make_prim4 M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+                }
             }
         }
     }
@@ -1114,6 +1126,7 @@ bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up
     p->cur_M = M;
     p->cur_K = K;
     p->acts_valid = true;
+    p->split_valid = do_split;
     return true;
 }
 
@@ -1130,6 +1143,12 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
             // decode: recombine the two 5-bit planes in-kernel (0.75 B/weight)
             k5_gemv_launch(p->q, e.vals, e.hi, e.scales, e.off, p->axe, p->axo, p->asa, p->xs, out, residual, alpha, K,
                            e.N);
+            return true;
+        }
+        // batched verify: same native 5-bit stream (0.75 B/weight) for all M
+        if (p->split_valid && p->axe && p->axo && p->axg && p->asa && p->xs && p->bit_lut
+            && nat_gemm_launch(p->q, 1, e.vals, e.hi, nullptr, e.scales, e.off, nullptr, p->bit_lut, p->axe, p->axo,
+                               p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, e.N)) {
             return true;
         }
         // prefill: expand q5 to int8 into the shared scratch, then the ordinary
@@ -1181,6 +1200,13 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
             cb4_gemv_launch(p->q, e.idx, p->lut16, e.scales, p->axg, p->asa, p->xs, out, residual, alpha, K, e.N);
             return true;
         }
+        // batched verify: the same index plane + in-kernel LUT, no int8 scratch
+        // (split_valid as above: the same activation form as the decode/verify)
+        if (p->split_valid && p->axg && p->asa && p->xs && p->lut16
+            && nat_gemm_launch(p->q, 2, e.idx, nullptr, nullptr, e.scales, nullptr, p->lut16, nullptr, nullptr,
+                               nullptr, p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, e.N)) {
+            return true;
+        }
         // prefill: materialize this tensor's indices as int8 into the shared
         // scratch, then run the ordinary int8 primitive over it.  oneDNN reads
         // the weight memory at every execute (verified), so the scratch can be
@@ -1219,6 +1245,19 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
     impl::w_entry & w = it->second;
     if (w.K != K) {
         return false;
+    }
+    // batched verify: grouped-scale int8 read once for all M rows (the oneDNN
+    // primitive below is ~2-3x slower per byte for these small-M shapes).
+    // split_valid gates it to the calls whose activation form this kernel is
+    // built for (mode-0 decode / the mtp_dry verify): a mode-1/mode-2 prefill
+    // quantizes with do_split=false and then reads *different* (stale) grouped
+    // activation views - without the guard the 0.8B multi-device
+    // decode-vs-prefill test fails with nat on and passes with PF_NAT=0.
+    if (M >= 2 && p->split_valid && p->axg && p->asa && p->xs) {
+        if (nat_gemm_launch(p->q, 3, nullptr, nullptr, w.dev, w.scales, nullptr, nullptr, nullptr, nullptr, nullptr,
+                            p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, w.N)) {
+            return true;
+        }
     }
     auto pit = p->prims.find(impl::pkey(M, K, w.N));
     if (pit == p->prims.end()) {
@@ -1273,6 +1312,15 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
     impl::w4_entry & w = it->second;
     if (w.K != K) {
         return false;
+    }
+    // MTP speculative verify: read the 0.625 B/weight native u4 stream once for
+    // all M rows at the card's read ceiling, instead of oneDNN's grouped
+    // f32-dst matmul.  Needs the even/odd activation split (mtp_dry / decode).
+    if (M >= 2 && p->split_valid && p->axe && p->axo && p->axg && p->asa && p->xs) {
+        if (nat_gemm_launch(p->q, 0, w.vals, nullptr, nullptr, w.scales, w.off, nullptr, nullptr, p->axe, p->axo,
+                            p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, w.N)) {
+            return true;
+        }
     }
     static int n_fail = 0;
     if (!p->prims4.count(impl::pkey(M, K, w.N)) && M > p->cap_M) {

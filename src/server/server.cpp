@@ -880,6 +880,59 @@ void run_mm_choice(engine & e, const mm_prompt & mp, const gen_params & gp, cons
     }
 }
 
+// A request can use the MTP loop when the engine loaded a NextN head, the
+// sampling is greedy (the acceptance test is an exact equality against the
+// target's own next token, so a sampled target would need rejection sampling)
+// and nothing else needs the logits machinery (logprobs, n > 1).  The loop owns
+// its sequence's block table and recurrent state, so such a request bypasses
+// the scheduler exactly like the multimodal path.
+bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
+    return e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
+}
+
+// Run one text prompt through the single-sequence engine path (no scheduler).
+// Same split of reasoning / content / tool calls as run_mm_choice; the engine
+// routes greedy requests to its MTP draft/verify loop internally.
+void run_mtp_choice(engine & e, const std::vector<int> & prompt, const gen_params & gp,
+                    const std::vector<std::string> & stops, bool chat, bool thinking, bool parse_tools,
+                    choice_out & out) {
+    stop_filter sf(stops);
+    response_parser parser(thinking, parse_tools, [](const response_piece &) {});
+    utf8_stream_buffer ub;
+    auto cb = [&](int tok) -> bool {
+        const std::string piece = ub.push(e.tk.token_piece(tok));
+        if (piece.empty()) {
+            return true;
+        }
+        out.n_gen++;
+        mm_piece(piece, sf, &parser, out, chat);
+        return !sf.stopped;
+    };
+    e.generate(prompt, gp, cb);
+    const std::string tail = ub.flush();
+    if (!tail.empty() && !sf.stopped) {
+        mm_piece(tail, sf, &parser, out, chat);
+    }
+    if (!sf.stopped) {
+        const std::string rest = sf.flush();
+        if (!rest.empty()) {
+            mm_piece(rest, sf, &parser, out, chat);
+        }
+    }
+    if (chat) {
+        parser.finish();
+        out.reasoning = parser.reasoning();
+        out.content = parser.content();
+        out.tools = parser.tool_calls();
+    }
+    out.prompt_tokens = (int)prompt.size();
+    if (chat && !out.tools.empty()) {
+        out.finish = "tool_calls";
+    } else {
+        out.finish = sf.stopped ? "stop" : "length";
+    }
+}
+
 // --------------------------------------------------------------- SSE plumbing
 
 json chat_chunk(const std::string & id, const std::string & model, uint64_t created, int index, const json & delta,
@@ -1100,6 +1153,78 @@ void stream_chat_mm_choices(std::shared_ptr<sse_session> sc, engine & e, const m
             sc->choice_done((int)mp.tokens.size(), n_gen, reasoning_tokens, 0);
         } catch (const std::exception &) {
             sse_error(sc, c, "multimodal generation failed");
+            sc->choice_done(0, 0);
+        }
+    }
+}
+
+// SSE variant of run_mtp_choice: the streaming skeleton is the multimodal one
+// (the scheduler is not involved), only the generator call differs.
+void stream_chat_mtp_choices(std::shared_ptr<sse_session> sc, engine & e, std::vector<int> prompt,
+                             const gen_params & gp, const std::vector<std::string> & stops, int n, bool thinking,
+                             bool parse_tools) {
+    for (int c = 0; c < n; c++) {
+        try {
+            sc->q->push("data: "
+                        + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, {{"role", "assistant"}}, nullptr))
+                        + "\n\n");
+            int tool_index = 0;
+            long long reasoning_tokens = 0;
+            response_parser parser(thinking, parse_tools, [&](const response_piece & p) {
+                json delta;
+                if (p.kind == response_piece_kind::reasoning) {
+                    reasoning_tokens++;
+                    delta = {{"reasoning_content", p.text}};
+                } else if (p.kind == response_piece_kind::content) {
+                    delta = {{"content", p.text}};
+                } else {
+                    json call = {{"index", tool_index},
+                                 {"id", p.call.id},
+                                 {"type", "function"},
+                                 {"function", {{"name", p.call.name}, {"arguments", p.call.arguments}}}};
+                    delta = {{"tool_calls", json::array({call})}};
+                    tool_index++;
+                }
+                sc->q->push("data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, delta, nullptr))
+                            + "\n\n");
+            });
+            stop_filter sf(stops);
+            utf8_stream_buffer ub;
+            int n_gen = 0;
+            auto cb = [&](int tok) -> bool {
+                const std::string piece = ub.push(e.tk.token_piece(tok));
+                if (piece.empty()) {
+                    return true;
+                }
+                n_gen++;
+                const std::string emit = sf.feed(piece);
+                if (!emit.empty()) {
+                    parser.feed(emit);
+                }
+                return !sf.stopped;
+            };
+            e.generate(prompt, gp_for_choice(gp, c), cb);
+            const std::string tail = ub.flush();
+            if (!tail.empty() && !sf.stopped) {
+                const std::string emit = sf.feed(tail);
+                if (!emit.empty()) {
+                    parser.feed(emit);
+                }
+            }
+            if (!sf.stopped) {
+                const std::string rest = sf.flush();
+                if (!rest.empty()) {
+                    parser.feed(rest);
+                }
+            }
+            parser.finish();
+            const std::string finish =
+                sf.stopped ? "stop" : (parser.tool_calls().empty() ? std::string("length") : std::string("tool_calls"));
+            sc->q->push(
+                "data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, json::object(), finish)) + "\n\n");
+            sc->choice_done((int)prompt.size(), n_gen, reasoning_tokens, 0);
+        } catch (const std::exception &) {
+            sse_error(sc, c, "mtp generation failed");
             sc->choice_done(0, 0);
         }
     }
@@ -1570,6 +1695,39 @@ int serve(engine & e, const server_config & cfg) {
                     text.size(), prompt.size());
         }
         if (reject_too_long(e, prompt.size(), res)) {
+            return;
+        }
+
+        if (mtp_direct(e, gp, n, gp.logprobs)) {
+            if (!stream) {
+                choice_out out;
+                run_mtp_choice(e, prompt, gp, stops, true, thinking, parse_tools, out);
+                set_json(res, 200,
+                         {{"id", id},
+                          {"object", "chat.completion"},
+                          {"created", created},
+                          {"model", model},
+                          {"choices", json::array({{{"index", 0},
+                                                    {"message", chat_message_json(out, thinking)},
+                                                    {"finish_reason", out.finish},
+                                                    {"logprobs", nullptr}}})},
+                          {"usage",
+                           usage_json(out.prompt_tokens, out.n_gen, out.reasoning_tokens, out.cached_tokens)}});
+                return;
+            }
+            auto sc = std::make_shared<sse_session>();
+            sc->q = std::make_shared<sse_queue>();
+            sc->remaining = n;
+            sc->include_usage = include_usage;
+            sc->chat = true;
+            sc->id = id;
+            sc->model = model;
+            sc->created = created;
+            sc->ths.emplace_back([&e, prompt, gp, stops, thinking, parse_tools, sc]() {
+                stream_chat_mtp_choices(sc, e, prompt, gp, stops, 1, thinking, parse_tools);
+            });
+            cors_sse(res);
+            serve_sse(res, sc);
             return;
         }
 

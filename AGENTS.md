@@ -413,7 +413,13 @@ attention KV slice (`attn_layers() - 1`) in the same paged pool and is counted i
 `--kv-cap-mb` and by all three prefix-cache tiers.
 
 Semantics, all required for the emitted stream to stay bit-equal to a plain
-greedy decode:
+greedy decode.  **Caveat (measured):** on the 27B it does not always stay
+bit-equal - a ~130-token generation on one prompt diverges from the plain
+decode from token 11 on, in both draft-head variants and with
+`PF_MTP_NOACCEPT=1`, `PF_MTP_NORB=1` and `k=1` (so it is the verify/rollback
+state, not the draft quality); other prompts are byte-identical.  Treat the
+stream as *greedy-equivalent in intent* but not byte-guaranteed until that is
+tracked down.  The pieces:
 
 * the head consumes the trunk hidden **before** `output_norm` (`t_h_pre_norm`)
   and applies its own `enorm`/`hnorm`; a draft row pairs `emb(t_p)` with
@@ -430,36 +436,159 @@ greedy decode:
   (which restores the matched chain's KV *and* recurrent state) and `pc_commit`
   after the prefill.
 
-The path is opt-in (`--mtp 0`/absent is the plain decode, byte-identical output)
-and currently gated behind `PF_MTP_EXPERIMENTAL=1` because it is **not yet a
-speedup**: at k=6 it measures ~67-73 ms/token against the plain decode's
-50.6 ms/token.  The gap is entirely the verify's batch GEMM - the engine's
-small-M batched path runs oneDNN's `jit:gemm:any` at ~63 GB/s/card while the
-decode's own u4/cb4/k5 GEMVs stream the same weights at ~220-250 GB/s/card, i.e.
-one verify costs ~4 decode passes while the drafts only buy ~2.6 accepted
-tokens/cycle.  `--mtp N` also disables the q5/cb4 native stores for the
-speculative path (they would expand to int8 on every verify pass).
+The path is opt-in (`--mtp 0`/absent is the plain decode) and no longer
+experimental.  On the 27B (2x A770, `--layer-map 0-31:gpu.0,32-63:gpu.1`,
+ctx 4096, k=4) it measures ~37 ms/token internally in a 400-token generation
+(plain decode ~65-68 ms/token wall-clock marginal; the gap between the internal
+and wall MTP numbers is the loop's own host bookkeeping, dominated by the
+argmax over the verify's 7 x 248320-row logits on the host).  `--mtp N` takes
+its length optionally: a bare `--mtp` is k=4, the measured optimum (a sweep
+with the u4 draft head gives k=2/3/4/5/6/8 -> 40.2/38.1/38.1/39.0/40.6/47.6
+ms/token on a technical prompt and k=3/4/6/8 -> 41.1/40.8/43.1/52.7 on another;
+each extra draft costs ~5.4 ms and each extra verify row ~5.7 ms, while the
+marginal acceptance past k=4 is only 0.1-0.2).
+The per-cycle split is draft ~39 ms, verify ~108 ms, commit ~2.0 ms, rollback
+~1.5 ms for ~3.3 emitted tokens/cycle.
 
-Reaching >1x needs a batched native-layout GEMM at the decode's per-byte rate.
-Measured so far on the 27B: the weight stream itself is nearly free (removing
-the per-`(row,group)` activation/scale loads from the batched kernel reaches
-219 GB/s = the GEMV's own rate); the hand-written batched u4 kernels in
-`w4_gemv.cpp` are bit-exact against the M=1 GEMV but reach only 43 GB/s at M=5
-(accumulator spilling was the first 3x, fixed by expanding the row bodies with
-`if constexpr`; every column-tiled variant then collapses ~10x), and forcing
-oneDNN onto a blocked int8 weight layout makes it pick `ocl:ref:any` rather than
-an XMX kernel - so neither the XMX route nor the current hand-written kernels
-beat `jit:gemm:any` on this stack yet.
+The verify is the whole cost.  `nat_gemm_launch` (`w4_gemv.cpp`) is a batched
+native-width GEMM (u4/k5/cb4/grouped int8) for M = 2..13 that stages the K-tile's
+activations in SLM once per workgroup, so the weight stream is read once for all
+M rows; it runs the whole scale/offset/residual epilogue in the same kernel and
+takes over `gemm_w4`/`gemm` for M <= 13.  That took the verify from 196 to 147 ms
+and let `--mtp N` keep the native q5/cb4 stores (it no longer forces
+`PF_CB4=0`/`PF_K5=0`).
+
+The largest single win was a loop-order change, and the reason is worth stating
+because it is invisible in the source: with the **c-outer / m-inner** order
+(loop over the C columns a sub-group owns, then over the M rows) IGC scalarises
+the whole inner loop - the IGC asm contains **zero `dp4a`** and the kernel runs
+at 106 GB/s.  Reordering to **m-outer / c-inner** (load one row's activation
+group once, then run the 8 `dp4a` for every column against it) makes IGC emit
+336 `dp4a` in the asm and the kernel jumps to **221 GB/s** (u4, M=7,
+K=5120, N=17408: 0.421 -> 0.200 ms, 2.08x; k5 0.342 -> 0.237, cb4 0.380 ->
+0.258, int8 0.370 -> 0.276).  The winning shape is `C=2, KT=32, SG=8, TX=128,
+TREE=1, VECST=1, VECA=1`, all bit-exact against the M=1 GEMVs.  Other things
+that were load-bearing: SIMD8 sub-groups (a SIMD16/SIMD32 float costs 2/4 GRFs,
+so the M*C accumulator set spilled 18-23 KB/thread to scratch); staging the
+activation and the scale/offset tiles with 16-byte copies rather than byte
+loops; and the SLM activation stride - 48 bytes pushes M >= 8 over the register
+cliff, so `APAD` is 32 except for u4 at M >= 12 (measured: M=8 u4 0.360 ->
+0.240, M=12 k5 0.685 -> 0.497, cb4 0.639 -> 0.426, int8 0.583 -> 0.398).  C=4/8
+in any order, a larger `TX` (a bigger workgroup is slower, and the extra RB does
+not help because the staged activation is L2-resident), and the c-outer order
+all lose.
+
+After the reorder the kernel is within ~1.3-1.5x of the M=1 GEMV's rate
+(measured M=7, K=5120, N=17408: u4 223 GB/s, k5 188, cb4 173, int8 323, against
+the M=1 GEMV's 294/249/261/364).  On *true* per-format traffic (weight plane +
+fifth-bit/index plane + the per-32 f16 scale/offset planes: u4 0.625, k5 0.875,
+cb4 0.5625 B/weight) k5 already matches u4's ~280 GB/s and only reads 20% more
+bytes; cb4 is at ~195 GB/s and is decode-issue bound - its codebook LUT decode
+(16 `lt16` lookups + shifts/ORs per operand set) is the whole excess, and a
+256-entry uint32 table, a pre-biased codebook and pre-shifted LUTs all measured
+worse.  The remaining bound is the combined weight + scale +
+offset stream and its latency, not raw issue throughput: the grouped per-32
+scale/offset planes are 11.2 MB of the ~66 MB moved per pass.  OneDNN's own
+grouped-scale int8 kernel measures 154-214 GB/s on this box, so the dp4a kernel
+is already at or above the best grouped-scale rate oneDNN achieves.
+
+XMX was evaluated as an alternative and is **not** usable here: the DPAS
+contraction length K is fixed at 32 for 8-bit operands, which is exactly our
+quantisation group width, so the accumulator must be drained and rescaled once
+per 32 weights (~3 us per drained group-row measured over the whole grid, and it
+is the `joint_matrix_fill`/`apply` breaking the DPAS accumulation chain, not the
+scale loads).  That costs the per-32 format ~2.3x versus a plain int8 GEMM
+(0.276 -> 0.640 ms for M=8/K=5120/N=17408) and leaves it slower than the dp4a
+kernel.  Widening the group to 128 would let four DPAS chain into one
+accumulator, but the accuracy study measured per-128 u4 at 9.9-10.2% relative L2
+weight error versus 0.077% for the native per-32 store (131-524x worse), so it
+is not admissible.  joint_matrix on DG2 is also very constrained (int8 only, M<=8,
+N==8 exactly, K==32 exactly, sub-group size 8 - verified to lower to `dpas.8x8`).
+
+With the verify at a hypothetical one-decode-pass cost and free drafts the
+ceiling is ~2x (verify >= 1 weight pass + ~3.3 ms/row of attention/GDN/norm).
+
+**MTP is a short-context win only.**  Measured on the 27B / 2x A770 with
+`llama-benchy 0.4.0` (`--pp 512 --tg 128 --exact-tg --skip-coherence`, chat
+completions vs `serve`, `PF_PREFIX_CACHE=0`, i8 KV, merged into the server by
+routing greedy single requests to `engine::generate` - see `mtp_direct` in
+`server.cpp`), plain scheduler vs MTP (`temperature=1` vs `0`):
+
+| test | plain | MTP (before fixes) | MTP (now) |
+|---|---:|---:|---:|
+| pp512 (d0) | 2.49k t/s | 2325 | 2526 |
+| tg128 (d0) | 14.5-14.6 | 6.51 | 16.18 |
+| tg128 (d64k) | 8.0 | 0.94 | 2.26 |
+| tg128 (d128k) | 5.5 | 0.32 | 1.13 |
+| e2e_ttft (d64k) | 115 s | 697 | 169 |
+| e2e_ttft (d128k) | 312 s | 1472 | 420 |
+
+The 128k t/s is plain-equivalent *within measurement noise* because no token
+generation is involved (the request is a pure prompt load), but the prefill and
+short-context numbers are real: the MTP prompt prefill now batches up to
+`batched_prefill_fit` instead of flushing every 32 tokens, and the draft split
+(3) plus the adaptive k (4) cut the decode cost.
+
+Three separate causes, all measured in the server's `[mtp] time:` line:
+(1) *acceptance* - llama-benchy forces `ignore_eos`, so after the model's own
+EOS the 128 tokens are `<|im_end|>`-spam; the draft agrees with the target's
+greedy token only 0.15-0.85x/cycle there, against 1.8-2.6x on natural prompts
+(the same server measures acc 1.75-2.25 for a technical prompt, and the CLI
+1.88 for the llama-benchy corpus text as a raw continuation).  MTP still pays 6
+drafts + a 7-row verify for ~1.3 tokens.
+(2) *long context multiplies attention*: at 128k the verify (7 rows over 131k
+keys) costs 1390 ms/cycle against 181 ms for a plain decode, i.e. MTP buys a
+~3.5x weight amortization with ~8 decode-equivalents of attention.
+(3) the draft's attention used the *prefill* split ceiling `n_splits`, which
+the `--layer-map` path defaults to **1** (`PF_MD_SPLITS`); one warp per head
+looping over the whole KV made a 1-row draft pass cost 408 ms at 128k.  Fixed:
+`mtp_forward` now derives its own split count from the KV length (the same ~512
+keys per split the prefill uses, capped by `PF_MTP_SPLITS`, default
+`kMaxDecSplits`) instead of taking `n_splits`, and allocates the few hundred KB
+of partials it needs itself.  The draft phase went 2451 -> 35.7 ms/cycle at
+128k (68x, better than the 183 the blanket `PF_MD_SPLITS=1` gave) and is
+*identical* to the old single-split behaviour at short context (a fixed
+256-split grid there measurably degrades the draft: acceptance 1.27 vs 2.29 per
+cycle on a 320-token prompt - the plain decode, which does use the full cap,
+has no acceptance to lose).
+(4) the MTP prompt prefill used to walk the prompt in `kMaxT` chunks, paying a
+`prefill_flush()` plus a host-blocking `memcpy/wait` of `d_mtp_hprev` per 32
+tokens, which serialised the 3-phase multi-device pipeline (e2e_ttft at 131k
+1475 vs 311 s).  Fixed: one `prefill_text()` batch of up to
+`batched_prefill_fit()` tokens, then the MTP layer over its captured hidden in
+`kMaxT`-token pieces (`mtp_forward` also stopped taking the full-plan `n_splits`
+partials for this).  e2e_ttft went 697 -> 169 s at 64k and 1472 -> 420 s at
+128k, and the gradient is now prefill-dominated on both sides.
+`PF_MTP_HEAD_W4` (default on) gives the draft its own lossy u4 copy of the LM
+head, registered under a private key so the *target* keeps its exact int8 head:
+the draft reads the head once per drafted token, so 0.625 vs 1.0625 B/weight
+cuts the draft from 40.7 to 30.5 ms/cycle at k=6 and the acceptance is
+unchanged (acc 2.6 vs 2.6 per cycle over 400 tokens, and within +/-0.15 on four
+other prompts).  `PF_MTP_HEAD_W4=0` keeps the int8 head for the draft; the
+emitted stream is identical either way because the verify never uses it.
+
+`PF_MTP_ADAPT` (default on) shrinks the draft length by one whenever a whole
+cycle accepts nothing and grows it back on a full-acceptance cycle, keeping the
+ceiling at `--mtp` (buffers still cover it) and never changing the emitted
+stream (acceptance ignores k).  Measured: a low-acceptance prompt goes 42.0 ->
+38.7 ms/token, a high-acceptance one auto-raises k to the cap and runs
+27.5 ms/token.
 
 Diagnostics (all env-gated, `0`/unset = off unless noted): `PF_MTP` (draft
 length, `--mtp` overrides), `PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms),
 `PF_MTP_DEBUG`/`PF_MTP_DUMP`, `PF_MTP_VERIFY_PAD`/`PF_MTP_VERIFY_M32` (pad the
 verify's GEMM M), `PF_MTP_VERIFYN`, `PF_MTP_DECCHK` (verify row 0 vs a plain
 decode of the same token), `PF_MTP_LSTAT`, `PF_MTP_DECODE_H`, `PF_MTP_NOACCEPT`,
-`PF_MTP_NOMTPFWD`, `PF_MTP_NORB`, `PF_MTP_DBG_RB`.  Batch-GEMM knobs:
+`PF_MTP_NOMTPFWD`, `PF_MTP_NORB`, `PF_MTP_DBG_RB`, `PF_MTP_FORCE_INT8` (restore
+the old int8-only verify stores).  Batch-GEMM knobs: `PF_NAT` (`0` disables
+`nat_gemm_launch` and falls back to the oneDNN grouped-scale matmul + epilogue),
+`PF_MTP_SPLITS` (the MTP draft's key-split cap, default `kMaxDecSplits`; `1`
+restores the old single-split draft),
 `PF_W4_GEMM_MAXM` (default 1 = the oneDNN matmul; 2..8 routes the u4 tensors to
-`w4_gemm_launch`), `PF_W4_GEMM_U` (accumulator sets), `PF_W4_GEMM_TN`
-(0 = row-expanded, 2/3/4 = the tiled experiments), `PF_DNNL_BLOCKED`.
+`w4_gemm_launch` for the legacy path), `PF_W4_GEMM_U` (accumulator sets),
+`PF_W4_GEMM_TN` (0 = row-expanded, 2/3/4 = the tiled experiments),
+`PF_DNNL_BLOCKED`.  `dev/bench_natgemm.cpp` benchmarks the batched GEMM against a
+scalar reference and the M=1 GEMVs.
 
 ### OpenAI-compatible API
 
@@ -706,6 +835,20 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
 * **`st_a` is an XMX-only stream.**  The dense `PF_GEMM_DNNL` GEMMs still use
   `p->st`; `attn_qk`/`attn_pv` submit to `p->st_a` and wait only that stream.
   Do not move the dense path onto `st_a`.
+* **`nat_gemm_launch`'s int8 (FMT 3) and cb4 (FMT 2) paths need the
+  decode/verify activation form, not just "an activation".**  `gemm()`'s int8
+  nat call is guarded by `p->split_valid` (like the u4 one): a mode-1/mode-2
+  prefill quantizes with `do_split=false`, so the grouped views it would read
+  are the *previous* call's.  Missing that guard silently corrupted the 0.8B
+  multi-device decode-vs-prefill (`gen0`/`gen1`/`ref` 220/220/567 against
+  248068/271/271) while every single-device test passed, and it also made
+  `PF_MD_SPLITS=1` look broken.  `PF_NAT=0` is the bisection knob; the u4 path
+  (FMT 0) already had the guard.
+* **The MTP draft's attention split is `PF_MTP_SPLITS`, independent of
+  `PF_MD_SPLITS`.**  The `--layer-map` path pins `n_splits`/`dec_splits` to 1
+  (its split path is opt-in, and with the nat bug above fixed it verifies clean
+  again), so the draft derives `ceil((pos0+n)/512)` clamped to `PF_MTP_SPLITS`
+  and uses its own partials buffer - see the MTP section.
 * **A partial mode-2 batch requires the oneDNN weight path.**
   `batched_prefill_fit` only allows a last row with `n_real_row < kMaxT` when
   `use_dnnl` or a multi-device GPU partition has oneDNN (`dnnl_any_dev()`); the

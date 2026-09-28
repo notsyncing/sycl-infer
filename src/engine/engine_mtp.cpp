@@ -122,17 +122,21 @@ void engine::mtp_gemv(int ci, int M) {
     if (D == nullptr || xq.x == nullptr) {
         throw std::runtime_error("mtp: the oneDNN int8 weight path is required");
     }
-    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/false);
+    // The draft's single-token LM head can run from the u4 copy; the u4 GEMV
+    // reads the even/odd activation split, so that call must produce it.
+    const bool w4_head = ci == 4 && mtp_head_w4_ && M == 1;
+    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_head);
     const int gb = p.call_group_begin[(size_t)ci];
     const int gc = p.call_group_count[(size_t)ci];
     for (int g = 0; g < gc; g++) {
         const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
         for (int j = 0; j < gr.n; j++) {
             const gemv_seg & s = d_segs_mtp[gr.off + j];
-            if (D->gemm_w4(s.w, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+            const void * wk = w4_head ? (const void *)mtp_head_w4_key_ : s.w;
+            if (D->gemm_w4(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
-            if (D->gemm(s.w, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+            if (D->gemm(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
             throw std::runtime_error("mtp: oneDNN GEMM failed for a layer tensor");
@@ -209,15 +213,26 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
             }
         }
     }
-    int nsp = std::min(std::max(n_splits, 1), kMaxSplits);
+    // The draft is a *decode* (one row over the MTP layer's KV), so it wants key
+    // parallelism: one warp per head looping the whole KV cost 2451 vs 183
+    // ms/cycle at 128k.  The split count is derived from the KV length (the same
+    // ~512 keys per split the prefill uses) rather than taken as the full decode
+    // cap: at short context a fixed 256-split grid measurably degrades the
+    // *draft* (acceptance 1.27 vs 2.29 per cycle on a 320-token prompt), while
+    // the plain decode - which does use the full cap - has no acceptance to
+    // lose.  A multi-row call (the prompt chunks) already has n*n_head
+    // workgroups, so it keeps the fused single split; that is also why the
+    // partials buffer only has to cover max(mtp_splits, kMaxT*n_head) entries.
+    const int max_nkv = pos0 + n;
+    const int nsp = std::min(std::max((max_nkv + 511) / 512, 1), mtp_splits);
     be.qk_norm_rope(d_mtp_qbuf, d_mtp_kbuf, d_mtp_vbuf, wf32(mtp_dev, M.q_norm), wf32(mtp_dev, M.k_norm), (void *)kp, (void *)vp,
                     d_tables, inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
                     max_blocks, 1, n, ksc, vsc);
     const bool fused = (nsp == 1);
-    be.attn(d_mtp_qbuf, d_mtp_qbuf, kp, vp, d_partials, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
+    be.attn(d_mtp_qbuf, d_mtp_qbuf, kp, vp, d_mtp_partials, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
             hp.attn_scale, max_blocks, 1, n, fused ? d_mtp_attn_out : nullptr, -1, ksc, vsc);
     if (!fused) {
-        be.attn_combine(d_partials, d_mtp_qbuf, d_mtp_attn_out, inf, hp.n_head, hp.head_dim, nsp, 1, n);
+        be.attn_combine(d_mtp_partials, d_mtp_qbuf, d_mtp_attn_out, inf, hp.n_head, hp.head_dim, nsp, 1, n);
     }
     MTPDBG("forward wo\n");
     mtp_gemv(1, n); // wo + residual
@@ -526,28 +541,47 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     std::vector<int32_t> chunk;
     const bool decode_h = getenv("PF_MTP_DECODE_H") != nullptr;
     for (int pos = matched; decode_h ? false : pos < nprompt;) {
-        const int n = std::min(kMaxT, nprompt - pos);
+        // Take the largest prefill batch the plan supports (batched_prefill_fit,
+        // up to kMaxB*kMaxT) and then walk *its captured hidden* in kMaxT-token
+        // pieces for the MTP layer.  Doing kMaxT-token prefill batches instead
+        // costs a prefill_flush() plus a host-blocking copy per 32 tokens, which
+        // serialises the 3-phase multi-device pipeline: measured e2e_ttft at
+        // 131k was 1475 s against 311 s for the same prompt through the
+        // scheduler, and 64k 697 s against 117 s.
+        const int rem = nprompt - pos;
+        const int fit = batched_prefill_fit(rem);
+        const int nb = (fit >= 1 && fit <= rem) ? fit : std::min(kMaxT, rem);
         if (dbg_gen) {
-            fprintf(stderr, "[mtp] prefill chunk pos=%d n=%d\n", pos, n);
+            fprintf(stderr, "[mtp] prefill batch pos=%d n=%d\n", pos, nb);
         }
         // mode 2 is the prefill path the multi-device engine actually uses; its
         // output norm leaves the per-position main hidden in d_xnorm
-        prefill_text(prompt, pos, n);
+        prefill_text(prompt, pos, nb);
         // The multi-device prefill pipeline defers the last chunk's device-1 and
         // head phases to the next call (or to prefill_flush).  The per-position
         // main hidden (and the capture) is only written by that head phase, so
         // it must be flushed before the draft head reads it.
         prefill_flush();
         if (dbg_gen) {
-            fprintf(stderr, "[mtp] prefill chunk done\n");
+            fprintf(stderr, "[mtp] prefill batch done\n");
         }
-        chunk.assign(prompt.begin() + pos, prompt.begin() + pos + n);
-        mtp_forward(chunk.data(), d_mtp_main_h, d_mtp_hprev, n, 0, pos, /*with_head=*/false);
-        if (dbg_gen) {
-            fprintf(stderr, "[mtp] mtp prefill chunk done\n");
+        // mtp_capture copies the batch's rows in token order, and mtp_concat
+        // indexes the hidden by the *global* slot (r*tpb + t) with h_prev only
+        // at slot 0, so a piece starting at `off` passes the capture base at
+        // `off` and takes its preceding token (the same capture, unless this is
+        // the batch's first piece) as h_prev.
+        for (int off = 0; off < nb; off += kMaxT) {
+            const int n = std::min(kMaxT, nb - off);
+            chunk.assign(prompt.begin() + pos + off, prompt.begin() + pos + off + n);
+            const float * h = d_mtp_main_h + (size_t)off * hp.n_embd;
+            const float * hprev = off > 0 ? (d_mtp_main_h + (size_t)(off - 1) * hp.n_embd) : d_mtp_hprev;
+            mtp_forward(chunk.data(), h, hprev, n, 0, pos + off, /*with_head=*/false);
+            if (dbg_gen) {
+                fprintf(stderr, "[mtp] mtp prefill piece off=%d n=%d\n", off, n);
+            }
         }
-        dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (size_t)(n - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
-        pos += n;
+        dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (size_t)(nb - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
+        pos += nb;
     }
 
     if (getenv("PF_MTP_HVEC") != nullptr) {
@@ -829,9 +863,22 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         return out;
     }
 
+    // Adaptive draft length: with poor acceptance (an aligned/boilerplate
+    // continuation, or an ignore_eos run) MTP is a net loss and usually falls
+    // back to plain decoding, which is single-sequence and cannot share the
+    // scheduler.  Shrinking k by one whenever a whole cycle accepts nothing and
+    // growing it back on a full-acceptance cycle keeps the ceiling at mtp_k (so
+    // the buffers still cover it) while cutting the wasted verify work.  The
+    // emitted stream is unaffected: acceptance ignores k.
+    static const bool adapt = [] {
+        const char * e = getenv("PF_MTP_ADAPT");
+        return e ? atoi(e) != 0 : true;
+    }();
+    int k = mtp_k;
     std::vector<int> cand((size_t)mtp_k + 1);
     static const bool mt = getenv("PF_MTP_TIME") != nullptr;
     double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0;
+    long t_acc = 0;
     int t_cycles = 0, t_tok = 0;
     auto now_t = [] { return std::chrono::high_resolution_clock::now(); };
     auto ms_t = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -841,7 +888,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         cand[0] = tok;
         const float * hprev = d_mtp_hprev;
         static const bool no_mtpfwd = getenv("PF_MTP_NOMTPFWD") != nullptr;
-        for (int i = 0; !no_mtpfwd && i < mtp_k; i++) {
+        for (int i = 0; !no_mtpfwd && i < k; i++) {
             const int32_t t = cand[(size_t)i];
             MTPDBG("draft %d\n", i);
             mtp_forward(&t, nullptr, hprev, 1, 0, pos + i, /*with_head=*/true);
@@ -951,27 +998,27 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             const char * e = getenv("PF_MTP_VERIFYN");
             return e ? atoi(e) : 0;
         }();
-        const int n_ver = (vn_env > 0 && vn_env < mtp_k + 1) ? vn_env : mtp_k + 1;
+        const int n_ver = (vn_env > 0 && vn_env < k + 1) ? vn_env : k + 1;
         mtp_verify(cand, n_ver, 0, pos);
         MTPDBG("verify done\n");
         sync_all();
         const auto tc2 = now_t();
         t_verify += ms_t(tc1, tc2);
-        dev_queue(0).memcpy(h_logits, d_logits, (size_t)(mtp_k + 1) * hp.n_vocab * 4).wait();
+        dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
         if (mtp_dbg()) {
             fprintf(stderr, "[mtp] pos=%d drafts:", pos);
-            for (int i = 1; i <= mtp_k; i++) {
+            for (int i = 1; i <= k; i++) {
                 fprintf(stderr, " %d", cand[(size_t)i]);
             }
             fprintf(stderr, "  target:");
-            for (int i = 0; i < mtp_k; i++) {
+            for (int i = 0; i < k; i++) {
                 fprintf(stderr, " %d", argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab));
             }
             fprintf(stderr, "\n");
         }
         int j = 0;
         static const bool no_accept = getenv("PF_MTP_NOACCEPT") != nullptr;
-        while (!no_accept && j < std::min(mtp_k, n_ver - 1)) {
+        while (!no_accept && j < std::min(k, n_ver - 1)) {
             const int t = argmax_f(h_logits + (size_t)j * hp.n_vocab, hp.n_vocab);
             if (t != cand[(size_t)j + 1]) {
                 break;
@@ -1037,12 +1084,21 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         t_rb += ms_t(tc4, tc5);
         t_cycles++;
         t_tok += j + 1;
+        t_acc += j;
+        if (adapt && !no_accept) {
+            // a fully accepted cycle means the chain can still run
+            if (j == k) {
+                k = std::min(k + 1, mtp_k);
+            } else if (j <= 1) {
+                k = std::max(k - 1, 1);
+            }
+        }
         if (mt && (t_cycles % 4 == 0)) {
             fprintf(stderr,
-                    "[mtp] time: cycles=%d tok=%d | draft=%.1f verify=%.1f commit=%.1f rb=%.1f ms/cycle "
-                    "| %.1f ms/token\n",
-                    t_cycles, t_tok, t_draft / t_cycles, t_verify / t_cycles, t_commit / t_cycles,
-                    t_rb / t_cycles, (t_draft + t_verify + t_commit + t_rb) / t_tok);
+                    "[mtp] time: cycles=%d tok=%d acc=%.2f | draft=%.1f verify=%.1f commit=%.1f rb=%.1f "
+                    "ms/cycle | %.1f ms/token\n",
+                    t_cycles, t_tok, (double)t_acc / t_cycles, t_draft / t_cycles, t_verify / t_cycles,
+                    t_commit / t_cycles, t_rb / t_cycles, (t_draft + t_verify + t_commit + t_rb) / t_tok);
         }
         static const bool statechk = getenv("PF_MTP_STATECHK") != nullptr;
         if (statechk && !h_save_.empty()) {
@@ -1091,7 +1147,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         pos += j + 1;
         // grow the block table if the draft window could cross a block boundary
         if ((pos + mtp_k + 1 + kBlockSize - 1) / kBlockSize > (int)blocks.size()) {
-            for (int k = (int)blocks.size(); k < (pos + mtp_k + 1 + kBlockSize - 1) / kBlockSize; k++) {
+            for (int kb = (int)blocks.size(); kb < (pos + mtp_k + 1 + kBlockSize - 1) / kBlockSize; kb++) {
                 int b = alloc_block();
                 if (b < 0) {
                     break;

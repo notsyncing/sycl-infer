@@ -112,28 +112,21 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         mtp_k = 12; // d_logits / step_info bounds: n = mtp_k+1 <= kMaxB
     }
     mtp_on = mtp_k > 0;
-    if (mtp_on && getenv("PF_MTP_EXPERIMENTAL") == nullptr) {
-        // The speculative loop is now numerically exact (greedy MTP == greedy
-        // decode, verified token-for-token), but it is not yet a speedup: the
-        // batched verify runs the oneDNN int8 weight path (~24.5 GB/pass at
-        // ~130 GB/s) while the plain decode's u4 GEMV streams 16 GB at ~315 GB/s,
-        // so a verify costs ~3.7 decode passes and the drafts only buy ~2.2
-        // accepted tokens/cycle.  Reaching >1x needs a batched u4 (native-width)
-        // GEMM for the verify so it costs about one decode pass; until then the
-        // path stays opt-in.
-        fprintf(stderr,
-                "[mtp] MTP is experimental (correct, but not yet faster than plain decode);"
-                " set PF_MTP_EXPERIMENTAL=1 to enable\n");
-        mtp_on = false;
-        mtp_k = 0;
+    {
+        const char * e = getenv("PF_MTP_SPLITS");
+        if (e) {
+            mtp_splits = atoi(e);
+        }
+        mtp_splits = std::min(std::max(mtp_splits, 1), kMaxDecSplits);
     }
-    if (mtp_on) {
-        // The native q5/cb4 weight stores store prefill the tensor back to int8 in
-        // a per-pass scratch, which a multi-token speculative verify pays on every
-        // cycle (~110 ms/cycle on the 27B, measured): force the plain int8/SIn
-        // copies for the batched path unless the user asked otherwise.
-        setenv("PF_CB4", "0", 0);
-        setenv("PF_K5", "0", 0);
+    if (mtp_on && getenv("PF_MTP_FORCE_INT8") != nullptr) {
+        // Historical: the native q5/cb4 stores used to prefill the tensor back to
+        // int8 in a per-pass scratch, which a multi-token verify paid every cycle.
+        // The batched native GEMM (nat_gemm_launch) now consumes the k5/cb4/u4
+        // planes directly for M <= 13, so the verify keeps the smaller native
+        // stores; PF_MTP_FORCE_INT8=1 restores the old int8-only behaviour for A/B.
+        setenv("PF_CB4", "0", 1);
+        setenv("PF_K5", "0", 1);
     }
     if (const char * ed = getenv("PF_MTP_DEV")) {
         mtp_dev = atoi(ed);
@@ -165,7 +158,11 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // (n_splits = dec_splits = 1), which caps a multi-device prefill at one
         // warp per (token, head) looping over the whole key range, and a decode
         // at one warp per token with no key parallelism.  PF_MD_SPLITS=1 opts
-        // back into the split path for A/B.
+        // back into the split path for A/B (it verifies clean now, and buys
+        // ~10% prefill, but it stays opt-in until it is measured end to end).
+        // The MTP draft does not depend on this gate: it has its own mtp_splits
+        // cap (PF_MTP_SPLITS), because a single-token attention over a long KV
+        // is the worst case for a fixed 1-split grid (13x at 128k).
         const char * emd = getenv("PF_MD_SPLITS");
         if (!(emd && atoi(emd) != 0)) {
             n_splits = 1;
@@ -1148,6 +1145,28 @@ bool engine::setup_md_dnnl() {
             // after the upload, keyed by the uploaded device pointer - see
             // setup_multi_device.
             add(m.output);
+            // PF_MTP_HEAD_W4 (default on): one extra draft-only u4 copy of the
+            // LM head.  The draft reads the head once per drafted token (k times
+            // per cycle, 1.35 GB each at int8) and only needs its argmax, so
+            // 0.625 vs 1.0625 B/weight cuts the draft by ~20% (measured 38.4 ->
+            // 30.4 ms/cycle at k=6) with the acceptance unchanged to two
+            // decimals on every prompt tried.  It is registered under its own
+            // key - a second store for the head's key would also switch the
+            // *target* decode onto u4.  PF_MTP_HEAD_W4=0 keeps the exact int8
+            // head for the draft (the emitted stream is identical either way:
+            // the verify always uses the int8 head).
+            if (mtp_on) {
+                static const bool head_w4 = [] {
+                    const char * e = getenv("PF_MTP_HEAD_W4");
+                    return !e || atoi(e) != 0;
+                }();
+                if (head_w4) {
+                    mtp_head_w4_ = D->add_weight_w4(mtp_head_w4_key_, m.output.data, m.output.type, m.output.K,
+                                                    m.output.N, /*any_type=*/true);
+                    fprintf(stderr, "[mtp] draft LM head: %s\n",
+                            mtp_head_w4_ ? "u4 copy registered" : "u4 conversion failed - keeping int8");
+                }
+            }
         }
         for (int il = 0; il < m.hp.n_layer; il++) {
             if (layer_dev_[(size_t)il] != (int)d) {
@@ -1560,6 +1579,12 @@ void engine::alloc_buffers() {
         d_mtp_attn_out = ab((size_t)R * hp.n_head * hp.head_dim);
         d_mtp_ffn = ab((size_t)R * ffn_stride);
         d_mtp_hnorm = ab((size_t)R * hp.n_embd);
+        // The MTP's own attention partials.  Its layout is
+        // ((row*tpb + t)*n_head + h)*nsp + s, so the two shapes it uses need
+        // max(mtp_splits, kMaxT*n_head) entries - a few hundred KB, not the
+        // R*n_head*n_splits prefill buffer (scaling that one by mtp_splits would
+        // be 2.7 GB and loses the device).
+        d_mtp_partials = ab((size_t)std::max(mtp_splits, kMaxT * hp.n_head) * (2 + hp.head_dim));
         d_mtp_hprev = ab((size_t)kMaxB * hp.n_embd);
         // host USM: written by the primary device's capture and read by the
         // MTP layer wherever --mtp-device put it

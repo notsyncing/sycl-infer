@@ -88,8 +88,8 @@ static bool pack_q4_K(const void * src, int K, int N, w4t & out) {
 // of the type's native resolution.  `off` is the *additive* constant (w ~=
 // step*q + off) so it slots straight into the u4 GEMV's `step*qdot + off*xs`.
 // Mirrors w8.cpp's PF_SI4 generic requant.
-static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
-    if (!w4_all_enabled() || (K % kW4Group) != 0) {
+static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t & out, bool allow) {
+    if (!(allow || w4_all_enabled()) || (K % kW4Group) != 0) {
         return false;
     }
     const size_t row_bytes = quant_row_bytes(ggml_type, K);
@@ -295,8 +295,19 @@ bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
     case 12:
         return pack_q4_K(src, K, N, out);
     default:
-        return pack_generic(ggml_type, src, K, N, out);
+        return pack_generic(ggml_type, src, K, N, out, false);
     }
+}
+
+// The lossy generic pack for one explicitly chosen tensor, skipping the
+// PF_W4_ALL gate: the MTP draft's LM head (PF_MTP_HEAD_W4) is read once per
+// drafted token, so 0.625 B/weight instead of int8's 1.0625 is the draft's
+// dominant cost - and the draft only needs its argmax.
+bool w4_pack_any(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
+    if (!src || K <= 0 || N <= 0) {
+        return false;
+    }
+    return pack_generic(ggml_type, src, K, N, out, true);
 }
 
 } // namespace si

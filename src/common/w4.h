@@ -68,6 +68,10 @@ bool w4_all_enabled();
 // untouched) for unsupported types, which keep the int8 conversion.
 bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out);
 
+// The same generic (lossy) pack as the PF_W4_ALL path, for one explicitly
+// chosen tensor and without that gate: the MTP draft's LM head.
+bool w4_pack_any(uint32_t ggml_type, const void * src, int K, int N, w4t & out);
+
 // ---- native-width 5-bit (Q5_K) ---------------------------------------------
 // Q5_K sits on a 5-bit grid,  q5 = lo4 | (hi1 << 4),  w = d*sc*q5 - dmin*m  per
 // 32-group.  Keeping the fifth bit in its own plane - rather than re-quantizing
