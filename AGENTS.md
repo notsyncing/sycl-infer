@@ -492,18 +492,92 @@ scale/offset planes are 11.2 MB of the ~66 MB moved per pass.  OneDNN's own
 grouped-scale int8 kernel measures 154-214 GB/s on this box, so the dp4a kernel
 is already at or above the best grouped-scale rate oneDNN achieves.
 
-XMX was evaluated as an alternative and is **not** usable here: the DPAS
-contraction length K is fixed at 32 for 8-bit operands, which is exactly our
-quantisation group width, so the accumulator must be drained and rescaled once
-per 32 weights (~3 us per drained group-row measured over the whole grid, and it
-is the `joint_matrix_fill`/`apply` breaking the DPAS accumulation chain, not the
-scale loads).  That costs the per-32 format ~2.3x versus a plain int8 GEMM
-(0.276 -> 0.640 ms for M=8/K=5120/N=17408) and leaves it slower than the dp4a
-kernel.  Widening the group to 128 would let four DPAS chain into one
-accumulator, but the accuracy study measured per-128 u4 at 9.9-10.2% relative L2
-weight error versus 0.077% for the native per-32 store (131-524x worse), so it
-is not admissible.  joint_matrix on DG2 is also very constrained (int8 only, M<=8,
-N==8 exactly, K==32 exactly, sub-group size 8 - verified to lower to `dpas.8x8`).
+**The dp4a ceiling, and why MTP tops out at ~2x.**  This is the number that
+bounds every speculative-decoding effort on this hardware, so record it before
+re-litigating the kernel.  Measured on one A770 (Iris Xe-LP-class DG2):
+
+* stream rate: **~376 GB/s** measured (`bw_probe`), i.e. the MIG ceiling for a
+  pure read stream.  The M=1 GEMVs reach 294 (u4), 249 (k5), 261 (cb4) and 364
+  GB/s (int8) of true per-format traffic; `nat_gemm_launch` reaches 323 GB/s on
+  int8 at M=7, and oneDNN's own grouped-scale int8 kernel only 154-214 GB/s.
+* dp4a throughput: ~4.9 T-MAC/s (oneDNN plain int8 M=8, 307 GB/s at 1 byte/weight
+  -> 307e9 dp4a/s, x16 MAC each).  The Xe-cores' int8 ALU peak is far above this,
+  but nothing here is ALU-limited.
+* **arithmetic intensity of the memory system**: 4.9e12 MAC/s / 376e9 B/s =
+  **~13 MAC/byte**.  Compare a tensor-core card at 20-30x that.
+
+The consequence is the batched-GEMM critical batch size.  A weight-streamed
+GEMM reads W bytes and does M*N*K MAC; at the M where the MAC rate stops hiding
+the stream, `M* = peak_MAC / (2 * BW_per_element)` ~= **6.4** MAC per byte of
+weight for the u4 store.  Below it the kernel is memory bound and extra rows are
+nearly free; above it it is compute bound and each row costs real time.  Measured
+slope: 3.6 ms per verify row vs a 76 ms weight pass, i.e. we sit *just above* M*
+at the MTP verify's M=5-7 -- which is why the batched GEMM still wins ~2x over
+per-row GEMVs but cannot win more.
+
+Both paths are memory bound and both read the same ~16.3 GB of weights per unit
+of work, so the only lever left is **tokens per weight pass**, and that is capped
+by the text's own information content, not by the kernel: 4 greedy draft tokens
+from a 27B model carry only ~3.1-3.3 tokens of accepted prefix (measured acc
+2.1-2.8 drafts + the bonus).  Hence
+
+    ceiling ~= 3.3 tokens/cycle x (weight-pass share of the cycle) ~= 2x
+
+and no amount of kernel work moves it; only a higher arithmetic-intensity
+execution unit (tensor cores / XMX) changes the constant.  That is why the GPU
+path stays dp4a and why the remaining work must go at XMX, below.
+
+**XMX / DPAS: re-examined and rejected on measured grounds.**  The earlier
+rejection rested on "DPAS K is fixed at 32 = our group width, so the accumulator
+must be drained per group", and on `joint_matrix`'s DG2 constraints (int8 only,
+M<=8, N==8, K==32, sub-group 8).  Both premises turned out to be narrower than
+stated - the *native* `esimd::dpas` intrinsic takes a **u4** weight operand with
+**K=64**, i.e. exactly two 32-wide quantisation groups chained without a drain -
+so the idea was re-implemented and re-measured end to end.  It still loses, by a
+wide margin, for a different and more fundamental reason.
+
+What is real (measured on the A770, `/tmp/kilo/dpas_*.cpp`, `xmx_*.cpp`):
+
+* `esimd::dpas<8,8,int32_t,int32_t,uint32_t,uint32_t,u4,s8,64,32,64>` exists and
+  is bit-exact for a per-32 u4 weight stream against a scalar reference
+  (0/64 and 0/200 mismatches on two probes).  The operand layouts were
+  calibrated: A (s8 activations) row m -> dwords [m*8,m*8+8) with 4 k per dword
+  (plain VNNI); B (u4 weights) pair (k,n) -> dword (k/8)*8+n, nibble k%8.  The
+  nibble *order* already matches the existing u4 plane, so adopting it is a
+  one-time dword reorder of the same 44.6 MB.
+* raw throughput, operands held in registers: **s8 (K=32) 16.2, u8 (K=32) 127.2,
+  u4 (K=64) 254.1 T-MAC/s**.  Note `s8` is 16x slower than `u4`/`u8` - the Xe
+  XMX presumably lacks a native signed-8 path.
+* the same DPAS loop measured **inside a real GEMM** (M=7, K=5120, N=17408,
+  operands streamed from memory, several accumulator/BIAS variants tried):
+  **0.06 T-MAC/s**, i.e. **255 ns per dpas against a 16 ns budget - 4527x below
+  the intuition, and 55x slower than the whole dp4a GEMM (11.1 vs 0.200 ms)**.
+
+The cause is the operand feed, not the memory system and not the dpas unit:
+the full B plane streams in 0.28 ms (158 GB/s) and re-reading A costs 0.39 ms,
+but the kernel's dpas issue slot is consumed by *building* the A and B SIMD
+vectors from memory for every single dpas (384 B per dpas, 16.7 MB total - which
+would take 0.056 ms at stream rate).  The microbenchmark hides this because its
+operands are loop-invariant registers; the real kernel rebuilds them, and the
+dependency/issue cost lands entirely on the 8x8x64 dpas.  Independent
+accumulator chains (4-way) made it *worse* (13-16 ms), so it is not accumulator
+latency either - it is the per-dpas operand assembly.  Getting around that needs
+operand reuse across many dpas (a much larger M or N tile held in registers),
+which is exactly what the M<=8 (one row tile at M=7) MTP verify shape cannot
+give: with M=7 there is a single 8-row tile, so every work-group must rebuild A.
+
+The older drain-per-group measurement (per-32 format ~2.3x slower than a plain
+int8 GEMM, 0.276 -> 0.640 ms at M=8) is consistent with this: widening the group
+to 128 to let four DPAS chain would help the drain cost, but the accuracy study
+measured per-128 u4 at 9.9-10.2% relative L2 weight error against 0.077% for the
+native per-32 store (131-524x worse), so it is not admissible anyway.
+
+**Conclusion: the dp4a path stays.**  XMX's advantage is real in a
+register-resident GEMM (large M), but the workload here is a handful of rows, and
+at that shape the operand assembly dominates by two orders of magnitude.  A
+future attempt should only be made if the verify can be restructured to give each
+DPAS a large register-resident tile (e.g. batching many independent sequences so
+M is 64+), which changes the problem rather than the kernel.
 
 With the verify at a hypothetical one-decode-pass cost and free drafts the
 ceiling is ~2x (verify >= 1 weight pass + ~3.3 ms/row of attention/GDN/norm).
