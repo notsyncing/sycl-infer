@@ -148,7 +148,13 @@ void scheduler::loop() {
         // ---- admit waiting sequences ----
         {
             std::lock_guard<std::mutex> lk(e.mtx);
-            std::lock_guard<std::mutex> lk2(m);
+            // The sequence mutex is RELEASED across the engine calls below (a
+            // ~300 ms prefill / ~65 ms decode).  Holding it through them and
+            // immediately re-locking it in this loop starves
+            // scheduler::submit(): requests were only admitted once the
+            // previous generation had finished, so nothing ever batched.
+            // e.mtx still serialises the engine itself.
+            std::unique_lock<std::mutex> lk2(m);
             while (!waiting.empty()) {
                 auto s = waiting.front();
                 const auto t_a0 = std::chrono::steady_clock::now();
@@ -225,9 +231,13 @@ void scheduler::loop() {
                         s->wait_ms = dms(s->t_submit, t_pf0);
                     }
                     if (batch_pf) {
+                        lk2.unlock();
                         e.prefill_batch(s->prompt, s->prompt_pos, n, s->slot, s->prompt_pos);
+                        lk2.lock();
                     } else {
+                        lk2.unlock();
                         e.prefill_chunk(s->prompt, s->prompt_pos, n, s->slot, last_chunk);
+                        lk2.lock();
                     }
                     const auto t_pf1 = std::chrono::steady_clock::now();
                     if (tdbg) {
@@ -306,7 +316,7 @@ void scheduler::loop() {
         // ---- batched decode ----
         {
             std::lock_guard<std::mutex> lk(e.mtx);
-            std::lock_guard<std::mutex> lk2(m);
+            std::unique_lock<std::mutex> lk2(m);
             int nb = 0;
             std::vector<std::shared_ptr<sequence>> batch;
             for (auto & s : active) {
@@ -347,7 +357,9 @@ void scheduler::loop() {
                 nb++;
             }
             if (nb > 0) {
+                lk2.unlock();
                 e.decode_batch(toks.data(), poss.data(), slots.data(), nb);
+                lk2.lock();
                 if (dbg()) {
                     fprintf(stderr, "[sched] decode nb=%d:", nb);
                     for (int r = 0; r < nb; r++) {

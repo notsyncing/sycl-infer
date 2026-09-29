@@ -948,26 +948,39 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   (its split path is opt-in, and with the nat bug above fixed it verifies clean
   again), so the draft derives `ceil((pos0+n)/512)` clamped to `PF_MTP_SPLITS`
   and uses its own partials buffer - see the MTP section.
-* **The scheduler serialises requests, so nothing batches (measured, not yet
-  fixed).**  `scheduler::loop` holds the sequence mutex `m` across every engine
-  call (`prefill_batch` ~300 ms, `decode_batch` ~65 ms) and immediately
-  re-locks it, so `scheduler::submit()` is starved: with 4-16 simultaneous
-  requests every request is admitted only after the previous generation has
-  *finished*.  Measured on the 27B: 8 concurrent requests finish 9, 18, 27, ...
-  71 s apart, aggregate 14.5 tok/s = exactly one request's rate; the trace shows
-  4 submits ~5 s apart and 188/188 decode passes at `nb=1 active=1`.  Both
-  cross-sequence batching paths therefore never run, which is why the
-  pre-existing `decode_batch(nb>1)` support looks like it works: it is dead code.
-  Releasing `m` around the engine calls (keeping `e.mtx`) makes concurrent
-  admission work and reaches **4.36x aggregate** (N=1..8: 14.2 / 24.4 / 42.5 /
-  61.9 tok/s, ignore_eos, 128 tokens each).  **That is not shippable yet:** with
-  admission concurrent, both latent multi-sequence paths produce wrong output -
-  the same temperature-0 prompt fanned out to 5-6 concurrent requests returns
-  different, degenerate continuations, with the decode batch capped at 1 as well
-  as uncapped.  So fix (a) `decode_batch`'s multi-row mode-0 replay (it passes
-  the *bucket* `b->tb` as `rows` while `d_info->n_rows` is the real count) and
-  (b) the cross-sequence mode-2 prefill (slot/pos per row) before lifting the
-  cap; the mutex scope is the enabling change.
+* **The scheduler used to serialise every request; releasing the sequence
+  mutex fixes it (measured).**  `scheduler::loop` held the sequence mutex `m`
+  across every engine call (`prefill_batch` ~300 ms, `decode_batch` ~65 ms) and
+  immediately re-locked it, so `scheduler::submit()` was starved: each request
+  was admitted only after the previous generation had *finished*, and both
+  cross-sequence batching paths were dead code (8 concurrent requests finished
+  9, 18, 27, ... 71 s apart, aggregate 14.5 tok/s = exactly one request's rate,
+  with 188/188 decode passes at `nb=1 active=1`).  The engine calls now run with
+  `m` **released** (a `std::unique_lock`; `e.mtx` still serialises the engine),
+  which lets admission and the pre-existing multi-row decode batch.  Measured on
+  the 27B (temperature 0, `ignore_eos`, 128 tokens each): N=1/2/4/8 -> 14.3 /
+  24.5 / 40.1 / **55.0 tok/s**, i.e. **3.85x aggregate at N=8**.
+  **Concurrency costs bit-exactness**: the same temperature-0 prompt fanned out
+  to N concurrent requests returns coherent, *deterministic* text that can
+  differ from the single-request result - the flip happens at a near-tie
+  argmax, once a sequence joins a batch (measured: 1 of N rows is byte-exact,
+  the rest flip at the same "attention mechanism" / "**Scaled Dot-Product
+  Attention**" tie ~20 tokens in; the multiset of outputs is identical across
+  repeated runs, so it is accumulation-order numerics, not a race).  A sequence
+  admitted first and decoded alone keeps the exact early tokens; batching only
+  changes the *order* of the fp accumulation in the batched GEMMs.
+* **Cross-sequence prefill batching is NOT enabled** (it corrupts).  Packing
+  several prompts into one mode-2 forward (row-major over the concatenated
+  tokens, per-row `slot`/`pos`/`n_real_row`, one `prefill_text` per batch) was
+  implemented and produced *garbage* - degenerate continuations, not plausible
+  alternatives: `1000000000...`, `| 10 | 10 | 10 |` - even with the decode batch
+  capped at 1, and `step_info` already carries per-row `slot`/`pos`/`active`, so
+  the fault is in something reading plan-time state rather than `info`.
+  Prefill therefore stays one sequence at a time (each ~300 ms); the 3.85x above
+  is decode batching alone.  Fixing it is worth doing - at N=8 the serialised
+  prefills are ~2.4 s of the 18.6 s wall - but it needs the same
+  "N concurrent identical requests must return byte-identical output" harness,
+  run with the decode batch capped at 1 to isolate it.
 * **A partial mode-2 batch requires the oneDNN weight path.**
   `batched_prefill_fit` only allows a last row with `n_real_row < kMaxT` when
   `use_dnnl` or a multi-device GPU partition has oneDNN (`dnnl_any_dev()`); the
