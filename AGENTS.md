@@ -948,6 +948,26 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   (its split path is opt-in, and with the nat bug above fixed it verifies clean
   again), so the draft derives `ceil((pos0+n)/512)` clamped to `PF_MTP_SPLITS`
   and uses its own partials buffer - see the MTP section.
+* **The scheduler serialises requests, so nothing batches (measured, not yet
+  fixed).**  `scheduler::loop` holds the sequence mutex `m` across every engine
+  call (`prefill_batch` ~300 ms, `decode_batch` ~65 ms) and immediately
+  re-locks it, so `scheduler::submit()` is starved: with 4-16 simultaneous
+  requests every request is admitted only after the previous generation has
+  *finished*.  Measured on the 27B: 8 concurrent requests finish 9, 18, 27, ...
+  71 s apart, aggregate 14.5 tok/s = exactly one request's rate; the trace shows
+  4 submits ~5 s apart and 188/188 decode passes at `nb=1 active=1`.  Both
+  cross-sequence batching paths therefore never run, which is why the
+  pre-existing `decode_batch(nb>1)` support looks like it works: it is dead code.
+  Releasing `m` around the engine calls (keeping `e.mtx`) makes concurrent
+  admission work and reaches **4.36x aggregate** (N=1..8: 14.2 / 24.4 / 42.5 /
+  61.9 tok/s, ignore_eos, 128 tokens each).  **That is not shippable yet:** with
+  admission concurrent, both latent multi-sequence paths produce wrong output -
+  the same temperature-0 prompt fanned out to 5-6 concurrent requests returns
+  different, degenerate continuations, with the decode batch capped at 1 as well
+  as uncapped.  So fix (a) `decode_batch`'s multi-row mode-0 replay (it passes
+  the *bucket* `b->tb` as `rows` while `d_info->n_rows` is the real count) and
+  (b) the cross-sequence mode-2 prefill (slot/pos per row) before lifting the
+  cap; the mutex scope is the enabling change.
 * **A partial mode-2 batch requires the oneDNN weight path.**
   `batched_prefill_fit` only allows a last row with `n_real_row < kMaxT` when
   `use_dnnl` or a multi-device GPU partition has oneDNN (`dnnl_any_dev()`); the
