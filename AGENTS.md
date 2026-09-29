@@ -648,6 +648,28 @@ stream (acceptance ignores k).  Measured: a low-acceptance prompt goes 42.0 ->
 38.7 ms/token, a high-acceptance one auto-raises k to the cap and runs
 27.5 ms/token.
 
+**MTP does not compose with batching, so the server defaults to the
+scheduler.**  A batched decode step measures `59.0 ms + 10.7 ms per row` (fitted
+over N=1/2/4/8 at 70.0/81.6/99.7/145.5 ms), and MTP spends `k+1 = 5` verify rows
+per `acc+1` emitted tokens - at the measured acc 1.49 that is **2.0 rows per
+token against the plain decode's 1.0**.  Both paths pay the same per-row cost,
+so for a fixed row budget plain batching wins as soon as the 59 ms weight pass is
+amortised: modelled `S=1/2/4/8 -> plain 69.7/40.2/25.5/18.1 ms/token vs MTP
+50.4/36.0/28.8/25.1`, i.e. MTP wins only at `S<=2` (1.38x at S=1) and loses from
+S=4 (0.89x) to S=8 (0.72x).  This is the same arithmetic-intensity ceiling from
+the other side: batching amortises the weight pass for free, so paying k+1 rows
+for ~2.5 tokens is strictly worse than paying 1 row per token.
+`server.cpp`'s `mtp_direct` therefore no longer routes greedy requests into the
+single-sequence MTP loop by default - doing so took the engine for the whole
+generation and serialised everything (measured: 8 concurrent greedy 128-token
+requests, 17.5 tok/s with MTP vs 55.0 through the scheduler).  `PF_MTP_SERVER=1`
+restores the old routing for a strictly single-request workload.
+MTP's remaining value is single-request latency: on the server, same prompt,
+same greedy settings, 68.6 -> 58.3 ms/token = **1.18x**, and it is strongly
+prompt-dependent (acc 1.49 on a structured "explain attention" prompt against
+2.28 on a shorter one).  The lossy u4 draft head is not the cause: acc 1.49 (u4)
+vs 1.51 (exact int8 head), so `PF_MTP_HEAD_W4` stays on for the cheaper draft.
+
 **Three speculative-decoding ideas that do not pay (all measured).**  The
 engine is memory bound in *both* paths, so the only lever is tokens per weight
 pass; the ceiling is the text's information content, ~3.1-3.3 accepted tokens

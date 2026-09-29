@@ -886,8 +886,24 @@ void run_mm_choice(engine & e, const mm_prompt & mp, const gen_params & gp, cons
 // and nothing else needs the logits machinery (logprobs, n > 1).  The loop owns
 // its sequence's block table and recurrent state, so such a request bypasses
 // the scheduler exactly like the multimodal path.
+// MTP is a *single-sequence* loop: it owns its sequence's block table and
+// recurrent state, so it cannot join the scheduler and running it here means
+// taking the engine for the whole generation.  That is the right trade for one
+// request and the wrong one for many: measured on the 27B with 8 concurrent
+// greedy 128-token requests, the scheduler's batched decode reaches 55.0 tok/s
+// while this path serialises to 17.5 tok/s.  Worse, batching and MTP do not
+// compose - the batched decode step is `59.0 + 10.7 ms per row`, and MTP spends
+// k+1 = 5 rows per 2.49 emitted tokens (2.0 rows/token) against the plain
+// decode's 1.0, so a hypothetical batched MTP loses to plain batching for S>=4
+// (S=8: 25.1 vs 18.1 ms/token).  The server therefore defaults to the
+// scheduler; set PF_MTP_SERVER=1 to route greedy requests through MTP instead
+// (only worth it for a strictly single-request workload).
 bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
-    return e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
+    static const bool on = [] {
+        const char * v = getenv("PF_MTP_SERVER");
+        return v && atoi(v) != 0;
+    }();
+    return on && e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
 }
 
 // Run one text prompt through the single-sequence engine path (no scheduler).
