@@ -44,8 +44,11 @@ struct dnnl_gemm {
     // The matmul keeps oneDNN's grouped f16 weight scales (= step) and moves
     // the offset (zero-point) into a separate correction term, because
     // oneDNN's grouped zero-point descriptors do not validate.
+    // any_type: pack a type with no native 4-bit grid (the draft LM head).
+    // gemv_only: skip the prefill primitive ladder - the consumer is the M=1
+    // u4 GEMV only (the MTP draft layer, which never prefills).
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                       bool any_type = false);
+                       bool any_type = false, bool gemv_only = false);
     bool has_weight_w4(const void * key) const;
 
     // ---- native-width 5-bit weights (Q5_K, see common/w4.h) ---------------

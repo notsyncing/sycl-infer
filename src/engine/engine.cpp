@@ -1120,15 +1120,43 @@ bool engine::setup_md_dnnl() {
             // The MTP draft layer runs on --mtp-device, so its linears (and the
             // eh_proj input projection) are converted into that partition's
             // oneDNN table, keyed by their host pointers.
+            //
+            // NOTE: the MTP layer's own linears are deliberately NOT taken to
+            // 4 bits.  They are Q6_K/Q8_0 (338 MB), and the generic per-32 u4
+            // pack costs 2.6% relative L2 on Q6_K (measured: cos 0.9949,
+            // max|diff| 0.031 on blk.64.nextn.eh_proj) - 8x the error PF_W4_ALL
+            // is documented at.  The layer is read once per drafted token and a
+            // wrong draft token costs the whole verify, so the bytes saved are
+            // not worth it: with a u4 layer the acceptance collapsed to 0.11
+            // (draft 5.4 vs 16.9 ms, but 83 vs 36 ms/token net).
+            // PF_MTP_LAYER_W4 exists only to reproduce/measure that.
+            static const bool layer_w4 = [] {
+                const char * e = getenv("PF_MTP_LAYER_W4");
+                return e && atoi(e) != 0;
+            }();
             const mtp_layer_t & M = m.mtp;
-            add(M.eh_proj);
-            add(M.wq);
-            add(M.wk);
-            add(M.wv);
-            add(M.wo);
-            add(M.ffn_gate);
-            add(M.ffn_up);
-            add(M.ffn_down);
+            bool layer_w4_ok = false;
+            auto add_mtp = [&](const wt & t) {
+                if (layer_w4 && t.data) {
+                    const int K = t.K;
+                    const int N = t.N;
+                    if (D->add_weight_w4(t.data, t.data, t.type, K, N, /*any_type=*/true, /*gemv_only=*/true)) {
+                        layer_w4_ok = true;
+                        m.page_out_tensor(t);
+                        return;
+                    }
+                }
+                add(t);
+            };
+            add_mtp(M.eh_proj);
+            add_mtp(M.wq);
+            add_mtp(M.wk);
+            add_mtp(M.wv);
+            add_mtp(M.wo);
+            add_mtp(M.ffn_gate);
+            add_mtp(M.ffn_up);
+            add_mtp(M.ffn_down);
+            mtp_layer_w4_ = layer_w4_ok;
         }
         if (d == 0 && m.output.data != m.tok_embd.data) {
             // The LM head is a global pinned to backend 0.  Convert it here -

@@ -918,7 +918,7 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // per-32-group f16 step/offset planes.  Returns false for unsupported types,
 // which keep their int8 conversion.
 bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                              bool any_type) {
+                              bool any_type, bool gemv_only) {
     if (!key || !host_data || !(any_type || si::w4_supported(ggml_type))) {
         return false;
     }
@@ -970,13 +970,15 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     // tensors never upload - that would read garbage.  cap_M = kMaxB*kMaxT is
     // the largest M any plan uses, so requiring it covers every call.
     //
-    // `any_type` (the draft-only LM head) is consumed by the M=1 u4 GEMV and
-    // the M <= 13 native GEMM, neither of which touches the oneDNN f32
-    // accumulator scratch or needs a prim4 - and a 248k-wide head can never
-    // have one, which is why the target head is int8.  Register it GEMV-only.
-    bool any = any_type;
+    // `any_type` (the draft-only LM head and MTP layer tensors) is consumed by
+    // the M=1 u4 GEMV and the M <= 13 native GEMM, neither of which touches the
+    // oneDNN f32 accumulator scratch or needs a prim4 - and a 248k-wide head can
+    // never have one, which is why the target head is int8.  Register it
+    // GEMV-only.  `gemv_only` is the same thing for a *native* (Q4_K) tensor
+    // whose prefill ladder cannot be built at this shape.
+    bool any = any_type || gemv_only;
     const int ladder[] = {1, kMaxT, 2 * kMaxT, 3 * kMaxT, 4 * kMaxT, 8 * kMaxT, 16 * kMaxT};
-    if (!any_type) {
+    if (!(any_type || gemv_only)) {
         if ((size_t)p->cap_M * (size_t)N > p->acc_cap) {
             sycl::free(e.vals, p->q);
             sycl::free(e.scales, p->q);

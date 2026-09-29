@@ -122,17 +122,21 @@ void engine::mtp_gemv(int ci, int M) {
     if (D == nullptr || xq.x == nullptr) {
         throw std::runtime_error("mtp: the oneDNN int8 weight path is required");
     }
-    // The draft's single-token LM head can run from the u4 copy; the u4 GEMV
-    // reads the even/odd activation split, so that call must produce it.
-    const bool w4_head = ci == 4 && mtp_head_w4_ && M == 1;
-    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_head);
+    // Any single-token draft call can run from a u4 copy (the shared LM head
+    // under its private key, the MTP layer's own linears under their own), and
+    // the u4 GEMV reads the even/odd activation split - so *every* call that
+    // could hit a u4 weight must produce it, not just the head's.  The u4
+    // tensors themselves are found through gemm_w4's key lookup, so no special
+    // dispatch is needed here beyond the split.
+    const bool w4_draft = M == 1 && (mtp_head_w4_ || mtp_layer_w4_);
+    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
     const int gb = p.call_group_begin[(size_t)ci];
     const int gc = p.call_group_count[(size_t)ci];
     for (int g = 0; g < gc; g++) {
         const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
         for (int j = 0; j < gr.n; j++) {
             const gemv_seg & s = d_segs_mtp[gr.off + j];
-            const void * wk = w4_head ? (const void *)mtp_head_w4_key_ : s.w;
+            const void * wk = (ci == 4 && mtp_head_w4_) ? (const void *)mtp_head_w4_key_ : s.w;
             if (D->gemm_w4(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
@@ -456,6 +460,16 @@ void engine::mtp_rollback(int j) {
 }
 
 // ---------------------------------------------------------------------------
+// NOTE on the verify's accept test (PF_MTP_ARGMAX_CPU=1 for the old path): the
+// per-row argmax runs on the device and copies back k+1 ints instead of
+// (k+1)*n_vocab floats (~7 MB/cycle at k=6).  Measured: this does NOT make the
+// engine faster - 200.2/199.8 s (host scan) against 199.8/200.1 s (device) for a
+// 2000-token run, and user+sys CPU time is unchanged (~150 s both ways).  The
+// transfer was never on the critical path: the verify's own sync dominates, and
+// the copy overlaps the next cycle's draft.  It is kept because it is strictly
+// less host work and bit-identical (ties resolve to the lowest index, matching
+// the host `v[i] > v[best]` scan), but do not expect it to show up in t/s.
+//
 // Speculative generation loop (greedy).  Emits exactly the tokens a plain greedy
 // decode would: the target's own sampled token is always the last one emitted
 // per cycle, so acceptance can only ever skip work, never change the output.
@@ -895,8 +909,18 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             // the LM head runs on device 0 while the MTP layer may live on a
             // partition device: `q` is not ordered against dev_queue(0), so a
             // q.wait()/q.memcpy here reads the *previous* step's logits and the
-            // draft chain degenerates into a stale-logits echo.
-            sync_all();
+            // draft chain degenerates into a stale-logits echo.  Only the MTP
+            // device and device 0 produced anything this step, so synchronizing
+            // just those two beats the multi-device sync_all's serial sweep of
+            // every backend (this is k of the 9 syncs per cycle).
+            if (multi_dev) {
+                if (mtp_dev != 0) {
+                    dev_queue(mtp_dev).wait();
+                }
+                dev_queue(0).wait();
+            } else {
+                backend().synchronize();
+            }
             dev_queue(0).memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
             cand[(size_t)i + 1] = argmax_f(h_logits, hp.n_vocab);
             static const bool lstat = getenv("PF_MTP_LSTAT") != nullptr;
@@ -1004,7 +1028,41 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         sync_all();
         const auto tc2 = now_t();
         t_verify += ms_t(tc1, tc2);
-        dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
+        // The accept test needs only the per-row argmax, so it runs on the device
+        // and copies back k+1 ints instead of (k+1)*n_vocab floats (~7 MB/cycle
+        // at k=6, comparable to a whole draft pass).  The bonus token still goes
+        // through sample_token, but the MTP loop is greedy-only and a greedy
+        // sample_token is exactly the row argmax - so when nothing else can
+        // perturb the choice the device indices serve both and the host copy
+        // leaves the hot path entirely.
+        const bool greedy = (gp.temperature <= 0.f || gp.top_k == 1);
+        const bool no_penalty =
+            gp.repeat_penalty == 1.0f && gp.presence_penalty == 0.f && gp.frequency_penalty == 0.f;
+        const bool have_dev_argmax = greedy && no_penalty && gp.logit_bias.empty() && !mtp_dbg();
+        // `dev_argmax` must be device memory: a kernel cannot write a host stack
+        // array.
+        static int32_t * d_argmax = nullptr;
+        if (!d_argmax) {
+            d_argmax = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
+        }
+        if (have_dev_argmax) {
+            backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, nullptr, k + 1);
+            dev_queue(0).memcpy(h_argmax, d_argmax, (size_t)(k + 1) * 4).wait();
+            if (getenv("PF_MTP_AMCHK") != nullptr) {
+                dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
+                for (int i = 0; i <= k; i++) {
+                    const int h = argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
+                    if (h != (int)h_argmax[i]) {
+                        fprintf(stderr, "[mtp] amchk MISMATCH row=%d dev=%d host=%d\n", i, (int)h_argmax[i], h);
+                    }
+                }
+            }
+        } else {
+            dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
+        }
+        auto row_argmax = [&](int i) -> int {
+            return have_dev_argmax ? (int)h_argmax[i] : argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
+        };
         if (mtp_dbg()) {
             fprintf(stderr, "[mtp] pos=%d drafts:", pos);
             for (int i = 1; i <= k; i++) {
@@ -1012,14 +1070,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             }
             fprintf(stderr, "  target:");
             for (int i = 0; i < k; i++) {
-                fprintf(stderr, " %d", argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab));
+                fprintf(stderr, " %d", row_argmax(i));
             }
             fprintf(stderr, "\n");
         }
         int j = 0;
         static const bool no_accept = getenv("PF_MTP_NOACCEPT") != nullptr;
         while (!no_accept && j < std::min(k, n_ver - 1)) {
-            const int t = argmax_f(h_logits + (size_t)j * hp.n_vocab, hp.n_vocab);
+            const int t = row_argmax(j);
             if (t != cand[(size_t)j + 1]) {
                 break;
             }
@@ -1028,7 +1086,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // adopt the main model's token at the first mismatch (or past the drafts)
         {
             const float * row = h_logits + (size_t)j * hp.n_vocab;
-            int bonus = sample_token(row, hp.n_vocab, gp, out, ss);
+            int bonus = have_dev_argmax ? (int)h_argmax[j] : sample_token(row, hp.n_vocab, gp, out, ss);
             // emit the accepted drafts then the target's own token
             for (int i = 1; i <= j; i++) {
                 if ((int)out.size() >= gp.max_tokens) {
@@ -1072,15 +1130,23 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             comm.push_back(tok);
             mtp_forward(comm.data(), d_mtp_main_h, d_mtp_hprev, j + 2, 0, pos, /*with_head=*/false);
         }
-        sync_all();
+        // The commit and the rollback are back-to-back and both end in a
+        // device-wide barrier, so the commit's own sync is pure latency: the
+        // rollback's memcpys are queued behind the commit's kernels on the same
+        // in-order queues, and one sync after both waits for everything.  (At
+        // ~0.45 ms per sync_all x 2 devices this was ~0.9 ms of the 4.0 ms
+        // "commit" phase; the phase split below keeps the commit timer
+        // meaningful by charging the shared barrier to the rollback.)
         const auto tc4 = now_t();
-        t_commit += ms_t(tc3, tc4);
         static const bool no_rb = getenv("PF_MTP_NORB") != nullptr;
         if (!no_rb) {
             mtp_rollback(j);
+        } else {
+            sync_all();
         }
         sync_all();
         const auto tc5 = now_t();
+        t_commit += ms_t(tc3, tc4);
         t_rb += ms_t(tc4, tc5);
         t_cycles++;
         t_tok += j + 1;

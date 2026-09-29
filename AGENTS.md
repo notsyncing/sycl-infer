@@ -574,8 +574,33 @@ stream (acceptance ignores k).  Measured: a low-acceptance prompt goes 42.0 ->
 38.7 ms/token, a high-acceptance one auto-raises k to the cap and runs
 27.5 ms/token.
 
+**Three speculative-decoding ideas that do not pay (all measured).**  The
+engine is memory bound in *both* paths, so the only lever is tokens per weight
+pass; the ceiling is the text's information content, ~3.1-3.3 accepted tokens
+per chain for a 27B model (measured acc 2.1-2.8 drafts + the bonus), which caps
+the speedup at ~2x on this hardware.  Verified dead ends:
+
+* **Taking the MTP layer's own linears to 4 bits** (`PF_MTP_LAYER_W4`, opt-in,
+  default off).  It is Q6_K/Q8_0 (338 MB) and the generic per-32 u4 pack costs
+  2.6% relative L2 on Q6_K (cos 0.9949 on `blk.64.nextn.eh_proj` - 8x the error
+  `PF_W4_ALL` is documented at).  The draft got 3x cheaper (16.9 -> 5.4 ms) but
+  the acceptance collapsed to 0.11 and the net went 36.4 -> 83.4 ms/token.
+  A wrong draft costs the whole verify, so the bytes saved are never worth it.
+* **Moving the verify's accept argmax onto the device** (`PF_MTP_ARGMAX_CPU=1`
+  for the old host scan; `mtp_argmax.cpp` + `compute_backend::mtp_argmax`).  This
+  removes a real 7 MB/cycle host copy, but it is *not* a speedup: 200.2/199.8 s
+  (host) against 199.8/200.1 s (device) for 2000 tokens, with identical user+sys
+  CPU time.  The transfer was never on the critical path - the verify's own sync
+  dominates and the copy overlaps the next draft.  Kept for the lower host work
+  and bit-identical output, not for t/s.
+* **Removing the commit/rollback syncs.**  `commit` measured 4.0 ms and looked
+  like pure overhead, but it is one device-wide barrier per cycle: merging it
+  into the rollback's just moves the cost (commit 4.0 -> 0.3, rb 1.5 -> 4.0, net
+  unchanged at 36.2 vs 36.4 ms/token).  The barrier itself is the cost.
+
 Diagnostics (all env-gated, `0`/unset = off unless noted): `PF_MTP` (draft
-length, `--mtp` overrides), `PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms),
+length, `--mtp` overrides), `PF_MTP_ARGMAX_CPU`, `PF_MTP_LAYER_W4`, `PF_MTP_AMCHK`,
+`PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms),
 `PF_MTP_DEBUG`/`PF_MTP_DUMP`, `PF_MTP_VERIFY_PAD`/`PF_MTP_VERIFY_M32` (pad the
 verify's GEMM M), `PF_MTP_VERIFYN`, `PF_MTP_DECCHK` (verify row 0 vs a plain
 decode of the same token), `PF_MTP_LSTAT`, `PF_MTP_DECODE_H`, `PF_MTP_NOACCEPT`,

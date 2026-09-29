@@ -135,6 +135,10 @@ void mtp_capture_launch(sycl::queue & q, const float * src, float * dst, int n_r
 void mtp_concat_launch(sycl::queue & q, const void * table, uint32_t type, size_t row_bytes, const float * enorm,
                        const float * hnorm, const float * h, const float * h_prev, const step_info * info,
                        float * out, int n_embd, float eps);
+// Per-row argmax over an [M][n] f32 logits matrix, writing only the indices
+// (and optionally the values) back: the MTP verify needs it for its accept test,
+// and a host copy of M*n_vocab floats per cycle costs ~7 MB.
+void mtp_argmax_launch(sycl::queue & q, const float * logits, int n, int32_t * out_idx, float * out_val, int M);
 void copy_row_launch(sycl::queue & q, const float * src, float * dst, const step_info * info, int n, int row = -1);
 void embed_launch(sycl::queue & q, const void * table, uint32_t type, const step_info * info, float * out, int n_embd,
                   size_t row_bytes);

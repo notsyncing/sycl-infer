@@ -36,6 +36,9 @@ struct gpu_backend : compute_backend {
     void mtp_capture(const float * src, float * dst, int n_rows, int n) override {
         mtp_capture_launch(q, src, dst, n_rows, n);
     }
+    void mtp_argmax(const float * logits, int n, int32_t * out_idx, float * out_val, int M) override {
+        mtp_argmax_launch(q, logits, n, out_idx, out_val, M);
+    }
     void mtp_concat(const void * table, uint32_t type, size_t row_bytes, const float * enorm, const float * hnorm,
                     const float * h, const float * h_prev, const step_info * info, float * out, int n_embd,
                     float eps) override {

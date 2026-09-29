@@ -487,7 +487,9 @@ struct engine {
     // private key (the target keeps its exact int8 head, so only the drafts -
     // and hence acceptance, never the emitted stream - can move).
     float * d_mtp_partials = nullptr; // the MTP's own attention partials (see mtp_splits)
+    int32_t h_argmax[kMaxB] = {0};    // host mirror of the verify's per-row argmax
     bool mtp_head_w4_ = false;
+    bool mtp_layer_w4_ = false; // the MTP layer's own linears are GEMV-only u4 too
     char mtp_head_w4_key_[1] = {0};
     // The MTP draft is a single-token decode over the MTP layer's KV, so it gets
     // the decode's key-parallel split count - *not* n_splits, which the

@@ -105,6 +105,21 @@ struct cpu_backend : compute_backend {
     void mtp_capture(const float * src, float * dst, int n_rows, int n) override {
         std::memcpy(dst, src, (size_t)n_rows * (size_t)n * sizeof(float));
     }
+    void mtp_argmax(const float * logits, int n, int32_t * out_idx, float * out_val, int M) override {
+        for (int r = 0; r < M; r++) {
+            const float * row = logits + (size_t)r * n;
+            int best = 0;
+            for (int i = 1; i < n; i++) {
+                if (row[i] > row[best]) {
+                    best = i;
+                }
+            }
+            out_idx[r] = best;
+            if (out_val) {
+                out_val[r] = row[best];
+            }
+        }
+    }
     void mtp_concat(const void * table, uint32_t, size_t, const float *, const float *, const float *, const float *,
                     const step_info *, float *, int, float) override {
         (void)table;

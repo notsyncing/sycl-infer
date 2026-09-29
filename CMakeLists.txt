@@ -100,6 +100,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/gated_norm.cpp
     src/backend/gpu/kernels/xq.cpp
     src/backend/gpu/kernels/mtp.cpp
+    src/backend/gpu/kernels/mtp_argmax.cpp
     src/backend/gpu/kernels/dp4a_common.cpp
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp

@@ -42,6 +42,8 @@ struct compute_backend {
     // MTP (NextN) draft head input preparation, see kernels.h
     // MTP: copy the post-output-norm hidden rows into the draft head's buffer
     virtual void mtp_capture(const float * src, float * dst, int n_rows, int n) = 0;
+    // [M][n] logits -> per-row argmax (indices on device; the MTP accept test)
+    virtual void mtp_argmax(const float * logits, int n, int32_t * out_idx, float * out_val, int M) = 0;
     virtual void mtp_concat(const void * table, uint32_t type, size_t row_bytes, const float * enorm,
                             const float * hnorm, const float * h, const float * h_prev, const step_info * info,
                             float * out, int n_embd, float eps) = 0;
