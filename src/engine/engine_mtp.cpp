@@ -891,7 +891,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     int k = mtp_k;
     std::vector<int> cand((size_t)mtp_k + 1);
     static const bool mt = getenv("PF_MTP_TIME") != nullptr;
-    double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0, t_emit = 0, t_cb = 0, t_am = 0;
+    double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0, t_emit = 0, t_cb = 0, t_am = 0, t_cyc = 0;
     long t_acc = 0;
     int t_cycles = 0, t_tok = 0;
     auto now_t = [] { return std::chrono::high_resolution_clock::now(); };
@@ -1148,15 +1148,25 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // meaningful by charging the shared barrier to the rollback.)
         const auto tc4 = now_t();
         static const bool no_rb = getenv("PF_MTP_NORB") != nullptr;
+        // The rollback only *enqueues* memcpys into the per-device in-order
+        // queues, and nothing on the host reads the recurrent state, so the
+        // device-wide barrier that used to follow it is pure latency: the next
+        // device work (the draft, which reads that state) is already ordered
+        // after the memcpys on the same queue.  PF_MTP_NORBSYNC=1 keeps the old
+        // barrier for A/B.
+        static const bool rb_sync = getenv("PF_MTP_NORBSYNC") != nullptr;
         if (!no_rb) {
             mtp_rollback(j);
+            if (rb_sync) {
+                sync_all();
+            }
         } else {
             sync_all();
         }
-        sync_all();
         const auto tc5 = now_t();
         t_commit += ms_t(tc3, tc4);
         t_rb += ms_t(tc4, tc5);
+        t_cyc += ms_t(tc0, now_t()); // whole loop body, from the draft's start
         t_cycles++;
         t_tok += j + 1;
         t_acc += j;
@@ -1174,8 +1184,11 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     "ms/cycle | %.1f ms/token\n",
                     t_cycles, t_tok, (double)t_acc / t_cycles, t_draft / t_cycles, t_verify / t_cycles,
                     t_commit / t_cycles, t_rb / t_cycles, (t_draft + t_verify + t_commit + t_rb) / t_tok);
-            fprintf(stderr, "[mtp] emit: %.1f ms/cycle  cb: %.1f  argmax-blk: %.1f ms/cycle\n",
-                    t_emit / t_cycles, t_cb / t_cycles, t_am / t_cycles);
+            fprintf(stderr, "[mtp] emit: %.1f ms/cycle  cb: %.1f  argmax-blk: %.1f\n", t_emit / t_cycles,
+                    t_cb / t_cycles, t_am / t_cycles);
+            fprintf(stderr, "[mtp] cycle-wall: %.1f ms (sum %.1f = draft+verify+commit+rb+emit), gap %.1f ms/cycle\n",
+                    t_cyc / t_cycles, (t_draft + t_verify + t_commit + t_rb + t_emit) / t_cycles,
+                    (t_cyc - (t_draft + t_verify + t_commit + t_rb + t_emit)) / t_cycles);
         }
         static const bool statechk = getenv("PF_MTP_STATECHK") != nullptr;
         if (statechk && !h_save_.empty()) {

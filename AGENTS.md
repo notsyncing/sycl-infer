@@ -687,6 +687,36 @@ the ~7 MB logits copy of a 5-row verify - correct, but only reachable when a
 repeat/presence/frequency penalty makes the device argmax invalid, and the
 server and CLI both default to `repeat_penalty` 1.0 so the device path is used.
 
+**Where MTP's remaining time is, and the one lever left (measured).**  After the
+argmax fix the cycle is ~104 ms for ~2.48 emitted tokens: draft **13.0**,
+verify **88.3**, commit 0.3, rollback 0.9, emit 1.2, and the loop body is now
+fully accounted for (`cycle-wall` prints a 0.0 ms gap against the phase sum).
+The verify decomposes as `72.2 ms + 4.0 ms per row` (M=1/3/5 -> 72.2/81.6/84.9),
+i.e. its fixed cost is *exactly one plain decode* (72.2 ms = 16.3 GB at the
+format limits) and the 4 extra rows cost 16 ms.  So:
+
+* the **weight stream (72 ms) is at the format limit** - 226 GB/s end to end and
+  ~272 GB/s once the non-GEMM work is removed, against the M=1 GEMV's 274-294 -
+  and XMX cannot beat it (it reads identical bytes);
+* the **draft (13 ms) is ~100% the draft LM head's u4 stream**: 4 steps x 794 MB
+  at the u4 M=1 rate (294 GB/s) = 10.8 ms, confirmed by the head-width A/B
+  (u4 13.0 vs int8 15.0 ms for +0.48 GB/step).  It is also at the format limit;
+* the rollback's device-wide barrier is **not** worth removing: dropping it takes
+  the phase from 3.9 to 0.9 ms/cycle but the wall does not move (8.74 -> 8.76 s
+  for 192 tokens) because the freed time reappears in the draft's first wait -
+  the same "the cost just moves" result as the commit/rollback merge below.  It
+  is kept (byte-identical output over 5 runs, one fewer barrier).
+
+The **only lever left is fewer bytes in the draft readout**.  The draft needs
+just the argmax of the head, but reads all 248320 rows (794 MB) per drafted
+token.  Restricting that to a candidate set - e.g. the previous step's top-N, or
+the verify's own top-N logits, which are already on the host - would read ~0.25 MB
+instead (64 rows), taking the cycle to ~92 ms and the single-request speedup
+from ~1.5x to ~1.9x.  It is a design change with an acceptance risk (the draft's
+argmax is then restricted to the candidate set) and is NOT implemented: it needs
+a gather-GEMV that reads selected u4 head rows, and the same
+"identical stream vs the unconstrained draft" harness to bound the loss.
+
 **Three speculative-decoding ideas that do not pay (all measured).**  The
 engine is memory bound in *both* paths, so the only lever is tokens per weight
 pass; the ceiling is the text's information content, ~3.1-3.3 accepted tokens
