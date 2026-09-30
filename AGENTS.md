@@ -665,10 +665,27 @@ generation and serialised everything (measured: 8 concurrent greedy 128-token
 requests, 17.5 tok/s with MTP vs 55.0 through the scheduler).  `PF_MTP_SERVER=1`
 restores the old routing for a strictly single-request workload.
 MTP's remaining value is single-request latency: on the server, same prompt,
-same greedy settings, 68.6 -> 58.3 ms/token = **1.18x**, and it is strongly
-prompt-dependent (acc 1.49 on a structured "explain attention" prompt against
-2.28 on a shorter one).  The lossy u4 draft head is not the cause: acc 1.49 (u4)
-vs 1.51 (exact int8 head), so `PF_MTP_HEAD_W4` stays on for the cheaper draft.
+same greedy settings, 68.6 -> **45.5 ms/token = 1.51x** (was 58.3 / 1.18x before
+the accept-argmax fix below), and it is strongly prompt-dependent (acc 1.49 on a
+structured "explain attention" prompt against 2.28 on a shorter one).  The lossy
+u4 draft head is not the cause: acc 1.49 (u4) vs 1.51 (exact int8 head), so
+`PF_MTP_HEAD_W4` stays on for the cheaper draft.
+
+**The accept argmax was 24% of the MTP cycle (fixed).**  `mtp_argmax_launch` was
+first written as `parallel_for(range<1>(M))` - one work-item per row - which on
+a 5-row verify means five GPU threads each scanning 248320 floats serially.  It
+measured **33.7 ms/cycle**, more than a third of the timed cycle, and since
+`mtp_verify` ends with `sync_all()` that cost is real GPU occupancy, not a
+hidden sync.  It is now one 256-lane work-group per row with a strided coalesced
+walk and an SLM tree reduction, and the reduction breaks ties to the *lowest*
+index (and so does the per-lane scan) to stay bit-identical to the host's
+`if (v[i] > best)`: **33.7 -> 1.2 ms/cycle (28x)**, verified by
+`PF_MTP_AMCHK` (device vs host argmax, 0 mismatches).  The whole cycle went from
+~138 to ~106 ms and single-request latency 58.3 -> 45.5 ms/token.
+`PF_MTP_ARGMAX_CPU=1` still selects the host scan, which costs ~34 ms/cycle for
+the ~7 MB logits copy of a 5-row verify - correct, but only reachable when a
+repeat/presence/frequency penalty makes the device argmax invalid, and the
+server and CLI both default to `repeat_penalty` 1.0 so the device path is used.
 
 **Three speculative-decoding ideas that do not pay (all measured).**  The
 engine is memory bound in *both* paths, so the only lever is tokens per weight

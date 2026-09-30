@@ -891,7 +891,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     int k = mtp_k;
     std::vector<int> cand((size_t)mtp_k + 1);
     static const bool mt = getenv("PF_MTP_TIME") != nullptr;
-    double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0;
+    double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0, t_emit = 0, t_cb = 0, t_am = 0;
     long t_acc = 0;
     int t_cycles = 0, t_tok = 0;
     auto now_t = [] { return std::chrono::high_resolution_clock::now(); };
@@ -1045,6 +1045,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         if (!d_argmax) {
             d_argmax = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
         }
+        const auto tam0 = now_t();
         if (have_dev_argmax) {
             backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, nullptr, k + 1);
             dev_queue(0).memcpy(h_argmax, d_argmax, (size_t)(k + 1) * 4).wait();
@@ -1060,6 +1061,13 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         } else {
             dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
         }
+        t_am += ms_t(tam0, now_t());
+        auto emit_cb = [&](int t) -> bool {
+            const auto a = now_t();
+            const bool r = cb(t);
+            t_cb += ms_t(a, now_t());
+            return r;
+        };
         auto row_argmax = [&](int i) -> int {
             return have_dev_argmax ? (int)h_argmax[i] : argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
         };
@@ -1099,7 +1107,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 if (dbg_gen) {
                     fprintf(stderr, "[mtp] accept pos=%d id=%d\n", pos + i, cand[(size_t)i]);
                 }
-                if ((!gp.ignore_eos && is_eos(cand[(size_t)i])) || !cb(cand[(size_t)i])) {
+                if ((!gp.ignore_eos && is_eos(cand[(size_t)i])) || !emit_cb(cand[(size_t)i])) {
                     for (int b : blocks) {
                         free_block(b);
                     }
@@ -1114,11 +1122,12 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             if (dbg_gen) {
                 fprintf(stderr, "[mtp] cycle pos=%d accepted=%d bonus=%d\n", pos, j, tok);
             }
-            if ((!gp.ignore_eos && is_eos(tok)) || !cb(tok)) {
+            if ((!gp.ignore_eos && is_eos(tok)) || !emit_cb(tok)) {
                 break;
             }
         }
         const auto tc3 = now_t();
+        t_emit += ms_t(tc2, tc3); // accept + argmax + sampling + the host callback
         // ---- commit --------------------------------------------------------
         // Rebuild the MTP KV for the *committed* tokens: cand[0..j] plus the
         // target's own bonus token.  Rebuilding it from the raw drafts (as this
@@ -1165,6 +1174,8 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     "ms/cycle | %.1f ms/token\n",
                     t_cycles, t_tok, (double)t_acc / t_cycles, t_draft / t_cycles, t_verify / t_cycles,
                     t_commit / t_cycles, t_rb / t_cycles, (t_draft + t_verify + t_commit + t_rb) / t_tok);
+            fprintf(stderr, "[mtp] emit: %.1f ms/cycle  cb: %.1f  argmax-blk: %.1f ms/cycle\n",
+                    t_emit / t_cycles, t_cb / t_cycles, t_am / t_cycles);
         }
         static const bool statechk = getenv("PF_MTP_STATECHK") != nullptr;
         if (statechk && !h_save_.empty()) {
