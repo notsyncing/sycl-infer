@@ -596,6 +596,35 @@ to 128 to let four DPAS chain would help the drain cost, but the accuracy study
 measured per-128 u4 at 9.9-10.2% relative L2 weight error against 0.077% for the
 native per-32 store (131-524x worse), so it is not admissible anyway.
 
+**`nat_gemm_launch` cannot serve prefill, and it is a hard limit, not a missing
+instantiation.**  `nat_gemm_impl` stages the call's whole 32-group activation tile in
+SLM (`local_accessor<int8_t,1> act_s((size_t)M * KT * APAD, h)`, `KT=32`), i.e. `M x 1024`
+bytes: with `APAD=32` that caps it at M ~ 56 rows and with the `APAD=48` the u4 path
+prefers at M >= 12, M ~ 37 - against DG2's 64 KB of SLM per work-group.  **Prefill's GEMM
+M is the total token count** (`rows` in `record_forward`, `tbm = (mode == 2 && !single) ?
+rows : tb`), so a 512-token prompt is *one* mode-2 forward at M=512, and `batched_prefill_fit`
+takes the whole remainder up to `kMaxB*kMaxT`.  On the main configuration (oneDNN on,
+multi-device with a GPU partition) prefill is therefore always mode 2, mode 1's M=kMaxT=32
+chunks are never used, and no prefill call lands inside nat_gemm's M <= 13 window.  Turning
+on the even/odd activation split for prefill would only buy short prompts (< 13 tokens).
+
+**What prefill actually costs, measured on the 27B / 2x A770** (`llama-benchy 0.4.0`,
+`--pp 512 --tg 128 --depth 0 --runs 3 --exact-tg`, `PF_PREFIX_CACHE=0`): **pp512
+2870 t/s** (ttft 187 ms, e2e_ttft 1286 ms) and **tg128 14.63 t/s** - note the depth-0 pp
+number is ~3x the 911 t/s at depth 16k the attention work adds below.  512 tokens in
+178 ms against 24.5 GB of *int8* weight bytes is ~138 GB/s effective, i.e. **~35 % of the
+card's read ceiling**, so prefill is not purely weight-bound; oneDNN's grouped-scale int8
+matmul is doing real work here (its own ceiling on this box measures 154-323 GB/s).
+Replaying the same 497-call list with the production dp4a launchers instead would cost
+~1.93 s at M=512 (53.93 ms + 511 x 3.67 ms), i.e. **oneDNN is ~11x better than dp4a at
+this M**, which is why prefill needs a *blocked large-M* kernel and neither nat_gemm
+(M-capped) nor dp4a is the answer.  The one remaining prefill lever is a native-u4 large-M
+GEMM - 24.5 GB of int8 weight bytes against 17.5 GB native, so at most -29 % of the
+weight traffic, on top of whatever oneDNN's own efficiency leaves - and no env knob
+measures it today (`PF_W4`, `PF_CB4` and `PF_K5` all leave prefill on the int8 `wmem`,
+because the native stores only win where `split_valid` is set, i.e. decode and the MTP
+verify).
+
 **The dp4a path stays, and a DPAS verify kernel is now measured not to work.**  The
 operand-assembly problem was a *how*, not a *whether*: re-ordering the u4 plane once at
 load into the DPAS B layout and staging the A tile once per work-group turns ~260
