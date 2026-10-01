@@ -21,9 +21,26 @@ bool w4_all_enabled() {
     return on;
 }
 
+bool w4_k5_only() {
+    static const bool on = [] {
+        const char * e = getenv("PF_W4_K5");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
 bool w4_supported(uint32_t ggml_type) {
     // Q4_K: q in [0,15] on a per-32-group grid (d*sc_j, dmin*m_j).
     if (ggml_type == 12) {
+        return true;
+    }
+    // PF_W4_K5=1: Q5_K only.  The k5 store is 0.875 B/weight and Q5_K is the
+    // largest single byte consumer of the 27B weight pass (6.15 GB of 18.8,
+    // 35 %), against the u4 grid's 0.625 - so this is the one lossy
+    // re-quantization with a real payoff.  Separate from PF_W4_ALL (which also
+    // takes the cb4/int8 types) because the accuracy cost is a per-type
+    // decision, not a global one.
+    if (w4_k5_only() && ggml_type == 13) {
         return true;
     }
     // PF_W4_ALL: every other quant type is re-quantized onto the same 4-bit
@@ -294,6 +311,9 @@ bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
     switch (ggml_type) {
     case 12:
         return pack_q4_K(src, K, N, out);
+    case 13:
+        // PF_W4_K5 (see w4_supported): Q5_K onto the u4 grid, nothing else.
+        return pack_generic(ggml_type, src, K, N, out, w4_k5_only());
     default:
         return pack_generic(ggml_type, src, K, N, out, false);
     }

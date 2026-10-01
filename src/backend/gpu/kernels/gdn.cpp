@@ -264,15 +264,38 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     // decode has one token per row: halving the warp count costs more than the
     // shared q/k loads save, so only batch columns when the row has real work
     const int n_real = nreal_arg > 0 ? nreal_arg : info->n_real;
-    const int c = (n_real >= 8 && head_dim % cols == 0) ? cols : 1;
+    // PF_GDN_COLS_MIN: the n_real at which batching columns starts paying.  The
+    // default 8 is the prefill's row width; the MTP verify runs n_real = k+1 = 5
+    // and was therefore excluded, so the knob exists to price the verify's
+    // recurrence against the multi-column path (see reports/mtp_ceiling.md).
+    static const int cols_min = [] {
+        const char * e = getenv("PF_GDN_COLS_MIN");
+        return e ? atoi(e) : 8;
+    }();
+    const int c = (n_real >= cols_min && head_dim % cols == 0) ? cols : 1;
     // PF_GDN_PD=0: classic form (at from the updated state)
 
     // float4 (contiguous 4 columns per lane) variant: one 16-byte load per
-    // lane for q/k instead of four 4-byte loads (default; PF_GDN_VEC=0 reverts)
-    static const bool f4 = [] {
+    // lane for q/k instead of four 4-byte loads; the state lives in one float4
+    // register.  It only pays for a *single* token per row: the float4 state
+    // slice is 4x the registers, so as soon as a row carries more the occupancy
+    // collapses.  Measured on the 27B / 2x A770, the gdn kernel's ms per pass:
+    //
+    //   n_real     1     2     4     8    12    16    32
+    //   float4  4.64  7.66  7.68 10.24 12.38 14.63 22.03
+    //   scalar  4.89  5.23  5.23  5.92  6.91  8.26 12.17
+    //
+    // i.e. float4 wins by 0.25 ms at n_real=1 (the plain decode) and loses by
+    // 1.46x from n_real=2, widening to 1.81x at 32 - its marginal is 0.51 ms per
+    // extra token against the scalar path's 0.25.  The MTP verify sits at
+    // n_real = k+1 = 5, where the scalar kernel is 2.5 ms of a ~95 ms pass
+    // faster.  PF_GDN_VEC: unset/-1 = this rule, 0 = always scalar, 1 = always
+    // float4 (the old default, kept for A/B).
+    static const int vec_mode = [] {
         const char * e = getenv("PF_GDN_VEC");
-        return !(e && atoi(e) == 0);
+        return e ? atoi(e) : -1;
     }();
+    const bool f4 = (vec_mode < 0) ? (n_real < 2) : (vec_mode != 0);
     if (f4 && head_dim % 4 == 0) {
         if (wpw == 2) {
             switch (c) {

@@ -121,9 +121,19 @@ struct cpu_backend : compute_backend {
         }
     }
     void mtp_concat(const void * table, uint32_t, size_t, const float *, const float *, const float *, const float *,
-                    const step_info *, float *, int, float) override {
+                    const step_info *, float *, int, float, const int32_t *) override {
         (void)table;
         throw std::runtime_error("mtp_concat: the MTP draft head is GPU-only");
+    }
+    void mtp_cand(const float *, int, const int32_t *, const float *, float, int32_t *, int) override {
+        throw std::runtime_error("mtp_cand: the MTP draft head is GPU-only");
+    }
+    void mtp_gather(const int32_t *, int, const int8_t *, const uint16_t *, const int8_t *, const uint16_t *,
+                    const float *, int, int, float *) override {
+        throw std::runtime_error("mtp_gather: the MTP draft head is GPU-only");
+    }
+    void mtp_gather_argmax(const float *, const int32_t *, int, int32_t *, float *) override {
+        throw std::runtime_error("mtp_gather_argmax: the MTP draft head is GPU-only");
     }
     void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                     int n_tok_blocks) override {

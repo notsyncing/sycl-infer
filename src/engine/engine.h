@@ -498,12 +498,31 @@ struct engine {
     // 183 ms/cycle at 128k.  PF_MTP_SPLITS overrides (1 = the old behaviour).
     int mtp_splits = kMaxDecSplits;
     void build_mtp_plan();
-    void mtp_gemv(int ci, int M);
+    void mtp_gemv(int ci, int M, int step = -1);
+    // ---- MTP draft head (see mtp_argmax.cpp) -------------------------------
+    // d_mtp_tok[i] is the token draft step i chose (the head's argmax, computed
+    // on the device), read back by the next step's concat, so the chain needs no
+    // host round-trip.  With PF_MTP_CAND the head is evaluated on a candidate set
+    // (mtp_cand_launch / mtp_gather_launch) instead of all 248320 rows - measured
+    // a net loss, so it is off by default; see reports/mtp_ceiling.md.
+    int32_t * d_mtp_cand_ = nullptr;  // [mtp_cand_cap] candidate token ids (device 0)
+    float * d_mtp_cvals_ = nullptr;   // [mtp_cand_cap] their head values
+    int32_t * d_mtp_tok_ = nullptr;   // [kMaxT] per-step draft token ids (device 0, next to the head)
+    float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
+    int32_t * d_mtp_tokx_ = nullptr;  // 4-byte staging slot for a non-zero --mtp-device
+    float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
+    int mtp_cand_src_ = 1;            // 1 = seed from the draft's own step-0 readout
+    int mtp_cand_cap_ = 0;            // 0 = off (the full head readout)
+    float mtp_cand_margin_ = 8.0f;
+    bool mtp_cand_ok_ = false;        // the head's int8 view exists on device 0
+    const int8_t * mtp_head_w8_ = nullptr;
+    const uint16_t * mtp_head_wsc_ = nullptr;
+    int mtp_head_rows_ = 0;
     // run the MTP layer over `n` tokens at positions pos0.. (mode 1 layout:
     // row 0, n <= kMaxT).  `h` is the main model's hidden [token][n_embd] for the
     // same tokens (h_{-1} comes from hprev), extra_writes the KV and the head.
     void mtp_forward(const int32_t * toks, const float * h, const float * hprev, int n, int slot, int pos0,
-                     bool with_head);
+                     bool with_head, const int32_t * tok_dev = nullptr, int step = -1);
     // verify forward: main model over `n` tokens at pos0..; logits land in
     // d_logits rows 0..n-1.  Also fills d_mtp_hprev with the hidden at each row.
     void mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0);

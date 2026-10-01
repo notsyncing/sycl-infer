@@ -56,6 +56,7 @@ struct w4t {
 
 // True when this ggml type has a native-width linear grid here.
 bool w4_supported(uint32_t ggml_type);
+bool w4_k5_only(); // PF_W4_K5: Q5_K alone onto the u4 grid (0.875 -> 0.625 B/w)
 
 // PF_W4_ALL=1 re-quantizes every convertible type onto the same 4-bit grid
 // instead of keeping int8.  u4 is 0.625 B/weight against int8's 1.0625, so a 27B

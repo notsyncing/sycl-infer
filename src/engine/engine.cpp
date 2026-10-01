@@ -1634,6 +1634,54 @@ void engine::alloc_buffers() {
             d_mtp_ssave_[d] =
                 (float *)dev_alloc_on((int)d, (size_t)ng * (size_t)hp.dt_rank * hp.d_state * hp.d_state * 4);
         }
+        // Candidate-restricted draft head (PF_MTP_CAND): the draft needs one token
+        // per step, so the head is evaluated on `cap` candidate rows instead of all
+        // n_vocab.  *Measured a net loss* - the candidate set (the top-N of the
+        // draft's own previous step) only contains the next step's argmax 80% of
+        // the time even at 16384 rows, and losing drafts costs more than the head
+        // bytes save, so the default is off.  See the report.
+        {
+            const char * ce = getenv("PF_MTP_CAND");
+            // default OFF: measured a net loss (the candidate set only catches ~80% of the
+            // next argmax even at 16384 rows, and lost drafts cost more than the head bytes save)
+            const int cap = ce ? atoi(ce) : 0;
+            const char * me = getenv("PF_MTP_CANDM");
+            mtp_cand_margin_ = me ? (float)atof(me) : 20.0f;
+            // the device-resident draft chain's per-step token buffer (the head's
+            // argmax -> the next step's concat); needed whether or not the
+            // candidate head is on
+            d_mtp_tok_ = (int32_t *)dev_alloc_on(0, (size_t)kMaxT * 4);
+            d_mtp_tokx_ = (int32_t *)dev_alloc_on(mtp_dev == 0 ? 0 : mtp_dev, 64);
+            if (cap > 1) {
+                mtp_cand_cap_ = std::min(cap, hp.n_vocab);
+                d_mtp_cand_ = (int32_t *)dev_alloc_on(0, (size_t)mtp_cand_cap_ * 4);
+                d_mtp_cvals_ = (float *)dev_alloc_on(0, (size_t)mtp_cand_cap_ * 4);
+                d_mtp_cval1_ = (float *)dev_alloc_on(0, 64);
+                d_mtp_amv_ = (float *)dev_alloc_on(0, 64);
+                {
+                    const char * se = getenv("PF_MTP_CANDSRC");
+                    mtp_cand_src_ = se ? atoi(se) : 1;
+                }
+                // the head's grouped int8 view (the gather reads it directly; the
+                // u4 draft copy is not needed for a 256-row readout)
+                const wt & head = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                dnnl_gemm * D0 = dnnl_for(0);
+                if (D0 != nullptr) {
+                    const void * hk = wkey(0, head.data);
+                    mtp_head_w8_ = D0->weight_data(hk);
+                    mtp_head_wsc_ = D0->weight_group_scales(hk);
+                    mtp_head_rows_ = head.N;
+                    mtp_cand_ok_ = mtp_head_w8_ != nullptr && mtp_head_wsc_ != nullptr;
+                }
+                if (!mtp_cand_ok_) {
+                    fprintf(stderr, "[mtp] candidate head: no grouped int8 head on device 0, using the full readout\n");
+                    mtp_cand_cap_ = 0;
+                } else {
+                    fprintf(stderr, "[mtp] candidate head: cap=%d margin=%.2f rows=%d\n", mtp_cand_cap_,
+                            mtp_cand_margin_, mtp_head_rows_);
+                }
+            }
+        }
         d_mtp_rinfo = sycl::malloc_host<step_info>(1, q);
         std::memset(d_mtp_rinfo, 0, sizeof(step_info));
         d_mtp_info = sycl::malloc_host<step_info>(1, q);

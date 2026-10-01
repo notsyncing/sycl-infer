@@ -1414,6 +1414,51 @@ const int8_t * dnnl_gemm::weight_data(const void * key) const {
     return it == p->weights.end() ? nullptr : it->second.dev;
 }
 
+// Narrow-int8 group fusion.  kNarrowRows is where the per-launch latency stops
+// mattering: at 27B sizes the GEMV itself (nat_gemm's per-call staging and
+// dp4a) is what costs, and the batched path is better above it.
+static const int kNarrowRows = 2048;
+
+bool dnnl_gemm::gemm_i8_group(const void * const * keys, const int * n_rows, const float * const * outs,
+                              int out_stride, const float * const * residuals, const float * alphas, int n_segs,
+                              int M, int K) {
+    if (n_segs < 1 || n_segs > 4 || !p->acts_valid || M < 1 || M > 13 || K <= 0 || K % 32) {
+        return false;
+    }
+    i8_grp_seg segs[4];
+    int total = 0;
+    for (int i = 0; i < n_segs; i++) {
+        auto it = p->weights.find(keys[i]);
+        if (it == p->weights.end() || !it->second.ok || !it->second.dev || !it->second.scales) {
+            return false; // not a grouped int8 weight
+        }
+        if (it->second.K != K) {
+            return false;
+        }
+        if (n_rows[i] <= 0) {
+            return false;
+        }
+        total += n_rows[i];
+        if (total > kNarrowRows) {
+            return false;
+        }
+        segs[i].w8 = it->second.dev;
+        segs[i].wsc = it->second.scales;
+        segs[i].n_rows = n_rows[i];
+        segs[i].out = (float *)outs[i];
+        segs[i].out_stride = out_stride;
+        segs[i].alpha = alphas[i];
+        segs[i].residual = residuals[i];
+    }
+    i8_grp_gemv_rows_multi_launch(p->q, segs, n_segs, total, p->axg, p->asa, p->xs, M, K);
+    return true;
+}
+
+const uint16_t * dnnl_gemm::weight_group_scales(const void * key) const {
+    auto it = p->weights.find(key);
+    return it == p->weights.end() ? nullptr : it->second.scales;
+}
+
 const float * dnnl_gemm::weight_scales(const void * key) const {
     // The int8 weights now carry a per-32-group f16 scale plane (consumed by
     // oneDNN and by i8_grp_gemv_launch), not a per-row float array.  Returning
@@ -1433,6 +1478,10 @@ const uint16_t * dnnl_gemm::act_grp_scales() const {
 
 const int8_t * dnnl_gemm::act_data() const {
     return p->acts_valid ? p->ax : nullptr;
+}
+
+const float * dnnl_gemm::act_group_sums() const {
+    return p->acts_valid ? p->xs : nullptr;
 }
 
 const float * dnnl_gemm::act_scales() const {

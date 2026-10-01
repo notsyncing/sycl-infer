@@ -210,8 +210,9 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 mtp_capture for the NextN draft head),
                  vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
                  bidirectional attention), at (audio tower helpers: at_conv1d,
-                 at_rope1d), attn_xmx (oneDNN int8 XMX prefill attention, see
-                 PF_ATTN_XMX below)
+                 at_rope1d), attn_xmx (oneDNN int8 *matmul* prefill attention -
+                 NOT the XMX unit, see the "XMX is a name, not a unit" note
+                 below; PF_ATTN_XMX below)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
                 model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
                 tokenizer.{h,cpp}
@@ -508,12 +509,35 @@ re-litigating the kernel.  Measured on one A770 (Iris Xe-LP-class DG2):
 
 The consequence is the batched-GEMM critical batch size.  A weight-streamed
 GEMM reads W bytes and does M*N*K MAC; at the M where the MAC rate stops hiding
-the stream, `M* = peak_MAC / (2 * BW_per_element)` ~= **6.4** MAC per byte of
-weight for the u4 store.  Below it the kernel is memory bound and extra rows are
-nearly free; above it it is compute bound and each row costs real time.  Measured
-slope: 3.6 ms per verify row vs a 76 ms weight pass, i.e. we sit *just above* M*
-at the MTP verify's M=5-7 -- which is why the batched GEMM still wins ~2x over
-per-row GEMVs but cannot win more.
+the stream, `M* = peak_MAC / BW_per_element`.  With the u4 store's 0.625 B/weight
+(4 bits + per-32 f16 step + offset) and the rate the *real* kernel achieves
+(**7.6 T-MAC/s** on the verify's marginal rows, which is 1.5-2.2x what
+`dev/bench_dp4a_peak.cpp` measures with register-resident operands - that
+microbenchmark is a lower bound, and any M\* taken from it is too small),
+`M* ~= 0.625 x 7.6e12 / 405e9 = ` **~12**, not the 6.4 the older 4.9 T-MAC/s figure
+gave.  Below M* the kernel is memory bound and extra rows are nearly free; above it
+each row costs real time.  For reference, the equivalent DPAS crossover is
+`0.625 x 78.8e12 / 405e9 = ` **~122**, so an XMX/DPAS unit only wins for
+**M in [12, 122]** - and `kMaxB = 16` caps every batched forward in the engine at
+M = 16, the first shape inside that window.  **Corrected after the whole-pass M
+sweep** (`dev/bench_wpass.cpp` over the real 497-call list): the pass is
+`53.93 ms of streaming + (M-1) x 3.67 ms of dp4a` (M=5 68.6, M=8 89.2, M=12 166.6),
+so the extra rows are *additive* pure compute at **7.1 T-MAC/s - the rate the real
+kernel achieves** - and DPAS's register-resident 78.8 is **11x** that.  The
+earlier "only ~3.5 ms of the marginal is dp4a" came from the *isolated* per-shape
+table and was low by ~4x; `dev/bench_dp4a_peak.cpp`'s 3.50/4.92 understate the
+kernel by 1.4-2x.  **A DPAS verify kernel is the right target in principle** (its
+arithmetic term is 14.7 ms at M=5 (u4/k5 is 52 % of the bytes, so ~8 ms of it),
+35.3 ms at M=8, 112 ms at M=12, and it grows with M) **but it is measured 37x
+slower than `nat_gemm` in a real GEMM**, so it needs another 37x on top of a
+register/occupancy redesign before it is worth anything - see the DPAS verdict
+below and `reports/mtp_ceiling.md` §4a.  The cb4 codebook LUT (30 % of
+the bytes) still cannot use a u4 DPAS operand and int8 (18 %) would need the s8
+path (measured 1/16 the u4 rate).  Also note dp4a is *not* a hardware unit on
+Xe-LP: a measured fp32 FMA peak of ~5.0 T-FMA/s (`dev/alu_probe2.cpp`; the older
+`alu_probe.cpp` is dead - the compiler folds its loop and it reports 1.5 PFLOP/s)
+puts dp4a's 3.5-4.9 T-MAC/s at 70-98 % of the vector ALU, so DPAS is a genuinely
+separate ~16x unit.  See [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §1, §4.
 
 Both paths are memory bound and both read the same ~16.3 GB of weights per unit
 of work, so the only lever left is **tokens per weight pass**, and that is capped
@@ -572,12 +596,71 @@ to 128 to let four DPAS chain would help the drain cost, but the accuracy study
 measured per-128 u4 at 9.9-10.2% relative L2 weight error against 0.077% for the
 native per-32 store (131-524x worse), so it is not admissible anyway.
 
-**Conclusion: the dp4a path stays.**  XMX's advantage is real in a
-register-resident GEMM (large M), but the workload here is a handful of rows, and
-at that shape the operand assembly dominates by two orders of magnitude.  A
-future attempt should only be made if the verify can be restructured to give each
-DPAS a large register-resident tile (e.g. batching many independent sequences so
-M is 64+), which changes the problem rather than the kernel.
+**The dp4a path stays, and a DPAS verify kernel is now measured not to work.**  The
+operand-assembly problem was a *how*, not a *whether*: re-ordering the u4 plane once at
+load into the DPAS B layout and staging the A tile once per work-group turns ~260
+instructions of per-dpas assembly into ~5-6.  `dev/bench_dpas_gemm.cpp` does exactly that
+with **ESIMD `gather`** and the GEMM is now **numerically exact** - rel 5.26e-07 at the real
+verify shape (K=5120, N=17408, M=5) and **all 2560 dpas values exact across all 160 groups**
+- and it is still **7.44 ms against `nat_gemm`'s 0.200 ms, i.e. 37x slower**.  The old
+"groups >= 1 are wrong" was a byte/dword factor-4 error in the B base pointer (and the same
+bug in the probe's `ref_at`), now fixed; the register-resident 78.8 T-MAC/s simply does not
+survive a real GEMM here.  Where the time goes is measured, and it is *not* the epilogue
+(`NOEPI=1` is a no-op) and *not* the arithmetic: **K-split regresses exactly linearly**
+(KSPLIT 1/2/4/8/16/32 -> 7.69/14.80/28.92/57.10/112.82/231.73 ms), so the cost is
+proportional to the **work-group count** - ~6-14 us per work-group, growing with `NT`, i.e.
+building the two 64/32-element cross-lane **offset vectors** (a runtime element write or a
+union'd array write into a cross-lane simd is serialised through local memory) plus spilling
+the `NT x 8 x 8` accumulators.  `NT` sweep: 1/2/4/8 -> 13.27/9.16/**7.44**/8.93 ms.
+**Three ways to build the offsets that do not work, do not retry them:** an initialiser list
+(`esimd::simd<int,64>{0,4,8,...}`) has no matching constructor at either length; the
+`VS`-blocked `gather<VS>(p, simd<OffsetT, N/VS>)` overloads (which would need only 8 or 4
+offsets) require a **`simd_view`** pass-through argument; and there is no `(start, step)` /
+iota constructor and no identity-`offsets` helper (the `offsets` in `memory.hpp` are gather
+*masks*).  A working kernel needs a group-major activation tile plus one of those, and must
+stop holding 4 tiles of accumulators live - so it has to find another 37x, and the M=1
+decode it would nominally serve is 1/8 of the dpas work.
+**The plumbing works - the earlier "the toolchain blocks it" reading was an artefact
+of the test** (`reports/mtp_ceiling.md` §4a, harnesses `dev/dpas_plumb.cpp` +
+`dev/dpas_data_probe.cpp` + `dev/bench_dpas_gemm.cpp`).  `esimd::gather` into a
+cross-lane operand, `block_store` out of one and per-element access with a *runtime*
+index all round-trip real memory data with 0/64 errors; the function they share
+(`simd_obj_impl::data()`, `__esimd_vload(&M_data)` on device) is fine here.  What is
+actually broken is **reading results back through SLM**: `copy_to(local_accessor)` plus
+a scalar SLM loop returns zero for even a plain scalar round trip in the 32-lane
+configuration, which is what made every earlier probe - including the previous
+session's 0.06 T-MAC/s one - look like it was never computing anything.  Use
+`block_store` to global (or per-lane scalar stores) to read results out, never SLM.
+Real constraints, each measured: `esimd::gather` needs **compile-time** offsets (runtime
+offsets return zero, so a GEMM must template on the activation row stride); cross-lane
+vectors assume a **32-thread block** (a 8-warp work-group produces zeros, `W=1` is
+required); `block_store` is block-cooperative so guarding it to one warp stores nothing.
+`src/common/dp4a.h` remains the pattern to imitate for anything esimd cannot express.
+(`dev/bench_wpass.cpp` also had a
+host-side out-of-bounds read in its activation pattern fill that glibc reported much
+later as `double free or corruption (out)`; fixed, and its M sweep is what corrected
+the XMX verdict.)
+
+**Refined later (see `reports/mtp_ceiling.md` §4).**  Both halves of that
+conclusion were re-measured and one is wrong for a fixable reason.  (a) The
+*hardware* verdict holds and the number behind it is
+`dev/bench_dp4a_peak.cpp`: with register-resident operands dp4a reaches
+3.50 T-MAC/s, the real u4 decode inner loop 4.92, and `dpas<8,8,...,u4/s8,64>`
+**78.8** - so DPAS is 16-24x, and the verify's marginal rows (3.6 ms/row at
+~7.6 T-MAC/s) really are dp4a-bound.  (b) The 0.06 T-MAC/s in-GEMM number is a
+*kernel* artifact, not a shape limit: the probe rebuilt A from DRAM with 256
+scalar byte loads per dpas and B with 32 strided scalar dword loads
+(`/tmp/kilo/xmx_rate3.cpp`); a weight plane re-ordered once at load into the DPAS
+B layout plus an SLM-staged A tile is ~5-6 instructions per dpas, and `M=8`
+padding would give the dpas a full register-resident A tile without changing the
+verify's shape.  What *does* survive is the cost/benefit: on this model only
+~3.5 ms of the 14.25 ms marginal GEMM cost is u4/k5 dp4a issue - 3.84 ms is the
+96 tiny `ssm_alpha`/`ssm_beta` GEMVs (2 workgroups each, pure launch latency) and
+4.2 ms is the cb4 codebook LUT, which cannot be a u4 DPAS operand at all.  So a
+DPAS verify kernel is worth ~3 ms of a 116 ms cycle here, and would only become
+the dominant term on a model whose weights are mostly u4, or with a longer draft
+chain (where each extra verify row is another full weight pass's worth of
+compute).
 
 With the verify at a hypothetical one-decode-pass cost and free drafts the
 ceiling is ~2x (verify >= 1 weight pass + ~3.3 ms/row of attention/GDN/norm).
@@ -756,7 +839,96 @@ restores the old single-split draft),
 `w4_gemm_launch` for the legacy path), `PF_W4_GEMM_U` (accumulator sets),
 `PF_W4_GEMM_TN` (0 = row-expanded, 2/3/4 = the tiled experiments),
 `PF_DNNL_BLOCKED`.  `dev/bench_natgemm.cpp` benchmarks the batched GEMM against a
-scalar reference and the M=1 GEMVs.
+scalar reference and the M=1 GEMVs.  Candidate-restricted draft head
+(`PF_MTP_CAND`=candidate cap, `PF_MTP_CANDM`=logit margin, `PF_MTP_CANDSRC`
+=1 seed the set from the draft's own first step, 0 from the verify's bonus row,
+`PF_MTP_CANDDBG`=1 print the per-step hit rate, `PF_MTP_CANDV`=1 also return the
+chosen logit): **default off, and it should stay off** - see below.  The narrow
+int8 call-group fusion is `PF_NOFUSE`=1 to turn it off, `PF_FUSEDBG`=1 to trace
+it (see the fused-GEMV note below).
+
+**The 3x question, measured (27B / 2x A770, single-request CLI, greedy).**  Full
+accounting in [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md).  The speedup is
+`speedup = n * T_plain / (T_plain + X)` with `n = 1 + accepted drafts` and `X` the
+cycle-only cost, so it is **bounded by the acceptance**, and the acceptance is a
+property of the MTP layer rather than of the engine:
+
+| prompt | k | acc | cycle | ms/token | speedup | ceiling (=n) |
+|---|---:|---:|---:|---:|---:|---:|
+| technical explanation | 4 | 1.64 | 115.7 ms | 43.4 | 1.67x | 2.64x |
+| story opener | 4 | 1.35 | 115.0 | 48.4 | 1.50x | 2.35x |
+| code continuation | 6 | 2.81 | 136.6 | 35.5 | **2.04x** | 3.81x |
+
+against a non-graphed plain decode step of **72.5 ms** (13.8 t/s; the graphed
+scheduler decode is 68.6 ms).  **3x is not reachable here**: it needs acc >= 2.2
+*and* X <= 8 ms, while X is 43 ms and its floor is ~20 ms.  The three things that
+make the numbers what they are:
+
+* **One weight pass is 17.54 GB in 497 GEMV calls and costs 54 ms at 325 GB/s**
+  (80 % of the card's 405 GB/s read ceiling), measured by replaying the real
+  per-step list with the production launchers - `dev/bench_wpass.cpp` with
+  `dev/wpass_list.py` (its per-format counts match the engine's load-time weight
+  report exactly).  Per-call overhead is 7.1 us, so the ~500 launches are not the
+  problem.  `M=3/5/7` cost 60.98/68.29/78.64 ms, i.e. **3.6 ms per extra verify
+  row**, which at 27.5 G MAC/row is ~7.6 T-MAC/s - at the scalar dp4a issue rate,
+  so the marginal rows are compute bound, not bandwidth bound.
+* **XMX/DPAS is 16-24x the dp4a issue rate** (register-resident, measured by
+  `dev/bench_dp4a_peak.cpp`: dp4a 3.50 T-MAC/s, dp4a+u4-nibble-decode 4.92, DPAS
+  u4 K=64 **78.8**), so it *is* the right tool for the verify's marginal rows and
+  the earlier "XMX cannot help" conclusion stands only for this model's weight
+  mix: of the 14.25 ms marginal GEMM cost only ~3.5 ms is u4/k5 dp4a issue, 3.84
+  ms is the 96 tiny `ssm_alpha`/`ssm_beta` GEMVs (2 workgroups each - launch
+  latency, no arithmetic unit fixes that) and 4.2 ms is the cb4 codebook LUT,
+  which **cannot** be a DPAS u4 operand (16 arbitrary int8 values vs values 0-15).
+  The previous session's in-GEMM DPAS number (0.06 T-MAC/s) was a kernel artifact:
+  `/tmp/kilo/xmx_rate3.cpp` rebuilds A from DRAM with 256 scalar byte loads per
+  dpas and B with 32 strided scalar dword loads.  A pre-reordered B plane plus an
+  SLM-staged A tile is ~5-6 instructions per dpas.
+* **The candidate-restricted draft head works mechanically and loses on
+  acceptance.**  The draft needs one token per step and its head GEMV reads all
+  248320 rows (794 MB of u4) to keep one argmax, so `mtp_gather_launch` evaluates
+  the head on a few hundred gathered rows (`mtp_cand_launch` collects them from
+  the draft's own previous step, `mtp_gather_argmax_launch` reduces).  It is
+  numerically exact and takes the draft from 19.1 to 10.9 ms/cycle, but the
+  candidate set only contains the *next* step's argmax 25/17/7 % of the time at
+  margin 8 and 81/77/83 % even at 16384 rows (7 % of the vocab) - the
+  distribution moves too far in one token.  Net: 43.4 -> 42.9 ms/token on one
+  prompt, 48.4 -> 50.4 on another.  **Default off**; the machinery is what a
+  better candidate source (a low-rank prefilter, or a lossier draft head) needs.
+
+**The narrow GEMVs can be fused, and the cost was per launch, not bandwidth.**
+The GDN's `ssm_alpha` / `ssm_beta` are two 48-row int8 segments in one call
+group; each read 0.26 MB and each cost 12.9 us at M=1 and 42.5 us at M=5.  The
+launch floor is 5.8 us (500 calls of a 32x32 tensor), and over the *same* 25 MB,
+48 calls of N=96 take 2.14 ms at M=5 against 0.12 ms for one call of N=4608 -
+so the cost is ~8 us per group-iteration of K, exposed as latency.  Dropping the
+96 calls from the whole per-step list in `dev/bench_wpass.cpp` prices them
+honestly: 1.24 ms at M=1, 4.08 at M=5, i.e. a 2.84 ms *marginal* (the
+isolated per-shape table overstates it, since an isolated narrow call is
+submit-bound).  Two fusions, both implemented or measured:
+`i8_grp_gemv_rows_multi_launch` (one launch for up to four int8 segments, 12
+args / one local accessor, the M=1 GEMV's arithmetic - verified against a host
+reference by `dev/test_fused_i8.cpp`) takes the verify from **94.0 to 91.7 ms
+(-2.4 ms, three repeats each)**; and the weight-level version (concatenate the
+two Q8_0 blocks into one `[2*dt_rank, K]` tensor at load, so the existing
+`nat_gemm` sees N=96) measures 68.32 -> 66.52 ms in the replay with *no*
+numerical change.  The kernel-level fusion is on by default
+(`PF_NOFUSE=1` off, `PF_FUSEDBG=1` traces): the -2.4 ms is deterministic, but it
+uses the M=1 GEMV's accumulation order where `nat_gemm`'s was, which reshuffles
+the emitted stream's acceptance (1.64 -> 1.53 on one prompt, unchanged on two
+others), so the end-to-end effect is -1.1 to +0.9 ms/token depending on the
+prompt.  A *caveat worth knowing*: the first version of that kernel passed its
+`i8_grp_seg` descriptors as a host pointer and the device read zeros from it -
+a silently empty GEMV that looked 1.9 ms *faster*.  Copy them into the lambda
+closure (by value) or don't.
+
+One measured win kept: **the draft chain is device-resident**.  The head's argmax
+goes straight to `d_mtp_tok[step]` and the next step's `mtp_concat` reads it
+through its new `tok_dev` argument, so a cycle issues its k drafts back to back
+instead of doing k device syncs + k x 1 MB logits copies + k host scans of
+248320 floats: **-1.2 ms/cycle**, byte-identical output.  It needs the MTP layer
+on the primary device (`--mtp-device 0`, the default); a cross-device
+`--mtp-device` keeps the host round-trip.
 
 ### OpenAI-compatible API
 
@@ -829,8 +1001,8 @@ scales always apply),
 `PF_ATTN_SPLIT`, `PF_ATTN_SPLIT_KEYS` (default 512), `PF_ATTN_VEC` (default on),
 `PF_ATTN_FUSE` (default on), `PF_DEC_SPLIT` (default 64, cap 256),
 `PF_DEC_GROUP` (grouped decode attention, default off), `PF_ATTN_XMX` (oneDNN
-int8 XMX prefill attention, **default on**; `0` restores the classic kernel),
-`PF_ATTN_XMX_MIN` (minimum key count for XMX, default 2048 - below it the
+int8 *matmul* prefill attention, **default on**; `0` restores the classic kernel),
+`PF_ATTN_XMX_MIN` (minimum key count for the oneDNN matmul path, default 2048 - below it the
 classic kernel is faster), `PF_ATTN_WAIT` (force a per-attention-matmul oneDNN
 stream wait; default off, the in-order queue already orders them).
 
@@ -842,7 +1014,17 @@ stream wait; default off, the in-order queue already orders them).
 
 **GDN**
 `PF_GDN_COLS` (state columns/warp, default 2), `PF_GDN_WG` (warps/WG, default 8),
-`PF_GDN_VEC` (float4 path, default on), `PF_GDN_FUSE` (1/2).
+`PF_GDN_VEC` (unset = **float4 only for `n_real < 2`**, 0 = always the scalar
+kernel, 1 = always float4; the float4 state slice costs 4x the registers, so it
+wins by 0.25 ms at one token per row and loses by 1.46x from two, 1.81x at 32 -
+the MTP verify's `n_real = k+1` is in the losing half and gains 2.4 ms from the
+scalar kernel, see `reports/mtp_ceiling.md` §1c), `PF_GDN_FUSE` (1/2),
+`PF_GDN_COLS_MIN` (the `n_real` at which column batching starts, default 8 =
+unchanged; the MTP verify's `n_real = k+1 = 5` is below it and every
+`PF_GDN_COLS>1` variant is 1-1.7 ms *slower* there, so the gate is right - see
+`reports/mtp_ceiling.md` §1c).  The GDN is the MTP verify's second-largest block
+(11.24 ms of 95, `PF_PROF` mode 2) and is sub-group-reduction-latency bound: one
+warp owns one state row and spends two `sg_sum` per token to advance 8 MACs.
 
 **Prefix cache**
 Three LRU tiers; an eviction demotes VRAM -> RAM -> disk -> dropped and a
@@ -877,7 +1059,14 @@ step), `PF_DUMP_PROMPT` (the exact ids - and, for a chat prompt, the rendered
 text - the model is conditioned on), `PF_DUMP_GEN` (the decode loop's sampled id
 and stop decisions), `PF_ROWACT` (restore the now-unused per-row activation
 quantizer for A/B; it is dead because oneDNN reads the per-32-group form, and
-cost ~13 ms/token in a 27B multi-device decode), `PF_DUMP_KV=<dir>` (append the
+cost ~13 ms/token in a 27B multi-device decode), `PF_LAUNCHCNT` (tally one `record_forward` pass's SYCL submissions by kind and
+count which are *adjacent-fusable*; the verify is 812 - 257 xq, 395 GEMV segments,
+64 rmsnorm, 96 GDN-family - of which only **75 (9 %) are fusable**, because every
+xq reads a different source and so sits on the critical dependency chain: see
+[`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §1e), `PF_MTP_SUBMIT` (the
+verify's host submit time vs its wall - 86.6 of 90.2 ms, i.e. the in-order queue
+paces the host, so a recorded verify graph would only buy the decode graph's
+measured 1-2 ms), `PF_DUMP_KV=<dir>` (append the
 live tokens' post-norm+RoPE f32 K and V of every full-attention layer to
 `<dir>/{k,v}_LL.bin`, for offline KV-quantization studies; skipped while a
 command graph is being recorded, so it only fires on the direct prefill paths), `PF_W4_RB` (decode GEMV rows
@@ -897,6 +1086,14 @@ fused-GDN mode-2 fix below).
 scale, 0.5625 B/weight and lossless, decoded by a LUT-expanding GEMV; prefill
 expands each tensor to int8 in a reused scratch - see
 [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+`PF_W4_K5` (`1` puts **only** Q5_K onto the per-32 4-bit grid instead of the
+native 5-bit store: 0.625 B/weight against k5's 0.75, and Q5_K is 30 % of the 27B
+weight pass, so the device weights go 16.90 -> 16.06 GiB and the MTP verify
+91.5 -> 86.3 ms (-5.7 %, deterministic over two repeats); **default off**,
+because `test_w4`'s round-trip rel L2 goes 0.077 % -> **4.60 % mean / 10.83 %
+worst**, the same error class as `PF_W4_ALL`, and a 160-token greedy generation
+stays coherent but diverges at word 37 - an accuracy decision, not an engine fix;
+see `reports/mtp_ceiling.md` §1d),
 `PF_K5` (store Q5_K as the native 5-bit grid: 4-bit nibble plane + 1-bit plane
 + per-(g,n) f16 step/offset, 0.75 B/weight and lossless, recombined with one OR
 in the decode GEMV; prefill expands q5 to int8 in the shared scratch and runs
@@ -975,7 +1172,20 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   for the GDN qkv/conv width and `m.output` for the LM head.
 * **oneDNN cannot be recorded** into a SYCL graph; the `PF_GEMM_DNNL` path
   replays mode-2 prefill directly (`prefill_batch`).
-* **XMX prefill attention (`attn_xmx.cpp`, `PF_ATTN_XMX`, default on above 2048
+* **"XMX" here is a name for oneDNN's int8 matmul, not the XMX unit.**
+  `attn_xmx.cpp` / `PF_ATTN_XMX` / `PF_ATTN_XMX_MIN` all date back to "use
+  oneDNN's int8 matmul for prefill attention"; the unit was never involved.
+  Measured: `ONEDNN_VERBOSE=2` names the impl `jit:gemm:any` for every matmul
+  the engine runs (a mode-2 prefill is 1154 of them, attention included), and in
+  this oneDNN 3.11.4 (`libdnnl.so.3.11`, Level Zero, DG2) `strings | grep -c
+  xmx` is 0 - all 498 `dpas` hits are `DUMMY_DPAS_*` JIT-generator placeholders,
+  so **no XMX GEMM kernel is compiled in at all**.  Do not read a win from
+  `PF_ATTN_XMX` as evidence about the XMX unit, and see
+  `reports/mtp_ceiling.md` §4b for the consequence: routing the *verify* onto
+  the oneDNN int8 primitive (`PF_NAT=0 PF_MTP_FORCE_INT8=1`) measures 2.05x
+  *slower* (verify 91.6 -> 188.7 ms, 158 GB/s over 24.5 GB of int8 weights vs
+  the native stores' 272-325).
+* **oneDNN int8 prefill attention (`attn_xmx.cpp`, `PF_ATTN_XMX`, default on above 2048
   keys)**: QK^T and PV run as plain oneDNN int8 matmuls over the paged KV
   gathered into a contiguous scratch.  Three things are load-bearing:
   (1) a plain int8 matmul sums over k, so a per-key scale cannot be applied
@@ -1000,7 +1210,7 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   540 t/s (both above the OpenVINO targets of 640 / 362).  Below the key
   threshold the classic kernel still wins (4k: 718 vs 649 t/s), hence the gate.
   Scope: i8 KV, head_dim 256, `n_real > 1`; other cases fall back.
-* **`st_a` is an XMX-only stream.**  The dense `PF_GEMM_DNNL` GEMMs still use
+* **`st_a` is the oneDNN-int8-matmul-only stream.**  The dense `PF_GEMM_DNNL` GEMMs still use
   `p->st`; `attn_qk`/`attn_pv` submit to `p->st_a` and wait only that stream.
   Do not move the dense path onto `st_a`.
 * **`nat_gemm_launch`'s int8 (FMT 3) and cb4 (FMT 2) paths need the

@@ -40,9 +40,20 @@ struct gpu_backend : compute_backend {
         mtp_argmax_launch(q, logits, n, out_idx, out_val, M);
     }
     void mtp_concat(const void * table, uint32_t type, size_t row_bytes, const float * enorm, const float * hnorm,
-                    const float * h, const float * h_prev, const step_info * info, float * out, int n_embd,
-                    float eps) override {
-        mtp_concat_launch(q, table, type, row_bytes, enorm, hnorm, h, h_prev, info, out, n_embd, eps);
+                    const float * h, const float * h_prev, const step_info * info, float * out, int n_embd, float eps,
+                    const int32_t * tok_dev) override {
+        mtp_concat_launch(q, table, type, row_bytes, enorm, hnorm, h, h_prev, info, out, n_embd, eps, tok_dev);
+    }
+    void mtp_cand(const float * logits, int n, const int32_t * am_idx, const float * am_val, float margin, int32_t * ids,
+                  int cap) override {
+        mtp_cand_launch(q, logits, n, am_idx, am_val, margin, ids, cap);
+    }
+    void mtp_gather(const int32_t * ids, int cap, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                    const uint16_t * asa, const float * xs, int K, int N, float * vals) override {
+        mtp_gather_launch(q, ids, cap, w8, wsc, xq, asa, xs, K, N, vals);
+    }
+    void mtp_gather_argmax(const float * vals, const int32_t * ids, int cap, int32_t * out_id, float * out_val) override {
+        mtp_gather_argmax_launch(q, vals, ids, cap, out_id, out_val);
     }
     void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                     int n_tok_blocks) override {

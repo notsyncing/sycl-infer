@@ -97,6 +97,21 @@ struct dnnl_gemm {
     // ---- diagnostics (dev checks) ----
     const int8_t * weight_data(const void * key) const;
     const float * weight_scales(const void * key) const;
+    // The grouped int8 weight's per-32-group f16 step plane ([K/32][N], the
+    // layout i8_grp_gemv_launch and the MTP candidate head read); null for the
+    // u4/k5/cb4 entries, which carry their own scale planes.
+    const uint16_t * weight_group_scales(const void * key) const;
+    // One launch for a whole call group of *narrow* int8 (grouped-scale)
+    // segments: they share the quantized activation and the K, and each of them
+    // is small enough that a per-segment launch's latency dominates its 0.26 MB
+    // (the GDN's ssm_alpha / ssm_beta, 48 rows each - see kernels.h).  `keys`
+    // are the segments' oneDNN keys, `n_rows` their output rows.  Returns false
+    // without launching anything when the group is not eligible (a non-int8
+    // segment, mixed K, more than four segments, or more rows than the narrow
+    // cutoff), so the caller keeps its per-segment path.
+    bool gemm_i8_group(const void * const * keys, const int * n_rows, const float * const * outs,
+                       int out_stride, const float * const * residuals, const float * alphas, int n_segs, int M,
+                       int K);
     const int8_t * act_data() const;
     // u4 path: the per-32-group quantized activations and their f16 scales
     // (device pointers), produced alongside the per-row form when a u4 weight
@@ -104,6 +119,9 @@ struct dnnl_gemm {
     const int8_t * act_grp_data() const;
     const uint16_t * act_grp_scales() const;
     const float * act_scales() const;
+    // Per-32-group f32 sum of the quantized activations ([M][K/32]): the XOR-bias
+    // correction the u4/k5/int8 grouped GEMVs apply, and the MTP candidate head's.
+    const float * act_group_sums() const;
     // per-row sum of the quantized activations (int32, device memory) used by
     // the dp4a decode GEMV's weight bias correction
     const int32_t * act_sum() const;

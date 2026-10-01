@@ -26,11 +26,13 @@ void mtp_capture_launch(queue & q, const float * src, float * dst, int n_rows, i
 }
 
 // out[slot] = [ rmsnorm(enorm, emb(tok_slot)) ; rmsnorm(hnorm, h_prev_of(slot)) ]
+// `tok_dev` (optional) supplies the token from device memory instead of
+// step_info::tokens, which is what keeps the MTP draft chain on the device.
 // The embedding half comes first, matching ggml_concat(e_norm, h_norm, dim=0)
 // in the reference MTP graph.
 void mtp_concat_launch(queue & q, const void * table, uint32_t type, size_t row_bytes, const float * enorm,
                        const float * hnorm, const float * h, const float * h_prev, const step_info * info,
-                       float * out, int n_embd, float eps) {
+                       float * out, int n_embd, float eps, const int32_t * tok_dev) {
     const int n_sb = n_embd / 256; // n_embd is a multiple of 256 for every qwen35 model
     const int tpb = info->tpb > 0 ? info->tpb : kMaxT;
     const int sb_bytes = superblock_bytes(type);
@@ -45,7 +47,10 @@ void mtp_concat_launch(queue & q, const void * table, uint32_t type, size_t row_
         if (r >= info->n_rows || !info->active[r] || t >= row_nr(info, r)) {
             return;
         }
-        const int tok = info->tokens[slot];
+        // tok_dev: the MTP draft chain's own token (written on the device by the
+        // candidate-restricted head's argmax), so a draft step needs no host
+        // round-trip; null during the prefill / the first step of a chain.
+        const int tok = tok_dev ? tok_dev[slot] : info->tokens[slot];
         const char * erow = (const char *)table + (size_t)tok * row_bytes;
         const float * hrow = (slot == 0) ? h_prev + (size_t)r * n_embd : h + (size_t)(slot - 1) * n_embd;
 

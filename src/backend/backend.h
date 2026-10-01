@@ -46,7 +46,16 @@ struct compute_backend {
     virtual void mtp_argmax(const float * logits, int n, int32_t * out_idx, float * out_val, int M) = 0;
     virtual void mtp_concat(const void * table, uint32_t type, size_t row_bytes, const float * enorm,
                             const float * hnorm, const float * h, const float * h_prev, const step_info * info,
-                            float * out, int n_embd, float eps) = 0;
+                            float * out, int n_embd, float eps, const int32_t * tok_dev) = 0;
+    // Candidate-restricted LM head for the MTP draft (kernels.h): the draft needs
+    // one token per step, so the head is evaluated only on a candidate set taken
+    // from a distribution the target just produced instead of all n_vocab rows.
+    virtual void mtp_cand(const float * logits, int n, const int32_t * am_idx, const float * am_val, float margin,
+                          int32_t * ids, int cap) = 0;
+    virtual void mtp_gather(const int32_t * ids, int cap, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                            const uint16_t * asa, const float * xs, int K, int N, float * vals) = 0;
+    virtual void mtp_gather_argmax(const float * vals, const int32_t * ids, int cap, int32_t * out_id,
+                                   float * out_val) = 0;
     virtual void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                             int n_tok_blocks) = 0;
     virtual void qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm,

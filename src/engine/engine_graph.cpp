@@ -392,6 +392,40 @@ static void dbg_dump_kv(sycl::queue & q, const float * kbuf, const float * vbuf,
     }
 }
 
+// PF_LAUNCHCNT: tally the SYCL submissions of one record_forward pass.  At the
+// verify's shapes a call is dominated by its own dispatch (~7 us measured by
+// dev/bench_wpass.cpp's per-call overhead), so the *number* of launches is the
+// quantity that decides whether a fusion is worth anything - and which one.
+namespace {
+struct launch_count {
+    long xq = 0, seg = 0, norm = 0, gdn = 0, attn = 0, misc = 0, calls = 0, pass = 0;
+    // fusibility: an xq can only be merged with the *previous* call's if both
+    // read the same source (a later layer's xq depends on the earlier call's
+    // GEMM output, so nothing else is hoistable), and two segments of a call can
+    // be merged only if they share the weight store's K and output stride.
+    const float * xq_prev = nullptr;
+    long xq_merge = 0, seg_merge = 0;
+    const void * seg_prev_key = nullptr;
+    int seg_prev_k = 0, seg_prev_out = 0;
+    void flush(int mode) {
+        if (getenv("PF_LAUNCHCNT") == nullptr) {
+            return;
+        }
+        pass++;
+        fprintf(stderr,
+                "[lc] pass=%d mode=%d xq=%ld (mergeable-adjacent=%ld) gemm-seg=%ld (mergeable-adjacent=%ld) "
+                "norm=%ld gdn=%ld attn=%ld  total=%ld  fusible=%ld\n",
+                pass, mode, xq, xq_merge, seg, seg_merge, norm, gdn, attn, xq + seg + norm + gdn + attn,
+                (xq - xq_merge) + (seg - seg_merge));
+        xq = seg = norm = gdn = attn = misc = calls = 0;
+        xq_merge = seg_merge = 0;
+        xq_prev = nullptr;
+        seg_prev_key = nullptr;
+    }
+};
+thread_local launch_count g_lc;
+} // namespace
+
 void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows,
                             int at_nsp_hint, const md_phase * ph, const step_info * info) {
     // Per-chunk step_info (multi-device prefill pipeline: two chunks can be in
@@ -532,6 +566,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             // which the MTP speculative verify (a mode-2 batch) uses.
             D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K,
                         /*do_split=*/mode == 0 || inf->mtp_dry != 0);
+            g_lc.calls++;
+            g_lc.xq++;
+            g_lc.xq_merge += (g_lc.xq_prev == xq.x) ? 1 : 0;
+            g_lc.xq_prev = xq.x;
             if (prof_on()) {
                 sync_cur();
                 prof_acc[5] += tms(a2, tnow());
@@ -645,6 +683,41 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         decoded = true;
                     }
                 }
+                static const bool nofuse = getenv("PF_NOFUSE") != nullptr;
+                if (!decoded && !nofuse && gr.n > 1 && tbm <= 13) {
+                    // Narrow int8 group: one launch for the whole group.  The
+                    // GDN puts ssm_alpha and ssm_beta (48 rows each) in one
+                    // group, and a per-segment launch costs ~40 us of exposed
+                    // latency for 0.26 MB - 48 layers x 2 of them is a quarter of
+                    // the MTP verify's marginal-row budget.  Returns false when
+                    // the group is not eligible, and the per-segment path below
+                    // runs unchanged.
+                    const void * keys[4];
+                    const float * outs[4], * res[4];
+                    int nrows[4];
+                    float alphas[4];
+                    bool ok = gr.n <= 4;
+                    for (int j = 0; ok && j < gr.n; j++) {
+                        const gemv_seg & sj = plan.segs[gr.off + j];
+                        keys[j] = sj.w;
+                        nrows[j] = sj.n_rows;
+                        outs[j] = sj.out;
+                        res[j] = sj.residual;
+                        alphas[j] = sj.alpha;
+                        ok = sj.K == plan.segs[gr.off].K && sj.out_stride == plan.segs[gr.off].out_stride;
+                    }
+                    if (ok) {
+                        decoded = D->gemm_i8_group(keys, nrows, outs, plan.segs[gr.off].out_stride, res, alphas, gr.n,
+                                                   tbm, plan.segs[gr.off].K);
+                        if (getenv("PF_FUSEDBG") != nullptr) {
+                            static long fused = 0, tried = 0;
+                            tried++;
+                            fused += decoded;
+                            fprintf(stderr, "[fused] M=%d gr.n=%d K=%d -> %d (tried=%ld fused=%ld)\n", tbm, gr.n,
+                                    plan.segs[gr.off].K, (int)decoded, tried, fused);
+                        }
+                    }
+                }
                 if (!decoded) {
                     for (int j = 0; j < gr.n; j++) {
                         const gemv_seg & sj = plan.segs[gr.off + j];
@@ -657,6 +730,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                             const char * e = getenv("PF_W4_DEBUG");
                             return e && atoi(e) != 0;
                         }();
+                        g_lc.seg++;
+                        g_lc.seg_merge += (g_lc.seg_prev_key != nullptr && g_lc.seg_prev_k == sj.K
+                                           && g_lc.seg_prev_out == sj.out_stride)
+                                              ? 1
+                                              : 0;
+                        g_lc.seg_prev_key = sj.w;
+                        g_lc.seg_prev_k = sj.K;
+                        g_lc.seg_prev_out = sj.out_stride;
                         if (D->gemm_w4(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
                             c_w4++;
                             continue;
@@ -810,6 +891,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         }();
         const auto a_n = tnow();
         cur_be->rmsnorm(d_x, wf32(dev, L.attn_norm), d_xnorm, T, hp.n_embd, hp.rms_eps);
+        g_lc.norm++;
         stamp(c_norm, a_n);
         if (L.recurrent) {
             gemv();
@@ -872,6 +954,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             if (mode == 2 && fuse_gdn >= 1 && !nogdn) {
                 cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
                                hp.d_state, hp.n_group, hp.rms_eps, NCH, kMaxT, 0, kMaxT, /*cross_row=*/true);
+                g_lc.gdn++;
                 stamp(prof_acc[11], a_sub);
                 a_sub = tnow();
                 cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT,
@@ -910,9 +993,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                                 "[gdn] mode=%d r0=%d rr0=%d rn=%d gdn_nr=%d info_n_rows=%d "
                                 "active=%d tpb=%d\n",
                                 mode, r0, rr0, rn, gdn_nr, inf->n_rows, inf->active[rr0], inf->tpb);
+                    g_lc.gdn++;
                     }
                     cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
                                    hp.d_state, hp.n_group, hp.rms_eps, rn, gdn_nr, rr0, -1, false);
+                    g_lc.gdn++;
                     cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, rn, rr0, -1, -1, false,
                                              snap);
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
@@ -939,6 +1024,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
             // gated_norm has no state dependency on the row order, so all chunk
             // rows run in one dispatch (batched it is ~4x cheaper than NCH calls)
+            g_lc.gdn++;
             cur_be->gated_norm(d_attn_pre, d_z, wf32(dev, L.ssm_norm), d_attn_merged, inf, hp.dt_rank, hp.d_state,
                               hp.rms_eps, mode == 2 ? NCH : nrows, gdn_nr, 0);
             stamp(prof_acc[14], a_sub);
@@ -1138,6 +1224,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             c_head += tms(a, tnow());
         }
     }
+    g_lc.flush(mode);
     if (prof) {
         dev_queue(0).wait();
         const double c_total = tms(pt0, tnow());

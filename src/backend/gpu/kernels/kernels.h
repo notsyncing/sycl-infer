@@ -134,7 +134,16 @@ void rmsnorm_launch(sycl::queue & q, const float * x, const float * w, float * o
 void mtp_capture_launch(sycl::queue & q, const float * src, float * dst, int n_rows, int n);
 void mtp_concat_launch(sycl::queue & q, const void * table, uint32_t type, size_t row_bytes, const float * enorm,
                        const float * hnorm, const float * h, const float * h_prev, const step_info * info,
-                       float * out, int n_embd, float eps);
+                       float * out, int n_embd, float eps, const int32_t * tok_dev = nullptr);
+// Candidate-restricted LM head for the MTP draft (see mtp_argmax.cpp): collect a
+// candidate set from a distribution the target just produced, evaluate the head
+// only on those rows, and take the argmax over them.
+void mtp_cand_launch(sycl::queue & q, const float * logits, int n, const int32_t * am_idx, const float * am_val,
+                     float margin, int32_t * ids, int cap);
+void mtp_gather_launch(sycl::queue & q, const int32_t * ids, int cap, const int8_t * w8, const uint16_t * wsc,
+                       const int8_t * xq, const uint16_t * asa, const float * xs, int K, int N, float * vals);
+void mtp_gather_argmax_launch(sycl::queue & q, const float * vals, const int32_t * ids, int cap, int32_t * out_id,
+                              float * out_val);
 // Per-row argmax over an [M][n] f32 logits matrix, writing only the indices
 // (and optionally the values) back: the MTP verify needs it for its accept test,
 // and a host copy of M*n_vocab floats per cycle costs ~7 MB.
@@ -148,6 +157,34 @@ void w4_split_act_launch(sycl::queue & q, const int8_t * axg, int8_t * axe, int8
 void i8_grp_gemv_launch(sycl::queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
                         const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
                         int N);
+// int8 grouped GEMV over M = 2..13 rows of a *narrow* weight: per-row arithmetic
+// bit-identical to i8_grp_gemv_launch (same lane->group map and reduction), but
+// with a 12-argument / one-local_accessor signature instead of nat_gemm's 25 / 6.
+// It exists because nat_gemm's per-launch cost (~52 us, measured) dwarfs the work
+// on tensors like the GDN's K=5120 x 48 alpha/beta projections - see
+// reports/mtp_ceiling.md.
+void i8_grp_gemv_rows_launch(sycl::queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                             const uint16_t * asa, const float * xs, float * out, int out_stride,
+                             const float * residual, float alpha, int M, int K, int N);
+// One launch for a whole call group's *narrow* int8 segments (they share the
+// quantized activation and the K).  The 27B's GDN has two of them per layer --
+// ssm_alpha and ssm_beta, 48 rows each -- and a per-segment launch costs ~40 us
+// of exposed latency for 0.26 MB of weights (measured at M=5: K=5120 x 32 rows
+// 40.1 us, x 96 rows 40.9 us, x 1024 rows 13.5 us at K=1024; the launch floor
+// itself is 5.8 us), so 48 layers x 2 launches is ~4 ms of the verify's
+// marginal-row budget.  Fusing them takes the 27B weight pass from 68.3 to
+// 66.5 ms at M=5 (53.9 -> 53.4 at M=1) - see reports/mtp_ceiling.md.
+struct i8_grp_seg {
+    const int8_t * w8;
+    const uint16_t * wsc;
+    int n_rows;
+    float * out;
+    int out_stride;
+    float alpha;
+    const float * residual;
+};
+void i8_grp_gemv_rows_multi_launch(sycl::queue & q, const i8_grp_seg * segs, int n_segs, int total_rows,
+                                    const int8_t * xq, const uint16_t * asa, const float * xs, int M, int K);
 void w4_gemm_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int M, int K, int N);

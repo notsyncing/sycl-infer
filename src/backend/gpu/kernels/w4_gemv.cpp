@@ -28,6 +28,9 @@
 
 #include "dp4a.h"
 
+#include <cstdlib>
+#include <stdexcept>
+
 namespace si {
 
 using namespace sycl;
@@ -159,6 +162,142 @@ void w4_gemv_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
         w4_gemv_impl<8>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
     }
 }
+
+// i8_grp_gemv_rows_multi_impl: one launch for a whole call group's int8
+// (per-32-group f16 scale) segments, which share the quantized activation and the
+// K.  The per-row arithmetic is i8_grp_gemv_impl's, unchanged (same lane->group
+// mapping, same sub-group tree reduction), so every row stays bit-identical to
+// the M=1 decode GEMV.  See i8_grp_seg in kernels.h for why.
+template <int M, int NS>
+static void i8_grp_gemv_rows_multi_impl(queue & q, const i8_grp_seg * segs, const int8_t * xq,
+                                        const uint16_t * asa, const float * xs, int K, int total_rows) {
+    const int ng = K / 32;
+    // The descriptors must reach the kernel *by value*: the caller keeps them in
+    // host memory (a stack array), and a device dereference of that reads zeros -
+    // which looks like a correct-looking, silently empty GEMV.  Copying them into
+    // the lambda's closure puts them in the kernel argument blob.
+    i8_grp_seg seg_v[NS];
+#pragma unroll
+    for (int i = 0; i < NS; i++) {
+        seg_v[i] = segs[i];
+    }
+    // One work-group per output row, 32 threads = one sub-group, so the row ->
+    // (segment, row) map is a scan over NS (<= 4) captured values and there is no
+    // cross-work-group reduction: the sub-group tree below is the only one.
+    // Measured no worse than 4 rows per work-group on the narrow shapes.
+    constexpr int TX = 32;
+    q.submit([&](handler & h) {
+        local_accessor<uint16_t, 1> meta((size_t)ng, h);
+        h.parallel_for(nd_range<1>((size_t)total_rows * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lane = (int)it.get_local_id(0);
+            const int fr = (int)it.get_group(0);
+            int rem = fr;
+            int si = 0;
+#pragma unroll
+            for (int t = 0; t < NS; t++) {
+                if (t + 1 < NS && rem >= seg_v[t].n_rows) {
+                    rem -= seg_v[t].n_rows;
+                    si = t + 1;
+                }
+            }
+            const i8_grp_seg & S = seg_v[si];
+            const int n = rem;
+            // g-major scale staging for this row (the plane is [K/32][n_rows] of
+            // its own segment), then the same group loop as the M=1 GEMV.
+            for (int g = lane; g < ng; g += 32) {
+                meta[g] = S.wsc[(size_t)g * S.n_rows + n];
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int8_t * wrow = S.w8 + (size_t)n * K;
+            float acc[M];
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+                acc[m] = 0.f;
+            }
+            for (int g = lane; g < ng; g += 32) {
+                const uint4 w0 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32);
+                const uint4 w1 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32 + 16);
+                const float scw = w4_h2f(meta[g]);
+#pragma unroll
+                for (int m = 0; m < M; m++) {
+                    const uint4 x0 = *reinterpret_cast<const uint4 *>(xq + (size_t)m * K + (size_t)g * 32);
+                    const uint4 x1 = *reinterpret_cast<const uint4 *>(xq + (size_t)m * K + (size_t)g * 32 + 16);
+                    int32_t qd = 0;
+                    qd = dp4a_s8u8((int32_t)x0.x(), w0.x() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x0.y(), w0.y() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x0.z(), w0.z() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x0.w(), w0.w() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x1.x(), w1.x() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x1.y(), w1.y() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x1.z(), w1.z() ^ 0x80808080u, qd);
+                    qd = dp4a_s8u8((int32_t)x1.w(), w1.w() ^ 0x80808080u, qd);
+                    qd -= 128 * (int32_t)xs[(size_t)m * ng + g]; // undo the XOR bias
+                    acc[m] += w4_h2f(asa[(size_t)m * ng + g]) * scw * (float)qd;
+                }
+            }
+            const sub_group sgg = it.get_sub_group();
+#pragma unroll
+            for (int m = 0; m < M; m++) {
+                const float tot = reduce_over_group(sgg, acc[m], plus<float>());
+                if (lane == 0) {
+                    float v = S.alpha * tot;
+                    if (S.residual) {
+                        v += S.residual[(size_t)m * S.out_stride + n];
+                    }
+                    S.out[(size_t)m * S.out_stride + n] = v;
+                }
+            }
+        });
+    });
+}
+
+#define I8GM(mm, ns) i8_grp_gemv_rows_multi_impl<mm, ns>(q, segs, xq, asa, xs, K, total_rows)
+
+template <int M>
+static void i8_grp_gemv_rows_multi_pick(queue & q, const i8_grp_seg * segs, int n_segs, const int8_t * xq,
+                                         const uint16_t * asa, const float * xs, int K, int total_rows) {
+    switch (n_segs) {
+    case 1: I8GM(M, 1); return;
+    case 2: I8GM(M, 2); return;
+    case 3: I8GM(M, 3); return;
+    case 4: I8GM(M, 4); return;
+    default: break;
+    }
+    throw std::runtime_error("i8_grp_gemv_rows_multi_launch: too many segments");
+}
+
+#undef I8GM
+
+void i8_grp_gemv_rows_multi_launch(queue & q, const i8_grp_seg * segs, int n_segs, int total_rows,
+                                    const int8_t * xq, const uint16_t * asa, const float * xs, int M, int K) {
+#define I8GR(mm) i8_grp_gemv_rows_multi_pick<mm>(q, segs, n_segs, xq, asa, xs, K, total_rows)
+    switch (M) {
+    case 1: I8GR(1); return;
+    case 2: I8GR(2); return;
+    case 3: I8GR(3); return;
+    case 4: I8GR(4); return;
+    case 5: I8GR(5); return;
+    case 6: I8GR(6); return;
+    case 7: I8GR(7); return;
+    case 8: I8GR(8); return;
+    case 9: I8GR(9); return;
+    case 10: I8GR(10); return;
+    case 11: I8GR(11); return;
+    case 12: I8GR(12); return;
+    case 13: I8GR(13); return;
+    default: break;
+    }
+#undef I8GR
+    throw std::runtime_error("i8_grp_gemv_rows_multi_launch: unsupported M");
+}
+
+void i8_grp_gemv_rows_launch(queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                             const uint16_t * asa, const float * xs, float * out, int out_stride,
+                             const float * residual, float alpha, int M, int K, int N) {
+    const i8_grp_seg s = {w8, wsc, N, out, out_stride, alpha, residual};
+    i8_grp_gemv_rows_multi_launch(q, &s, 1, N, xq, asa, xs, M, K);
+}
+
 
 // int8 decode GEMV with per-32-group scales (M == 1), the int8 counterpart of
 // w4_gemv_launch:

@@ -115,12 +115,31 @@ void engine::build_mtp_plan() {
 // One call of the MTP plan: quantize its activations once, then run the GEMMs.
 // OneDNN cannot be recorded and its M==1 path is the grouped GEMV the
 // multi-device decode already uses per segment, so this mirrors that dispatch.
-void engine::mtp_gemv(int ci, int M) {
+void engine::mtp_gemv(int ci, int M, int step) {
     const seg_plan & p = plan_mtp_;
     dnnl_gemm * D = dnnl_for(ci == 4 ? 0 : mtp_dev);
     const seg_plan::xq_t & xq = p.call_xq[(size_t)ci];
     if (D == nullptr || xq.x == nullptr) {
         throw std::runtime_error("mtp: the oneDNN int8 weight path is required");
+    }
+    // Head readout.  With `step >= 0` the chain is device-resident: the argmax
+    // lands in d_mtp_tok[step], which the next draft step's concat reads, so a
+    // cycle needs no host round-trip per step (k syncs + k x n_vocab-float copies
+    // + k host scans of 248320 values, ~1.2 ms/cycle).  With PF_MTP_CAND on, the
+    // head is evaluated on the candidate rows instead of all n_vocab - the same
+    // quantized activation and the same int8 grouped dot product the decode GEMV
+    // computes (mtp_gather_launch).
+    if (ci == 4 && step >= 0) {
+        const bool gather = (mtp_cand_cap_ > 0 && mtp_cand_ok_);
+        compute_backend & hb = *backends_[0];
+        if (gather) {
+            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/false);
+            hb.mtp_gather(d_mtp_cand_, mtp_cand_cap_, mtp_head_w8_, mtp_head_wsc_, D->act_grp_data(),
+                          D->act_grp_scales(), D->act_group_sums(), (int)xq.K, mtp_head_rows_, d_mtp_cvals_);
+            hb.mtp_gather_argmax(d_mtp_cvals_, d_mtp_cand_, mtp_cand_cap_, d_mtp_tok_ + step,
+                                 getenv("PF_MTP_CANDV") ? d_mtp_cval1_ : nullptr);
+            return;
+        }
     }
     // Any single-token draft call can run from a u4 copy (the shared LM head
     // under its private key, the MTP layer's own linears under their own), and
@@ -146,6 +165,14 @@ void engine::mtp_gemv(int ci, int M) {
             throw std::runtime_error("mtp: oneDNN GEMM failed for a layer tensor");
         }
     }
+    if (ci == 4 && step >= 0) {
+        // The full head readout's argmax stays on the device.  It has to go on
+        // the *primary partition's* queue (backends_[0] = dev_queues_[0]), which
+        // is where the head GEMV was submitted - `backend()` is the single-device
+        // backend on the main queue, and a different in-order queue would race
+        // the GEMV and hand the next draft step the previous step's logits.
+        backends_[0]->mtp_argmax(d_logits, m.hp.n_vocab, d_mtp_tok_ + step, nullptr, 1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +181,7 @@ void engine::mtp_gemv(int ci, int M) {
 // those same tokens (or null when n == 1 and hprev carries the hidden); token i
 // takes h[i-1] and the first token of the row takes hprev.
 void engine::mtp_forward(const int32_t * toks, const float * h, const float * hprev, int n, int slot, int pos0,
-                         bool with_head) {
+                         bool with_head, const int32_t * tok_dev, int step) {
     const hparams & hp = m.hp;
     const mtp_layer_t & M = m.mtp;
     dnnl_gemm * D = dnnl_for(mtp_dev);
@@ -180,7 +207,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     // 1. concat(enorm(emb(tok)), hnorm(h_prev))
     MTPDBG("forward n=%d pos=%d head=%d concat\n", n, pos0, (int)with_head);
     be.mtp_concat(wptr(0, m.tok_embd.data), m.tok_embd.type, m.tok_embd_row_bytes, wf32(mtp_dev, M.enorm),
-                  wf32(mtp_dev, M.hnorm), h, hprev, inf, d_mtp_cat, hp.n_embd, hp.rms_eps);
+                  wf32(mtp_dev, M.hnorm), h, hprev, inf, d_mtp_cat, hp.n_embd, hp.rms_eps, tok_dev);
     MTPDBG("forward eh_proj\n");
     // 2. eh_proj -> d_mtp_x
     {
@@ -254,7 +281,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
             // the shared LM head lives on the primary device
             dev_queue(0).memcpy(d_mtp_hnorm0, d_mtp_hnorm, (size_t)n * hp.n_embd * 4).wait();
         }
-        mtp_gemv(4, n);
+        mtp_gemv(4, n, step);
     }
     MTPDBG("forward done\n");
 }
@@ -336,9 +363,25 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
         return (m32 && atoi(m32) != 0) ? kMaxT : 0;
     }();
     const int rows_vf = v_pad > n ? v_pad : n;
+    // PF_MTP_SUBMIT: size the prize for a recorded verify graph.  The host cost
+    // of record_forward is the ~1000 SYCL submissions (497 GEMV groups plus the
+    // per-layer norm/xq/attn/gdn launches) *without* any device wait; the
+    // following sync_all() then gives the wall time, so the difference is what
+    // the GPU actually had to do.  If the submit is a large share of the wall
+    // time, one command graph for the pass is worth building.
+    const bool submit_dbg = getenv("PF_MTP_SUBMIT") != nullptr;
+    const auto t_now = [] { return std::chrono::high_resolution_clock::now(); };
+    const auto t_ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto t_submit0 = t_now();
     record_forward(2, plan_vf_, d_segs_vf, rows_vf, d_segs_vf);
+    const double t_submit = submit_dbg ? t_ms(t_submit0, t_now()) : 0.0;
     MTPDBG("verify record_forward returned, syncing\n");
     sync_all();
+    if (submit_dbg) {
+        fprintf(stderr, "[mtp] verify submit=%.2f ms  wall-after-submit=%.2f ms\n", t_submit, t_ms(t_submit0, t_now()));
+    }
     if (const char * sd = getenv("PF_MTP_SNAPDUMP"); sd && pos0 == 0) {
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
         const size_t per = gdn_per + (size_t)(hp.conv_k - 1) * hp.qkv_dim();
@@ -890,6 +933,9 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     }();
     int k = mtp_k;
     std::vector<int> cand((size_t)mtp_k + 1);
+    // the candidate-restricted draft head arms itself after the first verify has
+    // produced a candidate set (the first cycle uses the full head readout)
+    bool cand_ready = false;
     static const bool mt = getenv("PF_MTP_TIME") != nullptr;
     double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0, t_emit = 0, t_cb = 0, t_am = 0, t_cyc = 0;
     long t_acc = 0;
@@ -902,10 +948,77 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         cand[0] = tok;
         const float * hprev = d_mtp_hprev;
         static const bool no_mtpfwd = getenv("PF_MTP_NOMTPFWD") != nullptr;
+        // PF_MTP_CAND=0 (the default, and the measured-better setting): the head
+        // readout is the full 248320 rows.  With it on, step 0 is a full readout
+        // that seeds the candidate set and steps 1..k-1 evaluate the head only on
+        // that set - see reports/mtp_ceiling.md for the hit-rate measurement that
+        // keeps it off by default.
+        const bool cand_head = mtp_cand_cap_ > 0 && mtp_cand_ok_ && (cand_ready || mtp_cand_src_ == 1);
+        // Device-resident draft chain: the head runs on the primary device and the
+        // MTP layer on mtp_dev, so with the default --mtp-device 0 both sit on one
+        // in-order queue and step i+1's concat reads step i's argmax straight out
+        // of device memory.  That removes k syncs, k x n_vocab-float D2H copies and
+        // k host scans of 248320 values per cycle (~1.2 ms/cycle measured).  A
+        // cross-device mtp_dev keeps the host round-trip.
+        const bool dev_chain = (mtp_dev == 0);
         for (int i = 0; !no_mtpfwd && i < k; i++) {
             const int32_t t = cand[(size_t)i];
             MTPDBG("draft %d\n", i);
-            mtp_forward(&t, nullptr, hprev, 1, 0, pos + i, /*with_head=*/true);
+            if (cand_head && dev_chain && i == 0 && mtp_cand_src_ == 1) {
+                // The draft's *own* first-step distribution is the best available
+                // seed for the rest of the chain (the target's row from the last
+                // verify is one position back and only catches ~35% of the next
+                // argmax even at 938 candidates - see the [canddbg] sweep).  One
+                // full readout per cycle, then the chain runs on its top-N.
+                mtp_forward(&t, nullptr, hprev, 1, 0, pos + i, /*with_head=*/true);
+                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, d_mtp_tok_, d_mtp_amv_, 1);
+                backends_[0]->mtp_cand(d_logits, hp.n_vocab, d_mtp_tok_, d_mtp_amv_, mtp_cand_margin_, d_mtp_cand_,
+                                   mtp_cand_cap_);
+            } else {
+            mtp_forward(&t, nullptr, hprev, 1, 0, pos + i, /*with_head=*/true,
+                        /*tok_dev=*/(dev_chain && i > 0) ? d_mtp_tok_ + (i - 1) : nullptr,
+                        /*step=*/dev_chain ? i : -1);
+            }
+            // PF_MTP_CANDDBG: hit rate of the candidate set - this step's
+            // restricted argmax against a full readout of the *same* hidden.
+            // Costs a full readout per step, so it is a diagnostic only.
+            static const bool cand_dbg = getenv("PF_MTP_CANDDBG") != nullptr;
+            static int32_t * d_am2 = nullptr;
+            static int h_cand = 0, h_full = 0, h_steps = 0;
+            static int h_cand_s[kMaxT] = {0}, h_full_s[kMaxT] = {0};
+            if (cand_head && cand_dbg) {
+                if (!d_am2) {
+                    d_am2 = sycl::malloc_device<int32_t>(4, dev_queue(0));
+                }
+                int32_t hid = -1, hf = -1;
+                dev_queue(0).memcpy(&hid, d_mtp_tok_ + i, 4);
+                mtp_gemv(4, 1, -1); // full readout of the same hidden
+                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, d_am2, nullptr, 1);
+                dev_queue(0).memcpy(&hf, d_am2, 4).wait();
+                h_cand += (hid == hf);
+                h_full++;
+                h_cand_s[i] += (hid == hf);
+                h_full_s[i]++;
+                h_steps++;
+                if (h_steps % 64 == 0) {
+                    // how many ids the collect kernel actually filled
+                    std::vector<int32_t> ids((size_t)mtp_cand_cap_);
+                    dev_queue(0).memcpy(ids.data(), d_mtp_cand_, (size_t)mtp_cand_cap_ * 4).wait();
+                    int nf = 0;
+                    for (int32_t v : ids) {
+                        nf += (v >= 0);
+                    }
+                    fprintf(stderr, "[canddbg] steps=%d hit=%d/%d (%.1f%%) set=%d/%d per-step:", h_steps, h_cand,
+                            h_full, 100.0 * h_cand / std::max(h_full, 1), nf, mtp_cand_cap_);
+                    for (int s2 = 0; s2 < k; s2++) {
+                        fprintf(stderr, " %d%%", h_full_s[s2] ? 100 * h_cand_s[s2] / h_full_s[s2] : 0);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (dev_chain) {
+                cand[(size_t)i + 1] = 0; // filled from d_mtp_tok_ after the chain
+            } else {
             // the LM head runs on device 0 while the MTP layer may live on a
             // partition device: `q` is not ordered against dev_queue(0), so a
             // q.wait()/q.memcpy here reads the *previous* step's logits and the
@@ -923,8 +1036,9 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             }
             dev_queue(0).memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
             cand[(size_t)i + 1] = argmax_f(h_logits, hp.n_vocab);
+            }
             static const bool lstat = getenv("PF_MTP_LSTAT") != nullptr;
-            if (lstat) {
+            if (lstat && !dev_chain) {
                 double mx = -1e30, mn = 1e30, sum = 0;
                 int nan = 0;
                 for (int v = 0; v < hp.n_vocab; v++) {
@@ -956,6 +1070,10 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                         i, pos + i, mx, mn, sum / hp.n_vocab, nan, t3[0], b3[0], t3[1], b3[1], t3[2], b3[2]);
             }
             hprev = d_mtp_raw; // the raw MTP hidden at this row seeds the next
+        }
+        if (dev_chain) {
+            // one small copy for the whole chain (instead of k x n_vocab floats)
+            dev_queue(0).memcpy(cand.data() + 1, d_mtp_tok_, (size_t)k * 4).wait();
         }
         const auto tc1 = now_t();
         t_draft += ms_t(tc0, tc1);
@@ -1042,12 +1160,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // `dev_argmax` must be device memory: a kernel cannot write a host stack
         // array.
         static int32_t * d_argmax = nullptr;
+        static float * d_argval = nullptr;
         if (!d_argmax) {
             d_argmax = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
+            d_argval = sycl::malloc_device<float>(kMaxB, dev_queue(0));
         }
         const auto tam0 = now_t();
         if (have_dev_argmax) {
-            backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, nullptr, k + 1);
+            backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, mtp_cand_cap_ > 0 ? d_argval : nullptr, k + 1);
             dev_queue(0).memcpy(h_argmax, d_argmax, (size_t)(k + 1) * 4).wait();
             if (getenv("PF_MTP_AMCHK") != nullptr) {
                 dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
@@ -1125,6 +1245,18 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             if ((!gp.ignore_eos && is_eos(tok)) || !emit_cb(tok)) {
                 break;
             }
+        }
+        // Seed the next cycle's draft candidate set from the *target's own*
+        // distribution at the accepted position (row j: the row that produced the
+        // bonus token).  ids[0] is that row's exact argmax, so the set always
+        // contains it, and the remaining entries are the tokens within
+        // PF_MTP_CANDM logits of it - a few hundred rows out of 248320, which is
+        // all the draft head has to read.  Enqueued on device 0's queue, so it is
+        // ordered after the verify's own kernels and before the next draft.
+        if (mtp_cand_src_ == 0 && have_dev_argmax && mtp_cand_cap_ > 0 && mtp_cand_ok_) {
+            backend().mtp_cand(d_logits + (size_t)j * hp.n_vocab, hp.n_vocab, d_argmax + j, d_argval + j,
+                               mtp_cand_margin_, d_mtp_cand_, mtp_cand_cap_);
+            cand_ready = true;
         }
         const auto tc3 = now_t();
         t_emit += ms_t(tc2, tc3); // accept + argmax + sampling + the host callback
