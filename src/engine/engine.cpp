@@ -199,11 +199,44 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     // conv/GDN state at every block boundary it crosses).  PF_PREFIX_CACHE=0
     // disables it; PF_PC_STATES=N bounds the checkpoint pool.
     {
-        // decode attention K-split: the single-token shape has only n_head
-        // workgroups, so at long context a wider split is what keeps the GPU
-        // busy (2x the fan-out of n_splits at ~0.3 ms combine cost)
+        // Decode attention K-split.  The single-token shape has only n_head
+        // workgroups, so the split is what keeps the GPU busy, and the kernel is
+        // latency bound (not bandwidth bound - the 6x GQA K/V re-read is served
+        // from L2 for free), so more splits = more warps to hide the serial
+        // (load, sg_sum, exp) chain.
+        //
+        // The useful range is set by an occupancy wave.  The kernel launches
+        // n_head * n_splits 32-thread warps per layer, and a DG2/Xe-LP EU holds
+        // 8 of them; past 8 warps/EU the excess cannot be co-resident and the
+        // time steps up instead of improving.  Measured one A770 (512 EUs), i8
+        // KV, 27B shape (n_head 24), `dev/bench_attn27 <depth> --dec-only
+        // --splits N` (attn + combine, ms, best of 10, reproducible to +-0.5%):
+        //
+        //   depth   nsp=128  nsp=144  nsp=160  nsp=168  nsp=176
+        //     4096    0.390    0.351      -        -        -
+        //    16384    0.799    0.653    0.621      -        -
+        //    32768    1.071    0.946    0.944    0.963      -
+        //    65536    2.177    1.748    1.699    1.744    2.678
+        //
+        // nsp=176 is 24*176 = 4224 warps = 8.25/EU and falls off the cliff;
+        // 160 is 3840 = 7.5/EU and is the optimum at every depth.  The 0.8B
+        // shape (n_head 8) puts its optimum at the same 6.5-7.5 warps/EU, so
+        // the default is derived from the query-head count and the device's
+        // compute-unit count rather than hardcoded:
+        //
+        //     dec_splits = 7.5 * compute_units / n_head
+        //
+        // The old default was kMaxSplits (64); 128 (an earlier change) measured
+        // 2.177 ms at 64k depth against 160's 1.699.
         const char * e = getenv("PF_DEC_SPLIT");
-        dec_splits = e ? atoi(e) : kMaxSplits;
+        if (e) {
+            dec_splits = atoi(e);
+        } else {
+            const uint32_t eus = q.get_device().get_info<sycl::info::device::max_compute_units>();
+            // 15/2 = 7.5 warps per EU, rounded down to a multiple of 8
+            const int want = (int)((15ull * eus) / (2ull * (unsigned)std::max(1, m.hp.n_head)));
+            dec_splits = std::max(8, (want / 8) * 8);
+        }
         if (dec_splits < 1) {
             dec_splits = 1;
         }

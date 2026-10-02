@@ -1028,7 +1028,19 @@ scales always apply),
 
 **Attention**
 `PF_ATTN_SPLIT`, `PF_ATTN_SPLIT_KEYS` (default 512), `PF_ATTN_VEC` (default on),
-`PF_ATTN_FUSE` (default on), `PF_DEC_SPLIT` (default 64, cap 256),
+`PF_ATTN_FUSE` (default on), `PF_DEC_SPLIT` (default **`7.5 * compute_units /
+n_head`**, i.e. 160 on a 512-EU A770 for the 27B's 24 query heads; cap 512 —
+decode K-split).  The decode attention is **occupancy** bound, not bandwidth
+bound: `n_head * n_splits` 32-thread warps per layer, 8 per EU, and past 8
+warps/EU the excess is not co-resident and the time steps *up*.  Measured one
+layer, 27B shape, i8 KV, 64k depth, attn+combine ms: nsp=64 3.05, 128 2.18,
+**160 1.70**, 168 1.74, 176 **2.68** (the cliff, at 8.25 warps/EU).  End to end
+that is tg128@64k 8.26 -> 10.34 t/s and @16k 12.37 -> 13.35, with batched
+decode neutral at c8.  Two consequences worth not re-deriving: do **not** "fix"
+the 6x GQA K/V re-read by sharing loads across query heads (measured 5x
+*SLOWER* — the re-read is free from L2 and the lost warps are not), and do not
+unroll the key loop for MLP (KU=2..8 all slower; IGC already pipelines it).  See
+`reports/d64k_pp_tg_evaluation.md`),
 `PF_DEC_GROUP` (grouped decode attention, default off), `PF_ATTN_XMX` (oneDNN
 int8 *matmul* prefill attention, **default on**; `0` restores the classic kernel),
 `PF_ATTN_XMX_MIN` (minimum key count for the oneDNN matmul path, default 2048 - below it the
@@ -1095,7 +1107,15 @@ xq reads a different source and so sits on the critical dependency chain: see
 [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §1e), `PF_MTP_SUBMIT` (the
 verify's host submit time vs its wall - 86.6 of 90.2 ms, i.e. the in-order queue
 paces the host, so a recorded verify graph would only buy the decode graph's
-measured 1-2 ms), `PF_DUMP_KV=<dir>` (append the
+measured 1-2 ms), `PF_XMX_BREAKDOWN` (per-stage wall clock inside the prefill
+attention block loop - gather / QK / softmax / PV; the only way to attribute the
+*mode-2* 512-token prefill, because `PF_PROF` needs `PF_NOGRAPH` and that forces
+the mode-1 32-token path; every stage is measured with a `q.wait()`, so the
+absolute values are inflated by the serialisation and only the shares are
+meaningful), `PF_XMX_TIME` (whole-call wall clock, same caveat),
+`PF_XMX_DBG` (print `M`, `max_nkv` and the per-block widths of one call),
+`PF_XMX_GRED=N` (gather stage-1 work-group count, default 64), `PF_XMX_TAILBLK=0`
+(keep the last block at the full `kBlk`), `PF_DUMP_KV=<dir>` (append the
 live tokens' post-norm+RoPE f32 K and V of every full-attention layer to
 `<dir>/{k,v}_LL.bin`, for offline KV-quantization studies; skipped while a
 command graph is being recorded, so it only fires on the direct prefill paths), `PF_W4_RB` (decode GEMV rows
@@ -1216,14 +1236,31 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   the native stores' 272-325).
 * **oneDNN int8 prefill attention (`attn_xmx.cpp`, `PF_ATTN_XMX`, default on above 2048
   keys)**: QK^T and PV run as plain oneDNN int8 matmuls over the paged KV
-  gathered into a contiguous scratch.  Three things are load-bearing:
+  gathered into a contiguous scratch.  Four things are load-bearing:
   (1) a plain int8 matmul sums over k, so a per-key scale cannot be applied
   after it - K and V each carry ONE block-wide scale, folded in at gather time;
   (2) the query tile stacks every HPG query head sharing a kv head, so the
   matmul width is `HPG * tokens` and the KV is read once per kv head, not once
-  per query head; (3) the matmuls always run at the FIXED width `kBlk = 2048`
+  per query head; (3) the matmuls always run at a FIXED width `kBlk = 8192`
   (zero-padded), because oneDNN primitive creation is ~15 ms per new shape and
-  a per-chunk `N` made prims never reusable - that alone was a 12x regression.
+  a per-chunk `N` made prims never reusable - that alone was a 12x regression;
+  (4) **the block-max reduction in the gather must be spread over many
+  work-groups, never one** - a single 256-thread group reducing a whole 8192-key
+  block was 18.1 ms of the 37.8 ms one attention layer costs at 64k depth
+  (the QK matmul 6.7, the softmax 6.1, the PV matmul 4.3), i.e. 23 % of the
+  whole 512-token prefill chunk.  It is now `kGatherRed = 64` work-groups
+  reducing a slice each into a private slot, then one small kernel folds the
+  partials; `fmax` is exact and associative so the block scale, and the whole
+  output, is bit-identical.  Measured: 18.1 -> 9.1 ms, marginal 512-token
+  chunk at 64k **975 -> 833 ms (-15 %)**.  `PF_XMX_BREAKDOWN=1` prints the
+  per-stage split and is the only way to attribute the mode-2 512-token
+  prefill (`PF_PROF` needs `PF_NOGRAPH`, which forces the mode-1 32-token
+  path); `PF_XMX_GRED` / `PF_XMX_TAILBLK` are the A/B knobs.  Note two
+  *negative* results here: tiling M so the 101 MB score matrix fits the 16 MB
+  L2 is +53 % (L2 caps the tile *area*, so the oneDNN execute count goes up ~7x
+  either way at ~35 us each), and the per-block padding that the fixed width
+  leaves behind is free (the tail-block width is trimmed anyway, but it measured
+  neutral at both 16k and 64k).  See `reports/d64k_pp_tg_evaluation.md`.
   The attention scratch is per-queue (`xmx_get` keys on the queue address): a
   function-local static was shared across the two `--layer-map` devices and the
   cross-device USM access cost another ~12x.  The matmuls use a dedicated

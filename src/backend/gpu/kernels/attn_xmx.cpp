@@ -4,6 +4,7 @@
 #include "dnnl_gemm.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -70,10 +71,51 @@ static constexpr int kD = 256;    // head_dim (fixed for this model)
 static constexpr int kBlk = 8192; // keys per matmul block
 static constexpr int kMaxQ = kMaxT * kMaxB;
 
+// Work-groups in the gather's first-stage max reduction.  The reduction used to
+// be a single 256-thread work-group over the whole key block, which on a 512-EU
+// device was the worst-scaled piece of the prefill; see xmx_gather.  64 gives
+// 64 x 64 = 4096 concurrent row-readers and a 64-float fold afterwards.
+// PF_XMX_GRED=N overrides the work-group count for A/B; the buffer is sized
+// for kGatherRedMax so a larger sweep needs no reallocation.
+constexpr int kGatherRedMax = 512;
+constexpr int kGatherRed = 64;
+
+// Width used for the *last* key block of a call.  The oneDNN matmuls always run
+// at a fixed width (primitive creation is ~15 ms per new shape, so a width that
+// followed the chunk size made prims never reusable -- a 12x regression), which
+// means every block runs at kBlk columns even when only a few hundred keys
+// remain, and the QK matmul, the softmax's pass over the score row, the PV matmul
+// and the K/V gather all zero-fill and then compute those columns for nothing.
+//
+// The waste is largest at *shallow* depth and nearly gone at 64k, because the
+// true key count is `pos0 + 512`, not `depth + 512`: a chunk ending at 4096
+// needs 4608 keys = 1 block = 44 % padding, at 16384 31 %, and at 65536 only
+// 0.8 % (65024 keys into 8 blocks of 8192).  Shrinking only the tail block costs
+// at most log2(kBlk) extra primitive shapes per M, which are then cached.
+//
+// Measured: NEUTRAL end to end at both 16k (563.7/565.3/566.7 vs
+// 563.3/565.9/567.3 ms per marginal chunk) and 64k (971.0/972.7/975.8 vs
+// 971.3/972.8/978.3 ms) -- the padded columns turn out to be nearly free.  Kept
+// because it cannot lose; `PF_XMX_TAILBLK=0` restores the old behaviour.
+static inline int xmx_tail_blk(int rem) {
+    static const bool off = [] {
+        const char * e = getenv("PF_XMX_TAILBLK");
+        return e && atoi(e) == 0;
+    }();
+    if (off) {
+        return kBlk;
+    }
+    int b = kBlk;
+    while (b > 256 && rem <= b / 2) {
+        b >>= 1;
+    }
+    return b;
+}
+
 struct xmx_bufs {
     int8_t * k = nullptr;  // [kBlk * kD]
     int8_t * v = nullptr;  // [kBlk * kD]
-    float * bs = nullptr;  // [2] block-wide K scaled, V scale
+    float * bs = nullptr;  // [2 + 2*kGatherRed] block scales + gather max partials
     int8_t * q8 = nullptr; // [Mcap * kD]
     float * qsc = nullptr; // [Mcap]
     int32_t * orow = nullptr; // [Mcap] qbuf row index (r * tpb + t)
@@ -147,7 +189,7 @@ static xmx_bufs & xmx_get(queue & q, int m_cap, int key_cap) {
         b.cap_keys = key_cap;
         b.k = sycl::malloc_device<int8_t>((size_t)kBlk * kD, q);
         b.v = sycl::malloc_device<int8_t>((size_t)kBlk * kD, q);
-        b.bs = sycl::malloc_device<float>(2, q);
+        b.bs = sycl::malloc_device<float>(2 + 2 * kGatherRedMax, q);
         b.q8 = sycl::malloc_device<int8_t>((size_t)m_cap * kD, q);
         b.qsc = sycl::malloc_device<float>(m_cap, q);
         b.orow = sycl::malloc_device<int32_t>(m_cap, q);
@@ -196,21 +238,39 @@ static void xmx_quant_q(queue & q, const float * qbuf, int qstride, const int32_
 // with ONE scale for the whole block.  bs[0] = K block scale, bs[1] = V block
 // scale.
 static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base, const sycl::half * ksc_base,
-                       const sycl::half * vsc_base, const int32_t * table, int n_head_kv, int kvh, int k0, int nk,
+                       const sycl::half * vsc_base, const int32_t * table, int n_head_kv, int kvh, int k0, int nk, int blk,
                        int8_t * gk, int8_t * gv, float * bs) {
-    // The oneDNN matmul always runs at the fixed block width kBlk (primitive
-    // creation is ~15 ms per new shape, so the shape must not follow the chunk
-    // size).  Keys beyond nk are zero-filled; the softmax's causal limit
-    // (<= nk for the last block) masks them and a zero V row contributes
-    // nothing to PV.
-    // one work-group of 256 reduces the whole block (nk <= kBlk)
-    const int W = 256;
+    // The oneDNN matmul runs at the fixed block width `blk` (primitive creation
+    // is ~15 ms per new shape, so the shape must not follow the chunk size).
+    // Keys beyond nk are zero-filled; the softmax's causal limit (<= nk for the
+    // last block) masks them and a zero V row contributes nothing to PV.
+    //
+    // Pass 1 reduces max|k| and max|v| over the block so the requantization has
+    // ONE scale per K/V pair (a plain int8 matmul sums over k, so a per-key
+    // scale cannot be applied after it).  This used to be a *single* 256-thread
+    // work-group reducing all nk rows, which on a 512-EU device is the single
+    // worst-scaled piece of the whole prefill: measured per attention layer at
+    // 64k depth it was 18.1 ms of the 37.8 ms the layer costs (the QK matmul is
+    // 6.7, the softmax 6.1, the PV matmul 4.3) -- one work-group cannot cover
+    // enough of the memory system to get anywhere near the bandwidth ceiling.
+    // It is now a two-stage reduction: `kGatherRed` work-groups each reduce a
+    // slice into `part`, then one small group folds those.  fmax is exact and
+    // associative, so the resulting block scale -- and therefore the whole
+    // requantized block, bit for bit -- is unchanged.
+    static const int nslice_cfg = [] {
+        const char * e = getenv("PF_XMX_GRED");
+        int n = e ? atoi(e) : kGatherRed;
+        return n < 1 ? 1 : (n > kGatherRedMax ? kGatherRedMax : n);
+    }();
+    const int nslice = nslice_cfg; // by-value copy: a kernel lambda cannot capture it
+    float * part = bs + 2;         // [2 * kGatherRedMax] partials, past bs[0..1]
     q.submit([&](sycl::handler & h) {
-        auto red = sycl::local_accessor<float, 1>(W * 2, h);
-        h.parallel_for(nd_range<1>(W, W), [=](nd_item<1> it) {
+        h.parallel_for(nd_range<1>((size_t)nslice * 64, 64), [=](nd_item<1> it) {
+            const int s = it.get_group(0);
             const int tid = it.get_local_linear_id();
             float km = 0, vm = 0;
-            for (int row = tid; row < nk; row += W) {
+            // each slice takes a contiguous run of rows, one row per lane
+            for (int row = s * 64 + tid; row < nk; row += nslice * 64) {
                 const int kk = k0 + row;
                 const int kb = table[kk / kBlockSize];
                 const int ko = kk % kBlockSize;
@@ -219,30 +279,60 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
                 const int8_t * vrow = kv_row_data(vp_base, unit, ko, kD);
                 const sycl::half * ksc = kv_row_scales(ksc_base, unit, ko, kD);
                 const sycl::half * vsc = kv_row_scales(vsc_base, unit, ko, kD);
-                for (int c = 0; c < kD; c++) {
-                    km = sycl::fmax(km, sycl::fabs((float)krow[c] * (float)ksc[c / 32]));
-                    vm = sycl::fmax(vm, sycl::fabs((float)vrow[c] * (float)vsc[c / 32]));
+// One fp16 scale per 32 head dims, so max|k*s| over a group is
+                // |s| * max|k| -- exact, and it collapses 256 multiply+fabs+max
+                // into 8.  Four groups are done per iteration into four
+                // independent accumulators: the scalar form was one 256-long
+                // fmax dependency chain per lane, which is what this stage's
+                // remaining 9 ms is.  Data loads are 16-byte vectors.
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                float vacc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                for (int g0 = 0; g0 < kD / 32; g0 += 4) {
+                    const sycl::vec<sycl::half, 4> shk =
+                        vload<sycl::vec<sycl::half, 4>, sycl::half>(ksc + g0);
+                    const sycl::vec<sycl::half, 4> shv =
+                        vload<sycl::vec<sycl::half, 4>, sycl::half>(vsc + g0);
+#pragma unroll
+                    for (int u = 0; u < 4; u++) {
+                        const int g = g0 + u;
+                        const sycl::vec<int8_t, 16> a0v = vload<sycl::vec<int8_t, 16>, int8_t>(krow + g * 32);
+                        const sycl::vec<int8_t, 16> a1v = vload<sycl::vec<int8_t, 16>, int8_t>(krow + g * 32 + 16);
+                        const sycl::vec<int8_t, 16> b0v = vload<sycl::vec<int8_t, 16>, int8_t>(vrow + g * 32);
+                        const sycl::vec<int8_t, 16> b1v = vload<sycl::vec<int8_t, 16>, int8_t>(vrow + g * 32 + 16);
+                        float mk = 0, mv = 0;
+#pragma unroll
+                        for (int j = 0; j < 16; j++) {
+                            mk = sycl::fmax(mk, sycl::fabs((float)a0v[j]));
+                            mk = sycl::fmax(mk, sycl::fabs((float)a1v[j]));
+                            mv = sycl::fmax(mv, sycl::fabs((float)b0v[j]));
+                            mv = sycl::fmax(mv, sycl::fabs((float)b1v[j]));
+                        }
+                        acc[u] = sycl::fmax(acc[u], sycl::fabs((float)shk[u]) * mk);
+                        vacc[u] = sycl::fmax(vacc[u], sycl::fabs((float)shv[u]) * mv);
+                    }
                 }
+                km = sycl::fmax(sycl::fmax(acc[0], acc[1]), sycl::fmax(acc[2], acc[3]));
+                vm = sycl::fmax(sycl::fmax(vacc[0], vacc[1]), sycl::fmax(vacc[2], vacc[3]));
             }
-            red[tid] = km;
-            red[W + tid] = vm;
-            it.barrier();
-            for (int s = W / 2; s > 0; s >>= 1) {
-                if (tid < s) {
-                    red[tid] = sycl::fmax(red[tid], red[tid + s]);
-                    red[W + tid] = sycl::fmax(red[W + tid], red[W + tid + s]);
-                }
-                it.barrier();
+            part[s] = km;             // slice-private slot, no atomic needed
+            part[nslice + s] = vm;
+        });
+    });
+    // stage 2: fold the slices into the two block scales (nslice <= 64 floats)
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(2), [=](sycl::id<1> id) {
+            float m = 0;
+            const float * p = part + (id[0] == 0 ? 0 : nslice);
+            for (int s = 0; s < nslice; s++) {
+                m = sycl::fmax(m, p[s]);
             }
-            if (tid == 0) {
-                bs[0] = red[0] > 0 ? red[0] / 127.f : 1.f;
-                bs[1] = red[W] > 0 ? red[W] / 127.f : 1.f;
-            }
+            bs[id[0]] = m > 0 ? m / 127.f : 1.f;
         });
     });
     // pass 2: quantize every key row with the block scales, zero-fill the pad
     q.submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::range<1>((size_t)kBlk), [=](sycl::id<1> id) {
+        h.parallel_for(sycl::range<1>((size_t)blk), [=](sycl::id<1> id) {
             if (id[0] >= (size_t)nk) {
                 for (int c = 0; c < kD; c++) {
                     gk[(size_t)id[0] * kD + c] = 0;
@@ -470,8 +560,37 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
         return true;
     }
 
+    // PF_XMX_TIME=1: wall-clock the whole call (the queue is in-order, so one
+    // wait at the end covers everything submitted here).  This is the only way
+    // to attribute the *mode-2* 512-token prefill attention, because the
+    // engine's PF_PROF profiler requires PF_NOGRAPH, which forces the mode-1
+    // 32-token chunk path instead.
+    const bool tm = getenv("PF_XMX_TIME") != nullptr;
+    // PF_XMX_BREAKDOWN=1: per-stage wall clock inside the block loop.  Every
+    // stage is measured with a q.wait() on the in-order queue, so this
+    // serialises and inflates the absolute numbers -- it is for *attribution*
+    // (which stage owns the time), not for timing.
+    const bool brk = getenv("PF_XMX_BREAKDOWN") != nullptr;
+    double b_gather = 0, b_qk = 0, b_sm = 0, b_pv = 0;
+    long b_cols = 0, b_blocks = 0;
+    std::chrono::steady_clock::time_point t_gather, t_qk, t_sm, t_pv;
+    std::chrono::steady_clock::time_point t0;
+    if (tm || brk) {
+        q.wait();
+        t0 = std::chrono::steady_clock::now();
+    }
     for (int kvh = 0; kvh < n_head_kv; kvh++) {
         const int M = Mtot;
+        if (getenv("PF_XMX_DBG") && kvh == 0) {
+            fprintf(stderr, "[xmx] M=%d max_nkv=%d nblk@%d=", M, max_nkv, kBlk);
+            for (int k0 = 0; k0 < max_nkv;) {
+                const int blk = (max_nkv - k0 > kBlk) ? kBlk : xmx_tail_blk(max_nkv - k0);
+                fprintf(stderr, "%d", blk);
+                if (blk < kBlk) fprintf(stderr, "(%d)", std::min(blk, max_nkv - k0));
+                k0 += blk;
+            }
+            fprintf(stderr, " total_cols=%d\n", max_nkv);
+        }
         // Build the per-row (qbuf row, query head, causal limit) on the device
         // from `info`.  Three host->device q.memcpy per kv head used to do this;
         // a host-pointer copy on the in-order queue serialised the host against
@@ -505,20 +624,81 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
             });
         });
         xmx_quant_q(q, qbuf, qstride, b.orow, b.oh, M, b.q8, b.qsc, b.m, b.l, b.acc);
-        for (int k0 = 0; k0 < max_nkv; k0 += kBlk) {
-            const int nk = std::min(kBlk, max_nkv - k0);
-            xmx_gather(q, kp_base, vp_base, ksc, vsc, table, n_head_kv, kvh, k0, nk, b.k, b.v, b.bs);
-            if (!D->attn_qk(M, kBlk, b.q8, b.k, b.qk)) {
+        for (int k0 = 0; k0 < max_nkv;) {
+            // Full blocks run at kBlk; the last one shrinks to the smallest
+            // power-of-two width that still covers the remainder, so the tail
+            // does not compute (and does not pay DRAM traffic for) thousands of
+            // zero columns.  The width is always a compile-time constant, so the
+            // oneDNN primitives are a small cached set.
+            const int blk = (max_nkv - k0 > kBlk) ? kBlk : xmx_tail_blk(max_nkv - k0);
+            const int nk = std::min(blk, max_nkv - k0);
+            const bool bd = brk;
+            if (bd) {
+                q.wait();
+                t_gather = std::chrono::steady_clock::now();
+            }
+            xmx_gather(q, kp_base, vp_base, ksc, vsc, table, n_head_kv, kvh, k0, nk, blk, b.k, b.v, b.bs);
+            if (bd) {
+                q.wait();
+                t_qk = std::chrono::steady_clock::now();
+            }
+            if (!D->attn_qk(M, blk, b.q8, b.k, b.qk)) {
                 return false;
             }
-            xmx_softmax(q, b.qk, b.qsc, b.bs, scale, M, nk, kBlk, k0, b.olim, b.p, b.ps, b.acc, b.m, b.l);
-            if (!D->attn_pv(M, kBlk, b.p, b.v, b.pv)) {
+            if (bd) {
+                q.wait();
+                t_sm = std::chrono::steady_clock::now();
+            }
+            xmx_softmax(q, b.qk, b.qsc, b.bs, scale, M, nk, blk, k0, b.olim, b.p, b.ps, b.acc, b.m, b.l);
+            if (bd) {
+                q.wait();
+                t_pv = std::chrono::steady_clock::now();
+            }
+            if (!D->attn_pv(M, blk, b.p, b.v, b.pv)) {
                 return false;
             }
             xmx_pv_acc(q, b.pv, b.ps, b.bs, M, b.acc);
+            if (bd) {
+                q.wait();
+                const auto t_end = std::chrono::steady_clock::now();
+                auto ms = [&](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point c) {
+                    return std::chrono::duration<double, std::milli>(c - a).count();
+                };
+                b_gather += ms(t_gather, t_qk);
+                b_qk += ms(t_qk, t_sm);
+                b_sm += ms(t_sm, t_pv);
+                b_pv += ms(t_pv, t_end);
+                b_cols += blk;
+                b_blocks++;
+            }
+            k0 += blk;
         }
         xmx_output(q, b.acc, b.m, b.l, b.orow, b.oh, gate, out, partials, qstride, n_head, n_splits, pstride, M,
                    fuse);
+    }
+    if (tm || brk) {
+        q.wait();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static double acc_ms = 0;
+        static long acc_n = 0;
+        static double g_qk = 0, g_sm = 0, g_pv = 0, g_ga = 0;
+        static long g_cols = 0, g_blk = 0, g_calls = 0;
+        acc_ms += ms;
+        acc_n++;
+        g_qk += b_qk;
+        g_sm += b_sm;
+        g_pv += b_pv;
+        g_ga += b_gather;
+        g_cols += b_cols;
+        g_blk += b_blocks;
+        g_calls++;
+        if ((acc_n % 64) == 0) {
+            const double d = (double)g_calls;
+            fprintf(stderr,
+                    "[xmx] %ld calls %.2f ms total %.3f/call | gather %.3f  qk %.3f  softmax %.3f  pv %.3f "
+                    "(ms/call) cols/call %.0f\n",
+                    acc_n, acc_ms, acc_ms / acc_n, g_ga / d, g_qk / d, g_sm / d, g_pv / d, (double)g_cols / d);
+        }
     }
     return true;
 }

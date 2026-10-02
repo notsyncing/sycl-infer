@@ -15,10 +15,13 @@ constexpr int kMaxRows = 32;   // max rows in the per-token buffers
 constexpr int kBlockSize = 32; // paged KV cache block size (tokens)
 
 constexpr int kMaxSplits = 64; // partial-buffer capacity (prefill K-split)
-// decode K-split capacity: the grouped decode kernel fans out over kv heads
-// rather than query heads, so it needs (n_head/n_head_kv) x more splits for
-// the same warp count (PF_DEC_SPLIT, default kMaxSplits)
-constexpr int kMaxDecSplits = 256;
+// decode K-split capacity.  The decode attention is occupancy bound and its
+// useful warp count is bounded by one occupancy wave (~8 warps per compute
+// unit), so the engine derives dec_splits from n_head and the device's compute
+// units (see engine.cpp) and this is only the hard ceiling.  The partials
+// buffers are sized from the runtime dec_splits, not from this constant.
+// Measured optima: 27B (n_head 24, 512 EUs) 160, 0.8B (n_head 8) ~416-480.
+constexpr int kMaxDecSplits = 512;
 // prefix-cache snapshot map length: boundaries are indexed by complete blocks,
 // so this covers max_seq <= kPcMapLen*32 tokens (32768 with 1024)
 constexpr int kPcMapLen = 1024;
