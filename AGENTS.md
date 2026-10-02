@@ -1036,11 +1036,16 @@ warps/EU the excess is not co-resident and the time steps *up*.  Measured one
 layer, 27B shape, i8 KV, 64k depth, attn+combine ms: nsp=64 3.05, 128 2.18,
 **160 1.70**, 168 1.74, 176 **2.68** (the cliff, at 8.25 warps/EU).  End to end
 that is tg128@64k 8.26 -> 10.34 t/s and @16k 12.37 -> 13.35, with batched
-decode neutral at c8.  Two consequences worth not re-deriving: do **not** "fix"
-the 6x GQA K/V re-read by sharing loads across query heads (measured 5x
-*SLOWER* — the re-read is free from L2 and the lost warps are not), and do not
-unroll the key loop for MLP (KU=2..8 all slower; IGC already pipelines it).  See
-`reports/d64k_pp_tg_evaluation.md`),
+decode neutral at c8.  Three consequences worth not re-deriving, all measured: do
+**not** "fix" the 6x GQA K/V re-read by sharing loads across query heads (5x
+*SLOWER* — the re-read is free from L2 and the lost warps are not); do not
+unroll the key loop for MLP (KU=2..8 all slower; IGC already pipelines it); and
+do not widen a lane to 16 dims for 16-byte loads (`attn_dec16_kernel`: 4.45 vs
+1.55 ms/layer — 16 accumulators + 16 query + 16 K + 16 V floats per lane makes IGC
+allocate 128 registers and spill; the report's §4.3 has two bugs in that kernel
+that both measured *faster* while being wrong, so read it before trusting a
+timing).  The 8-warps-per-EU wave is architectural, so no register trick buys
+more warps.  See `reports/d64k_pp_tg_evaluation.md`),
 `PF_DEC_GROUP` (grouped decode attention, default off), `PF_ATTN_XMX` (oneDNN
 int8 *matmul* prefill attention, **default on**; `0` restores the classic kernel),
 `PF_ATTN_XMX_MIN` (minimum key count for the oneDNN matmul path, default 2048 - below it the
@@ -1256,11 +1261,18 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   per-stage split and is the only way to attribute the mode-2 512-token
   prefill (`PF_PROF` needs `PF_NOGRAPH`, which forces the mode-1 32-token
   path); `PF_XMX_GRED` / `PF_XMX_TAILBLK` are the A/B knobs.  Note two
-  *negative* results here: tiling M so the 101 MB score matrix fits the 16 MB
-  L2 is +53 % (L2 caps the tile *area*, so the oneDNN execute count goes up ~7x
-  either way at ~35 us each), and the per-block padding that the fixed width
-  leaves behind is free (the tail-block width is trimmed anyway, but it measured
-  neutral at both 16k and 64k).  See `reports/d64k_pp_tg_evaluation.md`.
+  *negative* results here, all worth not re-deriving: tiling M so the 101 MB
+  score matrix fits the 16 MB L2 is +53 % (L2 caps the tile *area*, so the
+  oneDNN execute count goes up ~7x either way at ~35 us each); the per-block
+  padding the fixed width leaves behind is free (trimmed anyway, measured neutral
+  at 16k and 64k); and computing the block max from the **scale plane alone** —
+  exact, since every non-zero 32-wide group quantizes its extreme to |k| = 127, so
+  max|k*scale| == 127 * max(scale[]) — cuts that pass's traffic 16x and measures
+  **neutral** (833 -> 830 ms), because the gather is bound by the page-table
+  lookup latency, not by bandwidth.  That is why parallelising it (§3.2, 15%) beat
+  shrinking it.  The identity needs an all-zero group to store scale 0 rather
+  than 1 (or it is wrong by up to 127x) plus an `i8_quant` zero-scale guard
+  (0/0 is NaN); both are reverted, since a KV-format change is not worth 0.3 %.  See `reports/d64k_pp_tg_evaluation.md`.
   The attention scratch is per-queue (`xmx_get` keys on the queue address): a
   function-local static was shared across the two `--layer-map` devices and the
   cross-device USM access cost another ~12x.  The matmuls use a dedicated
