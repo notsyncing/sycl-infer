@@ -24,6 +24,7 @@
 // reports/gemv_staging.md).  The tile is staged as f16 (the planes are f16) so
 // RB can be 16 without exceeding the SLM budget.
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "kernel_utils.h"
 
 #include "dp4a.h"
@@ -149,7 +150,7 @@ void w4_gemv_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
                     int out_stride, const float * residual, float alpha, int K, int N) {
     const int ng = K / 32;
     const int ov = w4_rb_override();
-    const auto fits = [&](int rb) { return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) <= 48 * 1024; };
+    const auto fits = [&](int rb) { return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::active().slm.budget_bytes; };
     if (ov == 8 && fits(8)) {
         w4_gemv_impl<8>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
     } else if (ov == 32 && fits(32)) {
@@ -369,7 +370,7 @@ void i8_grp_gemv_launch(queue & q, const int8_t * w8, const uint16_t * wsc, cons
                         int K, int N) {
     const int ng = K / 32;
     const int ov = w4_rb_override();
-    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) <= 48 * 1024; };
+    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::active().slm.budget_bytes; };
     if (ov == 8 && fits(8)) {
         i8_grp_gemv_impl<8>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
     } else if (ov == 32 && fits(32)) {
@@ -485,7 +486,7 @@ void k5_gemv_launch(queue & q, const uint8_t * vals, const uint8_t * hi, const u
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     const float * residual, float alpha, int K, int N) {
     const int ng = K / 32;
-    const auto fits = [&](int rb) { return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) + 64 <= 48 * 1024; };
+    const auto fits = [&](int rb) { return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) + 64 <= (size_t)si::dev::active().slm.budget_bytes; };
     if (fits(kK5RB)) {
         k5_gemv_impl<kK5RB>(q, vals, hi, scale, off, axe, axo, asa, xs, out, residual, alpha, K, N);
     } else {
@@ -648,7 +649,7 @@ void cb4_gemv_launch(queue & q, const uint8_t * idx, const uint16_t * lut16, con
                      const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
                      int N) {
     const int ng = K / 32;
-    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) + 256 * 2 <= 48 * 1024; };
+    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) + 256 * 2 <= (size_t)si::dev::active().slm.budget_bytes; };
     if (fits(kW4RB)) {
         cb4_gemv_impl<kW4RB>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
     } else {

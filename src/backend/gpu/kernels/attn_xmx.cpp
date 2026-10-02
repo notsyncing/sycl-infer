@@ -2,6 +2,7 @@
 #include "kernel_utils.h"
 
 #include "dnnl_gemm.h"
+#include "device/device_profile.h"
 
 #include <algorithm>
 #include <chrono>
@@ -47,7 +48,10 @@ using namespace si::kd;
 bool attn_xmx_enabled() {
     static const bool v = [] {
         const char * e = getenv("PF_ATTN_XMX");
-        return !(e && atoi(e) == 0); // default on; PF_ATTN_XMX=0 restores classic
+        // default from the device profile: the oneDNN int8 matmul path pays off
+        // on a part with a fast int8 GEMM and is untested on a part where DP4A
+        // was worth 4x over the scalar path to begin with
+        return !(e && atoi(e) == 0) && si::dev::active().attn.xmx; // default on; PF_ATTN_XMX=0 restores classic
     }();
     return v;
 }
@@ -59,10 +63,13 @@ bool attn_xmx_enabled() {
 // ~480-560 ms.  A 16k cold prefill totals 16.7 s at 2048 vs 18.4 s at 6144,
 // and 1024/0 are within noise (16.7-16.8 s) while being slower on short
 // prompts.  Below this key count the classic kernel is used.
+static int xmx_min_keys_dev() {
+    return si::dev::active().attn.xmx_min_keys;
+}
 static int xmx_min_keys() {
     static const int v = [] {
         const char * e = getenv("PF_ATTN_XMX_MIN");
-        return e ? atoi(e) : 2048;
+        return e ? atoi(e) : xmx_min_keys_dev();
     }();
     return v;
 }
@@ -73,12 +80,12 @@ static constexpr int kMaxQ = kMaxT * kMaxB;
 
 // Work-groups in the gather's first-stage max reduction.  The reduction used to
 // be a single 256-thread work-group over the whole key block, which on a 512-EU
-// device was the worst-scaled piece of the prefill; see xmx_gather.  64 gives
-// 64 x 64 = 4096 concurrent row-readers and a 64-float fold afterwards.
-// PF_XMX_GRED=N overrides the work-group count for A/B; the buffer is sized
-// for kGatherRedMax so a larger sweep needs no reallocation.
-constexpr int kGatherRedMax = 512;
-constexpr int kGatherRed = 64;
+// device was the worst-scaled piece of the prefill; see xmx_gather.  Both counts
+// come from the device profile (src/device/profile_*.cpp): it is a latency fix,
+// so the right value depends on how many EUs there are to hide it with.
+// PF_XMX_GRED=N overrides the work-group count for A/B.
+static const int kGatherRedMax = si::dev::active().attn.xmx_gather_red_max;
+static const int kGatherRed = si::dev::active().attn.xmx_gather_red;
 
 // Width used for the *last* key block of a call.  The oneDNN matmuls always run
 // at a fixed width (primitive creation is ~15 ms per new shape, so a width that

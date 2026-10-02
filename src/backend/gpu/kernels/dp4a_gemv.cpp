@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "kernel_utils.h"
 
 #include <cstdio>
@@ -98,11 +99,16 @@ void dp4a_gemv_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
         const char * e = getenv("PF_GEMV_SPLIT");
         return !e || atoi(e) != 0;
     }();
+    // how many output rows it takes to fill the machine: a device-profile value,
+    // since it scales with the EU count
+    const si::dev::profile & dp = si::dev::active();
+    const int fill_rows = dp.split.gemv_rows;
+    const int split_cap = dp.split.max;
     int S = 1;
-    if (split_on && w.N <= 4096) {
-        S = (int)((2048 + w.N - 1) / w.N);
-        if (S > 8) {
-            S = 8;
+    if (split_on && w.N <= fill_rows * 2) {
+        S = (int)((fill_rows + w.N - 1) / w.N);
+        if (S > split_cap) {
+            S = split_cap;
         }
     }
     if (S > 1) {

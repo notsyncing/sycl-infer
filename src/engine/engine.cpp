@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "device/device_profile.h"
 #include "quant.h"
 
 #include <algorithm>
@@ -224,17 +225,25 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // the default is derived from the query-head count and the device's
         // compute-unit count rather than hardcoded:
         //
-        //     dec_splits = 7.5 * compute_units / n_head
+        //     dec_splits = warps_per_eu * compute_units / n_head
         //
-        // The old default was kMaxSplits (64); 128 (an earlier change) measured
-        // 2.177 ms at 64k depth against 160's 1.699.
+        // where warps_per_eu comes from the device profile
+        // (src/device/profile_*.cpp) because it is a property of the GPU's
+        // sub-group lattice.  The old default was kMaxSplits (64); 128 (an
+        // earlier change) measured 2.177 ms at 64k depth against 160's 1.699.
         const char * e = getenv("PF_DEC_SPLIT");
         if (e) {
             dec_splits = atoi(e);
         } else {
-            const uint32_t eus = q.get_device().get_info<sycl::info::device::max_compute_units>();
-            // 15/2 = 7.5 warps per EU, rounded down to a multiple of 8
-            const int want = (int)((15ull * eus) / (2ull * (unsigned)std::max(1, m.hp.n_head)));
+            const dev::profile & dp = dev::active();
+            uint32_t eus = q.get_device().get_info<sycl::info::device::max_compute_units>();
+            if (!eus) {
+                eus = (uint32_t)dp.hw.compute_units; // unknown card: the profile's fallback
+            }
+            // warps_per_eu is stored doubled (15 = 7.5), so this is
+            // (wpe/2) * eus / n_head with no lossy integer 7 anywhere.
+            const int want = (int)(((uint64_t)dp.occ.warps_per_eu_x2 * eus) /
+                                   (2ull * (unsigned)std::max(1, m.hp.n_head)));
             dec_splits = std::max(8, (want / 8) * 8);
         }
         if (dec_splits < 1) {
@@ -1101,20 +1110,25 @@ bool engine::setup_md_dnnl() {
         // sense that it keeps Q4_K's native per-32 grid instead of re-quantizing
         // onto a per-row one.  It saves 1.4 GB/card of weight memory for ~5%
         // decode and ~3% prefill throughput.  PF_W4=0 restores pure int8.
+        // the native 4/5-bit stores are a decode-BANDWIDTH trade (they cut bytes
+        // per weight), so whether they are worth it depends on how much read
+        // bandwidth the card has relative to its compute -- a per-device
+        // measurement, hence the profile default.  PF_W4=0 restores pure int8.
+        const dev::profile & wd = dev::active();
         static const bool w4_on = [] {
             const char * e = getenv("PF_W4");
-            return !e || atoi(e) != 0;
+            return e ? atoi(e) != 0 : si::dev::active().wt.w4 != 0;
         }();
         int n_w4 = 0, n_i8 = 0, n_cb = 0, n_k5 = 0;
         // PF_K5=0 keeps Q5_K on the int8 conversion (A/B knob)
         static const bool add_k5 = [] {
             const char * e = getenv("PF_K5");
-            return !e || atoi(e) != 0;
+            return e ? atoi(e) != 0 : si::dev::active().wt.k5 != 0;
         }();
         // PF_CB4=0 keeps IQ4_XS/IQ4_NL on the int8 conversion (A/B knob)
         static const bool add_cb = [] {
             const char * e = getenv("PF_CB4");
-            return !e || atoi(e) != 0;
+            return e ? atoi(e) != 0 : si::dev::active().wt.cb4 != 0;
         }();
         auto add = [&](const wt & t) {
             if (!t.data) {

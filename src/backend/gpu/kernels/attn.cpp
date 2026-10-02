@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "kernel_utils.h"
 
 #include <cmath>
@@ -16,7 +17,8 @@ using namespace si::kd;
 static inline bool attn_vec_env() {
     static const bool v = [] {
         const char * e = getenv("PF_ATTN_VEC");
-        return !(e && atoi(e) == 0);
+        const int dflt = si::dev::active().attn.vec;
+        return (e ? atoi(e) != 0 : dflt != 0);
     }();
     return v;
 }
@@ -293,7 +295,13 @@ static inline bool attn_flash_env() {
 static inline int dec_group_env() {
     static const int v = [] {
         const char * e = getenv("PF_DEC_GROUP");
-        return (e && atoi(e) != 0) ? 1 : 0;
+        // the grouped decode kernel has n_head_kv instead of n_head workgroups; it
+        // is off on BOTH parts but for opposite measured reasons (A770: 5x slower
+        // at 64k; Iris Xe: measurably faster for the classic kernel, which has 4x
+        // the warps).  The default still belongs in the profile because it is a
+        // per-device measurement, and the reasoning differs per device.
+        const int dflt = si::dev::active().attn.dec_group;
+        return (e ? atoi(e) : dflt) != 0 ? 1 : 0;
     }();
     return v;
 }

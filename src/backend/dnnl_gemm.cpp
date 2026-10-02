@@ -17,6 +17,7 @@
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "quant.h"
 #include "w4.h"
 
@@ -284,7 +285,7 @@ bool dnnl_gemm_enabled() {
     // the dp4a chunk-batched path, e.g. for bit-exact dp4a validation
     static const bool on = [] {
         const char * e = getenv("PF_GEMM_DNNL");
-        return !(e && atoi(e) == 0);
+        return !(e && atoi(e) == 0) && si::dev::active().wt.gemm_dnnl;
     }();
     return on;
 }

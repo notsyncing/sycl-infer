@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "kernel_utils.h"
 
 #include <cstdio>
@@ -1079,11 +1080,12 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     if (use_row && TB == 32 && w.N <= 8192) {
         const char * sp_env = getenv("PF_GEMM_SPLIT");
         int S = sp_env ? atoi(sp_env) : 0;
+        const si::dev::profile & dp = si::dev::active();
         if (S == 0) {
-            S = (int)((16384 + w.N - 1) / w.N);
+            S = (int)((dp.split.gemm_rows + w.N - 1) / w.N);
         }
-        if (S > 8) {
-            S = 8;
+        if (S > dp.split.max) {
+            S = dp.split.max;
         }
         if (S > 1) {
             // smaller workgroups raise the resident warp count (a 128-thread WG

@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "kernel_utils.h"
 
 #include <cstdio>
@@ -212,8 +213,9 @@ static int gemv_env_cfg(const char * name) {
 // activations are two float4 loads.  Measured ~1.5x fewer instructions/value.
 template <uint32_t QT>
 static void gemv_dec_vec_kernel(queue & q, const gemv_seg * segs, int n_segs, int total_rows, int nsb) {
-    const int SGW = 8;
-    const int rows_per_wg = SGW;
+    // rows per work-group comes from the device profile (8 on both cards): it is
+    // a workgroup size, so it scales with what the part wants resident
+    const int rows_per_wg = si::dev::active().shape.gemv_rows_per_wg;
     const int n_wg = (total_rows + rows_per_wg - 1) / rows_per_wg;
     const int sb_bytes = (QT == 13) ? 176 : 144;
     q.parallel_for(nd_range<1>((size_t)n_wg * 256, 256), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {

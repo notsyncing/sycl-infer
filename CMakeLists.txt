@@ -32,10 +32,22 @@ add_compile_options(-fsycl)
 add_link_options(-fsycl)
 
 option(SYCL_INFER_AOT "AOT compile for the target GPU (avoids runtime JIT)" OFF)
-set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (e.g. adl-p, acm-g10)")
+# The ocloc target is device-specific and must agree with the device profile the
+# binary will select at runtime (src/device/device_profile.h), so it is a BUILD-side
+# mirror of a profile value.  The default stays `adl-p` because the primary dev
+# box is the Iris Xe; the 2x A770 host must pass -DSYCL_INFER_AOT_DEVICE=acm-g10.
+# Check `ocloc query` for any other SKU rather than inheriting either default.
+set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (adl-p = Iris Xe, acm-g10 = A770/DG2)")
+set(SYCL_INFER_AOT_PROFILE "" CACHE STRING "device profile key baked into the binary; empty = auto-detect from the SYCL device name")
 if(SYCL_INFER_AOT)
     add_compile_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
     add_link_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
+    if(SYCL_INFER_AOT_PROFILE)
+        # bake the profile in, so an AOT binary built for one card says so even
+        # when it runs somewhere the name would mislead
+        add_compile_definitions(SI_FORCE_DEVICE_PROFILE="${SYCL_INFER_AOT_PROFILE}")
+        message(STATUS "sycl-infer: device profile baked in: ${SYCL_INFER_AOT_PROFILE}")
+    endif()
     # AOT lowering (llvm-foreach -> ocloc/IGC) runs once per device image at the
     # final link and costs minutes of IGC work per image.  The default code split
     # (`auto`) merges a whole module into one image, which serialises that work;
@@ -62,6 +74,10 @@ endif()
 add_library(sycl_infer_core STATIC
     third_party/unicode.cpp
     third_party/unicode-data.cpp
+    # device: per-GPU tuning profiles + the registry that selects one
+    src/device/device_registry.cpp
+    src/device/profiles/arc_a770.cpp
+    src/device/profiles/iris_xe.cpp
     # common: quantization formats and shared low-level helpers
     src/common/w8.cpp
     src/common/w4.cpp
@@ -136,6 +152,7 @@ add_library(sycl_infer_core STATIC
     src/server/server.cpp
 )
 target_include_directories(sycl_infer_core PUBLIC
+    src                       # so "device/device_profile.h" resolves everywhere
     src/common
     src/backend
     src/backend/cpu

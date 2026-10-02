@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "kernel_utils.h"
 
 #include <cstdio>
@@ -249,16 +250,18 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
                 int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0,
                 int tpb_arg, int nreal_arg, pc_snap snap) {
     (void)n_slots;
-    // PF_GDN_COLS=2/4/8: state rows per warp (default 4; 1 = original mapping)
+    const si::dev::profile & dp = si::dev::active();
+    // PF_GDN_COLS=1/2/4/8: state rows per warp (1 = the original mapping).
+    // The default is the device profile's gdn_cols (2).
     static const int cols = [] {
         const char * e = getenv("PF_GDN_COLS");
-        const int c = e ? atoi(e) : 2;
+        const int c = e ? atoi(e) : si::dev::active().shape.gdn_cols;
         return c == 1 || c == 2 || c == 4 || c == 8 ? c : 2;
     }();
-    // PF_GDN_WG=4/8: warps per workgroup (occupancy experiment)
+    // PF_GDN_WG=1/2/4/8: warps per workgroup (occupancy experiment)
     static const int wpw = [] {
         const char * e = getenv("PF_GDN_WG");
-        const int c = e ? atoi(e) : 8;
+        const int c = e ? atoi(e) : si::dev::active().shape.gdn_warps_per_wg;
         return c == 1 ? 1 : (c == 2 ? 2 : (c == 4 ? 4 : 8));
     }();
     // decode has one token per row: halving the warp count costs more than the
@@ -295,7 +298,7 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
         const char * e = getenv("PF_GDN_VEC");
         return e ? atoi(e) : -1;
     }();
-    const bool f4 = (vec_mode < 0) ? (n_real < 2) : (vec_mode != 0);
+    const bool f4 = (vec_mode < 0) ? (n_real < dp.shape.gdn_vec_max_rows) : (vec_mode != 0);
     if (f4 && head_dim % 4 == 0) {
         if (wpw == 2) {
             switch (c) {

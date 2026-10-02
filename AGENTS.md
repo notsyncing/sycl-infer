@@ -981,6 +981,77 @@ Reasoning and tool markup are split by `src/server/response_parser.cpp`
 of truth, including its §8 field-by-field support matrix (what is implemented,
 partial or not).
 
+## Device profiles: where a GPU-specific number belongs
+
+**Rule: a constant that was measured on a particular GPU lives in that GPU's
+device profile, not as a literal at its use site.**  The use site asks for it by
+name.
+
+    src/device/profiles/<card>.cpp  one card's COMPLETE implementation: its
+                                    values, its key, and its own matcher
+    src/device/device_registry.cpp  the kDevices[] list of those entries, and
+                                    the selection/reporting that reads them
+    src/device/device_profile.h     the `profile` struct and the API
+
+* **What belongs there**: occupancy (`occ.warps_per_eu_x2`, which sets the decode
+  K-split), the SLM budget the staging GEMVs size against, the split heuristics
+  that fill the machine (`split.gemv_rows`, `split.gemm_rows`, `split.max`),
+  per-kernel shapes (`shape.*`, `attn.xmx_gather_red`), and the *default* for any
+  on/off feature whose value was chosen by measurement (`wt.w4`, `wt.k5`,
+  `wt.cb4`, `attn.xmx`, `attn.dec_group`, ...).
+* **What stays a literal**: hardware facts SYCL already reports and that cannot
+  change with tuning — they are queried, with the profile as the fallback.  And
+  anything a *model* dictates rather than a card (`kBlockSize`, `kI8Q`,
+  `kMaxT`/`kMaxB`, `head_dim`).
+* **An env var still overrides** the profile: the profile is the default, the env
+  var is the A/B.  Keep that ordering (`env ? atoi(env) : profile`), and keep the
+  profile value the one that is *measured* — an env default that was never
+  measured is a bug.
+* **Both parts are measured, not one assumed.**  `dec_group` is off on the A770
+  because the grouped decode kernel is 5x slower there, and off on the Iris Xe
+  because the *classic* kernel is faster there — same value, opposite reasons.
+  That is the case the split exists for.
+* **Say which numbers are inherited.**  A field marked INHERITED is a value
+  carried across from the other card because the two share an architecture (both
+  are Xe-LP, so the 8-warp/EU sub-group lattice is common) but which was *not*
+  re-measured.  Unmeasured is a liability; write it down rather than implying it
+  was checked.  The Iris Xe profile currently marks most of its tuning inherited:
+  the decode-split microbenchmark on an integrated part returned 2.1-4.4 ms for
+  one configuration across three repeats, i.e. the noise exceeded the effect, so
+  the sweep has to be redone on an idle box before those values are trusted.
+* **The registry holds no knowledge of any card.**  Detection is a function
+  pointer: each `<card>.cpp` owns its own `arc_a770_matches(name)` /
+  `iris_xe_matches(name)`, and `for_name()` just asks each registered card in
+  order.  So "how do we recognise an A770" is answered in the A770's file, and
+  adding a card never means editing a central `if` on device names.  Order is
+  match order (first match wins), so a broad matcher goes after a specific one --
+  the Iris Xe matcher matches only "Iris", deliberately not "Xe", because a
+  future Xe part has different tunings and must get its own file.
+* **Write every field with a designated initializer.**  `.key = ...`,
+  `.shape = {.rmsnorm_wg = ...}`.  The build uses `-Wall -Wextra`, so an omitted
+  field warns rather than defaulting silently, and a field can be inserted or
+  reordered without shifting every value after it.  Not theoretical: an earlier
+  draft had `rmsnorm_wg` under `attn_vec` and every later field printed one slot
+  off.
+* **An unknown card must be loud.**  `for_name()` falls back to a profile whose
+  key is `unknown`, built at compile time from `kDevices[0]` so it cannot drift
+  from the row it copies, and `active()` prints a WARNING naming where to add a
+  card rather than silently inheriting the last card's tuning.  `PF_DEVICE_PROFILE`
+  pins a profile regardless of the reported name (for re-measuring one card's
+  curve on another), and `-DSYCL_INFER_AOT_PROFILE=<key>` bakes it into an AOT
+  binary; `PF_DEVICE_INFO=1` dumps the resolved profile and its provenance at
+  startup.
+* **`shape.rmsnorm_wg` is the hardware boundary to watch.**  It is one of the few places
+  the two parts differ as *hardware* rather than as tuning: the A770 accepts a
+  1024-thread work-group and the Iris Xe only 512, and an unconditional
+  1024-thread kernel does not launch on the latter at all.  `wg_clamped()` exists
+  so a card with no profile gets a smaller kernel instead of a launch failure.
+  Work-group widths must be *template* parameters (a SYCL kernel cannot capture a
+  runtime-initialised global), which also lets the strided load loops unroll.
+* `CMakeLists.txt`'s `SYCL_INFER_AOT_DEVICE` is the ocloc target and is
+  device-specific for the same reason: it must agree with the profile the binary
+  will select at runtime.
+
 ## Conventions
 
 * C++17, `namespace si`, 4-space indent, Allman braces.  Types/functions are

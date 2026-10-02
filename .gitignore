@@ -1,4 +1,5 @@
 build/
+build-*/
 .cache/
 __pycache__/
 *.o
