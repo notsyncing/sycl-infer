@@ -228,9 +228,10 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         //     dec_splits = warps_per_eu * compute_units / n_head
         //
         // where warps_per_eu comes from the device profile
-        // (src/device/profile_*.cpp) because it is a property of the GPU's
-        // sub-group lattice.  The old default was kMaxSplits (64); 128 (an
-        // earlier change) measured 2.177 ms at 64k depth against 160's 1.699.
+        // (src/device/profiles/<card>.cpp) because it is a property of the
+        // GPU's sub-group lattice.  The old default was kMaxSplits (64); 128
+        // (an earlier change) measured 2.177 ms at 64k depth against 160's
+        // 1.699.
         const char * e = getenv("PF_DEC_SPLIT");
         if (e) {
             dec_splits = atoi(e);

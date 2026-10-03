@@ -120,6 +120,13 @@ cmake --build build --target sycl-infer -j$(nproc)   # only the binary, not ever
   `SYCL_CACHE_DIR=...`, entries under `~/.cache/neo_compiler_cache/*.l0_cache`),
   which caches JIT-compiled kernels across runs and avoids the AOT build
   entirely; `ccache` does not help because device lowering is a link step.
+  **On the 2x A770 box that cache is a trap** (measured 2026-10-03, driver as
+  shipped): with `SYCL_CACHE_PERSISTENT=1` *every* GPU test binary dies with
+  `SIGSEGV` a few seconds in - right after the KV-pool init line, i.e. inside
+  the first JIT-compiled kernel - while the same binary with the cache unset
+  passes (`test_gpu_stages`: "all stages OK").  A brand-new `SYCL_CACHE_DIR`
+  fails the same way, so it is not a poisoned directory: the cache itself
+  crashes on that driver.  Use the AOT build there (or leave the cache off).
 
 ## Run
 
@@ -479,7 +486,17 @@ tracked down.  The pieces:
   saved in `d_mtp_qsave_`;
 * the prefix cache is supported: `generate_mtp` calls `pc_admit` for the prompt
   (which restores the matched chain's KV *and* recurrent state) and `pc_commit`
-  after the prefill.
+  after the prefill.  **The order is load-bearing** - `pc_commit` advances
+  `pc_slot_[0].registered`, which every chunk's `pc_capture_begin` checks against
+  `pos0` (`engine_prefix_cache.cpp:806-808`), so committing before the prefill
+  captures nothing.  Measured on the 27B / 2x A770 with `--mtp 4 gen --temp 0`
+  (~90-token prompt): committing after the prefill moves the exit stats from
+  `nodes=2 (with state 0) ... captured=0` to `nodes=2 (with state 2) ...
+  captured=2`, i.e. the nodes become resumable (only boundaries *with* a state
+  can be resumed).  Note the CLI `gen` never reaches this: `pc_admit`/`pc_commit`
+  are only called from `src/server/scheduler.cpp`, so the contract applies to
+  `--temp 0 --mtp N` (which `generate_impl` routes to `generate_mtp`) and to the
+  server's `mtp_direct` (`PF_MTP_SERVER=1`).
 
 The path is opt-in (`--mtp 0`/absent is the plain decode) and no longer
 experimental.  On the 27B (2x A770, `--layer-map 0-31:gpu.0,32-63:gpu.1`,
@@ -526,7 +543,7 @@ all lose.
 After the reorder the kernel is within ~1.3-1.5x of the M=1 GEMV's rate
 (measured M=7, K=5120, N=17408: u4 223 GB/s, k5 188, cb4 173, int8 323, against
 the M=1 GEMV's 294/249/261/364).  On *true* per-format traffic (weight plane +
-fifth-bit/index plane + the per-32 f16 scale/offset planes: u4 0.625, k5 0.875,
+fifth-bit/index plane + the per-32 f16 scale/offset planes: u4 0.625, k5 0.75,
 cb4 0.5625 B/weight) k5 already matches u4's ~280 GB/s and only reads 20% more
 bytes; cb4 is at ~195 GB/s and is decode-issue bound - its codebook LUT decode
 (16 `lt16` lookups + shifts/ORs per operand set) is the whole excess, and a

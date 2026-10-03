@@ -22,7 +22,9 @@ static float h16(uint16_t h) {
 }
 
 int main(int argc, char ** argv) {
-    const char * path = argc > 1 ? argv[1] : "/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    // CPU-only packing round-trip: shape-independent, so it defaults to the 0.8B
+    // like the other CPU tests (the 27B works too - pass it as argv[1]).
+    const char * path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
     gguf_file f;
     f.load(path);
 

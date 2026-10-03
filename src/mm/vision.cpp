@@ -408,7 +408,10 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
     // ---- transformer layers ----
     const int HD = hp.head_dim;
     const int NH = hp.n_head;
-    const float rope_scale = std::pow(10000.0f, -2.0f / (float)(HD / 2));
+    // the same base the device path hands vit_rope_launch (hp.rope_base, from
+    // clip.vision.rope_theta): hardcoding 10000 here made the reference diverge
+    // from the GPU for any mmproj that sets a different theta
+    const float rope_scale = std::pow(hp.rope_base, -2.0f / (float)(HD / 2));
     std::vector<float> qkv((size_t)np * 3 * E);
     std::vector<float> attn((size_t)np * E);
     std::vector<float> tmp((size_t)np * E);

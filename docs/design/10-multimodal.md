@@ -189,9 +189,10 @@ bias → GELU → `mm.2` → bias）→ `q.wait()`。
 
 * **残差通过 GEMM 的 `residual` 参数完成**：`vit_gemm_launch` 的最后一个参数非空时输出为
   `alpha*acc + residual[t][n]`（`vit.cpp:178-190`），所以 `out`/`down` 两个投影直接写回 `d_x`。
-* **host/device 的 RoPE 基数不同源**：host 硬编码 `pow(10000.0f, -2/(HD/2))`（`vision.cpp:411`），device
-  传的是 `hp.rope_base`（`vision.cpp:627`，`vit.cpp:309` 用 `log2(rope_base)`）。随附 mmproj 的
-  `clip.vision.rope_theta` 就是 10000，所以两者一致；换一个 `rope_theta` 就会分叉。
+* **两条路径的 RoPE 基数同源**：都用 `hp.rope_base`（即 mmproj 的 `clip.vision.rope_theta`，默认
+  10000）——host 是 `pow(rope_base, -2/(HD/2))`（`vision.cpp:411-415`），device 把它交给
+  `vit_rope_launch`（`vision.cpp:627`，`vit.cpp:309` 再取 `log2(rope_base)`）。host 路径原先硬编码
+  10000，于是换一个 `rope_theta` 的 mmproj 会让参考与 GPU 分叉，已修。
 
 **队列必须 in-order**：各阶段数据依赖但启动器不发事件（没有 `ext_oneapi_submit_barrier`），因此要求
 in-order 队列（引擎队列即是）。测试也显式建 in-order 队列（`test_multimodal.cpp:207`）。

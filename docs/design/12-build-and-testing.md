@@ -98,6 +98,12 @@ cmake --build build --target sycl-infer -j$(nproc)   # 只构建二进制，不�
   它跨运行缓存 JIT 编译后的 kernel，可以完全绕开 AOT 构建。**`ccache` 没有用**：设备 lowering 是链接
   步骤，不经过编译器的 cc 缓存路径。
 
+  ⚠️ **在 2x A770 那台机器上这个缓存是个陷阱**（2026-10-03 实测，随盒子的驱动版本）：设了
+  `SYCL_CACHE_PERSISTENT=1` 之后**每个** GPU 测试程序都在几秒内 `SIGSEGV`——正好在 KV 池 init 那一行
+  之后，也就是第一个 JIT kernel 里面；而同一个二进制不设缓存就通过（`test_gpu_stages`：
+  "all stages OK"）。换一个全新的 `SYCL_CACHE_DIR` 同样崩，所以不是目录被污染：**缓存本身在那台驱动上
+  会崩**。那台机器请用 AOT 构建（或干脆不设缓存）。
+
 ### 1.5 `dev/` 压测工具（本地未跟踪）
 
 `dev/` 在 `.gitignore` 里、`git ls-files dev` 为空，即**这些工具不属于本仓库**，仓库内文档只能按名字
@@ -151,7 +157,7 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_sampler` | 无 | CPU | `logit_bias` 强制/封禁 token、logprob log-softmax 与归一化、best_of 打分路径 |
 | `test_cpu_gemv` | 0.8B | CPU | CPU 融合 fp32 + 整数 int8 GEMV/RMSNorm vs `quant.h` 主机反量化参考，多类型多 TB；`PF_CPU_ISA=scalar\|avx2\|avx512` 钉住变体 |
 | `test_cpu_gdn` | 无 | CPU | `cpu_gdn` 用**非对称 head 数**（`n_k_heads=2, n_heads=6`）对照测试内标量参考，覆盖 `head % n_k_heads` 配对与状态写回（0.8B 的真实维度是恒等映射，测不出该 bug） |
-| `test_w4` | **27B** | CPU | w4 原生宽度打包：unpack(pack(Q4_K)) 往返（~0.077% rel L2，int8 转换是 ~0.98%）+ prefill 的 grouped-scale 恒等式 |
+| `test_w4` | 0.8B | CPU | w4 原生宽度打包：unpack(pack(Q4_K)) 往返（~0.077% rel L2，int8 转换是 ~0.98%）+ prefill 的 grouped-scale 恒等式 |
 | `test_pc_cpu` | 0.8B | CPU | 主机后端的 paged 注意力 + 前缀缓存磁盘 spill/promote 往返（日志逐位一致） |
 | `test_pc_disk` | 无 | CPU | 磁盘层记录格式往返、token 校验、LRU 预算、重开持久化、损坏/未知记录 |
 | `test_pc_ram` | 无 | CPU | RAM 层 LRU 记录存储 |
@@ -217,6 +223,23 @@ cmake --build build -j$(nproc)
 
 **四个都要跑。** 前三个是 prefill-only，对 decode-only 的 bug 完全盲（§7.2 第 6 条就是这个 bug 的藏身处），
 所以**任何影响单 token 路径的改动都必须跑 `test_decode_vs_prefill`**。
+
+### 3.2.1 已知失败（2026-10-03，两台机器都复现，与当次改动无关）
+
+`test_pc_cpu`（CPU 后端的前缀缓存往返）**当前是失败的**，在本地 Iris Xe-LP 与 2x A770 上都复现：
+最后一行是 `pc_cpu: 3 check(s) failed` /
+`matched=96 logits max|diff|=3.840658 argmax 248046/198 DIFFERENT`——命中了 96 个 token 的前缀，但
+从缓存恢复后的 logits 与参考不一致（`max|diff|` 在两台机器上分别约 3.37 与 3.84，说明这条 CPU 路径
+本身还有随线程数/ISA 变化的数值成分）。改动前（`6d77f95` 的 AOT 二进制）同样失败，所以它是一个
+**尚未跟踪的既存缺陷**，不是回归；CPU 分区的 `pc_restore_state` / 主机反量化路径值得单独查。
+其余测试（0.8B 全套 + 27B 的 `test_27b_prefill` / `test_w4_topk` / `test_w4_gemm` /
+`test_w4_vs_cpuref` / `test_decode_vs_prefill`）在 2x A770 上全部通过。
+
+另一个环境陷阱：同一台 A770 上连续跑多个 27B 测试时，后面的运行可能以
+`level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)` 失败（第一个失败的测试之后
+卡片状态就坏了）。**单独跑每一个**就都通过（`test_w4_vs_cpuref` 单独跑：
+`max|diff|=0.4448 mean|diff|=0.0528 argmax gpu=248045 ref=248045 SAME`），所以遇到 DEVICE_LOST
+先单独重跑该测试，别急着改代码。
 
 ### 3.3 27B（需要分卡，单卡放不下）
 

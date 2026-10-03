@@ -222,7 +222,8 @@ static void dp4a_row_gemm_impl(queue & q, const w8t & w, const int8_t * x8, cons
         const int g1 = (int)((long)(s + 1) * MG / n_split);
         // optional: prefetch the next group's packed weight bytes while the
         // current group's 32-token body runs (the load has ~2400 cycles to
-        // arrive); PF_ROW_PF=0 disables the experiment
+        // arrive).  Part of -DPF_MT_DEBUG, with no separate switch: delete the
+        // loop to price it
         for (int g = g0; g < g1; g++) {
             uint32_t gw[WGN];
             w8_group_expand<QT>(wp + (size_t)g * kRB * GB, gw);

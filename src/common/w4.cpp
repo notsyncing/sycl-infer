@@ -34,12 +34,12 @@ bool w4_supported(uint32_t ggml_type) {
     if (ggml_type == 12) {
         return true;
     }
-    // PF_W4_K5=1: Q5_K only.  The k5 store is 0.875 B/weight and Q5_K is the
-    // largest single byte consumer of the 27B weight pass (6.15 GB of 18.8,
-    // 35 %), against the u4 grid's 0.625 - so this is the one lossy
-    // re-quantization with a real payoff.  Separate from PF_W4_ALL (which also
-    // takes the cb4/int8 types) because the accuracy cost is a per-type
-    // decision, not a global one.
+    // PF_W4_K5=1: Q5_K only.  The k5 store is 0.75 B/weight (0.5 nibble plane
+    // + 0.125 fifth-bit plane + 2 f16 per 32-group, see dnnl_gemm::weight_bytes)
+    // and Q5_K is the largest single byte consumer of the 27B weight pass,
+    // against the u4 grid's 0.625 - so this is the one lossy re-quantization with
+    // a real payoff.  Separate from PF_W4_ALL (which also takes the cb4/int8
+    // types) because the accuracy cost is a per-type decision, not a global one.
     if (w4_k5_only() && ggml_type == 13) {
         return true;
     }
@@ -118,7 +118,6 @@ static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t
     out.scale.assign((size_t)ng * N, 0);
     out.off.assign((size_t)ng * N, 0);
     std::vector<float> row((size_t)K);
-    double num = 0.0, den = 0.0;
     for (int n = 0; n < N; n++) {
         dequantize_row(ggml_type, (const char *)src + (size_t)n * row_bytes, row.data(), K);
         for (int g = 0; g < ng; g++) {

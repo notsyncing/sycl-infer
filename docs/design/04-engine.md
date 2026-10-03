@@ -830,22 +830,32 @@ MTP 层的 plan 是手工构造的 5 个 call（`build_mtp_plan`，`engine_mtp.c
 2. 按 `batched_prefill_fit(rem)` 取**能容纳的最大批量**，一次 `prefill_text` 走完，再
    `prefill_flush()`（多设备流水线把最后一个 chunk 的 device-1 + head 相位推迟到下一次调用，
    而每位置的隐状态与 capture 只由那个 head 相位写）。
-3. 把 MTP 层跑在它**捕获到的**隐状态上，按 `kMaxT` 一片一片（828-837）：每片把自己的 capture
+3. 把 MTP 层跑在它**捕获到的**隐状态上，按 `kMaxT` 一片一片（823-832）：每片把自己的 capture
    基址当 `h`，把同 capture 里的前一个 token（第一批时是 `d_mtp_hprev`）当 `h_prev`。
 4. `dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (nb-1)*n_embd)`，进入生成循环。
 
 ⚠️ 旧实现按 `kMaxT` 分批走 prompt，每 32 个 token 付一次 `prefill_flush()` **加一次阻塞的
 `d_mtp_hprev` 主机 memcpy/wait**，把三相位多设备流水线彻底串行化：131k 深度的 e2e_ttft 是 1475 s，
-走调度器的同一 prompt 是 311 s；64k 是 697 vs 117 s（`engine_mtp.cpp:799-806`）。
+走调度器的同一 prompt 是 311 s；64k 是 697 vs 117 s（`engine_mtp.cpp:794-801`）。
 
-**前缀缓存**：`generate_mtp` 调 `pc_admit`（消费命中：恢复 KV 与递归状态），
-`pc_commit(0, prompt, blocks, nprompt)`（`engine_mtp.cpp:793-795`）。注意**代码里 `pc_commit`
-是在 prefill 循环之前调用的**（它上面的注释写的是 "after the prefill"）：节点先注册，检查点随后由
-`pc_capture_begin`/`pc_commit` 的 pending 列表挂上。因此这条路径能**吃**调度器留下的前缀，却因为
-`pc_capture_begin` 的链连续性守卫（`ps.registered * kMaxT == pos0`，
-`engine_prefix_cache.cpp:806-808`）在这一次调用里不成立、而 `pc_commit` 已经把 `registered` 推到
-`nprompt/32`，它自己 prefill 时捕到的检查点不会被挂上——也就是 MTP 生成的块下次不会被当成可续接的
-命中。
+**前缀缓存**：`generate_mtp` 调 `pc_admit`（消费命中：恢复 KV 与递归状态），prefill 循环**之后**调
+`pc_commit(0, prompt, blocks, nprompt)`，与调度器同一套契约。顺序是承重的：`pc_commit` 会把
+`pc_slot_[0].registered` 推到 `nprompt/32`，而每个 prefill chunk 里的 `pc_capture_begin` 要求
+`ps.registered * kBlockSize == pos0`（`engine_prefix_cache.cpp:806-808`）——所以提前提交会让本次
+prefill 一个检查点也捕不到（`pc_active` 恒 0），这条路径的缓存支持等于没有；而且节点会在其 KV 块
+还没写完时就发布，prefill 中途抛错就会留下"声称常驻、实际是陈旧 KV"的记录。`pc_commit` 必须在
+prefill 之后、生成之前。
+
+实测（27B、`--layer-map 0-31:gpu.0,32-63:gpu.1`、`--mtp 4 gen --temp 0`、约 90 token 的 prompt、
+`PF_PC_DEBUG=1`，2x A770）：把 `pc_commit` 挪到 prefill 之后，退出统计从
+`nodes=2 (with state 0) ... captured=0` 变成 `nodes=2 (with state 2) ... captured=2`——节点从
+"有链无状态"（`pc_admit` 只恢复到**有状态**的最深边界，所以这种节点下次根本接不上）变成带递归状态
+检查点的可续接命中。改动前那两个节点是既不可续接、又是在 KV 写完之前发布的。
+
+注意 CLI 的 `gen`（无论普通还是 MTP）**不走前缀缓存**：`pc_admit`/`pc_commit` 只有
+`src/server/scheduler.cpp:91,259` 调用，`generate_impl` 直接 `alloc_block`。所以这条契约只在
+`--temp 0 --mtp N`（`generate_impl` 分流到 `generate_mtp`，`engine.cpp:2365-2368`）与服务端
+`mtp_direct`（`PF_MTP_SERVER=1`）下生效。
 
 ### 12.7 cycle 的时间分解，以及 2x 是 acceptance 决定的
 

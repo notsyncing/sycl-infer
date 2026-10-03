@@ -27,7 +27,7 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 > （`engine_prefix_cache.cpp:128`、`:154`），块内偏移与单设备布局一致。
 >
 > **MTP 路径**也支持：`generate_mtp` 对 prompt 调 `pc_admit`（`engine_mtp.cpp:736`，命中数还会打印
-> `[mtp] prefix cache: reused N prompt tokens`）、prefill 后调 `pc_commit`（`engine_mtp.cpp:794`），
+> `[mtp] prefix cache: reused N prompt tokens`）、prefill 后调 `pc_commit`（`engine_mtp.cpp:847-849`），
 > 与调度器是同一套契约。
 
 ---

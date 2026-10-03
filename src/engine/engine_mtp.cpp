@@ -788,11 +788,6 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 .wait();
         }
     }
-    // Register the prompt's checkpoints with the cache (same contract as the
-    // scheduler: pc_commit after the prefill, before generation).
-    if (nprompt > 0) {
-        pc_commit(0, prompt, blocks, nprompt);
-    }
     std::vector<int32_t> chunk;
     const bool decode_h = getenv("PF_MTP_DECODE_H") != nullptr;
     for (int pos = matched; decode_h ? false : pos < nprompt;) {
@@ -837,6 +832,20 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
         dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (size_t)(nb - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
         pos += nb;
+    }
+
+    // Register the prompt's blocks and the checkpoints this prefill captured -
+    // same contract as the scheduler: pc_commit *after* the prefill, before
+    // generation.  Committing earlier (it used to sit right after set_table)
+    // was wrong twice over: pc_commit advances pc_slot_[0].registered to
+    // nprompt/32, so the pc_capture_begin inside every prefill chunk then failed
+    // its chain guard (`registered*kBlockSize == pos0`) and nothing was ever
+    // captured - the MTP prefix-cache support below silently did nothing; and the
+    // nodes were published while their KV blocks were still unwritten, so a
+    // prefill that threw would leave the cache claiming a prefix that holds
+    // stale KV.
+    if (nprompt > 0) {
+        pc_commit(0, prompt, blocks, nprompt);
     }
 
     if (getenv("PF_MTP_HVEC") != nullptr) {

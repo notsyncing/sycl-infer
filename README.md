@@ -179,7 +179,8 @@ Common flags:
 | `--host H` / `--port N` | 0.0.0.0 / 8080 | server bind address |
 | `--max-tokens` / `--temp` / `--top-p` / `--top-k` | 256 / 0.7 / 0.95 / 40 | `gen` sampling |
 | `--raw` | off | `gen`: send the prompt verbatim (no chat template) |
-| `--thinking` | off | `gen`: set the chat template `enable_thinking` (reasoning on); the server takes this from each request instead |
+| `--thinking` | off | `gen`: set the chat template `enable_thinking` (reasoning on); `--enable-thinking` is an accepted alias; the server takes this from each request instead |
+| `-h` / `--help` | – | print the built-in flag list and exit 0 |
 
 `--mtp` is hard-gated: it needs a GGUF that bundles the NextN head
 (`blk.<n>.nextn.*`) *and* a multi-device oneDNN int8 partition (`--layer-map` over

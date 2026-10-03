@@ -95,7 +95,7 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
 | `attn.*` | `vec` / `dec_group` | `attn.cpp:20` / `attn.cpp:303` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
 | | `xmx` / `xmx_min_keys` | `attn_xmx.cpp:54` / `attn_xmx.cpp:72` | oneDNN prefill attention 开关与键数门槛 |
 | | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp:87-88` | gather 一级 max 归约的工作组数与上限 |
-| | `split_keys` | 目前无读点：`engine_graph.cpp:1097-1101` 直接把 `PF_ATTN_SPLIT_KEYS` 默认成字面 512 | 字段已就位，engine 尚未改用它 |
+| | `split_keys` | `engine_graph.cpp:1096-1101`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
 | `wt.*` | `w4` / `k5` / `cb4` | `engine.cpp:1132` / `1138` / `1143` | 原生 u4 / 5-bit / codebook 存储的默认 |
 | `hw.*` | `compute_units` | `engine.cpp:241` | SYCL 查不到 EU 数时的兜底 |
 | | `max_work_group_size` | `device_registry.cpp:153` | `wg_clamped()` 的兜底 |
@@ -298,8 +298,8 @@ alpha/residual，写 `out[t*out_stride + row]`。注意 partials 用张量自己
 
 **编译期开关（不是环境变量）**：`PF_MT_DEBUG` 是 `#ifdef` 宏（`dp4a_gemm.cpp:190`）。定义后给 MT 路径
 加一段"在当前 group 的 32-token 主体运行时预取下一个 group 的打包权重字节"的实验块（载入有约 2400
-个周期可以到达），并打印一行一次性的 `[mtk] K=… N=… TB=… tstride=… n_tt=… grid=…`。该实验块注释里写的
-`PF_ROW_PF=0`（`dp4a_gemm.cpp:225`）用来关掉这个实验，但代码里没有任何地方读它，所以它同样是编译期的。
+个周期可以到达），并打印一行一次性的 `[mtk] K=… N=… TB=… tstride=… n_tt=… grid=…`。这个预取没有独立开关
+（注释里曾提到的 `PF_ROW_PF` 在代码里没有任何读取处，已删除；要给它定价就删掉那个循环）。
 MT 路径真正的环境变量开关是上表列出的 `PF_MT_R`/`_R2`/`_TB`/`_WG`/`_WG2`/`_PF`/`_SLM`。
 
 ### 5.4 分组 scale 解码 GEMV（`w4_gemv.cpp`）
@@ -779,9 +779,9 @@ out  = (S · q) * scale
     4.64/7.66/7.68/10.24/12.38/14.63/22.03，标量是 4.89/5.23/5.23/5.92/6.91/8.26/12.17——即 float4
     在 `n_real=1`（普通 decode）赢 0.25 ms，从 2 起就输 1.46×，到 32 输 1.81×；边际成本 0.51 ms/token
     对标量的 0.25。MTP verify 在 `n_real=5`，那里标量快 2.5 ms。`PF_GDN_VEC=0/1` 强制标量/float4。
-  * `PF_GDN_PD` 只剩一行注释（`gdn.cpp:280`，宣布"classic form：`at` 取更新后的状态"的 A/B），代码里
-    没有对应的 `getenv`——两种 `at` 形式已不可切换，`gdn_launch` 的实际分派只看 `f4`、`c`（列数）与
-    `wpw`（每工作组 warp 数）三者。
+  * 历史上曾有一个 `PF_GDN_PD`（"classic form：`at` 取更新后的状态"）的 A/B，它只剩注释、没有
+    `getenv`，已删除——两种 `at` 形式不可切换，`gdn_launch` 的实际分派只看 `f4`、`c`（列数）与 `wpw`
+    （每工作组 warp 数）三者。
 
 ---
 

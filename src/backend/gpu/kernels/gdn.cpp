@@ -277,7 +277,6 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
         return e ? atoi(e) : 8;
     }();
     const int c = (n_real >= cols_min && head_dim % cols == 0) ? cols : 1;
-    // PF_GDN_PD=0: classic form (at from the updated state)
 
     // float4 (contiguous 4 columns per lane) variant: one 16-byte load per
     // lane for q/k instead of four 4-byte loads; the state lives in one float4

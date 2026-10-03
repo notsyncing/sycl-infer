@@ -427,7 +427,7 @@ struct launch_count {
         }
         pass++;
         fprintf(stderr,
-                "[lc] pass=%d mode=%d xq=%ld (mergeable-adjacent=%ld) gemm-seg=%ld (mergeable-adjacent=%ld) "
+                "[lc] pass=%ld mode=%d xq=%ld (mergeable-adjacent=%ld) gemm-seg=%ld (mergeable-adjacent=%ld) "
                 "norm=%ld gdn=%ld attn=%ld  total=%ld  fusible=%ld\n",
                 pass, mode, xq, xq_merge, seg, seg_merge, norm, gdn, attn, xq + seg + norm + gdn + attn,
                 (xq - xq_merge) + (seg - seg_merge));
@@ -1096,8 +1096,9 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }();
             static const int at_split_keys = [] {
                 const char * e = getenv("PF_ATTN_SPLIT_KEYS");
-                const int v = e ? atoi(e) : 512;
-                return v > 0 ? v : 512;
+                const int dflt = si::dev::active().attn.split_keys;
+                const int v = e ? atoi(e) : dflt;
+                return v > 0 ? v : dflt;
             }();
             // PF_ATTN_FUSE=0: keep the separate attn_combine kernel even when
             // n_splits == 1 (A/B knob; fusion is the default)
