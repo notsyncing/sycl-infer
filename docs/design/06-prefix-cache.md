@@ -241,7 +241,6 @@ flags(4) hash(8) depth(4) blob_bytes(4) state_bytes(4) toks(32*4)
 
 ## 9. 进一步阅读
 
-* `reports/prefix_cache.md`：前缀缓存的设计/测量报告。
 * `tests/backend/cpu/test_pc_disk.cpp`（磁盘格式/LRU/重开）、`test_pc_ram.cpp`（RAM 层）、
   `tests/backend/cpu/test_pc_cpu.cpp`（主机后端的 paged attention + 磁盘 tier 往返）、
   `tests/backend/gpu/test_pc_gpu.cpp`（磁盘 spill + promote 往返）、

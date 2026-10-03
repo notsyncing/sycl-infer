@@ -59,6 +59,14 @@ gotchas.
 * [`docs/design/12-build-and-testing.md`](docs/design/12-build-and-testing.md) —
   build targets, test matrix, verification flow.
 
+**`reports/` is not part of this repository.**  It is in `.gitignore` and stays
+that way: nothing under it is ever committed, so **no document here may link to
+it** — not this file, not `README.md`, not `docs/`.  A `reports/` reference in a
+committed doc is a dead link for everyone who clones the tree.  Every number worth
+keeping is quoted inline below (with the measurement it came from), and a
+measurement that only exists in a write-up has to be summarised here before it can
+be relied on.
+
 ## Build
 
 ```bash
@@ -129,14 +137,23 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2
 ```
 
 `main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --kv-type
---port --host --device --cpu-threads --layer-map --mmproj --audio-mmproj`, and
+--port --host --device --cpu-threads --layer-map --mmproj --mtp --mtp-device
+--audio-mmproj`, the three prefix-cache budgets `--pc-vram-mb`/`--pc-mem-mb`
+(alias) `--pc-ram-mb`/`--pc-dir`+`--pc-disk-mb`, and
 for `gen`:
 `--prompt --max-tokens --temp --top-p --top-k --raw --thinking --image --video
 --audio --max-video-frames --max-video-side`).  `--device cpu|gpu|auto`
 selects the compute backend; `--cpu-threads N` (or `PF_CPU_THREADS`) sets the
 host worker count;
-`--layer-map 0-11:gpu,12-23:cpu` places closed layer ranges on devices (each
-range must cover the layer list without gaps).
+`--layer-map 0-11:gpu,12-23:cpu` places closed **inclusive** `begin-end` ranges
+on a device (`gpu`, `gpu.N`, or `cpu`/`host`/`1`); the ranges must tile
+`[0, n_layer)` in order, with no gaps;
+`--mtp [N]` turns the speculative draft on (the length is optional - a bare
+`--mtp` is the measured optimum k=4 and never swallows the next flag) and
+`--mtp-device N` picks the partition the draft layer runs on (default 0).  Both
+are hard-gated: no `blk.<n>.nextn.*` in the GGUF, or no multi-device oneDNN
+int8 partition, prints one `[mtp]` line and falls back to the plain decode (see
+the MTP section).
 
 `--kv-type K:V` sizes the K and V caches independently (only the scale-carrying
 i4/i8 may be mixed).  The attention error is dominated by V, not K: on the 27B
@@ -144,17 +161,23 @@ i4/i8 may be mixed).  The attention error is dominated by V, not K: on the 27B
 the fp32 CPU reference, versus 0.035 for i8 and 0.183 for i4, at 24 KB/token
 (i8 is 32, i4 is 16) - so it fits a 262144-token context on 2x A770 with
 near-i8 accuracy.  `i8:i4` is the mirror image and is *worse* than i4/i4
-(mean|diff| 1.49), confirming V is the sensitive side.  See
-[`reports/turboquant_and_perf.md`](reports/turboquant_and_perf.md).
+(mean|diff| 1.49), confirming V is the sensitive side.
 
 ## Testing
 
 The tests default to `/path/to/Qwen3.5-0.8B-Q4_K_M.gguf` and require the
 GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
+The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
+`test_w4_vs_i8`, `test_gemv_stride`, `test_iq_dequant`, `test_w4_vs_cpuref`,
+`test_w4_topk`, `test_27b_prefill` - default to the 27B at
+`/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` and take it as
+`argv[1]`.
 
 ```bash
 ./build/test_tokenizer     # tokenizer round-trips (CPU only, no GPU work)
 ./build/test_chat_template # GGUF chat template vs reference Jinja2 output (CPU only)
+./build/test_response_parser # reasoning_content / tool_call splitter (CPU only)
+./build/test_sampler       # logit_bias + logprob reporting (CPU only)
 ./build/test_multimodal    # image/video prompt, audio decode+mels, vision + audio
                               # encoders (host + device), positions (CPU+GPU)
 ./build/test_compare       # CPU reference vs llama.cpp dumps (CPU only)
@@ -167,6 +190,8 @@ GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
 ./build/test_iq_dequant    # IQ*/Q3_K GPU dequant vs host reference (GPU, 27B)
 ./build/test_quant_audit   # int8(oneDNN) GEMM loss per ggml type (GPU)
 ./build/test_w4*           # native-width u4 packing / GEMM / vs int8 (CPU+GPU)
+./build/test_k5_gemv       # native 5-bit (Q5_K) store GEMV vs a host reference
+                              # (GPU, 27B)
 ./build/test_gpu_vs_ref    # end-to-end logits vs CPU reference (GPU)
 ./build/test_forward       # end-to-end logits / top-k (GPU)
 ./build/test_decode_vs_prefill  # single-token decode == re-prefill (GPU)
@@ -189,6 +214,11 @@ src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
                 interleaved nibble order + per-32 f16 scale, `cb4t`/`cb4_pack`),
                 dp4a.h (portable dp4a helper),
                 cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch)
+src/device/     device_profile.h (the `profile` struct + the registry API),
+                device_registry.cpp (the `kDevices[]` list, name -> profile
+                selection, `PF_DEVICE_INFO` report, the cached `wg_clamped`),
+                profiles/<card>.cpp (one card's key, values and matcher each:
+                arc_a770, iris_xe) — see "Device profiles" below
 src/backend/    backend.h (compute_backend abstraction), dnnl_gemm.{h,cpp}
                 (optional oneDNN int8 matmul, PF_GEMM_DNNL),
                 gpu/gpu_backend.cpp (forwards to the SYCL kernels),
@@ -204,15 +234,19 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 and one .cpp per kernel: rmsnorm, embed, copy_row, gemv,
                 qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a_gemv,
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
-                w4_gemv (u4/int8/codebook decode GEMV: g-major SLM-staged 4-bit
-                GEMV, LUT-expanding codebook GEMV and its prefill expansion, plus
-                the opt-in batched u4 GEMM `w4_gemm_launch`), mtp (mtp_concat /
-                mtp_capture for the NextN draft head),
-                 vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
-                 bidirectional attention), at (audio tower helpers: at_conv1d,
-                 at_rope1d), attn_xmx (oneDNN int8 *matmul* prefill attention -
-                 NOT the XMX unit, see the "XMX is a name, not a unit" note
-                 below; PF_ATTN_XMX below)
+                 w4_gemv (every native weight store's GEMV: u4/k5/codebook/2-bit
+                 g-major SLM-staged decode GEMV, the LUT-expanding codebook GEMV
+                 and its prefill expansion, the batched nat_gemm_launch (M <= 13),
+                 the opt-in batched u4 GEMM `w4_gemm_launch`, and the fused narrow
+                 int8 call group `i8_grp_gemv_rows_multi_launch`), mtp (mtp_concat /
+                 mtp_capture for the NextN draft head), mtp_argmax (the verify's
+                 accept argmax plus the opt-in gathered draft head: mtp_cand_launch
+                 / mtp_gather_launch / mtp_gather_argmax_launch),
+                  vit (vision encoder: GEMM, LayerNorm, GELU/bias, 2D RoPE,
+                  bidirectional attention), at (audio tower helpers: at_conv1d,
+                  at_rope1d), attn_xmx (oneDNN int8 *matmul* prefill attention -
+                  NOT the XMX unit, see the "XMX is a name, not a unit" note
+                  below; PF_ATTN_XMX below)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
                 model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
                 tokenizer.{h,cpp}
@@ -239,8 +273,8 @@ src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
                 + <kernel>_stage.cpp (one per GPU kernel), plus the weight-path
-                audits: test_w4_gemm.cpp, test_w4_vs_i8.cpp, test_gemv_stride.cpp,
-                test_iq_dequant.cpp, test_quant_audit.cpp
+                audits: test_w4_gemm.cpp, test_k5_gemv.cpp, test_w4_vs_i8.cpp,
+                test_gemv_stride.cpp, test_iq_dequant.cpp, test_quant_audit.cpp
 tests/backend/gpu/  test_forward.cpp, test_gpu_vs_ref.cpp,
                 test_pc_gpu.cpp (disk spill + promote round-trip),
                 test_pc_ram_gpu.cpp (VRAM->RAM->VRAM round-trip)
@@ -302,7 +336,10 @@ loading design.
 Shared device helpers (dequantization, KV element access, sub-group reductions,
 SIn/DP4A expansion, `gemm_ws`) live in `src/backend/gpu/kernels/kernel_utils.h` under
 `si::kd`.  Device kernels must be compiled into the TU that uses them — do not
-put kernel bodies in headers.
+put kernel bodies in headers.  **A tuned constant that was measured on one GPU
+does not belong in the launcher** - add a field to that card's profile
+(`src/device/profiles/<card>.cpp`) and read it through `si::dev::active()`, so the
+other card and an unknown one can differ; see "Device profiles" below.
 
 ### Add a CPU kernel
 
@@ -409,7 +446,14 @@ plain greedy decode would.  Requires a GGUF that bundles the head: the 27B
 reference model has `qwen35.nextn_predict_layers == 1` with `blk.<n_layer>.nextn.*`
 (`eh_proj`, `enorm`, `hnorm`, `attn_norm`, q/k/v/wo/ffn, optional
 `shared_head_norm`/`shared_head_head`); the 0.8B has none, so `--mtp` there is a
-no-op.  The MTP layer is a full-attention Qwen3.5 block, so it owns one extra
+no-op.  **The second hard requirement is a multi-device oneDNN int8 partition**:
+`engine`'s constructor drops the path with `[mtp] MTP needs a multi-device oneDNN
+int8 partition (single device) - disabled` unless `multi_dev && md_xmx`
+(`src/engine/engine.cpp`), i.e. a `--layer-map` whose GPU partitions have
+`setup_md_dnnl()` weights (`PF_DP4A` on).  A single-device `--mtp 4` is
+therefore a silent no-op on the 0.8B *and* on a 27B that fits one card, and the
+draft length is clamped to 12 (`n = k+1 <= kMaxB`, the `d_logits` / `step_info`
+bound).  The MTP layer is a full-attention Qwen3.5 block, so it owns one extra
 attention KV slice (`attn_layers() - 1`) in the same paged pool and is counted in
 `--kv-cap-mb` and by all three prefix-cache tiers.
 
@@ -530,14 +574,13 @@ kernel by 1.4-2x.  **A DPAS verify kernel is the right target in principle** (it
 arithmetic term is 14.7 ms at M=5 (u4/k5 is 52 % of the bytes, so ~8 ms of it),
 35.3 ms at M=8, 112 ms at M=12, and it grows with M) **but it is measured 37x
 slower than `nat_gemm` in a real GEMM**, so it needs another 37x on top of a
-register/occupancy redesign before it is worth anything - see the DPAS verdict
-below and `reports/mtp_ceiling.md` §4a.  The cb4 codebook LUT (30 % of
-the bytes) still cannot use a u4 DPAS operand and int8 (18 %) would need the s8
-path (measured 1/16 the u4 rate).  Also note dp4a is *not* a hardware unit on
+register/occupancy redesign before it is worth anything.  The cb4 codebook LUT
+(30 % of the bytes) still cannot use a u4 DPAS operand and int8 (18 %) would need
+the s8 path (measured 1/16 the u4 rate).  Also note dp4a is *not* a hardware unit on
 Xe-LP: a measured fp32 FMA peak of ~5.0 T-FMA/s (`dev/alu_probe2.cpp`; the older
 `alu_probe.cpp` is dead - the compiler folds its loop and it reports 1.5 PFLOP/s)
 puts dp4a's 3.5-4.9 T-MAC/s at 70-98 % of the vector ALU, so DPAS is a genuinely
-separate ~16x unit.  See [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §1, §4.
+separate ~16x unit.
 
 Both paths are memory bound and both read the same ~16.3 GB of weights per unit
 of work, so the only lever left is **tokens per weight pass**, and that is capped
@@ -650,7 +693,7 @@ iota constructor and no identity-`offsets` helper (the `offsets` in `memory.hpp`
 stop holding 4 tiles of accumulators live - so it has to find another 37x, and the M=1
 decode it would nominally serve is 1/8 of the dpas work.
 **The plumbing works - the earlier "the toolchain blocks it" reading was an artefact
-of the test** (`reports/mtp_ceiling.md` §4a, harnesses `dev/dpas_plumb.cpp` +
+of the test** (harnesses `dev/dpas_plumb.cpp` +
 `dev/dpas_data_probe.cpp` + `dev/bench_dpas_gemm.cpp`).  `esimd::gather` into a
 cross-lane operand, `block_store` out of one and per-element access with a *runtime*
 index all round-trip real memory data with 0/64 errors; the function they share
@@ -670,7 +713,7 @@ host-side out-of-bounds read in its activation pattern fill that glibc reported 
 later as `double free or corruption (out)`; fixed, and its M sweep is what corrected
 the XMX verdict.)
 
-**Refined later (see `reports/mtp_ceiling.md` §4).**  Both halves of that
+**Refined later.**  Both halves of that
 conclusion were re-measured and one is wrong for a fixable reason.  (a) The
 *hardware* verdict holds and the number behind it is
 `dev/bench_dp4a_peak.cpp`: with register-resident operands dp4a reaches
@@ -794,10 +837,11 @@ index (and so does the per-lane scan) to stay bit-identical to the host's
 `if (v[i] > best)`: **33.7 -> 1.2 ms/cycle (28x)**, verified by
 `PF_MTP_AMCHK` (device vs host argmax, 0 mismatches).  The whole cycle went from
 ~138 to ~106 ms and single-request latency 58.3 -> 45.5 ms/token.
-`PF_MTP_ARGMAX_CPU=1` still selects the host scan, which costs ~34 ms/cycle for
-the ~7 MB logits copy of a 5-row verify - correct, but only reachable when a
-repeat/presence/frequency penalty makes the device argmax invalid, and the
-server and CLI both default to `repeat_penalty` 1.0 so the device path is used.
+The old host scan is **gone as a knob**: `compute_backend::mtp_argmax` is the only
+entry point (`mtp_argmax.cpp` on the GPU backend, a host loop in
+`cpu_backend.cpp` for an all-`cpu` run), so the device path is what the verify
+uses and `PF_MTP_ARGMAX_CPU` no longer exists.  The ~34 ms/cycle host scan is kept
+only as that dead-end measurement below.
 
 **Where MTP's remaining time is, and the one lever left (measured).**  After the
 argmax fix the cycle is ~104 ms for ~2.48 emitted tokens: draft **13.0**,
@@ -835,31 +879,36 @@ pass; the ceiling is the text's information content, ~3.1-3.3 accepted tokens
 per chain for a 27B model (measured acc 2.1-2.8 drafts + the bonus), which caps
 the speedup at ~2x on this hardware.  Verified dead ends:
 
-* **Taking the MTP layer's own linears to 4 bits** (`PF_MTP_LAYER_W4`, opt-in,
-  default off).  It is Q6_K/Q8_0 (338 MB) and the generic per-32 u4 pack costs
-  2.6% relative L2 on Q6_K (cos 0.9949 on `blk.64.nextn.eh_proj` - 8x the error
+* **Taking the MTP layer's own linears to 4 bits** (`PF_MTP_LAYER_W4`).  As first
+  measured it was Q6_K/Q8_0 (338 MB) and the generic per-32 u4 pack cost 2.6%
+  relative L2 on Q6_K (cos 0.9949 on `blk.64.nextn.eh_proj` - 8x the error
   `PF_W4_ALL` is documented at).  The draft got 3x cheaper (16.9 -> 5.4 ms) but
   the acceptance collapsed to 0.11 and the net went 36.4 -> 83.4 ms/token.
   A wrong draft costs the whole verify, so the bytes saved are never worth it.
-* **Moving the verify's accept argmax onto the device** (`PF_MTP_ARGMAX_CPU=1`
-  for the old host scan; `mtp_argmax.cpp` + `compute_backend::mtp_argmax`).  This
+  **The 0.11 was a bug, not the precision**: `eh_proj`'s activation was
+  quantized without `do_split=true`, so the u4 GEMV read the *previous* call's
+  even/odd planes (`do_split` rule below).  Fixed, it is **default on** with an
+  unchanged acceptance (2.06 -> 0.875 B/w, -1.4 ms/cycle).
+* **Moving the verify's accept argmax onto the device** (`mtp_argmax.cpp` +
+  `compute_backend::mtp_argmax`).  This
   removes a real 7 MB/cycle host copy, but it is *not* a speedup: 200.2/199.8 s
   (host) against 199.8/200.1 s (device) for 2000 tokens, with identical user+sys
   CPU time.  The transfer was never on the critical path - the verify's own sync
   dominates and the copy overlaps the next draft.  Kept for the lower host work
-  and bit-identical output, not for t/s.
+  and bit-identical output, not for t/s (and the device form became the only
+  path - see the accept-argmax fix above).
 * **Removing the commit/rollback syncs.**  `commit` measured 4.0 ms and looked
   like pure overhead, but it is one device-wide barrier per cycle: merging it
   into the rollback's just moves the cost (commit 4.0 -> 0.3, rb 1.5 -> 4.0, net
   unchanged at 36.2 vs 36.4 ms/token).  The barrier itself is the cost.
 
 Diagnostics (all env-gated, `0`/unset = off unless noted): `PF_MTP` (draft
-length, `--mtp` overrides), `PF_MTP_ARGMAX_CPU`, `PF_MTP_LAYER_W4`, `PF_MTP_AMCHK`,
-`PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms),
+length, `--mtp` overrides), `PF_MTP_LAYER_W4`, `PF_MTP_AMCHK`,
+`PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms), `PF_MTP_SUBMIT`,
 `PF_MTP_DEBUG`/`PF_MTP_DUMP`, `PF_MTP_VERIFY_PAD`/`PF_MTP_VERIFY_M32` (pad the
 verify's GEMM M), `PF_MTP_VERIFYN`, `PF_MTP_DECCHK` (verify row 0 vs a plain
 decode of the same token), `PF_MTP_LSTAT`, `PF_MTP_DECODE_H`, `PF_MTP_NOACCEPT`,
-`PF_MTP_NOMTPFWD`, `PF_MTP_NORB`, `PF_MTP_DBG_RB`, `PF_MTP_FORCE_INT8` (restore
+`PF_MTP_NOMTPFWD`, `PF_MTP_NORB`, `PF_MTP_NORBSYNC`, `PF_MTP_FORCE_INT8` (restore
 the old int8-only verify stores).  Batch-GEMM knobs: `PF_NAT` (`0` disables
 `nat_gemm_launch` and falls back to the oneDNN grouped-scale matmul + epilogue),
 `PF_MTP_SPLITS` (the MTP draft's key-split cap, default `kMaxDecSplits`; `1`
@@ -876,8 +925,8 @@ chosen logit): **default off, and it should stay off** - see below.  The narrow
 int8 call-group fusion is `PF_NOFUSE`=1 to turn it off, `PF_FUSEDBG`=1 to trace
 it (see the fused-GEMV note below).
 
-**The 3x question, measured (27B / 2x A770, single-request CLI, greedy).**  Full
-accounting in [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md).  The speedup is
+**The 3x question, measured (27B / 2x A770, single-request CLI, greedy).**  The
+speedup is
 `speedup = n * T_plain / (T_plain + X)` with `n = 1 + accepted drafts` and `X` the
 cycle-only cost, so it is **bounded by the acceptance**, and the acceptance is a
 property of the MTP layer rather than of the engine:
@@ -961,8 +1010,7 @@ on the primary device (`--mtp-device 0`, the default); a cross-device
 
 ### MTP on 27B, re-measured 2026-10: what the cycle is made of, and the 2x question
 
-Full record in [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §9.  The short
-version, because the numbers in §1-§8 above predate it:
+Re-measured 2026-10-02, because the numbers in §1-§8 above predate it:
 
 * **A 3.2 ms-per-launch regression was hiding in the verify path**, from the
   device-profile refactor: `rmsnorm_launch` calls `si::dev::wg_clamped()`, which
@@ -1037,8 +1085,22 @@ New diagnostics: `PF_HOSTPROF=1` (the `PF_PROF` buckets *without* the per-stamp
 device wait, i.e. submission cost - this is what found the regression),
 `PF_MTP_STEPS=1`, `PF_MTP_DSTEP=1` (per-stage draft-step time),
 `PF_MTP_LAYER_EXACT=1`, `PF_MTP_HEAD_W2=1`, `PF_W2_PAIR=1`, `PF_W2_INFO=1`,
-`PF_W2_DEBUG=1`.  Build the harnesses with `-DSI_DEV_BENCH=ON`
-(`dev/bench_mtp.cpp`, `dev/test_w2.cpp`).
+`PF_W2_DEBUG=1`.  `-DSI_DEV_BENCH=ON` builds exactly one of the `dev/` harnesses
+(`dev/bench_mtp.cpp`, the one-process-per-config MTP sweep); the rest are one-file
+tools compiled by hand against `sycl_infer_core` (e.g. `dev/test_w2.cpp`,
+`dev/test_fused_i8.cpp`, `dev/bench_wpass.cpp`, `dev/bench_dp4a_peak.cpp`,
+`dev/bench_natgemm.cpp`, `dev/bench_dpas_gemm.cpp`), because each one re-lowers the
+device image at link:
+
+```bash
+icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
+  -Isrc -Isrc/common -Isrc/backend -Isrc/backend/cpu -Isrc/backend/gpu/kernels \
+  -Isrc/model -Isrc/mm -Isrc/engine -Isrc/server -Ithird_party \
+  -I/opt/intel/oneapi/dnnl/2026.0/include -Lbuild -lsycl_infer_core -ldnnl
+```
+
+(`build/libsycl_infer_core.a` has to be current or the link fails on whatever
+launcher the tool was last changed to call.)
 
 ### OpenAI-compatible API
 
@@ -1115,7 +1177,7 @@ name.
   launch** = 210 ms of host time in one MTP verify pass (65 rmsnorm calls), and
   it was invisible in the plain decode because the decode is a recorded command
   graph (captured once at startup) while the verify is a direct replay.  The
-  profile refactor introduced it; reports/mtp_ceiling.md §9a has the numbers.
+  profile refactor introduced it; the measurement is the 3.2 ms and 210 ms above.
 * **Write every field with a designated initializer.**  `.key = ...`,
   `.shape = {.rmsnorm_wg = ...}`.  The build uses `-Wall -Wextra`, so an omitted
   field warns rather than defaulting silently, and a field can be inserted or
@@ -1123,12 +1185,14 @@ name.
   draft had `rmsnorm_wg` under `attn_vec` and every later field printed one slot
   off.
 * **An unknown card must be loud.**  `for_name()` falls back to a profile whose
-  key is `unknown`, built at compile time from `kDevices[0]` so it cannot drift
-  from the row it copies, and `active()` prints a WARNING naming where to add a
+  key is `unknown`, a struct copy of `kDevices[0]`'s profile built once in a
+  function-local static, so it cannot drift from the row it copies, and `active()`
+  prints a WARNING naming where to add a
   card rather than silently inheriting the last card's tuning.  `PF_DEVICE_PROFILE`
   pins a profile regardless of the reported name (for re-measuring one card's
   curve on another), and `-DSYCL_INFER_AOT_PROFILE=<key>` bakes it into an AOT
-  binary; `PF_DEVICE_INFO=1` dumps the resolved profile and its provenance at
+  binary (`SI_FORCE_DEVICE_PROFILE`, which `PF_DEVICE_PROFILE` overrides);
+  `PF_DEVICE_INFO=1` dumps the resolved profile and its provenance at
   startup.
 * **`shape.rmsnorm_wg` is the hardware boundary to watch.**  It is one of the few places
   the two parts differ as *hardware* rather than as tuning: the A770 accepts a
@@ -1188,9 +1252,11 @@ scales always apply),
 
 **Attention**
 `PF_ATTN_SPLIT`, `PF_ATTN_SPLIT_KEYS` (default 512), `PF_ATTN_VEC` (default on),
-`PF_ATTN_FUSE` (default on), `PF_DEC_SPLIT` (default **`7.5 * compute_units /
-n_head`**, i.e. 160 on a 512-EU A770 for the 27B's 24 query heads; cap 512 —
-decode K-split).  The decode attention is **occupancy** bound, not bandwidth
+`PF_ATTN_FUSE` (default on), `PF_DEC_SPLIT` (default
+**`(warps_per_eu/2) * compute_units / n_head`** from the device profile's
+`occ.warps_per_eu_x2`, rounded down to a multiple of 8 and floored at 8 — 160 on a
+512-EU A770 for the 27B's 24 query heads; cap `kMaxDecSplits` = 512 — decode
+K-split).  The decode attention is **occupancy** bound, not bandwidth
 bound: `n_head * n_splits` 32-thread warps per layer, 8 per EU, and past 8
 warps/EU the excess is not co-resident and the time steps *up*.  Measured one
 layer, 27B shape, i8 KV, 64k depth, attn+combine ms: nsp=64 3.05, 128 2.18,
@@ -1205,7 +1271,7 @@ do not widen a lane to 16 dims for 16-byte loads (`attn_dec16_kernel`: 4.45 vs
 allocate 128 registers and spill; the report's §4.3 has two bugs in that kernel
 that both measured *faster* while being wrong, so read it before trusting a
 timing).  The 8-warps-per-EU wave is architectural, so no register trick buys
-more warps.  See `reports/d64k_pp_tg_evaluation.md`),
+more warps),
 `PF_DEC_GROUP` (grouped decode attention, default off), `PF_ATTN_XMX` (oneDNN
 int8 *matmul* prefill attention, **default on**; `0` restores the classic kernel),
 `PF_ATTN_XMX_MIN` (minimum key count for the oneDNN matmul path, default 2048 - below it the
@@ -1213,7 +1279,7 @@ classic kernel is faster), `PF_ATTN_WAIT` (force a per-attention-matmul oneDNN
 stream wait; default off, the in-order queue already orders them).
 
 **GEMV / GEMM tuning**
-`PF_GEMV_SPLIT`, `GEMV_DEC_VEC`, `GEMV_VEC12`, `GEMV_VEC13`, `GEMV_CFG1/8/16/32`,
+`PF_GEMV_SPLIT`, `GEMV_DEC_VEC`, `GEMV_VEC12`, `GEMV_VEC13`,
 `PF_GEMM_ROW`, `PF_GEMM_TILE`, `PF_GEMM_SPLIT`, `PF_GEMM_WG`, `PF_GEMM_SG`,
 `PF_GEMM_XSLM`, `PF_GEMM_ARCH`, `PF_MT_R`/`PF_MT_R2`, `PF_MT_TB`, `PF_MT_WG`,
 `PF_MT_WG2`, `PF_MT_PF`, `PF_MT_SLM`.
@@ -1224,11 +1290,11 @@ stream wait; default off, the in-order queue already orders them).
 kernel, 1 = always float4; the float4 state slice costs 4x the registers, so it
 wins by 0.25 ms at one token per row and loses by 1.46x from two, 1.81x at 32 -
 the MTP verify's `n_real = k+1` is in the losing half and gains 2.4 ms from the
-scalar kernel, see `reports/mtp_ceiling.md` §1c), `PF_GDN_FUSE` (1/2),
+scalar kernel), `PF_GDN_FUSE` (1/2),
 `PF_GDN_COLS_MIN` (the `n_real` at which column batching starts, default 8 =
 unchanged; the MTP verify's `n_real = k+1 = 5` is below it and every
-`PF_GDN_COLS>1` variant is 1-1.7 ms *slower* there, so the gate is right - see
-`reports/mtp_ceiling.md` §1c).  The GDN is the MTP verify's second-largest block
+`PF_GDN_COLS>1` variant is 1-1.7 ms *slower* there, so the gate is right).
+The GDN is the MTP verify's second-largest block
 (11.24 ms of 95, `PF_PROF` mode 2) and is sub-group-reduction-latency bound: one
 warp owns one state row and spends two `sg_sum` per token to advance 8 MACs.
 
@@ -1276,25 +1342,26 @@ so the argmax stays one scan on device 0.  Draft 17.2 -> 13.1 ms/cycle
 deterministically and end-to-end a wash, because halving N changes the u4 GEMV's
 decomposition and flips the draft's argmax on a near-tie: p1 bit-identical over
 128 tokens, p0 -6 % and p2 -8 % acceptance), `PF_MTP_HEAD_SPLIT_DEBUG` (prints
-the device and host argmax of the split row per step), `PF_MTP_HEAD_TIME` (device
-time of the head readout per draft step: 3.04 of a 4.0 ms step, i.e. 75 % of the
-draft), `PF_MTP_HEAD_W2=1` / `PF_W2_PAIR=1` / `PF_W2_INFO=1` / `PF_W2_DEBUG=1`
-(the 2-bit draft head store, measured a wash - see reports/mtp_ceiling.md §9d),
+the device and host argmax of the split row per step), `PF_MTP_HEAD_W2=1` /
+`PF_W2_PAIR=1` / `PF_W2_INFO=1` / `PF_W2_DEBUG=1`
+(the 2-bit draft head store, measured a wash: -2.6 ms/cycle for -2 % acceptance;
+the per-step head time is inside `PF_MTP_DSTEP`, there is no separate head knob),
 `PF_CHAT_TMPL_DEBUG` (log why a GGUF chat template fell back to the built-in
 renderer), `SCHED_DEBUG`, `STOP_AFTER_LAYER`, `PF_ABL_NOATTN`, `PF_ABL_NOGDN`,
 `PF_DUMP_LAYERS` (per-layer hidden-state fingerprints; `layerlast` = the last
 real token slot; `PF_DUMP_RAW=<prefix>` writes the whole activation vector so a
 decode run can be diffed element-wise against a prefill),
-`PF_DUMP_LOGITS`/`PF_DUMP_DEC_LOGITS=<path>` (sampler logits; the latter per
-step), `PF_DUMP_PROMPT` (the exact ids - and, for a chat prompt, the rendered
+`PF_DUMP_LOGITS=<path>` (full logit vector, **tests only** - `test_w4_topk` /
+`test_w4_vs_cpuref`) / `PF_DUMP_DEC_LOGITS=<path>` (sampler logits, per step),
+`PF_DUMP_PROMPT` (the exact ids - and, for a chat prompt, the rendered
 text - the model is conditioned on), `PF_DUMP_GEN` (the decode loop's sampled id
 and stop decisions), `PF_ROWACT` (restore the now-unused per-row activation
 quantizer for A/B; it is dead because oneDNN reads the per-32-group form, and
 cost ~13 ms/token in a 27B multi-device decode), `PF_LAUNCHCNT` (tally one `record_forward` pass's SYCL submissions by kind and
 count which are *adjacent-fusable*; the verify is 812 - 257 xq, 395 GEMV segments,
 64 rmsnorm, 96 GDN-family - of which only **75 (9 %) are fusable**, because every
-xq reads a different source and so sits on the critical dependency chain: see
-[`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §1e), `PF_MTP_SUBMIT` (the
+xq reads a different source and so sits on the critical dependency chain),
+`PF_MTP_SUBMIT` (the
 verify's host submit time vs its wall - 86.6 of 90.2 ms, i.e. the in-order queue
 paces the host, so a recorded verify graph would only buy the decode graph's
 measured 1-2 ms), `PF_XMX_BREAKDOWN` (per-stage wall clock inside the prefill
@@ -1320,30 +1387,47 @@ of the top 8), `PF_PFB_MAX_M` (optional cap on the multi-device mode-2 prefill
 batch; `0` = no cap, the default — the cap is no longer needed, see the
 fused-GDN mode-2 fix below).
 
+**Internal A/B knobs** (same env-gated rule, one line each because they are
+diagnostics rather than tuning): `PF_W4_INFO` (why each u4 weight was rejected or
+registered, with its B/weight), `PF_W4_DEBUG` (which store each GEMV segment
+takes), `PF_W4_NOCORR` / `PF_I8_NOGEMV` / `PF_W4_NOGEMV` / `PF_ABL_NOGEMV` (drop
+one branch of the oneDNN int8 path, to bisect which half is wrong), `PF_DEC_R`
+(dp4a decode GEMV rows per work-group: 1/2/4/8), `PF_ATTN_FLASH` (unfused tiled
+prefill attention; `PF_ATTN_DBG` traces it), `PF_DUMP_SEGS=<layer>` (per-segment
+hidden fingerprints inside one layer, `-1` = all), `PF_CPU_DBG` (trace the host
+rmsnorm), `PF_AV_FFPROBE` (the ffprobe binary video decode uses; `PF_AV_FFMPEG`
+is ffmpeg's), `PF_PF_PIPE=0` (disable the 3-phase multi-device prefill pipeline),
+`PF_NO_PFB_PARTIAL` (mode-2 batches must be multiples of `kMaxT` again - the
+pre-partial-batch behaviour, for A/B).  The MTP debug dumps follow the same
+pattern and are one-off: `PF_MTP_DIAG`, `PF_MTP_VPROBE`, `PF_MTP_HPROBE`,
+`PF_MTP_HVEC`, `PF_MTP_MEM`, `PF_MTP_HDUMPS`, `PF_MTP_HOSTCMP`, `PF_MTP_INFOCHK`,
+`PF_MTP_SNAP1`/`PF_MTP_SNAPCHK`/`PF_MTP_SNAPDUMP`,
+`PF_MTP_STATECHK`/`PF_MTP_STATEDUMP`/`PF_MTP_STATESEQ`,
+`PF_MTP_EXACT_CALL`/`PF_MTP_EXACT_DEBUG`, `PF_MTP_AUTOTEST`/`PF_MTP_DRAFTTEST`,
+`PF_MTP_LAYER_W4_CALL=<ci>` (put only call `ci`'s MTP-layer tensors on the u4
+grid — 0 qkv, 1 wo, 2 ffn gate/up, 3 ffn down, -1 eh_proj; the bisection knob
+that localised the `do_split` bug).
+
 **Weight representation**
 `PF_W4` (native u4 for Q4_K, default on), `PF_CB4` (store IQ4_XS/IQ4_NL as native 4-bit codebook indices + a per-32 f16
 scale, 0.5625 B/weight and lossless, decoded by a LUT-expanding GEMV; prefill
-expands each tensor to int8 in a reused scratch - see
-[`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+expands each tensor to int8 in a reused scratch),
 `PF_W4_K5` (`1` puts **only** Q5_K onto the per-32 4-bit grid instead of the
 native 5-bit store: 0.625 B/weight against k5's 0.75, and Q5_K is 30 % of the 27B
 weight pass, so the device weights go 16.90 -> 16.06 GiB and the MTP verify
 91.5 -> 86.3 ms (-5.7 %, deterministic over two repeats); **default off**,
 because `test_w4`'s round-trip rel L2 goes 0.077 % -> **4.60 % mean / 10.83 %
 worst**, the same error class as `PF_W4_ALL`, and a 160-token greedy generation
-stays coherent but diverges at word 37 - an accuracy decision, not an engine fix;
-see `reports/mtp_ceiling.md` §1d),
+stays coherent but diverges at word 37 - an accuracy decision, not an engine fix),
 `PF_K5` (store Q5_K as the native 5-bit grid: 4-bit nibble plane + 1-bit plane
 + per-(g,n) f16 step/offset, 0.75 B/weight and lossless, recombined with one OR
 in the decode GEMV; prefill expands q5 to int8 in the shared scratch and runs
 the grouped-scale int8 primitive with the u4 offset-correction epilogue - i.e.
 it costs ~1.6 B/weight of *serial* prefill traffic per pass, measured -15..-20%
-pp512 for +6% tg128 and -2.1 GB/card; see
-[`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+pp512 for +6% tg128 and -2.1 GB/card),
 `PF_W4_ALL` (`1` re-quantizes every
 other type onto the same 4-bit grid: 16.0 vs 24.5 GB read per 27B decode token,
-measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32,
-see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
+measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
 `PF_SI4` (SIn 4-bit), `PF_META`.
 
 ## Invariants and gotchas
@@ -1419,8 +1503,8 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   this oneDNN 3.11.4 (`libdnnl.so.3.11`, Level Zero, DG2) `strings | grep -c
   xmx` is 0 - all 498 `dpas` hits are `DUMMY_DPAS_*` JIT-generator placeholders,
   so **no XMX GEMM kernel is compiled in at all**.  Do not read a win from
-  `PF_ATTN_XMX` as evidence about the XMX unit, and see
-  `reports/mtp_ceiling.md` §4b for the consequence: routing the *verify* onto
+  `PF_ATTN_XMX` as evidence about the XMX unit.  The consequence: routing the
+  *verify* onto
   the oneDNN int8 primitive (`PF_NAT=0 PF_MTP_FORCE_INT8=1`) measures 2.05x
   *slower* (verify 91.6 -> 188.7 ms, 158 GB/s over 24.5 GB of int8 weights vs
   the native stores' 272-325).
@@ -1457,7 +1541,7 @@ see [`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md)),
   lookup latency, not by bandwidth.  That is why parallelising it (§3.2, 15%) beat
   shrinking it.  The identity needs an all-zero group to store scale 0 rather
   than 1 (or it is wrong by up to 127x) plus an `i8_quant` zero-scale guard
-  (0/0 is NaN); both are reverted, since a KV-format change is not worth 0.3 %.  See `reports/d64k_pp_tg_evaluation.md`.
+  (0/0 is NaN); both are reverted, since a KV-format change is not worth 0.3 %.
   The attention scratch is per-queue (`xmx_get` keys on the queue address): a
   function-local static was shared across the two `--layer-map` devices and the
   cross-device USM access cost another ~12x.  The matmuls use a dedicated
@@ -1612,9 +1696,8 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 
 `test_decode_vs_prefill` defaults to the 0.8B, so it needs the model path
 explicitly; `test_w4_vs_cpuref` defaults to the 27B.  The multi-device decode
-cost breakdown (and the 20 tps feasibility analysis) is in
-[`reports/tg128_20tps_evaluation.md`](reports/tg128_20tps_evaluation.md), with
-the `STOP_AFTER_LAYER` sweep and the decode-GEMV microbenchmarks in `dev/`.
+cost breakdown and the `STOP_AFTER_LAYER` sweep are in `dev/`, with the
+decode-GEMV microbenchmarks next to them.
 
 If a build seems to ignore your edit, remember `rsync -a` preserves source
 mtimes: `find src tests -name '*.cpp' -o -name '*.h' | xargs touch` first.

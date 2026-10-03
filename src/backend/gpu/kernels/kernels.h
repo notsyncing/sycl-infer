@@ -170,8 +170,8 @@ void i8_grp_gemv_launch(sycl::queue & q, const int8_t * w8, const uint16_t * wsc
 // bit-identical to i8_grp_gemv_launch (same lane->group map and reduction), but
 // with a 12-argument / one-local_accessor signature instead of nat_gemm's 25 / 6.
 // It exists because nat_gemm's per-launch cost (~52 us, measured) dwarfs the work
-// on tensors like the GDN's K=5120 x 48 alpha/beta projections - see
-// reports/mtp_ceiling.md.
+// on tensors like the GDN's K=5120 x 48 alpha/beta projections: 48 layers x 2
+// launches is ~4 ms of the MTP verify's marginal-row budget.
 void i8_grp_gemv_rows_launch(sycl::queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
                              const uint16_t * asa, const float * xs, float * out, int out_stride,
                              const float * residual, float alpha, int M, int K, int N);
@@ -182,7 +182,7 @@ void i8_grp_gemv_rows_launch(sycl::queue & q, const int8_t * w8, const uint16_t 
 // 40.1 us, x 96 rows 40.9 us, x 1024 rows 13.5 us at K=1024; the launch floor
 // itself is 5.8 us), so 48 layers x 2 launches is ~4 ms of the verify's
 // marginal-row budget.  Fusing them takes the 27B weight pass from 68.3 to
-// 66.5 ms at M=5 (53.9 -> 53.4 at M=1) - see reports/mtp_ceiling.md.
+// 66.5 ms at M=5 (53.9 -> 53.4 at M=1).
 struct i8_grp_seg {
     const int8_t * w8;
     const uint16_t * wsc;

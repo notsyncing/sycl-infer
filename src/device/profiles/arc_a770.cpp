@@ -17,10 +17,13 @@ static const profile arc_a770 = {
     .key = "arc_a770",
     .name = "Intel Arc A770 (DG2)",
     .provenance =
-        "measured on 1-2x A770 16 GB (DG2, 512 EUs/card). Decode split curve and the "
-        "8-warps/EU cliff: reports/d64k_pp_tg_evaluation.md 3.1. Prefill attention stage "
-        "breakdown and the gather reduction: same report 3.2. GEMV/GEMM/GDN tunings: "
-        "reports/tg128_20tps_evaluation.md and reports/mtp_ceiling.md.",
+        "measured on 1-2x A770 16 GB (DG2, 512 EUs/card), 27B UD-Q4_K_M split "
+        "0-31:gpu.0,32-63:gpu.1. Decode split curve and the 8-warps/EU cliff: "
+        "attn+combine at 64k depth, nsp 64/128/144/160/168/176 -> "
+        "3.05/2.18/1.75/1.70/1.74/2.68 ms. Prefill attention stage breakdown and "
+        "the gather reduction: same shape, 37.8 ms/layer at 64k of which 18.1 was "
+        "the single-work-group block-max. GEMV/GEMM/GDN tunings: per-shape "
+        "measurements quoted next to each field.",
 
     // reported by sycl, used as the fallback when the query is unavailable
     .hw = {

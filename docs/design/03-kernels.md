@@ -190,8 +190,8 @@ multi-device 的单 token 解码走这两个 kernel（`dnnl_gemm::gemm_w4` / `ge
   stage 进 SLM，索引取 **g 外 / 行内**（`g=i/RB, r=i%RB`），让相邻 lane 读相邻 `n`（一次
   64 B line 覆盖 32 个 f16），SLM 存 f16（u4 两个平面也能用 `RB=16`）。实测：int8 +10-17 %，
   u4 最高 **-39 %**（`ffn_down` K=17408 N=5120：174 → 288 GB/s）；输出与改前逐位一致
-  （`dev/bench_decgemv_eq.cpp`）。`RB` 依 `K` 在 16/8 间回退以守住 48 KB SLM。
-- 调优细节与整机 tg128 的结果见 [`reports/tg128_20tps_evaluation.md`](../../reports/tg128_20tps_evaluation.md)。
+  （`dev/bench_decgemv_eq.cpp`）。`RB` 依 `K` 在 16/8 间回退以守住 48 KB SLM。整机 tg128
+  的结果见 `AGENTS.md`。
 
 ### 5.5 codebook 4-bit（IQ4_XS / IQ4_NL，`cb4_*`，`w4_gemv.cpp`）
 
@@ -420,8 +420,7 @@ K 与 V 由 `kv_k_dtype()` / `kv_v_dtype()` 分别给出（`kv_dtype()` 是 K �
 
 **精度**：attention 的误差由 V 主导，不是 K。27B 对 fp32 CPU 参考的 mean|diff|：i8 0.035、
 `i4:i8`（K=i4/V=i8）0.061、i4 0.183、`i8:i4` 1.49。所以 `--kv-type i4:i8` 用 i8 的 75% 字节
-拿到接近 i8 的精度，并能装下 262144 上下文。详见
-[`reports/turboquant_and_perf.md`](../../reports/turboquant_and_perf.md)。
+拿到接近 i8 的精度，并能装下 262144 上下文。
 
 i8 几何：`[block][kv head]` 单元内是 `kBlockSize` 行 × `head_dim` int8，后接独立的
 `kBlockSize × (head_dim/32)` fp16 scale 平面。成本 3 KB/token/layer（K+V）对比 bf16 的 6、f32 的 12。
@@ -438,8 +437,7 @@ pool 的 scale 处理在 `engine::kv_read_vec`。
 i4 读取细节：`i4_ld4` 用**一次对齐 16-bit 加载**取 4 个 nibble（`d` 是 4 的倍数，字节偏移
 `d/2` 必为偶数），再做 4 次提取——两次标量字节加载会让 16k decode 明显变慢（该 kernel 在长
 上下文是**指令**而非字节受限）。性能取舍：i4 端到端 decode/prefill 与 i8 持平，收益是容量
-（同预算 2x 上下文）；短上下文 prefill attention 因解包 ALU 慢约 20%，但被 GEMM 稀释。测量见
-[`reports/int4_kv.md`](../../reports/int4_kv.md)。
+（同预算 2x 上下文）；短上下文 prefill attention 因解包 ALU 慢约 20%，但被 GEMM 稀释。
 
 ---
 

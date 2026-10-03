@@ -145,7 +145,6 @@
 
 int8/int4 的量化与反量化在 kernel 内完成（`qk_norm_rope` 写、`attn` 读），中间算术保持 fp32。
 KV 类型通过 `--kv-type`（CLI）或 `PF_KV_TYPE`（env）选择，见 [03-kernels.md](03-kernels.md#11-kv-存储类型kv_typeh)。
-`--kv-type K:V` 可分别指定 K 与 V（仅 i4/i8 可混）。i4 的精度/性能测量见
-[`reports/int4_kv.md`](../../reports/int4_kv.md)：端到端与 i8 持平，收益是容量。误差由 V 主导，
-所以 `i4:i8`（K 用 i4、V 用 i8）用 i8 的 75% 字节拿到接近 i8 的精度，并装得下 262144 上下文；
-见 [`reports/turboquant_and_perf.md`](../../reports/turboquant_and_perf.md)。
+`--kv-type K:V` 可分别指定 K 与 V（仅 i4/i8 可混）。i4 的端到端表现与 i8 持平，收益是容量；误差由 V 主导，
+所以 `i4:i8`（K 用 i4、V 用 i8）用 i8 的 75% 字节拿到接近 i8 的精度（27B 对 fp32 参考的 mean|diff|
+0.061，i8 为 0.035、i4 0.183、`i8:i4` 1.49），并装得下 262144 上下文。

@@ -1293,8 +1293,7 @@ bool engine::setup_md_dnnl() {
                     // bytes (draft 18.9 -> 17.4 ms/cycle at k=4), but the 2-bit
                     // fit costs 39.8% relative L2 on this Q6_K head and takes
                     // ~2% of the acceptance with it, which cancels the saving
-                    // end to end (32.4 vs 32.0 ms/token on a code prompt).  See
-                    // reports/mtp_ceiling.md.
+                    // end to end (32.4 vs 32.0 ms/token on a code prompt).
                     static const bool head_w2 = [] {
                         const char * e = getenv("PF_MTP_HEAD_W2");
                         return e && atoi(e) != 0;

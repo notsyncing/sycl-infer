@@ -270,7 +270,8 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     // PF_GDN_COLS_MIN: the n_real at which batching columns starts paying.  The
     // default 8 is the prefill's row width; the MTP verify runs n_real = k+1 = 5
     // and was therefore excluded, so the knob exists to price the verify's
-    // recurrence against the multi-column path (see reports/mtp_ceiling.md).
+    // recurrence against the multi-column path (measured: every PF_GDN_COLS>1
+    // variant is 1-1.7 ms slower there, so the gate is right).
     static const int cols_min = [] {
         const char * e = getenv("PF_GDN_COLS_MIN");
         return e ? atoi(e) : 8;

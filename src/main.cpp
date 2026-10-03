@@ -72,7 +72,13 @@ static void usage(const char * prog) {
             "  --mtp [N]                    MTP (NextN) speculative draft length: run\n"
             "                               the model's draft head N times per verify\n"
             "                               (0 = off; N defaults to 4, the measured\n"
-            "                               optimum; env PF_MTP).  Needs 2+ GPUs.\n"
+            "                               optimum, capped at 12; env PF_MTP).  Needs a\n"
+            "                               GGUF with a blk.<n>.nextn.* head AND a\n"
+            "                               multi-device oneDNN int8 partition\n"
+            "                               (--layer-map over GPUs, PF_DP4A on), else\n"
+            "                               one [mtp] line and the plain decode.\n"
+            "                               Measured 1.4x-2.5x single-request; see\n"
+            "                               AGENTS.md.\n"
             "  --mtp-device N               device partition the MTP draft layer (and\n"
             "                               its KV slice) runs on (default 0; env\n"
             "                               PF_MTP_DEV).  The MTP slice counts toward\n"
@@ -91,7 +97,8 @@ static void usage(const char * prog) {
             "gen:\n"
             "  --prompt \"...\"               prompt text (chat-templated unless --raw)\n"
             "  --raw                        encode the prompt verbatim (no chat template)\n"
-            "  --thinking                   chat template `enable_thinking` (default off)\n"
+            "  --thinking                   chat template `enable_thinking` (default off;\n"
+            "                               --enable-thinking is an accepted alias)\n"
             "  --image <file>               attach an image (repeatable; needs --mmproj)\n"
             "  --video <file>               attach a video (repeatable; needs --mmproj)\n"
             "  --audio <file>               attach audio (repeatable; needs --audio-mmproj)\n"
@@ -117,7 +124,8 @@ static void usage(const char * prog) {
             "\n"
             "env: PF_CTX, PF_KV_CAP_MB, PF_KV_TYPE, PF_PREFIX_CACHE, PF_PC_STATES,\n"
             "  PF_DEVICE, PF_CPU_ISA, PF_CPU_THREADS, PF_DP4A, PF_DP4A_DEC,\n"
-            "  PF_GEMM_DNNL, PF_NOGRAPH, PF_PROF, PF_TIME.\n",
+            "  PF_GEMM_DNNL, PF_W4, PF_K5, PF_CB4, PF_ATTN_XMX, PF_MTP,\n"
+            "  PF_NOGRAPH, PF_PROF, PF_TIME.  Full list: AGENTS.md.\n",
             prog, kDefaultModel, kDefaultCtx, kBlockSize);
 }
 

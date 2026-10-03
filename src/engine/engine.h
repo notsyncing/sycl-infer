@@ -497,8 +497,9 @@ struct engine {
     // 0.625): the draft reads the whole head once per drafted token, so this is
     // the single largest byte item in the speculative cycle.  The draft only
     // needs its argmax, and its weights are already re-quantized, so the extra
-    // step is a trade in acceptance for bytes - measured in
-    // reports/mtp_ceiling.md.  Off with PF_MTP_HEAD_W2=0.
+    // step is a trade in acceptance for bytes: 0.375 B/weight is exact enough
+    // for an argmax (39.8 % relative L2) but costs ~2 % acceptance, which
+    // cancels the saving.  Off with PF_MTP_HEAD_W2=0.
     bool mtp_head_w2_ = false;
     char mtp_head_w2_key_[1] = {0};
     bool mtp_layer_w4_ = false; // the MTP layer's own linears are GEMV-only u4 too
@@ -516,7 +517,7 @@ struct engine {
     // on the device), read back by the next step's concat, so the chain needs no
     // host round-trip.  With PF_MTP_CAND the head is evaluated on a candidate set
     // (mtp_cand_launch / mtp_gather_launch) instead of all 248320 rows - measured
-    // a net loss, so it is off by default; see reports/mtp_ceiling.md.
+    // a net loss, so it is off by default (25/17/7 % hit rate at margin 8).
     int32_t * d_mtp_cand_ = nullptr;  // [mtp_cand_cap] candidate token ids (device 0)
     float * d_mtp_cvals_ = nullptr;   // [mtp_cand_cap] their head values
     int32_t * d_mtp_tok_ = nullptr;   // [kMaxT] per-step draft token ids (device 0, next to the head)
@@ -528,7 +529,7 @@ struct engine {
     // device-0 logits row, so the argmax stays one scan on the owning card.
     // Draft 17.2 -> 13.1 ms/cycle, and end to end a wash: halving N changes the
     // u4 GEMV's decomposition, so the draft's argmax flips on a near-tie now and
-    // then (p0 -6 %, p2 -8 % acceptance).  See reports/mtp_ceiling.md 10c.
+    // then (p0 -6 %, p2 -8 % acceptance).
     bool mtp_head_split_ = false;
     int mtp_head_half_ = 0;      // rows [0, half) on device 0, [half, n_vocab) on device 1
     char mtp_head_w4lo_key_[1] = {0};

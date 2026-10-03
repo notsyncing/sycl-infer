@@ -339,7 +339,7 @@ zero-points（其布局未通过验证）。`w4_xs_launch` 算 `XS`，修正由 
   `do_split=false`（oneDNN 读未拆分的整行形式），而 u4 GEMV 读的是分量化器写出的**每 32 组
   偶/奇 k 激活平面**。少了这个守卫，原生路径会静默读到**上一次 call** 的平面：MTP 层的
   `eh_proj` 就这样给出 acc 0.08（draft 全是垃圾），修成
-  `do_split = mtp_layer_w4_ || mtp_head_w4_` 后恢复到 2.14（`reports/mtp_ceiling.md` §10b）。
+  `do_split = mtp_layer_w4_ || mtp_head_w4_` 后恢复到 2.14。
 * 各类型的实际损失用 `test_quant_audit` 逐类型度量；u4 打包往返用 `test_w4`，u4 vs int8 的逐张量
   差异用 `test_w4_vs_i8`，u4 GEMM vs 真实反量化权重用 `test_w4_gemm`。
 

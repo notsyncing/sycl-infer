@@ -153,22 +153,11 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 
 ---
 
-## 6. 测量报告索引（`reports/`）
+## 6. 测量报告不进仓库
 
-`reports/` 保存一次性的性能/正确性报告，与稳定设计文档互补：
-
-| 报告 | 主题 |
-|---|---|
-| `attn_blockread_int8kv.md` | int8 KV 的 attention block-read |
-| `int4_kv.md` | int4 KV 存储、精度与 GPU 性能 |
-| `kv_bf16_splits.md` | bf16 KV split 调优 |
-| `longctx_16k.md` / `longctx_decode.md` | 长上下文 prefill / decode |
-| `prefix_cache.md` | 前缀缓存设计与测量 |
-| `tg128_20tps_evaluation.md` | 双 A770 上 27B 的 tg128 优化与 20 tps 可行性（含带宽/collective 实测） |
-| `vtune_profile.md` | VTune profile |
-| `bugfix_hang.md` | 挂起问题修复记录 |
-
-性能数字必须注明所用的环境变量，因为不同开关会选择不同 kernel 变体。
+一次性的性能/正确性报告写在 `reports/`，该目录在 `.gitignore` 里，**内容永远不会被提交**，所以
+仓库内任何文档都不引用它。需要保留的数字必须连同测量条件（硬件、开关、环境变量）写进本文档或
+`AGENTS.md`；性能数字尤其必须注明所用的环境变量，因为不同开关会选择不同 kernel 变体。
 
 ---
 

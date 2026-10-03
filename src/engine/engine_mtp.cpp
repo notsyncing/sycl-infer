@@ -248,7 +248,8 @@ void engine::mtp_gemv(int ci, int M, int step) {
     static const bool head_split_dbg = getenv("PF_MTP_HEAD_SPLIT_DEBUG") != nullptr;
     if (ci == 4 && M == 1 && step >= 0 && mtp_head_split_) {
         // The head readout split across both cards (opt-in, default off - it
-        // measures as a wash, see reports/mtp_ceiling.md 10c).  out[n] = w[n].h is
+        // measures as a wash: -4.1 ms/cycle of draft, no end-to-end gain).
+        // out[n] = w[n].h is
         // independent per row, so device 1 can own the upper half of the rows: it
         // reads the same hidden (one host hop, 20 KB, since the two devices share
         // no device USM) and writes its half of the logits into the *same*
@@ -1148,8 +1149,8 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // PF_MTP_CAND=0 (the default, and the measured-better setting): the head
         // readout is the full 248320 rows.  With it on, step 0 is a full readout
         // that seeds the candidate set and steps 1..k-1 evaluate the head only on
-        // that set - see reports/mtp_ceiling.md for the hit-rate measurement that
-        // keeps it off by default.
+        // that set - the candidate set holds the next step's argmax 25/17/7 % of
+        // the time at margin 8, which is what keeps it off by default.
         const bool cand_head = mtp_cand_cap_ > 0 && mtp_cand_ok_ && (cand_ready || mtp_cand_src_ == 1);
         // Device-resident draft chain: the head runs on the primary device and the
         // MTP layer on mtp_dev, so with the default --mtp-device 0 both sit on one

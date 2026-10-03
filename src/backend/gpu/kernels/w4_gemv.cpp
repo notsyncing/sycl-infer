@@ -20,8 +20,8 @@
 // into local memory.  The staging index is *g-major / row-inner* so consecutive
 // lanes of a staging pass read consecutive n of the same g: that turns a
 // cache-line-per-scale read into one contiguous line per (g, tile) and is worth
-// 10-25% of the kernel's bandwidth (measured on the A770; see
-// reports/gemv_staging.md).  The tile is staged as f16 (the planes are f16) so
+// 10-25% of the kernel's bandwidth (measured on the A770).  The tile is staged
+// as f16 (the planes are f16) so
 // RB can be 16 without exceeding the SLM budget.
 #include "kernels.h"
 #include "device/device_profile.h"

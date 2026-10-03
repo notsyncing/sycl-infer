@@ -131,8 +131,9 @@ struct profile {
         int dp4a;         // PF_DP4A
         int gemm_dnnl;    // PF_GEMM_DNNL (oneDNN prefill GEMM)
         int dpas_in_gemm; // esimd::dpas: measured 37x slower than dp4a in a real
-                          // GEMM on both cards (reports/mtp_ceiling.md 4a), so
-                          // nothing depends on it; kept for a part where it wins
+                          // GEMM on both cards (7.44 ms against nat_gemm's 0.200
+                          // at M=5), so nothing depends on it; kept for a part
+                          // where it wins
     } wt;
 };
 
