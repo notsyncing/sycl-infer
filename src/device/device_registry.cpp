@@ -132,20 +132,31 @@ const profile & active() {
 }
 
 int wg_clamped(int want) {
-    int limit = 0;
-    try {
-        auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-        if (!devs.empty()) {
-            limit = (int)devs[0].get_info<sycl::info::device::max_work_group_size>();
+    // The device limit is a HARDWARE fact and cannot change over a run, but the
+    // query is not free: `device::get_devices()` enumerates every GPU through
+    // the driver and builds SYCL device objects, and `rmsnorm_launch` calls this
+    // on EVERY launch.  Measured 3.2 ms per call, i.e. 210 ms of pure host
+    // overhead in one MTP verify pass (65 rmsnorm calls) and nothing at all in
+    // the graphed decode - the graph records the launch once and replays it, so
+    // the bug was invisible in the plain-decode numbers and dominated the
+    // speculative cycle.  Query once, like active() does.
+    static const int limit = [] {
+        int lim = 0;
+        try {
+            auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+            if (!devs.empty()) {
+                lim = (int)devs[0].get_info<sycl::info::device::max_work_group_size>();
+            }
+        } catch (...) {
         }
-    } catch (...) {
-    }
-    if (!limit) {
-        limit = active().hw.max_work_group_size;
-    }
-    if (limit < 32) {
-        limit = 32; // a sub-group is the floor for anything below this
-    }
+        if (!lim) {
+            lim = active().hw.max_work_group_size;
+        }
+        if (lim < 32) {
+            lim = 32; // a sub-group is the floor for anything below this
+        }
+        return lim;
+    }();
     // round down to a whole sub-group: the two-level SLM reductions all assume
     // the group is a multiple of 32
     return want > limit ? (limit / 32) * 32 : want;
