@@ -1094,6 +1094,19 @@ bool engine::setup_md_dnnl() {
     }
     dnnl_dev_.clear();
     dnnl_dev_.resize(backends_.size());
+    // Split draft-head readout state, filled by device 0's iteration (the pack)
+    // and consumed by device 1's (the second half lands on that queue).
+    // Measured a wash, so off by default: the split halves the 795 MB stream's
+    // wall time (-4.1 ms/cycle) but the u4 GEMV's decomposition depends on the
+    // row count, so the draft's argmax flips on a near-tie now and then and the
+    // acceptance moves with it (p1 unchanged, p0 -6%, p2 -8%; net -0.3%
+    // end-to-end over three prompts).  PF_MTP_HEAD_SPLIT=1 turns it on.
+    const bool head_split = [] {
+        const char * e = getenv("PF_MTP_HEAD_SPLIT");
+        return e && atoi(e) != 0;
+    }();
+    bool head_split_pending_ = false;
+    int head_split_K_ = 0, head_split_N_ = 0;
     bool any = false;
     for (size_t d = 0; d < backends_.size(); d++) {
         if (dev_kind_[d] != 0 || !dev_queues_[d]) {
@@ -1114,7 +1127,6 @@ bool engine::setup_md_dnnl() {
         // per weight), so whether they are worth it depends on how much read
         // bandwidth the card has relative to its compute -- a per-device
         // measurement, hence the profile default.  PF_W4=0 restores pure int8.
-        const dev::profile & wd = dev::active();
         static const bool w4_on = [] {
             const char * e = getenv("PF_W4");
             return e ? atoi(e) != 0 : si::dev::active().wt.w4 != 0;
@@ -1177,32 +1189,70 @@ bool engine::setup_md_dnnl() {
             // not worth it: with a u4 layer the acceptance collapsed to 0.11
             // (draft 5.4 vs 16.9 ms, but 83 vs 36 ms/token net).
             // PF_MTP_LAYER_W4 exists only to reproduce/measure that.
+            // Default ON (PF_MTP_LAYER_W4=0 restores int8).  The Q6_K/Q8_0
+            // tensors re-quantized onto the per-32 4-bit grid cost *no* acceptance:
+            // acc 2.14 with int8, with u4, and on the exact fp32 dequant path
+            // (PF_MTP_LAYER_EXACT), while the draft drops 14.2 -> 12.8 ms/cycle.
+            // 2-bit is a step too far (PF_MTP_LAYER_W2): acc 2.14 -> 1.75 for
+            // 0.5 ms/cycle more, because the layer's error compounds down the
+            // draft chain (the head's single readout does not).
             static const bool layer_w4 = [] {
                 const char * e = getenv("PF_MTP_LAYER_W4");
-                return e && atoi(e) != 0;
+                return !(e && atoi(e) == 0);
             }();
             const mtp_layer_t & M = m.mtp;
             bool layer_w4_ok = false;
-            auto add_mtp = [&](const wt & t) {
-                if (layer_w4 && t.data) {
-                    const int K = t.K;
-                    const int N = t.N;
-                    if (D->add_weight_w4(t.data, t.data, t.type, K, N, /*any_type=*/true, /*gemv_only=*/true)) {
+            // PF_MTP_LAYER_W4_CALL=<ci>: put only call ci's tensors on the u4
+            // grid (0 = qkv, 1 = wo, 2 = ffn gate/up, 3 = ffn down, -1 = eh_proj).
+            // A bisection knob: the u4 store of the MTP layer produces a *wrong*
+            // draft (acc 2.14 -> 0.08), which is not a precision effect - the
+            // same layer on the exact fp32 dequant path is bit-comparable to
+            // int8 (acc 2.14 either way, PF_MTP_LAYER_EXACT) - so this localises
+            // which tensor's u4 store is the problem.
+            static const int w4_call = [] {
+                const char * e = getenv("PF_MTP_LAYER_W4_CALL");
+                return e ? atoi(e) : -99;
+            }();
+            // PF_MTP_LAYER_W2=1: the 2-bit draft store (0.375 B/weight) for the
+            // MTP layer.  The exact-fp32 probe (PF_MTP_LAYER_EXACT) measures the
+            // layer's int8 re-quantization error at *zero* acceptance cost, so the
+            // cheapest correct store is the right one - and unlike the u4 store
+            // this one does not need the even/odd activation planes.
+            static const bool layer_w2 = [] {
+                const char * e = getenv("PF_MTP_LAYER_W2");
+                return e && atoi(e) != 0;
+            }();
+            static const int w2_call = [] {
+                const char * e = getenv("PF_MTP_LAYER_W2_CALL");
+                return e ? atoi(e) : -99;
+            }();
+            auto add_mtp = [&](const wt & t, int ci) {
+                // Both native copies are *added* to the int8 store, never instead
+                // of it: the MTP layer's own prefill (M up to kMaxT) and any shape
+                // the M=1 GEMVs cannot serve still read the int8 store, and only
+                // the draft's single row dispatches to the native planes.
+                // Skipping `add(t)` is what made the layer's u4 store unusable:
+                // the prefill then threw "oneDNN GEMM failed for a layer tensor".
+                if (layer_w2 && t.data && (w2_call == -99 || w2_call == ci)) {
+                    if (D->add_weight_w2(t.data, t.data, t.type, t.K, t.N)) {
+                        mtp_layer_w2_ = true;
+                    }
+                }
+                if (layer_w4 && t.data && (w4_call == -99 || w4_call == ci)) {
+                    if (D->add_weight_w4(t.data, t.data, t.type, t.K, t.N, /*any_type=*/true, /*gemv_only=*/true)) {
                         layer_w4_ok = true;
-                        m.page_out_tensor(t);
-                        return;
                     }
                 }
                 add(t);
             };
-            add_mtp(M.eh_proj);
-            add_mtp(M.wq);
-            add_mtp(M.wk);
-            add_mtp(M.wv);
-            add_mtp(M.wo);
-            add_mtp(M.ffn_gate);
-            add_mtp(M.ffn_up);
-            add_mtp(M.ffn_down);
+            add_mtp(M.eh_proj, -1);
+            add_mtp(M.wq, 0);
+            add_mtp(M.wk, 0);
+            add_mtp(M.wv, 0);
+            add_mtp(M.wo, 1);
+            add_mtp(M.ffn_gate, 2);
+            add_mtp(M.ffn_up, 2);
+            add_mtp(M.ffn_down, 3);
             mtp_layer_w4_ = layer_w4_ok;
         }
         if (d == 0 && m.output.data != m.tok_embd.data) {
@@ -1238,8 +1288,55 @@ bool engine::setup_md_dnnl() {
                 if (head_w4) {
                     mtp_head_w4_ = D->add_weight_w4(mtp_head_w4_key_, m.output.data, m.output.type, m.output.K,
                                                     m.output.N, /*any_type=*/true);
-                    fprintf(stderr, "[mtp] draft LM head: %s\n",
-                            mtp_head_w4_ ? "u4 copy registered" : "u4 conversion failed - keeping int8");
+                    // PF_MTP_HEAD_W2=1: also keep the 2-bit copy.  Measured
+                    // default OFF: it is exact arithmetic and 40% fewer head
+                    // bytes (draft 18.9 -> 17.4 ms/cycle at k=4), but the 2-bit
+                    // fit costs 39.8% relative L2 on this Q6_K head and takes
+                    // ~2% of the acceptance with it, which cancels the saving
+                    // end to end (32.4 vs 32.0 ms/token on a code prompt).  See
+                    // reports/mtp_ceiling.md.
+                    static const bool head_w2 = [] {
+                        const char * e = getenv("PF_MTP_HEAD_W2");
+                        return e && atoi(e) != 0;
+                    }();
+                    if (head_w2 && mtp_head_w4_) {
+                        const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                        mtp_head_w2_ = D->add_weight_w2(mtp_head_w2_key_, hd.data, hd.type, hd.K, hd.N);
+                        if (getenv("PF_MTP_MEM")) {
+                            fprintf(stderr, "[mtp] draft LM head: %d rows x %d K, %s\n", (int)hd.N, (int)hd.K,
+                                    mtp_head_w2_ ? "2-bit copy ok" : "2-bit copy failed");
+                        }
+                    }
+                    if (getenv("PF_MTP_MEM")) {
+                        const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                        auto pr = [&](const char * nm, const wt & t) {
+                            fprintf(stderr, "[mtp] layer %-12s K=%d N=%d type=%d\n", nm, (int)t.K, (int)t.N,
+                                    (int)t.type);
+                        };
+                        const mtp_layer_t & M = m.mtp;
+                        pr("eh_proj", M.eh_proj);
+                        pr("wq", M.wq);
+                        pr("wk", M.wk);
+                        pr("wv", M.wv);
+                        pr("wo", M.wo);
+                        pr("ffn_gate", M.ffn_gate);
+                        pr("ffn_up", M.ffn_up);
+                        pr("ffn_down", M.ffn_down);
+                        pr("head", hd);
+                    }
+                    // The draft's head readout is split across both cards; the
+                    // two halves are registered in device 1's iteration below (its
+                    // dnnl_gemm owns the allocations).  PF_MTP_HEAD_SPLIT=0 keeps
+                    // the whole readout on device 0.
+                    if (head_split && mtp_head_w4_) {
+                        const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                        head_split_N_ = hd.N;
+                        head_split_K_ = hd.K;
+                        head_split_pending_ = hd.N / 2 > 0;
+                    }
+                    fprintf(stderr, "[mtp] draft LM head: %s%s\n",
+                            mtp_head_w4_ ? "u4 copy registered" : "u4 conversion failed - keeping int8",
+                            mtp_head_w2_ ? " + 2-bit copy (0.375 B/w)" : "");
                 }
             }
         }
@@ -1267,6 +1364,31 @@ bool engine::setup_md_dnnl() {
         if (dev_ok) {
             fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
                     n_w4, n_k5, n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
+            // Upper (and lower, for device 0) halves of the split draft head:
+            // out[n] = w[n].h is independent per row, so each card can hold one
+            // range and the readout costs half the wall time.  Each side runs the
+            // identical GEMV over disjoint rows, so every logit is bit-identical
+            // to the single-device readout and only the argmax pair crosses.
+            if (d == 1 && head_split_pending_ && mtp_head_w4_) {
+                const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                const int half = head_split_N_ / 2;
+                const size_t rb = (size_t)quant_row_bytes(hd.type, hd.K);
+                // device 0's low half replaces its full-tensor entry so it does
+                // not stream the rows device 1 owns
+                const bool lo = dnnl_for(0)->add_weight_w4(mtp_head_w4lo_key_, hd.data, hd.type, hd.K, half,
+                                                            /*any_type=*/true, /*gemv_only=*/true);
+                const bool hi = D->add_weight_w4(mtp_head_w4b_key_, (const char *)hd.data + (size_t)half * rb, hd.type,
+                                                 hd.K, head_split_N_ - half, /*any_type=*/true, /*gemv_only=*/true);
+                if (lo && hi) {
+                    mtp_head_split_ = true;
+                    mtp_head_half_ = half;
+                    d_mtp_hnorm1 = (float *)dev_alloc_on(1, (size_t)m.hp.n_embd * 4);
+                    h_head_stage = (float *)alloc_bytes((size_t)m.hp.n_embd * 4);
+                    fprintf(stderr, "[mtp] draft LM head: split across 2 GPUs, %d rows each (%.0f MB extra)\n", half,
+                            (double)head_split_K_ * head_split_N_ * 0.625 / (1024.0 * 1024.0));
+                }
+                head_split_pending_ = false;
+            }
             const char * envw = getenv("PF_DNNL_NOWARM");
             if (!(envw && atoi(envw) != 0)) {
                 D->warmup();

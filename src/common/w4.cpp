@@ -118,6 +118,7 @@ static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t
     out.scale.assign((size_t)ng * N, 0);
     out.off.assign((size_t)ng * N, 0);
     std::vector<float> row((size_t)K);
+    double num = 0.0, den = 0.0;
     for (int n = 0; n < N; n++) {
         dequantize_row(ggml_type, (const char *)src + (size_t)n * row_bytes, row.data(), K);
         for (int g = 0; g < ng; g++) {
@@ -328,6 +329,57 @@ bool w4_pack_any(uint32_t ggml_type, const void * src, int K, int N, w4t & out) 
         return false;
     }
     return pack_generic(ggml_type, src, K, N, out, true);
+}
+
+// The 2-bit draft store (see w2t).  Same per-32 group (min, step) fit as
+// pack_generic with 4 levels instead of 16, and the nibble plane replaced by a
+// 2-bit plane: 8 data bytes + 2 f16 per 32 weights = 0.375 B/weight.
+bool w2_pack_any(uint32_t ggml_type, const void * src, int K, int N, w2t & out) {
+    if (!src || K <= 0 || N <= 0 || (K % kW4Group) != 0) {
+        return false;
+    }
+    const size_t row_bytes = quant_row_bytes(ggml_type, K);
+    if (row_bytes == 0) {
+        return false;
+    }
+    const int ng = K / kW4Group;
+    out.vals.assign((size_t)N * K / 4, 0);
+    out.scale.assign((size_t)ng * N, 0);
+    out.off.assign((size_t)ng * N, 0);
+    std::vector<float> row((size_t)K);
+    double num = 0.0, den = 0.0;
+    for (int n = 0; n < N; n++) {
+        dequantize_row(ggml_type, (const char *)src + (size_t)n * row_bytes, row.data(), K);
+        for (int g = 0; g < ng; g++) {
+            const float * w = row.data() + (size_t)g * kW4Group;
+            float mn = w[0], mx = w[0];
+            for (int j = 1; j < kW4Group; j++) {
+                mn = std::min(mn, w[j]);
+                mx = std::max(mx, w[j]);
+            }
+            float step = (mx - mn) / 3.0f;
+            if (!(step > 0.f)) {
+                step = 1.f;
+            }
+            const float inv = 1.0f / step;
+            out.scale[(size_t)g * N + n] = ggml_float_to_half(step);
+            out.off[(size_t)g * N + n] = ggml_float_to_half(mn);
+            const size_t base = (size_t)n * (K / 4) + (size_t)g * 8;
+            for (int j = 0; j < kW4Group; j++) {
+                int q = (int)std::lround((w[j] - mn) * inv);
+                q = std::max(0, std::min(3, q));
+                const size_t ia = base + (size_t)(j >> 2);
+                out.vals[ia] |= (uint8_t)(q << ((j & 3) * 2));
+                const double d = (double)(mn + step * q) - (double)w[j];
+                num += d * d;
+                den += (double)w[j] * w[j];
+            }
+        }
+    }
+    out.rel_l2 = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    out.K = K;
+    out.N = N;
+    return true;
 }
 
 } // namespace si

@@ -280,6 +280,16 @@ void epilogue_scalar_launch(sycl::queue & q, const int32_t * acc, const float * 
 
 } // namespace
 
+static bool g_dnnl_capturing = false;
+void dnnl_set_capturing(bool on) {
+    g_dnnl_capturing = on;
+}
+void dnnl_capture_guard() {
+    if (g_dnnl_capturing) {
+        throw std::runtime_error("oneDNN primitive reached during SYCL graph capture");
+    }
+}
+
 bool dnnl_gemm_enabled() {
     // default ON (the mode-2 int8 GEMMs run on oneDNN); PF_GEMM_DNNL=0 forces
     // the dp4a chunk-batched path, e.g. for bit-exact dp4a validation
@@ -349,6 +359,9 @@ struct dnnl_gemm::impl {
         bool ok = false;
     };
     std::unordered_map<const void *, w4_entry> w4weights;
+    // 2-bit draft store: the same three planes as a w4_entry (no oneDNN memory
+    // objects - only the M=1 w2 GEMV reads it).
+    std::unordered_map<const void *, w4_entry> w2weights;
 
     // Native-width 5-bit (Q5_K): the u4 nibble plane, a 1-bit fifth-bit plane
     // and the same two per-(g,n) f16 planes the u4 path keeps.  Decode
@@ -593,15 +606,17 @@ dnnl_gemm::~dnnl_gemm() {
     if (p->axo) {
         sycl::free(p->axo, p->q);
     }
-    for (auto & it : p->w4weights) {
-        if (it.second.vals) {
-            sycl::free(it.second.vals, p->q);
-        }
-        if (it.second.scales) {
-            sycl::free(it.second.scales, p->q);
-        }
-        if (it.second.off) {
-            sycl::free(it.second.off, p->q);
+    for (auto * wm : {&p->w4weights, &p->w2weights}) {
+        for (auto & it : *wm) {
+            if (it.second.vals) {
+                sycl::free(it.second.vals, p->q);
+            }
+            if (it.second.scales) {
+                sycl::free(it.second.scales, p->q);
+            }
+            if (it.second.off) {
+                sycl::free(it.second.off, p->q);
+            }
         }
     }
     for (auto & it : p->k5weights) {
@@ -759,6 +774,9 @@ size_t dnnl_gemm::weight_bytes() const {
     }
     for (const auto & kv : p->w4weights) {
         n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)(kv.second.K / kW4Group) * kv.second.N * 4;
+    }
+    for (const auto & kv : p->w2weights) {
+        n += (size_t)kv.second.K * kv.second.N / 4 + (size_t)(kv.second.K / kW4Group) * kv.second.N * 4;
     }
     for (const auto & kv : p->cb4weights) {
         n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)kv.second.ng * kv.second.N * 2;
@@ -920,10 +938,17 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // which keep their int8 conversion.
 bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
                               bool any_type, bool gemv_only) {
+    const bool w4info = getenv("PF_W4_INFO") != nullptr;
     if (!key || !host_data || !(any_type || si::w4_supported(ggml_type))) {
+        if (w4info) {
+            fprintf(stderr, "[w4] reject key=%p: precheck type=%u any=%d\n", key, ggml_type, (int)any_type);
+        }
         return false;
     }
     if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+        if (w4info) {
+            fprintf(stderr, "[w4] reject key=%p: K=%d N=%d maxK=%d\n", key, K, N, (int)kActMaxK);
+        }
         return false;
     }
     auto found = p->w4weights.find(key);
@@ -932,12 +957,19 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     }
     si::w4t w;
     if (!(any_type ? si::w4_pack_any(ggml_type, host_data, K, N, w) : si::w4_pack(ggml_type, host_data, K, N, w))) {
+        if (w4info) {
+            fprintf(stderr, "[w4] reject key=%p: pack failed type=%u K=%d N=%d\n", key, ggml_type, K, N);
+        }
         return false;
     }
     const int ng = K / kW4Group;
     impl::w4_entry e;
     e.K = K;
     e.N = N;
+    if (w4info) {
+        fprintf(stderr, "[w4] register key=%p type=%u K=%d N=%d (%.4f B/weight)\n", key, ggml_type, K, N,
+                (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
+    }
     e.vals = sycl::malloc_device<uint8_t>(w.vals.size(), p->q);
     e.scales = sycl::malloc_device<uint16_t>(w.scale.size(), p->q);
     e.off = sycl::malloc_device<uint16_t>(w.off.size(), p->q);
@@ -1018,6 +1050,87 @@ bool dnnl_gemm::has_weight_w4(const void * key) const {
     return it != p->w4weights.end() && it->second.ok;
 }
 
+// The 2-bit draft store.  No oneDNN memory object: the only consumer is the
+// M=1 w2 GEMV, so the three device planes are all that is needed.
+bool dnnl_gemm::add_weight_w2(const void * key, const void * host_data, uint32_t ggml_type, int K, int N) {
+    if (!key || !host_data || K <= 0 || N <= 0 || (K % kW4Group) != 0) {
+        return false;
+    }
+    auto found = p->w2weights.find(key);
+    if (found != p->w2weights.end()) {
+        return found->second.ok;
+    }
+    si::w2t w;
+    if (!si::w2_pack_any(ggml_type, host_data, K, N, w)) {
+        return false;
+    }
+    impl::w4_entry e;
+    e.K = K;
+    e.N = N;
+    e.vals = sycl::malloc_device<uint8_t>(w.vals.size(), p->q);
+    e.scales = sycl::malloc_device<uint16_t>(w.scale.size(), p->q);
+    e.off = sycl::malloc_device<uint16_t>(w.off.size(), p->q);
+    if (!e.vals || !e.scales || !e.off) {
+        if (e.vals) {
+            sycl::free(e.vals, p->q);
+        }
+        if (e.scales) {
+            sycl::free(e.scales, p->q);
+        }
+        if (e.off) {
+            sycl::free(e.off, p->q);
+        }
+        return false;
+    }
+    p->q.memcpy(e.vals, w.vals.data(), w.vals.size()).wait();
+    p->q.memcpy(e.scales, w.scale.data(), w.scale.size() * 2).wait();
+    p->q.memcpy(e.off, w.off.data(), w.off.size() * 2).wait();
+    e.ok = true;
+    if (getenv("PF_W2_INFO")) {
+        fprintf(stderr, "[w2] %s: K=%d N=%d  %.4f B/weight  rel L2 vs source = %.3f%%\n", (const char *)key, K, N,
+                (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N), 100.0 * w.rel_l2);
+    }
+    auto ins = p->w2weights.emplace(key, std::move(e));
+    return ins.first->second.ok;
+}
+
+bool dnnl_gemm::has_weight_w2(const void * key) const {
+    auto it = p->w2weights.find(key);
+    return it != p->w2weights.end() && it->second.ok;
+}
+
+// out[n] = sum_g asa[g] * (scale[g][n] * qd[g] + off[g][n] * xs[g]), qd the
+// int8 dot product of the group's quantized activation with the 2-bit levels.
+bool dnnl_gemm::gemm_w2(const void * key, const float * residual, float alpha, int M, int K, float * out,
+                        int out_stride) {
+    static const bool dbg = getenv("PF_W2_DEBUG") != nullptr;
+    auto it = p->w2weights.find(key);
+    if (it == p->w2weights.end() || !it->second.ok || M != 1 || it->second.K != K) {
+        if (dbg) {
+            fprintf(stderr, "[w2] miss: entry=%d ok=%d M=%d K=%d (entry K=%d)\n",
+                    (int)(it != p->w2weights.end()), (int)(it != p->w2weights.end() && it->second.ok), M, K,
+                    it == p->w2weights.end() ? -1 : it->second.K);
+        }
+        return false;
+    }
+    if (!p->acts_valid || M != p->cur_M || K != p->cur_K || !p->axg || !p->asa || !p->xs) {
+        if (dbg) {
+            fprintf(stderr, "[w2] miss: acts_valid=%d curM=%d/%d curK=%d/%d axg=%p asa=%p xs=%p\n",
+                    (int)p->acts_valid, M, p->cur_M, K, p->cur_K, (void *)p->axg, (void *)p->asa, (void *)p->xs);
+        }
+        return false;
+    }
+    if (dbg) {
+        static int once = 0;
+        if (once++ < 4) {
+            fprintf(stderr, "[w2] hit: M=%d K=%d N=%d\n", M, K, it->second.N);
+        }
+    }
+    const impl::w4_entry & w = it->second;
+    w2_gemv_launch(p->q, w.vals, w.scales, w.off, p->axg, p->asa, p->xs, out, out_stride, residual, alpha, K, w.N);
+    return true;
+}
+
 // One execute per cached primitive with whatever is in the scratch buffers.
 // The values are irrelevant (the int32 accumulator cannot overflow on 8-bit
 // inputs); the point is that each primitive's GPU kernel is loaded once here
@@ -1054,6 +1167,7 @@ int dnnl_gemm::warmup() {
                 memory::desc({1, (memory::dim)((K / kW4Group) * N)}, memory::data_type::f16, memory::format_tag::ab),
                 p->eng,
                 sycl_interop::memory_kind::usm, (void *)dsc);
+            dnnl_capture_guard();
             pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                                     {DNNL_ARG_WEIGHTS, *wmem},
                                     {DNNL_ARG_DST, pe.dst},
@@ -1177,6 +1291,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         auto scmem = sycl_interop::make_memory(
             memory::desc({1, e.ng * e.N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
             sycl_interop::memory_kind::usm, (void *)e.scales);
+        dnnl_capture_guard();
         pe->prim.execute(p->st, {{DNNL_ARG_SRC, pe->src},
                                  {DNNL_ARG_WEIGHTS, wmem},
                                  {DNNL_ARG_DST, pe->dst},
@@ -1233,6 +1348,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         auto scmem = sycl_interop::make_memory(
             memory::desc({1, e.ng * e.N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
             sycl_interop::memory_kind::usm, (void *)e.scales);
+        dnnl_capture_guard();
         pe->prim.execute(p->st, {{DNNL_ARG_SRC, pe->src},
                                  {DNNL_ARG_WEIGHTS, wmem},
                                  {DNNL_ARG_DST, pe->dst},
@@ -1289,6 +1405,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         }
     }
     impl::prim_entry & pe = pit->second;
+    dnnl_capture_guard();
     pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                             {DNNL_ARG_WEIGHTS, w.wmem},
                             {DNNL_ARG_DST, pe.dst},
@@ -1355,8 +1472,12 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
         hist[M <= 1 ? 0 : (M <= 32 ? 1 : (M <= 64 ? 2 : 3))]++;
         if (nrep < 6) {
             nrep++;
-            fprintf(stderr, "[w4] gemm_w4 M=%d K=%d N=%d  (bucket counts so far: 1=%ld 32=%ld 64=%ld big=%ld)\n", M,
-                    K, w.N, hist[0], hist[1], hist[2], hist[3]);
+            const bool has_axe = p->axe != nullptr && p->axo != nullptr;
+            fprintf(stderr,
+                    "[w4] gemm_w4 M=%d K=%d N=%d key=%p actsv=%d split=%d axe=%d/%d out=%p res=%p alpha=%.2f "
+                    "(buckets: 1=%ld 32=%ld 64=%ld big=%ld)\n",
+                    M, K, w.N, key, (int)p->acts_valid, (int)p->split_valid, (int)(p->axe != nullptr), (int)has_axe,
+                    (void *)out, (void *)residual, alpha, hist[0], hist[1], hist[2], hist[3]);
         }
     }
     static const bool no_gemv = [] {
@@ -1391,6 +1512,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
         }
     }
     impl::prim4_entry & pe = pit->second;
+    dnnl_capture_guard();
     pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                             {DNNL_ARG_WEIGHTS, w.wmem},
                             {DNNL_ARG_DST, pe.dst},
@@ -1523,6 +1645,7 @@ bool dnnl_gemm::attn_qk(int M, int blk, const int8_t * q_kmajor, const int8_t * 
                                         sycl_interop::memory_kind::usm, (void *)k_keymajor);
     auto dm = sycl_interop::make_memory(memory::desc({M, blk}, memory::data_type::s32, memory::format_tag::ab), p->eng,
                                         sycl_interop::memory_kind::usm, (void *)dst);
+    dnnl_capture_guard();
     e->prim.execute(p->st_a, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
     if (attn_wait_env()) {
         p->st_a.wait();
@@ -1541,6 +1664,7 @@ bool dnnl_gemm::attn_pv(int M, int blk, const uint8_t * p_major, const int8_t * 
                                         sycl_interop::memory_kind::usm, (void *)v_keymajor);
     auto dm = sycl_interop::make_memory(memory::desc({M, 256}, memory::data_type::s32, memory::format_tag::ab), p->eng,
                                         sycl_interop::memory_kind::usm, (void *)dst);
+    dnnl_capture_guard();
     e->prim.execute(p->st_a, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
     if (attn_wait_env()) {
         p->st_a.wait();

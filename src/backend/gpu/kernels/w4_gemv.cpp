@@ -164,6 +164,142 @@ void w4_gemv_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2-bit draft store (w2t).  Same shape, loop order and epilogue as the u4 GEMV
+// above, one difference per stage:
+//   * the weight plane is 2 bits per weight in *element* order, so a byte holds
+//     weights 4j..4j+3 and expands to exactly one dp4a word - no even/odd
+//     activation deinterleave is needed and `xq` is the contiguous per-32-group
+//     int8 activation the int8 path already produces;
+//   * the levels are 0..3, which are valid *unsigned* dp4a operands as they
+//     stand, so unlike the int8 path there is no 0x80 bias and no
+//     128*sum(a) correction;
+//   * one group is 8 bytes, so a lane reads 16 weights per 8-byte load instead
+//     of u4's 8 weights per 16-byte load.
+// 0.375 B/weight against u4's 0.625 is what the draft pays once per drafted
+// token; the expansion is ~9 ALU ops per 4 weights, i.e. ~2e9 ops/s at the
+// resulting byte rate, far under the issue budget, so the kernel stays
+// bandwidth bound like the u4 one.
+template <int RB, int PAIR = 1>
+static void w2_gemv_impl(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                         const int8_t * xq, const uint16_t * asa, const float * xs, float * out, int out_stride,
+                         const float * residual, float alpha, int K, int N) {
+    const int ng = K / 32;
+    constexpr int TX = RB * 32;
+    const int nwg = (N + RB - 1) / RB;
+    q.submit([&](handler & h) {
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            const int n0 = (int)it.get_group(0) * RB;
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int r = i % RB;
+                const int n = n0 + r;
+                const bool ok = n < N;
+                const size_t src = (size_t)g * N + n;
+                meta[i] = ok ? scale[src] : (uint16_t)0;
+                meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int n = n0 + sg;
+            if (n >= N) {
+                return;
+            }
+            const uint8_t * wrow = vals + (size_t)n * (size_t)(K / 4);
+            float acc = 0.f;
+            // byte -> the four weights it holds, one per dp4a byte lane
+            auto expand = [](uint32_t b) {
+                return (b & 3u) | (((b >> 2) & 3u) << 8) | (((b >> 4) & 3u) << 16) | (((b >> 6) & 3u) << 24);
+            };
+            auto byte = [](uint32_t v, int j) {
+                return j == 0 ? v : (j == 1 ? (v >> 8) : (j == 2 ? (v >> 16) : (v >> 24)));
+            };
+            // PAIR: one 32-value group is 8 bytes, so the narrow form issues
+            // 8-byte loads where the u4 path issues 16.  Widening it to two
+            // groups per uint4 measured *worse* (0.517 ms / 243 GB/s against
+            // 0.467 / 270 at the head shape, K=5120 N=65536) - fewer words live
+            // beats a wider load here - so PAIR defaults to 0 and PF_W2_PAIR=1
+            // is the A/B.
+            const int ngp = PAIR ? (ng / 2) : ng;
+            for (int gp = lane; gp < ngp; gp += 32) {
+                const int g = PAIR ? gp * 2 : gp;
+                const uint32_t * xw = reinterpret_cast<const uint32_t *>(xq + (size_t)g * 32);
+                int32_t qd = 0;
+                if constexpr (PAIR == 1) {
+                    // wv.x()/wv.y() = group g, wv.z()/wv.w() = group g+1
+                    const uint4 wv = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 8);
+                    int32_t q1 = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        qd = dp4a_s8u8(xw[j], expand(byte(wv.x(), j)), qd);
+                        qd = dp4a_s8u8(xw[4 + j], expand(byte(wv.y(), j)), qd);
+                        q1 = dp4a_s8u8(xw[8 + j], expand(byte(wv.z(), j)), q1);
+                        q1 = dp4a_s8u8(xw[12 + j], expand(byte(wv.w(), j)), q1);
+                    }
+                    const float sa1 = w4_h2f(asa[g + 1]);
+                    const size_t mo1 = (size_t)(g + 1) * RB + sg;
+                    acc += sa1 * (w4_h2f(meta[mo1]) * (float)q1
+                                  + w4_h2f(meta[(size_t)RB * ng + mo1]) * xs[g + 1]);
+                } else {
+                    const sycl::uint2 wv = *reinterpret_cast<const sycl::uint2 *>(wrow + (size_t)g * 8);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        qd = dp4a_s8u8(xw[j], expand(byte(wv.x(), j)), qd);
+                        qd = dp4a_s8u8(xw[4 + j], expand(byte(wv.y(), j)), qd);
+                    }
+                }
+                const float sa = w4_h2f(asa[g]);
+                const size_t mo = (size_t)g * RB + sg;
+                acc += sa * (w4_h2f(meta[mo]) * (float)qd + w4_h2f(meta[(size_t)RB * ng + mo]) * xs[g]);
+            }
+            const sub_group sgg = it.get_sub_group();
+            const float tot = reduce_over_group(sgg, acc, plus<float>());
+            if (lane == 0) {
+                (void)out_stride;
+                float v = alpha * tot;
+                if (residual) {
+                    v += residual[n];
+                }
+                out[n] = v;
+            }
+        });
+    });
+}
+
+void w2_gemv_launch(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                    const int8_t * xq, const uint16_t * asa, const float * xs, float * out, int out_stride,
+                    const float * residual, float alpha, int K, int N) {
+    const int ng = K / 32;
+    const auto fits = [&](int rb) {
+        return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::active().slm.budget_bytes;
+    };
+    // Two groups per load (PAIR) measured *worse* at the head shape - 0.517 ms
+    // against 0.467 ms for one group per 8-byte load, i.e. 243 vs 270 GB/s - so
+    // the default is the narrow form and PF_W2_PAIR=1 is the A/B.  Both reach
+    // the same 0.625 -> 0.375 B/weight byte count; the narrow one just keeps
+    // fewer words live and issues more, smaller loads.
+    static const bool pair = [] {
+        const char * e = getenv("PF_W2_PAIR");
+        return e && atoi(e) != 0;
+    }();
+    const bool p2 = pair && (K % 64) == 0;
+    // same row-block ladder as the u4 GEMV: RB=16 is the tuned default and the
+    // SLM (step+off for RB rows x ng groups) is what decides the fallback.
+    if (fits(16)) {
+        p2 ? w2_gemv_impl<16, 1>(q, vals, scale, off, xq, asa, xs, out, out_stride, residual, alpha, K, N)
+           : w2_gemv_impl<16, 0>(q, vals, scale, off, xq, asa, xs, out, out_stride, residual, alpha, K, N);
+    } else if (fits(8)) {
+        p2 ? w2_gemv_impl<8, 1>(q, vals, scale, off, xq, asa, xs, out, out_stride, residual, alpha, K, N)
+           : w2_gemv_impl<8, 0>(q, vals, scale, off, xq, asa, xs, out, out_stride, residual, alpha, K, N);
+    } else {
+        p2 ? w2_gemv_impl<4, 1>(q, vals, scale, off, xq, asa, xs, out, out_stride, residual, alpha, K, N)
+           : w2_gemv_impl<4, 0>(q, vals, scale, off, xq, asa, xs, out, out_stride, residual, alpha, K, N);
+    }
+}
+
 // i8_grp_gemv_rows_multi_impl: one launch for a whole call group's int8
 // (per-32-group f16 scale) segments, which share the quantized activation and the
 // K.  The per-row arithmetic is i8_grp_gemv_impl's, unchanged (same lane->group

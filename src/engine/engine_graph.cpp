@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "device/device_profile.h"
 
 #include <algorithm>
 #include <chrono>
@@ -17,6 +18,19 @@ struct capture_guard {
     }
     ~capture_guard() {
         g_capturing = false;
+    }
+};
+// The oneDNN guard is *not* tied to capture_guard: the single-device prefill
+// graphs have always been recorded with oneDNN in the pass (mode 1 runs its
+// GEMMs on oneDNN), and changing that is a separate question from the MTP
+// verify, which is all-SYCL by construction.  Only a capture that declares it
+// must be all-SYCL arms the guard.
+struct dnnl_capture_guard {
+    dnnl_capture_guard() {
+        dnnl_set_capturing(true);
+    }
+    ~dnnl_capture_guard() {
+        dnnl_set_capturing(false);
     }
 };
 static double prof_ci_t[256];
@@ -450,6 +464,9 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     auto tms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto pt0 = tnow();
     double c_embed = 0, c_gemv = 0, c_head = 0, c_attn = 0, c_gdn = 0, c_norm = 0;
+    // PF_HOSTPROF: the same buckets as PF_PROF but without the per-stamp device
+    // wait, so they measure *submission* cost instead of device time.
+    static const bool hostprof = getenv("PF_HOSTPROF") != nullptr;
     static const bool dbg_dump = [] {
         const char * e = getenv("PF_DUMP_LAYERS");
         return e && atoi(e) != 0;
@@ -478,6 +495,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     auto stamp = [&](double & acc, const std::chrono::high_resolution_clock::time_point & a) {
         if (prof) {
             sync_cur();
+            acc += tms(a, tnow());
+        } else if (hostprof) {
+            // host-side attribution only: no device wait, so the buckets are
+            // pure enqueue cost.  Used to tell a slow kernel from a slow
+            // submission (the MTP verify spends ~217 ms on the host alone).
             acc += tms(a, tnow());
         }
     };
@@ -877,7 +899,9 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         cur_dev = dev;
         dbg_layer = il;
         if (!phased && multi_dev && dev != prev_dev) {
+            const auto a_ho = tnow();
             handoff_x(prev_dev, dev, (size_t)nrows * (size_t)nreal);
+            stamp(prof_acc[9], a_ho);
             bind_acts(dev);
             prev_dev = dev;
         }
@@ -1225,26 +1249,33 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         }
     }
     g_lc.flush(mode);
-    if (prof) {
-        dev_queue(0).wait();
+    if (prof || hostprof) {
+        const double c_host = tms(pt0, tnow());
+        if (prof && !g_capturing) {
+            dev_queue(0).wait();
+        }
         const double c_total = tms(pt0, tnow());
         prof_acc[0] += c_embed;
         prof_acc[2] += c_gemv + c_head;
-        prof_acc[3] += c_total - c_embed - c_gemv - c_head - c_attn - c_gdn - c_norm;
-        prof_acc[4] += c_total;
+        const double c_base = prof ? c_total : c_host;
+        prof_acc[3] += c_base - c_embed - c_gemv - c_head - c_attn - c_gdn - c_norm;
+        prof_acc[4] += c_base;
         prof_acc[6] += c_attn;
         prof_acc[7] += c_gdn;
-        prof_acc[9] += 0;
+        if (prof) {
+            prof_acc[9] += 0;
+        }
         prof_acc[8] += c_norm;
         prof_calls++;
         const long every = (mode == 2) ? 1 : 8;
         if ((prof_calls % every) == 0) {
-            printf("[prof] %s: gemv=%.2f xq=%.2f head=%.2f attn=%.2f gdn=%.2f norm=%.2f "
+            printf("[prof%s] %s: gemv=%.2f xq=%.2f head=%.2f attn=%.2f gdn=%.2f norm=%.2f "
                    "other=%.2f total=%.2f ms (embed=%.2f)\n",
-                   mode == 2 ? "batch" : "chunk", prof_acc[2] / every, prof_acc[5] / every, c_head, prof_acc[6] / every,
+                   hostprof && !prof ? "HOST " : "", mode == 2 ? "batch" : "chunk", prof_acc[2] / every, prof_acc[5] / every, c_head, prof_acc[6] / every,
                    prof_acc[7] / every, prof_acc[8] / every, prof_acc[3] / every, prof_acc[4] / every,
                    prof_acc[0] / every);
             printf("      gemv split: w8=%.2f fp32/side=%.2f (incl. per-group sync)\n", c_g8, c_gf);
+            printf("      handoff: %.2f ms  (multi-device xfer + wait; blocks the host)\n", prof_acc[9] / every);
             printf("      gdn split: conv_l2=%.2f conv_state=%.2f gdn=%.2f gated=%.2f\n", prof_acc[11] / every,
                    prof_acc[12] / every, prof_acc[13] / every, prof_acc[14] / every);
             for (double & v : prof_acc) {
@@ -1493,11 +1524,185 @@ void engine::replay_md_dec_graphs() {
     bind_acts(0);
 }
 
+// ---------------------------------------------------------------------------
+// The MTP verify pass, recorded the same way as the decode.
+//
+// The verify is a mode-2 batch over mtp_k+1 rows: a *fixed* shape, executed
+// every cycle with the same plan, the same segment count and the same buffers,
+// so it is the ideal command-graph payload - everything that varies per cycle
+// (token ids, positions, slots, n_real, the KV page table) is read from
+// host/device USM inside the kernels, which is exactly the invariant the
+// graphs already rely on.  The measured prize is the ~810 per-cycle SYCL
+// submissions of the direct replay (PF_MTP_SUBMIT: 82 ms of host submit for a
+// 86 ms pass).
+//
+// Two things can make a pass unrecordable, and both are checked rather than
+// assumed:
+//   * oneDNN cannot be recorded.  The verify's GEMMs all take the native
+//     (nat_gemm) SYCL path, but a shape nat cannot serve falls back to oneDNN
+//     inside dnnl_gemm::gemm, which throws while a capture is in progress
+//     (oneDNN would otherwise execute against a recording queue).
+//   * attn_xmx_launch is a host-side oneDNN path chosen by the key count, so a
+//     verify recorded at a short context would keep the classic kernel after
+//     the context outgrows xmx_min_keys.  That is correct but slow, so the
+//     graphs are simply dropped once the context crosses the threshold and the
+//     direct replay (which re-decides per call) takes over.
+void engine::build_md_verify_graphs() {
+    static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    static const int xmx_min = [] {
+        const char * e = getenv("PF_ATTN_XMX_MIN");
+        return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
+    }();
+    const int rows = mtp_k + 1;
+    vf_dec_rows = rows;
+    if (!d_segs_vf || nog || rows <= 0 || plan_vf_.segs.empty()) {
+        return;
+    }
+    // phase split: one graph per contiguous device run, the head on the primary
+    std::vector<md_phase> phs;
+    md_phase p{};
+    p.dev = 0;
+    p.embed = true;
+    int il = 0;
+    while (il < m.hp.n_layer) {
+        const int d = layer_dev_[(size_t)il];
+        int j = il;
+        while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
+            j++;
+        }
+        if (p.l0 == p.l1 && p.dev == d) {
+            p.l1 = j;
+        } else {
+            phs.push_back(p);
+            md_phase q2{};
+            q2.dev = d;
+            q2.l0 = il;
+            q2.l1 = j;
+            p = q2;
+        }
+        il = j;
+    }
+    if (p.dev == 0) {
+        p.head = true;
+        phs.push_back(p);
+    } else {
+        phs.push_back(p);
+        md_phase h{};
+        h.dev = 0;
+        h.head = true;
+        phs.push_back(h);
+    }
+    for (const md_phase & ph : phs) {
+        if (ph.dev < 0 || (size_t)ph.dev >= dev_kind_.size() || dev_kind_[(size_t)ph.dev] != 0) {
+            return; // a CPU partition runs host code
+        }
+    }
+    capture_guard cg;
+    struct dnnl_capture_guard dcg;
+    // Record against a step_info that looks like the real verify: the host-side
+    // decisions record_forward makes while recording (the attention split count
+    // is derived from pos + n_real) must not be *smaller* than what a replay at
+    // a longer context needs, so record at the longest context the graph stays
+    // valid for.  A too-large split count is correct (the extra splits mask
+    // themselves out); a too-small one would not be.
+    const int rec_pos = std::max(0, xmx_min - rows - kMaxT);
+    d_info->n_rows = 1;
+    d_info->tpb = kMaxT;
+    d_info->n_real = rows;
+    d_info->n_real_row[0] = rows;
+    d_info->pos[0] = rec_pos;
+    d_info->slot[0] = 0;
+    d_info->active[0] = 1;
+    d_info->pc_active = 1;
+    d_info->mtp_dt = 1;
+    d_info->mtp_dry = 1;
+    for (int t = 0; t < mtp_nsnap && t < kPcMapLen; t++) {
+        d_info->pc_row_slot[t] = t;
+    }
+    vf_dec_.clear();
+    vf_dec_.reserve(phs.size());
+    for (const md_phase & ph : phs) {
+        md_cmd_graph mg;
+        mg.ph = ph;
+        sycl::queue & qd = dev_queue(ph.dev);
+        mg.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(qd.get_context(), qd.get_device());
+        mg.g->begin_recording(qd);
+        try {
+            record_forward(2, plan_vf_, d_segs_vf, rows, d_segs_vf, 0, &ph);
+            mg.g->end_recording();
+            mg.e = std::make_unique<sx::command_graph<sx::graph_state::executable>>(mg.g->finalize());
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "[mtp] verify graphs: phase dev=%d not recordable (%s) - direct replay\n", ph.dev, ex.what());
+            // leave the queue out of the recording state before dropping the
+            // graph, or every later submission on it fails
+            try {
+                mg.g->end_recording();
+            } catch (...) {
+            }
+            mg.g.reset();
+            vf_dec_.clear();
+            vf_dec_ok = false;
+            bind_acts(0);
+            return;
+        }
+        vf_dec_.push_back(std::move(mg));
+    }
+    vf_dec_ok = true;
+    // the capture ran the forward for real: undo its device-side effects on the
+    // recurrent state / KV so the first genuine cycle starts clean.  The verify
+    // is dry (no state write) and writes only its own snapshot slots + KV for
+    // rows the next cycle re-writes, and d_info is rewritten before every real
+    // call, so nothing here has to be undone beyond the flags.
+    d_info->pc_active = 0;
+    d_info->mtp_dt = 0;
+    d_info->mtp_dry = 0;
+    bind_acts(0);
+    fprintf(stderr, "[mtp] verify command graphs: %zu phase(s), %d rows\n", vf_dec_.size(), rows);
+}
+
+bool engine::vf_graph_usable(int rows, int pos0) const {
+    if (!vf_dec_ok || rows != vf_dec_rows || vf_dec_.empty()) {
+        return false;
+    }
+    // the recorded attention is the classic kernel; once oneDNN's int8 matmul
+    // would win, hand the pass back to the direct replay (which re-decides)
+    static const int xmx_min = [] {
+        const char * e = getenv("PF_ATTN_XMX_MIN");
+        return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
+    }();
+    static const bool xmx_on = [] {
+        const char * e = getenv("PF_ATTN_XMX");
+        return !(e && atoi(e) == 0) && si::dev::active().attn.xmx;
+    }();
+    if (xmx_on && pos0 + rows > xmx_min) {
+        return false;
+    }
+    return true;
+}
+
+void engine::replay_md_verify_graphs() {
+    for (size_t i = 0; i < vf_dec_.size(); i++) {
+        const md_phase & ph = vf_dec_[i].ph;
+        if (vf_dec_[i].e) {
+            dev_queue(ph.dev).ext_oneapi_graph(*vf_dec_[i].e);
+        } else {
+            record_forward(2, plan_vf_, d_segs_vf, vf_dec_rows, d_segs_vf, 0, &ph);
+        }
+        if (i + 1 < vf_dec_.size() && vf_dec_[i + 1].ph.dev != ph.dev) {
+            handoff_x(ph.dev, vf_dec_[i + 1].ph.dev, (size_t)vf_dec_rows);
+        }
+    }
+    bind_acts(0);
+}
+
 void engine::build_graphs() {
     if (cpu_mode || multi_dev) {
         build_plans();
         if (multi_dev) {
             build_md_dec_graphs();
+        }
+        if (mtp_on) {
+            build_md_verify_graphs();
         }
         return;
     }

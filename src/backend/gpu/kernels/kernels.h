@@ -49,6 +49,12 @@ struct gemv_seg {
     // optional pre-extracted per-32-value (scale, min) pairs in fp32, row-major
     // [n_rows][K/32]: lets the decode GEMV skip the packed 6-bit scale decode
     const sycl::float2 * meta32 = nullptr;
+    // optional device pointer to the *raw* GGUF bytes for this tensor, used by
+    // the fp32 dequant GEMV.  It travels with the segment because seg_plan
+    // sorts segments by (device, type), so a positional binding would attach
+    // each tensor's copy to the wrong segment.  Only PF_MTP_LAYER_EXACT sets
+    // it; every shipping path uses `w`.
+    const void * w_raw = nullptr;
     // DP4A path: when w8.vals != nullptr this segment runs on the int8 GEMM
     // with activations quantized by xq_launch into the shared x8 scratch.
     w8t w8;
@@ -194,6 +200,13 @@ void w4_gemm_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scal
 void w4_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int K, int N);
+// 2-bit draft store GEMV (see w2t in common/w4.h): the MTP draft's LM head at
+// 0.375 B/weight instead of u4's 0.625.  `xq` is the *contiguous* per-32-group
+// int8 activation (no even/odd split planes): the 2-bit plane is stored in
+// element order, so each byte expands to the one dp4a word of its four weights.
+void w2_gemv_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
+                    const int8_t * xq, const uint16_t * asa, const float * xs, float * out, int out_stride,
+                    const float * residual, float alpha, int K, int N);
 // Batched (M = 2..13) native-width GEMM for the MTP speculative verify: the
 // activation tile is staged in SLM once per workgroup and reused across 16*C
 // output columns, so the weight stream is read once for all M rows.  `fmt` is

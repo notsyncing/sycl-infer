@@ -230,6 +230,13 @@ function(si_add_test name)
     target_include_directories(${name} PRIVATE ${SI_TEST_INCLUDE_DIRS})
 endfunction()
 
+# dev/ benchmark harnesses (off by default: they are measurement tools, not
+# part of the shipped build, and each one re-lowers the device image at link).
+option(SI_DEV_BENCH "build the dev/ measurement harnesses" OFF)
+if (SI_DEV_BENCH)
+  si_add_test(bench_mtp dev/bench_mtp.cpp)
+endif()
+
 si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_response_parser tests/server/test_response_parser.cpp)

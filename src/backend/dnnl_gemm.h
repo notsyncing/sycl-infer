@@ -25,6 +25,15 @@ namespace si {
 // true unless PF_GEMM_DNNL=0 (read once per process)
 bool dnnl_gemm_enabled();
 
+// While a SYCL command graph is recording, a oneDNN primitive must not run:
+// oneDNN owns its own stream and its execute() would either bypass the
+// recording or invalidate the queue's state.  The engine sets this flag around
+// every capture, and dnnl_capture_guard() throws from every execute() site so
+// the caller can drop the graph and fall back to the direct replay instead of
+// recording a pass that is silently missing work.
+void dnnl_set_capturing(bool on);
+void dnnl_capture_guard();
+
 struct dnnl_gemm {
     explicit dnnl_gemm(sycl::queue & q);
     ~dnnl_gemm();
@@ -50,6 +59,16 @@ struct dnnl_gemm {
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
                        bool any_type = false, bool gemv_only = false);
     bool has_weight_w4(const void * key) const;
+
+    // ---- 2-bit draft store (see common/w4.h) ------------------------------
+    // 0.375 B/weight against the u4 draft copy's 0.625 and the int8
+    // conversion's 1.0625.  Only the M=1 GEMV consumes it (the MTP draft's LM
+    // head, read once per drafted token), so there is no prefill primitive and
+    // no oneDNN memory object - just the three planes plus a GEMV entry point.
+    bool add_weight_w2(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
+    bool has_weight_w2(const void * key) const;
+    // Same contract as gemm_w4 but on the 2-bit store and M == 1 only.
+    bool gemm_w2(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
 
     // ---- native-width 5-bit weights (Q5_K, see common/w4.h) ---------------
     // The 4-bit nibble plane plus a 1-bit fifth-bit plane and the same two

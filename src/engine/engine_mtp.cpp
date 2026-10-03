@@ -13,6 +13,7 @@
 // so the first row of a cycle uses the main hidden at the last committed
 // position, and every later draft row uses the MTP's own hidden.
 #include "engine.h"
+#include "quant.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,10 +56,40 @@ void engine::build_mtp_plan() {
     seg_plan & p = plan_mtp_;
     p = seg_plan{};
     dnnl_gemm * D = dnnl_for(mtp_dev);
-    auto seg = [&](const wt & w, const float * x, int xs, float * out, int os, const float * res) {
+    // PF_MTP_LAYER_EXACT=1 runs the draft's layer on the exact fp32 dequant
+    // GEMV, which reads GGUF blocks from the *device* pointer in the segment.
+    // In multi-device mode those tensors have no raw device copy at all (oneDNN
+    // owns the only conversion and the raw upload is skipped), so the probe has
+    // to bring its own - without it the path silently reads garbage and the
+    // measurement is acc = 0.  Seven tensors, ~290 MB of GGUF bytes, uploaded
+    // once at build time; this is a diagnostic, never the shipping path.
+    static const bool exact = getenv("PF_MTP_LAYER_EXACT") != nullptr;
+    std::vector<void *> raw(7, nullptr);
+    if (exact && multi_dev) {
+        const wt * ts[7] = {&M.wq, &M.wk, &M.wv, &M.wo, &M.ffn_gate, &M.ffn_up, &M.ffn_down};
+        size_t bytes_total = 0;
+        for (int i = 0; i < 7; i++) {
+            const size_t bytes = quant_row_bytes(ts[i]->type, ts[i]->K) * (size_t)ts[i]->N;
+            if (bytes == 0) {
+                continue;
+            }
+            raw[i] = dev_alloc_on(mtp_dev, bytes);
+            dev_queue(mtp_dev).memcpy(raw[i], ts[i]->data, bytes).wait();
+            bytes_total += bytes;
+        }
+        fprintf(stderr, "[mtp] PF_MTP_LAYER_EXACT: raw layer copies on device %d (%.0f MB)\n", mtp_dev,
+                bytes_total / (1024.0 * 1024.0));
+    }
+    auto seg = [&](const wt & w, const float * x, int xs, float * out, int os, const float * res, int ri = -1) {
         gemv_seg s{};
         s.dev = mtp_dev;
         s.w = multi_dev ? wkey(mtp_dev, w.data) : wptr(0, w.data);
+        // w_raw carries the alternate native-store handle for this segment: the
+        // 2-bit key (the tensor's host pointer - the w2 map is keyed by it, and
+        // the segment's own `w` is the *uploaded device* pointer, which is why
+        // the lookup cannot use `w`), or the raw GGUF device pointer under
+        // PF_MTP_LAYER_EXACT.  The two are mutually exclusive.
+        s.w_raw = ri < 0 ? nullptr : (mtp_layer_w2_ ? (const void *)w.data : raw[(size_t)ri]);
         s.type = w.type;
         s.K = w.K;
         s.n_rows = w.N;
@@ -76,22 +107,22 @@ void engine::build_mtp_plan() {
     };
     // call 0: wq / wk / wv
     p.begin_call(kMaxT, hp.n_embd / 256);
-    p.add(seg(M.wq, d_mtp_xnorm, hp.n_embd, d_mtp_qbuf, hp.n_head * 2 * hp.head_dim, nullptr));
-    p.add(seg(M.wk, d_mtp_xnorm, hp.n_embd, d_mtp_kbuf, hp.n_head_kv * hp.head_dim, nullptr));
-    p.add(seg(M.wv, d_mtp_xnorm, hp.n_embd, d_mtp_vbuf, hp.n_head_kv * hp.head_dim, nullptr));
+    p.add(seg(M.wq, d_mtp_xnorm, hp.n_embd, d_mtp_qbuf, hp.n_head * 2 * hp.head_dim, nullptr, 0));
+    p.add(seg(M.wk, d_mtp_xnorm, hp.n_embd, d_mtp_kbuf, hp.n_head_kv * hp.head_dim, nullptr, 1));
+    p.add(seg(M.wv, d_mtp_xnorm, hp.n_embd, d_mtp_vbuf, hp.n_head_kv * hp.head_dim, nullptr, 2));
     p.set_xq(d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
     // call 1: wo (+ residual)
     p.begin_call(kMaxT, hp.n_head * hp.head_dim / 256);
-    p.add(seg(M.wo, d_mtp_attn_out, hp.n_head * hp.head_dim, d_mtp_x, hp.n_embd, d_mtp_x));
+    p.add(seg(M.wo, d_mtp_attn_out, hp.n_head * hp.head_dim, d_mtp_x, hp.n_embd, d_mtp_x, 3));
     p.set_xq(d_mtp_attn_out, nullptr, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim);
     // call 2: ffn_gate + ffn_up
     p.begin_call(kMaxT, hp.n_embd / 256);
-    p.add(seg(M.ffn_gate, d_mtp_xnorm, hp.n_embd, d_mtp_ffn, ffn_stride, nullptr));
-    p.add(seg(M.ffn_up, d_mtp_xnorm, hp.n_embd, d_mtp_ffn + hp.n_ff, ffn_stride, nullptr));
+    p.add(seg(M.ffn_gate, d_mtp_xnorm, hp.n_embd, d_mtp_ffn, ffn_stride, nullptr, 4));
+    p.add(seg(M.ffn_up, d_mtp_xnorm, hp.n_embd, d_mtp_ffn + hp.n_ff, ffn_stride, nullptr, 5));
     p.set_xq(d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
     // call 3: ffn_down (silu gate) (+ residual)
     p.begin_call(kMaxT, hp.n_ff / 256);
-    p.add(seg(M.ffn_down, d_mtp_ffn, ffn_stride, d_mtp_x, hp.n_embd, d_mtp_x));
+    p.add(seg(M.ffn_down, d_mtp_ffn, ffn_stride, d_mtp_x, hp.n_embd, d_mtp_x, 6));
     p.set_xq(d_mtp_ffn, d_mtp_ffn + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
     p.set_act_up(d_mtp_ffn + hp.n_ff, d_mtp_ffn);
     // call 4: shared LM head over the MTP hidden
@@ -106,10 +137,28 @@ void engine::build_mtp_plan() {
     }
     p.finalize();
     p.has_head = false;
+    // the head segment is the last one added (call 4) and must keep its key
+    size_t head_seg = p.segs.size() - 1;
     if (d_segs_mtp == nullptr) {
         d_segs_mtp = alloc_elems<gemv_seg>(p.segs.size());
     }
     q.memcpy(d_segs_mtp, p.segs.data(), p.segs.size() * sizeof(gemv_seg)).wait();
+    // The exact probe needs the segments' `w` to be the *device* pointer of the
+    // raw GGUF bytes, while the normal path wants the oneDNN key - so keep a
+    // second device copy for it rather than changing the shared seg array.
+    if (exact && multi_dev) {
+        std::vector<gemv_seg> x(p.segs);
+        int bound = 0;
+        for (size_t i = 0; i < x.size(); i++) {
+            if (x[i].w_raw && i != head_seg) {
+                x[i].w = x[i].w_raw;
+                bound++;
+            }
+        }
+        d_segs_mtp_exact = alloc_elems<gemv_seg>(x.size());
+        q.memcpy(d_segs_mtp_exact, x.data(), x.size() * sizeof(gemv_seg)).wait();
+        fprintf(stderr, "[mtp] exact seg copy: %zu segs, %d raw pointers bound\n", x.size(), bound);
+    }
 }
 
 // One call of the MTP plan: quantize its activations once, then run the GEMMs.
@@ -117,6 +166,7 @@ void engine::build_mtp_plan() {
 // multi-device decode already uses per segment, so this mirrors that dispatch.
 void engine::mtp_gemv(int ci, int M, int step) {
     const seg_plan & p = plan_mtp_;
+    compute_backend & be = multi_dev ? *backends_[(size_t)mtp_dev] : backend();
     dnnl_gemm * D = dnnl_for(ci == 4 ? 0 : mtp_dev);
     const seg_plan::xq_t & xq = p.call_xq[(size_t)ci];
     if (D == nullptr || xq.x == nullptr) {
@@ -148,15 +198,109 @@ void engine::mtp_gemv(int ci, int M, int step) {
     // tensors themselves are found through gemm_w4's key lookup, so no special
     // dispatch is needed here beyond the split.
     const bool w4_draft = M == 1 && (mtp_head_w4_ || mtp_layer_w4_);
-    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
+    // PF_MTP_LAYER_EXACT=1: run every draft call group on the exact fp32
+    // dequant GEMV instead of the int8/native stores.  The draft is only a
+    // guess, so nothing downstream needs the quantised form - this exists to
+    // price the *acceptance* headroom of the draft's weight precision (the
+    // Q6_K tensors are SIn-int8 here, ~1 % relative L2), and it is far too slow
+    // to ship.  It also skips the activation quantiser entirely.
+    // ci == 4 is the LM head: in multi-device mode its raw GGUF copy is skipped
+    // (oneDNN owns it), so the fp32 dequant path would read a pointer that does
+    // not exist.  Keep the head on its usual u4 store - the probe is about the
+    // MTP *layer's* int8 error, and the head's u4 error is already priced at
+    // ~0.02 acceptance (PF_MTP_HEAD_W4 A/B in AGENTS.md).
+    // The fp32 dequant GEMV is instantiated for TB in {1,8,16,32} only, and a
+    // dispatch with any other row count silently runs the TB=32 kernel (so the
+    // MTP *prefill*, which calls this with n = the prompt chunk, corrupts the
+    // activation buffers and poisons every later draft).  The probe only has to
+    // be exact for the draft steps (M == 1); anything else falls through to the
+    // normal stores, and the state it touches is then the shipping one.
+    // NB: `exact` must NOT be a function-local static - it would capture the
+    // *first* call's ci/M (the MTP prefill's n = 13) and then be wrong for
+    // every later call, which is exactly how this probe first read acc = 0 with
+    // no exact GEMV in sight.
+    static const bool exact_env = getenv("PF_MTP_LAYER_EXACT") != nullptr;
+    static const int exact_only = [] {
+        const char * e = getenv("PF_MTP_EXACT_CALL");
+        return e ? atoi(e) : -1;
+    }();
+    const bool exact = exact_env && ci != 4 && (M == 1 || M == 8 || M == 16 || M == 32)
+                       && (exact_only < 0 || exact_only == ci);
+
     const int gb = p.call_group_begin[(size_t)ci];
     const int gc = p.call_group_count[(size_t)ci];
+    if (exact) {
+        static const bool edbg = getenv("PF_MTP_EXACT_DEBUG") != nullptr;
+        if (edbg) {
+            static int seen = 0;
+            if (seen++ < 12) {
+                fprintf(stderr, "[exact] ci=%d M=%d groups=%d nsb=%d filter=%d\n", ci, M, gc, p.call_nsb[(size_t)ci],
+                        exact_only);
+            }
+        }
+        for (int g = 0; g < gc; g++) {
+            const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
+            be.gemv_group(gr.type, d_segs_mtp_exact + gr.off, gr.n, gr.rows, M, p.call_nsb[(size_t)ci], 0);
+        }
+        return;
+    }
+    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
+    static const bool head_split_dbg = getenv("PF_MTP_HEAD_SPLIT_DEBUG") != nullptr;
+    if (ci == 4 && M == 1 && step >= 0 && mtp_head_split_) {
+        // The head readout split across both cards (opt-in, default off - it
+        // measures as a wash, see reports/mtp_ceiling.md 10c).  out[n] = w[n].h is
+        // independent per row, so device 1 can own the upper half of the rows: it
+        // reads the same hidden (one host hop, 20 KB, since the two devices share
+        // no device USM) and writes its half of the logits into the *same*
+        // device-0 row, so the argmax stays a single scan on the card that owns
+        // the row.  Note what is *not* bit-identical to the unsplit readout: the
+        // u4 GEMV's decomposition depends on N, so halving N flips the draft's
+        // argmax on a near-tie now and then (p1 128 tokens bit-identical, p0
+        // -6 % and p2 -8 % acceptance) - which is why it is not the default.
+        const seg_plan::group_t & g0 = p.groups[(size_t)(gb + 0)];
+        const gemv_seg & s = d_segs_mtp[g0.off];
+        dnnl_gemm * D1 = dnnl_for(1);
+        const int n0 = mtp_head_half_;
+        const size_t ab = (size_t)m.hp.n_embd * 4;
+        dev_queue(1).memcpy(h_head_stage, d_mtp_hnorm0, ab).wait();
+        dev_queue(1).memcpy(d_mtp_hnorm1, h_head_stage, ab);
+        D1->quantize(d_mtp_hnorm1, nullptr, m.hp.n_embd, 0, 1, m.hp.n_embd, /*do_split=*/true);
+        D1->gemm_w4(mtp_head_w4b_key_, nullptr, s.alpha, 1, s.K, s.out + n0, 1);
+        D->gemm_w4(mtp_head_w4lo_key_, nullptr, s.alpha, 1, s.K, s.out, 1);
+        backends_[0]->mtp_argmax(s.out, m.hp.n_vocab, d_mtp_tok_ + step, nullptr, 1);
+        if (head_split_dbg) {
+            std::vector<float> hl((size_t)m.hp.n_vocab);
+            dev_queue(0).memcpy(hl.data(), s.out, hl.size() * 4).wait();
+            int bh = 0;
+            for (int i = 1; i < m.hp.n_vocab; i++)
+                if (hl[(size_t)i] > hl[(size_t)bh]) bh = i;
+            int32_t di = -1;
+            dev_queue(0).memcpy(&di, d_mtp_tok_ + step, sizeof(di)).wait();
+            fprintf(stderr, "[mtp] head split step=%d dev=%d host=%d val=%.9g\n", step, di, bh, hl[(size_t)bh]);
+        }
+        return;
+    }
     for (int g = 0; g < gc; g++) {
         const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
         for (int j = 0; j < gr.n; j++) {
             const gemv_seg & s = d_segs_mtp[gr.off + j];
             const void * wk = (ci == 4 && mtp_head_w4_) ? (const void *)mtp_head_w4_key_ : s.w;
-            if (D->gemm_w4(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+            // the draft's head readout on the 2-bit store: 0.375 B/weight
+            // against the u4 copy's 0.625, so ~0.5 ms of the cycle per drafted
+            // token.  It is the one place a lossy store is free of consequence
+            // beyond the draft's own argmax accuracy (see PF_MTP_HEAD_W2).
+            if (ci == 4 && M == 1 && mtp_head_w2_ && D->gemm_w2(mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out,
+                                                               s.out_stride)) {
+                continue;
+            }
+            if (ci < 4 && M == 1 && mtp_layer_w2_ && s.w_raw
+                && D->gemm_w2(s.w_raw, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+                continue;
+            }
+            // M == 1 only: the layer's native stores serve the draft's single-row
+            // GEMV; the MTP prefill (M up to kMaxT) reads the int8 store, whose
+            // oneDNN grouped matmul is the better shape there.
+            if (M == 1 && D->gemm_w4(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
             if (D->gemm(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
@@ -187,6 +331,23 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     dnnl_gemm * D = dnnl_for(mtp_dev);
     compute_backend & be = multi_dev ? *backends_[(size_t)mtp_dev] : backend();
 
+    // PF_MTP_DSTEP=1: per-stage host time of one draft step.  The draft is a
+    // dependent chain of ~15 launches whose device work is ~1.1 GB of weights,
+    // so this separates "bytes" from "dispatch" - the draft step costs 4.75 ms
+    // while its byte floor is ~3.6 ms, and this says where the rest goes.
+    static const bool dstep = getenv("PF_MTP_DSTEP") != nullptr;
+    static const auto dnow = [] { return std::chrono::high_resolution_clock::now(); };
+    static const auto dms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto dt = dnow();
+    auto dmark = [&](const char * tag) {
+        if (dstep) {
+            const auto t2 = dnow();
+            fprintf(stderr, "[mtp] draft n=%d %-10s %.2f ms\n", n, tag, dms(dt, t2));
+            dt = t2;
+        }
+    };
     step_info * inf = d_mtp_info;
     std::memset(inf, 0, sizeof(step_info));
     std::memcpy(inf->mrope_sections, hp.rope_sections, sizeof(hp.rope_sections));
@@ -212,16 +373,25 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     // 2. eh_proj -> d_mtp_x
     {
         const void * ek = wkey(multi_dev ? mtp_dev : 0, M.eh_proj.data);
-        D->quantize(d_mtp_cat, nullptr, 2 * hp.n_embd, 0, n, 2 * hp.n_embd, false);
-        if (!(D->gemm_w4(ek, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd)
+        // do_split matters whenever eh_proj runs on a native 4-bit store: the u4
+        // GEMV reads the even/odd activation planes, and with do_split=false
+        // they are left stale from the previous call - which is what made
+        // PF_MTP_LAYER_W4 produce a *wrong* draft (acc 2.14 -> 0.08) rather than
+        // a merely lossier one.  Bit-localised with PF_MTP_LAYER_W4_CALL=-1.
+        D->quantize(d_mtp_cat, nullptr, 2 * hp.n_embd, 0, n, 2 * hp.n_embd, mtp_layer_w4_ || mtp_head_w4_);
+        const void * ek2 = mtp_layer_w2_ ? (const void *)M.eh_proj.data : ek;
+        if (!((n == 1 && D->gemm_w2(ek2, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd))
+              || (n == 1 && D->gemm_w4(ek, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd))
               || D->gemm(ek, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd))) {
             throw std::runtime_error("mtp: eh_proj GEMM failed");
         }
     }
     // 3. attention block
+    dmark("eh_proj");
     MTPDBG("forward attn_norm\n");
     be.rmsnorm(d_mtp_x, wf32(mtp_dev, M.attn_norm), d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
     mtp_gemv(0, n);
+    dmark("qkv");
     MTPDBG("forward qk_norm_rope\n");
     const char * kp;
     const char * vp;
@@ -265,16 +435,33 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     if (!fused) {
         be.attn_combine(d_mtp_partials, d_mtp_qbuf, d_mtp_attn_out, inf, hp.n_head, hp.head_dim, nsp, 1, n);
     }
+    dmark("attn");
     MTPDBG("forward wo\n");
     mtp_gemv(1, n); // wo + residual
+    dmark("wo");
     // 4. FFN
     be.rmsnorm(d_mtp_x, wf32(mtp_dev, M.post_attn_norm), d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
     mtp_gemv(2, n);
     mtp_gemv(3, n);
+    dmark("ffn");
     // 5. the AR draft chain seeds the next step with the MTP hidden *before*
     // the shared head norm (llama.cpp: the draft context's pre-norm hidden)
     be.copy_row(d_mtp_x, d_mtp_raw, inf, hp.n_embd, -1);
     be.rmsnorm(d_mtp_x, wf32(mtp_dev, M.shared_head_norm), d_mtp_hnorm, n, hp.n_embd, hp.rms_eps);
+    dmark("hnorm");
+    // PF_MTP_EXACT_DEBUG: dump the draft hidden so the exact and int8 paths can
+    // be compared numerically (the acceptance is the coarse signal; this is the
+    // direct one).
+    if (getenv("PF_MTP_EXACT_DEBUG") != nullptr && n == 1) {
+        static int seen = 0;
+        if (seen++ < 4) {
+            std::vector<float> h(8), hn(8);
+            dev_queue(mtp_dev).memcpy(h.data(), d_mtp_x, 32).wait();
+            dev_queue(mtp_dev).memcpy(hn.data(), d_mtp_hnorm, 32).wait();
+            fprintf(stderr, "[exact] step=%d x[0:4]=%.4f %.4f %.4f %.4f hnorm[0:4]=%.4f %.4f %.4f %.4f\n", step,
+                    h[0], h[1], h[2], h[3], hn[0], hn[1], hn[2], hn[3]);
+        }
+    }
     if (with_head) {
         MTPDBG("forward head\n");
         if (d_mtp_hnorm0 != d_mtp_hnorm) {
@@ -283,6 +470,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
         }
         mtp_gemv(4, n, step);
     }
+    dmark("head");
     MTPDBG("forward done\n");
 }
 
@@ -375,7 +563,16 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
     const auto t_submit0 = t_now();
-    record_forward(2, plan_vf_, d_segs_vf, rows_vf, d_segs_vf);
+    // Recorded command graphs: one submission per device partition instead of
+    // ~810.  Everything that varies per cycle (tokens, positions, slots,
+    // n_real, the KV page table, the recurrent-state snapshot slot map) is read
+    // from USM inside the kernels, so the graph is shape-fixed, not state-fixed.
+    const bool use_graph = v_pad == 0 && vf_graph_usable(rows_vf, pos0);
+    if (use_graph) {
+        replay_md_verify_graphs();
+    } else {
+        record_forward(2, plan_vf_, d_segs_vf, rows_vf, d_segs_vf);
+    }
     const double t_submit = submit_dbg ? t_ms(t_submit0, t_now()) : 0.0;
     MTPDBG("verify record_forward returned, syncing\n");
     sync_all();
@@ -1210,6 +1407,26 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 break;
             }
             j++;
+        }
+        // PF_MTP_STEPS=1: per-depth acceptance.  A chain whose step 0 already
+        // scores like its step 3 has either a wrong state (the draft's hidden
+        // is not the one the MTP layer expects) or a systematically wrong
+        // readout; a geometric decay is the model's own accuracy and nothing
+        // here can move it.  Prints reach[j] = cycles that accepted >= j drafts.
+        static const bool steps_dbg = getenv("PF_MTP_STEPS") != nullptr;
+        static long steps_cyc = 0, steps_reach[33] = {0};
+        if (steps_dbg) {
+            steps_cyc++;
+            for (int s2 = 0; s2 <= j; s2++) {
+                steps_reach[s2]++;
+            }
+            if (steps_cyc % 32 == 0) {
+                fprintf(stderr, "[mtp] steps: cycles=%ld reach:", steps_cyc);
+                for (int s2 = 0; s2 < k; s2++) {
+                    fprintf(stderr, " %ld%%", 100L * steps_reach[s2 + 1] / steps_cyc);
+                }
+                fprintf(stderr, "  (mean accepted %.2f)\n", (double)j / steps_cyc);
+            }
         }
         // adopt the main model's token at the first mismatch (or past the drafts)
         {

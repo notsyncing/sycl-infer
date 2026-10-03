@@ -959,6 +959,87 @@ instead of doing k device syncs + k x 1 MB logits copies + k host scans of
 on the primary device (`--mtp-device 0`, the default); a cross-device
 `--mtp-device` keeps the host round-trip.
 
+### MTP on 27B, re-measured 2026-10: what the cycle is made of, and the 2x question
+
+Full record in [`reports/mtp_ceiling.md`](reports/mtp_ceiling.md) §9.  The short
+version, because the numbers in §1-§8 above predate it:
+
+* **A 3.2 ms-per-launch regression was hiding in the verify path**, from the
+  device-profile refactor: `rmsnorm_launch` calls `si::dev::wg_clamped()`, which
+  was re-running `sycl::device::get_devices(gpu)` + a driver query on *every*
+  launch.  65 rmsnorms per verify = 210 ms of pure host time per cycle.  The
+  plain decode never saw it because it is a recorded command graph (the launch
+  is captured once at startup); the MTP verify is a direct replay.  Fixing it
+  took the verify 221 -> 85 ms and the cycle 255 -> 107 ms, i.e. **MTP went from
+  0.72x (slower than a plain decode) to 1.8-2.2x**.  **Never put a device query
+  in a kernel launcher** - see the `wg_clamped` cache in
+  `src/device/device_registry.cpp`.
+* **The verify is now a recorded command graph** (`build_md_verify_graphs`,
+  same phase split as the decode's `build_md_dec_graphs`): -3.7 ms/cycle at
+  k=6, byte-identical output.  Two guards earn their keep:
+  `dnnl_capture_guard()` throws from every oneDNN `prim.execute` while a
+  *declared-all-SYCL* capture is in progress (the verify's GEMMs all take
+  `nat_gemm_launch`, but an unservable shape would fall back to oneDNN and
+  silently record a pass that is missing work), and `vf_graph_usable()` declines
+  the graph once the context outgrows `xmx_min_keys`, where the recorded
+  attention split count would be stale.
+* **Where the 105 ms cycle goes** (k=4, p0): draft 19.0 (4 steps x 1.25 GB at
+  263-297 GB/s = its byte floor), verify 85.0 (70.7 for the M=1-equivalent pass
+  + 4.2 per extra row), commit/rollback/emit 1.2.  The plain decode is 69.1 ms
+  and is within 3 % of its structural floor (17.5 GB at 325 GB/s + ~13 ms
+  non-GEMV).  So `X = cycle - plain = 36 ms` is 53 % draft bytes and 47 % the
+  verify's extra rows, and the two big *fixed* costs cancel in the ratio.
+* **2x is acceptance-bound.**  `PF_MTP_STEPS=1` shows reach[j] = 75/53/37/28/15/6 %
+  at k=6 (p0): a clean geometric p ~ 0.70 with **no step-0 collapse**, so the
+  draft's hidden is right and the decay is the MTP layer's own accuracy.  Final
+  measured speedups (one process per cell; plain 69.10 ms/token): code
+  continuation **2.16x** (k=4), technical explanation **1.97x** (k=3), story
+  opener 1.35x (k=2).  The remaining engine-side headroom is ~10 % of X, worth
+  ~5 % of the speedup; the story prompt cannot be fixed by the engine at all,
+  because its ceiling is `n = 1 + acc = 2.23`.
+* **The draft's bytes cannot be cut.**  A 2-bit head store
+  (`w2_pack_any`/`w2_gemv_launch`, 0.375 B/w, exact to 1.9e-07 in
+  `dev/test_w2.cpp`) makes the draft 6 % cheaper and costs 2 % of the
+  acceptance - a wash - because the GEMV is not bandwidth-bound (270 vs the u4
+  path's 314 GB/s) so only 1.4x of the 1.6x byte cut is realised.  Its
+  quantization error on this Q6_K head is **39.8 % relative L2** (u4's is
+  0.077 %) and the argmax survives that, which is the useful result: the draft
+  head's *precision* is not the constraint, its bytes are.
+* **Draft precision is free, so the speedup is acceptance-bound (settled).
+  `PF_MTP_LAYER_EXACT=1` runs the MTP layer's GEMVs on the exact fp32 dequant
+  reference and the acceptance is *identical* to the int8 store (2.14 both), so
+  the layer's ~1 % weight error is orders of magnitude below the MTP head's
+  argmax sensitivity.  Every "fewer bits for the draft" attempt therefore has
+  nothing to gain on the acceptance side and can only lose the head's discrete
+  argmax decisions - which is what they all did.  n is bounded by the MTP
+  layer's own accuracy (reach[] geometric, p ~ 0.70).
+* Two measurement traps worth knowing: a **prefix-cache hit changes the
+  numerics enough to move the acceptance** (acc 1.9 cold vs 2.8 after the same
+  prompt ran at k=2..5 first in the same process), so an in-process k sweep
+  compares configs that did not start from the same state - `dev/bench_mtp.cpp`
+  is one process per config for that reason; and the two device partitions run
+  their layer ranges *sequentially* by necessity, so there is no cross-device
+  overlap to recover in the decode or the verify (a token's forward is a strict
+  chain, and token t+1 does not exist until t's forward ends).
+
+**The verify cannot be split across the two cards** (structural, measured): a
+token's forward is a strict chain through the layer split - card 0's layers 0-31
+must finish and hand over before card 1 starts, and `PF_HOSTPROF=1` measures that
+handoff at 37 ms of host-side blocking; the verify's 7 rows are also one forward,
+not 7 (row i+1 attends to row i's KV).  The one tensor-parallel opportunity in
+the MTP cycle is the draft's head readout, which is implemented and priced above.
+The `do_split` rule that came out of the u4 layer store is worth stating on its
+own: **any activation feeding a native-store GEMV must be quantized with
+`do_split=true`** - `eh_proj` was not, so the u4 path read the previous call's
+even/odd planes and gave acc 0.08 (garbage draft) until it was fixed.
+
+New diagnostics: `PF_HOSTPROF=1` (the `PF_PROF` buckets *without* the per-stamp
+device wait, i.e. submission cost - this is what found the regression),
+`PF_MTP_STEPS=1`, `PF_MTP_DSTEP=1` (per-stage draft-step time),
+`PF_MTP_LAYER_EXACT=1`, `PF_MTP_HEAD_W2=1`, `PF_W2_PAIR=1`, `PF_W2_INFO=1`,
+`PF_W2_DEBUG=1`.  Build the harnesses with `-DSI_DEV_BENCH=ON`
+(`dev/bench_mtp.cpp`, `dev/test_w2.cpp`).
+
 ### OpenAI-compatible API
 
 `GET /v1/models` lists the model (id from the GGUF `general.name`) and
@@ -1027,6 +1108,14 @@ name.
   match order (first match wins), so a broad matcher goes after a specific one --
   the Iris Xe matcher matches only "Iris", deliberately not "Xe", because a
   future Xe part has different tunings and must get its own file.
+* **Never query the device from a kernel launcher.**  `rmsnorm_launch` calls
+  `si::dev::wg_clamped()` on *every* launch, so that function's
+  `sycl::device::get_devices()` + `get_info<max_work_group_size>()` must stay
+  cached (it is, in a function-local static).  Uncached it cost **3.2 ms per
+  launch** = 210 ms of host time in one MTP verify pass (65 rmsnorm calls), and
+  it was invisible in the plain decode because the decode is a recorded command
+  graph (captured once at startup) while the verify is a direct replay.  The
+  profile refactor introduced it; reports/mtp_ceiling.md §9a has the numbers.
 * **Write every field with a designated initializer.**  `.key = ...`,
   `.shape = {.rmsnorm_wg = ...}`.  The build uses `-Wall -Wextra`, so an omitted
   field warns rather than defaulting silently, and a field can be inserted or
@@ -1166,6 +1255,31 @@ path, default `ffmpeg`).
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
 `PF_TIME`, `PF_DBG_MID` (stop after embedding/norm/attn/ffn), `PF_DBG_GEMV`,
 `PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`,
+`PF_HOSTPROF=1` (the `PF_PROF` block breakdown *without* the per-stamp device
+wait, so it measures host submission cost - the only way to tell a slow kernel
+from a slow launch; this is what found the `wg_clamped` regression below),
+`PF_MTP_STEPS=1` (per-depth MTP acceptance: reach[j] = the fraction of cycles
+that accepted >= j drafts, which is how one tells a geometric decay from a
+draft-state bug), `PF_MTP_DSTEP=1` (per-stage time of one draft step),
+`PF_MTP_LAYER_EXACT=1` (the draft's MTP layer on the exact fp32 dequant GEMV -
+it now needs `build_mtp_plan`'s raw device copy to work in multi-device mode, and
+it prices the precision half: acc is *identical* to int8, so draft precision is
+free), `PF_MTP_LAYER_W4` (**default on**: the draft's MTP-layer linears also get
+a native per-32 u4 store, 2.06 -> 0.875 B/w, -1.4 ms/cycle, accuracy-neutral;
+it is *added* to the int8 store because the MTP prefill at M = kMaxT still needs
+int8, and only M == 1 dispatches native), `PF_MTP_LAYER_W2` / `PF_MTP_LAYER_W2_CALL`
+(a 2-bit MTP-layer store: acc 2.14 -> 1.75 for -0.5 ms, **rejected** - lossy is
+free at the *readout*, lossy compounds in the *recurrence*), `PF_MTP_HEAD_SPLIT`
+(default **off**; 1 splits the draft's 795 MB head readout across both cards -
+device 1 takes the upper half of the rows and writes into device 0's logits row,
+so the argmax stays one scan on device 0.  Draft 17.2 -> 13.1 ms/cycle
+deterministically and end-to-end a wash, because halving N changes the u4 GEMV's
+decomposition and flips the draft's argmax on a near-tie: p1 bit-identical over
+128 tokens, p0 -6 % and p2 -8 % acceptance), `PF_MTP_HEAD_SPLIT_DEBUG` (prints
+the device and host argmax of the split row per step), `PF_MTP_HEAD_TIME` (device
+time of the head readout per draft step: 3.04 of a 4.0 ms step, i.e. 75 % of the
+draft), `PF_MTP_HEAD_W2=1` / `PF_W2_PAIR=1` / `PF_W2_INFO=1` / `PF_W2_DEBUG=1`
+(the 2-bit draft head store, measured a wash - see reports/mtp_ceiling.md §9d),
 `PF_CHAT_TMPL_DEBUG` (log why a GGUF chat template fell back to the built-in
 renderer), `SCHED_DEBUG`, `STOP_AFTER_LAYER`, `PF_ABL_NOATTN`, `PF_ABL_NOGDN`,
 `PF_DUMP_LAYERS` (per-layer hidden-state fingerprints; `layerlast` = the last

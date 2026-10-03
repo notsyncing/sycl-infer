@@ -335,6 +335,11 @@ zero-points（其布局未通过验证）。`w4_xs_launch` 算 `XS`，修正由 
   盖过 4-bit 权重的精度优势。int8 的 oneDNN matmul 只接受每行一个 SRC scale，所以每行版本仍然保留
   （一次 call 可能混有 u4 与 int8 段）。
 * `PF_W4=0` 恢复纯 int8（每 32 组的权重 scale 仍然生效，那不是 u4 专有的）。
+* **喂给原生 store 的 GEMV，激活必须用 `do_split=true` 量化**。prefill 故意用
+  `do_split=false`（oneDNN 读未拆分的整行形式），而 u4 GEMV 读的是分量化器写出的**每 32 组
+  偶/奇 k 激活平面**。少了这个守卫，原生路径会静默读到**上一次 call** 的平面：MTP 层的
+  `eh_proj` 就这样给出 acc 0.08（draft 全是垃圾），修成
+  `do_split = mtp_layer_w4_ || mtp_head_w4_` 后恢复到 2.14（`reports/mtp_ceiling.md` §10b）。
 * 各类型的实际损失用 `test_quant_audit` 逐类型度量；u4 打包往返用 `test_w4`，u4 vs int8 的逐张量
   差异用 `test_w4_vs_i8`，u4 GEMM vs 真实反量化权重用 `test_w4_gemm`。
 
@@ -473,3 +478,20 @@ w  = d·sc_j · q5 − dmin·m_j          （每 32 个一组，6-bit (sc,m) 由
 
 精度反而更好（保留 native 值），设备显存合计 −2.1 GB。pp 的代价是展开流量，
 `--kv-type i4` 或后续把展开分块进 L2 才能收回。
+
+## 12. 2-bit 权重（`w2t`，MTP draft 专用，默认关）
+
+`w2_pack_any` 把任意 K-quant 张量重化到**每 32 值 2-bit** 的均匀网格，存 `vals` 的两个
+bit-plane + 每组一个 f16 scale（0.375 B/w，u4 的 0.625 的 60 %），GEMV 侧是
+`w2_gemv_launch`（`src/backend/gpu/kernels/w4_gemv.cpp`，`PF_W2_PAIR=1` 走 16-bit 成对载入）。
+往返误差用 `dev/test_w2.cpp` 对拍（1.9e-07 精确到 fp32 参考）。
+
+它只为 MTP draft 的 head readout 存在（`PF_MTP_HEAD_W2=1`，需要 `--mtp` + 27B 的 NextN 头），
+而且**默认关**：27B 的 Q6_K head 上 rel L2 是 39.8 %（u4 是 0.077 %），draft 19.1 → 16.5 ms/cycle
+（−2.6 ms）换来 acceptance −2 %，端到端打平。
+
+关键的不对称，也是所有"给 draft 减位"的尝试都失败的原因：**读出端有损无所谓，递推里有损会累积。**
+head readout 只取 argmax，偶尔翻一个近似打平不致命（verify 会兜住）；但 MTP **层**的 2-bit
+store（`PF_MTP_LAYER_W2=1`）误差会喂回下一个 draft step，acc 2.14 → 1.75，换来 −0.5 ms，被否决。
+反过来 `PF_MTP_LAYER_EXACT=1`（层的 GEMV 走精确 fp32 反量化）与 int8 store 的 acceptance
+**完全相同**，说明 draft 的精度余量很大，位宽根本不是 acceptance 的限制项。

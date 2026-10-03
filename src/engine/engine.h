@@ -483,12 +483,24 @@ struct engine {
     gemv_seg * d_segs_vf = nullptr;
     seg_plan plan_mtp_;                // the MTP layer's own calls
     gemv_seg * d_segs_mtp = nullptr;
+    // PF_MTP_LAYER_EXACT: same segments with `w` pointing at the raw GGUF bytes
+    gemv_seg * d_segs_mtp_exact = nullptr;
     // PF_MTP_HEAD_W4: a draft-only u4 copy of the LM head, registered under a
     // private key (the target keeps its exact int8 head, so only the drafts -
     // and hence acceptance, never the emitted stream - can move).
     float * d_mtp_partials = nullptr; // the MTP's own attention partials (see mtp_splits)
     int32_t h_argmax[kMaxB] = {0};    // host mirror of the verify's per-row argmax
     bool mtp_head_w4_ = false;
+    // PF_MTP_LAYER_W2: the MTP layer also has a 2-bit copy (0.375 B/weight).
+    bool mtp_layer_w2_ = false;
+    // 2-bit copy of the draft LM head (0.375 B/weight against the u4 copy's
+    // 0.625): the draft reads the whole head once per drafted token, so this is
+    // the single largest byte item in the speculative cycle.  The draft only
+    // needs its argmax, and its weights are already re-quantized, so the extra
+    // step is a trade in acceptance for bytes - measured in
+    // reports/mtp_ceiling.md.  Off with PF_MTP_HEAD_W2=0.
+    bool mtp_head_w2_ = false;
+    char mtp_head_w2_key_[1] = {0};
     bool mtp_layer_w4_ = false; // the MTP layer's own linears are GEMV-only u4 too
     char mtp_head_w4_key_[1] = {0};
     // The MTP draft is a single-token decode over the MTP layer's KV, so it gets
@@ -508,6 +520,21 @@ struct engine {
     int32_t * d_mtp_cand_ = nullptr;  // [mtp_cand_cap] candidate token ids (device 0)
     float * d_mtp_cvals_ = nullptr;   // [mtp_cand_cap] their head values
     int32_t * d_mtp_tok_ = nullptr;   // [kMaxT] per-step draft token ids (device 0, next to the head)
+    // Head readout split across both cards (PF_MTP_HEAD_SPLIT=1, **default off**).
+    // out[n] = w[n].h is independent per output row, so the draft's 795 MB u4
+    // stream (3.0 ms of device time, 75 % of a draft step) can be halved by
+    // giving the second device the upper row range while it is otherwise idle:
+    // each side runs the identical GEMV over its own rows into the *same*
+    // device-0 logits row, so the argmax stays one scan on the owning card.
+    // Draft 17.2 -> 13.1 ms/cycle, and end to end a wash: halving N changes the
+    // u4 GEMV's decomposition, so the draft's argmax flips on a near-tie now and
+    // then (p0 -6 %, p2 -8 % acceptance).  See reports/mtp_ceiling.md 10c.
+    bool mtp_head_split_ = false;
+    int mtp_head_half_ = 0;      // rows [0, half) on device 0, [half, n_vocab) on device 1
+    char mtp_head_w4lo_key_[1] = {0};
+    char mtp_head_w4b_key_[1] = {0};
+    float * d_mtp_hnorm1 = nullptr;   // device-1 copy of the draft hidden
+    float * h_head_stage = nullptr;   // host staging for the 20 KB activation copy
     float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
     int32_t * d_mtp_tokx_ = nullptr;  // 4-byte staging slot for a non-zero --mtp-device
     float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
@@ -736,6 +763,13 @@ private:
     };
     std::vector<md_cmd_graph> md_dec_;
     bool md_dec_ok = false;
+    // The MTP verify's own command graphs.  Same phase split as the decode
+    // (one graph per contiguous device run, host handoff between), but the
+    // recorded pass is the mode-2 batch over k+1 rows: a fixed shape, so it is
+    // recorded once and replayed every cycle.  See build_md_verify_graphs().
+    std::vector<md_cmd_graph> vf_dec_;
+    bool vf_dec_ok = false;
+    int vf_dec_rows = 0;
 
     // Multi-device prefill pipeline: the layer split into contiguous device runs
     // (device 0 with the embedding, device 1, device 0 with the head).  When the
@@ -747,6 +781,11 @@ private:
     int pf_pipe_count_ = 0; // parity source for the double-buffered step_info
     void build_md_dec_graphs();
     void replay_md_dec_graphs();
+    void build_md_verify_graphs();
+    void replay_md_verify_graphs();
+    // true when the recorded verify graphs are usable for a `rows`-row pass at
+    // `pos0`; false falls back to the direct replay.
+    bool vf_graph_usable(int rows, int pos0) const;
 
     void record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows = nullptr,
                         int at_nsp_hint = 0, const md_phase * ph = nullptr, const step_info * info = nullptr);

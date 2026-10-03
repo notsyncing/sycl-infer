@@ -130,4 +130,40 @@ struct cb4t {
 bool cb4_supported(uint32_t ggml_type); // IQ4_XS (23) / IQ4_NL (20)
 bool cb4_pack(uint32_t ggml_type, const void * src, int K, int N, cb4t & out);
 
+// ---- low-bit draft store (2-bit) -------------------------------------------
+// The MTP draft reads the whole LM head once per drafted token - 795 MB of u4
+// at 0.625 B/weight, and 1.35 GB on the int8 conversion - which is ~60% of the
+// draft's bytes and 27% of the whole speculative cycle.  The draft only needs
+// that head's *argmax*, and its weights are already re-quantized (the u4 copy
+// is a lossy per-32 4-bit grid with 0.077% relative L2, against the exact int8
+// conversion's 0.98% - and switching between them moves the acceptance by 0.02,
+// see PF_MTP_HEAD_W4 in AGENTS.md).  A 2-bit grid is the same trade one step
+// further: 0.25 B/weight of data + 4 B of f16 (step, offset) per 32-group =
+// 0.375 B/weight, 40% less than u4.
+//
+// Layout (K inner, element k at byte k>>2, bits (k&3)*2, low field first) is
+// chosen so the *contiguous* per-32-group int8 activation applies directly -
+// no even/odd deinterleave planes like the u4 path needs - at the cost of a
+// 3-shift/3-and expansion per 4 weights, which is far below the issue budget
+// (the kernel stays bandwidth bound).
+struct w2t {
+    std::vector<uint8_t> vals;   // [N][K/4] 2-bit, K inner
+    std::vector<uint16_t> scale; // [K/32][N] f16 step
+    std::vector<uint16_t> off;   // [K/32][N] f16 offset (= group min)
+    int K = 0;
+    int N = 0;
+    // relative L2 the 2-bit fit introduces against the dequantized source.
+    // This is the number that decides whether the store is usable at all: the
+    // head's argmax has to survive it (compare the u4 copy's 0.077% and the
+    // int8 conversion's 0.98%, which measure as acceptance-neutral).
+    double rel_l2 = 0.0;
+    bool ok() const {
+        return !vals.empty() && !scale.empty() && !off.empty();
+    }
+};
+
+// Re-quantize any GGUF tensor onto the 2-bit per-32 grid.  Returns false for
+// shapes the store cannot hold (K not a multiple of 32).
+bool w2_pack_any(uint32_t ggml_type, const void * src, int K, int N, w2t & out);
+
 } // namespace si
