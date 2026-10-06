@@ -656,6 +656,11 @@ head 已经不再上传它。`d_segs_aux` 的 fp32 回落仍然保留，但只�
 `mtp_concat`/`mtp_capture`、`mtp_argmax.cpp` 的 `mtp_argmax`/`mtp_cand`/`mtp_gather`、以及
 `nat_gemm_launch` 的批量原生精度 GEMM）见 [03-kernels.md](03-kernels.md)，本文不重复。
 
+> **DFlash2**（`--spec-type dflash2`）复用本节描述的 verify/rollback/accept
+> （`mtp_verify`），只有 draft 那一半是新的：它一次非因果前向产出整块候选，由 selector
+> lattice 在主机侧走出一条路径。引擎侧在 `src/engine/engine_dflash.cpp`，见
+> [设计 14](14-dflash2.md)。
+
 ### 12.1 两个硬门控
 
 MTP 需要 GGUF 里有一个额外的**全注意力块** `blk.<n_layer>.*`（由

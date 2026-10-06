@@ -606,6 +606,11 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 批量前向验证。27B 参考模型带 `qwen35.nextn_predict_layers == 1` 与 `blk.<n_layer>.nextn.*`；
 0.8B 不带，所以那里的 `--mtp` 是空操作。
 
+> 第二个草稿器 **DFlash2**（`--spec-type dflash2`）与 MTP 的 verify/rollback/accept 那一半
+> 完全共用（`engine_mtp.cpp` 的 `mtp_verify`），只有 draft 那一半不同：它一次**非因果**前向
+> 产出整块候选，由 selector lattice 在主机侧走出一条连贯路径。见
+> [设计 14](design/14-dflash2.md)。
+
 ### 12.1 结构
 
 * **MTP 层是一个完整的 full-attention qwen35 block**，输入是

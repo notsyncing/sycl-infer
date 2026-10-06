@@ -21,6 +21,7 @@
 | 12 | [design/11-qwen35-model.md](design/11-qwen35-model.md) | Qwen3.5 混合架构（Gated DeltaNet + full attention）的加载与执行 |
 | 13 | [design/12-build-and-testing.md](design/12-build-and-testing.md) | 构建系统（含 AOT）、测试矩阵、验证流程、调试手册（27B 案例分析）与经验教训、实测数字的归档位置 |
 | 14 | [design/13-audio-video.md](design/13-audio-video.md) | 音频与视频输入：解码、音频编码塔、视频/音频 M-RoPE、混合 prompt 装配 |
+| 15 | [design/14-dflash2.md](design/14-dflash2.md) | DFlash2 块草稿器：块扩散前向、动态卷积、selector lattice、verify 定价、与参考实现逐元素对比 |
 
 ## 快速定位
 
@@ -31,7 +32,8 @@
 * 想理解图捕获与模式 0/1/2 → [design/04-engine.md](design/04-engine.md)
 * 想看设备选择 / CPU 后端 / 多设备（`--device`、`--layer-map`）→ [architecture.md §11](architecture.md)、[design/04-engine.md §11](design/04-engine.md)
 * 想动权重存储（u4 / k5 / cb4 / 2-bit）或多设备 oneDNN 权重路径 → [design/02-quantization.md](design/02-quantization.md)、[design/03-kernels.md §5](design/03-kernels.md)
-* 想动 MTP / 投机解码 → [design/04-engine.md §12](design/04-engine.md)、[design/03-kernels.md §15](design/03-kernels.md)
+* 想动 MTP / 投机解码 → [design/04-engine.md §12](design/04-engine.md)、[design/03-kernels.md §15](design/03-kernels.md)、[design/14-dflash2.md](design/14-dflash2.md)
+* 想动 DFlash2 块草稿器（卷积下标、RoPE 宽度、lattice、top-k）→ [design/14-dflash2.md](design/14-dflash2.md)
 * 想让 prefill 更快（batch 形状、oneDNN prefill attention）→ [design/04-engine.md §7](design/04-engine.md)、[design/03-kernels.md §5.8](design/03-kernels.md)、[design/03-kernels.md §7.5](design/03-kernels.md)
 * 想调优内存/前缀缓存 → [design/05-kv-cache.md](design/05-kv-cache.md)、[design/06-prefix-cache.md](design/06-prefix-cache.md)
 * 环境变量总表 → [AGENTS.md](../AGENTS.md#environment-variables)

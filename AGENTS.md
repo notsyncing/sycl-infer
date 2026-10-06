@@ -1335,6 +1335,52 @@ breakdown must be checked against an independent total before it is believed**;
 `devspan` exists for exactly that, and `sum ≈ devspan` should have been the first
 thing printed rather than the last thing added.
 
+**The verify is at its structural floor - measured, not assumed.**  A `k` sweep
+prices it to 0.1 ms against the weight-stream model:
+
+    k          1      2      3      5      7
+    verify   71.9   76.3   80.0   90.8  105.0 ms
+
+i.e. 72.2 ms fixed + ~5.5 ms per extra row, and `53.93 (streaming) + 3.67 x
+(k) + ~18.5 (non-GEMM) = 90.8` at k=5.  The fixed part is one plain decode's
+weight pass.  The one thing that had cost 210 ms on the MTP path - an ungraphed
+direct replay - is **not** happening here: DFlash's verify goes through
+`mtp_verify`'s recorded graphs and it is live (`PF_DFLASH_VFCHK` prints
+`vf_dec_ok`, the row count and the graph count: 1, 6, 378).  So the only two
+levers left are fewer weight bytes and a faster dp4a, and both are already
+priced and rejected above (`PF_W4_K5` -5.7% at 4.60% mean weight error,
+`PF_W4_ALL` -29% bytes at ~8x error; DPAS 16-24x the issue rate and 37x slower
+in a real GEMM).  **Do not re-derive either.**
+
+**The one genuinely slow kernel is the draft's top-k, and it is 100x off the
+floor.**  The readout does a top-16 over `[M=6][n_vocab=248320]` logits - 5.96 MB -
+and measured **2.06 ms**, about 2.8 GB/s where the floor is ~300 GB/s.  It is not
+the obvious suspect: transposing the per-lane top-K SLM lists from `[tid][k]` to
+`[k][tid]` removes a real 16-way bank conflict (stride-16 floats put all 256
+lanes on two banks, hit on every one of ~970 element compares *and* 16x per
+reduction round) and changes nothing, 2.06 -> 2.11 ms.  It was **six workgroups on
+a 512-EU GPU**: one workgroup per row is all the parallelism `M=6` allows.
+`df_topk_launch` now reduces `S` slices per row into `[M][S][K]` partials and
+merges them with one more workgroup per row; `PF_DFLASH_SLICES` overrides `S`.
+
+Two things about that implementation are worth not re-deriving.  The slices must
+be **one launch** covering `M*S` workgroups with the bounds computed from the
+group index - the first version submitted one kernel per slice so the bounds
+could be literal, which serialized the work (each submit still had only 6
+workgroups) and measured **8.0 ms, 4x worse** than the original.  And the
+optimum is **not** the occupancy-maximising value: `S=1/8/32/64/128/256` measures
+`2.09/1.39/1.52/1.69/1.70/1.67 ms`, so `S=8` ships.  Past 8 the merge and its
+`S*K` candidates cost more than the parallelism buys, which is the tell that the
+kernel is **latency-bound on its per-lane SLM insertion chain**, not
+bandwidth-bound - 1.39 ms for 5.96 MB is still ~4 GB/s.  A real rewrite would be
+a per-lane threshold in a register plus a warp-ballot merge, not more slices.
+Net: topk 2.06 -> 1.39 ms, draft 28.0 -> 26.9 ms, cycle 122.9 -> 121.8 ms, output
+byte-identical.
+
+The draft's readout tail also looked like 5.7 ms of host work and is 1.8 ms of
+device work (`PF_DFLASH_TOPTIME` vs `PF_DFLASH_DTTAIL`); the lattice walk itself
+is free (0.001 ms), so the whole tail is the two kernels and the blocking wait.
+
 The verify, by contrast, is unchanged and still done: 91.6 ms = 72.2 + 4.75 x (k-1),
 i.e. one plain decode's weight pass plus 4 ms per extra row, and see the
 DPAS/pipelining sections above for why neither is movable.
@@ -1650,7 +1696,14 @@ that localised the `do_split` bug).
 
 **DFlash2 diagnostics** (all default off; see the DFlash2 section above for what
 each one is compared against)
-`PF_DFLASH_DEBUG` (master switch for the probes below), `PF_DFLASH_SEGTIME` (device-side
+`PF_DFLASH_DEBUG` (master switch for the probes below), `PF_DFLASH_VFCHK` (is the
+verify using `mtp_verify`'s recorded command graphs, and with how many rows and
+graphs - the direct replay cost 210 ms on the MTP path, so this is the first
+question), `PF_DFLASH_TOPTIME` (device-side split of the draft's readout tail into
+topk / selector-hidden / selector, against the host wall), `PF_DFLASH_DTTAIL` (the
+same tail host-side: block vs blocking copy vs the lattice walk),
+`PF_DFLASH_SLICES` (top-k slices per row; default 8, the measured optimum, and
+*not* the occupancy-maximising value), `PF_DFLASH_SEGTIME` (device-side
 segment timing, all 5 layers: `anorm/acproj/aconv0/attn | ffn_norm+cproj+cconv /
 gate_up / down+cconv`, plus `sum` against `devspan` and the host wall - the last
 of which is the check that makes the rest trustworthy; needs the queue's

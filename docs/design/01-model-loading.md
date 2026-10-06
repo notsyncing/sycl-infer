@@ -280,6 +280,10 @@ fp32 dequant GEMV**：记录在 `engine_graph.cpp:301-306` 注释里的实测是
 
 ### 5.3 `mtp_layer_t`（`model.h:73-88`）
 
+> DFlash2 草稿器是**另一个 GGUF**，不在本节：`src/model/dflash.{h,cpp}` 加载
+> `--spec-draft-model` 指向的草稿模型，绑定它自己的张量（词表/embedding/LM head 借目标）。
+> 见 [设计 14](14-dflash2.md)。
+
 MTP/NextN 草稿头，**只有 `hp.n_mtp > 0` 时才绑定**（`m.has_mtp = true`），否则所有字段为空、
 `model::build_w8` / `setup_md_dnnl` 的 `if (mtp_on)` 分支根本不会走到它：
 
@@ -346,8 +350,12 @@ int8 副本。格式与数学见 [02-quantization.md](02-quantization.md)。这�
 | `--kv-type T` | KV 存储类型 `i4\|i8\|bf16\|f16\|f32`，或 `K:V` 分别指定（如 `i4:i8`）（覆盖 `PF_KV_TYPE`） | i8 |
 | `--mmproj <gguf>` | 视觉 projector（`--image` / `--video` 需要） | 空 |
 | `--audio-mmproj <gguf>` | 音频塔（`--audio` 需要，单独加载第二个 GGUF） | 空 |
-| `--mtp [N]` | MTP/NextN 投机草稿长度；**长度可选**，裸 `--mtp` = 4（引擎侧再把 >12 截到 12） | 关（env `PF_MTP` 可覆盖） |
-| `--mtp-device N` | 草稿层（含它的 KV slice）落在哪个设备分区 | 0（env `PF_MTP_DEV`） |
+| `--spec-type T` | 投机解码类型 `none\|mtp\|dflash2`（llama.cpp 的拼法） | 关（env `PF_SPEC_TYPE`） |
+| `--spec-draft-model <gguf>` | DFlash2 草稿 GGUF（`--spec-type dflash2` 需要） | 空 |
+| `--spec-draft-n-max N` | 每 cycle 的草稿 token 数（DFlash2） | 5（env `PF_DFLASH_NMAX`） |
+| `--spec-draft-device N` | 草稿跑在哪个设备分区 | 0（env `PF_MTP_DEV` / `PF_DFLASH_DEV`） |
+| `--mtp [N]` | `--spec-type mtp --spec-draft-n-max N` 的别名；**长度可选**，裸 `--mtp` = 4（引擎侧再把 >12 截到 12） | 关（env `PF_MTP` 可覆盖） |
+| `--mtp-device N` | `--spec-draft-device` 的别名 | 0（env `PF_MTP_DEV`） |
 | `--host H` / `--port N` | serve 绑定 | 0.0.0.0 / 8080 |
 | `--prompt <text>` / `--raw` | `gen` 提示词 / 原样发送（不套 chat 模板） | 空 / off |
 | `--thinking`（别名 `--enable-thinking`） | `gen` 传给 chat 模板的 `enable_thinking` | off |

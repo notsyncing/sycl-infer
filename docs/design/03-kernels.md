@@ -965,3 +965,46 @@ logits 内的 token，`ids[0]` 恒为源行的精确 argmax，所以受限 argma
 `PF_MTP_CANDM` = margin、`PF_MTP_CANDSRC` = 1 从 draft 自己的第一步取种子、0 从 verify 的 bonus 行取、
 `PF_MTP_CANDDBG` 打逐步命中率、`PF_MTP_CANDV` 顺带返回所选 logit）；这机制是给更好的候选来源
 （低秩预筛、或者更粗的 draft head）准备的。
+
+---
+
+## 16. DFlash2 块草稿器 kernel（`dflash.cpp`）
+
+`src/backend/gpu/kernels/dflash.cpp` 的 launch API：目标 hidden 的分层捕获、动态卷积、
+草稿 LM head、top-k 与 selector lattice。整体设计、几何推导与性能在
+[设计 14](14-dflash2.md)，这里只列 launch 面。
+
+| launcher | 作用 |
+|---|---|
+| `df_capture_launch` | 按目标层把一层的 post-norm+RoPE hidden 拷到交错特征缓冲的一个 slot |
+| `df_conv_launch` | grouped dynamic depthwise conv（attn/FFN 各两处，side=0/1） |
+| `df_gemm_head` | 草稿读出：共享的目标 LM head |
+| `df_topk_launch` | `[M][n_vocab]` logits 的逐行 top-K，**两段式**（切片 + 合并） |
+| `df_sel_launch` | selector lattice：`[M][K + K*K]` 的边权 |
+
+### 16.1 `df_topk_launch` 的两段式切分
+
+原始实现是一个 workgroup/行，top-16 的每 lane 私有表放在 SLM。对 `[M=6][n_vocab=248320]`
+（5.96 MB）实测 **2.06 ms ≈ 2.8 GB/s**，地板约 300 GB/s——即 512 个 EU 上只起了 6 个工作组。
+
+现在每行切成 `S` 片（`PF_DFLASH_SLICES`，默认 8），一次 launch 覆盖 `M*S` 个工作组、各自
+归约成 `[M][S][K]` 的 partial，再由一个 workgroup/行合并。两点：
+
+* **切片必须在一次 launch 里**，边界由 group 下标算。第一个版本每片单独 submit（好让边界是
+  字面量），结果把工作串行化了（每次 submit 仍然只有 6 个工作组），实测 8.0 ms，**比原版差 4×**。
+* **最优值不是占满机器的那个**：`S=1/8/32/64/128/256` → `2.09/1.39/1.52/1.69/1.70/1.67 ms`。
+  超过 8 之后合并本身比多出来的并行更贵，说明 kernel 卡在每 lane SLM 插入链的**延迟**上而
+  不是带宽上（1.39 ms 跑 5.96 MB 仍然只有 ~4 GB/s）。真要重写应该是每 lane 一个寄存器阈值
+  + warp ballot 合并，不是更多切片。
+
+> SLM 表从 `[tid][k]` 转置成 `[k][tid]` 可以消掉一个真实的 16 路 bank conflict
+> （stride 16 个 float 让 256 个 lane 落在两个 bank 上），实测 **2.06 → 2.11 ms，毫无变化**。
+> 那个转置是对的，但不是成本所在——这是"先试显然的东西"的典型。
+
+### 16.2 `df_conv_launch` 的两个镜像轴序
+
+base 张量是 **channel 最内**（`(c,t) = c + width*t`），dynamic 张量是 **token 最内**
+（`(g,t,side) = g + n_groups*t + side*n_groups*conv_k`）。详见
+[设计 14 §3](14-dflash2.md)。
+
+---

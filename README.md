@@ -93,6 +93,15 @@ model type is selected through the architecture registry.
   greedy-equivalent.  Requires a GGUF with a `blk.<n>.nextn.*` head *and* a
   multi-device oneDNN int8 partition, and it does not compose with batching, so
   the server keeps it off by default.
+* **DFlash2 block drafter (`--spec-type dflash2`)** — a second speculative
+  drafter, structurally different from MTP: the draft GGUF's own 5-layer head runs
+  **one non-causal forward** over `[anchor, MASK x (n_max)]` and a selector scores
+  the top-K candidate sets per block position plus every ordered pair, so the host
+  walks one coherent path through the lattice instead of re-drawing per token.
+  Measured **2.17x** single-request decode on the 27B (31.5 vs ~68 ms/token at
+  `n_max=5`), with acceptance matching llama.cpp at the same `n_max`.  Needs a
+  matching draft GGUF via `--spec-draft-model`.  See
+  [Design 14](docs/design/14-dflash2.md).
 * **Per-GPU tuning profiles** — every launch constant that was measured on a
   particular card lives in that card's profile (`src/device/profiles/<card>.cpp`,
   selected from the reported device name), so an unknown GPU warns loudly instead
@@ -169,8 +178,12 @@ Common flags:
 | `--device cpu\|gpu\|auto` | auto (gpu) | compute backend; `auto` reads `PF_DEVICE` |
 | `--cpu-threads N` | physical cores | CPU backend worker threads (`0` = auto) |
 | `--layer-map L:dev,...` | – | pipeline-parallel layer placement, e.g. `0-31:gpu.0,32-63:gpu.1` |
-| `--mtp [N]` | 4 | MTP (NextN) speculative draft length, `0` = off; see the note below |
-| `--mtp-device N` | 0 | device partition the MTP draft layer and its KV slice run on |
+| `--spec-type T` | `none` | speculative decoding: `none` / `mtp` / `dflash2` |
+| `--spec-draft-model <gguf>` | – | DFlash2 drafter GGUF (`--spec-type dflash2`); it reads the target's hidden states at the layers its `dflash.target_layers` names and proposes up to `dflash.block_size`-1 tokens |
+| `--spec-draft-n-max N` | 5 | draft tokens per cycle (DFlash2); the measured optimum |
+| `--spec-draft-device N` | 0 | device partition the draft runs on |
+| `--mtp [N]` | 4 | alias for `--spec-type mtp --spec-draft-n-max N` |
+| `--mtp-device N` | 0 | alias for `--spec-draft-device` |
 | `--pc-vram-mb N` | – | VRAM (device) prefix-cache budget, converted to a checkpoint count |
 | `--pc-ram-mb N` | 512 | host-RAM prefix-cache budget (`0` disables the RAM tier) |
 | `--pc-dir DIR` | – | enable the disk prefix-cache tier in `DIR` (model-scoped) |
@@ -186,6 +199,11 @@ Common flags:
 (`blk.<n>.nextn.*`) *and* a multi-device oneDNN int8 partition (`--layer-map` over
 GPUs with `PF_DP4A` on).  If either is missing the engine prints one `[mtp]` line
 and stays on the plain decode; the draft length is also capped at 12.
+
+`--spec-type dflash2` needs a matching draft GGUF (`--spec-draft-model`) that
+carries the block-drafter tensors (`dflash.block_size`, `dflash.target_layers`);
+without one the engine stays on the plain decode.  It has no multi-device
+partition requirement — the draft runs on `--spec-draft-device`.
 
 HTTP endpoints:
 
@@ -363,6 +381,39 @@ the acceptance is identical), and neither is its bytes (`PF_MTP_HEAD_W2=1`, a 2-
 head store at 0.375 B/weight, is a wash: -2.6 ms/cycle for -2 % acceptance,
 because that GEMV is not bandwidth-bound).
 
+### DFlash2 block drafter (`--spec-type dflash2`)
+
+Single-request greedy decode on the same box and model.  `n_max` is the number of
+draft tokens per cycle (`acc` is accepted drafts per cycle, so the ceiling on
+speedup is `1 + acc`); each cell is one process per configuration, and the plain
+decode on the same build is **~68 ms/token**:
+
+| `n_max` | 1 | 2 | 3 | 4 | **5** | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| acc | 0.98 | 1.44 | 2.18 | 2.54 | **2.90** | 2.90 |
+| ms/token | 48.6 | 41.9 | 34.1 | 32.5 | **31.5** | 33.3 |
+
+**`n_max=5` is the shipped default: 2.90 accepted drafts per cycle, 31.5 ms/token,
+2.17x over the plain decode.**  Acceptance against llama.cpp at the same `n_max`
+(short prompt, mean accepted tokens per cycle):
+
+| generated | 32 | 116 | 227 |
+|---|---:|---:|---:|
+| llama.cpp | 4.43 | 3.96 | 4.13 |
+| this engine | 4.75 | 3.90 | 3.92 |
+
+On a 204-token prompt both engines drop (llama.cpp 0.239 / mean 2.07, this engine
+0.81 / 1.81), so the long-context gap is ~12 %, not a structural difference.
+
+Where the 122 ms cycle goes at `n_max=5`: `verify=90.9`, `draft=26.9`,
+`inject=1.5`, `emit=1.5`, `rollback=1.0`.  **The verify is already at its
+structural floor** — a `n_max` sweep prices it at 72.2 ms fixed plus ~5.5 ms per
+extra row, which the weight-stream model predicts to 0.1 ms — and it runs on the
+recorded command graphs (378 of them), not the direct replay that cost 210 ms on
+the MTP path.  The remaining levers are fewer weight bytes and a faster dp4a, and
+both are already measured and rejected on accuracy grounds.  Details in
+[Design 14 §7](docs/design/14-dflash2.md).
+
 ## Configuration
 
 Runtime behavior is controlled by environment variables.  The most useful ones:
@@ -390,6 +441,10 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_K5` | on | store Q5_K as the native 5-bit (nibble + bit) planes; `0` keeps int8 |
 | `PF_MTP` | – | draft length for `--mtp` (overrides the flag) |
 | `PF_MTP_SERVER` | off | `1` routes greedy server requests into the single-sequence MTP loop instead of the batching scheduler |
+| `PF_DFLASH_NMAX` | 5 | draft tokens per cycle for `--spec-type dflash2` (overrides `--spec-draft-n-max`) |
+| `PF_DFLASH_TIME` | off | DFlash2 cycle phase breakdown in ms |
+| `PF_DFLASH_SEGTIME` | off | device-side breakdown of the draft block forward (needs `PF_DFLASH_DEBUG`-free; see `AGENTS.md`) |
+| `PF_DFLASH_SLICES` | 8 | top-k slices per row; the measured optimum, *not* the occupancy-maximising value |
 | `PF_DEVICE_PROFILE` / `PF_DEVICE_INFO` | – | pin a tuning profile / dump the resolved one with its provenance |
 
 The full tuning/diagnostics knob list and internals are documented in
