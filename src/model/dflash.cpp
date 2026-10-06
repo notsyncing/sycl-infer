@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <stdexcept>
+
 #include "common/env.h"
 
 namespace si {
@@ -212,11 +213,14 @@ size_t dflash_model::bytes() const {
     add(sel_prev);
     add(sel_next);
     for (const auto & L : layers) {
-        const char * tyn[9] = {"wq", "wk", "wv", "wo", "fgate", "fup", "fdown", "acproj", "fcproj"};
-        const wt * tw[9] = {&L.wq, &L.wk, &L.wv, &L.wo, &L.ffn_gate, &L.ffn_up, &L.ffn_down, &L.attn_conv_proj,
-                            &L.ffn_conv_proj};
-        for (int i = 0; i < 9; i++) {
-            fprintf(stderr, "[dflash] %-7s type=%d K=%d N=%d\n", tyn[i], (int)tw[i]->type, tw[i]->K, tw[i]->N);
+        // PF_W4_INFO-style per-tensor dump is on whenever PF_W4_INFO is set
+        if (si::env::flag("PF_W4_INFO")) {
+            const char * tyn[9] = {"wq", "wk", "wv", "wo", "fgate", "fup", "fdown", "acproj", "fcproj"};
+            const wt * tw[9] = {&L.wq, &L.wk, &L.wv, &L.wo, &L.ffn_gate, &L.ffn_up, &L.ffn_down, &L.attn_conv_proj,
+                                &L.ffn_conv_proj};
+            for (int i = 0; i < 9; i++) {
+                fprintf(stderr, "[dflash] %-7s type=%d K=%d N=%d\n", tyn[i], (int)tw[i]->type, tw[i]->K, tw[i]->N);
+            }
         }
         add(L.wq);
         add(L.wk);

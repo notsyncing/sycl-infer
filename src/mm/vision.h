@@ -106,7 +106,6 @@ struct vision_model {
     void * dev_weights = nullptr;
     size_t dev_weights_size = 0;
     void upload(sycl::queue & q);
-    ~vision_model();
     const void * dev_ptr(const void * host_ptr) const {
         return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
     }

@@ -919,14 +919,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         // injects from.  It must come after the device handoff above (d_x belongs
         // to this layer's device) and before any kernel can overwrite d_x.
         static const bool df_nocap = si::env::flag("PF_DFLASH_NOCAP");
-        if (dflash_on_ && d_df_feat && !df_nocap) {
+        if (dfl.dflash_on_ && dfl.d_df_feat && !df_nocap) {
             const int df_slot = df_tgt_slot(il);
             if (df_slot >= 0) {
                 // slot stride is n_feat (the whole interleaved row), NOT n_embd:
                 // with n_tgt_layer slots the latter makes every slot alias slot 0,
                 // and the draft then reads one layer's hidden state five times.
-                df_capture_launch(dev_queue(dev), d_x, d_df_feat + (size_t)df_slot * hp.n_embd, T, hp.n_embd,
-                                  dfm_->hp.n_feat);
+                df_capture_launch(dev_queue(dev), d_x, dfl.d_df_feat + (size_t)df_slot * hp.n_embd, T, hp.n_embd,
+                                  dfl.dfm_->hp.n_feat);
             }
         }
         const auto a_n = tnow();
@@ -958,15 +958,15 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 static int cnt = 0;
                 if (cnt++ < 4) {
                     fprintf(stderr, "[mtp] infochk rf: mtp_dt=%d pc_active=%d dev=%d nhist=%zu hist=%p\n", inf->mtp_dt,
-                            inf->pc_active, dev, d_mtp_hist_.size(), (void *)d_mtp_hist_[(size_t)dev]);
+                            inf->pc_active, dev, mtp.d_mtp_hist_.size(), (void *)mtp.d_mtp_hist_[(size_t)dev]);
                 }
             }
-            if (inf->mtp_dt && (size_t)dev < d_mtp_hist_.size() && d_mtp_hist_[(size_t)dev] != nullptr) {
+            if (inf->mtp_dt && (size_t)dev < mtp.d_mtp_hist_.size() && mtp.d_mtp_hist_[(size_t)dev] != nullptr) {
                 // Same [slot][layer][gdn|conv] layout the prefix-cache checkpoints
                 // use: conv_state_update writes at layer_off + gdn_per, so the
                 // conv plane must exist per layer or it would land in the NEXT
                 // layer's GDN snapshot and corrupt the rollback state.
-                snap.base = d_mtp_hist_[(size_t)dev];
+                snap.base = mtp.d_mtp_hist_[(size_t)dev];
                 snap.stride = (int64_t)n_gdn_dev_[(size_t)dev] * ((int64_t)gdn_per + (int64_t)conv_per);
                 snap.layer_off = (int64_t)gl * ((int64_t)gdn_per + (int64_t)conv_per);
                 snap.gdn_per = (int32_t)gdn_per;
@@ -1047,16 +1047,16 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 stamp(prof_acc[13], a_sub);
                 a_sub = tnow();
             }
-            if (inf->mtp_dt && (size_t)dev < d_mtp_rin_.size() && d_mtp_rin_[(size_t)dev] != nullptr) {
+            if (inf->mtp_dt && (size_t)dev < mtp.d_mtp_rin_.size() && mtp.d_mtp_rin_[(size_t)dev] != nullptr) {
                 // MTP spec verify: keep this layer's per-token recurrence inputs
                 // so the commit can replay the accepted tokens on the restored
                 // state (the engine's per-token state snapshot is not reliable).
-                const int nsv = std::min(T, mtp_nsnap);
+                const int nsv = std::min(T, mtp.mtp_nsnap);
                 const int cvd = hp.qkv_dim();
                 const int dtr = hp.dt_rank;
-                const size_t st = (size_t)mtp_nsnap;
-                float * rb = d_mtp_rin_[(size_t)dev] + (size_t)gl * st * (size_t)(cvd + 2 * dtr);
-                float * qs = d_mtp_qsave_[(size_t)dev] + (size_t)gl * st * (size_t)cvd;
+                const size_t st = (size_t)mtp.mtp_nsnap;
+                float * rb = mtp.d_mtp_rin_[(size_t)dev] + (size_t)gl * st * (size_t)(cvd + 2 * dtr);
+                float * qs = mtp.d_mtp_qsave_[(size_t)dev] + (size_t)gl * st * (size_t)cvd;
                 cur_be->mtp_capture(d_qkv, qs, 1, nsv * cvd);
                 cur_be->mtp_capture(d_conv_out, rb, 1, nsv * cvd);
                 cur_be->mtp_capture(d_alpha, rb + st * (size_t)cvd, 1, nsv * dtr);
@@ -1247,11 +1247,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // global tensors (output norm, LM head) live on the primary device
     cur_be = &backend();
     cur_be->rmsnorm(d_x, out_norm, d_xnorm, T, hp.n_embd, hp.rms_eps);
-    if (mtp_on && d_mtp_main_h) {
+    if (mtp.mtp_on && mtp.d_mtp_main_h) {
         // the MTP head applies its own hnorm to the *pre*-output-norm trunk
         // hidden (llama.cpp: t_h_pre_norm), so capture d_x here, on the device
         // and in order, before any other kernel can reuse the scratch.
-        cur_be->mtp_capture(d_x, d_mtp_main_h, T, hp.n_embd);
+        cur_be->mtp_capture(d_x, mtp.d_mtp_main_h, T, hp.n_embd);
     }
     if (mode != 0) {
         cur_be->copy_row(d_xnorm, d_last_hidden, inf, hp.n_embd, -1);
@@ -1425,20 +1425,20 @@ void engine::build_plans() {
     if (multi_dev) {
         bind_acts(0);
     }
-    if (mtp_on || dflash_on_) {
+    if (mtp.mtp_on || dfl.dflash_on_) {
         // Verify plan: the main model over n = k+1 tokens (mode 2, one chunk row)
         // with the LM head batched over every row, so d_logits gets the
         // per-draft-position distributions the acceptance compares.  Shared by
         // the MTP and DFlash drafters.
-        plan_vf_ = build_plan(kMaxT, kMaxT, /*head_batched=*/true, /*use_w8=*/true, /*with_head=*/true);
-        plan_vf_.finalize();
-        if (plan_vf_.segs.size() > 4096) {
+        mtp.plan_vf_ = build_plan(kMaxT, kMaxT, /*head_batched=*/true, /*use_w8=*/true, /*with_head=*/true);
+        mtp.plan_vf_.finalize();
+        if (mtp.plan_vf_.segs.size() > 4096) {
             throw std::runtime_error("segment buffer too small (verify plan)");
         }
-        d_segs_vf = alloc_elems<gemv_seg>(plan_vf_.segs.size());
-        q.memcpy(d_segs_vf, plan_vf_.segs.data(), plan_vf_.segs.size() * sizeof(gemv_seg)).wait();
+        mtp.d_segs_vf = alloc_elems<gemv_seg>(mtp.plan_vf_.segs.size());
+        q.memcpy(mtp.d_segs_vf, mtp.plan_vf_.segs.data(), mtp.plan_vf_.segs.size() * sizeof(gemv_seg)).wait();
         bind_acts(0);
-        if (mtp_on) {
+        if (mtp.mtp_on) {
             build_mtp_plan();
         }
     }
@@ -1515,7 +1515,7 @@ void engine::replay_md_dec_graphs() {
 // ---------------------------------------------------------------------------
 // The MTP verify pass, recorded the same way as the decode.
 //
-// The verify is a mode-2 batch over mtp_k+1 rows: a *fixed* shape, executed
+// The verify is a mode-2 batch over mtp.mtp_k+1 rows: a *fixed* shape, executed
 // every cycle with the same plan, the same segment count and the same buffers,
 // so it is the ideal command-graph payload - everything that varies per cycle
 // (token ids, positions, slots, n_real, the KV page table) is read from
@@ -1541,13 +1541,13 @@ void engine::build_md_verify_graphs() {
         const char * e = si::env::str("PF_ATTN_XMX_MIN");
         return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
     }();
-    // The verify runs draft_len + 1 rows.  For MTP that is mtp_k + 1, but DFlash2
-    // has its own (CLI-tunable) draft length and leaves mtp_k at 0 - using it here
+    // The verify runs draft_len + 1 rows.  For MTP that is mtp.mtp_k + 1, but DFlash2
+    // has its own (CLI-tunable) draft length and leaves mtp.mtp_k at 0 - using it here
     // recorded a 1-row graph that vf_graph_usable() then rejected for every
     // 4-row verify, so the whole cycle replayed directly with no graph at all.
-    const int rows = (dflash_on_ ? df_k_ : mtp_k) + 1;
+    const int rows = (dfl.dflash_on_ ? dfl.df_k_ : mtp.mtp_k) + 1;
     vf_dec_rows = rows;
-    if (!d_segs_vf || nog || rows <= 0 || plan_vf_.segs.empty()) {
+    if (!mtp.d_segs_vf || nog || rows <= 0 || mtp.plan_vf_.segs.empty()) {
         return;
     }
     // phase split: one graph per contiguous device run, the head on the primary
@@ -1576,7 +1576,7 @@ void engine::build_md_verify_graphs() {
     d_info->pc_active = 1;
     d_info->mtp_dt = 1;
     d_info->mtp_dry = 1;
-    for (int t = 0; t < mtp_nsnap && t < kPcMapLen; t++) {
+    for (int t = 0; t < mtp.mtp_nsnap && t < kPcMapLen; t++) {
         d_info->pc_row_slot[t] = t;
     }
     vf_dec_.clear();
@@ -1588,7 +1588,7 @@ void engine::build_md_verify_graphs() {
         mg.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(qd.get_context(), qd.get_device());
         mg.g->begin_recording(qd);
         try {
-            record_forward(2, plan_vf_, d_segs_vf, rows, d_segs_vf, 0, &ph);
+            record_forward(2, mtp.plan_vf_, mtp.d_segs_vf, rows, mtp.d_segs_vf, 0, &ph);
             mg.g->end_recording();
             mg.e = std::make_unique<sx::command_graph<sx::graph_state::executable>>(mg.g->finalize());
         } catch (const std::exception & ex) {
@@ -1646,7 +1646,7 @@ void engine::replay_md_verify_graphs() {
         if (vf_dec_[i].e) {
             dev_queue(ph.dev).ext_oneapi_graph(*vf_dec_[i].e);
         } else {
-            record_forward(2, plan_vf_, d_segs_vf, vf_dec_rows, d_segs_vf, 0, &ph);
+            record_forward(2, mtp.plan_vf_, mtp.d_segs_vf, vf_dec_rows, mtp.d_segs_vf, 0, &ph);
         }
         if (i + 1 < vf_dec_.size() && vf_dec_[i + 1].ph.dev != ph.dev) {
             handoff_x(ph.dev, vf_dec_[i + 1].ph.dev, (size_t)vf_dec_rows);
@@ -1661,7 +1661,7 @@ void engine::build_graphs() {
         if (multi_dev) {
             build_md_dec_graphs();
         }
-        if (mtp_on || dflash_on_) {
+        if (mtp.mtp_on || dfl.dflash_on_) {
             build_md_verify_graphs();
         }
         return;

@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include "common/rope.h"
 #include "kernel_utils.h"
 
 #include <cstdio>
@@ -79,7 +80,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         qh[lane + 32 * i] *= inv * q_norm[lane + 32 * i];
                     }
                     if (lane < n_rot / 2) {
-                        const float ang = rpos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
+                        const float ang = rope_theta(rpos, lane, n_rot, sycl::log2(rope_base));
                         const float c = sycl::cos(ang), s = sycl::sin(ang);
                         const float x0 = qh[lane], x1 = qh[lane + n_rot / 2];
                         qh[lane] = x0 * c - x1 * s;
@@ -100,7 +101,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         khp[lane + 32 * i] *= inv * k_norm[lane + 32 * i];
                     }
                     if (lane < n_rot / 2) {
-                        const float ang = rpos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
+                        const float ang = rope_theta(rpos, lane, n_rot, sycl::log2(rope_base));
                         const float c = sycl::cos(ang), s = sycl::sin(ang);
                         const float x0 = khp[lane], x1 = khp[lane + n_rot / 2];
                         khp[lane] = x0 * c - x1 * s;

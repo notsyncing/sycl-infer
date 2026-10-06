@@ -34,6 +34,8 @@ struct cpu_step_info {
     int32_t n_rows;
     int32_t n_real;
     int32_t tpb;
+    // per-row real token count for chunk-batched prefill (mirror of step_info)
+    int32_t n_real_row[16];
     int32_t pos[16];
     int32_t slot[16];
     int32_t active[16];

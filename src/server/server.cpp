@@ -45,6 +45,57 @@ namespace si {
 
 namespace {
 
+struct lp_fragment {
+    std::string text;
+    float logprob = 0.f;
+    std::vector<std::pair<int, float>> top;
+};
+
+
+// Small helper for the two places that pair a sampled token's logprob with its
+// parser fragment: `on_token` stashes them, `attach` folds them into the next
+// text piece the parser emits and only attaches once.
+struct lp_tracker {
+    int cur_id = -1;
+    float cur_lp = 0.f;
+    std::vector<std::pair<int, float>> cur_top;
+    bool cur_attached = true;
+
+    void on_token(int id, float lp, const std::vector<std::pair<int, float>> & top) {
+        cur_id = id;
+        cur_lp = lp;
+        cur_top = top;
+        cur_attached = false;
+    }
+
+    void attach(lp_fragment & f) {
+        if (!cur_attached && cur_id >= 0) {
+            f.logprob = cur_lp;
+            f.top = cur_top;
+            cur_attached = true;
+        }
+    }
+};
+
+// One parsed response fragment -> the json delta for an SSE chunk.
+// tool_index is the running tool_calls counter (function calls carry it).
+json chat_delta_json(const response_piece & p, int & tool_index, long long & reasoning_tokens) {
+    if (p.kind == response_piece_kind::reasoning) {
+        reasoning_tokens++;
+        return {{"reasoning_content", p.text}};
+    }
+    if (p.kind == response_piece_kind::content) {
+        return {{"content", p.text}};
+    }
+    json call = {{"index", tool_index},
+                 {"id", p.call.id},
+                 {"type", "function"},
+                 {"function", {{"name", p.call.name}, {"arguments", p.call.arguments}}}};
+    tool_index++;
+    return {{"tool_calls", json::array({call})}};
+}
+
+
 // SIGINT/SIGTERM only set this flag (async-signal-safe); a watchdog thread in
 // serve() turns it into srv.stop() so the process unwinds normally (scheduler
 // shutdown, then the engine destructor flushes the prefix cache).
@@ -404,7 +455,7 @@ bool parse_http_url(const std::string & url, std::string & base, std::string & p
 // Download a remote image.  The 10 s timeout and 10 MB cap keep a slow or
 // hostile URL from stalling the handler thread or exhausting memory; the size
 // is enforced by aborting the transfer once the limit is crossed.
-bool fetch_http_image(const std::string & url, std::vector<uint8_t> & bytes, std::string & err) {
+bool fetch_http_bytes(const std::string & url, std::vector<uint8_t> & bytes, std::string & err) {
     std::string base, path;
     if (!parse_http_url(url, base, path, err)) {
         return false;
@@ -484,7 +535,7 @@ bool load_media_bytes(const media_part & part, std::vector<uint8_t> & bytes, std
                 err = "remote media URLs are disabled (PF_MM_URL_FETCH=0)";
                 return false;
             }
-            return fetch_http_image(url, bytes, err);
+            return fetch_http_bytes(url, bytes, err);
         }
         err = "unsupported media URL (expected data:, http:// or https://)";
         return false;
@@ -508,7 +559,7 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
     for (auto & m : body["messages"]) {
         chat_msg cm;
         cm.role = m.value("role", "user");
-        bool has_image = false;
+        bool has_media = false;
         auto add_media = [&](chat_part_kind kind, const std::string & url, const std::string & data,
                              const std::string & format) {
             media_part mp;
@@ -540,7 +591,7 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
                             url = part.value("image", std::string());
                         }
                         add_media(chat_part_kind::IMAGE, url, "", "");
-                        has_image = true;
+                        has_media = true;
                     } else if (type == "video_url" || type == "video") {
                         std::string url;
                         if (part.contains("video_url")) {
@@ -550,7 +601,7 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
                             url = part.value("video", std::string());
                         }
                         add_media(chat_part_kind::VIDEO, url, "", "");
-                        has_image = true;
+                        has_media = true;
                     } else if (type == "input_audio") {
                         std::string data, format;
                         const json & a = part.value("input_audio", json::object());
@@ -559,7 +610,7 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
                             format = a.value("format", std::string());
                         }
                         add_media(chat_part_kind::AUDIO, "", data, format);
-                        has_image = true;
+                        has_media = true;
                     } else if (type == "audio_url") {
                         std::string url, format;
                         if (part.contains("audio_url")) {
@@ -568,7 +619,7 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
                             format = au.value("format", std::string());
                         }
                         add_media(chat_part_kind::AUDIO, url, "", format);
-                        has_image = true;
+                        has_media = true;
                     } else if (part.contains("text") && part["text"].is_string()) {
                         const std::string t = part["text"].get<std::string>();
                         cm.content += t;
@@ -629,7 +680,7 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
         if (m.contains("name") && m["name"].is_string()) {
             cm.name = m["name"].get<std::string>();
         }
-        if (!has_image) {
+        if (!has_media) {
             cm.parts.clear(); // text-only messages keep the plain path
         }
         msgs.push_back(std::move(cm));
@@ -711,11 +762,6 @@ struct stop_filter {
     }
 };
 
-struct lp_fragment {
-    std::string text;
-    float logprob = 0.f;
-    std::vector<std::pair<int, float>> top;
-};
 
 json chat_logprobs_json(const std::vector<lp_fragment> & es, const tokenizer & tk);
 json completion_logprobs_json(const std::vector<sequence::token_out> & toks, const tokenizer & tk);
@@ -755,10 +801,7 @@ void run_text_choice(scheduler & sched, const gen_params & gp, const std::vector
     stop_filter sf(stops);
     const bool collect = gp.wants_logprobs();
     const bool want_lp = gp.logprobs;
-    int cur_id = -1;
-    float cur_lp = 0.f;
-    std::vector<std::pair<int, float>> cur_top;
-    bool cur_attached = true;
+    lp_tracker lp_t;
     response_parser parser(thinking, parse_tools, [&](const response_piece & p) {
         if (p.kind == response_piece_kind::reasoning) {
             out.reasoning_tokens++;
@@ -769,11 +812,7 @@ void run_text_choice(scheduler & sched, const gen_params & gp, const std::vector
         }
         lp_fragment f;
         f.text = p.text;
-        if (!cur_attached && cur_id >= 0) {
-            f.logprob = cur_lp;
-            f.top = cur_top;
-            cur_attached = true;
-        }
+        lp_t.attach(f);
         out.chat_lp.push_back(std::move(f));
     });
     sequence::token_out t;
@@ -782,10 +821,7 @@ void run_text_choice(scheduler & sched, const gen_params & gp, const std::vector
         if (!emit.empty()) {
             if (chat) {
                 if (want_lp) {
-                    cur_id = t.id;
-                    cur_lp = t.logprob;
-                    cur_top = t.top;
-                    cur_attached = false;
+                    lp_t.on_token(t.id, t.logprob, t.top);
                 }
                 parser.feed(emit);
             } else {
@@ -842,51 +878,6 @@ void mm_piece(const std::string & piece, stop_filter & sf, response_parser * par
 }
 
 // Run one multimodal prompt (single-sequence engine path, no scheduler).
-void run_mm_choice(engine & e, const mm_prompt & mp, const gen_params & gp, const std::vector<std::string> & stops,
-                   bool chat, bool thinking, bool parse_tools, choice_out & out) {
-    stop_filter sf(stops);
-    response_parser parser(thinking, parse_tools, [](const response_piece &) {});
-    utf8_stream_buffer ub;
-    auto cb = [&](int tok) -> bool {
-        const std::string piece = ub.push(e.tk.token_piece(tok));
-        if (piece.empty()) {
-            return true;
-        }
-        out.n_gen++;
-        mm_piece(piece, sf, &parser, out, chat);
-        return !sf.stopped;
-    };
-    e.generate_mm(mp, gp, cb);
-    const std::string tail = ub.flush();
-    if (!tail.empty() && !sf.stopped) {
-        mm_piece(tail, sf, &parser, out, chat);
-    }
-    if (!sf.stopped) {
-        const std::string rest = sf.flush();
-        if (!rest.empty()) {
-            mm_piece(rest, sf, &parser, out, chat);
-        }
-    }
-    if (chat) {
-        parser.finish();
-        out.reasoning = parser.reasoning();
-        out.content = parser.content();
-        out.tools = parser.tool_calls();
-    }
-    out.prompt_tokens = (int)mp.tokens.size();
-    if (chat && !out.tools.empty()) {
-        out.finish = "tool_calls";
-    } else {
-        out.finish = sf.stopped ? "stop" : "length";
-    }
-}
-
-// A request can use the MTP loop when the engine loaded a NextN head, the
-// sampling is greedy (the acceptance test is an exact equality against the
-// target's own next token, so a sampled target would need rejection sampling)
-// and nothing else needs the logits machinery (logprobs, n > 1).  The loop owns
-// its sequence's block table and recurrent state, so such a request bypasses
-// the scheduler exactly like the multimodal path.
 // MTP is a *single-sequence* loop: it owns its sequence's block table and
 // recurrent state, so it cannot join the scheduler and running it here means
 // taking the engine for the whole generation.  That is the right trade for one
@@ -904,15 +895,12 @@ bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
         const char * v = si::env::str("PF_MTP_SERVER");
         return v && atoi(v) != 0;
     }();
-    return on && e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
+    return on && e.mtp.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
 }
 
-// Run one text prompt through the single-sequence engine path (no scheduler).
-// Same split of reasoning / content / tool calls as run_mm_choice; the engine
-// routes greedy requests to its MTP draft/verify loop internally.
-void run_mtp_choice(engine & e, const std::vector<int> & prompt, const gen_params & gp,
-                    const std::vector<std::string> & stops, bool chat, bool thinking, bool parse_tools,
-                    choice_out & out) {
+static void run_choice_engine(engine & e, const mm_prompt * mp, const std::vector<int> & prompt, const gen_params & gp,
+                              const std::vector<std::string> & stops, bool chat, bool thinking, bool parse_tools,
+                              choice_out & out) {
     stop_filter sf(stops);
     response_parser parser(thinking, parse_tools, [](const response_piece &) {});
     utf8_stream_buffer ub;
@@ -925,7 +913,11 @@ void run_mtp_choice(engine & e, const std::vector<int> & prompt, const gen_param
         mm_piece(piece, sf, &parser, out, chat);
         return !sf.stopped;
     };
-    e.generate(prompt, gp, cb);
+    if (mp) {
+        e.generate_mm(*mp, gp, cb);
+    } else {
+        e.generate(prompt, gp, cb);
+    }
     const std::string tail = ub.flush();
     if (!tail.empty() && !sf.stopped) {
         mm_piece(tail, sf, &parser, out, chat);
@@ -942,12 +934,23 @@ void run_mtp_choice(engine & e, const std::vector<int> & prompt, const gen_param
         out.content = parser.content();
         out.tools = parser.tool_calls();
     }
-    out.prompt_tokens = (int)prompt.size();
+    out.prompt_tokens = mp ? (int)mp->tokens.size() : (int)prompt.size();
     if (chat && !out.tools.empty()) {
         out.finish = "tool_calls";
     } else {
         out.finish = sf.stopped ? "stop" : "length";
     }
+}
+
+void run_mm_choice(engine & e, const mm_prompt & mp, const gen_params & gp, const std::vector<std::string> & stops,
+                   bool chat, bool thinking, bool parse_tools, choice_out & out) {
+    run_choice_engine(e, &mp, {}, gp, stops, chat, thinking, parse_tools, out);
+}
+
+void run_mtp_choice(engine & e, const std::vector<int> & prompt, const gen_params & gp,
+                    const std::vector<std::string> & stops, bool chat, bool thinking, bool parse_tools,
+                    choice_out & out) {
+    run_choice_engine(e, nullptr, prompt, gp, stops, chat, thinking, parse_tools, out);
 }
 
 // --------------------------------------------------------------- SSE plumbing
@@ -1041,10 +1044,7 @@ void stream_chat_text_choice(std::shared_ptr<sse_session> sc, scheduler & sched,
         int tool_index = 0;
         long long reasoning_tokens = 0;
         const bool want_lp = gp.logprobs;
-        int cur_id = -1;
-        float cur_lp = 0.f;
-        std::vector<std::pair<int, float>> cur_top;
-        bool cur_attached = true;
+        lp_tracker lp_t;
         response_parser parser(thinking, parse_tools, [&](const response_piece & p) {
             json delta;
             json lpj;
@@ -1056,11 +1056,7 @@ void stream_chat_text_choice(std::shared_ptr<sse_session> sc, scheduler & sched,
                 if (want_lp) {
                     lp_fragment f;
                     f.text = p.text;
-                    if (!cur_attached && cur_id >= 0) {
-                        f.logprob = cur_lp;
-                        f.top = cur_top;
-                        cur_attached = true;
-                    }
+                    lp_t.attach(f);
                     lpj = chat_logprobs_json(std::vector<lp_fragment>{std::move(f)}, sched.e.tk);
                 }
             } else {
@@ -1080,10 +1076,7 @@ void stream_chat_text_choice(std::shared_ptr<sse_session> sc, scheduler & sched,
             const std::string emit = sf.feed(t.text);
             if (!emit.empty()) {
                 if (want_lp) {
-                    cur_id = t.id;
-                    cur_lp = t.logprob;
-                    cur_top = t.top;
-                    cur_attached = false;
+                    lp_t.on_token(t.id, t.logprob, t.top);
                 }
                 parser.feed(emit);
             }
@@ -1116,20 +1109,7 @@ void stream_chat_mm_choices(std::shared_ptr<sse_session> sc, engine & e, const m
             int tool_index = 0;
             long long reasoning_tokens = 0;
             response_parser parser(thinking, parse_tools, [&](const response_piece & p) {
-                json delta;
-                if (p.kind == response_piece_kind::reasoning) {
-                    reasoning_tokens++;
-                    delta = {{"reasoning_content", p.text}};
-                } else if (p.kind == response_piece_kind::content) {
-                    delta = {{"content", p.text}};
-                } else {
-                    json call = {{"index", tool_index},
-                                 {"id", p.call.id},
-                                 {"type", "function"},
-                                 {"function", {{"name", p.call.name}, {"arguments", p.call.arguments}}}};
-                    delta = {{"tool_calls", json::array({call})}};
-                    tool_index++;
-                }
+                json delta = chat_delta_json(p, tool_index, reasoning_tokens);
                 sc->q->push("data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, delta, nullptr))
                             + "\n\n");
             });
@@ -1188,20 +1168,7 @@ void stream_chat_mtp_choices(std::shared_ptr<sse_session> sc, engine & e, std::v
             int tool_index = 0;
             long long reasoning_tokens = 0;
             response_parser parser(thinking, parse_tools, [&](const response_piece & p) {
-                json delta;
-                if (p.kind == response_piece_kind::reasoning) {
-                    reasoning_tokens++;
-                    delta = {{"reasoning_content", p.text}};
-                } else if (p.kind == response_piece_kind::content) {
-                    delta = {{"content", p.text}};
-                } else {
-                    json call = {{"index", tool_index},
-                                 {"id", p.call.id},
-                                 {"type", "function"},
-                                 {"function", {{"name", p.call.name}, {"arguments", p.call.arguments}}}};
-                    delta = {{"tool_calls", json::array({call})}};
-                    tool_index++;
-                }
+                json delta = chat_delta_json(p, tool_index, reasoning_tokens);
                 sc->q->push("data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, delta, nullptr))
                             + "\n\n");
             });

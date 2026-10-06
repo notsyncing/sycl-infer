@@ -54,9 +54,9 @@ bool mtp_dbg() {
 void engine::build_mtp_plan() {
     const hparams & hp = m.hp;
     const mtp_layer_t & M = m.mtp;
-    seg_plan & p = plan_mtp_;
+    seg_plan & p = mtp.plan_mtp_;
     p = seg_plan{};
-    dnnl_gemm * D = dnnl_for(mtp_dev);
+    dnnl_gemm * D = dnnl_for(mtp.mtp_dev);
     // PF_MTP_LAYER_EXACT=1 runs the draft's layer on the exact fp32 dequant
     // GEMV, which reads GGUF blocks from the *device* pointer in the segment.
     // In multi-device mode those tensors have no raw device copy at all (oneDNN
@@ -74,23 +74,23 @@ void engine::build_mtp_plan() {
             if (bytes == 0) {
                 continue;
             }
-            raw[i] = dev_alloc_on(mtp_dev, bytes);
-            dev_queue(mtp_dev).memcpy(raw[i], ts[i]->data, bytes).wait();
+            raw[i] = dev_alloc_on(mtp.mtp_dev, bytes);
+            dev_queue(mtp.mtp_dev).memcpy(raw[i], ts[i]->data, bytes).wait();
             bytes_total += bytes;
         }
-        fprintf(stderr, "[mtp] PF_MTP_LAYER_EXACT: raw layer copies on device %d (%.0f MB)\n", mtp_dev,
+        fprintf(stderr, "[mtp] PF_MTP_LAYER_EXACT: raw layer copies on device %d (%.0f MB)\n", mtp.mtp_dev,
                 bytes_total / (1024.0 * 1024.0));
     }
     auto seg = [&](const wt & w, const float * x, int xs, float * out, int os, const float * res, int ri = -1) {
         gemv_seg s{};
-        s.dev = mtp_dev;
-        s.w = multi_dev ? wkey(mtp_dev, w.data) : wptr(0, w.data);
+        s.dev = mtp.mtp_dev;
+        s.w = multi_dev ? wkey(mtp.mtp_dev, w.data) : wptr(0, w.data);
         // w_raw carries the alternate native-store handle for this segment: the
         // 2-bit key (the tensor's host pointer - the w2 map is keyed by it, and
         // the segment's own `w` is the *uploaded device* pointer, which is why
         // the lookup cannot use `w`), or the raw GGUF device pointer under
         // PF_MTP_LAYER_EXACT.  The two are mutually exclusive.
-        s.w_raw = ri < 0 ? nullptr : (mtp_layer_w2_ ? (const void *)w.data : raw[(size_t)ri]);
+        s.w_raw = ri < 0 ? nullptr : (mtp.mtp_layer_w2_ ? (const void *)w.data : raw[(size_t)ri]);
         s.type = w.type;
         s.K = w.K;
         s.n_rows = w.N;
@@ -108,42 +108,42 @@ void engine::build_mtp_plan() {
     };
     // call 0: wq / wk / wv
     p.begin_call(kMaxT, hp.n_embd / 256);
-    p.add(seg(M.wq, d_mtp_xnorm, hp.n_embd, d_mtp_qbuf, hp.n_head * 2 * hp.head_dim, nullptr, 0));
-    p.add(seg(M.wk, d_mtp_xnorm, hp.n_embd, d_mtp_kbuf, hp.n_head_kv * hp.head_dim, nullptr, 1));
-    p.add(seg(M.wv, d_mtp_xnorm, hp.n_embd, d_mtp_vbuf, hp.n_head_kv * hp.head_dim, nullptr, 2));
-    p.set_xq(d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+    p.add(seg(M.wq, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_qbuf, hp.n_head * 2 * hp.head_dim, nullptr, 0));
+    p.add(seg(M.wk, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_kbuf, hp.n_head_kv * hp.head_dim, nullptr, 1));
+    p.add(seg(M.wv, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_vbuf, hp.n_head_kv * hp.head_dim, nullptr, 2));
+    p.set_xq(mtp.d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
     // call 1: wo (+ residual)
     p.begin_call(kMaxT, hp.n_head * hp.head_dim / 256);
-    p.add(seg(M.wo, d_mtp_attn_out, hp.n_head * hp.head_dim, d_mtp_x, hp.n_embd, d_mtp_x, 3));
-    p.set_xq(d_mtp_attn_out, nullptr, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim);
+    p.add(seg(M.wo, mtp.d_mtp_attn_out, hp.n_head * hp.head_dim, mtp.d_mtp_x, hp.n_embd, mtp.d_mtp_x, 3));
+    p.set_xq(mtp.d_mtp_attn_out, nullptr, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim);
     // call 2: ffn_gate + ffn_up
     p.begin_call(kMaxT, hp.n_embd / 256);
-    p.add(seg(M.ffn_gate, d_mtp_xnorm, hp.n_embd, d_mtp_ffn, ffn_stride, nullptr, 4));
-    p.add(seg(M.ffn_up, d_mtp_xnorm, hp.n_embd, d_mtp_ffn + hp.n_ff, ffn_stride, nullptr, 5));
-    p.set_xq(d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+    p.add(seg(M.ffn_gate, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_ffn, ffn_stride, nullptr, 4));
+    p.add(seg(M.ffn_up, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_ffn + hp.n_ff, ffn_stride, nullptr, 5));
+    p.set_xq(mtp.d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
     // call 3: ffn_down (silu gate) (+ residual)
     p.begin_call(kMaxT, hp.n_ff / 256);
-    p.add(seg(M.ffn_down, d_mtp_ffn, ffn_stride, d_mtp_x, hp.n_embd, d_mtp_x, 6));
-    p.set_xq(d_mtp_ffn, d_mtp_ffn + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
-    p.set_act_up(d_mtp_ffn + hp.n_ff, d_mtp_ffn);
+    p.add(seg(M.ffn_down, mtp.d_mtp_ffn, ffn_stride, mtp.d_mtp_x, hp.n_embd, mtp.d_mtp_x, 6));
+    p.set_xq(mtp.d_mtp_ffn, mtp.d_mtp_ffn + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
+    p.set_act_up(mtp.d_mtp_ffn + hp.n_ff, mtp.d_mtp_ffn);
     // call 4: shared LM head over the MTP hidden
     p.begin_call(kMaxT, hp.n_embd / 256);
     {
         const wt & head = draft_head();
-        gemv_seg s = seg(head, d_mtp_hnorm0, hp.n_embd, d_logits, hp.n_vocab, nullptr);
+        gemv_seg s = seg(head, mtp.d_mtp_hnorm0, hp.n_embd, d_logits, hp.n_vocab, nullptr);
         s.dev = 0; // the shared LM head only exists on the primary device
         s.w = multi_dev ? wkey(0, head.data) : wptr(0, head.data);
         p.add(s);
-        p.set_xq(d_mtp_hnorm0, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+        p.set_xq(mtp.d_mtp_hnorm0, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
     }
     p.finalize();
     p.has_head = false;
     // the head segment is the last one added (call 4) and must keep its key
     size_t head_seg = p.segs.size() - 1;
-    if (d_segs_mtp == nullptr) {
-        d_segs_mtp = alloc_elems<gemv_seg>(p.segs.size());
+    if (mtp.d_segs_mtp == nullptr) {
+        mtp.d_segs_mtp = alloc_elems<gemv_seg>(p.segs.size());
     }
-    q.memcpy(d_segs_mtp, p.segs.data(), p.segs.size() * sizeof(gemv_seg)).wait();
+    q.memcpy(mtp.d_segs_mtp, p.segs.data(), p.segs.size() * sizeof(gemv_seg)).wait();
     // The exact probe needs the segments' `w` to be the *device* pointer of the
     // raw GGUF bytes, while the normal path wants the oneDNN key - so keep a
     // second device copy for it rather than changing the shared seg array.
@@ -156,8 +156,8 @@ void engine::build_mtp_plan() {
                 bound++;
             }
         }
-        d_segs_mtp_exact = alloc_elems<gemv_seg>(x.size());
-        q.memcpy(d_segs_mtp_exact, x.data(), x.size() * sizeof(gemv_seg)).wait();
+        mtp.d_segs_mtp_exact = alloc_elems<gemv_seg>(x.size());
+        q.memcpy(mtp.d_segs_mtp_exact, x.data(), x.size() * sizeof(gemv_seg)).wait();
         fprintf(stderr, "[mtp] exact seg copy: %zu segs, %d raw pointers bound\n", x.size(), bound);
     }
 }
@@ -166,9 +166,9 @@ void engine::build_mtp_plan() {
 // OneDNN cannot be recorded and its M==1 path is the grouped GEMV the
 // multi-device decode already uses per segment, so this mirrors that dispatch.
 void engine::mtp_gemv(int ci, int M, int step) {
-    const seg_plan & p = plan_mtp_;
-    compute_backend & be = multi_dev ? *backends_[(size_t)mtp_dev] : backend();
-    dnnl_gemm * D = dnnl_for(ci == 4 ? 0 : mtp_dev);
+    const seg_plan & p = mtp.plan_mtp_;
+    compute_backend & be = multi_dev ? *backends_[(size_t)mtp.mtp_dev] : backend();
+    dnnl_gemm * D = dnnl_for(ci == 4 ? 0 : mtp.mtp_dev);
     const seg_plan::xq_t & xq = p.call_xq[(size_t)ci];
     if (D == nullptr || xq.x == nullptr) {
         throw std::runtime_error("mtp: the oneDNN int8 weight path is required");
@@ -181,14 +181,14 @@ void engine::mtp_gemv(int ci, int M, int step) {
     // quantized activation and the same int8 grouped dot product the decode GEMV
     // computes (mtp_gather_launch).
     if (ci == 4 && step >= 0) {
-        const bool gather = (mtp_cand_cap_ > 0 && mtp_cand_ok_);
+        const bool gather = (mtp.mtp_cand_cap_ > 0 && mtp.mtp_cand_ok_);
         compute_backend & hb = *backends_[0];
         if (gather) {
             D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/false);
-            hb.mtp_gather(d_mtp_cand_, mtp_cand_cap_, mtp_head_w8_, mtp_head_wsc_, D->act_grp_data(),
-                          D->act_grp_scales(), D->act_group_sums(), (int)xq.K, mtp_head_rows_, d_mtp_cvals_);
-            hb.mtp_gather_argmax(d_mtp_cvals_, d_mtp_cand_, mtp_cand_cap_, d_mtp_tok_ + step,
-                                 si::env::str("PF_MTP_CANDV") ? d_mtp_cval1_ : nullptr);
+            hb.mtp_gather(mtp.d_mtp_cand_, mtp.mtp_cand_cap_, mtp.mtp_head_w8_, mtp.mtp_head_wsc_, D->act_grp_data(),
+                          D->act_grp_scales(), D->act_group_sums(), (int)xq.K, mtp.mtp_head_rows_, mtp.d_mtp_cvals_);
+            hb.mtp_gather_argmax(mtp.d_mtp_cvals_, mtp.d_mtp_cand_, mtp.mtp_cand_cap_, mtp.d_mtp_tok_ + step,
+                                 si::env::str("PF_MTP_CANDV") ? mtp.d_mtp_cval1_ : nullptr);
             return;
         }
     }
@@ -198,7 +198,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
     // could hit a u4 weight must produce it, not just the head's.  The u4
     // tensors themselves are found through gemm_w4's key lookup, so no special
     // dispatch is needed here beyond the split.
-    const bool w4_draft = M == 1 && (mtp_head_w4_ || mtp_layer_w4_);
+    const bool w4_draft = M == 1 && (mtp.mtp_head_w4_ || mtp.mtp_layer_w4_);
     // PF_MTP_LAYER_EXACT=1: run every draft call group on the exact fp32
     // dequant GEMV instead of the int8/native stores.  The draft is only a
     // guess, so nothing downstream needs the quantised form - this exists to
@@ -241,13 +241,13 @@ void engine::mtp_gemv(int ci, int M, int step) {
         }
         for (int g = 0; g < gc; g++) {
             const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
-            be.gemv_group(gr.type, d_segs_mtp_exact + gr.off, gr.n, gr.rows, M, p.call_nsb[(size_t)ci], 0);
+            be.gemv_group(gr.type, mtp.d_segs_mtp_exact + gr.off, gr.n, gr.rows, M, p.call_nsb[(size_t)ci], 0);
         }
         return;
     }
     D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
     static const bool head_split_dbg = si::env::flag("PF_MTP_HEAD_SPLIT_DEBUG");
-    if (ci == 4 && M == 1 && step >= 0 && mtp_head_split_) {
+    if (ci == 4 && M == 1 && step >= 0 && mtp.mtp_head_split_) {
         // The head readout split across both cards (opt-in, default off - it
         // measures as a wash: -4.1 ms/cycle of draft, no end-to-end gain).
         // out[n] = w[n].h is
@@ -260,16 +260,16 @@ void engine::mtp_gemv(int ci, int M, int step) {
         // argmax on a near-tie now and then (p1 128 tokens bit-identical, p0
         // -6 % and p2 -8 % acceptance) - which is why it is not the default.
         const seg_plan::group_t & g0 = p.groups[(size_t)(gb + 0)];
-        const gemv_seg & s = d_segs_mtp[g0.off];
+        const gemv_seg & s = mtp.d_segs_mtp[g0.off];
         dnnl_gemm * D1 = dnnl_for(1);
-        const int n0 = mtp_head_half_;
+        const int n0 = mtp.mtp_head_half_;
         const size_t ab = (size_t)m.hp.n_embd * 4;
-        dev_queue(1).memcpy(h_head_stage, d_mtp_hnorm0, ab).wait();
-        dev_queue(1).memcpy(d_mtp_hnorm1, h_head_stage, ab);
-        D1->quantize(d_mtp_hnorm1, nullptr, m.hp.n_embd, 0, 1, m.hp.n_embd, /*do_split=*/true);
-        D1->gemm_w4(mtp_head_w4b_key_, nullptr, s.alpha, 1, s.K, s.out + n0, 1);
-        D->gemm_w4(mtp_head_w4lo_key_, nullptr, s.alpha, 1, s.K, s.out, 1);
-        backends_[0]->mtp_argmax(s.out, m.hp.n_vocab, d_mtp_tok_ + step, nullptr, 1);
+        dev_queue(1).memcpy(mtp.h_head_stage, mtp.d_mtp_hnorm0, ab).wait();
+        dev_queue(1).memcpy(mtp.d_mtp_hnorm1, mtp.h_head_stage, ab);
+        D1->quantize(mtp.d_mtp_hnorm1, nullptr, m.hp.n_embd, 0, 1, m.hp.n_embd, /*do_split=*/true);
+        D1->gemm_w4(mtp.mtp_head_w4b_key_, nullptr, s.alpha, 1, s.K, s.out + n0, 1);
+        D->gemm_w4(mtp.mtp_head_w4lo_key_, nullptr, s.alpha, 1, s.K, s.out, 1);
+        backends_[0]->mtp_argmax(s.out, m.hp.n_vocab, mtp.d_mtp_tok_ + step, nullptr, 1);
         if (head_split_dbg) {
             std::vector<float> hl((size_t)m.hp.n_vocab);
             dev_queue(0).memcpy(hl.data(), s.out, hl.size() * 4).wait();
@@ -277,7 +277,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
             for (int i = 1; i < m.hp.n_vocab; i++)
                 if (hl[(size_t)i] > hl[(size_t)bh]) bh = i;
             int32_t di = -1;
-            dev_queue(0).memcpy(&di, d_mtp_tok_ + step, sizeof(di)).wait();
+            dev_queue(0).memcpy(&di, mtp.d_mtp_tok_ + step, sizeof(di)).wait();
             fprintf(stderr, "[mtp] head split step=%d dev=%d host=%d val=%.9g\n", step, di, bh, hl[(size_t)bh]);
         }
         return;
@@ -285,17 +285,17 @@ void engine::mtp_gemv(int ci, int M, int step) {
     for (int g = 0; g < gc; g++) {
         const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
         for (int j = 0; j < gr.n; j++) {
-            const gemv_seg & s = d_segs_mtp[gr.off + j];
-            const void * wk = (ci == 4 && mtp_head_w4_) ? (const void *)mtp_head_w4_key_ : s.w;
+            const gemv_seg & s = mtp.d_segs_mtp[gr.off + j];
+            const void * wk = (ci == 4 && mtp.mtp_head_w4_) ? (const void *)mtp.mtp_head_w4_key_ : s.w;
             // the draft's head readout on the 2-bit store: 0.375 B/weight
             // against the u4 copy's 0.625, so ~0.5 ms of the cycle per drafted
             // token.  It is the one place a lossy store is free of consequence
             // beyond the draft's own argmax accuracy (see PF_MTP_HEAD_W2).
-            if (ci == 4 && M == 1 && mtp_head_w2_ && D->gemm_w2(mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out,
+            if (ci == 4 && M == 1 && mtp.mtp_head_w2_ && D->gemm_w2(mtp.mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out,
                                                                s.out_stride)) {
                 continue;
             }
-            if (ci < 4 && M == 1 && mtp_layer_w2_ && s.w_raw
+            if (ci < 4 && M == 1 && mtp.mtp_layer_w2_ && s.w_raw
                 && D->gemm_w2(s.w_raw, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
@@ -317,7 +317,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
         // is where the head GEMV was submitted - `backend()` is the single-device
         // backend on the main queue, and a different in-order queue would race
         // the GEMV and hand the next draft step the previous step's logits.
-        backends_[0]->mtp_argmax(d_logits, m.hp.n_vocab, d_mtp_tok_ + step, nullptr, 1);
+        backends_[0]->mtp_argmax(d_logits, m.hp.n_vocab, mtp.d_mtp_tok_ + step, nullptr, 1);
     }
 }
 
@@ -330,8 +330,8 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
                          bool with_head, const int32_t * tok_dev, int step) {
     const hparams & hp = m.hp;
     const mtp_layer_t & M = m.mtp;
-    dnnl_gemm * D = dnnl_for(mtp_dev);
-    compute_backend & be = multi_dev ? *backends_[(size_t)mtp_dev] : backend();
+    dnnl_gemm * D = dnnl_for(mtp.mtp_dev);
+    compute_backend & be = multi_dev ? *backends_[(size_t)mtp.mtp_dev] : backend();
 
     // PF_MTP_DSTEP=1: per-stage host time of one draft step.  The draft is a
     // dependent chain of ~15 launches whose device work is ~1.1 GB of weights,
@@ -350,9 +350,8 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
             dt = t2;
         }
     };
-    step_info * inf = d_mtp_info;
-    std::memset(inf, 0, sizeof(step_info));
-    std::memcpy(inf->mrope_sections, hp.rope_sections, sizeof(hp.rope_sections));
+    step_info * inf = mtp.d_mtp_info;
+    reset_step_info(inf);
     inf->n_rows = 1;
     inf->n_real = n;
     inf->tpb = kMaxT;
@@ -369,29 +368,29 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
 
     // 1. concat(enorm(emb(tok)), hnorm(h_prev))
     MTPDBG("forward n=%d pos=%d head=%d concat\n", n, pos0, (int)with_head);
-    be.mtp_concat(wptr(0, m.tok_embd.data), m.tok_embd.type, m.tok_embd_row_bytes, wf32(mtp_dev, M.enorm),
-                  wf32(mtp_dev, M.hnorm), h, hprev, inf, d_mtp_cat, hp.n_embd, hp.rms_eps, tok_dev);
+    be.mtp_concat(wptr(0, m.tok_embd.data), m.tok_embd.type, m.tok_embd_row_bytes, wf32(mtp.mtp_dev, M.enorm),
+                  wf32(mtp.mtp_dev, M.hnorm), h, hprev, inf, mtp.d_mtp_cat, hp.n_embd, hp.rms_eps, tok_dev);
     MTPDBG("forward eh_proj\n");
-    // 2. eh_proj -> d_mtp_x
+    // 2. eh_proj -> mtp.d_mtp_x
     {
-        const void * ek = wkey(multi_dev ? mtp_dev : 0, M.eh_proj.data);
+        const void * ek = wkey(multi_dev ? mtp.mtp_dev : 0, M.eh_proj.data);
         // do_split matters whenever eh_proj runs on a native 4-bit store: the u4
         // GEMV reads the even/odd activation planes, and with do_split=false
         // they are left stale from the previous call - which is what made
         // PF_MTP_LAYER_W4 produce a *wrong* draft (acc 2.14 -> 0.08) rather than
         // a merely lossier one.  Bit-localised with PF_MTP_LAYER_W4_CALL=-1.
-        D->quantize(d_mtp_cat, nullptr, 2 * hp.n_embd, 0, n, 2 * hp.n_embd, mtp_layer_w4_ || mtp_head_w4_);
-        const void * ek2 = mtp_layer_w2_ ? (const void *)M.eh_proj.data : ek;
-        if (!((n == 1 && D->gemm_w2(ek2, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd))
-              || (n == 1 && D->gemm_w4(ek, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd))
-              || D->gemm(ek, nullptr, 1.0f, n, 2 * hp.n_embd, d_mtp_x, hp.n_embd))) {
+        D->quantize(mtp.d_mtp_cat, nullptr, 2 * hp.n_embd, 0, n, 2 * hp.n_embd, mtp.mtp_layer_w4_ || mtp.mtp_head_w4_);
+        const void * ek2 = mtp.mtp_layer_w2_ ? (const void *)M.eh_proj.data : ek;
+        if (!((n == 1 && D->gemm_w2(ek2, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))
+              || (n == 1 && D->gemm_w4(ek, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))
+              || D->gemm(ek, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))) {
             throw std::runtime_error("mtp: eh_proj GEMM failed");
         }
     }
     // 3. attention block
     dmark("eh_proj");
     MTPDBG("forward attn_norm\n");
-    be.rmsnorm(d_mtp_x, wf32(mtp_dev, M.attn_norm), d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
+    be.rmsnorm(mtp.d_mtp_x, wf32(mtp.mtp_dev, M.attn_norm), mtp.d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
     mtp_gemv(0, n);
     dmark("qkv");
     MTPDBG("forward qk_norm_rope\n");
@@ -404,7 +403,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
         static bool once = false;
         if (!once) {
             once = true;
-            fprintf(stderr, "[mtp] attn_layers=%d mtp_local=%d multi_dev=%d\n", attn_layers(), mtp_attn_local_,
+            fprintf(stderr, "[mtp] attn_layers=%d mtp_local=%d multi_dev=%d\n", attn_layers(), mtp.mtp_attn_local_,
                     (int)multi_dev);
             for (int a = 0; a <= attn_layers() - 1; a++) {
                 const char *p1;
@@ -425,31 +424,31 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     // the plain decode - which does use the full cap - has no acceptance to
     // lose.  A multi-row call (the prompt chunks) already has n*n_head
     // workgroups, so it keeps the fused single split; that is also why the
-    // partials buffer only has to cover max(mtp_splits, kMaxT*n_head) entries.
+    // partials buffer only has to cover max(mtp.mtp_splits, kMaxT*n_head) entries.
     const int max_nkv = pos0 + n;
-    const int nsp = std::min(std::max((max_nkv + 511) / 512, 1), mtp_splits);
-    be.qk_norm_rope(d_mtp_qbuf, d_mtp_kbuf, d_mtp_vbuf, wf32(mtp_dev, M.q_norm), wf32(mtp_dev, M.k_norm), (void *)kp, (void *)vp,
+    const int nsp = std::min(std::max((max_nkv + 511) / 512, 1), mtp.mtp_splits);
+    be.qk_norm_rope(mtp.d_mtp_qbuf, mtp.d_mtp_kbuf, mtp.d_mtp_vbuf, wf32(mtp.mtp_dev, M.q_norm), wf32(mtp.mtp_dev, M.k_norm), (void *)kp, (void *)vp,
                     d_tables, inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
                     max_blocks, 1, n, ksc, vsc);
     const bool fused = (nsp == 1);
-    be.attn(d_mtp_qbuf, d_mtp_qbuf, kp, vp, d_mtp_partials, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
-            hp.attn_scale, max_blocks, 1, n, fused ? d_mtp_attn_out : nullptr, -1, ksc, vsc);
+    be.attn(mtp.d_mtp_qbuf, mtp.d_mtp_qbuf, kp, vp, mtp.d_mtp_partials, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
+            hp.attn_scale, max_blocks, 1, n, fused ? mtp.d_mtp_attn_out : nullptr, -1, ksc, vsc);
     if (!fused) {
-        be.attn_combine(d_mtp_partials, d_mtp_qbuf, d_mtp_attn_out, inf, hp.n_head, hp.head_dim, nsp, 1, n);
+        be.attn_combine(mtp.d_mtp_partials, mtp.d_mtp_qbuf, mtp.d_mtp_attn_out, inf, hp.n_head, hp.head_dim, nsp, 1, n);
     }
     dmark("attn");
     MTPDBG("forward wo\n");
     mtp_gemv(1, n); // wo + residual
     dmark("wo");
     // 4. FFN
-    be.rmsnorm(d_mtp_x, wf32(mtp_dev, M.post_attn_norm), d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
+    be.rmsnorm(mtp.d_mtp_x, wf32(mtp.mtp_dev, M.post_attn_norm), mtp.d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
     mtp_gemv(2, n);
     mtp_gemv(3, n);
     dmark("ffn");
     // 5. the AR draft chain seeds the next step with the MTP hidden *before*
     // the shared head norm (llama.cpp: the draft context's pre-norm hidden)
-    be.copy_row(d_mtp_x, d_mtp_raw, inf, hp.n_embd, -1);
-    be.rmsnorm(d_mtp_x, wf32(mtp_dev, M.shared_head_norm), d_mtp_hnorm, n, hp.n_embd, hp.rms_eps);
+    be.copy_row(mtp.d_mtp_x, mtp.d_mtp_raw, inf, hp.n_embd, -1);
+    be.rmsnorm(mtp.d_mtp_x, wf32(mtp.mtp_dev, M.shared_head_norm), mtp.d_mtp_hnorm, n, hp.n_embd, hp.rms_eps);
     dmark("hnorm");
     // PF_MTP_EXACT_DEBUG: dump the draft hidden so the exact and int8 paths can
     // be compared numerically (the acceptance is the coarse signal; this is the
@@ -458,17 +457,17 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
         static int seen = 0;
         if (seen++ < 4) {
             std::vector<float> h(8), hn(8);
-            dev_queue(mtp_dev).memcpy(h.data(), d_mtp_x, 32).wait();
-            dev_queue(mtp_dev).memcpy(hn.data(), d_mtp_hnorm, 32).wait();
+            dev_queue(mtp.mtp_dev).memcpy(h.data(), mtp.d_mtp_x, 32).wait();
+            dev_queue(mtp.mtp_dev).memcpy(hn.data(), mtp.d_mtp_hnorm, 32).wait();
             fprintf(stderr, "[exact] step=%d x[0:4]=%.4f %.4f %.4f %.4f hnorm[0:4]=%.4f %.4f %.4f %.4f\n", step,
                     h[0], h[1], h[2], h[3], hn[0], hn[1], hn[2], hn[3]);
         }
     }
     if (with_head) {
         MTPDBG("forward head\n");
-        if (d_mtp_hnorm0 != d_mtp_hnorm) {
+        if (mtp.d_mtp_hnorm0 != mtp.d_mtp_hnorm) {
             // the shared LM head lives on the primary device
-            dev_queue(0).memcpy(d_mtp_hnorm0, d_mtp_hnorm, (size_t)n * hp.n_embd * 4).wait();
+            dev_queue(0).memcpy(mtp.d_mtp_hnorm0, mtp.d_mtp_hnorm, (size_t)n * hp.n_embd * 4).wait();
         }
         mtp_gemv(4, n, step);
     }
@@ -495,7 +494,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     const size_t conv_per = (size_t)(hp.conv_k - 1) * conv_dim;
     const int ndev = (int)as_.size();
     for (int dev = 0; dev < ndev; dev++) {
-        if (d_mtp_convsave_[(size_t)dev] == nullptr) {
+        if (mtp.d_mtp_convsave_[(size_t)dev] == nullptr) {
             continue;
         }
         sycl::queue & qd = dev_queue(dev);
@@ -506,19 +505,19 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
             }
             const int gl = layer_gdn_local_[(size_t)il];
             float * src = cstate + (size_t)gl * kMaxB * conv_per + conv_dim; // slot 0, row 1
-            qd.memcpy(d_mtp_convsave_[(size_t)dev] + (size_t)gl * 2 * conv_dim, src, conv_dim * 4);
-            qd.memcpy(d_mtp_convsave_[(size_t)dev] + ((size_t)gl * 2 + 1) * conv_dim, src + conv_dim, conv_dim * 4);
+            qd.memcpy(mtp.d_mtp_convsave_[(size_t)dev] + (size_t)gl * 2 * conv_dim, src, conv_dim * 4);
+            qd.memcpy(mtp.d_mtp_convsave_[(size_t)dev] + ((size_t)gl * 2 + 1) * conv_dim, src + conv_dim, conv_dim * 4);
         }
     }
-    if (si::env::flag("PF_MTP_STATECHK") && !d_mtp_hist_.empty()) {
+    if (si::env::flag("PF_MTP_STATECHK") && !mtp.d_mtp_hist_.empty()) {
         // snapshot the live recurrent state of (device 0, GDN layer 0) so the
         // rollback can be diffed against a plain-decode reference
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
         const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
-        h_save_.resize(gdn_per + conv_per);
+        mtp.h_save_.resize(gdn_per + conv_per);
         sycl::queue & qd0 = dev_queue(0);
-        qd0.memcpy(h_save_.data(), as_[0].gdn_state, gdn_per * 4).wait();
-        qd0.memcpy(h_save_.data() + gdn_per, as_[0].conv_state, conv_per * 4).wait();
+        qd0.memcpy(mtp.h_save_.data(), as_[0].gdn_state, gdn_per * 4).wait();
+        qd0.memcpy(mtp.h_save_.data() + gdn_per, as_[0].conv_state, conv_per * 4).wait();
         // the layer 0 slot-0 conv/GDN state starts at the base of the buffers
     }
     setup_pf_info(d_info, toks, 0, n, slot, pos0);
@@ -528,10 +527,10 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     // snapshot after the last accepted row (llama.cpp's n_rs_seq mechanism).
     // The conv window is rebuilt from the saved raw taps instead, because
     // conv_state_update only snapshots at 32-token boundaries.
-    d_info->pc_active = (d_mtp_hist_.empty() || d_mtp_hist_[0] == nullptr) ? 0 : 1;
+    d_info->pc_active = (mtp.d_mtp_hist_.empty() || mtp.d_mtp_hist_[0] == nullptr) ? 0 : 1;
     d_info->mtp_dt = 1;
     d_info->mtp_dry = 1;
-    for (int t = 0; t < mtp_nsnap && t < kPcMapLen; t++) {
+    for (int t = 0; t < mtp.mtp_nsnap && t < kPcMapLen; t++) {
         d_info->pc_row_slot[t] = t;
     }
     MTPDBG("verify record_forward n=%d pos=%d\n", n, pos0);
@@ -573,7 +572,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     if (use_graph) {
         replay_md_verify_graphs();
     } else {
-        record_forward(2, plan_vf_, d_segs_vf, rows_vf, d_segs_vf);
+        record_forward(2, mtp.plan_vf_, mtp.d_segs_vf, rows_vf, mtp.d_segs_vf);
     }
     const double t_submit = submit_dbg ? t_ms(t_submit0, t_now()) : 0.0;
     MTPDBG("verify record_forward returned, syncing\n");
@@ -588,8 +587,8 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
         FILE * f = fopen(sd, "wb");
         if (f) {
             std::vector<float> row(gdn_per);
-            for (int t = 0; t < mtp_nsnap && t < n; t++) {
-                dev_queue(0).memcpy(row.data(), d_mtp_hist_[0] + (size_t)t * ng * per, gdn_per * 4).wait();
+            for (int t = 0; t < mtp.mtp_nsnap && t < n; t++) {
+                dev_queue(0).memcpy(row.data(), mtp.d_mtp_hist_[0] + (size_t)t * ng * per, gdn_per * 4).wait();
                 fwrite(row.data(), 4, gdn_per, f);
             }
             fclose(f);
@@ -607,15 +606,15 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     if (si::env::flag("PF_MTP_SNAPCHK") && pos0 == 0) {
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
         for (int dev = 0; dev < (int)as_.size(); dev++) {
-            if (d_mtp_hist_[(size_t)dev] == nullptr || n_gdn_dev_[(size_t)dev] == 0) {
+            if (mtp.d_mtp_hist_[(size_t)dev] == nullptr || n_gdn_dev_[(size_t)dev] == 0) {
                 continue;
             }
             sycl::queue & qd = dev_queue(dev);
             const size_t per = gdn_per + (size_t)(hp.conv_k - 1) * hp.qkv_dim();
             const int ng = n_gdn_dev_[(size_t)dev];
             std::vector<float> s0(gdn_per), slast(gdn_per), live(gdn_per);
-            qd.memcpy(s0.data(), d_mtp_hist_[(size_t)dev], gdn_per * 4).wait();
-            qd.memcpy(slast.data(), d_mtp_hist_[(size_t)dev] + (size_t)(n - 1) * (size_t)ng * per, gdn_per * 4)
+            qd.memcpy(s0.data(), mtp.d_mtp_hist_[(size_t)dev], gdn_per * 4).wait();
+            qd.memcpy(slast.data(), mtp.d_mtp_hist_[(size_t)dev] + (size_t)(n - 1) * (size_t)ng * per, gdn_per * 4)
                 .wait();
             const double dlast = [&] {
                 double mx = 0;
@@ -627,7 +626,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
             fprintf(stderr, "[mtp] snapchk dev=%d slot(last=%d)-vs-live maxdiff=%.6f\n", dev, n - 1, dlast);
             std::vector<float> probe(gdn_per);
             for (int t = 0; t < n && t < 8; t++) {
-                qd.memcpy(probe.data(), d_mtp_hist_[(size_t)dev] + (size_t)t * (size_t)ng * per, gdn_per * 4).wait();
+                qd.memcpy(probe.data(), mtp.d_mtp_hist_[(size_t)dev] + (size_t)t * (size_t)ng * per, gdn_per * 4).wait();
                 size_t nz = 0;
                 double mx = 0;
                 for (size_t i = 0; i < gdn_per; i++) {
@@ -666,32 +665,32 @@ void engine::mtp_rollback(int j) {
     const size_t conv_per = (size_t)(hp.conv_k - 1) * conv_dim;
     const int ndev = (int)as_.size();
     for (int dev = 0; dev < ndev; dev++) {
-        if (d_mtp_hist_[(size_t)dev] == nullptr) {
+        if (mtp.d_mtp_hist_[(size_t)dev] == nullptr) {
             continue;
         }
         sycl::queue & qd = dev_queue(dev);
         const int ng = n_gdn_dev_[(size_t)dev];
         const size_t per = gdn_per + conv_per;
-        const float * hist = d_mtp_hist_[(size_t)dev];
-        float * save = d_mtp_convsave_[(size_t)dev];
-        const float * qtap = d_mtp_qsave_[(size_t)dev];
+        const float * hist = mtp.d_mtp_hist_[(size_t)dev];
+        float * save = mtp.d_mtp_convsave_[(size_t)dev];
+        const float * qtap = mtp.d_mtp_qsave_[(size_t)dev];
         for (int il = 0; il < hp.n_layer; il++) {
             if (!hp.is_recr(il) || layer_dev_[(size_t)il] != dev) {
                 continue;
             }
             const int gl = layer_gdn_local_[(size_t)il];
             // GDN state: the dry verify snapshotted the state after every token
-            // into d_mtp_hist_[token]; row j is the last committed token, so its
+            // into mtp.d_mtp_hist_[token]; row j is the last committed token, so its
             // snapshot is exactly the committed state.
             qd.memcpy(as_[(size_t)dev].gdn_state + (size_t)gl * kMaxB * gdn_per,
                       hist + (size_t)j * (size_t)ng * per + (size_t)gl * per, gdn_per * 4);
             // conv window of the last three committed tokens: rows j-2..j come
             // from the verify's own taps, older ones from the pre-verify window.
             float * cs = as_[(size_t)dev].conv_state + (size_t)gl * kMaxB * conv_per; // slot 0
-            const float * v2 = qtap + (size_t)gl * mtp_nsnap * conv_dim + (size_t)j * conv_dim;
-            const float * v1 = j >= 1 ? qtap + (size_t)gl * mtp_nsnap * conv_dim + (size_t)(j - 1) * conv_dim
+            const float * v2 = qtap + (size_t)gl * mtp.mtp_nsnap * conv_dim + (size_t)j * conv_dim;
+            const float * v1 = j >= 1 ? qtap + (size_t)gl * mtp.mtp_nsnap * conv_dim + (size_t)(j - 1) * conv_dim
                                       : save + (size_t)gl * 2 * conv_dim + conv_dim;
-            const float * v0 = j >= 2 ? qtap + (size_t)gl * mtp_nsnap * conv_dim + (size_t)(j - 2) * conv_dim
+            const float * v0 = j >= 2 ? qtap + (size_t)gl * mtp.mtp_nsnap * conv_dim + (size_t)(j - 2) * conv_dim
                                       : (j == 1 ? save + (size_t)gl * 2 * conv_dim + conv_dim
                                                 : save + (size_t)gl * 2 * conv_dim);
             qd.memcpy(cs, v0, conv_dim * 4);
@@ -718,14 +717,14 @@ void engine::mtp_rollback(int j) {
 std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen_params & gp,
                                       const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
     // Fall through to the plain decode when MTP is not enabled.  The constructor
-    // clears mtp_k (-> mtp_on false) whenever a gate fails - no NextN head, no
+    // clears mtp.mtp_k (-> mtp.mtp_on false) whenever a gate fails - no NextN head, no
     // multi-device oneDNN int8 partition - and leaves every d_mtp_* buffer null,
     // so entering the speculative loop anyway walks into an unallocated kernel
     // argument.  It surfaced as "multi-device: weight tensor not uploaded to this
     // device's partition" from inside the verify's plan build, which reads as a
     // weight-partition bug rather than "you called the wrong entry point".
-    // generate_dflash already gates on dfm_ the same way.
-    if (!mtp_on) {
+    // generate_dflash already gates on dfl.dfm_ the same way.
+    if (!mtp.mtp_on) {
         return generate(prompt, gp, cb, first_logits);
     }
     reset_single();
@@ -738,7 +737,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     if (nprompt == 0) {
         return out;
     }
-    dev_queue(0).memset(d_mtp_hprev, 0, (size_t)hp.n_embd * 4).wait();
+    dev_queue(0).memset(mtp.d_mtp_hprev, 0, (size_t)hp.n_embd * 4).wait();
 
     // KV blocks: reuse the deepest cached block chain of this prompt first
     // (pc_admit restores that node's KV and recurrent state and pins its
@@ -747,7 +746,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     std::vector<int> blocks;
     const int matched = pc_admit(0, prompt, blocks);
     const int pretail = nprompt - matched;
-    const int need = (pretail + kBlockSize - 1) / kBlockSize + (mtp_k + 2 + kBlockSize - 1) / kBlockSize + 1;
+    const int need = (pretail + kBlockSize - 1) / kBlockSize + (mtp.mtp_k + 2 + kBlockSize - 1) / kBlockSize + 1;
     for (int i = 0; i < need; i++) {
         int b = alloc_block();
         if (b < 0) {
@@ -795,7 +794,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
         for (int i = 0; i < nprompt; i++) {
             dev_queue(0)
-                .memcpy(d_mtp_main_h + (size_t)i * hp.n_embd, htmp.data() + (size_t)i * hp.n_embd,
+                .memcpy(mtp.d_mtp_main_h + (size_t)i * hp.n_embd, htmp.data() + (size_t)i * hp.n_embd,
                         (size_t)hp.n_embd * 4)
                 .wait();
         }
@@ -835,14 +834,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         for (int off = 0; off < nb; off += kMaxT) {
             const int n = std::min(kMaxT, nb - off);
             chunk.assign(prompt.begin() + pos + off, prompt.begin() + pos + off + n);
-            const float * h = d_mtp_main_h + (size_t)off * hp.n_embd;
-            const float * hprev = off > 0 ? (d_mtp_main_h + (size_t)(off - 1) * hp.n_embd) : d_mtp_hprev;
+            const float * h = mtp.d_mtp_main_h + (size_t)off * hp.n_embd;
+            const float * hprev = off > 0 ? (mtp.d_mtp_main_h + (size_t)(off - 1) * hp.n_embd) : mtp.d_mtp_hprev;
             mtp_forward(chunk.data(), h, hprev, n, 0, pos + off, /*with_head=*/false);
             if (dbg_gen) {
                 fprintf(stderr, "[mtp] mtp prefill piece off=%d n=%d\n", off, n);
             }
         }
-        dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (size_t)(nb - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
+        dev_queue(0).memcpy(mtp.d_mtp_hprev, mtp.d_mtp_main_h + (size_t)(nb - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
         pos += nb;
     }
 
@@ -864,7 +863,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         sync_all();
         const int nr = 8;
         std::vector<float> hb((size_t)nr * hp.n_embd);
-        q.memcpy(hb.data(), d_mtp_main_h, hb.size() * 4).wait();
+        q.memcpy(hb.data(), mtp.d_mtp_main_h, hb.size() * 4).wait();
         for (int i = 0; i < nr; i++) {
             double n = 0;
             for (int j = 0; j < hp.n_embd; j++) {
@@ -905,7 +904,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         const int dn = std::min(nprompt, kMaxB); // d_logits holds kMaxB rows
         float * d_h0 = (float *)dev_alloc_on(0, (size_t)hp.n_embd * 4);
         dev_queue(0).memcpy(d_h0, h0.data(), (size_t)hp.n_embd * 4).wait();
-        mtp_forward(chunk.data(), d_mtp_main_h, d_h0, dn, 0, 0, /*with_head=*/true);
+        mtp_forward(chunk.data(), mtp.d_mtp_main_h, d_h0, dn, 0, 0, /*with_head=*/true);
         sync_all();
         q.memcpy(h_logits, d_logits, (size_t)dn * hp.n_vocab * 4).wait();
         for (int i = 0; i < dn; i++) {
@@ -920,7 +919,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             std::vector<int> probe;
             for (int i = 0; i < 32; i++) { probe.push_back(i); }
             for (int i : probe) {
-                q.memcpy(d_last_hidden, d_mtp_main_h + (size_t)i * hp.n_embd, (size_t)hp.n_embd * 4).wait();
+                q.memcpy(d_last_hidden, mtp.d_mtp_main_h + (size_t)i * hp.n_embd, (size_t)hp.n_embd * 4).wait();
                 std::vector<float> lg2 = run_head();
                 const int got = argmax_f(lg2.data(), hp.n_vocab);
                 const int want = (i + 1 < nprompt) ? prompt[(size_t)i + 1] : tok;
@@ -941,10 +940,10 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 }
                 fprintf(stderr, "[mtp]   ||xnorm[%d]||=%.4f\n", i, std::sqrt(n));
             }
-            q.memcpy(cat.data(), d_mtp_cat, (size_t)nr * 2 * hp.n_embd * 4).wait();
-            q.memcpy(buf.data(), d_mtp_x, (size_t)nr * hp.n_embd * 4).wait();
+            q.memcpy(cat.data(), mtp.d_mtp_cat, (size_t)nr * 2 * hp.n_embd * 4).wait();
+            q.memcpy(buf.data(), mtp.d_mtp_x, (size_t)nr * hp.n_embd * 4).wait();
             std::vector<float> hn((size_t)nr * hp.n_embd);
-            q.memcpy(hn.data(), d_mtp_hnorm, (size_t)nr * hp.n_embd * 4).wait();
+            q.memcpy(hn.data(), mtp.d_mtp_hnorm, (size_t)nr * hp.n_embd * 4).wait();
             for (int i = 0; i < nr; i++) {
                 double ne = 0, nh = 0, nx = 0, nhn = 0;
                 for (int j = 0; j < hp.n_embd; j++) {
@@ -970,7 +969,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 sycl::queue & qd = dev_queue(0);
                 const int ni = nprompt;
                 std::vector<float> hb((size_t)dn * hp.n_embd);
-                q.memcpy(hb.data(), d_mtp_main_h, (size_t)dn * hp.n_embd * 4).wait();
+                q.memcpy(hb.data(), mtp.d_mtp_main_h, (size_t)dn * hp.n_embd * 4).wait();
                 fwrite(&ni, 4, 1, f);
                 fwrite(&dn, 4, 1, f);
                 fwrite(&hp.n_embd, 4, 1, f);
@@ -985,13 +984,13 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     qd.memcpy(tmp.data(), src, n * 4).wait();
                     fwrite(tmp.data(), 4, n, f);
                 };
-                dumpf(d_mtp_cat, (size_t)dn * 2 * hp.n_embd);
-                dumpf(d_mtp_qbuf, (size_t)dn * hp.n_head * 2 * hp.head_dim);
-                dumpf(d_mtp_kbuf, (size_t)dn * hp.n_head_kv * hp.head_dim);
-                dumpf(d_mtp_vbuf, (size_t)dn * hp.n_head_kv * hp.head_dim);
-                dumpf(d_mtp_attn_out, (size_t)dn * hp.n_head * hp.head_dim);
-                dumpf(d_mtp_x, (size_t)dn * hp.n_embd);
-                dumpf(d_mtp_hnorm, (size_t)dn * hp.n_embd);
+                dumpf(mtp.d_mtp_cat, (size_t)dn * 2 * hp.n_embd);
+                dumpf(mtp.d_mtp_qbuf, (size_t)dn * hp.n_head * 2 * hp.head_dim);
+                dumpf(mtp.d_mtp_kbuf, (size_t)dn * hp.n_head_kv * hp.head_dim);
+                dumpf(mtp.d_mtp_vbuf, (size_t)dn * hp.n_head_kv * hp.head_dim);
+                dumpf(mtp.d_mtp_attn_out, (size_t)dn * hp.n_head * hp.head_dim);
+                dumpf(mtp.d_mtp_x, (size_t)dn * hp.n_embd);
+                dumpf(mtp.d_mtp_hnorm, (size_t)dn * hp.n_embd);
                 fwrite(h_logits, 4, (size_t)dn * hp.n_vocab, f);
                 fclose(f);
                 fprintf(stderr, "[mtp] dumped %s (ni=%d dn=%d)\n", dp, ni, dn);
@@ -1015,13 +1014,13 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
     }
     if (si::env::flag("PF_MTP_HOSTCMP")) {
-        // d_mtp_main_h and d_last_hidden are HOST USM, so compare them directly
+        // mtp.d_mtp_main_h and d_last_hidden are HOST USM, so compare them directly
         // (no SYCL queue involved, no ordering question)
         const int rows[4] = {0, 1, nprompt - 2, nprompt - 1};
         for (int k = 0; k < 4; k++) {
             const int i = rows[k];
             if (i < 0 || i >= nprompt) continue;
-            const float * a = d_mtp_main_h + (size_t)i * hp.n_embd;
+            const float * a = mtp.d_mtp_main_h + (size_t)i * hp.n_embd;
             double nb = 0;
             for (int j = 0; j < hp.n_embd; j++) {
                 nb = std::max(nb, (double)std::fabs(a[j]));
@@ -1029,7 +1028,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fprintf(stderr, "[mtp] hostcmp capt[%d] ||.|=%.4f v=%.4f,%.4f,%.4f\n", i, nb, a[0], a[1], a[2]);
         }
         {
-            const float * a = d_mtp_main_h + (size_t)(nprompt - 1) * hp.n_embd;
+            const float * a = mtp.d_mtp_main_h + (size_t)(nprompt - 1) * hp.n_embd;
             const float * b = d_last_hidden;
             double d = 0, nb = 0;
             for (int j = 0; j < hp.n_embd; j++) {
@@ -1063,30 +1062,30 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         chunk.assign(prompt.begin(), prompt.end());
         for (int pos = 0; pos < nprompt;) {
             const int n = std::min(kMaxT, nprompt - pos);
-            mtp_forward(chunk.data() + pos, d_mtp_main_h + (size_t)pos * hp.n_embd, d_mtp_hprev, n, 0, pos,
+            mtp_forward(chunk.data() + pos, mtp.d_mtp_main_h + (size_t)pos * hp.n_embd, mtp.d_mtp_hprev, n, 0, pos,
                         /*with_head=*/false);
             dev_queue(0)
-                .memcpy(d_mtp_hprev, d_mtp_main_h + (size_t)(pos + n - 1) * hp.n_embd, (size_t)hp.n_embd * 4)
+                .memcpy(mtp.d_mtp_hprev, mtp.d_mtp_main_h + (size_t)(pos + n - 1) * hp.n_embd, (size_t)hp.n_embd * 4)
                 .wait();
             pos += n;
         }
     }
-    if (si::env::flag("PF_MTP_SNAPDUMP") && nprompt >= mtp_nsnap) {
-        // verify-like pass over exactly mtp_nsnap prompt tokens (a longer pass
+    if (si::env::flag("PF_MTP_SNAPDUMP") && nprompt >= mtp.mtp_nsnap) {
+        // verify-like pass over exactly mtp.mtp_nsnap prompt tokens (a longer pass
         // would write past the pc_row_slot entries mtp_verify initialises)
-        const int pn = si::env::str("PF_MTP_SNAP1") ? 1 : mtp_nsnap;
+        const int pn = si::env::str("PF_MTP_SNAP1") ? 1 : mtp.mtp_nsnap;
         std::vector<int> pv(prompt.begin(), prompt.begin() + pn);
         mtp_verify(pv, pn, 0, 0);
     }
     if (const char * hd = si::env::str("PF_MTP_HDUMPS")) {
-        // d_mtp_main_h is host USM: dump it directly, before run_head or any
+        // mtp.d_mtp_main_h is host USM: dump it directly, before run_head or any
         // other call can touch the activation buffers
         FILE * f = fopen(hd, "wb");
         if (f) {
-            int hdr[4] = {nprompt, hp.n_embd, hp.n_vocab, mtp_on ? 1 : 0};
+            int hdr[4] = {nprompt, hp.n_embd, hp.n_vocab, mtp.mtp_on ? 1 : 0};
             fwrite(hdr, 4, 4, f);
             fwrite(prompt.data(), 4, prompt.size(), f);
-            fwrite(d_mtp_main_h, 4, (size_t)nprompt * hp.n_embd, f);
+            fwrite(mtp.d_mtp_main_h, 4, (size_t)nprompt * hp.n_embd, f);
             fclose(f);
             fprintf(stderr, "[mtp] hdumps %s (nprompt=%d decode_h=%d)\n", hd, nprompt,
                     (int)(si::env::flag("PF_MTP_DECODE_H")));
@@ -1101,7 +1100,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         std::vector<float> h0((size_t)hp.n_embd, 0.0f);
         float * d_h0 = (float *)dev_alloc_on(0, (size_t)hp.n_embd * 4);
         dev_queue(0).memcpy(d_h0, h0.data(), (size_t)hp.n_embd * 4).wait();
-        mtp_forward(t23.data(), d_mtp_main_h, d_h0, (int)t23.size(), 0, 0, /*with_head=*/true);
+        mtp_forward(t23.data(), mtp.d_mtp_main_h, d_h0, (int)t23.size(), 0, 0, /*with_head=*/true);
         sync_all();
         dev_queue(0).memcpy(h_logits, d_logits + (size_t)(t23.size() - 1) * hp.n_vocab, (size_t)hp.n_vocab * 4).wait();
         fprintf(stderr, "[mtp] drafttest in-pass row %zu (tok=%d) -> %d  (single-token draft gives %d)\n",
@@ -1109,7 +1108,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 /* reported by the caller */ -1);
         // and the same row as a standalone single-token call
         const int32_t t22 = tok;
-        mtp_forward(&t22, nullptr, d_mtp_hprev, 1, 0, nprompt, /*with_head=*/true);
+        mtp_forward(&t22, nullptr, mtp.d_mtp_hprev, 1, 0, nprompt, /*with_head=*/true);
         dev_queue(0).wait();
         dev_queue(0).memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
         fprintf(stderr, "[mtp] drafttest single row %d (tok=%d) -> %d\n", nprompt, t22,
@@ -1122,7 +1121,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         std::vector<int> rows = {0, 1, 2, nprompt - 2, nprompt - 1};
         for (int i : rows) {
             if (i < 0 || i >= nprompt) continue;
-            q.memcpy(d_last_hidden, d_mtp_main_h + (size_t)i * hp.n_embd, (size_t)hp.n_embd * 4).wait();
+            q.memcpy(d_last_hidden, mtp.d_mtp_main_h + (size_t)i * hp.n_embd, (size_t)hp.n_embd * 4).wait();
             std::vector<float> lg2 = run_head();
             const int got = argmax_f(lg2.data(), hp.n_vocab);
             const int want = (i + 1 < nprompt) ? prompt[(size_t)i + 1] : tok;
@@ -1143,15 +1142,15 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     // continuation, or an ignore_eos run) MTP is a net loss and usually falls
     // back to plain decoding, which is single-sequence and cannot share the
     // scheduler.  Shrinking k by one whenever a whole cycle accepts nothing and
-    // growing it back on a full-acceptance cycle keeps the ceiling at mtp_k (so
+    // growing it back on a full-acceptance cycle keeps the ceiling at mtp.mtp_k (so
     // the buffers still cover it) while cutting the wasted verify work.  The
     // emitted stream is unaffected: acceptance ignores k.
     static const bool adapt = [] {
         const char * e = si::env::str("PF_MTP_ADAPT");
         return e ? atoi(e) != 0 : true;
     }();
-    int k = mtp_k;
-    std::vector<int> cand((size_t)mtp_k + 1);
+    int k = mtp.mtp_k;
+    std::vector<int> cand((size_t)mtp.mtp_k + 1);
     // the candidate-restricted draft head arms itself after the first verify has
     // produced a candidate set (the first cycle uses the full head readout)
     bool cand_ready = false;
@@ -1165,37 +1164,37 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         const auto tc0 = now_t();
         // ---- draft: k autoregressive MTP steps -----------------------------
         cand[0] = tok;
-        const float * hprev = d_mtp_hprev;
+        const float * hprev = mtp.d_mtp_hprev;
         static const bool no_mtpfwd = si::env::flag("PF_MTP_NOMTPFWD");
         // PF_MTP_CAND=0 (the default, and the measured-better setting): the head
         // readout is the full 248320 rows.  With it on, step 0 is a full readout
         // that seeds the candidate set and steps 1..k-1 evaluate the head only on
         // that set - the candidate set holds the next step's argmax 25/17/7 % of
         // the time at margin 8, which is what keeps it off by default.
-        const bool cand_head = mtp_cand_cap_ > 0 && mtp_cand_ok_ && (cand_ready || mtp_cand_src_ == 1);
+        const bool cand_head = mtp.mtp_cand_cap_ > 0 && mtp.mtp_cand_ok_ && (cand_ready || mtp.mtp_cand_src_ == 1);
         // Device-resident draft chain: the head runs on the primary device and the
-        // MTP layer on mtp_dev, so with the default --mtp-device 0 both sit on one
+        // MTP layer on mtp.mtp_dev, so with the default --mtp-device 0 both sit on one
         // in-order queue and step i+1's concat reads step i's argmax straight out
         // of device memory.  That removes k syncs, k x n_vocab-float D2H copies and
         // k host scans of 248320 values per cycle (~1.2 ms/cycle measured).  A
-        // cross-device mtp_dev keeps the host round-trip.
-        const bool dev_chain = (mtp_dev == 0);
+        // cross-device mtp.mtp_dev keeps the host round-trip.
+        const bool dev_chain = (mtp.mtp_dev == 0);
         for (int i = 0; !no_mtpfwd && i < k; i++) {
             const int32_t t = cand[(size_t)i];
             MTPDBG("draft %d\n", i);
-            if (cand_head && dev_chain && i == 0 && mtp_cand_src_ == 1) {
+            if (cand_head && dev_chain && i == 0 && mtp.mtp_cand_src_ == 1) {
                 // The draft's *own* first-step distribution is the best available
                 // seed for the rest of the chain (the target's row from the last
                 // verify is one position back and only catches ~35% of the next
                 // argmax even at 938 candidates - see the [canddbg] sweep).  One
                 // full readout per cycle, then the chain runs on its top-N.
                 mtp_forward(&t, nullptr, hprev, 1, 0, pos + i, /*with_head=*/true);
-                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, d_mtp_tok_, d_mtp_amv_, 1);
-                backends_[0]->mtp_cand(d_logits, hp.n_vocab, d_mtp_tok_, d_mtp_amv_, mtp_cand_margin_, d_mtp_cand_,
-                                   mtp_cand_cap_);
+                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, mtp.d_mtp_tok_, mtp.d_mtp_amv_, 1);
+                backends_[0]->mtp_cand(d_logits, hp.n_vocab, mtp.d_mtp_tok_, mtp.d_mtp_amv_, mtp.mtp_cand_margin_, mtp.d_mtp_cand_,
+                                   mtp.mtp_cand_cap_);
             } else {
             mtp_forward(&t, nullptr, hprev, 1, 0, pos + i, /*with_head=*/true,
-                        /*tok_dev=*/(dev_chain && i > 0) ? d_mtp_tok_ + (i - 1) : nullptr,
+                        /*tok_dev=*/(dev_chain && i > 0) ? mtp.d_mtp_tok_ + (i - 1) : nullptr,
                         /*step=*/dev_chain ? i : -1);
             }
             // PF_MTP_CANDDBG: hit rate of the candidate set - this step's
@@ -1205,14 +1204,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             static int h_cand = 0, h_full = 0, h_steps = 0;
             static int h_cand_s[kMaxT] = {0}, h_full_s[kMaxT] = {0};
             if (cand_head && cand_dbg) {
-                if (!d_am2_) {
-                    d_am2_ = sycl::malloc_device<int32_t>(4, dev_queue(0));
+                if (!mtp.d_am2_) {
+                    mtp.d_am2_ = sycl::malloc_device<int32_t>(4, dev_queue(0));
                 }
                 int32_t hid = -1, hf = -1;
-                dev_queue(0).memcpy(&hid, d_mtp_tok_ + i, 4);
+                dev_queue(0).memcpy(&hid, mtp.d_mtp_tok_ + i, 4);
                 mtp_gemv(4, 1, -1); // full readout of the same hidden
-                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, d_am2_, nullptr, 1);
-                dev_queue(0).memcpy(&hf, d_am2_, 4).wait();
+                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, mtp.d_am2_, nullptr, 1);
+                dev_queue(0).memcpy(&hf, mtp.d_am2_, 4).wait();
                 h_cand += (hid == hf);
                 h_full++;
                 h_cand_s[i] += (hid == hf);
@@ -1220,14 +1219,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 h_steps++;
                 if (h_steps % 64 == 0) {
                     // how many ids the collect kernel actually filled
-                    std::vector<int32_t> ids((size_t)mtp_cand_cap_);
-                    dev_queue(0).memcpy(ids.data(), d_mtp_cand_, (size_t)mtp_cand_cap_ * 4).wait();
+                    std::vector<int32_t> ids((size_t)mtp.mtp_cand_cap_);
+                    dev_queue(0).memcpy(ids.data(), mtp.d_mtp_cand_, (size_t)mtp.mtp_cand_cap_ * 4).wait();
                     int nf = 0;
                     for (int32_t v : ids) {
                         nf += (v >= 0);
                     }
                     fprintf(stderr, "[canddbg] steps=%d hit=%d/%d (%.1f%%) set=%d/%d per-step:", h_steps, h_cand,
-                            h_full, 100.0 * h_cand / std::max(h_full, 1), nf, mtp_cand_cap_);
+                            h_full, 100.0 * h_cand / std::max(h_full, 1), nf, mtp.mtp_cand_cap_);
                     for (int s2 = 0; s2 < k; s2++) {
                         fprintf(stderr, " %d%%", h_full_s[s2] ? 100 * h_cand_s[s2] / h_full_s[s2] : 0);
                     }
@@ -1235,7 +1234,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 }
             }
             if (dev_chain) {
-                cand[(size_t)i + 1] = 0; // filled from d_mtp_tok_ after the chain
+                cand[(size_t)i + 1] = 0; // filled from mtp.d_mtp_tok_ after the chain
             } else {
             // the LM head runs on device 0 while the MTP layer may live on a
             // partition device: `q` is not ordered against dev_queue(0), so a
@@ -1245,8 +1244,8 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             // just those two beats the multi-device sync_all's serial sweep of
             // every backend (this is k of the 9 syncs per cycle).
             if (multi_dev) {
-                if (mtp_dev != 0) {
-                    dev_queue(mtp_dev).wait();
+                if (mtp.mtp_dev != 0) {
+                    dev_queue(mtp.mtp_dev).wait();
                 }
                 dev_queue(0).wait();
             } else {
@@ -1287,11 +1286,11 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 fprintf(stderr, "[mtp] lstat step=%d pos=%d max=%.3f min=%.3f mean=%.4f nan=%d top=%d(%.2f) %d(%.2f) %d(%.2f)\n",
                         i, pos + i, mx, mn, sum / hp.n_vocab, nan, t3[0], b3[0], t3[1], b3[1], t3[2], b3[2]);
             }
-            hprev = d_mtp_raw; // the raw MTP hidden at this row seeds the next
+            hprev = mtp.d_mtp_raw; // the raw MTP hidden at this row seeds the next
         }
         if (dev_chain) {
             // one small copy for the whole chain (instead of k x n_vocab floats)
-            dev_queue(0).memcpy(cand.data() + 1, d_mtp_tok_, (size_t)k * 4).wait();
+            dev_queue(0).memcpy(cand.data() + 1, mtp.d_mtp_tok_, (size_t)k * 4).wait();
         }
         const auto tc1 = now_t();
         t_draft += ms_t(tc0, tc1);
@@ -1377,24 +1376,24 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         const bool have_dev_argmax = greedy && no_penalty && gp.logit_bias.empty() && !mtp_dbg();
         // `dev_argmax` must be device memory: a kernel cannot write a host stack
         // array.
-        int32_t * d_argmax = d_argmax_buf_;
-        float * d_argval = d_argval_buf_;
+        int32_t * d_argmax = mtp.d_argmax_buf_;
+        float * d_argval = mtp.d_argval_buf_;
         if (!d_argmax) {
-            d_argmax_buf_ = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
-            d_argval_buf_ = sycl::malloc_device<float>(kMaxB, dev_queue(0));
-            d_argmax = d_argmax_buf_;
-            d_argval = d_argval_buf_;
+            mtp.d_argmax_buf_ = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
+            mtp.d_argval_buf_ = sycl::malloc_device<float>(kMaxB, dev_queue(0));
+            d_argmax = mtp.d_argmax_buf_;
+            d_argval = mtp.d_argval_buf_;
         }
         const auto tam0 = now_t();
         if (have_dev_argmax) {
-            backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, mtp_cand_cap_ > 0 ? d_argval : nullptr, k + 1);
-            dev_queue(0).memcpy(h_argmax, d_argmax, (size_t)(k + 1) * 4).wait();
+            backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, mtp.mtp_cand_cap_ > 0 ? d_argval : nullptr, k + 1);
+            dev_queue(0).memcpy(mtp.h_argmax, d_argmax, (size_t)(k + 1) * 4).wait();
             if (si::env::flag("PF_MTP_AMCHK")) {
                 dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
                 for (int i = 0; i <= k; i++) {
                     const int h = argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
-                    if (h != (int)h_argmax[i]) {
-                        fprintf(stderr, "[mtp] amchk MISMATCH row=%d dev=%d host=%d\n", i, (int)h_argmax[i], h);
+                    if (h != (int)mtp.h_argmax[i]) {
+                        fprintf(stderr, "[mtp] amchk MISMATCH row=%d dev=%d host=%d\n", i, (int)mtp.h_argmax[i], h);
                     }
                 }
             }
@@ -1409,7 +1408,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             return r;
         };
         auto row_argmax = [&](int i) -> int {
-            return have_dev_argmax ? (int)h_argmax[i] : argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
+            return have_dev_argmax ? (int)mtp.h_argmax[i] : argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
         };
         if (mtp_dbg()) {
             fprintf(stderr, "[mtp] pos=%d drafts:", pos);
@@ -1454,7 +1453,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // adopt the main model's token at the first mismatch (or past the drafts)
         {
             const float * row = h_logits + (size_t)j * hp.n_vocab;
-            int bonus = have_dev_argmax ? (int)h_argmax[j] : sample_token(row, hp.n_vocab, gp, out, ss);
+            int bonus = have_dev_argmax ? (int)mtp.h_argmax[j] : sample_token(row, hp.n_vocab, gp, out, ss);
             // emit the accepted drafts then the target's own token
             for (int i = 1; i <= j; i++) {
                 if ((int)out.size() >= gp.max_tokens) {
@@ -1493,9 +1492,9 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // PF_MTP_CANDM logits of it - a few hundred rows out of 248320, which is
         // all the draft head has to read.  Enqueued on device 0's queue, so it is
         // ordered after the verify's own kernels and before the next draft.
-        if (mtp_cand_src_ == 0 && have_dev_argmax && mtp_cand_cap_ > 0 && mtp_cand_ok_) {
+        if (mtp.mtp_cand_src_ == 0 && have_dev_argmax && mtp.mtp_cand_cap_ > 0 && mtp.mtp_cand_ok_) {
             backend().mtp_cand(d_logits + (size_t)j * hp.n_vocab, hp.n_vocab, d_argmax + j, d_argval + j,
-                               mtp_cand_margin_, d_mtp_cand_, mtp_cand_cap_);
+                               mtp.mtp_cand_margin_, mtp.d_mtp_cand_, mtp.mtp_cand_cap_);
             cand_ready = true;
         }
         const auto tc3 = now_t();
@@ -1509,7 +1508,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         if (!no_mtpfwd) {
             std::vector<int32_t> comm(cand.begin(), cand.begin() + (size_t)j + 1);
             comm.push_back(tok);
-            mtp_forward(comm.data(), d_mtp_main_h, d_mtp_hprev, j + 2, 0, pos, /*with_head=*/false);
+            mtp_forward(comm.data(), mtp.d_mtp_main_h, mtp.d_mtp_hprev, j + 2, 0, pos, /*with_head=*/false);
         }
         // The commit and the rollback are back-to-back and both end in a
         // device-wide barrier, so the commit's own sync is pure latency: the
@@ -1545,7 +1544,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         if (adapt && !no_accept) {
             // a fully accepted cycle means the chain can still run
             if (j == k) {
-                k = std::min(k + 1, mtp_k);
+                k = std::min(k + 1, mtp.mtp_k);
             } else if (j <= 1) {
                 k = std::max(k - 1, 1);
             }
@@ -1563,7 +1562,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     (t_cyc - (t_draft + t_verify + t_commit + t_rb + t_emit)) / t_cycles);
         }
         static const bool statechk = si::env::flag("PF_MTP_STATECHK");
-        if (statechk && !h_save_.empty()) {
+        if (statechk && !mtp.h_save_.empty()) {
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
             const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
             const size_t tot = gdn_per + conv_per;
@@ -1573,8 +1572,8 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             qd0.memcpy(rb.data() + gdn_per, as_[0].conv_state, conv_per * 4).wait();
             // reference: restore the pre-verify state and replay the committed
             // tokens one at a time on the validated single-token path
-            qd0.memcpy(as_[0].gdn_state, h_save_.data(), gdn_per * 4).wait();
-            qd0.memcpy(as_[0].conv_state, h_save_.data() + gdn_per, conv_per * 4).wait();
+            qd0.memcpy(as_[0].gdn_state, mtp.h_save_.data(), gdn_per * 4).wait();
+            qd0.memcpy(as_[0].conv_state, mtp.h_save_.data() + gdn_per, conv_per * 4).wait();
             for (int c = 0; c <= j; c++) {
                 int32_t tt = (c == 0) ? cand[0] : cand[(size_t)c];
                 int32_t pp = pos + c;
@@ -1590,7 +1589,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 nb = std::max(nb, (double)std::fabs(ref[i]));
             }
             fprintf(stderr, "[mtp] statechk pos=%d j=%d rollback-vs-ref maxdiff=%.6f |ref|=%.4f\n", pos, j, d, nb);
-            h_save_.clear();
+            mtp.h_save_.clear();
         }
         if (si::env::flag("PF_MTP_AUTOTEST")) {
             // compare the verify's row-0 prediction against a plain single-token
@@ -1605,19 +1604,10 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             mtp_rollback(j);
         }
         // the main hidden at the last committed position seeds the next cycle
-        dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (size_t)j * hp.n_embd, (size_t)hp.n_embd * 4).wait();
+        dev_queue(0).memcpy(mtp.d_mtp_hprev, mtp.d_mtp_main_h + (size_t)j * hp.n_embd, (size_t)hp.n_embd * 4).wait();
         pos += j + 1;
         // grow the block table if the draft window could cross a block boundary
-        if ((pos + mtp_k + 1 + kBlockSize - 1) / kBlockSize > (int)blocks.size()) {
-            for (int kb = (int)blocks.size(); kb < (pos + mtp_k + 1 + kBlockSize - 1) / kBlockSize; kb++) {
-                int b = alloc_block();
-                if (b < 0) {
-                    break;
-                }
-                blocks.push_back(b);
-            }
-            set_table(0, blocks);
-        }
+        ensure_block_headroom(blocks, pos, mtp.mtp_k + 1);
         if ((int)out.size() >= gp.max_tokens) {
             break;
         }

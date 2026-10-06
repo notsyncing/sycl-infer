@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "av_common.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,12 +18,6 @@ namespace si {
 
 namespace {
 
-constexpr const char * kFfmpegErr = "/tmp/opencode/ffmpeg_sycl_infer_err.log";
-
-const char * ffmpeg_cmd() {
-    const char * v = si::env::str("PF_AV_FFMPEG");
-    return (v && v[0]) ? v : "ffmpeg";
-}
 
 // ---------------------------------------------------------------------------
 // WAV (RIFF) decoder.  Covers the canonical formats: PCM 8/16/24/32 and IEEE
@@ -196,8 +191,8 @@ bool mm_audio_decode_mem(const uint8_t * data, size_t len, const audio_preproc_c
 }
 
 bool mm_audio_decode_ffmpeg(const std::string & path, mm_audio & out, std::string * err) {
-    std::string cmd = std::string(ffmpeg_cmd()) + " -v error -i \"" + path + "\" -f f32le -ac 1 -ar 16000 2> "
-                      + kFfmpegErr + " pipe:1";
+    std::string cmd = std::string(av_ffmpeg_cmd()) + " -v error -i \"" + path + "\" -f f32le -ac 1 -ar 16000 2> "
+                      + av_ffmpeg_err_log() + " pipe:1";
     FILE * p = popen(cmd.c_str(), "r");
     if (!p) {
         if (err) {
@@ -213,15 +208,7 @@ bool mm_audio_decode_ffmpeg(const std::string & path, mm_audio & out, std::strin
     }
     const int status = pclose(p);
     if (samples.empty() || status != 0) {
-        std::string tail;
-        FILE * ef = std::fopen(kFfmpegErr, "r");
-        if (ef) {
-            char tb[512];
-            while (std::fgets(tb, sizeof(tb), ef) && tail.size() < 600) {
-                tail += tb;
-            }
-            std::fclose(ef);
-        }
+        std::string tail = av_err_tail();
         if (err) {
             if (samples.empty() && status == 0) {
                 *err = "audio produced no samples";

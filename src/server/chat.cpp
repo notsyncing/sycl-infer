@@ -1,4 +1,5 @@
 #include "chat.h"
+#include "chat_util.h"
 
 #include <cstddef>
 #include <string>
@@ -8,31 +9,6 @@
 #include "json.hpp"
 
 namespace si {
-
-static std::string rstrip_nl(const std::string & s) {
-    size_t e = s.size();
-    while (e > 0 && s[e - 1] == '\n') {
-        e--;
-    }
-    return s.substr(0, e);
-}
-static std::string lstrip_nl(const std::string & s) {
-    size_t b = 0;
-    while (b < s.size() && s[b] == '\n') {
-        b++;
-    }
-    return s.substr(b);
-}
-static std::string trim(const std::string & s) {
-    size_t b = 0, e = s.size();
-    while (b < e && (s[b] == ' ' || s[b] == '\n' || s[b] == '\t' || s[b] == '\r')) {
-        b++;
-    }
-    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\n' || s[e - 1] == '\t' || s[e - 1] == '\r')) {
-        e--;
-    }
-    return s.substr(b, e - b);
-}
 
 std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
                         bool enable_thinking, const std::string & tools_json) {
@@ -119,7 +95,7 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
 
     size_t start = 0;
     if (msgs[0].role == "system") {
-        const std::string c = trim(content_of(msgs[0]));
+        const std::string c = trim_spaces(content_of(msgs[0]));
         out += "<|im_start|>system\n" + c + tools_block + "<|im_end|>\n";
         start = 1;
     } else if (!tools_block.empty()) {
@@ -141,21 +117,21 @@ std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_gen
                     std::string before = content.substr(0, close_pos);
                     const size_t open_pos = before.rfind("<think>");
                     if (open_pos != std::string::npos) {
-                        reasoning = lstrip_nl(rstrip_nl(before.substr(open_pos + 7)));
-                        content = lstrip_nl(content.substr(close_pos + 8));
+                        reasoning = lstrip_newlines(rstrip_newlines(before.substr(open_pos + 7)));
+                        content = lstrip_newlines(content.substr(close_pos + 8));
                         has_reasoning = true;
                     }
                 }
             }
             out += "<|im_start|>assistant\n";
             if (has_reasoning && (int)i > last_query) {
-                out += "<think>\n" + trim(reasoning) + "\n</think>\n\n" + content;
+                out += "<think>\n" + trim_spaces(reasoning) + "\n</think>\n\n" + content;
             } else {
                 out += content;
             }
             bool first_call = true;
             for (const chat_tool_call & tc : msg.tool_calls) {
-                if (first_call && trim(content).empty()) {
+                if (first_call && trim_spaces(content).empty()) {
                     out += builtin_tool_call_xml(tc);
                 } else {
                     out += "\n\n" + builtin_tool_call_xml(tc);

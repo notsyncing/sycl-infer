@@ -1,4 +1,7 @@
 #include "video.h"
+#include "av_common.h"
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -337,16 +340,6 @@ bool try_avi(const uint8_t * data, size_t len, const mm_video_fmt & fmt, mm_vide
 // duration, then piped as raw rgb24 with an `fps` filter that produces about
 // `max_frames` uniformly spaced frames.
 // ---------------------------------------------------------------------------
-const char * ffmpeg_cmd() {
-    const char * v = si::env::str("PF_AV_FFMPEG");
-    return (v && v[0]) ? v : "ffmpeg";
-}
-
-const char * ffprobe_cmd() {
-    const char * v = si::env::str("PF_AV_FFPROBE");
-    return (v && v[0]) ? v : "ffprobe";
-}
-
 namespace {
 // parse "Stream #0:0: Video: ... 854x480 [SAR 1:1 DAR 16:9]" and
 // "Duration: 01:29:45.07" from `ffmpeg -i` stderr (ffprobe-less fallback)
@@ -393,7 +386,7 @@ void parse_ffmpeg_info(const std::string & text, int & w, int & h, double & dur)
 
 bool probe_video(const std::string & path, int & w, int & h, double & dur) {
     // ffprobe prints "width,height,duration" on one line with -of csv
-    const std::string pcmd = std::string(ffprobe_cmd())
+    const std::string pcmd = std::string(av_ffprobe_cmd())
                              + " -v error -select_streams v:0 -show_entries stream=width,height:format=duration -of "
                                "csv=p=0 \""
                              + path + "\"";
@@ -430,7 +423,7 @@ bool probe_video(const std::string & path, int & w, int & h, double & dur) {
         pclose(p);
     }
     // no ffprobe: parse `ffmpeg -i` stderr
-    const std::string fcmd = std::string(ffmpeg_cmd()) + " -v error -i \"" + path + "\" 2>&1";
+    const std::string fcmd = std::string(av_ffmpeg_cmd()) + " -v error -i \"" + path + "\" 2>&1";
     FILE * fp = popen(fcmd.c_str(), "r");
     if (!fp) {
         return false;
@@ -467,12 +460,10 @@ bool decode_ffmpeg(const std::string & path, const mm_video_fmt & fmt, mm_video 
     }
     char with_odd[64];
     std::snprintf(with_odd, sizeof(with_odd), "%.4g", fps);
-    const std::string err_path = "/tmp/opencode/ffmpeg_sycl_infer_err.log";
-    std::string cmd = std::string(ffmpeg_cmd())
+    std::string cmd = std::string(av_ffmpeg_cmd())
                       + " -v error -i \"" + path
                       + "\" -an -sn -vf \"fps=" + with_odd
-                      + ",scale=trunc(iw/2)*2:trunc(ih/2)*2\" -pix_fmt rgb24 -f rawvideo 2> /tmp/opencode/ffmpeg_sycl_infer_err.log "
-                        "pipe:1";
+                      + ",scale=trunc(iw/2)*2:trunc(ih/2)*2\" -pix_fmt rgb24 -f rawvideo 2> " + std::string(av_ffmpeg_err_log()) + " pipe:1";
     FILE * p = popen(cmd.c_str(), "r");
     if (!p) {
         if (err) {
@@ -495,18 +486,7 @@ bool decode_ffmpeg(const std::string & path, const mm_video_fmt & fmt, mm_video 
     }
     const int status = pclose(p);
     if (all.empty()) {
-        std::string tail;
-        FILE * ef = std::fopen("/tmp/opencode/ffmpeg_sycl_infer_err.log", "r");
-        if (ef) {
-            char tb[512];
-            while (std::fgets(tb, sizeof(tb), ef)) {
-                tail += tb;
-                if (tail.size() > 600) {
-                    break;
-                }
-            }
-            std::fclose(ef);
-        }
+        std::string tail = av_err_tail();
         if (err) {
             *err = "ffmpeg produced no frames" + (status != 0 ? (": " + tail) : std::string());
         }
@@ -553,20 +533,37 @@ bool mm_video_decode_mem(const uint8_t * data, size_t len, const mm_video_fmt & 
     if (std::memcmp(data, "RIFF", 4) == 0 && std::memcmp(data + 8, "AVI ", 4) == 0 && try_avi(data, len, fmt, out, err)) {
         return true;
     }
-    // not a decodable AVI (or failed): hand the bytes to ffmpeg
-    std::string path = "/tmp/opencode/video_input_" + std::to_string((uintptr_t)data) + ".bin";
-    FILE * f = std::fopen(path.c_str(), "wb");
-    if (!f) {
+    // not a decodable AVI (or failed): hand the bytes to ffmpeg via a tmp file
+    char tmpl[128] = "/tmp/opencode/sycl_infer_video_XXXXXX";
+    const int fd = mkstemp(tmpl);
+    if (fd < 0) {
         if (err) {
             *err = "cannot write video temp file";
         }
         return false;
     }
-    std::fwrite(data, 1, len, f);
-    std::fclose(f);
-    const bool ok = decode_ffmpeg(path, fmt, out, err);
+    const std::string path = tmpl;
+    bool ok = true;
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t w = write(fd, data + off, len - off);
+        if (w <= 0) {
+            ok = false;
+            break;
+        }
+        off += (size_t)w;
+    }
+    close(fd);
+    if (!ok) {
+        std::remove(path.c_str());
+        if (err) {
+            *err = "cannot write video temp file";
+        }
+        return false;
+    }
+    const bool decoded = decode_ffmpeg(path, fmt, out, err);
     std::remove(path.c_str());
-    return ok;
+    return decoded;
 }
 
 bool mm_video_decode_file(const std::string & path, const mm_video_fmt & fmt, mm_video & out, std::string * err) {

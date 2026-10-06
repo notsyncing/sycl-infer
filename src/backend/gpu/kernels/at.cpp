@@ -6,6 +6,7 @@
 // bidirectional attention) reuses the shared vision kernels in vit.cpp.
 // ---------------------------------------------------------------------------
 #include "kernels.h"
+#include "common/rope.h"
 #include "kernel_utils.h"
 
 #include <cmath>
@@ -50,7 +51,7 @@ void at_rope1d_launch(queue & q, float * qkv, int qkv_stride, int n_tok, int n_h
         const int pair = it[0] % half;
         const int h = (it[0] / half) % n_head;
         const int t = (int)(it[0] / (half * n_head));
-        const float theta = (float)t * sycl::exp2(-2.0f * pair / (float)head_dim * log2b);
+        const float theta = rope_theta((float)t, pair, head_dim, log2b);
         const float c = sycl::cos(theta), s = sycl::sin(theta);
         // Q and K live in the first two thirds of the fused qkv row
         float * qrow = qkv + (size_t)t * qkv_stride + h * head_dim;

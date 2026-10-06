@@ -22,6 +22,7 @@ cpu_step_info to_cpu_info(const step_info * in) {
     c.n_rows = in->n_rows;
     c.n_real = in->n_real;
     c.tpb = in->tpb;
+    std::memcpy(c.n_real_row, in->n_real_row, sizeof(c.n_real_row));
     std::memcpy(c.pos, in->pos, sizeof(c.pos));
     std::memcpy(c.slot, in->slot, sizeof(c.slot));
     std::memcpy(c.active, in->active, sizeof(c.active));

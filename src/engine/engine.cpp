@@ -111,29 +111,29 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     m.load(model_path);
     tk.load(m.gguf);
     // MTP draft length: --mtp N (0/absent = off), PF_MTP as an env override.
-    mtp_k = mtp_k_arg;
+    mtp.mtp_k = mtp_k_arg;
     if (const char * em = si::env::str("PF_MTP")) {
         const int v = atoi(em);
         if (v >= 0) {
-            mtp_k = v;
+            mtp.mtp_k = v;
         }
     }
-    if (mtp_k > 0 && !m.has_mtp) {
+    if (mtp.mtp_k > 0 && !m.has_mtp) {
         fprintf(stderr, "[mtp] model has no NextN (blk.%d.nextn.*) layer - MTP disabled\n", m.hp.n_layer);
-        mtp_k = 0;
+        mtp.mtp_k = 0;
     }
-    if (mtp_k > 12) {
-        mtp_k = 12; // d_logits / step_info bounds: n = mtp_k+1 <= kMaxB
+    if (mtp.mtp_k > 12) {
+        mtp.mtp_k = 12; // d_logits / step_info bounds: n = mtp.mtp_k+1 <= kMaxB
     }
-    mtp_on = mtp_k > 0;
+    mtp.mtp_on = mtp.mtp_k > 0;
     {
         const char * e = si::env::str("PF_MTP_SPLITS");
         if (e) {
-            mtp_splits = atoi(e);
+            mtp.mtp_splits = atoi(e);
         }
-        mtp_splits = std::min(std::max(mtp_splits, 1), kMaxDecSplits);
+        mtp.mtp_splits = std::min(std::max(mtp.mtp_splits, 1), kMaxDecSplits);
     }
-    if (mtp_on && si::env::flag("PF_MTP_FORCE_INT8")) {
+    if (mtp.mtp_on && si::env::flag("PF_MTP_FORCE_INT8")) {
         // Historical: the native q5/cb4 stores used to prefill the tensor back to
         // int8 in a per-pass scratch, which a multi-token verify paid every cycle.
         // The batched native GEMM (nat_gemm_launch) now consumes the k5/cb4/u4
@@ -143,7 +143,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         setenv("PF_K5", "0", 1);
     }
     if (const char * ed = si::env::str("PF_MTP_DEV")) {
-        mtp_dev = atoi(ed);
+        mtp.mtp_dev = atoi(ed);
     }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
@@ -151,42 +151,42 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     if (!multi_dev) {
         be = cpu_mode ? make_cpu_backend() : make_gpu_backend(q);
     }
-    if (mtp_on && !(multi_dev && md_xmx)) {
+    if (mtp.mtp_on && !(multi_dev && md_xmx)) {
         // The draft head needs the oneDNN int8 row-major weight path (the same
         // one the multi-device decode uses); everything else would fall back to
         // a much slower per-call GEMM chain.
         fprintf(stderr, "[mtp] MTP needs a multi-device oneDNN int8 partition (%s) - disabled\n",
                 multi_dev ? (md_xmx ? "ok" : "no XMX") : "single device");
-        mtp_on = false;
-        mtp_k = 0;
+        mtp.mtp_on = false;
+        mtp.mtp_k = 0;
     }
-    if (mtp_on && (mtp_dev < 0 || mtp_dev >= (int)backends_.size())) {
-        fprintf(stderr, "[mtp] --mtp-device %d out of range (%zu device(s)) - using 0\n", mtp_dev, backends_.size());
-        mtp_dev = 0;
+    if (mtp.mtp_on && (mtp.mtp_dev < 0 || mtp.mtp_dev >= (int)backends_.size())) {
+        fprintf(stderr, "[mtp] --mtp-device %d out of range (%zu device(s)) - using 0\n", mtp.mtp_dev, backends_.size());
+        mtp.mtp_dev = 0;
     }
     // DFlash / DFlash2 drafter (--spec-type dflash2): its own GGUF, its own K/V
     // ring, and the feature-capture hook record_forward bakes into the graphs.
-    df_kmax_ = draft_k_arg;
+    dfl.df_kmax_ = draft_k_arg;
     if (const char * e = si::env::str("PF_DFLASH_NMAX")) {
         const int v = atoi(e);
         if (v > 0) {
-            df_kmax_ = v;
+            dfl.df_kmax_ = v;
         }
     }
     if (const char * e = si::env::str("PF_DFLASH_DEV")) {
-        df_dev_ = atoi(e);
+        dfl.df_dev_ = atoi(e);
     }
     if (draft_dev > 0) {
-        df_dev_ = draft_dev;
+        dfl.df_dev_ = draft_dev;
     }
     if (!draft_path.empty()) {
-        if (mtp_on) {
+        if (mtp.mtp_on) {
             fprintf(stderr, "[dflash] --spec-draft-model and --mtp are exclusive; MTP off\n");
-            mtp_on = false;
-            mtp_k = 0;
+            mtp.mtp_on = false;
+            mtp.mtp_k = 0;
         }
         setup_dflash(draft_path);
-        if (!dflash_on_) {
+        if (!dfl.dflash_on_) {
             fprintf(stderr, "[dflash] speculative decoding unavailable - plain decode\n");
         }
     }
@@ -200,7 +200,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // at one warp per token with no key parallelism.  PF_MD_SPLITS=1 opts
         // back into the split path for A/B (it verifies clean now, and buys
         // ~10% prefill, but it stays opt-in until it is measured end to end).
-        // The MTP draft does not depend on this gate: it has its own mtp_splits
+        // The MTP draft does not depend on this gate: it has its own mtp.mtp_splits
         // cap (PF_MTP_SPLITS), because a single-token attention over a long KV
         // is the worst case for a fixed 1-split grid (13x at 128k).
         const char * emd = si::env::str("PF_MD_SPLITS");
@@ -499,7 +499,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         for (int il = 0; il < m.hp.n_layer; il++) {
             n_attn += !m.hp.is_recr(il);
         }
-        n_attn += mtp_on ? 1 : 0; // the MTP layer owns one KV slice too
+        n_attn += mtp.mtp_on ? 1 : 0; // the MTP layer owns one KV slice too
         const size_t block_bytes = kv_block_bytes();
         // a block holds a K block and a V block, which may differ (--kv-type K:V)
         const size_t blk_pair = block_bytes + kv_v_block_bytes();
@@ -608,7 +608,6 @@ engine::~engine() {
     }
     f(d_tables);
     f(d_info);
-    f(d_segs_dec);
     f(d_segs_dec8);
     f(d_segs_pf);
     f(d_segs_pf8);
@@ -616,9 +615,9 @@ engine::~engine() {
     // MTP / DFlash speculative-decoding buffers (both are pure device/USM
     // allocations; the drafts share the verify machinery)
     {
-        sycl::queue & qm = dev_queue(mtp_dev);
+        sycl::queue & qm = dev_queue(mtp.mtp_dev);
         sycl::queue & qf0 = dev_queue(0);
-        sycl::queue & qd0 = dev_queue(df_dev_);
+        sycl::queue & qd0 = dev_queue(dfl.df_dev_);
         auto fm = [&](auto * p) {
             if (p) {
                 sycl::free(p, qm);
@@ -634,102 +633,101 @@ engine::~engine() {
                 sycl::free(p, qd0);
             }
         };
-        fm(d_mtp_cat);
-        fm(d_mtp_x);
-        fm(d_mtp_xnorm);
-        fm(d_mtp_qbuf);
-        fm(d_mtp_kbuf);
-        fm(d_mtp_vbuf);
-        fm(d_mtp_attn_out);
-        fm(d_mtp_ffn);
-        fm(d_mtp_hnorm);
-        fm(d_mtp_raw);
-        fm(d_mtp_partials);
-        fm(d_mtp_hprev);
-        // d_mtp_hnorm0 aliases d_mtp_hnorm whenever mtp_dev == 0
-        if (d_mtp_hnorm0 != d_mtp_hnorm) {
-            f0(d_mtp_hnorm0);
+        fm(mtp.d_mtp_cat);
+        fm(mtp.d_mtp_x);
+        fm(mtp.d_mtp_xnorm);
+        fm(mtp.d_mtp_qbuf);
+        fm(mtp.d_mtp_kbuf);
+        fm(mtp.d_mtp_vbuf);
+        fm(mtp.d_mtp_attn_out);
+        fm(mtp.d_mtp_ffn);
+        fm(mtp.d_mtp_hnorm);
+        fm(mtp.d_mtp_raw);
+        fm(mtp.d_mtp_partials);
+        fm(mtp.d_mtp_hprev);
+        // mtp.d_mtp_hnorm0 aliases mtp.d_mtp_hnorm whenever mtp.mtp_dev == 0
+        if (mtp.d_mtp_hnorm0 != mtp.d_mtp_hnorm) {
+            f0(mtp.d_mtp_hnorm0);
         }
-        if (d_mtp_hnorm1) {
-            sycl::free(d_mtp_hnorm1, dev_queue(1));
+        if (mtp.d_mtp_hnorm1) {
+            sycl::free(mtp.d_mtp_hnorm1, dev_queue(1));
         }
-        f(d_mtp_main_h);
-        f0(d_mtp_tok_);
-        fm(d_mtp_tokx_);
-        f0(d_mtp_cand_);
-        f0(d_mtp_cvals_);
-        f0(d_mtp_cval1_);
-        f0(d_mtp_amv_);
-        f0(d_argmax_buf_);
-        f0(d_argval_buf_);
-        f0(d_am2_);
-        if (d_mtp_rinfo) {
-            sycl::free(d_mtp_rinfo, q);
+        f(mtp.d_mtp_main_h);
+        f0(mtp.d_mtp_tok_);
+        f0(mtp.d_mtp_cand_);
+        f0(mtp.d_mtp_cvals_);
+        f0(mtp.d_mtp_cval1_);
+        f0(mtp.d_mtp_amv_);
+        f0(mtp.d_argmax_buf_);
+        f0(mtp.d_argval_buf_);
+        f0(mtp.d_am2_);
+        if (mtp.d_mtp_rinfo) {
+            sycl::free(mtp.d_mtp_rinfo, q);
         }
-        if (d_mtp_info) {
-            sycl::free(d_mtp_info, q);
+        if (mtp.d_mtp_info) {
+            sycl::free(mtp.d_mtp_info, q);
         }
-        f(d_segs_vf);
-        f(d_segs_mtp);
-        f(d_segs_mtp_exact);
-        f(h_head_stage);
-        for (size_t d = 0; d < d_mtp_hist_.size(); d++) {
+        f(mtp.d_segs_vf);
+        f(mtp.d_segs_mtp);
+        f(mtp.d_segs_mtp_exact);
+        f(mtp.h_head_stage);
+        for (size_t d = 0; d < mtp.d_mtp_hist_.size(); d++) {
             sycl::queue & qd = dev_queue((int)d);
             auto fz = [&](auto * p) {
                 if (p) {
                     sycl::free(p, qd);
                 }
             };
-            fz(d_mtp_hist_[d]);
-            fz(d_mtp_convsave_[d]);
-            fz(d_mtp_rin_[d]);
-            fz(d_mtp_qsave_[d]);
-            fz(d_mtp_ssave_[d]);
+            fz(mtp.d_mtp_hist_[d]);
+            fz(mtp.d_mtp_convsave_[d]);
+            fz(mtp.d_mtp_rin_[d]);
+            fz(mtp.d_mtp_qsave_[d]);
+            fz(mtp.d_mtp_ssave_[d]);
         }
-        d_mtp_hist_.clear();
-        d_mtp_convsave_.clear();
-        d_mtp_rin_.clear();
-        d_mtp_qsave_.clear();
-        d_mtp_ssave_.clear();
-        f(d_df_h);
-        f(d_df_b);
-        f(d_df_c);
-        f(d_df_qkv);
-        f(d_df_gu);
-        f(d_df_dyn);
-        f(d_df_gate);
-        f(d_df_partials);
-        f(d_df_feat);
-        f(d_df_feat_dev);
-        fd(d_df_kring);
-        fd(d_df_vring);
-        f(d_df_pos);
-        f(d_df_ids);
-        f(d_df_vals);
-        f(d_df_pids);
-        f(d_df_pvals);
-        f(d_df_lattice);
-        if (d_df_info) {
-            sycl::free(d_df_info, q);
+        mtp.d_mtp_hist_.clear();
+        mtp.d_mtp_convsave_.clear();
+        mtp.d_mtp_rin_.clear();
+        mtp.d_mtp_qsave_.clear();
+        mtp.d_mtp_ssave_.clear();
+        f(dfl.d_df_h);
+        f(dfl.d_df_b);
+        f(dfl.d_df_c);
+        f(dfl.d_df_qkv);
+        f(dfl.d_df_gu);
+        f(dfl.d_df_dyn);
+        f(dfl.d_df_gate);
+        f(dfl.d_df_partials);
+        f(dfl.d_df_feat);
+        f(dfl.d_df_feat_dev);
+        fd(dfl.d_df_kring);
+        fd(dfl.d_df_vring);
+        f(dfl.d_df_pos);
+        f(dfl.d_df_ids);
+        f(dfl.d_df_vals);
+        f(dfl.d_df_pids);
+        f(dfl.d_df_pvals);
+        f(dfl.d_df_lattice);
+        if (dfl.d_df_info) {
+            sycl::free(dfl.d_df_info, q);
         }
-        d_mtp_cat = d_mtp_x = d_mtp_xnorm = d_mtp_qbuf = d_mtp_kbuf = d_mtp_vbuf = nullptr;
-        d_mtp_attn_out = d_mtp_ffn = d_mtp_hnorm = d_mtp_raw = nullptr;
-        d_mtp_partials = d_mtp_hprev = d_mtp_main_h = d_mtp_hnorm0 = nullptr;
-        d_mtp_rinfo = d_mtp_info = nullptr;
-        d_segs_vf = d_segs_mtp = d_segs_mtp_exact = nullptr;
-        d_mtp_tok_ = d_mtp_tokx_ = d_mtp_cand_ = nullptr;
-        d_mtp_cvals_ = d_mtp_cval1_ = d_mtp_amv_ = nullptr;
-        d_mtp_hnorm1 = nullptr;
-        d_argmax_buf_ = d_am2_ = nullptr;
-        d_argval_buf_ = nullptr;
-        h_head_stage = nullptr;
-        d_df_h = d_df_b = d_df_c = d_df_qkv = d_df_gu = d_df_dyn = d_df_gate = nullptr;
-        d_df_partials = d_df_feat = d_df_feat_dev = nullptr;
-        d_df_kring = d_df_vring = nullptr;
-        d_df_pos = nullptr;
-        d_df_ids = d_df_pids = nullptr;
-        d_df_vals = d_df_pvals = d_df_lattice = nullptr;
-        d_df_info = nullptr;
+        mtp.d_mtp_cat = mtp.d_mtp_x = mtp.d_mtp_xnorm = mtp.d_mtp_qbuf = mtp.d_mtp_kbuf = mtp.d_mtp_vbuf = nullptr;
+        mtp.d_mtp_attn_out = mtp.d_mtp_ffn = mtp.d_mtp_hnorm = mtp.d_mtp_raw = nullptr;
+        mtp.d_mtp_partials = mtp.d_mtp_hprev = mtp.d_mtp_main_h = mtp.d_mtp_hnorm0 = nullptr;
+        mtp.d_mtp_rinfo = mtp.d_mtp_info = nullptr;
+        mtp.d_segs_vf = mtp.d_segs_mtp = mtp.d_segs_mtp_exact = nullptr;
+        mtp.d_mtp_tok_ = mtp.d_mtp_cand_ = nullptr;
+        mtp.d_mtp_cvals_ = mtp.d_mtp_cval1_ = mtp.d_mtp_amv_ = nullptr;
+        mtp.d_mtp_hnorm1 = nullptr;
+        mtp.d_argmax_buf_ = mtp.d_am2_ = nullptr;
+        mtp.d_argval_buf_ = nullptr;
+        mtp.h_head_stage = nullptr;
+        dfl.d_df_h = dfl.d_df_b = dfl.d_df_c = dfl.d_df_qkv = dfl.d_df_gu = dfl.d_df_dyn = dfl.d_df_gate = nullptr;
+        dfl.d_df_partials = dfl.d_df_feat = dfl.d_df_feat_dev = nullptr;
+        dfl.d_df_kring = dfl.d_df_vring = nullptr;
+        dfl.d_df_pos = nullptr;
+        dfl.d_df_ids = dfl.d_df_pids = nullptr;
+        dfl.d_df_vals = dfl.d_df_pvals = dfl.d_df_lattice = nullptr;
+        dfl.d_df_info = nullptr;
     }
     for (int i = 0; i < kPfSlots; i++) {
         f(d_segs_pf_slot[i]);
@@ -1048,7 +1046,7 @@ void engine::upload_device_weights(int dev) {
     // global tensors (embedding, LM head, output norm) always run on the
     // primary device: only device 0 carries them, which matters because
     // tok_embd + output are ~10 GB for a large-vocab model
-    if (dev == (multi_dev ? mtp_dev : 0) && mtp_on) {
+    if (dev == (multi_dev ? mtp.mtp_dev : 0) && mtp.mtp_on) {
         // the MTP layer's F32 norms ride on its own device; tok_embd stays on
         // device 0 (host USM, reachable from every backend in the context)
         const mtp_layer_t & M = m.mtp;
@@ -1064,7 +1062,7 @@ void engine::upload_device_weights(int dev) {
         addp(m.tok_embd.data);
         addp(m.output.data);
         addp(m.output_norm);
-        if (mtp_on) {
+        if (mtp.mtp_on) {
             const mtp_layer_t & M = m.mtp;
             addp(M.attn_norm);
             addp(M.post_attn_norm);
@@ -1349,7 +1347,7 @@ bool engine::setup_md_dnnl() {
                 m.page_out_tensor(t);
             }
         };
-        if ((int)d == mtp_dev && mtp_on) {
+        if ((int)d == mtp.mtp_dev && mtp.mtp_on) {
             // The MTP draft layer runs on --mtp-device, so its linears (and the
             // eh_proj input projection) are converted into that partition's
             // oneDNN table, keyed by their host pointers.
@@ -1409,7 +1407,7 @@ bool engine::setup_md_dnnl() {
                 // the prefill then threw "oneDNN GEMM failed for a layer tensor".
                 if (layer_w2 && t.data && (w2_call == -99 || w2_call == ci)) {
                     if (D->add_weight_w2(t.data, t.data, t.type, t.K, t.N)) {
-                        mtp_layer_w2_ = true;
+                        mtp.mtp_layer_w2_ = true;
                     }
                 }
                 if (layer_w4 && t.data && (w4_call == -99 || w4_call == ci)) {
@@ -1427,7 +1425,7 @@ bool engine::setup_md_dnnl() {
             add_mtp(M.ffn_gate, 2);
             add_mtp(M.ffn_up, 2);
             add_mtp(M.ffn_down, 3);
-            mtp_layer_w4_ = layer_w4_ok;
+            mtp.mtp_layer_w4_ = layer_w4_ok;
         }
         if (d == 0 && m.output.data != m.tok_embd.data) {
             // The LM head is a global pinned to backend 0.  Convert it here -
@@ -1454,13 +1452,13 @@ bool engine::setup_md_dnnl() {
             // *target* decode onto u4.  PF_MTP_HEAD_W4=0 keeps the exact int8
             // head for the draft (the emitted stream is identical either way:
             // the verify always uses the int8 head).
-            if (mtp_on) {
+            if (mtp.mtp_on) {
                 static const bool head_w4 = [] {
                     const char * e = si::env::str("PF_MTP_HEAD_W4");
                     return !e || atoi(e) != 0;
                 }();
                 if (head_w4) {
-                    mtp_head_w4_ = D->add_weight_w4(mtp_head_w4_key_, m.output.data, m.output.type, m.output.K,
+                    mtp.mtp_head_w4_ = D->add_weight_w4(mtp.mtp_head_w4_key_, m.output.data, m.output.type, m.output.K,
                                                     m.output.N, /*any_type=*/true);
                     // PF_MTP_HEAD_W2=1: also keep the 2-bit copy.  Measured
                     // default OFF: it is exact arithmetic and 40% fewer head
@@ -1472,12 +1470,12 @@ bool engine::setup_md_dnnl() {
                         const char * e = si::env::str("PF_MTP_HEAD_W2");
                         return e && atoi(e) != 0;
                     }();
-                    if (head_w2 && mtp_head_w4_) {
+                    if (head_w2 && mtp.mtp_head_w4_) {
                         const wt & hd = draft_head();
-                        mtp_head_w2_ = D->add_weight_w2(mtp_head_w2_key_, hd.data, hd.type, hd.K, hd.N);
+                        mtp.mtp_head_w2_ = D->add_weight_w2(mtp.mtp_head_w2_key_, hd.data, hd.type, hd.K, hd.N);
                         if (si::env::flag("PF_MTP_MEM")) {
                             fprintf(stderr, "[mtp] draft LM head: %d rows x %d K, %s\n", (int)hd.N, (int)hd.K,
-                                    mtp_head_w2_ ? "2-bit copy ok" : "2-bit copy failed");
+                                    mtp.mtp_head_w2_ ? "2-bit copy ok" : "2-bit copy failed");
                         }
                     }
                     if (si::env::flag("PF_MTP_MEM")) {
@@ -1501,15 +1499,15 @@ bool engine::setup_md_dnnl() {
                     // two halves are registered in device 1's iteration below (its
                     // dnnl_gemm owns the allocations).  PF_MTP_HEAD_SPLIT=0 keeps
                     // the whole readout on device 0.
-                    if (head_split && mtp_head_w4_) {
+                    if (head_split && mtp.mtp_head_w4_) {
                         const wt & hd = draft_head();
                         head_split_N_ = hd.N;
                         head_split_K_ = hd.K;
                         head_split_pending_ = hd.N / 2 > 0;
                     }
                     fprintf(stderr, "[mtp] draft LM head: %s%s\n",
-                            mtp_head_w4_ ? "u4 copy registered" : "u4 conversion failed - keeping int8",
-                            mtp_head_w2_ ? " + 2-bit copy (0.375 B/w)" : "");
+                            mtp.mtp_head_w4_ ? "u4 copy registered" : "u4 conversion failed - keeping int8",
+                            mtp.mtp_head_w2_ ? " + 2-bit copy (0.375 B/w)" : "");
                 }
             }
         }
@@ -1534,21 +1532,21 @@ bool engine::setup_md_dnnl() {
             // range and the readout costs half the wall time.  Each side runs the
             // identical GEMV over disjoint rows, so every logit is bit-identical
             // to the single-device readout and only the argmax pair crosses.
-            if (d == 1 && head_split_pending_ && mtp_head_w4_) {
+            if (d == 1 && head_split_pending_ && mtp.mtp_head_w4_) {
                 const wt & hd = draft_head();
                 const int half = head_split_N_ / 2;
                 const size_t rb = (size_t)quant_row_bytes(hd.type, hd.K);
                 // device 0's low half replaces its full-tensor entry so it does
                 // not stream the rows device 1 owns
-                const bool lo = dnnl_for(0)->add_weight_w4(mtp_head_w4lo_key_, hd.data, hd.type, hd.K, half,
+                const bool lo = dnnl_for(0)->add_weight_w4(mtp.mtp_head_w4lo_key_, hd.data, hd.type, hd.K, half,
                                                             /*any_type=*/true, /*gemv_only=*/true);
-                const bool hi = D->add_weight_w4(mtp_head_w4b_key_, (const char *)hd.data + (size_t)half * rb, hd.type,
+                const bool hi = D->add_weight_w4(mtp.mtp_head_w4b_key_, (const char *)hd.data + (size_t)half * rb, hd.type,
                                                  hd.K, head_split_N_ - half, /*any_type=*/true, /*gemv_only=*/true);
                 if (lo && hi) {
-                    mtp_head_split_ = true;
-                    mtp_head_half_ = half;
-                    d_mtp_hnorm1 = (float *)dev_alloc_on(1, (size_t)m.hp.n_embd * 4);
-                    h_head_stage = (float *)alloc_bytes((size_t)m.hp.n_embd * 4);
+                    mtp.mtp_head_split_ = true;
+                    mtp.mtp_head_half_ = half;
+                    mtp.d_mtp_hnorm1 = (float *)dev_alloc_on(1, (size_t)m.hp.n_embd * 4);
+                    mtp.h_head_stage = (float *)alloc_bytes((size_t)m.hp.n_embd * 4);
                     fprintf(stderr, "[mtp] draft LM head: split across 2 GPUs, %d rows each (%.0f MB extra)\n", half,
                             (double)head_split_K_ * head_split_N_ * 0.625 / (1024.0 * 1024.0));
                 }
@@ -1870,7 +1868,6 @@ void engine::alloc_buffers() {
     // flight on the two devices at once)
     d_info2_ = sycl::malloc_host<step_info>(1, q);
     std::memset(d_info2_, 0, sizeof(step_info));
-    d_segs_dec = alloc_elems<gemv_seg>(1024);
     d_segs_pf = alloc_elems<gemv_seg>(4096);
     d_segs_pf8 = alloc_elems<gemv_seg>(4096);
     {
@@ -1897,39 +1894,39 @@ void engine::alloc_buffers() {
     // The DFlash drafter runs on the *target's* speculative machinery (the same
     // dry verify, per-token recurrent-state snapshots and rollback the MTP uses),
     // so it needs the same buffers even though it has no MTP layer of its own.
-    if (mtp_on || dflash_on_) {
+    if (mtp.mtp_on || dfl.dflash_on_) {
         // MTP draft-head activations live on the primary device (the MTP layer
         // always runs there); the per-token recurrent-state history is split
         // per partition so the GDN kernels snapshot into their own device USM.
-        mtp_nsnap = std::max(mtp_on ? mtp_k : 0, dflash_on_ ? df_k_ : 0) + 1;
+        mtp.mtp_nsnap = std::max(mtp.mtp_on ? mtp.mtp_k : 0, dfl.dflash_on_ ? dfl.df_k_ : 0) + 1;
         auto ab = [&](size_t n) -> float * {
-            return (float *)(multi_dev ? dev_alloc_on(mtp_dev, n * 4) : alloc_bytes(n * 4));
+            return (float *)(multi_dev ? dev_alloc_on(mtp.mtp_dev, n * 4) : alloc_bytes(n * 4));
         };
         const int R = kMaxB * kMaxT;
-        d_mtp_cat = ab((size_t)R * 2 * hp.n_embd);
-        d_mtp_x = ab((size_t)R * hp.n_embd);
-        d_mtp_xnorm = ab((size_t)R * hp.n_embd);
-        d_mtp_qbuf = ab((size_t)R * hp.n_head * 2 * hp.head_dim);
-        d_mtp_kbuf = ab((size_t)R * hp.n_head_kv * hp.head_dim);
-        d_mtp_vbuf = ab((size_t)R * hp.n_head_kv * hp.head_dim);
-        d_mtp_attn_out = ab((size_t)R * hp.n_head * hp.head_dim);
-        d_mtp_ffn = ab((size_t)R * ffn_stride);
-        d_mtp_hnorm = ab((size_t)R * hp.n_embd);
+        mtp.d_mtp_cat = ab((size_t)R * 2 * hp.n_embd);
+        mtp.d_mtp_x = ab((size_t)R * hp.n_embd);
+        mtp.d_mtp_xnorm = ab((size_t)R * hp.n_embd);
+        mtp.d_mtp_qbuf = ab((size_t)R * hp.n_head * 2 * hp.head_dim);
+        mtp.d_mtp_kbuf = ab((size_t)R * hp.n_head_kv * hp.head_dim);
+        mtp.d_mtp_vbuf = ab((size_t)R * hp.n_head_kv * hp.head_dim);
+        mtp.d_mtp_attn_out = ab((size_t)R * hp.n_head * hp.head_dim);
+        mtp.d_mtp_ffn = ab((size_t)R * ffn_stride);
+        mtp.d_mtp_hnorm = ab((size_t)R * hp.n_embd);
         // The MTP's own attention partials.  Its layout is
         // ((row*tpb + t)*n_head + h)*nsp + s, so the two shapes it uses need
-        // max(mtp_splits, kMaxT*n_head) entries - a few hundred KB, not the
-        // R*n_head*n_splits prefill buffer (scaling that one by mtp_splits would
+        // max(mtp.mtp_splits, kMaxT*n_head) entries - a few hundred KB, not the
+        // R*n_head*n_splits prefill buffer (scaling that one by mtp.mtp_splits would
         // be 2.7 GB and loses the device).
-        d_mtp_partials = ab((size_t)std::max(mtp_splits, kMaxT * hp.n_head) * (2 + hp.head_dim));
-        d_mtp_hprev = ab((size_t)kMaxB * hp.n_embd);
+        mtp.d_mtp_partials = ab((size_t)std::max(mtp.mtp_splits, kMaxT * hp.n_head) * (2 + hp.head_dim));
+        mtp.d_mtp_hprev = ab((size_t)kMaxB * hp.n_embd);
         // host USM: written by the primary device's capture and read by the
         // MTP layer wherever --mtp-device put it
-        d_mtp_main_h = alloc_elems<float>((size_t)kMaxB * kMaxT * hp.n_embd);
-        d_mtp_hnorm0 = (mtp_dev == 0) ? d_mtp_hnorm : (float *)dev_alloc_on(0, (size_t)kMaxB * hp.n_embd * 4);
-        d_mtp_raw = (float *)dev_alloc_on(mtp_dev, (size_t)kMaxT * hp.n_embd * 4);
-        d_mtp_rin_.assign(as_.size(), nullptr);
-        d_mtp_qsave_.assign(as_.size(), nullptr);
-        d_mtp_ssave_.assign(as_.size(), nullptr);
+        mtp.d_mtp_main_h = alloc_elems<float>((size_t)kMaxB * kMaxT * hp.n_embd);
+        mtp.d_mtp_hnorm0 = (mtp.mtp_dev == 0) ? mtp.d_mtp_hnorm : (float *)dev_alloc_on(0, (size_t)kMaxB * hp.n_embd * 4);
+        mtp.d_mtp_raw = (float *)dev_alloc_on(mtp.mtp_dev, (size_t)kMaxT * hp.n_embd * 4);
+        mtp.d_mtp_rin_.assign(as_.size(), nullptr);
+        mtp.d_mtp_qsave_.assign(as_.size(), nullptr);
+        mtp.d_mtp_ssave_.assign(as_.size(), nullptr);
         const int dtr = hp.dt_rank;
         const int cvd = hp.qkv_dim();
         for (size_t d = 0; d < as_.size(); d++) {
@@ -1937,9 +1934,9 @@ void engine::alloc_buffers() {
             if (ng <= 0) {
                 continue;
             }
-            d_mtp_rin_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * mtp_nsnap * (cvd + 2 * dtr) * 4);
-            d_mtp_qsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * mtp_nsnap * (size_t)cvd * 4);
-            d_mtp_ssave_[d] =
+            mtp.d_mtp_rin_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * mtp.mtp_nsnap * (cvd + 2 * dtr) * 4);
+            mtp.d_mtp_qsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * mtp.mtp_nsnap * (size_t)cvd * 4);
+            mtp.d_mtp_ssave_[d] =
                 (float *)dev_alloc_on((int)d, (size_t)ng * (size_t)hp.dt_rank * hp.d_state * hp.d_state * 4);
         }
         // Candidate-restricted draft head (PF_MTP_CAND): the draft needs one token
@@ -1954,21 +1951,20 @@ void engine::alloc_buffers() {
             // next argmax even at 16384 rows, and lost drafts cost more than the head bytes save)
             const int cap = ce ? atoi(ce) : 0;
             const char * me = si::env::str("PF_MTP_CANDM");
-            mtp_cand_margin_ = me ? (float)atof(me) : 20.0f;
+            mtp.mtp_cand_margin_ = me ? (float)atof(me) : 20.0f;
             // the device-resident draft chain's per-step token buffer (the head's
             // argmax -> the next step's concat); needed whether or not the
             // candidate head is on
-            d_mtp_tok_ = (int32_t *)dev_alloc_on(0, (size_t)kMaxT * 4);
-            d_mtp_tokx_ = (int32_t *)dev_alloc_on(mtp_dev == 0 ? 0 : mtp_dev, 64);
+            mtp.d_mtp_tok_ = (int32_t *)dev_alloc_on(0, (size_t)kMaxT * 4);
             if (cap > 1) {
-                mtp_cand_cap_ = std::min(cap, hp.n_vocab);
-                d_mtp_cand_ = (int32_t *)dev_alloc_on(0, (size_t)mtp_cand_cap_ * 4);
-                d_mtp_cvals_ = (float *)dev_alloc_on(0, (size_t)mtp_cand_cap_ * 4);
-                d_mtp_cval1_ = (float *)dev_alloc_on(0, 64);
-                d_mtp_amv_ = (float *)dev_alloc_on(0, 64);
+                mtp.mtp_cand_cap_ = std::min(cap, hp.n_vocab);
+                mtp.d_mtp_cand_ = (int32_t *)dev_alloc_on(0, (size_t)mtp.mtp_cand_cap_ * 4);
+                mtp.d_mtp_cvals_ = (float *)dev_alloc_on(0, (size_t)mtp.mtp_cand_cap_ * 4);
+                mtp.d_mtp_cval1_ = (float *)dev_alloc_on(0, 64);
+                mtp.d_mtp_amv_ = (float *)dev_alloc_on(0, 64);
                 {
                     const char * se = si::env::str("PF_MTP_CANDSRC");
-                    mtp_cand_src_ = se ? atoi(se) : 1;
+                    mtp.mtp_cand_src_ = se ? atoi(se) : 1;
                 }
                 // the head's grouped int8 view (the gather reads it directly; the
                 // u4 draft copy is not needed for a 256-row readout)
@@ -1976,27 +1972,26 @@ void engine::alloc_buffers() {
                 dnnl_gemm * D0 = dnnl_for(0);
                 if (D0 != nullptr) {
                     const void * hk = wkey(0, head.data);
-                    mtp_head_w8_ = D0->weight_data(hk);
-                    mtp_head_wsc_ = D0->weight_group_scales(hk);
-                    mtp_head_rows_ = head.N;
-                    mtp_cand_ok_ = mtp_head_w8_ != nullptr && mtp_head_wsc_ != nullptr;
+                    mtp.mtp_head_w8_ = D0->weight_data(hk);
+                    mtp.mtp_head_wsc_ = D0->weight_group_scales(hk);
+                    mtp.mtp_head_rows_ = head.N;
+                    mtp.mtp_cand_ok_ = mtp.mtp_head_w8_ != nullptr && mtp.mtp_head_wsc_ != nullptr;
                 }
-                if (!mtp_cand_ok_) {
+                if (!mtp.mtp_cand_ok_) {
                     fprintf(stderr, "[mtp] candidate head: no grouped int8 head on device 0, using the full readout\n");
-                    mtp_cand_cap_ = 0;
+                    mtp.mtp_cand_cap_ = 0;
                 } else {
-                    fprintf(stderr, "[mtp] candidate head: cap=%d margin=%.2f rows=%d\n", mtp_cand_cap_,
-                            mtp_cand_margin_, mtp_head_rows_);
+                    fprintf(stderr, "[mtp] candidate head: cap=%d margin=%.2f rows=%d\n", mtp.mtp_cand_cap_,
+                            mtp.mtp_cand_margin_, mtp.mtp_head_rows_);
                 }
             }
         }
-        d_mtp_rinfo = sycl::malloc_host<step_info>(1, q);
-        std::memset(d_mtp_rinfo, 0, sizeof(step_info));
-        d_mtp_info = sycl::malloc_host<step_info>(1, q);
-        std::memset(d_mtp_info, 0, sizeof(step_info));
-        std::memcpy(d_mtp_info->mrope_sections, hp.rope_sections, sizeof(hp.rope_sections));
-        d_mtp_hist_.assign(as_.size(), nullptr);
-        d_mtp_convsave_.assign(as_.size(), nullptr);
+        mtp.d_mtp_rinfo = sycl::malloc_host<step_info>(1, q);
+        std::memset(mtp.d_mtp_rinfo, 0, sizeof(step_info));
+        mtp.d_mtp_info = sycl::malloc_host<step_info>(1, q);
+        reset_step_info(mtp.d_mtp_info);
+        mtp.d_mtp_hist_.assign(as_.size(), nullptr);
+        mtp.d_mtp_convsave_.assign(as_.size(), nullptr);
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
         const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
         for (size_t d = 0; d < as_.size(); d++) {
@@ -2013,20 +2008,20 @@ void engine::alloc_buffers() {
                         default: return "unknown";
                     }
                 };
-                fprintf(stderr, "[mtp] mem: q_dev=%s dev0=%s mtp_dev=%d\n",
+                fprintf(stderr, "[mtp] mem: q_dev=%s dev0=%s mtp.mtp_dev=%d\n",
                         q.get_device().get_info<sycl::info::device::name>().c_str(),
                         dev_queues_.empty() || !dev_queues_[0] ? "-"
                                                               : dev_queues_[0]->get_device().get_info<sycl::info::device::name>().c_str(),
-                        mtp_dev);
-                fprintf(stderr, "[mtp] mem: main_h=%s last_hidden=%s xnorm0=%s hprev=%s hist=%s\n", ty(d_mtp_main_h),
-                        ty(d_last_hidden), ty(as_[0].xnorm), ty(d_mtp_hprev), ty(d_mtp_hist_[d]));
+                        mtp.mtp_dev);
+                fprintf(stderr, "[mtp] mem: main_h=%s last_hidden=%s xnorm0=%s hprev=%s hist=%s\n", ty(mtp.d_mtp_main_h),
+                        ty(d_last_hidden), ty(as_[0].xnorm), ty(mtp.d_mtp_hprev), ty(mtp.d_mtp_hist_[d]));
             }
-            d_mtp_hist_[d] =
-                (float *)dev_alloc_on((int)d, (size_t)mtp_nsnap * (size_t)ng * (gdn_per + conv_per) * 4);
+            mtp.d_mtp_hist_[d] =
+                (float *)dev_alloc_on((int)d, (size_t)mtp.mtp_nsnap * (size_t)ng * (gdn_per + conv_per) * 4);
             // zero it so a missing per-token snapshot shows up as zeros, not as
             // whatever the allocator handed back
-            dev_queue((int)d).memset(d_mtp_hist_[d], 0, (size_t)mtp_nsnap * (size_t)ng * (gdn_per + conv_per) * 4);
-            d_mtp_convsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * 2 * conv_per * 4);
+            dev_queue((int)d).memset(mtp.d_mtp_hist_[d], 0, (size_t)mtp.mtp_nsnap * (size_t)ng * (gdn_per + conv_per) * 4);
+            mtp.d_mtp_convsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * 2 * conv_per * 4);
         }
     }
     for (int tb : {1, 2, 4, 8, 16}) {
@@ -2095,9 +2090,7 @@ void engine::reset_state() {
         q.memset(d_conv_state, 0, (size_t)kMaxB * n_gdn * conv_per * 4);
         q.wait();
     }
-    std::memset(d_info, 0, sizeof(step_info));
-    // rope sections are model constants; the memset above clears them
-    std::memcpy(d_info->mrope_sections, hp.rope_sections, sizeof(hp.rope_sections));
+    reset_step_info(d_info);
     // the single-sequence entry points (eval/generate) do not run the prefix
     // cache: never let a stale tracking flag capture snapshots for them
     for (auto & s : pc_slot_) {
@@ -2399,22 +2392,6 @@ void engine::fetch_logits(int row, float * out) {
     std::memcpy(out, h_logits, (size_t)hp.n_vocab * 4);
 }
 
-void engine::forward_plain_pf() {
-    record_forward(1, plan_pf_, d_segs_pf, kMaxT);
-}
-
-void engine::forward_plain_pf8() {
-    record_forward(1, plan_pf8_, d_segs_pf8, kMaxT);
-}
-
-void engine::forward_plain_dec(int rows) {
-    for (auto & b : buckets_) {
-        if (b.tb == rows) {
-            record_forward(0, b.plan, b.d_segs, rows);
-            return;
-        }
-    }
-}
 std::vector<float> engine::run_head() {
     // the pipelined multi-device prefill may still owe the last chunk's device-1
     // phase (and the head, which writes d_last_hidden)
@@ -2502,10 +2479,10 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // MTP speculative decoding: greedy requests only (the acceptance test is an
     // equality against the target's own next token; a sampled target would need
     // rejection sampling to stay exact).  Multimodal prompts bypass it too.
-    if (dflash_on_ && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
+    if (dfl.dflash_on_ && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
         return generate_dflash(prompt, gp, cb, first_logits);
     }
-    if (mtp_on && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
+    if (mtp.mtp_on && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
         return generate_mtp(prompt, gp, cb, first_logits);
     }
     reset_single();
@@ -2613,13 +2590,8 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
             break;
         }
         // grow the block table if needed (KV slots advance one per token)
-        if (pos % kBlockSize == 0) {
-            int b = alloc_block();
-            if (b < 0) {
-                break;
-            }
-            blocks.push_back(b);
-            set_table(0, blocks);
+        if (!ensure_block_headroom(blocks, pos, 1)) {
+            break; // out of KV blocks
         }
         tok_buf[0] = tok;
         pos_buf[0] = pos;

@@ -108,7 +108,7 @@ int engine::attn_layers() const {
     // stored last (index n-1).  Keeping it inside attn_layers() makes the pool
     // sizing, the prefix-cache block blob and its serialize/deserialize loops
     // cover it with no extra plumbing.
-    if (mtp_on) {
+    if (mtp.mtp_on) {
         n += 1;
     }
     return n;
@@ -125,11 +125,11 @@ static int main_attn_layers(const hparams & hp) {
 
 void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const {
     if (multi_dev) {
-        if (mtp_on && a == main_attn_layers(m.hp)) {
+        if (mtp.mtp_on && a == main_attn_layers(m.hp)) {
             // the MTP draft layer's KV lives on its own backend (--mtp-device),
             // as that partition's last attention slice
-            const size_t md = (mtp_dev >= 0 && (size_t)mtp_dev < dev_kpool_.size()) ? (size_t)mtp_dev : 0;
-            const int la = mtp_attn_local_;
+            const size_t md = (mtp.mtp_dev >= 0 && (size_t)mtp.mtp_dev < dev_kpool_.size()) ? (size_t)mtp.mtp_dev : 0;
+            const int la = mtp.mtp_attn_local_;
             kp = (const char *)dev_kpool_[md] + (size_t)la * kv_layer_stride;
             vp = (const char *)dev_vpool_[md] + (size_t)la * kv_v_layer_stride;
             ksc = dev_kscales_[md] ? (const char *)dev_kscales_[md] + (size_t)la * kv_scale_stride : nullptr;
@@ -165,8 +165,8 @@ int engine::attn_dev(int a) const {
     if (!multi_dev) {
         return 0;
     }
-    if (mtp_on && a == main_attn_layers(m.hp)) {
-        return mtp_dev;
+    if (mtp.mtp_on && a == main_attn_layers(m.hp)) {
+        return mtp.mtp_dev;
     }
     int na = 0;
     for (int t = 0; t < m.hp.n_layer; t++) {
@@ -199,11 +199,11 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
                 local_attn[(size_t)layer_dev_[il]]++;
             }
         }
-        if (mtp_on) {
+        if (mtp.mtp_on) {
             // the MTP draft layer's KV lives on --mtp-device, after that
             // partition's own attention layers
-            const int md = (mtp_dev >= 0 && mtp_dev < ndev) ? mtp_dev : 0;
-            mtp_attn_local_ = local_attn[(size_t)md];
+            const int md = (mtp.mtp_dev >= 0 && mtp.mtp_dev < ndev) ? mtp.mtp_dev : 0;
+            mtp.mtp_attn_local_ = local_attn[(size_t)md];
             local_attn[(size_t)md]++;
         }
         dev_kpool_.assign((size_t)ndev, nullptr);
@@ -609,6 +609,32 @@ void engine::set_table(int slot, const std::vector<int> & blocks) {
     } else {
         q.memcpy(d_tables + (size_t)slot * max_blocks, h_tables.data() + (size_t)slot * max_blocks, (size_t)max_blocks * 4);
     }
+}
+
+// grow so slot `pos + lookahead` still fits a fresh KV block (the generate
+// loops' common check)
+bool engine::ensure_block_headroom(std::vector<int> & blocks, int pos, int lookahead) {
+    const int need = (pos + lookahead + kBlockSize - 1) / kBlockSize;
+    bool grew = false;
+    while ((int)blocks.size() < need) {
+        int b = alloc_block();
+        if (b < 0) {
+            break;
+        }
+        blocks.push_back(b);
+        grew = true;
+    }
+    if (grew) {
+        set_table(0, blocks);
+    }
+    return (int)blocks.size() >= need;
+}
+
+// zero a step_info and restore the model-constant M-RoPE sections (memset
+// alone clears them)
+void engine::reset_step_info(step_info * inf) {
+    std::memset(inf, 0, sizeof(step_info));
+    std::memcpy(inf->mrope_sections, m.hp.rope_sections, sizeof(m.hp.rope_sections));
 }
 
 } // namespace si

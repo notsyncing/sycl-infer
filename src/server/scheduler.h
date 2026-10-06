@@ -83,9 +83,6 @@ struct sequence {
         out_q.pop_front();
         return true;
     }
-    bool pop_wait(std::string & out) { // blocking without spin for the server
-        return pop(out);
-    }
 };
 
 // Continuous batching scheduler: admits sequences (tokenized prompts), runs

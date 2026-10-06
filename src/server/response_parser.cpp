@@ -1,4 +1,5 @@
 #include "response_parser.h"
+#include "chat_util.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,44 +28,6 @@ constexpr size_t kToolOpenLen = sizeof(kToolOpen) - 1;
 constexpr size_t kToolCloseLen = sizeof(kToolClose) - 1;
 constexpr size_t kParamCloseLen = sizeof("</parameter>") - 1;
 
-bool is_space(char c) {
-    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
-}
-
-std::string trim_spaces(const std::string & s) {
-    size_t b = 0, e = s.size();
-    while (b < e && is_space(s[b])) {
-        b++;
-    }
-    while (e > b && is_space(s[e - 1])) {
-        e--;
-    }
-    return s.substr(b, e - b);
-}
-
-std::string lstrip_newlines(const std::string & s) {
-    size_t b = 0;
-    while (b < s.size() && (s[b] == '\n' || s[b] == '\r')) {
-        b++;
-    }
-    return s.substr(b);
-}
-
-std::string lstrip_spaces(const std::string & s) {
-    size_t b = 0;
-    while (b < s.size() && is_space(s[b])) {
-        b++;
-    }
-    return s.substr(b);
-}
-
-std::string rstrip_spaces(const std::string & s) {
-    size_t e = s.size();
-    while (e > 0 && is_space(s[e - 1])) {
-        e--;
-    }
-    return s.substr(0, e);
-}
 
 // Length of the whitespace run ending at `end` (used to hold back trailing
 // whitespace so the reasoning text can be right-trimmed at `</think>` the way

@@ -16,6 +16,7 @@
 //                           <A[p] * gate(h_i), B[c]> + unary_i[c] for every
 //                           (candidate at i-1, candidate at i) pair
 #include "kernels.h"
+#include "common/rope.h"
 #include "kernel_utils.h"
 
 #include <algorithm>
@@ -203,7 +204,7 @@ static void df_rope_store_impl(queue & q, float * qbuf, float * kbuf, float * vb
         const int pos = pos_dev[r];
         auto rope = [&](float * h) {
             if (lane < n_rot / 2) {
-                const float ang = (float)pos * sycl::exp2(-2.0f * lane / n_rot * sycl::log2(rope_base));
+                const float ang = rope_theta((float)pos, lane, n_rot, sycl::log2(rope_base));
                 const float c = sycl::cos(ang), s = sycl::sin(ang);
                 const float x0 = h[lane], x1 = h[lane + n_rot / 2];
                 h[lane] = x0 * c - x1 * s;

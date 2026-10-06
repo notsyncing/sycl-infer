@@ -7,6 +7,7 @@
 // n_tok x n_tok score matrix.
 // ---------------------------------------------------------------------------
 #include "kernels.h"
+#include "common/rope.h"
 #include "kernel_utils.h"
 
 #include <cmath>
@@ -306,7 +307,7 @@ void vit_rope_launch(queue & q, float * qkv, int qkv_stride, int n_tok, int n_he
         const int sec = pair / (head_dim / 4); // 0 = row, 1 = col (2/3 unused here)
         const int p = pair % (head_dim / 4);
         const int pos = sec == 0 ? py : px;
-        const float theta = (float)pos * sycl::exp2(-2.0f * p / (float)half * log2b);
+        const float theta = rope_theta((float)pos, p, half, log2b);
         const float c = sycl::cos(theta), s = sycl::sin(theta);
         // Q and K live in the first two thirds of the fused qkv row
         float * qrow = qkv + (size_t)t * qkv_stride + h * head_dim;

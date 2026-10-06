@@ -17,7 +17,8 @@
 #include <utility>
 
 #include "cpu_types.h" // mirrors + launcher declarations (no SYCL)
-#include "quant.h"     // ggml block formats + host dequant
+#include "quant.h" // ggml block formats + host dequant
+#include "common/rope.h"
 
 namespace si {
 
@@ -133,7 +134,7 @@ inline int mrope_section(const cpu_step_info * info, int pair) {
 inline void rope_apply(float * v, int n_rot, float base, float rpos) {
     const int half = n_rot / 2;
     for (int i = 0; i < half; i++) {
-        const float ang = rpos * std::exp2(-2.0f * i / n_rot * std::log2(base));
+        const float ang = rope_theta(rpos, i, n_rot, std::log2(base));
         const float c = std::cos(ang), s = std::sin(ang);
         const float x0 = v[i], x1 = v[i + half];
         v[i] = x0 * c - x1 * s;

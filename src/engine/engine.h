@@ -263,7 +263,6 @@ struct engine {
     bool pf_pipe_pending_ = false;
     int pf_pipe_parity_ = 0;
     int pf_pipe_rows_ = 0;
-    bool pf_pipe_head_ = false;
     // per-chunk step_info used by pc_capture_begin/pc_commit during the pipeline
     step_info * pf_info_ = nullptr;
 
@@ -306,7 +305,6 @@ struct engine {
     // copy of chunk i while the host stages chunk i+1
     void * h_handoff2_ = nullptr;
 
-    gemv_seg * d_segs_dec = nullptr;
     gemv_seg * d_segs_dec8 = nullptr; // CPU SI8 decode plan (no command graph)
     gemv_seg * d_segs_pf = nullptr;
     gemv_seg * d_segs_pf8 = nullptr;
@@ -332,7 +330,7 @@ struct engine {
 
     float * h_logits = nullptr; // [kMaxB][vocab]
 
-    std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g_dec, g_pf;
+    std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g_pf;
     // prefill graph using the SI8/DP4A int8 path
     std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g_pf8;
     std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_pf8;
@@ -439,9 +437,9 @@ struct engine {
         }
         return (size_t)dev < dnnl_dev_.size() ? dnnl_dev_[(size_t)dev].get() : nullptr;
     }
-    std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_dec, e_pf;
+    std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e_pf;
 
-    seg_plan plan_dec_, plan_pf_, plan_pf8_, plan_dec8_;
+    seg_plan plan_pf_, plan_pf8_, plan_dec8_;
 
     // ------------------------------------------------------------------
     // MTP (NextN) speculative draft head.  Enabled when the GGUF ships a
@@ -450,117 +448,119 @@ struct engine {
     // owns its own paged KV slice (attention layer index attn_layers()-1), so it
     // shares the block table, the prefix cache and the KV storage type.
     // ------------------------------------------------------------------
-    bool mtp_on = false;
-    int mtp_dev = 0; // backend index the MTP layer runs on (its KV follows)
-    int mtp_k = 0;      // draft predictions per verify cycle
-    int mtp_nsnap = 0;  // per-token recurrent-state snapshots kept (k+1)
-    int mtp_attn_local_ = -1; // MTP layer index inside the primary device's pool
-    size_t mtp_hist_floats = 0; // per device: nsnap * n_local_gdn * gdn_per
-    std::vector<float *> d_mtp_hist_;    // [dev] per-token GDN state snapshots
-    std::vector<float *> d_mtp_convsave_; // [dev] conv rows (1,2) before the verify
-    float * d_mtp_cat = nullptr;       // [R][2*n_embd] concat(enorm(emb), hnorm(h))
-    float * d_mtp_x = nullptr;         // [R][n_embd]
-    float * d_mtp_xnorm = nullptr;     // [R][n_embd]
-    float * d_mtp_qbuf = nullptr;      // [R][n_head*2*head_dim]
-    float * d_mtp_kbuf = nullptr;      // [R][n_head_kv*head_dim]
-    float * d_mtp_vbuf = nullptr;      // [R][n_head_kv*head_dim]
-    float * d_mtp_attn_out = nullptr;  // [R][n_head*head_dim]
-    float * d_mtp_ffn = nullptr;       // [R][2*n_ff]
-    float * d_mtp_hnorm = nullptr;
-    float * d_mtp_raw = nullptr; // MTP hidden before shared_head_norm (AR seed)     // [R][n_embd] shared-head-normalized hidden
-    float * d_mtp_main_h = nullptr;    // [kMaxB*kMaxT][n_embd] main hidden capture
-    std::vector<float> h_save_;        // PF_MTP_STATECHK: pre-verify recurrent state
-    // MTP rollback by recurrence replay: the verify saves each GDN layer's
-    // per-token (conv_out, alpha, beta) plus the pre-verify GDN state, and the
-    // commit restores the state and replays those tokens.
-    std::vector<float *> d_mtp_rin_;
-    std::vector<float *> d_mtp_qsave_; // per-layer raw GDN conv taps of the verify rows    // [dev] ng * mtp_nsnap * (conv_dim + 2*dt_rank)
-    std::vector<float *> d_mtp_ssave_;  // [dev] ng * gdn_per
-    step_info * d_mtp_rinfo = nullptr;  // step_info for the replay launches
+    struct mspec_state {
+      bool mtp_on = false;
+      int mtp_dev = 0; // backend index the MTP layer runs on (its KV follows)
+      int mtp_k = 0;      // draft predictions per verify cycle
+      int mtp_nsnap = 0;  // per-token recurrent-state snapshots kept (k+1)
+      int mtp_attn_local_ = -1; // MTP layer index inside the primary device's pool
+      std::vector<float *> d_mtp_hist_;    // [dev] per-token GDN state snapshots
+      std::vector<float *> d_mtp_convsave_; // [dev] conv rows (1,2) before the verify
+      float * d_mtp_cat = nullptr;       // [R][2*n_embd] concat(enorm(emb), hnorm(h))
+      float * d_mtp_x = nullptr;         // [R][n_embd]
+      float * d_mtp_xnorm = nullptr;     // [R][n_embd]
+      float * d_mtp_qbuf = nullptr;      // [R][n_head*2*head_dim]
+      float * d_mtp_kbuf = nullptr;      // [R][n_head_kv*head_dim]
+      float * d_mtp_vbuf = nullptr;      // [R][n_head_kv*head_dim]
+      float * d_mtp_attn_out = nullptr;  // [R][n_head*head_dim]
+      float * d_mtp_ffn = nullptr;       // [R][2*n_ff]
+      float * d_mtp_hnorm = nullptr;
+      float * d_mtp_raw = nullptr; // MTP hidden before shared_head_norm (AR seed)     // [R][n_embd] shared-head-normalized hidden
+      float * d_mtp_main_h = nullptr;    // [kMaxB*kMaxT][n_embd] main hidden capture
+      std::vector<float> h_save_;        // PF_MTP_STATECHK: pre-verify recurrent state
+      // MTP rollback by recurrence replay: the verify saves each GDN layer's
+      // per-token (conv_out, alpha, beta) plus the pre-verify GDN state, and the
+      // commit restores the state and replays those tokens.
+      std::vector<float *> d_mtp_rin_;
+      std::vector<float *> d_mtp_qsave_; // per-layer raw GDN conv taps of the verify rows    // [dev] ng * mtp_nsnap * (conv_dim + 2*dt_rank)
+      std::vector<float *> d_mtp_ssave_;  // [dev] ng * gdn_per
+      step_info * d_mtp_rinfo = nullptr;  // step_info for the replay launches
+      float * d_mtp_hnorm0 = nullptr;    // primary-device copy feeding the shared LM head
+      float * d_mtp_hprev = nullptr;     // [kMaxB][n_embd] main hidden before the row
+      step_info * d_mtp_info = nullptr;  // host USM step_info for the MTP layer
+      seg_plan plan_vf_;                 // verify forward: mode 2 with a batched head
+      gemv_seg * d_segs_vf = nullptr;
+      seg_plan plan_mtp_;                // the MTP layer's own calls
+      gemv_seg * d_segs_mtp = nullptr;
+      // PF_MTP_LAYER_EXACT: same segments with `w` pointing at the raw GGUF bytes
+      gemv_seg * d_segs_mtp_exact = nullptr;
+      // PF_MTP_HEAD_W4: a draft-only u4 copy of the LM head, registered under a
+      // private key (the target keeps its exact int8 head, so only the drafts -
+      // and hence acceptance, never the emitted stream - can move).
+      float * d_mtp_partials = nullptr; // the MTP's own attention partials (see mtp_splits)
+      int32_t h_argmax[kMaxB] = {0};    // host mirror of the verify's per-row argmax
+      bool mtp_head_w4_ = false;
+      // PF_MTP_LAYER_W2: the MTP layer also has a 2-bit copy (0.375 B/weight).
+      bool mtp_layer_w2_ = false;
+      // 2-bit copy of the draft LM head (0.375 B/weight against the u4 copy's
+      // 0.625): the draft reads the whole head once per drafted token, so this is
+      // the single largest byte item in the speculative cycle.  The draft only
+      // needs its argmax, and its weights are already re-quantized, so the extra
+      // step is a trade in acceptance for bytes: 0.375 B/weight is exact enough
+      // for an argmax (39.8 % relative L2) but costs ~2 % acceptance, which
+      // cancels the saving.  Off with PF_MTP_HEAD_W2=0.
+      bool mtp_head_w2_ = false;
+      char mtp_head_w2_key_[1] = {0};
+      bool mtp_layer_w4_ = false; // the MTP layer's own linears are GEMV-only u4 too
+      char mtp_head_w4_key_[1] = {0};
+      // The MTP draft is a single-token decode over the MTP layer's KV, so it gets
+      // the decode's key-parallel split count - *not* n_splits, which the
+      // --layer-map path pins to 1 (its split path is opt-in) and which left a
+      // 1-row attention with n_head workgroups each looping the whole KV: 2451 vs
+      // 183 ms/cycle at 128k.  PF_MTP_SPLITS overrides (1 = the old behaviour).
+      int mtp_splits = kMaxDecSplits;
+      // The speculative draft's LM head: the MTP/NextN layer's shared head when
+      // the GGUF ships one, else the model's output projection.
+      // ---- MTP draft head (see mtp_argmax.cpp) -------------------------------
+      // d_mtp_tok[i] is the token draft step i chose (the head's argmax, computed
+      // on the device), read back by the next step's concat, so the chain needs no
+      // host round-trip.  With PF_MTP_CAND the head is evaluated on a candidate set
+      // (mtp_cand_launch / mtp_gather_launch) instead of all 248320 rows - measured
+      // a net loss, so it is off by default (25/17/7 % hit rate at margin 8).
+      int32_t * d_mtp_cand_ = nullptr;  // [mtp_cand_cap] candidate token ids (device 0)
+      float * d_mtp_cvals_ = nullptr;   // [mtp_cand_cap] their head values
+      int32_t * d_mtp_tok_ = nullptr;   // [kMaxT] per-step draft token ids (device 0, next to the head)
+      // Head readout split across both cards (PF_MTP_HEAD_SPLIT=1, **default off**).
+      // out[n] = w[n].h is independent per output row, so the draft's 795 MB u4
+      // stream (3.0 ms of device time, 75 % of a draft step) can be halved by
+      // giving the second device the upper row range while it is otherwise idle:
+      // each side runs the identical GEMV over its own rows into the *same*
+      // device-0 logits row, so the argmax stays one scan on the owning card.
+      // Draft 17.2 -> 13.1 ms/cycle, and end to end a wash: halving N changes the
+      // u4 GEMV's decomposition, so the draft's argmax flips on a near-tie now and
+      // then (p0 -6 %, p2 -8 % acceptance).
+      bool mtp_head_split_ = false;
+      int mtp_head_half_ = 0;      // rows [0, half) on device 0, [half, n_vocab) on device 1
+      char mtp_head_w4lo_key_[1] = {0};
+      char mtp_head_w4b_key_[1] = {0};
+      float * d_mtp_hnorm1 = nullptr;   // device-1 copy of the draft hidden
+      float * h_head_stage = nullptr;   // host staging for the 20 KB activation copy
+      float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
+      float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
+      int32_t * d_argmax_buf_ = nullptr; // verify-cycle argmax staging (device 0)
+      float * d_argval_buf_ = nullptr;   // ... and its value side
+      int32_t * d_am2_ = nullptr;        // PF_MTP_CANDDBG diagnostic staging
+      int mtp_cand_src_ = 1;            // 1 = seed from the draft's own step-0 readout
+      int mtp_cand_cap_ = 0;            // 0 = off (the full head readout)
+      float mtp_cand_margin_ = 8.0f;
+      bool mtp_cand_ok_ = false;        // the head's int8 view exists on device 0
+      const int8_t * mtp_head_w8_ = nullptr;
+      const uint16_t * mtp_head_wsc_ = nullptr;
+      int mtp_head_rows_ = 0;
+
+    } mtp;
+
     void mtp_rollback(int j);
-    float * d_mtp_hnorm0 = nullptr;    // primary-device copy feeding the shared LM head
-    float * d_mtp_hprev = nullptr;     // [kMaxB][n_embd] main hidden before the row
-    step_info * d_mtp_info = nullptr;  // host USM step_info for the MTP layer
-    seg_plan plan_vf_;                 // verify forward: mode 2 with a batched head
-    gemv_seg * d_segs_vf = nullptr;
-    seg_plan plan_mtp_;                // the MTP layer's own calls
-    gemv_seg * d_segs_mtp = nullptr;
-    // PF_MTP_LAYER_EXACT: same segments with `w` pointing at the raw GGUF bytes
-    gemv_seg * d_segs_mtp_exact = nullptr;
-    // PF_MTP_HEAD_W4: a draft-only u4 copy of the LM head, registered under a
-    // private key (the target keeps its exact int8 head, so only the drafts -
-    // and hence acceptance, never the emitted stream - can move).
-    float * d_mtp_partials = nullptr; // the MTP's own attention partials (see mtp_splits)
-    int32_t h_argmax[kMaxB] = {0};    // host mirror of the verify's per-row argmax
-    bool mtp_head_w4_ = false;
-    // PF_MTP_LAYER_W2: the MTP layer also has a 2-bit copy (0.375 B/weight).
-    bool mtp_layer_w2_ = false;
-    // 2-bit copy of the draft LM head (0.375 B/weight against the u4 copy's
-    // 0.625): the draft reads the whole head once per drafted token, so this is
-    // the single largest byte item in the speculative cycle.  The draft only
-    // needs its argmax, and its weights are already re-quantized, so the extra
-    // step is a trade in acceptance for bytes: 0.375 B/weight is exact enough
-    // for an argmax (39.8 % relative L2) but costs ~2 % acceptance, which
-    // cancels the saving.  Off with PF_MTP_HEAD_W2=0.
-    bool mtp_head_w2_ = false;
-    char mtp_head_w2_key_[1] = {0};
-    bool mtp_layer_w4_ = false; // the MTP layer's own linears are GEMV-only u4 too
-    char mtp_head_w4_key_[1] = {0};
-    // The MTP draft is a single-token decode over the MTP layer's KV, so it gets
-    // the decode's key-parallel split count - *not* n_splits, which the
-    // --layer-map path pins to 1 (its split path is opt-in) and which left a
-    // 1-row attention with n_head workgroups each looping the whole KV: 2451 vs
-    // 183 ms/cycle at 128k.  PF_MTP_SPLITS overrides (1 = the old behaviour).
-    int mtp_splits = kMaxDecSplits;
-    // The speculative draft's LM head: the MTP/NextN layer's shared head when
-    // the GGUF ships one, else the model's output projection.
     const wt & draft_head() const { return m.mtp.shared_head.data ? m.mtp.shared_head : m.output; }
     void build_mtp_plan();
     void mtp_gemv(int ci, int M, int step = -1);
-    // ---- MTP draft head (see mtp_argmax.cpp) -------------------------------
-    // d_mtp_tok[i] is the token draft step i chose (the head's argmax, computed
-    // on the device), read back by the next step's concat, so the chain needs no
-    // host round-trip.  With PF_MTP_CAND the head is evaluated on a candidate set
-    // (mtp_cand_launch / mtp_gather_launch) instead of all 248320 rows - measured
-    // a net loss, so it is off by default (25/17/7 % hit rate at margin 8).
-    int32_t * d_mtp_cand_ = nullptr;  // [mtp_cand_cap] candidate token ids (device 0)
-    float * d_mtp_cvals_ = nullptr;   // [mtp_cand_cap] their head values
-    int32_t * d_mtp_tok_ = nullptr;   // [kMaxT] per-step draft token ids (device 0, next to the head)
-    // Head readout split across both cards (PF_MTP_HEAD_SPLIT=1, **default off**).
-    // out[n] = w[n].h is independent per output row, so the draft's 795 MB u4
-    // stream (3.0 ms of device time, 75 % of a draft step) can be halved by
-    // giving the second device the upper row range while it is otherwise idle:
-    // each side runs the identical GEMV over its own rows into the *same*
-    // device-0 logits row, so the argmax stays one scan on the owning card.
-    // Draft 17.2 -> 13.1 ms/cycle, and end to end a wash: halving N changes the
-    // u4 GEMV's decomposition, so the draft's argmax flips on a near-tie now and
-    // then (p0 -6 %, p2 -8 % acceptance).
-    bool mtp_head_split_ = false;
-    int mtp_head_half_ = 0;      // rows [0, half) on device 0, [half, n_vocab) on device 1
-    char mtp_head_w4lo_key_[1] = {0};
-    char mtp_head_w4b_key_[1] = {0};
-    float * d_mtp_hnorm1 = nullptr;   // device-1 copy of the draft hidden
-    float * h_head_stage = nullptr;   // host staging for the 20 KB activation copy
-    float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
-    int32_t * d_mtp_tokx_ = nullptr;  // 4-byte staging slot for a non-zero --mtp-device
-    float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
-    int32_t * d_argmax_buf_ = nullptr; // verify-cycle argmax staging (device 0)
-    float * d_argval_buf_ = nullptr;   // ... and its value side
-    int32_t * d_am2_ = nullptr;        // PF_MTP_CANDDBG diagnostic staging
-    int mtp_cand_src_ = 1;            // 1 = seed from the draft's own step-0 readout
-    int mtp_cand_cap_ = 0;            // 0 = off (the full head readout)
-    float mtp_cand_margin_ = 8.0f;
-    bool mtp_cand_ok_ = false;        // the head's int8 view exists on device 0
-    const int8_t * mtp_head_w8_ = nullptr;
-    const uint16_t * mtp_head_wsc_ = nullptr;
-    int mtp_head_rows_ = 0;
     // run the MTP layer over `n` tokens at positions pos0.. (mode 1 layout:
     // row 0, n <= kMaxT).  `h` is the main model's hidden [token][n_embd] for the
     // same tokens (h_{-1} comes from hprev), extra_writes the KV and the head.
     void mtp_forward(const int32_t * toks, const float * h, const float * hprev, int n, int slot, int pos0,
                      bool with_head, const int32_t * tok_dev = nullptr, int step = -1);
     // verify forward: main model over `n` tokens at pos0..; logits land in
-    // d_logits rows 0..n-1.  Also fills d_mtp_hprev with the hidden at each row.
+    // d_logits rows 0..n-1.  Also fills mtp.d_mtp_hprev with the hidden at each row.
     void mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0);
     std::vector<int> generate_mtp(const std::vector<int> & prompt, const gen_params & gp,
                                   const std::function<bool(int)> & cb, std::vector<float> * first_logits);
@@ -570,48 +570,51 @@ struct engine {
     // states at `dflash.target_layers`, keeps its own K/V ring for every committed
     // token, and emits a whole block of candidates in one forward pass.  Enabled
     // by --spec-type dflash2 (a non-empty --spec-draft-model).
-    bool dflash_on_ = false;
-    std::string dflash_path_;
-    std::unique_ptr<dflash_model> dfm_;
-    int df_dev_ = 0;      // device the draft runs on (must be 0: the shared head)
-    int df_kmax_ = 0;     // requested draft tokens per cycle (block_size-1 max)
-    int df_k_ = 0;        // the clamped draft length actually used
-    int df_block_ = 0;    // dflash.block_size
-    int df_swa_ = 0;      // the draft's sliding window
-    int df_ring_ = 0;     // K/V ring tokens per layer
-    int df_kv_bytes_ = 2; // 2 = f16 ring, 4 = f32
-    int df_splits_ = 8;   // draft attention key splits
-    int df_cap_rows_ = 0;
-    float * d_df_h = nullptr; // [block][n_embd] residual stream
-    float * d_df_b = nullptr; // scratch [block][n_embd]
-    float * d_df_c = nullptr; // scratch [block][n_embd]
-    float * d_df_qkv = nullptr; // [block][(n_head + 2*n_head_kv)*head_dim]
-    float * d_df_gu = nullptr; // [block][2*n_ff]
-    float * d_df_dyn = nullptr; // [block][2*conv_k*n_groups]
-    float * d_df_gate = nullptr; // [block][selector rank]
-    float * d_df_partials = nullptr;
-    float * d_df_feat = nullptr; // HOST USM [kMaxB*kMaxT][n_tgt_layer*n_embd]
-    float * d_df_feat_dev = nullptr; // device staging for one injection chunk
-    void * d_df_kring = nullptr; // [n_layer][ring][n_head_kv][head_dim]
-    void * d_df_vring = nullptr;
-    int32_t * d_df_pos = nullptr; // device: absolute position per row
-    std::vector<int32_t> h_df_pos; // host mirror of d_df_pos
-    int32_t * d_df_ids = nullptr; // [block][top_k]
-    float * d_df_vals = nullptr;
-    int32_t * d_df_pids = nullptr; // [block][topk slices][top_k] partials
-    float * d_df_pvals = nullptr;
-    int df_pcap_ = 0;
-    int df_slices_ = 1;
-    float * d_df_lattice = nullptr; // [block][top_k + top_k*top_k]
-    std::vector<float> h_df_lattice;
-    step_info * d_df_info = nullptr;
-    const void * df_head_key_ = nullptr; // the store key for the shared LM head
-    bool df_head_w4_ = false;
-    char df_head_key_store_[1] = {0};
-    const uint8_t * df_sel_pv_ = nullptr; // selector codebooks (u4 planes)
-    const uint16_t * df_sel_ps_ = nullptr, * df_sel_po_ = nullptr;
-    const uint8_t * df_sel_nv_ = nullptr;
-    const uint16_t * df_sel_ns_ = nullptr, * df_sel_no_ = nullptr;
+    struct dflash_state {
+      bool dflash_on_ = false;
+      std::string dflash_path_;
+      std::unique_ptr<dflash_model> dfm_;
+      int df_dev_ = 0;      // device the draft runs on (must be 0: the shared head)
+      int df_kmax_ = 0;     // requested draft tokens per cycle (block_size-1 max)
+      int df_k_ = 0;        // the clamped draft length actually used
+      int df_block_ = 0;    // dflash.block_size
+      int df_swa_ = 0;      // the draft's sliding window
+      int df_ring_ = 0;     // K/V ring tokens per layer
+      int df_kv_bytes_ = 2; // 2 = f16 ring, 4 = f32
+      int df_splits_ = 8;   // draft attention key splits
+      int df_cap_rows_ = 0;
+      float * d_df_h = nullptr; // [block][n_embd] residual stream
+      float * d_df_b = nullptr; // scratch [block][n_embd]
+      float * d_df_c = nullptr; // scratch [block][n_embd]
+      float * d_df_qkv = nullptr; // [block][(n_head + 2*n_head_kv)*head_dim]
+      float * d_df_gu = nullptr; // [block][2*n_ff]
+      float * d_df_dyn = nullptr; // [block][2*conv_k*n_groups]
+      float * d_df_gate = nullptr; // [block][selector rank]
+      float * d_df_partials = nullptr;
+      float * d_df_feat = nullptr; // HOST USM [kMaxB*kMaxT][n_tgt_layer*n_embd]
+      float * d_df_feat_dev = nullptr; // device staging for one injection chunk
+      void * d_df_kring = nullptr; // [n_layer][ring][n_head_kv][head_dim]
+      void * d_df_vring = nullptr;
+      int32_t * d_df_pos = nullptr; // device: absolute position per row
+      std::vector<int32_t> h_df_pos; // host mirror of d_df_pos
+      int32_t * d_df_ids = nullptr; // [block][top_k]
+      float * d_df_vals = nullptr;
+      int32_t * d_df_pids = nullptr; // [block][topk slices][top_k] partials
+      float * d_df_pvals = nullptr;
+      int df_pcap_ = 0;
+      int df_slices_ = 1;
+      float * d_df_lattice = nullptr; // [block][top_k + top_k*top_k]
+      std::vector<float> h_df_lattice;
+      step_info * d_df_info = nullptr;
+      const void * df_head_key_ = nullptr; // the store key for the shared LM head
+      bool df_head_w4_ = false;
+      char df_head_key_store_[1] = {0};
+      const uint8_t * df_sel_pv_ = nullptr; // selector codebooks (u4 planes)
+      const uint16_t * df_sel_ps_ = nullptr, * df_sel_po_ = nullptr;
+      const uint8_t * df_sel_nv_ = nullptr;
+      const uint16_t * df_sel_ns_ = nullptr, * df_sel_no_ = nullptr;
+    } dfl;
+
     void setup_dflash(const std::string & draft_path);
     bool df_gemm(const wt & w, const float * x, int xs, float * out, int os, const float * res, int M,
                  const float * up = nullptr, int us = 0);
@@ -624,11 +627,11 @@ struct engine {
                                      const std::function<bool(int)> & cb, std::vector<float> * first_logits);
     // index of this layer in the draft's target_layers list, or -1
     int df_tgt_slot(int layer) const {
-        if (!dfm_) {
+        if (!dfl.dfm_) {
             return -1;
         }
-        for (int i = 0; i < dfm_->hp.n_tgt_layer; i++) {
-            if (dfm_->hp.tgt_layer[i] == layer) {
+        for (int i = 0; i < dfl.dfm_->hp.n_tgt_layer; i++) {
+            if (dfl.dfm_->hp.tgt_layer[i] == layer) {
                 return i;
             }
         }
@@ -652,7 +655,7 @@ struct engine {
     engine(const std::string & model_path, int max_seq = 8192, int n_splits = 16, int n_blocks = 512,
            int kv_cap_mb = 0, const std::string & pc_dir = "", int pc_disk_mb = -1, int pc_mem_mb = -1,
            int pc_ram_mb = -1, int pc_vram_mb = -1, int device = -1, const std::string & layer_map = "",
-           int mtp_k = 0, const std::string & draft_path = "", int draft_k = 0, int draft_dev = 0);
+           int mtp_k_arg = 0, const std::string & draft_path = "", int draft_k = 0, int draft_dev = 0);
     ~engine();
 
     void reset_state();
@@ -682,9 +685,6 @@ struct engine {
     // copy the logits of row r to the host
     void fetch_logits(int row, float * out);
     // run the prefill forward without a graph (diagnostics / fallback)
-    void forward_plain_pf();
-    void forward_plain_pf8();
-    void forward_plain_dec(int rows);
 
     // ---- simple single-sequence API (kept for tests / CLI) ----
     void reset_single();
@@ -710,6 +710,9 @@ struct engine {
         return !free_blocks_.empty();
     }
     void set_table(int slot, const std::vector<int> & blocks);
+    // true iff every slot up to pos+lookahead has a block
+    bool ensure_block_headroom(std::vector<int> & blocks, int pos, int lookahead);
+    void reset_step_info(step_info * inf);
 
     // block pool accounting (host side, informational)
     int pool_free_blocks() const {

@@ -56,4 +56,57 @@ struct utf8_stream_buffer {
     }
 };
 
+
+#include <cctype>
+
+
+// Text-normalization helpers shared by the chat renderers and the streaming
+// response parser.
+inline bool is_space(char c) {
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+inline std::string trim_spaces(const std::string & s) {
+    size_t b = 0, e = s.size();
+    while (b < e && is_space(s[b])) {
+        b++;
+    }
+    while (e > b && is_space(s[e - 1])) {
+        e--;
+    }
+    return s.substr(b, e - b);
+}
+
+inline std::string lstrip_newlines(const std::string & s) {
+    size_t b = 0;
+    while (b < s.size() && (s[b] == '\n' || s[b] == '\r')) {
+        b++;
+    }
+    return s.substr(b);
+}
+
+inline std::string rstrip_newlines(const std::string & s) {
+    size_t e = s.size();
+    while (e > 0 && (s[e - 1] == '\n' || s[e - 1] == '\r')) {
+        e--;
+    }
+    return s.substr(0, e);
+}
+
+inline std::string lstrip_spaces(const std::string & s) {
+    size_t b = 0;
+    while (b < s.size() && is_space(s[b])) {
+        b++;
+    }
+    return s.substr(b);
+}
+
+inline std::string rstrip_spaces(const std::string & s) {
+    size_t e = s.size();
+    while (e > 0 && is_space(s[e - 1])) {
+        e--;
+    }
+    return s.substr(0, e);
+}
+
 } // namespace si
