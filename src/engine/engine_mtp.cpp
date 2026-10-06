@@ -717,6 +717,17 @@ void engine::mtp_rollback(int j) {
 // per cycle, so acceptance can only ever skip work, never change the output.
 std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen_params & gp,
                                       const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
+    // Fall through to the plain decode when MTP is not enabled.  The constructor
+    // clears mtp_k (-> mtp_on false) whenever a gate fails - no NextN head, no
+    // multi-device oneDNN int8 partition - and leaves every d_mtp_* buffer null,
+    // so entering the speculative loop anyway walks into an unallocated kernel
+    // argument.  It surfaced as "multi-device: weight tensor not uploaded to this
+    // device's partition" from inside the verify's plan build, which reads as a
+    // weight-partition bug rather than "you called the wrong entry point".
+    // generate_dflash already gates on dfm_ the same way.
+    if (!mtp_on) {
+        return generate(prompt, gp, cb, first_logits);
+    }
     reset_single();
     const hparams & hp = m.hp;
     static const bool dbg_gen = si::env::flag("PF_DUMP_GEN");

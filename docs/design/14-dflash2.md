@@ -86,7 +86,14 @@ DFlash2 在 attn/FFN 前面各有一个 grouped depthwise **动态**卷积，系
 
 base 那一侧是 **channel 最内**（`(c,t) = c + width*t`），dynamic 那一侧是 **token 最内**
 （`(g,t,side) = g + n_groups*t + side*n_groups*conv_k`）。**两者的轴序是镜像的**，
-而且两边都曾经写错过。`df_conv_launch` 里 `base` 通道内、`dyn` 通道外。
+而且两边都曾经写错过。`df_conv_launch` 里 `base` 通道内、`dyn` 通道外，
+并且**两者相加**（`w = base + dyn`，再 `w * x`），不是相乘。
+
+> 另一个曾经藏住的错误是 launch 几何：kernel 用固定的 256 线程 local size，于是任何
+> `n_rows*width` 不是 256 倍数的形状都会被 SYCL 拒绝（*Non-uniform work-groups*）。
+> 27B 的形状恰好是倍数（6×5120=120×256、6×4096=96×256），所以模型里永远不触发。
+> 这个 kernel 没有 barrier 也没有 local memory，工作组大小本来就没用，现在是普通
+> `range<1>`。
 
 > 这两个下标是本项目里最容易写错的地方之一：base 写错时 anchor 行（只用 tap 0）仍能
 > 跟参考对上（cos 0.994），只有 mask 行错，于是出现 **"anchor 接近、mask 行偏离"**
@@ -239,6 +246,25 @@ workgroup/行合并。两点值得不要重新推导：
   段错误的是同一个错误）；
 * `df_conv_check` 保留了修复前的下标推导，于是 conv 轴修好之后它在报告两个公式的差，同时
   还把自己当成 conv 的验证（第 0 层报 host 0.805 vs dev 1.545）。
+
+## 8.2 测试
+
+* `tests/backend/gpu/kernels/test_dflash_kernels.cpp`（50 项检查）：`df_topk_launch`
+  对主机参考，覆盖真实 `n_vocab=248320`、`S=1/7/8/64/128`、`K=1/16/30/31/32`、
+  大量精确并列、`n` 略大于 `K`、`M=1`，以及**切片路径必须与单工作组路径逐位相同**；
+  `df_conv_launch` 对主机参考，覆盖真实几何、anchor 单行（只用到 tap 0，也就是
+  base 轴序错误唯一藏得住的那个 case）、`conv_group == width`、`conv_group == 1`、
+  两种 side、有无残差相加。
+* `tests/engine/test_spec.cpp`：两个草稿器各自的流必须与普通 greedy decode 逐 token
+  相同，外加门控与可复现性。
+
+这两个测试各找出一个真实 bug（见 §3 与 §16 的注记）：`df_conv_launch` 的
+non-uniform work-group，以及 `df_topk_launch` 的 `K` 上界（SLM 预算其实给出
+`K <= 30`，旧 guard 写 `K <= 32`，于是 K=31/32 直接 launch 失败）。
+
+> `df_topk_launch` 的**参考实现写错过一次**：kernel 是把两个系数张量**相加**融合
+> （`w = base + dyn`，然后 `w * x`），而参考写成了 `b * d * x`。每一项都会不一致，
+> 而且看起来非常合理——这正是这个测试存在的理由。
 
 ## 9. CLI
 

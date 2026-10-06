@@ -176,7 +176,7 @@ The tests default to `/path/to/Qwen3.5-0.8B-Q4_K_M.gguf` and require the
 GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
 The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 `test_w4_vs_i8`, `test_gemv_stride`, `test_iq_dequant`, `test_w4_vs_cpuref`,
-`test_w4_topk`, `test_27b_prefill` - default to the 27B at
+`test_w4_topk`, `test_27b_prefill`, `test_spec` - default to the 27B at
 `/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` and take it as
 `argv[1]`.
 
@@ -202,6 +202,8 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 ./build/test_gpu_vs_ref    # end-to-end logits vs CPU reference (GPU)
 ./build/test_forward       # end-to-end logits / top-k (GPU)
 ./build/test_decode_vs_prefill  # single-token decode == re-prefill (GPU)
+./build/test_dflash_kernels # DFlash2 top-k + conv vs host references (GPU)
+./build/test_spec          # MTP + DFlash2 stream == the plain greedy decode (27B)
 ```
 
 Always run at least `test_gpu_stages`, `test_gpu_vs_ref` and `test_forward`
@@ -290,12 +292,15 @@ tests/backend/cpu/  test_cpuref.cpp, test_pc_cpu.cpp (paged attention + disk
                 (tier stores)
 tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
                 host reference; run PF_CPU_ISA=scalar|avx2|avx512 to pin a variant),
-                test_cpu_gdn.cpp (cpu_gdn with an asymmetric head count)
+                test_cpu_gdn.cpp (cpu_gdn with an asymmetric head count),
+                test_dflash_kernels.cpp (DFlash2 top-k + conv vs host references)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp,
                 test_w4.cpp (u4 packing round-trip)
 tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter)
 tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
                 test_decode_vs_prefill.cpp (single-token decode vs re-prefill),
+                test_spec.cpp (MTP + DFlash2 stream == the plain greedy decode;
+                one engine per process, re-execing itself per configuration),
                 test_w4_vs_cpuref.cpp / test_w4_topk.cpp (u4 logits vs the fp32
                 reference; TEST_LAYER_MAP runs the 27B split across devices),
                 test_27b_prefill.cpp (27B prefill bring-up probe)
@@ -1384,6 +1389,62 @@ is free (0.001 ms), so the whole tail is the two kernels and the blocking wait.
 The verify, by contrast, is unchanged and still done: 91.6 ms = 72.2 + 4.75 x (k-1),
 i.e. one plain decode's weight pass plus 4 ms per extra row, and see the
 DPAS/pipelining sections above for why neither is movable.
+
+### Three bugs the new DFlash2 tests found
+
+`tests/backend/gpu/kernels/test_dflash_kernels.cpp` (top-k + conv vs host
+references) and `tests/engine/test_spec.cpp` (both drafters vs the plain greedy
+decode) each found a real bug that nothing else could reach.  All three are the
+shape AGENTS.md keeps warning about: **a plausible-looking thing that is wrong,
+and that nothing in the product path happens to exercise.**
+
+1. **`df_conv_launch` had a latent launch-geometry bug.**  It used a fixed
+   256-thread local size, so SYCL rejected any `n_rows*width` that was not a
+   multiple of 256 with *"Non-uniform work-groups are not supported"*.  The 27B
+   shapes are multiples by luck (6*5120 = 120*256, 6*4096 = 96*256), which is why
+   it never fired in the model - the kernel's own comment even says *"width is not
+   a multiple of the 256-thread group"* while the launch assumed it was.  The
+   kernel has no barriers and no local memory, so a work-group size buys nothing;
+   it is now a plain `range<1>`.
+
+2. **`df_topk_launch`'s `K` guard admitted a launch that could not run.**  The
+   per-lane SLM lists are two `256*K+1` accessors plus two `256`-element reduction
+   scratch arrays, so the real budget is `8*(256*K+1) + 8*256 <= 65536`, i.e.
+   **`K <= 30`**.  The guard said `K <= 32` with `WG*K+2` lists and no scratch in
+   the budget, so K=31 (65544 bytes) and K=32 (65552) both **failed to launch**
+   with `UR_RESULT_ERROR_OUT_OF_RESOURCES` - a config error reported as a
+   resource error, which killed the process rather than degrading.  The cap is now
+   `static_assert`ed from the budget so it cannot drift.  DFlash2's `sel_top_k` is
+   16, so no real model reaches it; the test asserts the out-of-range K is
+   *ignored and leaves the caller's buffers untouched*.
+
+3. **`generate_mtp` had no gate on `mtp_on`.**  The constructor clears `mtp_k`
+   (hence `mtp_on`) whenever a gate fails - no NextN head, no multi-device oneDNN
+   int8 partition - and leaves every `d_mtp_*` buffer null, but `generate_mtp`
+   walked into the speculative loop regardless.  It surfaced from inside the
+   verify's plan build as *"multi-device: weight tensor not uploaded to this
+   device's partition"*, i.e. as a **weight-partition bug** when the actual fault
+   was calling the wrong entry point.  It now falls through to `generate`, the
+   way `generate_dflash` already gates on `dfm_`.  This is the kind of thing a
+   test harness or a second-model server hits immediately and the CLI never does,
+   because `main.cpp` builds one engine and routes by `--spec-type`.
+
+Two things `test_spec` does that are worth stating.  It asserts **stream
+equality against the plain greedy decode**, not acceptance: a broken verify can
+accept at a perfectly healthy rate and still emit the wrong text, because
+acceptance only compares against the target's own argmax on the rows it kept.
+And it runs **one engine per process** (re-execing itself per configuration),
+because a second engine in the same process inherits state from the first - an
+MTP-enabled engine followed by a DFlash one fails at construction, while each
+alone and the reverse order both work.  The CLI never hits that because it builds
+one engine; the test would otherwise have encoded the limitation as a failure.
+
+Verified: `test_dflash_kernels` 50 checks / 0 failures; `test_spec` all four
+configurations OK; `test_gpu_stages` all stages OK; `test_gpu_vs_ref` argmax SAME;
+`test_forward` last_id=198; `test_decode_vs_prefill` OK.  A 48-token greedy DFlash
+generation is byte-identical before and after all three fixes (stdout md5
+`19edba39...`) - note the earlier md5 comparison that "changed" was including
+stderr's variable KV/prefix-cache exit lines, not the generated text.
 
 ### OpenAI-compatible API
 

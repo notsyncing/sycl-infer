@@ -417,7 +417,9 @@ void df_attn_launch(sycl::queue & q, const float * qbuf, const void * kpool, con
 void df_attn_combine_launch(sycl::queue & q, const float * partials, float * out, int n_rows, int n_head,
                             int head_dim, int n_splits, const float * sinks);
 // Per-row top-k over an [M][n] logit matrix; ties resolve to the lower index.
-// Per-row top-K over a [M][n] logit matrix.  `S` slices per row: each workgroup
+// Per-row top-K over a [M][n] logit matrix.  K <= 30 (derived from the 64 KB SLM budget): the per-lane SLM lists are
+// the budget is 8*(256*K+1) + 8*256 <= 65536, so K <= 30; a larger K must be
+// IGNORED, not launched (it would fail with UR_RESULT_ERROR_OUT_OF_RESOURCES).  `S` slices per row: each workgroup
 // reduces one slice to K and the last pass merges the S*K partials, so the grid is
 // M*S workgroups instead of M.  With M=6 a one-workgroup-per-row grid occupies
 // 6 of 512 EUs and this kernel measured 2.1 ms for 5.96 MB (~2.8 GB/s).

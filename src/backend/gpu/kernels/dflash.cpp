@@ -27,6 +27,25 @@
 namespace si {
 
 using namespace sycl;
+
+// Largest top-K the per-lane SLM lists fit, DERIVED rather than guessed.  Each
+// lane keeps a [K] list plus the scratch slot at index WG*K, so the two list
+// accessors are (WG*K + 1) elements each, and the two reduction scratch arrays
+// are WG elements each:
+//
+//     8*(WG*K + 1) + 8*WG  <=  64 KB
+//
+// At WG=256 that is K <= 30 (K=31 needs 65544 bytes, 8 over).  The original guard
+// said K <= 32 with WG*K+2 lists and no scratch in the budget: K=32 needs 65552
+// bytes and K=31 65544, so both failed to LAUNCH with
+// UR_RESULT_ERROR_OUT_OF_RESOURCES - a config error surfacing as a resource
+// error, which is exactly the shape of bug that only a test finds.  DFlash2's
+// sel_top_k is 16, so the model cannot reach this; it is a guard, not a limit.
+constexpr int kTopkWG = 256;
+constexpr int kTopkSlmBudget = 64 * 1024;
+constexpr int kTopkMaxK = (kTopkSlmBudget - 8 * kTopkWG - 8) / (8 * kTopkWG);
+static_assert(kTopkMaxK >= 16, "a model must be able to ask for at least sel_top_k=16");
+
 using namespace si::kd;
 
 static inline float mb_h2f(uint16_t h) {
@@ -89,12 +108,15 @@ void df_conv_launch(queue & q, const float * x, const float * dyn, const float *
     //     base's tap stride is `width` too - not the tensor's own n_embd
     (void)base_width;
     const int n_groups = width / conv_group;
-    // one work-item per (row, channel) from the *global* id: width is not a
-    // multiple of the 256-thread group, so group(0)/local_id(0) would run off
-    // the end of `out` and read the wrong rows (it only accidentally works when
-    // width % 256 == 0)
-    q.parallel_for(nd_range<1>((size_t)n_rows * width, 256), [=](nd_item<1> it) {
-        const size_t gid = it.get_global_id(0);
+    // One work-item per (row, channel), indexed from the *global* id.  A plain
+    // range, not nd_range: the kernel has no barriers and no local memory, so a
+    // work-group size buys nothing - and a fixed 256 local size is a LATENT
+    // BUG, because SYCL rejects a non-uniform group count and n_rows*width is
+    // only a multiple of 256 by luck (the 27B shapes are: 6*5120=30720=120*256
+    // and 6*4096=24576=96*256, which is why it never fired in the model).  Any
+    // other width died with "Non-uniform work-groups are not supported".
+    q.parallel_for(range<1>((size_t)n_rows * width), [=](id<1> it) {
+        const size_t gid = it[0];
         const int i = (int)(gid / width);
         const int c = (int)(gid % width);
         const int g = c / conv_group;
@@ -422,7 +444,7 @@ void df_attn_combine_launch(queue & q, const float * partials, float * out, int 
 // (~2.8 GB/s), i.e. ~100x off the bandwidth floor and 8% of a 28 ms cycle.
 static void df_topk_slice(queue & q, const float * logits, int n, int32_t * pids, float * pvals, int M, int K,
                           int S) {
-    if (M <= 0 || n <= 0 || K <= 0 || K > 32 || S <= 0) {
+    if (M <= 0 || n <= 0 || K <= 0 || K > kTopkMaxK || S <= 0) {
         return;
     }
     const int K_ = K;
@@ -430,7 +452,7 @@ static void df_topk_slice(queue & q, const float * logits, int n, int32_t * pids
     const float kNinf = -std::numeric_limits<float>::infinity();
     q.submit([&](handler & h) {
         local_accessor<float, 1> lv((size_t)WG * K_ + 2, h);
-        local_accessor<int32_t, 1> li((size_t)WG * K_ + 2, h);
+        local_accessor<int32_t, 1> li((size_t)WG * K_ + 1, h);
         local_accessor<float, 1> red(WG, h);
         local_accessor<int32_t, 1> rid(WG, h);
         h.parallel_for(nd_range<1>((size_t)M * S * WG, WG), [=](nd_item<1> it) {
@@ -517,14 +539,14 @@ static void df_topk_slice(queue & q, const float * logits, int n, int32_t * pids
 }
 
 void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K) {
-    if (M <= 0 || n <= 0 || K <= 0 || K > 32) {
+    if (M <= 0 || n <= 0 || K <= 0 || K > kTopkMaxK) {
         return;
     }
     const int K_ = K;
     constexpr int WG = 256;
     const float kNinf = -std::numeric_limits<float>::infinity();
     q.submit([&](handler & h) {
-        local_accessor<float, 1> lv((size_t)WG * K_ + 2, h);
+        local_accessor<float, 1> lv((size_t)WG * K_ + 1, h);
         local_accessor<int32_t, 1> li((size_t)WG * K_ + 2, h);
         local_accessor<float, 1> red(WG, h);
         local_accessor<int32_t, 1> rid(WG, h);
@@ -649,8 +671,8 @@ static void df_topk_merge(queue & q, int32_t * pids, float * pvals, int32_t * id
     const int K_ = K;
     const float kNinf = -std::numeric_limits<float>::infinity();
     q.submit([&](handler & h) {
-        local_accessor<float, 1> lv((size_t)WG * K_ + 2, h);
-        local_accessor<int32_t, 1> li((size_t)WG * K_ + 2, h);
+        local_accessor<float, 1> lv((size_t)WG * K_ + 1, h);
+        local_accessor<int32_t, 1> li((size_t)WG * K_ + 1, h);
         local_accessor<float, 1> red(WG, h);
         local_accessor<int32_t, 1> rid(WG, h);
         h.parallel_for(nd_range<1>((size_t)M * WG, WG), [=](nd_item<1> it) {
@@ -750,7 +772,7 @@ static void df_topk_merge(queue & q, int32_t * pids, float * pvals, int32_t * id
 // provide partial scratch get the original single-pass behaviour.
 void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K, int32_t * pids,
                     float * pvals, int S) {
-    if (M <= 0 || n <= 0 || K <= 0 || K > 32) {
+    if (M <= 0 || n <= 0 || K <= 0 || K > kTopkMaxK) {
         return;
     }
     if (!pids || !pvals || S <= 1) {
@@ -759,7 +781,6 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
     }
     // Keep at least a couple of elements per lane in every slice, so a lane's
     // top-K list is not trivially short and the merge has real candidates.
-    constexpr int kTopkWG = 256;
     int s_use = S;
     while (s_use > 1 && (long long)n / s_use < (long long)2 * kTopkWG) {
         s_use >>= 1;

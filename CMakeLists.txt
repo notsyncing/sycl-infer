@@ -269,6 +269,8 @@ si_add_test(test_w4_vs_cpuref tests/engine/test_w4_vs_cpuref.cpp)
 si_add_test(test_w4_topk     tests/engine/test_w4_topk.cpp)
 si_add_test(test_decode_vs_prefill tests/engine/test_decode_vs_prefill.cpp)
 si_add_test(test_dp4a        tests/backend/gpu/kernels/test_dp4a_gemm.cpp)
+si_add_test(test_dflash_kernels tests/backend/gpu/kernels/test_dflash_kernels.cpp)
+si_add_test(test_spec        tests/engine/test_spec.cpp)
 
 si_add_test(test_gpu_stages
     tests/backend/gpu/kernels/test_gpu_stages.cpp
