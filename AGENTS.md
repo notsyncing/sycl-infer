@@ -540,6 +540,51 @@ in any order, a larger `TX` (a bigger workgroup is slower, and the extra RB does
 not help because the staged activation is L2-resident), and the c-outer order
 all lose.
 
+**Do not software-pipeline this kernel - both forms measured a loss, and the
+reason generalises.**  The K-tile loop is strictly load -> barrier -> compute ->
+barrier, and the weight dwords are read from global *inside* the compute phase, so
+there is a real exposed-latency story here.  Two pipelines were implemented and
+verified bit-exact (identical acceptance), both slower on the 27B / 2x A770
+verify at M=6:
+
+    form                          verify      draft     (vs 91.6 / 28.1 ms baseline)
+    none (shipped)                91.6 ms    28.1 ms
+    SLM double buffer             117.1      30.2      +28 % / +7 %
+    register prefetch, 1 group    107.6      31.4      +17 % / +12 %
+    no activation SLM (DIRECT=1)   96.3       31.7      +5 % / +13 %
+
+The SLM version doubles `act_s` (M=6: 6 -> 12 KB, ~21 KB per work-group with
+`sc_s`/`of_s`); the register version adds `pw[2][C]` (16 uint32) on top of
+`acc[M*C]` and the existing `wl`/`wh`.  **Both trade directly against occupancy,
+and this kernel is occupancy-bound - the same pressure documented above, where a
+SIMD16 sub-group spilled 18-23 KB/thread.**  Worse, the register form is
+redundant: the gt loop already carries `#pragma unroll 2`, so the compiler is
+already free to hoist iteration *i+1*'s loads across iteration *i*'s dp4a;
+hand-rolling it on top of what the compiler already extracted is pure loss.
+
+The third row is the interesting one, because it was the most promising idea of
+the three.  `nat_gemm` reaches 223 GB/s at M=7 where the M=1 GEMV reaches 294 on
+the *same weights*, and the M=1 path needs no activation staging at all - so the
+gap looked like `act_s`'s ~7 KB.  Setting `NAT_DIRECT=1` reads the quantized
+activation straight from global and shrinks `act_s` to 1 byte (the
+`local_accessor` *size* is what counts against the SLM budget whether or not it
+is touched), taking ~8.5 KB of SLM down to `sc_s`+`of_s`'s 4 KB for ~0.2 % more
+traffic.  It still loses: staging turns 24 dependent global loads per thread
+into 24 register reads, and putting them back on dp4a's dependency chain costs
+more than the occupancy buys.  **The activation staging is not overhead; it is
+earning its keep.**
+
+**So `nat_gemm` is at a local optimum at M ~ 7**: three changes touching SLM,
+registers and SLM footprint all lost, each one trading a resource the kernel had
+already balanced against another.  Do not attempt a fourth.  **The right mental
+model is that occupancy IS the latency hiding here** - many concurrent warps
+cover one warp's load latency - so spending SLM or registers on single-warp
+overlap buys much less than spending them on more concurrency, and the M=1
+GEMV's 294 GB/s belongs to a different blocking (no C dimension) that may simply
+not generalise to M > 1.  To make the verify faster, cut weight bytes (the u4
+per-32 offset plane is 20 % of them) or change the execution unit (DPAS,
+measured hopeless on this part), not the schedule.
+
 After the reorder the kernel is within ~1.3-1.5x of the M=1 GEMV's rate
 (measured M=7, K=5120, N=17408: u4 223 GB/s, k5 188, cb4 173, int8 323, against
 the M=1 GEMV's 294/249/261/364).  On *true* per-format traffic (weight plane +
@@ -1119,6 +1164,181 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 (`build/libsycl_infer_core.a` has to be current or the link fails on whatever
 launcher the tool was last changed to call.)
 
+### DFlash2 block drafter (`--spec-type dflash2`)
+
+A second drafter, structurally different from MTP: the draft GGUF's own 5-layer
+NextN-style head runs **one non-causal forward over `[anchor, MASK x (n_max)]`**
+inside a private K/V ring, and a selector scores the top-K candidate sets per
+block position plus every ordered pair, so the host walks one coherent path
+through the lattice instead of re-drawing per token.  Model:
+`Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, 5 layers, `n_embd` 5120, 32/8 heads,
+`head_dim` 128, block 8, `swa` 2048, mask id 248070, selector rank 256 / top 16,
+target layers `[6,20,34,48,62]`.  Files: `src/model/dflash.{h,cpp}`,
+`src/backend/gpu/kernels/dflash.cpp`, `src/engine/engine_dflash.cpp`, plus the
+capture hook in `engine_graph.cpp`.
+
+Measured on the 27B / 2x A770, greedy, against llama.cpp at the same `n_max`
+(short prompt, mean accepted tokens per cycle):
+
+    generated   llama.cpp   ours
+       32         4.43      4.75
+      116         3.96      3.90
+      227         4.13      3.92
+
+    k      1     2     3     4     5     6
+    acc  0.98  1.44  2.18  2.54  2.90  2.90
+    ms/t 48.6  41.9  34.1  32.5  31.5  33.3
+
+**k=5 is the shipped default** (2.90 drafts/cycle, 31.5 ms/token against the~68
+ms/token plain decode, i.e. 2.17x).  On a 204-token prompt both engines drop
+(llama.cpp 0.239 / mean len 2.07, ours 0.81 / 1.81), so the long-context gap is
+~12 %, not the 5x an earlier broken state suggested.
+
+Three bugs were load-bearing, and **none of them was findable from the inside** -
+every host check passed throughout, because each check restates the bug:
+
+  - the block forward projected `wq` but **not `wk`/`wv`**, so the attention read
+    K and V out of whatever the injection path last left in the fused buffer.  The
+    injection writes the committed positions, so the ring held valid K/V for those
+    and an anchor row (which attends mostly to committed keys) still tracked
+    llama.cpp at cos 0.994, while the block's own rows attended to stale K/V.
+    **"Anchor close, mask rows off" is the signature.**  0.03 -> 0.48 acceptance.
+  - the conv composes two coefficient tensors with **mirrored axes**: base's side
+    slice is reshaped to `[group_size, n_groups, kernel_size]` (channel
+    innermost, so `(c,t)` is `c + width*t`) while the dynamic is
+    `[n_groups, kernel, 2, tokens]` (so `(g,t,side)` is
+    `g + n_groups*t + side*n_groups*kernel`).  Both were wrong; fixing base first
+    took the anchor row - which only ever uses tap 0 - to cos 0.999997, which is
+    what isolated the second error to the tap/side coefficients.
+  - the draft's rope **rotates the whole `head_dim`**.  `dimension_sections` is
+    `[64,0,0,0]` and reading `sections[0]` as the rotated width gives 64; the
+    reference rotates 128.  That is a fixed ~0.7 % on every attention score,
+    invisible in any aggregate, and it compounds to cos 0.79 by layer 4.
+    Measured against `DFLASH_REF_CUR` at pos0=204: n_rot 32/64/96/128 gives
+    0.9930 / 0.9932 / 0.9947 / **0.999991** on row 0.
+
+`attn_sinks` is wired up (ggml's `ggml_soft_max_add_sinks` semantics: one extra
+key per query head, score `sinks[h]`, value 0, so the whole effect is a factor
+`z / (z + exp(sink - max))`) but **this GGUF carries no such tensor** - 15
+`blk.N.*` tensors, `attn_sinks` not among them, and llama.cpp creates it
+`TENSOR_NOT_REQUIRED`.  So it is a no-op here; it is wired rather than assumed
+absent because a draft that *does* carry sinks would be wrong on every head.
+
+**How to compare against llama.cpp.**  Element-wise, never by fingerprint:
+`DFLASH_REF_{NOISE,CUR,FFNIN,FFNCONV,FFNOUT,XNORM,DYN,HIDDEN,LAYER}` publish a
+tensor at a layer chosen by `DFLASH_REF_IL=<il>` (default 0), and
+`DFLASH_REF_BIN=<path>` writes it raw; on this side `PF_DFLASH_BIN=<path>` does the
+same, with `PF_DFLASH_SIGALL` adding every layer and `PF_DFLASH_{SIG,GEMMCHK,
+PROJCHK,CONVCHK,CONVCHKALL,BASECHK,ROWRMS,EMBCHK,INJCHK}` selecting probes.
+`rms`/`max`/`first`/`top-6` say how big a divergence is but never where, and the
+anchor row carries an order of magnitude more energy than the mask rows, so a
+whole-batch aggregate is **not comparable with llama.cpp's per-position print at
+all** - an aggregate that said the `wo` output was 30 % low was comparing two
+different things.  llama.cpp's copy-out is fixed at `n_embd` wide, so a narrower
+tensor has to be padded on its side (`DFLASH_REF_DYN` does this).
+
+**A diagnostic whose identity depends on when it fired needs that context in its
+name.**  Four confident wrong answers came from this, and they cost more time than
+the bugs did: reading the f16 ring as f32 (1e12 rms garbage and a 104/205
+"coverage gap"); reading the layer output from `d_df_h` instead of `d_df_c`,
+which fabricated a clean-looking error-accumulation curve; naming dumps by layer
+alone, so a later block overwrote an earlier one and two readings of one layer
+disagreed by exactly one layer (which produced a very convincing "layer 4 reads
+the wrong tensor" - the layer index was being set in a *different function*, by a
+`replace(...,1)` that matched the first of two identical `const dflash_layer_t &`
+declarations, the same mistake that segfaulted a probe); and `df_conv_check`
+keeping the pre-fix index derivation, so after the conv axes were corrected it
+reported the difference between two formulas while presenting itself as a
+verification of the conv, and reported host 0.805 vs dev 1.545 at layer 0.  **A
+broken verifier is worse than none - it suppresses exactly the signal the fix
+should be checked against.**
+
+Open: the draft block forward is 21.2 ms, of which **20.5 ms is the five layers
+against a 4.67 ms bandwidth floor** (45 GEMM tensors, 1664.6 M params, 1040 MB at
+u4 0.625 B/w, vs `nat_gemm`'s measured 223 GB/s).  Ruled out: the weight format
+(all 49 draft tensors register as u4, `failed=0`), the dispatch (M=6 is
+`nat_gemm_pick`'s `case 6`, every draft GEMM has `K % 32 == 0`), and per-GEMM
+fixed cost - concatenating `ffn_gate`+`ffn_up` into one `[2*n_ff, n_embd]` GEMM
+(bit-identical, one launch instead of two) measured **28.0 -> 28.3 ms, i.e.
+nothing**, and switching to int8 stores (1.7x the bytes) only 28.0 -> 29.2.  So it
+is neither bytes, nor launches, nor arithmetic (10 GMAC is 1.3-2.8 ms at the
+measured 7.6 T-MAC/s).
+
+**`PF_DFLASH_OPTIME` (per-op, inserted by LINE NUMBER - every text-anchored
+insert landed in the injection path, which shares this code) must NOT be read as
+device time:**
+
+    attn_norm 1.5 | attn_conv_proj 0.1 | attn conv0 2.7 | qkv 0.3 | attn 0.1
+    wo 5.0 | attn conv1 1.6 | ffn_conv_proj 0.1 | ffn conv0 1.6
+    gate+up 0.2 | ffn_down 5.5 | ffn conv1 1.7 | total 20.4 (wall 20.7)
+
+**`gate+up` reads 167 MB of weights in a reported 0.2 ms**, which is impossible on
+an in-order queue: it submits, and the device time is charged to whoever waits
+next.  Every number in that table is *host-blocking* attribution.  Pricing the two
+expensive-looking groups with no-op knobs (`PF_DFLASH_NOGEMM` /
+`PF_DFLASH_NOCONV`, both produce wrong results and exist only for this) shows the
+smear directly:
+
+    everything               layers 20.8 ms
+    convs removed                    17.8    -> convs appear to be 3.0
+    GEMMs removed                    14.0    -> GEMMs appear to be 6.8
+    both removed                     12.1    -> "the rest" 12.1
+
+and the removal does not land where the table says.  With both removed,
+`attn_norm`, `attn_conv_proj`, `wo` and `ffn_down` all report **0.0** - not because
+they are free, but because with the heavy kernels gone the queue drains faster
+than the host submits and nothing blocks.  **So the three numbers do not add up to
+20.8, and A/B subtraction is not a valid attribution on an in-order queue**; the
+only sound figure is the wall clock, 20.8 ms against a 4.67 ms weight-stream floor.
+
+**All three of those subtractions are invalid, and so was the device-side table that
+was supposed to replace them.**  The host numbers above attribute 16.8 of 20.8 ms to
+`norm + attn_conv_proj + attn conv0`, which is why the FFN looked free.  Both
+methods were wrong, in the same direction, and the second one was wrong *because* of
+three bugs in its own arithmetic rather than in the model:
+
+* the segment accumulation ran **once after the layer loop**, so it differenced the
+  **last** layer's markers - every number was one layer's, not five;
+* the markers are **not in index order** (program order is `0, 6, 5, 1, 3, 4`), so
+  `for (i = 3; i < 6; i++) df_seg[i] += seg_e[i+1] - seg_e[i]` differenced two
+  early markers against two late ones and printed **-3.60 ms**;
+* `seg_e[0]` sat **outside** the loop while every other marker was inside it, so
+  segment 0 measured "before layer 0 -> layer 4's norm", i.e. nearly the whole
+  forward.  That single line is what produced "the RMSNorm is 82%": five RMSNorms
+  moving 614 KB do **not** take 16.4 ms; they take **0.36 ms**, 0.07 ms per layer,
+  and no host-side cost in `rmsnorm_launch` explains a millisecond either (caching
+  the work-group width in a function-local static changes nothing: 16.3 ms before
+  and after, so it was never the device-registry lookup that `AGENTS.md` warns about
+  elsewhere).
+
+Fixed, the device timeline accounts for itself and the profile is **flat**:
+
+    anorm=0.36  acproj=1.71  aconv0=2.27  attn=7.05          (qkv+rope+attn+wo+conv1)
+    ffn: norm+cproj+cconv=1.89  gate_up=2.75  down+cconv=4.33
+    sum=20.35   devspan=20.37   hostwall=20.70 ms
+
+`sum ≈ devspan` to 0.1% is the check that matters: `devspan` is the first layer's
+start barrier to the last layer's end barrier, so **the forward is device-bound**
+(20.37 of 20.70 ms), not submission-bound - which A/B subtraction could never have
+told you, and which is why the FFN's 8.97 ms is real and not "free".  There is no
+82% hotspot: the largest single item is the attention path at 35%, then
+`ffn_down + conv1` at 21%.  The FFN is *not* near its bandwidth floor after all -
+278 MB at 159 GB/s was measured on one layer's share of a mis-attributed total.
+
+**The lesson is the one this file already records elsewhere, and it is worth
+restating because it cost two sessions: a broken verifier is worse than none.**
+Here the verifier was self-consistent enough to look authoritative - it printed
+plausible positive numbers, one segment dominated, and the dominant segment had a
+ready-made physical story attached ("0.037 GB/s is impossible, so look at the host
+path").  Every one of those numbers was a mis-differenced timestamp.  **A timing
+breakdown must be checked against an independent total before it is believed**;
+`devspan` exists for exactly that, and `sum ≈ devspan` should have been the first
+thing printed rather than the last thing added.
+
+The verify, by contrast, is unchanged and still done: 91.6 ms = 72.2 + 4.75 x (k-1),
+i.e. one plain decode's weight pass plus 4 ms per extra row, and see the
+DPAS/pipelining sections above for why neither is movable.
+
 ### OpenAI-compatible API
 
 `GET /v1/models` lists the model (id from the GGUF `general.name`) and
@@ -1300,6 +1520,9 @@ stream wait; default off, the in-order queue already orders them).
 `PF_GEMM_ROW`, `PF_GEMM_TILE`, `PF_GEMM_SPLIT`, `PF_GEMM_WG`, `PF_GEMM_SG`,
 `PF_GEMM_XSLM`, `PF_GEMM_ARCH`, `PF_MT_R`/`PF_MT_R2`, `PF_MT_TB`, `PF_MT_WG`,
 `PF_MT_WG2`, `PF_MT_PF`, `PF_MT_SLM`.
+`PF_NATPF` / `PF_NATPIPE` (both default on, and both measured **losses** - see the
+software-pipelining note above; `0` keeps the in-place weight load / the serial
+load->barrier->compute form).
 
 **GDN**
 `PF_GDN_COLS` (state columns/warp, default 2), `PF_GDN_WG` (warps/WG, default 8),
@@ -1424,6 +1647,29 @@ pattern and are one-off: `PF_MTP_DIAG`, `PF_MTP_VPROBE`, `PF_MTP_HPROBE`,
 `PF_MTP_LAYER_W4_CALL=<ci>` (put only call `ci`'s MTP-layer tensors on the u4
 grid — 0 qkv, 1 wo, 2 ffn gate/up, 3 ffn down, -1 eh_proj; the bisection knob
 that localised the `do_split` bug).
+
+**DFlash2 diagnostics** (all default off; see the DFlash2 section above for what
+each one is compared against)
+`PF_DFLASH_DEBUG` (master switch for the probes below), `PF_DFLASH_SEGTIME` (device-side
+segment timing, all 5 layers: `anorm/acproj/aconv0/attn | ffn_norm+cproj+cconv /
+gate_up / down+cconv`, plus `sum` against `devspan` and the host wall - the last
+of which is the check that makes the rest trustworthy; needs the queue's
+enable_profiling, which the engine now sets),
+`PF_DFLASH_TIME` (per-phase
+cycle ms), `PF_DFLASH_NMAX` (draft length; default 5), `PF_DFLASH_SIG` /
+`PF_DFLASH_BIN` / `PF_DFLASH_SIGALL` (per-position fingerprints and full-tensor dumps
+for the element-wise diff against llama.cpp; filenames carry layer *and* block, see
+the note above), `PF_DFLASH_BTIME` (draft block phase split),
+`PF_DFLASH_CONVCHK` / `PF_DFLASH_CONVCHKALL`, `PF_DFLASH_PROJCHK` /
+`PF_DFLASH_PROJCHKALL`, `PF_DFLASH_BASECHK` (the conv base tensors are byte-identical
+device-side), `PF_DFLASH_GEMMCHK`, `PF_DFLASH_ROWRMS`, `PF_DFLASH_EMBCHK`,
+`PF_DFLASH_INJCHK`, `PF_DFLASH_INJTRACE` (ring V readback + coverage),
+`PF_DFLASH_ATTNCHK`, `PF_DFLASH_LAYER_W4` (int8 instead of the native u4 store for
+the draft layers - an A/B, costs 2 %), `PF_DFLASH_ROWED` (one row at a time),
+`PF_DFLASH_SPLITQ` (split activation quantisation - **this one is load-bearing**,
+`0` costs 28.0 -> 43.0 ms), `PF_DFLASH_NOCOMMIT` (drop the injected keys from the
+draft's attention), `PF_DFLASH_NROT`, `PF_DFLASH_HEADCHK` (exact fp32 reference for
+the draft head's logits).
 
 **Weight representation**
 `PF_W4` (native u4 for Q4_K, default on), `PF_CB4` (store IQ4_XS/IQ4_NL as native 4-bit codebook indices + a per-32 f16

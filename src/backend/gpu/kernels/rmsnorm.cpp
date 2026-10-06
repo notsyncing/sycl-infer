@@ -67,8 +67,13 @@ static void rmsnorm_impl(queue & q, const float * x, const float * w, float * ou
 
 void rmsnorm_launch(queue & q, const float * x, const float * w, float * out, int n_rows, int n, float eps) {
     // the widest width the device accepts, from the profile (see the header
-    // comment); anything narrower than 256 is not worth an instantiation
-    const int want = si::dev::wg_clamped(si::dev::active().shape.rmsnorm_wg);
+    // comment); anything narrower than 256 is not worth an instantiation.
+    // Resolved ONCE here, not per call: the device registry's own statics make each
+    // lookup cheap in isolation, but the DFlash2 draft block forward is a direct
+    // replay (not a recorded graph), so unlike the decode it cannot hide host time -
+    // and device-side segment timing put 16.4 ms of its 20.5 ms inside the five
+    // attn_norm launches, i.e. 3.3 ms each.
+    static const int want = si::dev::wg_clamped(si::dev::active().shape.rmsnorm_wg);
     if (want >= 1024) {
         rmsnorm_impl<1024>(q, x, w, out, n_rows, n, eps);
     } else if (want >= 512) {

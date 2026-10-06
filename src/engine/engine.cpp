@@ -35,10 +35,21 @@ static int resolve_device(int device, const std::string & layer_map) {
     return 0;
 }
 
+// enable_profiling so an event's command_start / command_end carry real device
+// timestamps.  Without it every query returns 0, which is why the DFlash2 draft
+// block forward had no valid per-op attribution: on an in-order queue a launch
+// only blocks when the queue is full, so host-side timers charge an op with
+// whichever one happens to wait next, and no-op A/B cannot repair it (removing
+// the heavy kernels just lets the queue drain with nothing blocking).  A barrier
+// pair's interval is the sound measurement there - submit a barrier at each
+// boundary and read the interval after one wait.  It costs nothing when unused.
+static const sycl::property_list in_order_prof{sycl::property::queue::in_order(),
+                                               sycl::property::queue::enable_profiling{}};
+
 static sycl::queue make_queue(int device_req, sycl::context * ctx) {
     if (device_req == 1) {
         try {
-            return sycl::queue(sycl::cpu_selector_v, sycl::property::queue::in_order());
+            return sycl::queue(sycl::cpu_selector_v, in_order_prof);
         } catch (...) {
             // no SYCL CPU device available: the queue is only used for
             // host-USM allocation / copies, compute runs on the CPU backend
@@ -46,9 +57,9 @@ static sycl::queue make_queue(int device_req, sycl::context * ctx) {
     }
     if (ctx) {
         // shared multi-GPU context: the primary queue is its first device
-        return sycl::queue(*ctx, ctx->get_devices().front(), sycl::property::queue::in_order());
+        return sycl::queue(*ctx, ctx->get_devices().front(), in_order_prof);
     }
-    return sycl::queue(sycl::gpu_selector_v, sycl::property::queue::in_order());
+    return sycl::queue(sycl::gpu_selector_v, in_order_prof);
 }
 
 // A --layer-map that places layers on two or more distinct GPUs shares one
@@ -90,7 +101,8 @@ static std::shared_ptr<sycl::context> make_md_context(const std::string & layer_
 
 engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb,
                const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb,
-               int device, const std::string & layer_map, int mtp_k_arg)
+               int device, const std::string & layer_map, int mtp_k_arg,
+               const std::string & draft_path, int draft_k_arg, int draft_dev)
     : device_req(resolve_device(device, layer_map)), md_ctx_(make_md_context(layer_map)), q(make_queue(device_req, md_ctx_.get())),
       max_seq(max_seq_), n_splits(n_splits_), n_blocks(n_blocks_) {
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
@@ -150,6 +162,32 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     if (mtp_on && (mtp_dev < 0 || mtp_dev >= (int)backends_.size())) {
         fprintf(stderr, "[mtp] --mtp-device %d out of range (%zu device(s)) - using 0\n", mtp_dev, backends_.size());
         mtp_dev = 0;
+    }
+    // DFlash / DFlash2 drafter (--spec-type dflash2): its own GGUF, its own K/V
+    // ring, and the feature-capture hook record_forward bakes into the graphs.
+    df_kmax_ = draft_k_arg;
+    if (const char * e = getenv("PF_DFLASH_NMAX")) {
+        const int v = atoi(e);
+        if (v > 0) {
+            df_kmax_ = v;
+        }
+    }
+    if (const char * e = getenv("PF_DFLASH_DEV")) {
+        df_dev_ = atoi(e);
+    }
+    if (draft_dev > 0) {
+        df_dev_ = draft_dev;
+    }
+    if (!draft_path.empty()) {
+        if (mtp_on) {
+            fprintf(stderr, "[dflash] --spec-draft-model and --mtp are exclusive; MTP off\n");
+            mtp_on = false;
+            mtp_k = 0;
+        }
+        setup_dflash(draft_path);
+        if (!dflash_on_) {
+            fprintf(stderr, "[dflash] speculative decoding unavailable - plain decode\n");
+        }
     }
     if (cpu_mode) {
         n_splits = 1;
@@ -1505,12 +1543,15 @@ void engine::setup_multi_device(const std::string & layer_map) {
             } else {
                 target = sycl::device(sycl::gpu_selector_v);
             }
+            // enable_profiling on the per-partition queues too, not just the primary
+            // one: this is the queue the DFlash2 draft runs on, and without it a
+            // barrier-based device timer throws "Profiling information is
+            // unavailable" rather than silently reading zero.
             if (md_ctx_) {
                 // all GPU partitions share the primary context
-                owned_queues_.push_back(
-                    std::make_unique<sycl::queue>(*md_ctx_, target, sycl::property::queue::in_order()));
+                owned_queues_.push_back(std::make_unique<sycl::queue>(*md_ctx_, target, in_order_prof));
             } else {
-                owned_queues_.push_back(std::make_unique<sycl::queue>(target, sycl::property::queue::in_order()));
+                owned_queues_.push_back(std::make_unique<sycl::queue>(target, in_order_prof));
             }
             dev_queues_[(size_t)bidx] = owned_queues_.back().get();
             backends_[(size_t)bidx] = make_gpu_backend(*dev_queues_[(size_t)bidx]);
@@ -1758,11 +1799,14 @@ void engine::alloc_buffers() {
         }
     }
     d_segs_aux = alloc_elems<gemv_seg>(8);
-    if (mtp_on) {
+    // The DFlash drafter runs on the *target's* speculative machinery (the same
+    // dry verify, per-token recurrent-state snapshots and rollback the MTP uses),
+    // so it needs the same buffers even though it has no MTP layer of its own.
+    if (mtp_on || dflash_on_) {
         // MTP draft-head activations live on the primary device (the MTP layer
         // always runs there); the per-token recurrent-state history is split
         // per partition so the GDN kernels snapshot into their own device USM.
-        mtp_nsnap = mtp_k + 1;
+        mtp_nsnap = std::max(mtp_on ? mtp_k : 0, dflash_on_ ? df_k_ : 0) + 1;
         auto ab = [&](size_t n) -> float * {
             return (float *)(multi_dev ? dev_alloc_on(mtp_dev, n * 4) : alloc_bytes(n * 4));
         };
@@ -2363,6 +2407,9 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // MTP speculative decoding: greedy requests only (the acceptance test is an
     // equality against the target's own next token; a sampled target would need
     // rejection sampling to stay exact).  Multimodal prompts bypass it too.
+    if (dflash_on_ && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
+        return generate_dflash(prompt, gp, cb, first_logits);
+    }
     if (mtp_on && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
         return generate_mtp(prompt, gp, cb, first_logits);
     }

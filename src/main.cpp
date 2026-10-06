@@ -69,20 +69,29 @@ static void usage(const char * prog) {
             "                               the three prefix-cache tiers, shrinking disk,\n"
             "                               then RAM, then VRAM.\n"
             "  --mmproj <mmproj.gguf>       vision projector needed by --image/--video\n"
-            "  --mtp [N]                    MTP (NextN) speculative draft length: run\n"
-            "                               the model's draft head N times per verify\n"
-            "                               (0 = off; N defaults to 4, the measured\n"
-            "                               optimum, capped at 12; env PF_MTP).  Needs a\n"
-            "                               GGUF with a blk.<n>.nextn.* head AND a\n"
-            "                               multi-device oneDNN int8 partition\n"
-            "                               (--layer-map over GPUs, PF_DP4A on), else\n"
-            "                               one [mtp] line and the plain decode.\n"
-            "                               Measured 1.4x-2.5x single-request; see\n"
-            "                               AGENTS.md.\n"
-            "  --mtp-device N               device partition the MTP draft layer (and\n"
-            "                               its KV slice) runs on (default 0; env\n"
-            "                               PF_MTP_DEV).  The MTP slice counts toward\n"
-            "                               --kv-cap-mb and all prefix-cache tiers.\n"
+            "  --spec-type T                 speculative decoding: none | mtp | dflash2\n"
+            "                               (default none; env PF_SPEC_TYPE).  mtp runs\n"
+            "                               the model's own NextN head autoregressively,\n"
+            "                               dflash2 drafts a whole block per step with a\n"
+            "                               DFlash2 drafter (needs --spec-draft-model).\n"
+            "                               Both are greedy-only (temperature 0 / top_k 1)\n"
+            "                               and single-sequence; anything else decodes\n"
+            "                               plainly.  See docs/design/14-dflash2.md.\n"
+            "  --spec-draft-model <gguf>    DFlash/DFlash2 drafter GGUF (--spec-type\n"
+            "                               dflash2).  It reads the target's hidden states\n"
+            "                               at the layers its `dflash.target_layers` names\n"
+            "                               and keeps its own K/V ring; one block forward\n"
+            "                               proposes up to `dflash.block_size`-1 tokens.\n"
+            "  --spec-draft-n-max N         draft tokens per cycle (default: the\n"
+            "                               drafter's block_size-1, capped by it; env\n"
+            "                               PF_DFLASH_NMAX / PF_MTP for the MTP path)\n"
+            "  --spec-draft-device N        device partition the draft runs on (default\n"
+            "                               0; env PF_MTP_DEV / PF_DFLASH_DEV).  dflash2\n"
+            "                               needs device 0: it reads the target's shared\n"
+            "                               LM head.\n"
+            "  --mtp [N]                     alias for --spec-type mtp --spec-draft-n-max N\n"
+            "                               (default N = 4, the measured optimum)\n"
+            "  --mtp-device N                alias for --spec-draft-device\n"
             "  --audio-mmproj <gguf>        audio tower needed by --audio\n"
             "  --kv-type T                  KV cache storage type: i4|i8|bf16|f16|f32,\n"
             "                               or K:V to size K and V independently\n"
@@ -166,8 +175,14 @@ int main(int argc, char ** argv) {
     int pc_vram_mb = -1;
     int device = -1; // -1 auto (PF_DEVICE), 0 gpu, 1 cpu
     std::string layer_map; // multi-device: "0-13:gpu,14-27:cpu"
-    int mtp_k = -1;        // MTP draft length (0/absent = off, env PF_MTP)
-    int mtp_dev = 0;       // device partition the MTP draft layer runs on
+    // speculative decoding: --spec-type {none,mtp,dflash2} (llama.cpp spelling).
+    // --mtp / --mtp-device are kept as aliases of --spec-type mtp /
+    // --spec-draft-device.
+    std::string spec_type;      // empty = unset (then PF_SPEC_TYPE, then none)
+    std::string spec_draft;     // DFlash/DFlash2 drafter GGUF
+    int spec_nmax = 0;          // draft tokens per cycle (0 = the type's default)
+    int spec_dev = 0;           // device partition the draft runs on
+    int mtp_k = -1;             // legacy --mtp length (0/absent = off, env PF_MTP)
     std::string cmd;
     bool bad_arg = false;
 
@@ -249,6 +264,19 @@ int main(int argc, char ** argv) {
             kv_dtype_set_kv(kt, vt);
         } else if (a == "--layer-map") {
             layer_map = next();
+        } else if (a == "--spec-type") {
+            const std::string v = next();
+            if (v != "none" && v != "mtp" && v != "dflash2" && v != "dflash") {
+                fprintf(stderr, "error: --spec-type expects none|mtp|dflash2\n");
+                return 1;
+            }
+            spec_type = v;
+        } else if (a == "--spec-draft-model") {
+            spec_draft = next();
+        } else if (a == "--spec-draft-n-max") {
+            spec_nmax = std::atoi(next().c_str());
+        } else if (a == "--spec-draft-device") {
+            spec_dev = std::atoi(next().c_str());
         } else if (a == "--mtp") {
             // The draft length is optional: a bare `--mtp` uses the measured
             // optimum and never swallows the next flag (`--mtp gen ...`).  k=4
@@ -269,7 +297,7 @@ int main(int argc, char ** argv) {
                 }
             }
         } else if (a == "--mtp-device") {
-            mtp_dev = std::atoi(next().c_str());
+            spec_dev = std::atoi(next().c_str());
         } else if (a == "--device") {
             const std::string v = next();
             if (v == "cpu" || v == "host") {
@@ -339,11 +367,43 @@ int main(int argc, char ** argv) {
             n_blocks = need_blocks;
         }
 
-        if (mtp_dev > 0) {
-            setenv("PF_MTP_DEV", std::to_string(mtp_dev).c_str(), 1);
+        if (spec_dev > 0) {
+            setenv("PF_MTP_DEV", std::to_string(spec_dev).c_str(), 1);
+            setenv("PF_DFLASH_DEV", std::to_string(spec_dev).c_str(), 1);
+        }
+        // --spec-type selects the drafter; a dflash2 run without a drafter GGUF
+        // is an error rather than a silent plain decode
+        std::string stype = spec_type;
+        if (stype.empty()) {
+            if (const char * e = getenv("PF_SPEC_TYPE")) {
+                stype = e;
+            }
+        }
+        if (mtp_k > 0 && stype.empty()) {
+            stype = "mtp"; // legacy --mtp
+        }
+        if (stype == "dflash") {
+            stype = "dflash2";
+        }
+        if (stype == "dflash2" && spec_draft.empty()) {
+            fprintf(stderr, "error: --spec-type dflash2 needs --spec-draft-model <drafter.gguf>\n");
+            return 1;
+        }
+        if (stype != "none" && stype.empty()) {
+            stype = "none";
+        }
+        int mtp_len = 0;             // MTP draft length
+        int draft_k = 0;             // dflash2 draft length
+        if (stype == "mtp") {
+            // --mtp [N] wins (including N = 0 = off); --spec-draft-n-max is the
+            // llama.cpp spelling; bare --spec-type mtp is the measured optimum k=4
+            mtp_len = (mtp_k >= 0) ? mtp_k : (spec_nmax > 0 ? spec_nmax : 4);
+        } else if (stype == "dflash2") {
+            draft_k = spec_nmax;
         }
         engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb, pc_dir, pc_disk_mb, pc_mem_mb,
-                 pc_ram_mb, pc_vram_mb, device, layer_map, mtp_k);
+                 pc_ram_mb, pc_vram_mb, device, layer_map, mtp_len,
+                 stype == "dflash2" ? spec_draft : std::string(), draft_k, spec_dev);
         {
             const char * isa = cpu_isa_spec();
             if (e.cpu_mode) {

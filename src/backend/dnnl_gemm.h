@@ -57,8 +57,13 @@ struct dnnl_gemm {
     // gemv_only: skip the prefill primitive ladder - the consumer is the M=1
     // u4 GEMV only (the MTP draft layer, which never prefills).
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                       bool any_type = false, bool gemv_only = false);
+                       bool any_type = false, bool gemv_only = false, float scale_mul = 1.0f);
     bool has_weight_w4(const void * key) const;
+    // the u4 store's device planes (values, per-(g,n) f16 step, per-(g,n) f16
+    // offset).  For consumers that read single rows rather than run a GEMM - the
+    // DFlash2 candidate selector gathers one row per candidate token.
+    bool w4_planes(const void * key, const uint8_t ** vals, const uint16_t ** scales, const uint16_t ** offs, int * K,
+                   int * N) const;
 
     // ---- 2-bit draft store (see common/w4.h) ------------------------------
     // 0.375 B/weight against the u4 draft copy's 0.625 and the int8

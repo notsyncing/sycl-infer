@@ -117,6 +117,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/xq.cpp
     src/backend/gpu/kernels/mtp.cpp
     src/backend/gpu/kernels/mtp_argmax.cpp
+    src/backend/gpu/kernels/dflash.cpp
     src/backend/gpu/kernels/dp4a_common.cpp
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp
@@ -127,6 +128,7 @@ add_library(sycl_infer_core STATIC
     src/model/model.cpp
     src/model/model_w8.cpp
     src/model/qwen35.cpp
+    src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
     src/mm/image.cpp
@@ -139,6 +141,7 @@ add_library(sycl_infer_core STATIC
     src/engine/engine.cpp
     src/engine/engine_graph.cpp
     src/engine/engine_mtp.cpp
+    src/engine/engine_dflash.cpp
     src/engine/engine_kvpool.cpp
     src/engine/engine_prefix_cache.cpp
     src/engine/pc_disk.cpp

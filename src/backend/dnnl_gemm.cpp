@@ -937,7 +937,7 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // per-32-group f16 step/offset planes.  Returns false for unsupported types,
 // which keep their int8 conversion.
 bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                              bool any_type, bool gemv_only) {
+                              bool any_type, bool gemv_only, float scale_mul) {
     const bool w4info = getenv("PF_W4_INFO") != nullptr;
     if (!key || !host_data || !(any_type || si::w4_supported(ggml_type))) {
         if (w4info) {
@@ -961,6 +961,17 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
             fprintf(stderr, "[w4] reject key=%p: pack failed type=%u K=%d N=%d\n", key, ggml_type, K, N);
         }
         return false;
+    }
+    // scale_mul: diagnostic multiplier on the store's per-(g,n) f16 step plane
+    // (used by the DFlash draft to test a weight-scale hypothesis; 1 = off)
+    if (scale_mul != 1.0f) {
+        for (size_t i = 0; i < w.scale.size(); i++) {
+            uint16_t h;
+            memcpy(&h, &w.scale[i], 2);
+            float v = ggml_half_to_float(h) * scale_mul;
+            h = ggml_float_to_half(v);
+            memcpy(&w.scale[i], &h, 2);
+        }
     }
     const int ng = K / kW4Group;
     impl::w4_entry e;
@@ -1048,6 +1059,33 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
 bool dnnl_gemm::has_weight_w4(const void * key) const {
     auto it = p->w4weights.find(key);
     return it != p->w4weights.end() && it->second.ok;
+}
+
+// The u4 store's three device planes.  The DFlash2 candidate selector reads
+// single per-token rows of its codebooks (one Q4_K block each), which no GEMM
+// entry point can express, so it needs the planes themselves.
+bool dnnl_gemm::w4_planes(const void * key, const uint8_t ** vals, const uint16_t ** scales, const uint16_t ** offs,
+                          int * K, int * N) const {
+    auto it = p->w4weights.find(key);
+    if (it == p->w4weights.end() || !it->second.ok) {
+        return false;
+    }
+    if (vals) {
+        *vals = it->second.vals;
+    }
+    if (scales) {
+        *scales = it->second.scales;
+    }
+    if (offs) {
+        *offs = it->second.off;
+    }
+    if (K) {
+        *K = it->second.K;
+    }
+    if (N) {
+        *N = it->second.N;
+    }
+    return true;
 }
 
 // The 2-bit draft store.  No oneDNN memory object: the only consumer is the

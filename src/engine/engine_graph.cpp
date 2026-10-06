@@ -913,6 +913,21 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const char * e = getenv("PF_ABL_NOATTN");
             return e && atoi(e) != 0;
         }();
+                // DFlash draft: this layer is one of the drafter's target_layers, so save
+        // its *input* hidden state into the interleaved feature buffer the draft
+        // injects from.  It must come after the device handoff above (d_x belongs
+        // to this layer's device) and before any kernel can overwrite d_x.
+        static const bool df_nocap = getenv("PF_DFLASH_NOCAP") != nullptr;
+        if (dflash_on_ && d_df_feat && !df_nocap) {
+            const int df_slot = df_tgt_slot(il);
+            if (df_slot >= 0) {
+                // slot stride is n_feat (the whole interleaved row), NOT n_embd:
+                // with n_tgt_layer slots the latter makes every slot alias slot 0,
+                // and the draft then reads one layer's hidden state five times.
+                df_capture_launch(dev_queue(dev), d_x, d_df_feat + (size_t)df_slot * hp.n_embd, T, hp.n_embd,
+                                  dfm_->hp.n_feat);
+            }
+        }
         const auto a_n = tnow();
         cur_be->rmsnorm(d_x, wf32(dev, L.attn_norm), d_xnorm, T, hp.n_embd, hp.rms_eps);
         g_lc.norm++;
@@ -1409,10 +1424,11 @@ void engine::build_plans() {
     if (multi_dev) {
         bind_acts(0);
     }
-    if (mtp_on) {
-        // MTP verify: the main model over n = mtp_k+1 tokens (mode 2, one chunk
-        // row) with the LM head batched over every row, so d_logits gets the
-        // per-draft-position distributions the acceptance compares.
+    if (mtp_on || dflash_on_) {
+        // Verify plan: the main model over n = k+1 tokens (mode 2, one chunk row)
+        // with the LM head batched over every row, so d_logits gets the
+        // per-draft-position distributions the acceptance compares.  Shared by
+        // the MTP and DFlash drafters.
         plan_vf_ = build_plan(kMaxT, kMaxT, /*head_batched=*/true, /*use_w8=*/true, /*with_head=*/true);
         plan_vf_.finalize();
         if (plan_vf_.segs.size() > 4096) {
@@ -1421,7 +1437,9 @@ void engine::build_plans() {
         d_segs_vf = alloc_elems<gemv_seg>(plan_vf_.segs.size());
         q.memcpy(d_segs_vf, plan_vf_.segs.data(), plan_vf_.segs.size() * sizeof(gemv_seg)).wait();
         bind_acts(0);
-        build_mtp_plan();
+        if (mtp_on) {
+            build_mtp_plan();
+        }
     }
 }
 
@@ -1554,7 +1572,11 @@ void engine::build_md_verify_graphs() {
         const char * e = getenv("PF_ATTN_XMX_MIN");
         return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
     }();
-    const int rows = mtp_k + 1;
+    // The verify runs draft_len + 1 rows.  For MTP that is mtp_k + 1, but DFlash2
+    // has its own (CLI-tunable) draft length and leaves mtp_k at 0 - using it here
+    // recorded a 1-row graph that vf_graph_usable() then rejected for every
+    // 4-row verify, so the whole cycle replayed directly with no graph at all.
+    const int rows = (dflash_on_ ? df_k_ : mtp_k) + 1;
     vf_dec_rows = rows;
     if (!d_segs_vf || nog || rows <= 0 || plan_vf_.segs.empty()) {
         return;
@@ -1702,7 +1724,7 @@ void engine::build_graphs() {
         if (multi_dev) {
             build_md_dec_graphs();
         }
-        if (mtp_on) {
+        if (mtp_on || dflash_on_) {
             build_md_verify_graphs();
         }
         return;

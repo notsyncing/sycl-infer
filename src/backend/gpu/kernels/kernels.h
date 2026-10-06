@@ -376,4 +376,54 @@ void at_conv1d_launch(sycl::queue & q, const float * x, int x_frames, int x_in, 
 void at_rope1d_launch(sycl::queue & q, float * qkv, int qkv_stride, int n_tok, int n_head, int head_dim,
                       float rope_base);
 
+// ---------------------------------------------------------------------------
+// DFlash / DFlash2 draft model (src/backend/gpu/kernels/dflash.cpp).  The draft
+// is a separate 5-layer model with head_dim 128, no attention gate, non-causal
+// attention inside its own draft block and a *ring* K/V cache (the cell for
+// absolute position p is p % ring), so none of the main-model attention kernels
+// apply.  See engine_dflash.cpp for the forward that drives them.
+
+// Strided row capture for the draft's target-feature buffer (see dflash.cpp).
+void df_capture_launch(sycl::queue & q, const float * src, float * dst, int n_rows, int n, int dst_row_stride);
+// out = a + b, elementwise over [n_rows][n].
+void df_add_launch(sycl::queue & q, const float * a, const float * b, float * out, int n_rows, int n);
+// DFlash2 grouped dynamic depthwise convolution:
+//   out[i,c] = sum_{t<=i, t<conv_k} (base[c,n_embd*t,n_embd*conv_k*side]
+//                                     + dyn[i,(t*2+side)*n_groups + c/conv_group])
+//                                  * x[i-t,c]
+// `width` is the conv's channel count (the attention side conv runs on the
+// n_head*head_dim-wide attention output, the FFN side on n_embd); `base_width` is
+// the conv_base tensor's channel count (the draft's n_embd) and `dyn_proj` the
+// projection's row stride.
+void df_conv_launch(sycl::queue & q, const float * x, const float * dyn, const float * base, float * out,
+                    const float * residual, int n_rows, int width, int base_width, int conv_k, int conv_group,
+                    int dyn_proj, int side);
+// Q/K rms-norm + RoPE and the K/V ring write.  `pos_dev` is the absolute position
+// of each row (device USM); `do_q` is false for the injection call, which has no
+// Q.  kv_bytes is 4 (f32 ring) or 2 (f16 ring).  `row_stride` is the distance in
+// floats between consecutive rows of qbuf/kbuf/vbuf: the QKV GEMMs write the
+// three segments with a shared [n_head*head_dim + 2*n_head_kv*head_dim] stride,
+// so it is *not* head_dim and indexing row r at r*head_dim silently reads a
+// neighbouring row's data (that was a 5.4x wrong-value injection).
+void df_qknorm_rope_store_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vbuf, const float * q_norm,
+                                 const float * k_norm, void * kpool, void * vpool, const int32_t * pos_dev, int n_rows,
+                                 int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, float eps,
+                                 int ring, int kv_bytes, bool do_q, int row_stride, bool do_norm);
+// Draft attention over [committed window, whole block] (non-causal in the block),
+// partials in the main model's [row][head][split][2+head_dim] layout.
+void df_attn_launch(sycl::queue & q, const float * qbuf, const void * kpool, const void * vpool, float * partials,
+                    const int32_t * pos_dev, int n_rows, int n_blk, int n_head, int n_head_kv, int head_dim,
+                    int ring, int swa, int n_splits, float scale, int kv_bytes, int row_stride);
+void df_attn_combine_launch(sycl::queue & q, const float * partials, float * out, int n_rows, int n_head,
+                            int head_dim, int n_splits, const float * sinks);
+// Per-row top-k over an [M][n] logit matrix; ties resolve to the lower index.
+void df_topk_launch(sycl::queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K);
+// DFlash2 candidate selector: fills lattice[i][0..K) with the candidate ids and
+// lattice[i][K + p*K + c] with edge(p->c) = <A[p]*gate_i, B[c]> + unary_i[c].
+// A/B are the per-token u4 codebooks (rank floats per token, one Q4_K block).
+void df_sel_launch(sycl::queue & q, const int32_t * ids, const float * vals, const float * gate,
+                   const uint8_t * prev_vals, const uint16_t * prev_scales, const uint16_t * prev_offs,
+                   const uint8_t * next_vals, const uint16_t * next_scales, const uint16_t * next_offs,
+                   float * lattice, int32_t anchor, int n_blk, int n_vocab, int rank, int K);
+
 } // namespace si

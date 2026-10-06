@@ -22,6 +22,7 @@
 #include "pc_ram.h"
 #include "sampler.h"
 #include "tokenizer.h"
+#include "dflash.h"
 
 namespace si {
 
@@ -557,6 +558,72 @@ struct engine {
     std::vector<int> generate_mtp(const std::vector<int> & prompt, const gen_params & gp,
                                   const std::function<bool(int)> & cb, std::vector<float> * first_logits);
 
+    // ---- DFlash / DFlash2 draft model (src/engine/engine_dflash.cpp) --------
+    // A block-diffusion drafter in its own GGUF: it reads the target's hidden
+    // states at `dflash.target_layers`, keeps its own K/V ring for every committed
+    // token, and emits a whole block of candidates in one forward pass.  Enabled
+    // by --spec-type dflash2 (a non-empty --spec-draft-model).
+    bool dflash_on_ = false;
+    std::string dflash_path_;
+    std::unique_ptr<dflash_model> dfm_;
+    int df_dev_ = 0;      // device the draft runs on (must be 0: the shared head)
+    int df_kmax_ = 0;     // requested draft tokens per cycle (block_size-1 max)
+    int df_k_ = 0;        // the clamped draft length actually used
+    int df_block_ = 0;    // dflash.block_size
+    int df_swa_ = 0;      // the draft's sliding window
+    int df_ring_ = 0;     // K/V ring tokens per layer
+    int df_kv_bytes_ = 2; // 2 = f16 ring, 4 = f32
+    int df_splits_ = 8;   // draft attention key splits
+    int df_cap_rows_ = 0;
+    float * d_df_h = nullptr; // [block][n_embd] residual stream
+    float * d_df_b = nullptr; // scratch [block][n_embd]
+    float * d_df_c = nullptr; // scratch [block][n_embd]
+    float * d_df_qkv = nullptr; // [block][(n_head + 2*n_head_kv)*head_dim]
+    float * d_df_gu = nullptr; // [block][2*n_ff]
+    float * d_df_dyn = nullptr; // [block][2*conv_k*n_groups]
+    float * d_df_gate = nullptr; // [block][selector rank]
+    float * d_df_partials = nullptr;
+    float * d_df_feat = nullptr; // HOST USM [kMaxB*kMaxT][n_tgt_layer*n_embd]
+    float * d_df_feat_dev = nullptr; // device staging for one injection chunk
+    void * d_df_kring = nullptr; // [n_layer][ring][n_head_kv][head_dim]
+    void * d_df_vring = nullptr;
+    int32_t * d_df_pos = nullptr; // device: absolute position per row
+    std::vector<int32_t> h_df_pos; // host mirror of d_df_pos
+    int32_t * d_df_ids = nullptr; // [block][top_k]
+    float * d_df_vals = nullptr;
+    float * d_df_lattice = nullptr; // [block][top_k + top_k*top_k]
+    std::vector<float> h_df_lattice;
+    step_info * d_df_info = nullptr;
+    const void * df_head_key_ = nullptr; // the store key for the shared LM head
+    bool df_head_w4_ = false;
+    char df_head_key_store_[1] = {0};
+    const uint8_t * df_sel_pv_ = nullptr; // selector codebooks (u4 planes)
+    const uint16_t * df_sel_ps_ = nullptr, * df_sel_po_ = nullptr;
+    const uint8_t * df_sel_nv_ = nullptr;
+    const uint16_t * df_sel_ns_ = nullptr, * df_sel_no_ = nullptr;
+    void setup_dflash(const std::string & draft_path);
+    bool df_gemm(const wt & w, const float * x, int xs, float * out, int os, const float * res, int M,
+                 const float * up = nullptr, int us = 0);
+    bool df_gemm_head(const float * x, int M);
+    size_t df_ring_stride_bytes() const;
+    void df_inject(int M, int pos0, int feat_row);
+    void df_block(int pos0, const int32_t * toks, int M);
+    std::vector<int> df_draft(int pos0, int anchor_tok, int n_max);
+    std::vector<int> generate_dflash(const std::vector<int> & prompt, const gen_params & gp,
+                                     const std::function<bool(int)> & cb, std::vector<float> * first_logits);
+    // index of this layer in the draft's target_layers list, or -1
+    int df_tgt_slot(int layer) const {
+        if (!dfm_) {
+            return -1;
+        }
+        for (int i = 0; i < dfm_->hp.n_tgt_layer; i++) {
+            if (dfm_->hp.tgt_layer[i] == layer) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     // fp32 (scale, min) side arrays for Q4_K/Q5_K, keyed by the tensor's host data pointer
     std::unordered_map<const void *, sycl::float2 *> meta32_;
     bool use_meta32 = false;
@@ -567,11 +634,14 @@ struct engine {
     }
 
     std::mutex mtx;
+    // `mtp_k` > 0 turns on the MTP (NextN) draft head; a non-empty `draft_path`
+    // turns on a DFlash/DFlash2 drafter loaded from its own GGUF (the two are
+    // the two --spec-type values and are mutually exclusive).
 
     engine(const std::string & model_path, int max_seq = 8192, int n_splits = 16, int n_blocks = 512,
            int kv_cap_mb = 0, const std::string & pc_dir = "", int pc_disk_mb = -1, int pc_mem_mb = -1,
            int pc_ram_mb = -1, int pc_vram_mb = -1, int device = -1, const std::string & layer_map = "",
-           int mtp_k = 0);
+           int mtp_k = 0, const std::string & draft_path = "", int draft_k = 0, int draft_dev = 0);
     ~engine();
 
     void reset_state();
