@@ -417,7 +417,13 @@ void df_attn_launch(sycl::queue & q, const float * qbuf, const void * kpool, con
 void df_attn_combine_launch(sycl::queue & q, const float * partials, float * out, int n_rows, int n_head,
                             int head_dim, int n_splits, const float * sinks);
 // Per-row top-k over an [M][n] logit matrix; ties resolve to the lower index.
+// Per-row top-K over a [M][n] logit matrix.  `S` slices per row: each workgroup
+// reduces one slice to K and the last pass merges the S*K partials, so the grid is
+// M*S workgroups instead of M.  With M=6 a one-workgroup-per-row grid occupies
+// 6 of 512 EUs and this kernel measured 2.1 ms for 5.96 MB (~2.8 GB/s).
 void df_topk_launch(sycl::queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K);
+void df_topk_launch(sycl::queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K,
+                    int32_t * pids, float * pvals, int S);
 // DFlash2 candidate selector: fills lattice[i][0..K) with the candidate ids and
 // lattice[i][K + p*K + c] with edge(p->c) = <A[p]*gate_i, B[c]> + unary_i[c].
 // A/B are the per-token u4 codebooks (rank floats per token, one Q4_K block).

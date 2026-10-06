@@ -86,6 +86,9 @@ static double df_seg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // time the device timeline cannot see.
 static sycl::event df_seg_dev0, df_seg_dev1;
 static sycl::event ffn_e[2];
+static sycl::event tt_e[4];
+static const bool tt_dbg = getenv("PF_DFLASH_TOPTIME") != nullptr;
+static auto tt_now = [] { return std::chrono::high_resolution_clock::now(); };
 static inline double df_ts_ms(const sycl::event & e, bool start) {
     const uint64_t t = start ? e.get_profiling_info<sycl::info::event_profiling::command_start>()
                              : e.get_profiling_info<sycl::info::event_profiling::command_end>();
@@ -680,6 +683,23 @@ void engine::setup_dflash(const std::string & draft_path) {
     // the head's per-position top-k ids and logits, which the selector walks
     d_df_ids = alloc_elems<int32_t>((size_t)M * hp.sel_top_k);
     d_df_vals = alloc_elems<float>((size_t)M * hp.sel_top_k);
+    // topk slice partials: S slices per row.  Sized from the device's compute-unit
+    // count so the slice pass fills the machine (M alone is 6 workgroups).
+    df_slices_ = (int)si::dev::active().hw.compute_units / std::max(1, M);
+    df_slices_ = std::max(1, std::min(df_slices_, 256));
+    if (const char * e = getenv("PF_DFLASH_SLICES")) {
+        df_slices_ = atoi(e);
+    } else {
+        // measured optimum, and NOT the occupancy-maximising value: S=1/8/32/64/128/256
+        // measures topk 2.09/1.39/1.52/1.69/1.70/1.67 ms.  Past S=8 the merge pass and
+        // the S*K candidates it reduces cost more than the extra parallelism buys, so
+        // the kernel is latency-bound on its per-lane SLM insertion chain, not on
+        // bandwidth.  1.39 ms for 5.96 MB is still ~4 GB/s.
+        df_slices_ = 8;
+    }
+    df_pcap_ = M * df_slices_ * hp.sel_top_k;
+    d_df_pids = alloc_elems<int32_t>((size_t)df_pcap_);
+    d_df_pvals = alloc_elems<float>((size_t)df_pcap_);
     d_df_lattice = alloc_elems<float>((size_t)M * (hp.sel_top_k + hp.sel_top_k * hp.sel_top_k));
     // The selector's two codebooks are read one row at a time by df_sel_launch, so
     // it wants their raw native u4 planes (a 248320-wide tensor gets no oneDNN
@@ -1560,10 +1580,15 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         }
     }
     const int K = hp.sel_top_k;
-    df_topk_launch(dq, d_logits, m.hp.n_vocab, d_df_ids, d_df_vals, M, K);
+    if (tt_dbg) { tt_e[0] = dq.ext_oneapi_submit_barrier(); }
+    const auto tt0 = tt_now();
+    df_topk_launch(dq, d_logits, m.hp.n_vocab, d_df_ids, d_df_vals, M, K, d_df_pids, d_df_pvals, df_slices_);
+    const auto tt1 = tt_now();
     if (!df_gemm(dfm_->sel_hidden, d_df_b, hp.n_embd, d_df_gate, hp.sel_rank, nullptr, M)) {
         throw std::runtime_error("dflash: selector_hidden GEMM failed");
     }
+    const auto tt2 = tt_now();
+    if (tt_dbg) { tt_e[1] = dq.ext_oneapi_submit_barrier(); }
     if (df_dbg()) {
         // the lattice score is unary + <A[p]*gate(h_i), B[c]>; a collapsed gate
         // leaves the scores at the unary alone, which is what a small lattice means
@@ -1586,6 +1611,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     }
     df_sel_launch(dq, d_df_ids, d_df_vals, d_df_gate, df_sel_pv_, df_sel_ps_, df_sel_po_, df_sel_nv_, df_sel_ns_,
                   df_sel_no_, d_df_lattice, toks[0], M, m.hp.n_vocab, hp.sel_rank, K);
+    if (tt_dbg) { tt_e[2] = dq.ext_oneapi_submit_barrier(); }
     const auto t_bs = now_t();
     if (df_op_on) {
         const double sum = df_op.norm + df_op.cproj + df_op.conv0 + df_op.qkv + df_op.rope + df_op.attn + df_op.wo
@@ -1685,7 +1711,11 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
     for (int i = 1; i < M; i++) {
         toks[(size_t)i] = hp.mask_id;
     }
+    static const bool dtt = getenv("PF_DFLASH_DTTAIL") != nullptr;
+    auto dtt_now = [] { return std::chrono::high_resolution_clock::now(); };
+    const auto dtt0 = dtt_now();
     df_block(pos0, toks.data(), M);
+    const auto dtt1 = dtt_now();
     std::vector<int> cand((size_t)M);
     cand[0] = anchor_tok;
     if (!hp.is_dflash2) {
@@ -1700,7 +1730,20 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
     }
     const int K = hp.sel_top_k;
     const int row = K + K * K;
+    const auto tt_d0 = tt_now();
+    if (tt_dbg) { tt_e[3] = dq.ext_oneapi_submit_barrier(); }
     dq.memcpy(h_df_lattice.data(), d_df_lattice, (size_t)M * row * 4).wait();
+    if (tt_dbg) {
+        dq.wait();
+        auto de = [&](const sycl::event & lo, const sycl::event & hi) {
+            return (df_ts_ms(hi, false) - df_ts_ms(lo, true));
+        };
+        fprintf(stderr,
+                "[dflash-tt] DEV topk=%.2f selhidden=%.2f sel=%.2f (total %.2f) | host_block=%.2f "
+                "host_tail=%.2f ms\n",
+                de(tt_e[0], tt_e[1]), de(tt_e[1], tt_e[2]), de(tt_e[2], tt_e[3]), de(tt_e[0], tt_e[3]),
+                ms_t(tt_d0, tt_now()) - (de(tt_e[3], tt_e[3])), 0.0);
+    }
     if (df_dbg()) {
         // localize a wrong draft: the head's top-k per position and the
         // selector's first lattice row
@@ -1772,12 +1815,18 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
             fprintf(stderr, "\n");
         }
     }
+    const auto dtt2 = dtt_now();
     int pred = 0;
     for (int i = 1; i < M; i++) {
         const float * r = h_df_lattice.data() + (size_t)i * row;
         const float * sc = r + K + (size_t)pred * K;
         pred = argmax_f(sc, K);
         cand[(size_t)i] = (int)r[pred];
+    }
+    if (dtt) {
+        auto d = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        fprintf(stderr, "[dflash-dt] block=%.2f tail_copy=%.2f walk=%.3f ms\n", d(dtt0, dtt1), d(dtt1, dtt2),
+                d(dtt2, dtt_now()));
     }
     if (df_dbg()) {
         fprintf(stderr, "[dflash] block pos=%d anchor=%d cand:", pos0, anchor_tok);
@@ -1870,6 +1919,11 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         sync_all();
         const auto tc2 = now_t();
         t_verify += ms_t(tc1, tc2);
+        if (getenv("PF_DFLASH_VFCHK")) {
+            fprintf(stderr, "[dflash-vf] pos=%d rows=%d graph_ok=%d vf_dec_ok=%d vf_rows=%d graphs=%d\n", pos,
+                    n_ver + 1, (int)vf_dec_ok, vf_dec_rows,
+                    (int)vf_dec_.size());
+        }
         // ---- accept (greedy: the device argmax is exactly the greedy sample) ----
         static int32_t * d_argmax = nullptr;
         if (!d_argmax) {

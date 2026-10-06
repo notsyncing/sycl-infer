@@ -414,6 +414,107 @@ void df_attn_combine_launch(queue & q, const float * partials, float * out, int 
 // pairwise merges of two sorted-K lists halve the candidate count per level
 // (8 levels for 256 lanes).  Exact, and unlike K rounds of argmax-and-exclude it
 // reads the row once.  Ties resolve to the lower token id.
+// One workgroup reduces one contiguous slice of one row to its top-K, written to
+// pids[(r*S + sl)*K .. ] in descending order.  Splitting the row this way puts
+// M*S workgroups on the device instead of M: with M=6 a one-workgroup-per-row
+// grid occupies 6 of 512 EUs and the whole kernel measured 2.1 ms for 5.96 MB
+// (~2.8 GB/s), i.e. ~100x off the bandwidth floor and 8% of a 28 ms cycle.
+static void df_topk_slice(queue & q, const float * logits, int n, int32_t * pids, float * pvals, int M, int K,
+                          int S) {
+    if (M <= 0 || n <= 0 || K <= 0 || K > 32 || S <= 0) {
+        return;
+    }
+    const int K_ = K;
+    constexpr int WG = 256;
+    const float kNinf = -std::numeric_limits<float>::infinity();
+    q.submit([&](handler & h) {
+        local_accessor<float, 1> lv((size_t)WG * K_ + 2, h);
+        local_accessor<int32_t, 1> li((size_t)WG * K_ + 2, h);
+        local_accessor<float, 1> red(WG, h);
+        local_accessor<int32_t, 1> rid(WG, h);
+        h.parallel_for(nd_range<1>((size_t)M * S * WG, WG), [=](nd_item<1> it) {
+            const int g = (int)it.get_group(0);
+            const int r = g / S;
+            const int sl = g - r * S;
+            const int tid = (int)it.get_local_id(0);
+            const float * row = logits + (size_t)r * n;
+            const int lo = (int)(((long long)n * sl) / S);
+            const int hi = (int)(((long long)n * (sl + 1)) / S);
+            int cnt = 0;
+            for (int i = lo + tid; i < hi; i += WG) {
+                const float v = row[i];
+                int p = (cnt < K_) ? cnt : K_ - 1;
+                if (cnt == K_ && v <= lv[(K_ - 1) * WG + tid]) {
+                    continue;
+                }
+                while (p > 0) {
+                    const float pv = lv[(p - 1) * WG + tid];
+                    const int32_t pi = li[(p - 1) * WG + tid];
+                    if (pv > v || (pv == v && pi < i)) {
+                        break;
+                    }
+                    lv[p * WG + tid] = pv;
+                    li[p * WG + tid] = pi;
+                    p--;
+                }
+                lv[p * WG + tid] = v;
+                li[p * WG + tid] = i;
+                if (cnt < K_) {
+                    cnt++;
+                }
+            }
+            it.barrier(access::fence_space::local_space);
+            constexpr int32_t kNone = std::numeric_limits<int32_t>::max();
+            const int rbase = r * S;
+            for (int rk = 0; rk < K_; rk++) {
+                float v = kNinf;
+                for (int k = 0; k < cnt; k++) {
+                    v = sycl::fmax(v, lv[k * WG + tid]);
+                }
+                red[tid] = v;
+                it.barrier(access::fence_space::local_space);
+                for (int st = WG / 2; st > 0; st >>= 1) {
+                    if (tid < st) {
+                        red[tid] = sycl::fmax(red[tid], red[tid + st]);
+                    }
+                    it.barrier(access::fence_space::local_space);
+                }
+                const float gv = red[0];
+                int32_t gi = kNone;
+                for (int k = 0; k < cnt; k++) {
+                    if (lv[k * WG + tid] == gv && li[k * WG + tid] < gi) {
+                        gi = li[k * WG + tid];
+                    }
+                }
+                rid[tid] = gi;
+                it.barrier(access::fence_space::local_space);
+                for (int st = WG / 2; st > 0; st >>= 1) {
+                    if (tid < st) {
+                        rid[tid] = std::min(rid[tid], rid[tid + st]);
+                    }
+                    it.barrier(access::fence_space::local_space);
+                }
+                gi = rid[0];
+                if (tid == 0) {
+                    pids[(size_t)(rbase + sl) * K_ + rk] = gi;
+                    pvals[(size_t)(rbase + sl) * K_ + rk] = gv;
+                    lv[WG * K_] = gv;
+                    li[WG * K_] = gi;
+                }
+                it.barrier(access::fence_space::local_space);
+                for (int k = 0; k < cnt; k++) {
+                    if (li[k * WG + tid] == li[WG * K_]) {
+                        lv[k * WG + tid] = kNinf;
+                        li[k * WG + tid] = kNone;
+                    }
+                }
+                it.barrier(access::fence_space::local_space);
+            }
+        });
+    });
+    (void)M;
+}
+
 void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K) {
     if (M <= 0 || n <= 0 || K <= 0 || K > 32) {
         return;
@@ -436,21 +537,21 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
             for (int i = tid; i < n; i += WG) {
                 const float v = row[i];
                 int p = (cnt < K_) ? cnt : K_ - 1;
-                if (cnt == K_ && v <= lv[tid * K_ + K_ - 1]) {
+                if (cnt == K_ && v <= lv[(K_ - 1) * WG + tid]) {
                     continue;
                 }
                 while (p > 0) {
-                    const float pv = lv[tid * K_ + p - 1];
-                    const int32_t pi = li[tid * K_ + p - 1];
+                    const float pv = lv[(p - 1) * WG + tid];
+                    const int32_t pi = li[(p - 1) * WG + tid];
                     if (pv > v || (pv == v && pi < i)) {
                         break;
                     }
-                    lv[tid * K_ + p] = pv;
-                    li[tid * K_ + p] = pi;
+                    lv[p * WG + tid] = pv;
+                    li[p * WG + tid] = pi;
                     p--;
                 }
-                lv[tid * K_ + p] = v;
-                li[tid * K_ + p] = i;
+                lv[p * WG + tid] = v;
+                li[p * WG + tid] = i;
                 if (cnt < K_) {
                     cnt++;
                 }
@@ -464,7 +565,7 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
             for (int rk = 0; rk < K_; rk++) {
                 float v = kNinf;
                 for (int k = 0; k < cnt; k++) {
-                    v = sycl::fmax(v, lv[tid * K_ + k]);
+                    v = sycl::fmax(v, lv[k * WG + tid]);
                 }
                 red[tid] = v;
                 it.barrier(access::fence_space::local_space);
@@ -480,8 +581,8 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
                 // the winner is the lowest-index entry equal to the winning value
                 int32_t ix = kNone;
                 for (int k = 0; k < cnt; k++) {
-                    if (lv[tid * K_ + k] == v && li[tid * K_ + k] < ix) {
-                        ix = li[tid * K_ + k];
+                    if (lv[k * WG + tid] == v && li[k * WG + tid] < ix) {
+                        ix = li[k * WG + tid];
                     }
                 }
                 rid[tid] = ix;
@@ -491,8 +592,8 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
                 const float gv = red[0];
                 int32_t gi = kNone;
                 for (int k = 0; k < cnt; k++) {
-                    if (lv[tid * K_ + k] == gv && li[tid * K_ + k] < gi) {
-                        gi = li[tid * K_ + k];
+                    if (lv[k * WG + tid] == gv && li[k * WG + tid] < gi) {
+                        gi = li[k * WG + tid];
                     }
                 }
                 rid[tid] = gi;
@@ -513,9 +614,9 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
                 it.barrier(access::fence_space::local_space);
                 // remove the winner: every index appears in exactly one lane
                 for (int k = 0; k < cnt; k++) {
-                    if (li[tid * K_ + k] == li[WG * K_]) {
-                        lv[tid * K_ + k] = kNinf;
-                        li[tid * K_ + k] = kNone;
+                    if (li[k * WG + tid] == li[WG * K_]) {
+                        lv[k * WG + tid] = kNinf;
+                        li[k * WG + tid] = kNone;
                     }
                 }
                 it.barrier(access::fence_space::local_space);
@@ -536,6 +637,134 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
             }
         });
     });
+}
+
+// Merge pass: one workgroup per row reduces the S*K slice partials to the row's
+// top-K.  Same "K rounds of take the global max and remove it" structure as the
+// slice pass, so the tie-break (lowest token id wins) is identical at both stages
+// and the merged order matches what a single-pass reduction would produce.
+static void df_topk_merge(queue & q, int32_t * pids, float * pvals, int32_t * ids, float * vals, int M, int K, int S) {
+    constexpr int WG = 256;
+    const int K_ = K;
+    const float kNinf = -std::numeric_limits<float>::infinity();
+    q.submit([&](handler & h) {
+        local_accessor<float, 1> lv((size_t)WG * K_ + 2, h);
+        local_accessor<int32_t, 1> li((size_t)WG * K_ + 2, h);
+        local_accessor<float, 1> red(WG, h);
+        local_accessor<int32_t, 1> rid(WG, h);
+        h.parallel_for(nd_range<1>((size_t)M * WG, WG), [=](nd_item<1> it) {
+            const int r = (int)it.get_group(0);
+            const int tid = (int)it.get_local_id(0);
+            const int ncand = S * K_;
+            int cnt = 0;
+            // lane t owns candidates t, t+WG, ... and keeps the descending top-K
+            for (int c = tid; c < ncand; c += WG) {
+                const float v = pvals[(size_t)r * ncand + c];
+                const int32_t id = pids[(size_t)r * ncand + c];
+                if (!(v > kNinf)) {
+                    continue;  // slice ran short of K candidates
+                }
+                int p = (cnt < K_) ? cnt : K_ - 1;
+                if (cnt == K_ && v <= lv[(K_ - 1) * WG + tid]) {
+                    continue;
+                }
+                while (p > 0) {
+                    const float pv = lv[(p - 1) * WG + tid];
+                    const int32_t pi = li[(p - 1) * WG + tid];
+                    if (pv > v || (pv == v && pi < id)) {
+                        break;
+                    }
+                    lv[p * WG + tid] = pv;
+                    li[p * WG + tid] = pi;
+                    p--;
+                }
+                lv[p * WG + tid] = v;
+                li[p * WG + tid] = id;
+                if (cnt < K_) {
+                    cnt++;
+                }
+            }
+            it.barrier(access::fence_space::local_space);
+            constexpr int32_t kNone = std::numeric_limits<int32_t>::max();
+            for (int rk = 0; rk < K_; rk++) {
+                float v = kNinf;
+                for (int k = 0; k < cnt; k++) {
+                    v = sycl::fmax(v, lv[k * WG + tid]);
+                }
+                red[tid] = v;
+                it.barrier(access::fence_space::local_space);
+                for (int st = WG / 2; st > 0; st >>= 1) {
+                    if (tid < st) {
+                        red[tid] = sycl::fmax(red[tid], red[tid + st]);
+                    }
+                    it.barrier(access::fence_space::local_space);
+                }
+                const float gv = red[0];
+                int32_t gi = kNone;
+                for (int k = 0; k < cnt; k++) {
+                    if (lv[k * WG + tid] == gv && li[k * WG + tid] < gi) {
+                        gi = li[k * WG + tid];
+                    }
+                }
+                rid[tid] = gi;
+                it.barrier(access::fence_space::local_space);
+                for (int st = WG / 2; st > 0; st >>= 1) {
+                    if (tid < st) {
+                        rid[tid] = std::min(rid[tid], rid[tid + st]);
+                    }
+                    it.barrier(access::fence_space::local_space);
+                }
+                gi = rid[0];
+                if (tid == 0) {
+                    ids[(size_t)r * K_ + rk] = gi;
+                    vals[(size_t)r * K_ + rk] = gv;
+                    lv[WG * K_] = gv;
+                    li[WG * K_] = gi;
+                }
+                it.barrier(access::fence_space::local_space);
+                for (int k = 0; k < cnt; k++) {
+                    if (li[k * WG + tid] == li[WG * K_]) {
+                        lv[k * WG + tid] = kNinf;
+                        li[k * WG + tid] = kNone;
+                    }
+                }
+                it.barrier(access::fence_space::local_space);
+            }
+            // ggml's top_k swaps the first two entries after the sort.  DFlash2's
+            // selector is NOT order-insensitive - the lattice walk treats
+            // candidate k as the successor of candidate k - so reproduce it.
+            if (K_ > 1 && tid == 0) {
+                const int32_t ti = ids[(size_t)r * K_ + 0];
+                const float tv = vals[(size_t)r * K_ + 0];
+                ids[(size_t)r * K_ + 0] = ids[(size_t)r * K_ + 1];
+                vals[(size_t)r * K_ + 0] = vals[(size_t)r * K_ + 1];
+                ids[(size_t)r * K_ + 1] = ti;
+                vals[(size_t)r * K_ + 1] = tv;
+            }
+        });
+    });
+}
+
+// Sliced top-K: `S` workgroups per row, then one merge pass.  Callers that cannot
+// provide partial scratch get the original single-pass behaviour.
+void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float * vals, int M, int K, int32_t * pids,
+                    float * pvals, int S) {
+    if (M <= 0 || n <= 0 || K <= 0 || K > 32) {
+        return;
+    }
+    if (!pids || !pvals || S <= 1) {
+        df_topk_launch(q, logits, n, ids, vals, M, K);
+        return;
+    }
+    // Keep at least a couple of elements per lane in every slice, so a lane's
+    // top-K list is not trivially short and the merge has real candidates.
+    constexpr int kTopkWG = 256;
+    int s_use = S;
+    while (s_use > 1 && (long long)n / s_use < (long long)2 * kTopkWG) {
+        s_use >>= 1;
+    }
+    df_topk_slice(q, logits, n, pids, pvals, M, K, s_use);
+    df_topk_merge(q, pids, pvals, ids, vals, M, K, s_use);
 }
 
 // ---------------------------------------------------------------------------

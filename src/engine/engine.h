@@ -591,6 +591,10 @@ struct engine {
     std::vector<int32_t> h_df_pos; // host mirror of d_df_pos
     int32_t * d_df_ids = nullptr; // [block][top_k]
     float * d_df_vals = nullptr;
+    int32_t * d_df_pids = nullptr; // [block][topk slices][top_k] partials
+    float * d_df_pvals = nullptr;
+    int df_pcap_ = 0;
+    int df_slices_ = 1;
     float * d_df_lattice = nullptr; // [block][top_k + top_k*top_k]
     std::vector<float> h_df_lattice;
     step_info * d_df_info = nullptr;
