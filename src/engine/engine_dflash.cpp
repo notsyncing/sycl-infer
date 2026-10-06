@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "common/env.h"
 
 namespace si {
 
@@ -87,7 +88,7 @@ static double df_seg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 static sycl::event df_seg_dev0, df_seg_dev1;
 static sycl::event ffn_e[2];
 static sycl::event tt_e[4];
-static const bool tt_dbg = getenv("PF_DFLASH_TOPTIME") != nullptr;
+static const bool tt_dbg = si::env::flag("PF_DFLASH_TOPTIME");
 static auto tt_now = [] { return std::chrono::high_resolution_clock::now(); };
 static inline double df_ts_ms(const sycl::event & e, bool start) {
     const uint64_t t = start ? e.get_profiling_info<sycl::info::event_profiling::command_start>()
@@ -107,7 +108,7 @@ static df_op_t df_op;
 static bool df_op_on = false;
 
 bool df_dbg() {
-    static const bool b = getenv("PF_DFLASH_DEBUG") != nullptr;
+    static const bool b = si::env::flag("PF_DFLASH_DEBUG");
     return b;
 }
 
@@ -190,15 +191,19 @@ void df_conv_check(sycl::queue & q, const float * in, const float * dyn, const f
 }
 
 void df_stage(sycl::queue & q, const char * tag, const float * p, size_t n) {
-    static const bool on = getenv("PF_DFLASH_STAGE") != nullptr;
-        std::vector<float> h(n);
+    static const bool on = si::env::flag("PF_DFLASH_STAGE");
+    if (!on) {
+        return;
+    }
+    std::vector<float> h(n);
     q.memcpy(h.data(), p, n * 4).wait();
-        double s = 0.0;
+    double s = 0.0;
     int bad = 0;
     double amax = 0;
     for (size_t i = 0; i < n; i++) {
-                s += (double)h[i] * h[i];
+        s += (double)h[i] * h[i];
         amax = std::max(amax, (double)std::fabs(h[i]));
+        bad += !std::isfinite(h[i]);
     }
     fprintf(stderr, "[dfstage] %-14s n=%zu rms=%.5f max=%.4g nonfinite=%d first=%.6g\n", tag, n, std::sqrt(s / (double)n),
             amax, bad, h[0]);
@@ -206,7 +211,7 @@ void df_stage(sycl::queue & q, const char * tag, const float * p, size_t n) {
 
 // PF_DFLASH_RAWQK=1 leaves the draft's Q/K projection un-normed, so a host check
 // can separate a wrong GEMM from a wrong norm/rope (both are Q4_K x f32)
-static const bool df_dn_norm = getenv("PF_DFLASH_RAWQK") == nullptr;
+static const bool df_dn_norm = !si::env::flag("PF_DFLASH_RAWQK");
 
 // f16 ring reads must REINTERPRET the bit pattern.  sycl::half(uint16_t) is a
 // numeric conversion, so every check that used it was reading the *integer* as a
@@ -284,7 +289,7 @@ void df_attn_check(sycl::queue & q, const float * qbuf, int row_stride, int M, c
 void df_rowrms(sycl::queue & q, const float * p, int M, int width, const char * tag) {
     std::vector<float> v((size_t)M * width);
     q.memcpy(v.data(), p, v.size() * 4).wait();
-    if (const char * bp = getenv("PF_DFLASH_BIN")) {
+    if (const char * bp = si::env::str("PF_DFLASH_BIN")) {
         // one file per stage: the four taps are all dumped in a single pass and the
         // reference writes a single tensor, so the tag has to be part of the name.
         std::string bp2 = std::string(bp) + "." + tag + ".bin";
@@ -324,10 +329,10 @@ int sig_block_now() {
 void df_sig(sycl::queue & q, const float * p, int M, int width, const char * tag) {
     std::vector<float> v((size_t)M * width);
     q.memcpy(v.data(), p, v.size() * 4).wait();
-    static const bool sig_all = getenv("PF_DFLASH_SIGALL") != nullptr;
+    static const bool sig_all = si::env::flag("PF_DFLASH_SIGALL");
     // The reference snapshots only the FIRST draft block, so the dump must too or
     // the comparison lines up block n with block 0.
-    static const bool bin_first_only = getenv("PF_DFLASH_BIN_ALL") == nullptr;
+    static const bool bin_first_only = !si::env::flag("PF_DFLASH_BIN_ALL");
     static int bin_block = -1;
     // Count blocks, not calls: all five stages are tapped in one pass, so the stage
     // that comes FIRST in the layer is what advances the block index.
@@ -352,7 +357,7 @@ void df_sig(sycl::queue & q, const float * p, int M, int width, const char * tag
     // replaces the one being compared.  Reading a stale file is worse than having no
     // file - it is how "layer 4's input is zero" came to be believed.
     const bool bin_here = !bin_first_only || bin_block == 0;
-    if (const char * bp = getenv("PF_DFLASH_BIN")) {
+    if (const char * bp = si::env::str("PF_DFLASH_BIN")) {
         // one file per stage: the four taps are all dumped in a single pass, so the
         // stage name has to be part of the filename.
         const std::string bp2 = std::string(bp) + "." + tag + (sig_all ? ".L" + std::to_string(df_sig_layer) : "")
@@ -454,13 +459,15 @@ static inline float silu_test(float x) {
 
 #define DFDBG(...)                                                                                                      \
     do {                                                                                                                 \
-                                                                                                                        \
+        if (si::env::flag("PF_DFLASH_DEBUG")) {                                                                                 \
+            fprintf(stderr, __VA_ARGS__);                                                                                \
+        }                                                                                                                \
     } while (0)
 
 // ---------------------------------------------------------------------------
 // Load the drafter, register its weights, size its buffers.
 void engine::setup_dflash(const std::string & draft_path) {
-        dflash_path_ = draft_path;
+    dflash_path_ = draft_path;
     auto dm = std::make_unique<dflash_model>();
     try {
         dm->load(draft_path, m.hp.n_embd, m.hp.n_vocab);
@@ -471,9 +478,14 @@ void engine::setup_dflash(const std::string & draft_path) {
     // every dflash.target_layers entry must be a real target layer *input*
     for (int i = 0; i < dm->hp.n_tgt_layer; i++) {
         const int il = dm->hp.tgt_layer[i];
-            }
-            dnnl_gemm * D = dnnl_for(df_dev_);
-            sycl::queue & dq = dev_queue(df_dev_);
+        if (il < 0 || il >= m.hp.n_layer) {
+            fprintf(stderr, "[dflash] draft model rejected: target_layers[%d] = %d is out of range [0, %d)\n", i, il,
+                    m.hp.n_layer);
+            return;
+        }
+    }
+    dnnl_gemm * D = dnnl_for(df_dev_);
+    sycl::queue & dq = dev_queue(df_dev_);
     dfm_ = std::move(dm);
     const dflash_hp & hp = dfm_->hp;
     dfm_->upload_f32(dq);
@@ -482,7 +494,11 @@ void engine::setup_dflash(const std::string & draft_path) {
     {
         int missing = 0;
         auto chk = [&](const void * p, const char * nm) {
-                    };
+            if (p == nullptr || dfm_->dev.find(p) == dfm_->dev.end()) {
+                missing++;
+                fprintf(stderr, "[dflash] missing device copy: %s\n", nm);
+            }
+        };
         chk(dfm_->enc_norm, "enc.output_norm");
     {
         // After an RMSNorm the output's rms is forced to be rms(weight), so this is
@@ -498,7 +514,7 @@ void engine::setup_dflash(const std::string & draft_path) {
         fprintf(stderr, "[dflash] norm rms: enc=%.6f out=%.6f (n_embd=%d)\n", frms2(dfm_->enc_norm, hp.n_embd),
                 frms2(dfm_->output_norm, hp.n_embd), hp.n_embd);
     }
-    if (getenv("PF_DFLASH_NDEVCHK")) {
+    if (si::env::flag("PF_DFLASH_NDEVCHK")) {
         // Every host check so far computed its reference from the DEVICE's weight, so
         // a wrong device-side norm weight would be invisible to all of them.  Compare
         // the uploaded copies against the GGUF tensors directly.
@@ -539,21 +555,23 @@ void engine::setup_dflash(const std::string & draft_path) {
             chk(L.attn_conv_base, "attn_conv_base");
             chk(L.ffn_conv_base, "ffn_conv_base");
         }
-                // the static conv kernels must be a sane size (they are what makes the
-        // conv a real operation rather than a 50x amplifier)
-            }
+        if (missing) {
+            fprintf(stderr, "[dflash] draft model rejected: %d tensors lack a device copy\n", missing);
+            return;
+        }
+    }
 
     // ---- weights: the same native/int8 stores the main model uses, keyed by
     // the draft GGUF's host pointers (which are unique per tensor) ----
     int n_u4 = 0, n_int8 = 0, n_fail = 0;
     static const bool w4_on = [] {
-        const char * e = getenv("PF_W4");
+        const char * e = si::env::str("PF_W4");
         return e ? atoi(e) != 0 : si::dev::active().wt.w4 != 0;
     }();
     // PF_DFLASH_WSCALE: multiply every drafter weight's step plane.  Diagnostic
     // for the "is the drafter's weight scale what a trained model expects"
     // question; 1 = the GGUF as shipped.
-    const float wscale = getenv("PF_DFLASH_WSCALE") ? (float)atof(getenv("PF_DFLASH_WSCALE")) : 1.0f;
+    const float wscale = si::env::str("PF_DFLASH_WSCALE") ? (float)atof(si::env::str("PF_DFLASH_WSCALE")) : 1.0f;
 
     auto add = [&](const wt & t, const char * nm, bool gather_only = false) {
                 bool ok = false;
@@ -564,7 +582,7 @@ void engine::setup_dflash(const std::string & draft_path) {
         // only valid u4-vs-int8 A/B for the draft; PF_W4=0 disables the selector and
         // with it the whole draft.
         static const bool layer_w4 = [] {
-            const char * e = getenv("PF_DFLASH_LAYER_W4");
+            const char * e = si::env::str("PF_DFLASH_LAYER_W4");
             return e ? atoi(e) != 0 : true;
         }();
         if (w4_on && (layer_w4 || gather_only)) {
@@ -618,7 +636,7 @@ void engine::setup_dflash(const std::string & draft_path) {
     // top-1 of each slot, and a per-32 4-bit grid of the Q6_K head can reorder
     // candidates that the hidden state got right, which costs acceptance without
     // any other symptom.
-    static const bool head_w4 = getenv("PF_DFLASH_HEAD_W4") != nullptr;
+    static const bool head_w4 = si::env::flag("PF_DFLASH_HEAD_W4");
     if (mtp_head_w4_ && head_w4) {
         df_head_key_ = mtp_head_w4_key_;
     } else if (w4_on && head_w4
@@ -661,7 +679,7 @@ void engine::setup_dflash(const std::string & draft_path) {
     df_swa_ = swa;
     df_ring_ = ((swa + df_block_ + 31) / 32) * 32;
     static const int kvb = [] {
-        const char * e = getenv("PF_DFLASH_KV");
+        const char * e = si::env::str("PF_DFLASH_KV");
         return e ? atoi(e) : 2;
     }();
     df_kv_bytes_ = kvb == 4 ? 4 : 2;
@@ -687,7 +705,7 @@ void engine::setup_dflash(const std::string & draft_path) {
     // count so the slice pass fills the machine (M alone is 6 workgroups).
     df_slices_ = (int)si::dev::active().hw.compute_units / std::max(1, M);
     df_slices_ = std::max(1, std::min(df_slices_, 256));
-    if (const char * e = getenv("PF_DFLASH_SLICES")) {
+    if (const char * e = si::env::str("PF_DFLASH_SLICES")) {
         df_slices_ = atoi(e);
     } else {
         // measured optimum, and NOT the occupancy-maximising value: S=1/8/32/64/128/256
@@ -779,18 +797,18 @@ bool engine::df_gemm(const wt & w, const float * x, int xs, float * out, int os,
     // removing the convs took the five layers 20.8 -> 17.8 ms, so the convs are 3.0
     // and everything else is 17.8 - which for 1040 MB of u4 weights is 58 GB/s
     // against a 4.67 ms / 223 GB/s floor.
-    if (getenv("PF_DFLASH_NOGEMM")) {
+    if (si::env::flag("PF_DFLASH_NOGEMM")) {
         return true;
     }
     [[maybe_unused]] static const bool dsplit = [] {
-        const char * e = getenv("PF_DFLASH_SPLITQ");
+        const char * e = si::env::str("PF_DFLASH_SPLITQ");
         return e ? atoi(e) != 0 : true;
     }();
     // PF_DFLASH_ROWED=1 runs the projection one row at a time.  M == 1 takes the
     // dedicated grouped-scale GEMV, M >= 2 the batched matmul, so this is both the
     // A/B that tells the two apart and the fallback if only the batched one is bad.
     static const bool rowed = [] {
-        const char * e = getenv("PF_DFLASH_ROWED");
+        const char * e = si::env::str("PF_DFLASH_ROWED");
         return e && atoi(e) != 0;
     }();
     if (D == nullptr) {
@@ -842,7 +860,7 @@ void engine::df_inject(int M, int pos0, int feat_row) {
         }
         df_stage(dq, "fc out", d_df_b, (size_t)n * hp.n_embd);
         rmsnorm_launch(dq, d_df_b, dfm_->dev_f32(dfm_->enc_norm), d_df_c, n, hp.n_embd, hp.rms_eps);
-        if (df_dbg() && getenv("PF_DFLASH_NINV")) {
+        if (df_dbg() && si::env::flag("PF_DFLASH_NINV")) {
             dq.wait();
             std::vector<float> oc((size_t)n * hp.n_embd), xc((size_t)n * hp.n_embd);
             std::vector<float> wc2((size_t)hp.n_embd);
@@ -863,7 +881,7 @@ void engine::df_inject(int M, int pos0, int feat_row) {
             }
         }
         df_stage(dq, "injected inp_g", d_df_c, (size_t)n * hp.n_embd);
-        if (getenv("PF_DFLASH_INJP")) {
+        if (si::env::flag("PF_DFLASH_INJP")) {
             // same shape as llama.cpp's DFLASH_REF_HIDDEN dump: row rms/max and the
             // top-8 channels by |value|, so the two can be diffed directly
             for (int r2 = 0; r2 < std::min(n, 2); r2++) {
@@ -917,7 +935,7 @@ void engine::df_inject(int M, int pos0, int feat_row) {
                                         /*do_q=*/false, qkv_stride, df_dn_norm);
         }
     }
-    if (getenv("PF_DFLASH_SLOTRMS")) {
+    if (si::env::flag("PF_DFLASH_SLOTRMS")) {
         // per-slot rms of the captured features: if the capture still aliases or
         // misses a slot the draft sees one layer's hidden state five times
         std::vector<float> all((size_t)std::max(M, 1) * hp.n_feat);
@@ -960,7 +978,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     // average over the keys and shrinks the attention output several-fold; this knob
     // is how that hypothesis gets tested rather than argued.
     static const float ascale_mul = [] {
-        const char * e = getenv("PF_DFLASH_ASCALE");
+        const char * e = si::env::str("PF_DFLASH_ASCALE");
         return e ? (float)atof(e) : 1.0f;
     }();
     const float attn_scale = ascale_mul / std::sqrt((float)hp.head_dim);
@@ -983,7 +1001,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     }
     dq.memcpy(d_df_pos, h_df_pos.data(), (size_t)M * sizeof(int32_t)).wait();
     DFDBG("block M=%d pos0=%d tok0=%d\n", M, pos0, toks[0]);
-    if (df_dbg() && getenv("PF_DFLASH_PTRS")) {
+    if (df_dbg() && si::env::flag("PF_DFLASH_PTRS")) {
         // The layer chain relies on d_df_h and d_df_c being two DISTINCT buffers that
         // the per-layer swap exchanges: the attn side-1 conv updates d_df_h in place
         // (out == res), the FFN's output conv writes d_df_c with d_df_h as the
@@ -995,8 +1013,8 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     }
 
     df_op = df_op_t();
-    df_op_on = getenv("PF_DFLASH_OPTIME") != nullptr;
-    df_seg_on = getenv("PF_DFLASH_SEGTIME") != nullptr;
+    df_op_on = si::env::flag("PF_DFLASH_OPTIME");
+    df_seg_on = si::env::flag("PF_DFLASH_SEGTIME");
     for (int i = 0; i < 8; i++) {
         df_seg[i] = 0;
     }
@@ -1004,7 +1022,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     // 1. embeddings (the target's table; the draft GGUF ships none)
     embed_launch(dq, wptr(0, m.tok_embd.data), m.tok_embd.type, inf, d_df_h, hp.n_embd, m.tok_embd_row_bytes);
     df_stage(dq, "embed", d_df_h, (size_t)M * hp.n_embd);
-    if (df_dbg() && getenv("PF_DFLASH_EMBCHK")) {
+    if (df_dbg() && si::env::flag("PF_DFLASH_EMBCHK")) {
         // The block's own embedding is the one input every host check above shares
         // without validating, so a wrong one makes the whole drafter consistently
         // wrong.  Compare row 0 against the target's table on the host.
@@ -1037,7 +1055,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         if (df_seg_on) { seg_e[0] = dq.ext_oneapi_submit_barrier(); }
                 const dflash_layer_t & L = dfm_->layers[(size_t)il];
         df_sig_layer = il;
-        if (df_dbg() && getenv("PF_DFLASH_SIGALL") && getenv("PF_DFLASH_SIG")) {
+        if (df_dbg() && si::env::flag("PF_DFLASH_SIGALL") && si::env::flag("PF_DFLASH_SIG")) {
             // what this layer actually reads.  rmsnorm of it is xnorm, and RMSNorm is
             // elementwise, so if this tensor is wrong the layer is wrong while every
             // probe downstream stays self-consistent.
@@ -1052,7 +1070,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         // build_attn includes wo - so the conv sees the n_embd-wide wo result,
         // not the raw n_head*head_dim attention output, and it runs BEFORE the
         // residual add (which is why df_conv_launch takes the residual).
-        static const bool nocv = getenv("PF_DFLASH_NOCONV") != nullptr;
+        static const bool nocv = si::env::flag("PF_DFLASH_NOCONV");
         const bool d2 = hp.is_dflash2 && !nocv;
         if (d2) {
         if (df_op_on) { df_op.norm += ms_t(dq_t, now_t()); dq_t = now_t(); }
@@ -1060,7 +1078,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 throw std::runtime_error("dflash: attn_conv_proj GEMM failed");
             }
             if (df_seg_on) { seg_e[5] = dq.ext_oneapi_submit_barrier(); }
-            if (df_dbg() && getenv("PF_DFLASH_BASECHK")) {
+            if (df_dbg() && si::env::flag("PF_DFLASH_BASECHK")) {
                 // attn_conv_base is a raw f32 tensor copied straight from the GGUF, so
                 // the device copy must be byte-identical.  Layer 4's conv takes an
                 // input at cos 0.99 and produces 0.88 while layer 0's takes 1.0 and
@@ -1081,14 +1099,14 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 fprintf(stderr, "[dflash] basechk attn blk.%d: worst=%.6g rmsdiff=%.6g hostrms=%.6f\n", il, worst,
                         std::sqrt(rmsd / nb4), std::sqrt(hs / nb4));
             }
-            if (df_dbg() && (il == 0 || getenv("PF_DFLASH_PROJCHKALL")) && getenv("PF_DFLASH_PROJCHK")) {
+            if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_PROJCHKALL")) && si::env::flag("PF_DFLASH_PROJCHK")) {
                 dq.wait();
                 df_proj_check(dq, L.attn_conv_proj, d_df_b, M, d_df_dyn, "attn_proj");
             }
-            if (df_dbg() && (il == 0 || getenv("PF_DFLASH_SIGALL")) && getenv("PF_DFLASH_SIG")) {
+            if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_SIGALL")) && si::env::flag("PF_DFLASH_SIG")) {
                 dq.wait();
                 df_sig(dq, d_df_b, M, hp.n_embd, "xnorm");
-                if (const char * bp = getenv("PF_DFLASH_BIN")) {
+                if (const char * bp = si::env::str("PF_DFLASH_BIN")) {
                     // the conv's other two inputs, so the whole conv can be
                     // recomputed on the host and checked against llama.cpp's output
                     const std::string dp = std::string(bp) + ".attn_dyn.bin";
@@ -1108,7 +1126,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                     fprintf(stderr, "[dflash-sig] conv inputs written (dyn %zu, base %zu)\n", dv.size(), bv.size());
                 }
             }
-            if (df_dbg() && getenv("PF_DFLASH_SIGALL") && getenv("PF_DFLASH_BIN")) {
+            if (df_dbg() && si::env::flag("PF_DFLASH_SIGALL") && si::env::flag("PF_DFLASH_BIN")) {
                 // attn_dynamic is the one conv input with no exact host check: the
                 // check shares this kernel's index assumption, so a permutation both
                 // agree on is invisible to it.  Zero-pad to n_embd so it lines up with
@@ -1124,7 +1142,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                     dq.memcpy(tmp.data(), d_df_dyn + (size_t)rr * cp, (size_t)cp * 4).wait();
                     std::memcpy(dv2.data() + (size_t)rr * hp.n_embd, tmp.data(), (size_t)cp * 4);
                 }
-                const std::string dp2 = std::string(getenv("PF_DFLASH_BIN")) + ".dyn.L" + std::to_string(il) + ".b"
+                const std::string dp2 = std::string(si::env::str("PF_DFLASH_BIN")) + ".dyn.L" + std::to_string(il) + ".b"
                                         + std::to_string(sig_block_now()) + ".bin";
                 if (FILE * f = fopen(dp2.c_str(), "wb")) {
                     fwrite(dv2.data(), 4, dv2.size(), f);
@@ -1134,7 +1152,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         if (df_op_on) { df_op.cproj += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, d_df_b, d_df_dyn, dfm_->dev_f32(L.attn_conv_base), d_df_c, nullptr, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/0);
-            if (getenv("PF_DFLASH_CONVCHK") && (il == 0 || getenv("PF_DFLASH_CONVCHKALL"))) {
+            if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
                 df_conv_check(dq, d_df_b, d_df_dyn, dfm_->dev_f32(L.attn_conv_base), d_df_c, nullptr, M, hp.n_embd,
                               hp.conv_k, hp.conv_group, hp.conv_proj, 0, "attn side0");
             }
@@ -1142,11 +1160,11 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             dq.memcpy(d_df_c, d_df_b, (size_t)M * hp.n_embd * 4).wait();
         }
         df_stage(dq, il == 0 ? "l0 attnconv" : "attnconv", d_df_c, (size_t)M * hp.n_embd);
-        if (df_dbg() && (il == 0 || getenv("PF_DFLASH_SIGALL")) && getenv("PF_DFLASH_SIG")) {
+        if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_SIGALL")) && si::env::flag("PF_DFLASH_SIG")) {
             dq.wait();
             df_sig(dq, d_df_c, M, hp.n_embd, "noise_norm");
         }
-        if (df_dbg() && il == 0 && getenv("PF_DFLASH_ROWRMS")) {
+        if (df_dbg() && il == 0 && si::env::flag("PF_DFLASH_ROWRMS")) {
             dq.wait();
             df_rowrms(dq, d_df_c, M, hp.n_embd, "attn_conv_out");
         }
@@ -1178,7 +1196,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         // separate a wrong GEMM from a wrong norm/rope (both are Q4_K x f32)
                 // PF_DFLASH_NONORM=1: skip the per-head q/k rms-norm, to attribute a
         // mismatch between our K rms and llama.cpp's to the norm itself
-        static const bool nonorm = getenv("PF_DFLASH_NONORM") != nullptr;
+        static const bool nonorm = si::env::flag("PF_DFLASH_NONORM");
         static const float k1w[1] = {1.0f};
         const float * qw = nonorm ? k1w : dfm_->dev_f32(L.q_norm);
         const float * kw = nonorm ? k1w : dfm_->dev_f32(L.k_norm);
@@ -1196,7 +1214,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                        df_kv_bytes_, qkv_stride);
         df_attn_combine_launch(dq, d_df_partials, d_df_b, M, hp.n_head, hp.head_dim, df_splits_,
                                dfm_->dev_f32(dfm_->layers[(size_t)il].attn_sinks));
-        if (df_dbg() && il == 0 && getenv("PF_DFLASH_ATTNCHK")) {
+        if (df_dbg() && il == 0 && si::env::flag("PF_DFLASH_ATTNCHK")) {
             dq.wait();
             std::vector<int32_t> pv((size_t)M);
             dq.memcpy(pv.data(), d_df_pos, pv.size() * 4).wait();
@@ -1205,7 +1223,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                           (char *)d_df_vring + (size_t)il * df_ring_stride_bytes(), pv.data(), hp.n_head,
                           hp.n_head_kv, hp.head_dim, pos0, df_swa_, df_ring_, attn_scale, d_df_b);
         }
-        if (df_dbg() && il == 0 && getenv("PF_DFLASH_ROWRMS")) {
+        if (df_dbg() && il == 0 && si::env::flag("PF_DFLASH_ROWRMS")) {
             dq.wait();
             df_rowrms(dq, d_df_b, M, hp.n_head * hp.head_dim, "attn_out");
         }
@@ -1224,17 +1242,17 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             // is the residual here, and out == residual is safe because every work
             // item reads and writes exactly one element.
             df_stage(dq, il == 0 ? "l0 wo" : "wo", d_df_c, (size_t)M * hp.n_embd);
-        if (df_dbg() && (il == 0 || getenv("PF_DFLASH_SIGALL")) && getenv("PF_DFLASH_SIG")) {
+        if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_SIGALL")) && si::env::flag("PF_DFLASH_SIG")) {
             dq.wait();
             df_sig(dq, d_df_c, M, hp.n_embd, "cur");
         }
-            if (df_dbg() && getenv("PF_DFLASH_GEMMCHK")) {
+            if (df_dbg() && si::env::flag("PF_DFLASH_GEMMCHK")) {
                 dq.wait();
                 char tg[32];
                 snprintf(tg, sizeof(tg), "wo_l%d", il);
                 df_gemm_check(dq, L.wo, d_df_b, nh, d_df_c, hp.n_embd, M, nullptr, 0, tg, 4);
             }
-            if (df_dbg() && getenv("PF_DFLASH_RING") && il == 0) {
+            if (df_dbg() && si::env::flag("PF_DFLASH_RING") && il == 0) {
                 // per-position ring V rms around the block: if the committed
                 // positions are empty the softmax averages them in as zeros and the
                 // attention output comes out several times too small
@@ -1308,7 +1326,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         if (df_op_on) { df_op.wo += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, d_df_c, d_df_dyn, dfm_->dev_f32(L.attn_conv_base), d_df_h, d_df_h, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/1);
-            if (getenv("PF_DFLASH_CONVCHK") && (il == 0 || getenv("PF_DFLASH_CONVCHKALL"))) {
+            if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
                 df_conv_check(dq, d_df_c, d_df_dyn, dfm_->dev_f32(L.attn_conv_base), d_df_h, d_df_h, M, hp.n_embd,
                               hp.conv_k, hp.conv_group, hp.conv_proj, 1, "attn side1");
             }
@@ -1316,11 +1334,11 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             df_add_launch(dq, d_df_b, d_df_h, d_df_c, M, hp.n_embd);
         }
         df_stage(dq, il == 0 ? "l0 post-attn" : "post-attn", d_df_h, (size_t)M * hp.n_embd);
-        if (df_dbg() && (il == 0 || getenv("PF_DFLASH_SIGALL")) && getenv("PF_DFLASH_SIG")) {
+        if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_SIGALL")) && si::env::flag("PF_DFLASH_SIG")) {
             dq.wait();
             df_sig(dq, d_df_h, M, hp.n_embd, "ffn_inp");
         }
-        if (df_dbg() && il == 0 && getenv("PF_DFLASH_ROWRMS")) {
+        if (df_dbg() && il == 0 && si::env::flag("PF_DFLASH_ROWRMS")) {
             dq.wait();
             // ffn_inp = attn_conv_out + layer input; the reference's REF_FFNIN
             // prints this tensor one row at a time
@@ -1335,14 +1353,14 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             if (!df_gemm(L.ffn_conv_proj, d_df_b, hp.n_embd, d_df_dyn, hp.conv_proj, nullptr, M)) {
                 throw std::runtime_error("dflash: ffn_conv_proj GEMM failed");
             }
-            if (df_dbg() && (il == 0 || getenv("PF_DFLASH_PROJCHKALL")) && getenv("PF_DFLASH_PROJCHK")) {
+            if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_PROJCHKALL")) && si::env::flag("PF_DFLASH_PROJCHK")) {
                 dq.wait();
                 df_proj_check(dq, L.ffn_conv_proj, d_df_b, M, d_df_dyn, "ffn_proj");
             }
         if (df_op_on) { df_op.fproj += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, d_df_b, d_df_dyn, dfm_->dev_f32(L.ffn_conv_base), d_df_c, nullptr, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/0);
-            if (getenv("PF_DFLASH_CONVCHK") && (il == 0 || getenv("PF_DFLASH_CONVCHKALL"))) {
+            if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
                 df_conv_check(dq, d_df_b, d_df_dyn, dfm_->dev_f32(L.ffn_conv_base), d_df_c, nullptr, M, hp.n_embd,
                               hp.conv_k, hp.conv_group, hp.conv_proj, 0, "ffn side0");
             }
@@ -1350,11 +1368,11 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             dq.memcpy(d_df_c, d_df_b, (size_t)M * hp.n_embd * 4).wait();
         }
         df_stage(dq, il == 0 ? "l0 ffn_xnorm" : "ffn_xnorm", d_df_c, (size_t)M * hp.n_embd);
-        if (df_dbg() && (il == 0 || getenv("PF_DFLASH_SIGALL")) && getenv("PF_DFLASH_SIG")) {
+        if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_SIGALL")) && si::env::flag("PF_DFLASH_SIG")) {
             dq.wait();
             df_sig(dq, d_df_c, M, hp.n_embd, "ffn_conv_in");
         }
-        if (df_dbg() && il == 0 && getenv("PF_DFLASH_ROWRMS")) {
+        if (df_dbg() && il == 0 && si::env::flag("PF_DFLASH_ROWRMS")) {
             dq.wait();
             df_rowrms(dq, d_df_c, M, hp.n_embd, "ffn_conv_in");
         }
@@ -1366,7 +1384,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             || !df_gemm(L.ffn_up, d_df_c, hp.n_embd, d_df_gu + hp.n_ff, 2 * hp.n_ff, nullptr, M)) {
             throw std::runtime_error("dflash: ffn gate/up GEMM failed");
         }
-        const bool dnchk = getenv("PF_DFLASH_GEMMCHK") != nullptr && il == 0;
+        const bool dnchk = si::env::flag("PF_DFLASH_GEMMCHK") && il == 0;
         if (dnchk) {
             std::vector<float> gu((size_t)M * 2 * hp.n_ff);
             dq.memcpy(gu.data(), d_df_gu, gu.size() * 4).wait();
@@ -1388,7 +1406,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             chk_gu.resize((size_t)M * 2 * hp.n_ff);
             dq.memcpy(chk_gu.data(), d_df_gu, chk_gu.size() * 4).wait();
         }
-        static const bool nosilu = getenv("PF_DFLASH_NOSILU") != nullptr;
+        static const bool nosilu = si::env::flag("PF_DFLASH_NOSILU");
         if (df_op_on) { df_op.fgu += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { ffn_e[1] = dq.ext_oneapi_submit_barrier(); }
         if (!df_gemm(L.ffn_down, d_df_gu, 2 * hp.n_ff, d_df_b, hp.n_embd, nullptr, M,
@@ -1457,14 +1475,14 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         if (df_op_on) { df_op.fdown += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, d_df_b, d_df_dyn, dfm_->dev_f32(L.ffn_conv_base), d_df_c, d_df_h, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/1);
-            if (getenv("PF_DFLASH_CONVCHK") && (il == 0 || getenv("PF_DFLASH_CONVCHKALL"))) {
+            if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
                 df_conv_check(dq, d_df_b, d_df_dyn, dfm_->dev_f32(L.ffn_conv_base), d_df_c, d_df_h, M, hp.n_embd,
                               hp.conv_k, hp.conv_group, hp.conv_proj, 1, "ffn side1");
             }
         } else {
             df_add_launch(dq, d_df_b, d_df_h, d_df_c, M, hp.n_embd);
         }
-        if (df_dbg() && getenv("PF_DFLASH_SIGALL") && getenv("PF_DFLASH_BIN")) {
+        if (df_dbg() && si::env::flag("PF_DFLASH_SIGALL") && si::env::flag("PF_DFLASH_BIN")) {
             // d_df_c, NOT d_df_h: the FFN's output conv writes d_df_c with d_df_h as
             // the residual, so the layer output is d_df_c and d_df_h still holds
             // ffn_inp.  The swap below is what publishes it.
@@ -1520,12 +1538,12 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     df_stage(dq, "pre_out_norm", d_df_h, (size_t)M * hp.n_embd);
     const auto t_b2 = now_t();
     rmsnorm_launch(dq, d_df_h, dfm_->dev_f32(dfm_->output_norm), d_df_b, M, hp.n_embd, hp.rms_eps);
-    if (df_dbg() && getenv("PF_DFLASH_SIG") && getenv("PF_DFLASH_BIN")) {
+    if (df_dbg() && si::env::flag("PF_DFLASH_SIG") && si::env::flag("PF_DFLASH_BIN")) {
         // The final normed hidden, i.e. what the head and the selector's gate both
         // read.  Comparing it against llama.cpp's DFLASH_REF_HIDDEN tap is what says
         // whether a wrong top-k is accumulated layer error or a readout bug.
         dq.wait();
-        std::string p2 = std::string(getenv("PF_DFLASH_BIN")) + ".final.bin";
+        std::string p2 = std::string(si::env::str("PF_DFLASH_BIN")) + ".final.bin";
         std::vector<float> fv((size_t)M * hp.n_embd);
         dq.memcpy(fv.data(), d_df_b, fv.size() * 4).wait();
         if (FILE * f = fopen(p2.c_str(), "wb")) {
@@ -1541,7 +1559,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         if (!hp.is_dflash2) {
         return;
     }
-    if (df_dbg() && getenv("PF_DFLASH_VRING")) {
+    if (df_dbg() && si::env::flag("PF_DFLASH_VRING")) {
         // the block rows' own V, per row: if the mask rows' V is short the whole
         // attention output (and so the hidden) is, which is what a wrong V looks like
         std::vector<float> vr((size_t)df_ring_ * hp.n_head_kv * hp.head_dim);
@@ -1624,7 +1642,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 df_op.fnorm, df_op.fproj, df_op.fconv0, df_op.fgu, df_op.fdown, df_op.fconv1, sum,
                 ms_t(t_b0, t_b1));
     }
-    if (getenv("PF_DFLASH_BTIME")) {
+    if (si::env::flag("PF_DFLASH_BTIME")) {
         const auto t_b4 = now_t();
         fprintf(stderr, "[dflash-bt] embed+layers=%.1f outnorm+head+topk+sel=%.1f | total=%.1f ms\n",
                 ms_t(t_b0, t_b1), ms_t(t_b1, t_b4), ms_t(t_b0, t_b4));
@@ -1644,7 +1662,7 @@ bool engine::df_gemm_head(const float * x, int M) {
         return true;
     }
     if (D->gemm(wkey(df_dev_, head.data), nullptr, 1.0f, M, head.K, d_logits, m.hp.n_vocab)) {
-        if (getenv("PF_DFLASH_HEADCHK") && M <= 4) {
+        if (si::env::flag("PF_DFLASH_HEADCHK") && M <= 4) {
             // Compare against an exact fp32 dequant of the GGUF blocks: the head is
             // the one readout with no exact path (gemm_w4 / oneDNN int8 only), so
             // this is the only way to tell a flat or biased logit row from a
@@ -1711,7 +1729,7 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
     for (int i = 1; i < M; i++) {
         toks[(size_t)i] = hp.mask_id;
     }
-    static const bool dtt = getenv("PF_DFLASH_DTTAIL") != nullptr;
+    static const bool dtt = si::env::flag("PF_DFLASH_DTTAIL");
     auto dtt_now = [] { return std::chrono::high_resolution_clock::now(); };
     const auto dtt0 = dtt_now();
     df_block(pos0, toks.data(), M);
@@ -1898,14 +1916,14 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         return out;
     }
     // ---- speculative loop ----
-    static const bool mt = getenv("PF_MTP_TIME") != nullptr || getenv("PF_DFLASH_TIME") != nullptr;
+    static const bool mt = si::env::flag("PF_MTP_TIME") || si::env::flag("PF_DFLASH_TIME");
     double t_draft = 0, t_verify = 0, t_rb = 0, t_emit = 0, t_inj = 0, t_cyc = 0;
     long t_acc = 0;
     int t_cycles = 0, t_tok = 0;
     auto now_t = [] { return std::chrono::high_resolution_clock::now(); };
     auto ms_t = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     std::vector<int> cand;
-    static const bool steps_dbg = getenv("PF_DFLASH_STEPS") != nullptr;
+    static const bool steps_dbg = si::env::flag("PF_DFLASH_STEPS");
     long steps_cyc = 0, steps_reach[40] = {0};
     while ((int)out.size() < gp.max_tokens && pos < max_seq - 1) {
         const auto tc0 = now_t();
@@ -1919,15 +1937,16 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         sync_all();
         const auto tc2 = now_t();
         t_verify += ms_t(tc1, tc2);
-        if (getenv("PF_DFLASH_VFCHK")) {
-            fprintf(stderr, "[dflash-vf] pos=%d rows=%d graph_ok=%d vf_dec_ok=%d vf_rows=%d graphs=%d\n", pos,
+        if (si::env::flag("PF_DFLASH_VFCHK")) {
+            fprintf(stderr, "[dflash-vf] pos=%d rows=%d vf_dec_ok=%d vf_rows=%d graphs=%d\n", pos,
                     n_ver + 1, (int)vf_dec_ok, vf_dec_rows,
                     (int)vf_dec_.size());
         }
         // ---- accept (greedy: the device argmax is exactly the greedy sample) ----
-        static int32_t * d_argmax = nullptr;
+        int32_t * d_argmax = d_argmax_buf_;
         if (!d_argmax) {
-            d_argmax = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
+            d_argmax_buf_ = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
+            d_argmax = d_argmax_buf_;
         }
         mtp_argmax_launch(dev_queue(0), d_logits, hp.n_vocab, d_argmax, nullptr, n_ver);
         dev_queue(0).memcpy(h_argmax, d_argmax, (size_t)n_ver * 4).wait();
@@ -1992,7 +2011,7 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         mtp_rollback(j);
         const auto tc4 = now_t();
         t_rb += ms_t(tc3, tc4);
-        if (getenv("PF_DFLASH_INJTRACE")) {
+        if (si::env::flag("PF_DFLASH_INJTRACE")) {
             // what the ring will hold after this cycle: the injected cells' V rms
             // next to the block's own, so a mis-placed injection shows up as a
             // discontinuity at the boundary

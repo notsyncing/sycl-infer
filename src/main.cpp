@@ -15,6 +15,7 @@
 #include "multimodal.h"
 #include "server.h"
 #include "vision.h"
+#include "common/env.h"
 
 using namespace si;
 
@@ -144,13 +145,13 @@ int main(int argc, char ** argv) {
     std::string host = "0.0.0.0";
     int port = 8080;
     int ctx = 0; // 0 = auto (kDefaultCtx)
-    if (const char * e = getenv("PF_CTX")) {
+    if (const char * e = si::env::str("PF_CTX")) {
         ctx = atoi(e);
     }
     bool ctx_full = false;   // --ctx full: read the maximum from the GGUF
     int blocks = 0;          // KV blocks committed at startup; 0 = auto
     int kv_cap_mb = INT_MIN; // INT_MIN = auto (size the cap from --ctx)
-    if (const char * e = getenv("PF_KV_CAP_MB")) {
+    if (const char * e = si::env::str("PF_KV_CAP_MB")) {
         kv_cap_mb = atoi(e);
     }
     int max_tokens = 256;
@@ -375,7 +376,7 @@ int main(int argc, char ** argv) {
         // is an error rather than a silent plain decode
         std::string stype = spec_type;
         if (stype.empty()) {
-            if (const char * e = getenv("PF_SPEC_TYPE")) {
+            if (const char * e = si::env::str("PF_SPEC_TYPE")) {
                 stype = e;
             }
         }
@@ -460,7 +461,7 @@ int main(int argc, char ** argv) {
             gp.top_p = top_p;
             gp.top_k = top_k;
             utf8_stream_buffer ub;
-            const bool dump_gen = getenv("PF_DUMP_GEN") != nullptr;
+            const bool dump_gen = si::env::flag("PF_DUMP_GEN");
             auto emit = [&](int tok) {
                 if (dump_gen) {
                     fprintf(stderr, "[gen] id=%d '%s'\n", tok, e.tk.token_piece(tok).c_str());
@@ -588,7 +589,7 @@ int main(int argc, char ** argv) {
             // PF_DUMP_PROMPT: dump the exact prompt the model is conditioned on
             // (the rendered chat text and/or the token ids) - the fastest way to
             // tell a bad chat template from a bad forward pass.
-            if (getenv("PF_DUMP_PROMPT")) {
+            if (si::env::flag("PF_DUMP_PROMPT")) {
                 if (!raw) {
                     std::vector<chat_msg> msgs = {{"user", prompt}};
                     fprintf(stderr, "[prompt] %s\n", render_chat(e.m.chat_template, msgs, true, thinking).c_str());

@@ -46,6 +46,34 @@ struct hparams {
 
 struct layer_t {
     bool recurrent = false;
+    // One slot of the canonical per-layer weight enumeration: the weight view
+    // and its SIn int8 copy (when the caller tracks them).
+    struct wl {
+        const wt * w;
+        w8t * w8; // null when the caller does not track w8t pairs
+    };
+    // Fill out[] (must hold at least 7 entries) with this layer's quantized
+    // weight slots in canonical order: FFN trio, then the GDN block
+    // (wqkv/wgate/ssm_out) or the attention block (wq/wk/wv/wo), based on
+    // `recurrent`.  ssm_beta/ssm_alpha are enumerated separately by the md
+    // paths that convert them and have no SIn copy.  Returns the count.
+    int lay_wts(wl out[], bool with_w8t = true) {
+        int n = 0;
+        out[n++] = {&ffn_gate, with_w8t ? &ffn_gate8 : nullptr};
+        out[n++] = {&ffn_up, with_w8t ? &ffn_up8 : nullptr};
+        out[n++] = {&ffn_down, with_w8t ? &ffn_down8 : nullptr};
+        if (recurrent) {
+            out[n++] = {&wqkv, with_w8t ? &wqkv8 : nullptr};
+            out[n++] = {&wgate, with_w8t ? &wgate8 : nullptr};
+            out[n++] = {&ssm_out, with_w8t ? &ssm_out8 : nullptr};
+        } else {
+            out[n++] = {&wq, with_w8t ? &wq8 : nullptr};
+            out[n++] = {&wk, with_w8t ? &wk8 : nullptr};
+            out[n++] = {&wv, with_w8t ? &wv8 : nullptr};
+            out[n++] = {&wo, with_w8t ? &wo8 : nullptr};
+        }
+        return n;
+    }
     const float * attn_norm = nullptr;
     const float * post_attn_norm = nullptr;
     wt ffn_gate, ffn_up, ffn_down;

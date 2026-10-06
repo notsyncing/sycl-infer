@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <stdexcept>
+#include "common/env.h"
 
 namespace si {
 
@@ -78,7 +79,7 @@ void dflash_model::load(const std::string & path, int target_n_embd, int target_
                     (int)sec->arr[0].i64, hp.n_rot);
         }
     }
-    if (const char * e = getenv("PF_DFLASH_NROT")) {
+    if (const char * e = si::env::str("PF_DFLASH_NROT")) {
         hp.n_rot = atoi(e);
     }
     const gguf_kv * tl = gguf.meta("dflash.target_layers");
@@ -193,7 +194,8 @@ void dflash_model::upload_f32(sycl::queue & q) {
         if (L.attn_conv_base) {
             up(L.attn_conv_base, cb);
             up(L.ffn_conv_base, cb);
-            up(L.attn_sinks, cb);
+            // sinks is one float per query head, not a conv-base-sized tensor.
+            up(L.attn_sinks, (size_t)hp.n_head * 4);
         }
     }
 }

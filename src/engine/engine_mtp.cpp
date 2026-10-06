@@ -22,6 +22,7 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include "common/env.h"
 
 namespace si {
 
@@ -36,7 +37,7 @@ int argmax_f(const float * v, int n) {
     return best;
 }
 bool mtp_dbg() {
-    static const bool b = getenv("PF_MTP_DEBUG") != nullptr;
+    static const bool b = si::env::flag("PF_MTP_DEBUG");
     return b;
 }
 } // namespace
@@ -63,7 +64,7 @@ void engine::build_mtp_plan() {
     // to bring its own - without it the path silently reads garbage and the
     // measurement is acc = 0.  Seven tensors, ~290 MB of GGUF bytes, uploaded
     // once at build time; this is a diagnostic, never the shipping path.
-    static const bool exact = getenv("PF_MTP_LAYER_EXACT") != nullptr;
+    static const bool exact = si::env::flag("PF_MTP_LAYER_EXACT");
     std::vector<void *> raw(7, nullptr);
     if (exact && multi_dev) {
         const wt * ts[7] = {&M.wq, &M.wk, &M.wv, &M.wo, &M.ffn_gate, &M.ffn_up, &M.ffn_down};
@@ -128,7 +129,7 @@ void engine::build_mtp_plan() {
     // call 4: shared LM head over the MTP hidden
     p.begin_call(kMaxT, hp.n_embd / 256);
     {
-        const wt & head = M.shared_head.data ? M.shared_head : m.output;
+        const wt & head = draft_head();
         gemv_seg s = seg(head, d_mtp_hnorm0, hp.n_embd, d_logits, hp.n_vocab, nullptr);
         s.dev = 0; // the shared LM head only exists on the primary device
         s.w = multi_dev ? wkey(0, head.data) : wptr(0, head.data);
@@ -187,7 +188,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
             hb.mtp_gather(d_mtp_cand_, mtp_cand_cap_, mtp_head_w8_, mtp_head_wsc_, D->act_grp_data(),
                           D->act_grp_scales(), D->act_group_sums(), (int)xq.K, mtp_head_rows_, d_mtp_cvals_);
             hb.mtp_gather_argmax(d_mtp_cvals_, d_mtp_cand_, mtp_cand_cap_, d_mtp_tok_ + step,
-                                 getenv("PF_MTP_CANDV") ? d_mtp_cval1_ : nullptr);
+                                 si::env::str("PF_MTP_CANDV") ? d_mtp_cval1_ : nullptr);
             return;
         }
     }
@@ -219,9 +220,9 @@ void engine::mtp_gemv(int ci, int M, int step) {
     // *first* call's ci/M (the MTP prefill's n = 13) and then be wrong for
     // every later call, which is exactly how this probe first read acc = 0 with
     // no exact GEMV in sight.
-    static const bool exact_env = getenv("PF_MTP_LAYER_EXACT") != nullptr;
+    static const bool exact_env = si::env::flag("PF_MTP_LAYER_EXACT");
     static const int exact_only = [] {
-        const char * e = getenv("PF_MTP_EXACT_CALL");
+        const char * e = si::env::str("PF_MTP_EXACT_CALL");
         return e ? atoi(e) : -1;
     }();
     const bool exact = exact_env && ci != 4 && (M == 1 || M == 8 || M == 16 || M == 32)
@@ -230,7 +231,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
     const int gb = p.call_group_begin[(size_t)ci];
     const int gc = p.call_group_count[(size_t)ci];
     if (exact) {
-        static const bool edbg = getenv("PF_MTP_EXACT_DEBUG") != nullptr;
+        static const bool edbg = si::env::flag("PF_MTP_EXACT_DEBUG");
         if (edbg) {
             static int seen = 0;
             if (seen++ < 12) {
@@ -245,7 +246,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
         return;
     }
     D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
-    static const bool head_split_dbg = getenv("PF_MTP_HEAD_SPLIT_DEBUG") != nullptr;
+    static const bool head_split_dbg = si::env::flag("PF_MTP_HEAD_SPLIT_DEBUG");
     if (ci == 4 && M == 1 && step >= 0 && mtp_head_split_) {
         // The head readout split across both cards (opt-in, default off - it
         // measures as a wash: -4.1 ms/cycle of draft, no end-to-end gain).
@@ -336,7 +337,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     // dependent chain of ~15 launches whose device work is ~1.1 GB of weights,
     // so this separates "bytes" from "dispatch" - the draft step costs 4.75 ms
     // while its byte floor is ~3.6 ms, and this says where the rest goes.
-    static const bool dstep = getenv("PF_MTP_DSTEP") != nullptr;
+    static const bool dstep = si::env::flag("PF_MTP_DSTEP");
     static const auto dnow = [] { return std::chrono::high_resolution_clock::now(); };
     static const auto dms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -453,7 +454,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     // PF_MTP_EXACT_DEBUG: dump the draft hidden so the exact and int8 paths can
     // be compared numerically (the acceptance is the coarse signal; this is the
     // direct one).
-    if (getenv("PF_MTP_EXACT_DEBUG") != nullptr && n == 1) {
+    if (si::env::flag("PF_MTP_EXACT_DEBUG") && n == 1) {
         static int seen = 0;
         if (seen++ < 4) {
             std::vector<float> h(8), hn(8);
@@ -509,7 +510,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
             qd.memcpy(d_mtp_convsave_[(size_t)dev] + ((size_t)gl * 2 + 1) * conv_dim, src + conv_dim, conv_dim * 4);
         }
     }
-    if (getenv("PF_MTP_STATECHK") != nullptr && !d_mtp_hist_.empty()) {
+    if (si::env::flag("PF_MTP_STATECHK") && !d_mtp_hist_.empty()) {
         // snapshot the live recurrent state of (device 0, GDN layer 0) so the
         // rollback can be diffed against a plain-decode reference
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
@@ -534,7 +535,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
         d_info->pc_row_slot[t] = t;
     }
     MTPDBG("verify record_forward n=%d pos=%d\n", n, pos0);
-    if (getenv("PF_MTP_INFOCHK") != nullptr) {
+    if (si::env::flag("PF_MTP_INFOCHK")) {
         fprintf(stderr, "[mtp] infochk before rf: mtp_dt=%d pc_active=%d slot0=%d slot1=%d sizeof=%zu\n",
                 d_info->mtp_dt, d_info->pc_active, d_info->pc_row_slot[0], d_info->pc_row_slot[1],
                 sizeof(step_info));
@@ -544,11 +545,11 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     // int8 weights is a plain jit:gemm, whose sweet spot is a SIMD-aligned M;
     // PF_MTP_VERIFY_M32=1 is the equivalent pad-to-kMaxT shortcut.
     static const int v_pad = [] {
-        const char * e = getenv("PF_MTP_VERIFY_PAD");
+        const char * e = si::env::str("PF_MTP_VERIFY_PAD");
         if (e && atoi(e) > 0) {
             return atoi(e);
         }
-        const char * m32 = getenv("PF_MTP_VERIFY_M32");
+        const char * m32 = si::env::str("PF_MTP_VERIFY_M32");
         return (m32 && atoi(m32) != 0) ? kMaxT : 0;
     }();
     const int rows_vf = v_pad > n ? v_pad : n;
@@ -558,7 +559,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     // following sync_all() then gives the wall time, so the difference is what
     // the GPU actually had to do.  If the submit is a large share of the wall
     // time, one command graph for the pass is worth building.
-    const bool submit_dbg = getenv("PF_MTP_SUBMIT") != nullptr;
+    const bool submit_dbg = si::env::flag("PF_MTP_SUBMIT");
     const auto t_now = [] { return std::chrono::high_resolution_clock::now(); };
     const auto t_ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -580,7 +581,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     if (submit_dbg) {
         fprintf(stderr, "[mtp] verify submit=%.2f ms  wall-after-submit=%.2f ms\n", t_submit, t_ms(t_submit0, t_now()));
     }
-    if (const char * sd = getenv("PF_MTP_SNAPDUMP"); sd && pos0 == 0) {
+    if (const char * sd = si::env::str("PF_MTP_SNAPDUMP"); sd && pos0 == 0) {
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
         const size_t per = gdn_per + (size_t)(hp.conv_k - 1) * hp.qkv_dim();
         const int ng = n_gdn_dev_[0];
@@ -595,7 +596,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
             fprintf(stderr, "[mtp] snapdump %s n=%d\n", sd, n);
         }
     }
-    if (getenv("PF_MTP_SNAPCHK") != nullptr && pos0 == 22) {
+    if (si::env::flag("PF_MTP_SNAPCHK") && pos0 == 22) {
         fprintf(stderr, "[mtp] gdnmap:");
         for (int il = 0; il < std::min(8, hp.n_layer); il++) {
             fprintf(stderr, " il%d(dev%d,gl%d)", il, layer_dev_[(size_t)il],
@@ -603,7 +604,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
         }
         fprintf(stderr, "  ng_dev=[%d,%d]\n", n_gdn_dev_[0], n_gdn_dev_.size() > 1 ? n_gdn_dev_[1] : -1);
     }
-    if (getenv("PF_MTP_SNAPCHK") != nullptr && pos0 == 0) {
+    if (si::env::flag("PF_MTP_SNAPCHK") && pos0 == 0) {
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
         for (int dev = 0; dev < (int)as_.size(); dev++) {
             if (d_mtp_hist_[(size_t)dev] == nullptr || n_gdn_dev_[(size_t)dev] == 0) {
@@ -718,7 +719,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                                       const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
     reset_single();
     const hparams & hp = m.hp;
-    static const bool dbg_gen = getenv("PF_DUMP_GEN") != nullptr;
+    static const bool dbg_gen = si::env::flag("PF_DUMP_GEN");
     sampler_state ss;
     ss.seed(gp.seed ? gp.seed : std::random_device{}());
     std::vector<int> out;
@@ -751,7 +752,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     // prefill (main + MTP KV).  The MTP is driven chunk by chunk because the
     // draft head needs the main hidden of the previous token, which only exists
     // for the tokens already forwarded.
-    if (getenv("PF_MTP_DECODE_H") != nullptr) {
+    if (si::env::flag("PF_MTP_DECODE_H")) {
         // Diagnostic / workaround: the mode-2 chunk forward leaves a correct
         // per-position hidden only for some rows, so build the draft head's h
         // rows from a one-token-at-a-time decode (the single-token path is the
@@ -764,7 +765,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             decode_batch(&tk, &pp, &sl, 1);
             // mode 0 leaves the single token's post-output-norm hidden in d_xnorm
             dev_queue(0).memcpy(htmp.data() + (size_t)i * hp.n_embd, d_xnorm, (size_t)hp.n_embd * 4).wait();
-            if (const char * sq = getenv("PF_MTP_STATESEQ")) {
+            if (const char * sq = si::env::str("PF_MTP_STATESEQ")) {
                 const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
                 std::vector<float> row(gdn_per);
                 dev_queue(0).memcpy(row.data(), as_[0].gdn_state, gdn_per * 4).wait();
@@ -774,7 +775,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     fclose(f);
                 }
             }
-            if (getenv("PF_MTP_HDUMPS")) {
+            if (si::env::flag("PF_MTP_HDUMPS")) {
                 std::vector<float> lg((size_t)hp.n_vocab);
                 fetch_logits(0, lg.data());
                 const int am = argmax_f(lg.data(), hp.n_vocab);
@@ -789,7 +790,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
     }
     std::vector<int32_t> chunk;
-    const bool decode_h = getenv("PF_MTP_DECODE_H") != nullptr;
+    const bool decode_h = si::env::flag("PF_MTP_DECODE_H");
     for (int pos = matched; decode_h ? false : pos < nprompt;) {
         // Take the largest prefill batch the plan supports (batched_prefill_fit,
         // up to kMaxB*kMaxT) and then walk *its captured hidden* in kMaxT-token
@@ -848,7 +849,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         pc_commit(0, prompt, blocks, nprompt);
     }
 
-    if (getenv("PF_MTP_HVEC") != nullptr) {
+    if (si::env::flag("PF_MTP_HVEC")) {
         sync_all();
         const int nr = 8;
         std::vector<float> hb((size_t)nr * hp.n_embd);
@@ -884,7 +885,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     }
     int pos = nprompt;
     int tok = sample_token(logits.data(), hp.n_vocab, gp, out, ss);
-    if (getenv("PF_MTP_DIAG") != nullptr && nprompt >= 2) {
+    if (si::env::flag("PF_MTP_DIAG") && nprompt >= 2) {
         // Run the MTP over the whole prompt (h=zeros, like the prefill pass) and
         // check every row's argmax against the actual next prompt token.  Row i
         // must predict prompt[i+1]; the last row must predict the main model's
@@ -947,7 +948,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             }
         }
         sycl::free(d_h0, dev_queue(0));
-        if (const char * dp = getenv("PF_MTP_DUMP")) {
+        if (const char * dp = si::env::str("PF_MTP_DUMP")) {
             // dump the prompt, the h rows fed to the MTP and its logits so a
             // host reference (Python) can reproduce the layer step by step
             FILE * f = fopen(dp, "wb");
@@ -987,7 +988,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
     }
     out.push_back(tok);
-    if (getenv("PF_MTP_VPROBE") != nullptr) {
+    if (si::env::flag("PF_MTP_VPROBE")) {
         // Run the MAIN model over the first 16 prompt tokens with the batched
         // head (the verify plan) and check each row against the next prompt
         // token.  This uses no MTP code and no capture: it tests whether the
@@ -1002,7 +1003,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     got == want ? "OK" : "XX");
         }
     }
-    if (getenv("PF_MTP_HOSTCMP") != nullptr) {
+    if (si::env::flag("PF_MTP_HOSTCMP")) {
         // d_mtp_main_h and d_last_hidden are HOST USM, so compare them directly
         // (no SYCL queue involved, no ordering question)
         const int rows[4] = {0, 1, nprompt - 2, nprompt - 1};
@@ -1027,7 +1028,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fprintf(stderr, "[mtp] hostcmp capt[last] vs d_last_hidden: maxdiff=%.6f |last_hidden|=%.4f\n", d, nb);
         }
     }
-    if (const char * sp = getenv("PF_MTP_STATEDUMP")) {
+    if (const char * sp = si::env::str("PF_MTP_STATEDUMP")) {
         // dump the post-prompt recurrent state of (device 0, GDN layer 0) so the
         // mode-2 prefill and the token-by-token decode paths can be compared
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
@@ -1059,14 +1060,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             pos += n;
         }
     }
-    if (getenv("PF_MTP_SNAPDUMP") != nullptr && nprompt >= mtp_nsnap) {
+    if (si::env::flag("PF_MTP_SNAPDUMP") && nprompt >= mtp_nsnap) {
         // verify-like pass over exactly mtp_nsnap prompt tokens (a longer pass
         // would write past the pc_row_slot entries mtp_verify initialises)
-        const int pn = getenv("PF_MTP_SNAP1") ? 1 : mtp_nsnap;
+        const int pn = si::env::str("PF_MTP_SNAP1") ? 1 : mtp_nsnap;
         std::vector<int> pv(prompt.begin(), prompt.begin() + pn);
         mtp_verify(pv, pn, 0, 0);
     }
-    if (const char * hd = getenv("PF_MTP_HDUMPS")) {
+    if (const char * hd = si::env::str("PF_MTP_HDUMPS")) {
         // d_mtp_main_h is host USM: dump it directly, before run_head or any
         // other call can touch the activation buffers
         FILE * f = fopen(hd, "wb");
@@ -1077,10 +1078,10 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fwrite(d_mtp_main_h, 4, (size_t)nprompt * hp.n_embd, f);
             fclose(f);
             fprintf(stderr, "[mtp] hdumps %s (nprompt=%d decode_h=%d)\n", hd, nprompt,
-                    (int)(getenv("PF_MTP_DECODE_H") != nullptr));
+                    (int)(si::env::flag("PF_MTP_DECODE_H")));
         }
     }
-    if (getenv("PF_MTP_DRAFTTEST") != nullptr) {
+    if (si::env::flag("PF_MTP_DRAFTTEST")) {
         // Emulate the first draft row *inside* a multi-token pass: row 22 gets
         // (emb(tok), h_21) exactly like the single-token draft call, but the
         // pass also carries rows 0..21.
@@ -1104,7 +1105,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 argmax_f(h_logits, hp.n_vocab));
         sycl::free(d_h0, dev_queue(0));
     }
-    if (getenv("PF_MTP_HPROBE") != nullptr) {
+    if (si::env::flag("PF_MTP_HPROBE")) {
         // capt[nprompt-1] must reproduce the first sampled token; capt[i] must
         // predict the prompt token at i+1
         std::vector<int> rows = {0, 1, 2, nprompt - 2, nprompt - 1};
@@ -1135,7 +1136,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     // the buffers still cover it) while cutting the wasted verify work.  The
     // emitted stream is unaffected: acceptance ignores k.
     static const bool adapt = [] {
-        const char * e = getenv("PF_MTP_ADAPT");
+        const char * e = si::env::str("PF_MTP_ADAPT");
         return e ? atoi(e) != 0 : true;
     }();
     int k = mtp_k;
@@ -1143,7 +1144,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     // the candidate-restricted draft head arms itself after the first verify has
     // produced a candidate set (the first cycle uses the full head readout)
     bool cand_ready = false;
-    static const bool mt = getenv("PF_MTP_TIME") != nullptr;
+    static const bool mt = si::env::flag("PF_MTP_TIME");
     double t_draft = 0, t_verify = 0, t_commit = 0, t_rb = 0, t_emit = 0, t_cb = 0, t_am = 0, t_cyc = 0;
     long t_acc = 0;
     int t_cycles = 0, t_tok = 0;
@@ -1154,7 +1155,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // ---- draft: k autoregressive MTP steps -----------------------------
         cand[0] = tok;
         const float * hprev = d_mtp_hprev;
-        static const bool no_mtpfwd = getenv("PF_MTP_NOMTPFWD") != nullptr;
+        static const bool no_mtpfwd = si::env::flag("PF_MTP_NOMTPFWD");
         // PF_MTP_CAND=0 (the default, and the measured-better setting): the head
         // readout is the full 248320 rows.  With it on, step 0 is a full readout
         // that seeds the candidate set and steps 1..k-1 evaluate the head only on
@@ -1189,19 +1190,18 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             // PF_MTP_CANDDBG: hit rate of the candidate set - this step's
             // restricted argmax against a full readout of the *same* hidden.
             // Costs a full readout per step, so it is a diagnostic only.
-            static const bool cand_dbg = getenv("PF_MTP_CANDDBG") != nullptr;
-            static int32_t * d_am2 = nullptr;
+            static const bool cand_dbg = si::env::flag("PF_MTP_CANDDBG");
             static int h_cand = 0, h_full = 0, h_steps = 0;
             static int h_cand_s[kMaxT] = {0}, h_full_s[kMaxT] = {0};
             if (cand_head && cand_dbg) {
-                if (!d_am2) {
-                    d_am2 = sycl::malloc_device<int32_t>(4, dev_queue(0));
+                if (!d_am2_) {
+                    d_am2_ = sycl::malloc_device<int32_t>(4, dev_queue(0));
                 }
                 int32_t hid = -1, hf = -1;
                 dev_queue(0).memcpy(&hid, d_mtp_tok_ + i, 4);
                 mtp_gemv(4, 1, -1); // full readout of the same hidden
-                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, d_am2, nullptr, 1);
-                dev_queue(0).memcpy(&hf, d_am2, 4).wait();
+                backends_[0]->mtp_argmax(d_logits, hp.n_vocab, d_am2_, nullptr, 1);
+                dev_queue(0).memcpy(&hf, d_am2_, 4).wait();
                 h_cand += (hid == hf);
                 h_full++;
                 h_cand_s[i] += (hid == hf);
@@ -1244,7 +1244,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             dev_queue(0).memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
             cand[(size_t)i + 1] = argmax_f(h_logits, hp.n_vocab);
             }
-            static const bool lstat = getenv("PF_MTP_LSTAT") != nullptr;
+            static const bool lstat = si::env::flag("PF_MTP_LSTAT");
             if (lstat && !dev_chain) {
                 double mx = -1e30, mn = 1e30, sum = 0;
                 int nan = 0;
@@ -1289,7 +1289,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // single-token decode of the same token at the same position from the
         // same (saved) state?  Distinguishes "state is wrong" from "batched
         // verify forward is wrong".
-        if (getenv("PF_MTP_DECCHK") != nullptr) {
+        if (si::env::flag("PF_MTP_DECCHK")) {
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
             const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
             std::vector<std::vector<float>> st_save(as_.size()), cv_save(as_.size());
@@ -1344,7 +1344,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
         MTPDBG("verify start\n");
         static const int vn_env = [] {
-            const char * e = getenv("PF_MTP_VERIFYN");
+            const char * e = si::env::str("PF_MTP_VERIFYN");
             return e ? atoi(e) : 0;
         }();
         const int n_ver = (vn_env > 0 && vn_env < k + 1) ? vn_env : k + 1;
@@ -1366,17 +1366,19 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         const bool have_dev_argmax = greedy && no_penalty && gp.logit_bias.empty() && !mtp_dbg();
         // `dev_argmax` must be device memory: a kernel cannot write a host stack
         // array.
-        static int32_t * d_argmax = nullptr;
-        static float * d_argval = nullptr;
+        int32_t * d_argmax = d_argmax_buf_;
+        float * d_argval = d_argval_buf_;
         if (!d_argmax) {
-            d_argmax = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
-            d_argval = sycl::malloc_device<float>(kMaxB, dev_queue(0));
+            d_argmax_buf_ = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
+            d_argval_buf_ = sycl::malloc_device<float>(kMaxB, dev_queue(0));
+            d_argmax = d_argmax_buf_;
+            d_argval = d_argval_buf_;
         }
         const auto tam0 = now_t();
         if (have_dev_argmax) {
             backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, mtp_cand_cap_ > 0 ? d_argval : nullptr, k + 1);
             dev_queue(0).memcpy(h_argmax, d_argmax, (size_t)(k + 1) * 4).wait();
-            if (getenv("PF_MTP_AMCHK") != nullptr) {
+            if (si::env::flag("PF_MTP_AMCHK")) {
                 dev_queue(0).memcpy(h_logits, d_logits, (size_t)(k + 1) * hp.n_vocab * 4).wait();
                 for (int i = 0; i <= k; i++) {
                     const int h = argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
@@ -1410,7 +1412,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fprintf(stderr, "\n");
         }
         int j = 0;
-        static const bool no_accept = getenv("PF_MTP_NOACCEPT") != nullptr;
+        static const bool no_accept = si::env::flag("PF_MTP_NOACCEPT");
         while (!no_accept && j < std::min(k, n_ver - 1)) {
             const int t = row_argmax(j);
             if (t != cand[(size_t)j + 1]) {
@@ -1423,7 +1425,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // is not the one the MTP layer expects) or a systematically wrong
         // readout; a geometric decay is the model's own accuracy and nothing
         // here can move it.  Prints reach[j] = cycles that accepted >= j drafts.
-        static const bool steps_dbg = getenv("PF_MTP_STEPS") != nullptr;
+        static const bool steps_dbg = si::env::flag("PF_MTP_STEPS");
         static long steps_cyc = 0, steps_reach[33] = {0};
         if (steps_dbg) {
             steps_cyc++;
@@ -1506,14 +1508,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // "commit" phase; the phase split below keeps the commit timer
         // meaningful by charging the shared barrier to the rollback.)
         const auto tc4 = now_t();
-        static const bool no_rb = getenv("PF_MTP_NORB") != nullptr;
+        static const bool no_rb = si::env::flag("PF_MTP_NORB");
         // The rollback only *enqueues* memcpys into the per-device in-order
         // queues, and nothing on the host reads the recurrent state, so the
         // device-wide barrier that used to follow it is pure latency: the next
         // device work (the draft, which reads that state) is already ordered
         // after the memcpys on the same queue.  PF_MTP_NORBSYNC=1 keeps the old
         // barrier for A/B.
-        static const bool rb_sync = getenv("PF_MTP_NORBSYNC") != nullptr;
+        static const bool rb_sync = si::env::flag("PF_MTP_NORBSYNC");
         if (!no_rb) {
             mtp_rollback(j);
             if (rb_sync) {
@@ -1549,7 +1551,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     t_cyc / t_cycles, (t_draft + t_verify + t_commit + t_rb + t_emit) / t_cycles,
                     (t_cyc - (t_draft + t_verify + t_commit + t_rb + t_emit)) / t_cycles);
         }
-        static const bool statechk = getenv("PF_MTP_STATECHK") != nullptr;
+        static const bool statechk = si::env::flag("PF_MTP_STATECHK");
         if (statechk && !h_save_.empty()) {
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
             const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
@@ -1579,7 +1581,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fprintf(stderr, "[mtp] statechk pos=%d j=%d rollback-vs-ref maxdiff=%.6f |ref|=%.4f\n", pos, j, d, nb);
             h_save_.clear();
         }
-        if (getenv("PF_MTP_AUTOTEST") != nullptr) {
+        if (si::env::flag("PF_MTP_AUTOTEST")) {
             // compare the verify's row-0 prediction against a plain single-token
             // decode from the same (rolled-back) state
             int32_t tt = tok, pp = pos, sl = 0;

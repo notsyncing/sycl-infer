@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "common/env.h"
 
 namespace si {
 
@@ -169,7 +170,7 @@ static void gemv_multi_kernel(queue & q, const gemv_seg * segs, int n_segs, int 
 
 // experimental: cfg = RPS*100 + SGW (SGW ignored unless listed)
 static int gemv_env_cfg(const char * name) {
-    const char * s = getenv(name);
+    const char * s = si::env::str(name);
     return s ? atoi(s) : 0;
 }
 
@@ -314,7 +315,7 @@ static void gemv_dec_vec_kernel(queue & q, const gemv_seg * segs, int n_segs, in
 void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                        int n_tok_blocks) {
     const int n_tb = (TB > 1 && n_tok_blocks > 0) ? n_tok_blocks : 1;
-    static const bool dbg_g = getenv("PF_DBG_GEMV") != nullptr;
+    static const bool dbg_g = si::env::flag("PF_DBG_GEMV");
     if (dbg_g) {
         // the segments live on the device, so only log the host side here
         fprintf(stderr, "[gemv] type=%u n_segs=%d total_rows=%d TB=%d nsb=%d segs=%p\n", type, n_segs, total_rows, TB,
@@ -323,15 +324,15 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
     static const int cfg1 = gemv_env_cfg("GEMV_CFG1");
     // single-token decode: use the vectorized-dequant kernels for Q4_K/Q5_K
     static const bool dec_vec = [] {
-        const char * e = getenv("GEMV_DEC_VEC");
+        const char * e = si::env::str("GEMV_DEC_VEC");
         return !(e && atoi(e) == 0);
     }();
     static const bool vec12 = [] {
-        const char * e = getenv("GEMV_VEC12");
+        const char * e = si::env::str("GEMV_VEC12");
         return !(e && atoi(e) == 0);
     }();
     static const bool vec13 = [] {
-        const char * e = getenv("GEMV_VEC13");
+        const char * e = si::env::str("GEMV_VEC13");
         return !(e && atoi(e) == 0);
     }();
     const bool use_vec = dec_vec && ((type == 12 && vec12) || (type == 13 && vec13));

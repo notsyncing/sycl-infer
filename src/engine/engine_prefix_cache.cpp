@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "common/env.h"
 
 namespace si {
 
@@ -617,7 +618,7 @@ int engine::pc_evict_lru() {
 }
 
 int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int> & blocks) {
-    static const bool pcdbg = getenv("PF_PC_DEBUG") != nullptr;
+    static const bool pcdbg = si::env::flag("PF_PC_DEBUG");
     if (slot >= 0 && slot < kMaxB) {
         pc_slot_[slot] = {};
     }
@@ -860,7 +861,7 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
 
 void engine::pc_commit(int slot, const std::vector<int> & toks, const std::vector<int> & blocks, int done) {
     step_info * inf = pf_info_ ? pf_info_ : d_info;
-    static const bool pcdbg = getenv("PF_PC_DEBUG") != nullptr;
+    static const bool pcdbg = si::env::flag("PF_PC_DEBUG");
     if (!pc_enabled || slot < 0 || slot >= kMaxB) {
         for (auto & p : pc_pending_) {
             pc_state_release(p.second);

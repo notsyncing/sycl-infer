@@ -11,6 +11,7 @@
 #define STBI_NO_STDIO
 #define STBI_ONLY_JPEG
 #include "stb/stb_image.h"
+#include "common/env.h"
 
 namespace si {
 
@@ -337,12 +338,12 @@ bool try_avi(const uint8_t * data, size_t len, const mm_video_fmt & fmt, mm_vide
 // `max_frames` uniformly spaced frames.
 // ---------------------------------------------------------------------------
 const char * ffmpeg_cmd() {
-    const char * v = getenv("PF_AV_FFMPEG");
+    const char * v = si::env::str("PF_AV_FFMPEG");
     return (v && v[0]) ? v : "ffmpeg";
 }
 
 const char * ffprobe_cmd() {
-    const char * v = getenv("PF_AV_FFPROBE");
+    const char * v = si::env::str("PF_AV_FFPROBE");
     return (v && v[0]) ? v : "ffprobe";
 }
 

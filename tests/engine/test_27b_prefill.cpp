@@ -7,16 +7,17 @@
 #include <vector>
 
 #include "engine.h"
+#include "common/env.h"
 
 using namespace si;
 
 int main(int argc, char ** argv) {
-    if (getenv("TEST_FP32")) {
+    if (si::env::flag("TEST_FP32")) {
         setenv("PF_DP4A", "0", 1); // strict fp32 comparison path
     }
     const char * model_path = argc > 1 ? argv[1] : "/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf";
-    const char * lm = getenv("TEST_LAYER_MAP");
-    const char * dv = getenv("TEST_DEVICE");
+    const char * lm = si::env::str("TEST_LAYER_MAP");
+    const char * dv = si::env::str("TEST_DEVICE");
     const int dev = (dv && strcmp(dv, "cpu") == 0) ? 1 : -1;
     try {
         engine e(model_path, 2048, 16, 512, 0, "", -1, -1, -1, -1, dev, lm ? lm : "");
@@ -43,7 +44,7 @@ int main(int argc, char ** argv) {
             fflush(stdout);
         }
         // decode throughput: small prompt, then 128 greedy steps
-        if (!getenv("TEST_SKIP_DECODE")) {
+        if (!si::env::flag("TEST_SKIP_DECODE")) {
             gen_params gp;
             gp.max_tokens = 128;
             gp.temperature = 0.f;
@@ -56,7 +57,7 @@ int main(int argc, char ** argv) {
             fflush(stdout);
         }
         // isolated dp4a_gemm benchmark on one device (TB=32, kMaxT chunk)
-        if (getenv("TEST_KERNEL_BENCH")) {
+        if (si::env::flag("TEST_KERNEL_BENCH")) {
             sycl::queue & q = e.q;
             const int TB = 32;
             const char * names[] = {"ffn_up", "ffn_down", "wqkv", "wgate", "ssm_out"};

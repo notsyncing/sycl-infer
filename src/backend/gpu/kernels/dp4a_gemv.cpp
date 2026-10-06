@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "common/env.h"
 
 namespace si {
 
@@ -96,7 +97,7 @@ void dp4a_gemv_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     // decode is also latency-bound for small output sizes (4-8 workgroups), so
     // split K the same way as the prefill GEMM
     static const bool split_on = [] {
-        const char * e = getenv("PF_GEMV_SPLIT");
+        const char * e = si::env::str("PF_GEMV_SPLIT");
         return !e || atoi(e) != 0;
     }();
     // how many output rows it takes to fill the machine: a device-profile value,
@@ -248,7 +249,7 @@ static void i8_row_gemv_multi_impl(queue & q, const gemv_seg * segs, int n_segs,
 void i8_row_gemv_multi_launch(sycl::queue & q, const gemv_seg * segs, int n_segs, int total_rows, const int8_t * xq,
                               const float * sx_dev, const int32_t * xsum_dev) {
     static const int rows = [] {
-        const char * e = getenv("PF_DEC_R");
+        const char * e = si::env::str("PF_DEC_R");
         const int v = e ? atoi(e) : 1;
         return v == 1 ? 1 : (v == 2 ? 2 : (v == 4 ? 4 : 8));
     }();

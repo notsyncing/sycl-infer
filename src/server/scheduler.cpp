@@ -15,11 +15,12 @@
 #include "chat_util.h"
 #include "kernels.h"
 #include "sampler.h"
+#include "common/env.h"
 
 namespace si {
 
 static bool srv_time() {
-    static const bool t = getenv("PF_SRV_TIME") != nullptr;
+    static const bool t = si::env::flag("PF_SRV_TIME");
     return t;
 }
 
@@ -127,7 +128,7 @@ void scheduler::retire(std::shared_ptr<sequence> & s, const char * reason) {
 }
 
 static bool dbg() {
-    static bool d = getenv("SCHED_DEBUG") != nullptr;
+    static bool d = si::env::flag("SCHED_DEBUG");
     return d;
 }
 

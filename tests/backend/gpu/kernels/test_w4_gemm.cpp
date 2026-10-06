@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <sycl/sycl.hpp>
+#include "common/env.h"
 
 int main(int argc, char ** argv) {
     const char * path = argc > 1 ? argv[1] : "/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf";
@@ -60,7 +61,7 @@ int main(int argc, char ** argv) {
         }
         // ---- optional kernel rate probe (PF_W4_RATE=1): runs before the slow
         // host reference and exits, so kernel tuning iterates in ~20 s -------
-        static const bool rate = getenv("PF_W4_RATE") != nullptr;
+        static const bool rate = si::env::flag("PF_W4_RATE");
         if (rate && N >= 4096) {
             const int iters = 200;
             const size_t wbytes = (size_t)N * (size_t)K / 2;

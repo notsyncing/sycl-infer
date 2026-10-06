@@ -23,6 +23,7 @@
 #include <immintrin.h>
 
 #include "cpu_isa.h"
+#include "common/env.h"
 
 namespace si {
 
@@ -69,7 +70,7 @@ int detect_threads() {
     if (g_cpu_threads_override > 0) {
         return g_cpu_threads_override;
     }
-    if (const char * e = getenv("PF_CPU_THREADS")) {
+    if (const char * e = si::env::str("PF_CPU_THREADS")) {
         const int n = atoi(e);
         if (n >= 1) {
             return n;

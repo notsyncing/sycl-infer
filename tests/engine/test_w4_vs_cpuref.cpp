@@ -9,6 +9,7 @@
 
 #include "cpu_ref.h"
 #include "engine.h"
+#include "common/env.h"
 
 using namespace si;
 
@@ -21,15 +22,15 @@ int main(int argc, char ** argv) {
     if (toks.empty()) {
         toks = {248045, 846, 198, 9419, 248046, 198}; // short ChatML-ish prompt
     }
-    const char * w4 = getenv("PF_W4");
+    const char * w4 = si::env::str("PF_W4");
     printf("PF_W4=%s  tokens=%zu\n", w4 ? w4 : "(unset)", toks.size());
 
-    const char * lm = getenv("TEST_LAYER_MAP");
+    const char * lm = si::env::str("TEST_LAYER_MAP");
     engine e(model_path, 2048, 16, 512, 0, "", -1, -1, -1, -1, -1, lm ? lm : "");
     auto gpu = e.eval(toks);
     // PF_DUMP_LOGITS=<path>: write the engine's full logit vector so it can be
     // diffed against an independent implementation (ll_logits) offline.
-    if (const char * lp = getenv("PF_DUMP_LOGITS")) {
+    if (const char * lp = si::env::str("PF_DUMP_LOGITS")) {
         if (FILE * fp = fopen(lp, "wb")) {
             fwrite(gpu.data(), sizeof(float), gpu.size(), fp);
             fclose(fp);

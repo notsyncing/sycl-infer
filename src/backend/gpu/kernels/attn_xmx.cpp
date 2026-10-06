@@ -12,6 +12,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include "common/env.h"
 
 namespace si {
 
@@ -47,7 +48,7 @@ using namespace si::kd;
 
 bool attn_xmx_enabled() {
     static const bool v = [] {
-        const char * e = getenv("PF_ATTN_XMX");
+        const char * e = si::env::str("PF_ATTN_XMX");
         // default from the device profile: the oneDNN int8 matmul path pays off
         // on a part with a fast int8 GEMM and is untested on a part where DP4A
         // was worth 4x over the scalar path to begin with
@@ -68,7 +69,7 @@ static int xmx_min_keys_dev() {
 }
 static int xmx_min_keys() {
     static const int v = [] {
-        const char * e = getenv("PF_ATTN_XMX_MIN");
+        const char * e = si::env::str("PF_ATTN_XMX_MIN");
         return e ? atoi(e) : xmx_min_keys_dev();
     }();
     return v;
@@ -106,7 +107,7 @@ static const int kGatherRed = si::dev::active().attn.xmx_gather_red;
 // because it cannot lose; `PF_XMX_TAILBLK=0` restores the old behaviour.
 static inline int xmx_tail_blk(int rem) {
     static const bool off = [] {
-        const char * e = getenv("PF_XMX_TAILBLK");
+        const char * e = si::env::str("PF_XMX_TAILBLK");
         return e && atoi(e) == 0;
     }();
     if (off) {
@@ -265,7 +266,7 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
     // associative, so the resulting block scale -- and therefore the whole
     // requantized block, bit for bit -- is unchanged.
     static const int nslice_cfg = [] {
-        const char * e = getenv("PF_XMX_GRED");
+        const char * e = si::env::str("PF_XMX_GRED");
         int n = e ? atoi(e) : kGatherRed;
         return n < 1 ? 1 : (n > kGatherRedMax ? kGatherRedMax : n);
     }();
@@ -572,12 +573,12 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
     // to attribute the *mode-2* 512-token prefill attention, because the
     // engine's PF_PROF profiler requires PF_NOGRAPH, which forces the mode-1
     // 32-token chunk path instead.
-    const bool tm = getenv("PF_XMX_TIME") != nullptr;
+    const bool tm = si::env::flag("PF_XMX_TIME");
     // PF_XMX_BREAKDOWN=1: per-stage wall clock inside the block loop.  Every
     // stage is measured with a q.wait() on the in-order queue, so this
     // serialises and inflates the absolute numbers -- it is for *attribution*
     // (which stage owns the time), not for timing.
-    const bool brk = getenv("PF_XMX_BREAKDOWN") != nullptr;
+    const bool brk = si::env::flag("PF_XMX_BREAKDOWN");
     double b_gather = 0, b_qk = 0, b_sm = 0, b_pv = 0;
     long b_cols = 0, b_blocks = 0;
     std::chrono::steady_clock::time_point t_gather, t_qk, t_sm, t_pv;
@@ -588,7 +589,7 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
     }
     for (int kvh = 0; kvh < n_head_kv; kvh++) {
         const int M = Mtot;
-        if (getenv("PF_XMX_DBG") && kvh == 0) {
+        if (si::env::flag("PF_XMX_DBG") && kvh == 0) {
             fprintf(stderr, "[xmx] M=%d max_nkv=%d nblk@%d=", M, max_nkv, kBlk);
             for (int k0 = 0; k0 < max_nkv;) {
                 const int blk = (max_nkv - k0 > kBlk) ? kBlk : xmx_tail_blk(max_nkv - k0);

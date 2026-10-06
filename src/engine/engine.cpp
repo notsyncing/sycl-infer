@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include "common/env.h"
 
 namespace si {
 
@@ -27,7 +28,7 @@ static int resolve_device(int device, const std::string & layer_map) {
     if (device >= 0) {
         return device ? 1 : 0;
     }
-    if (const char * e = getenv("PF_DEVICE")) {
+    if (const char * e = si::env::str("PF_DEVICE")) {
         if (strcmp(e, "cpu") == 0 || strcmp(e, "host") == 0 || strcmp(e, "1") == 0) {
             return 1;
         }
@@ -111,7 +112,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     tk.load(m.gguf);
     // MTP draft length: --mtp N (0/absent = off), PF_MTP as an env override.
     mtp_k = mtp_k_arg;
-    if (const char * em = getenv("PF_MTP")) {
+    if (const char * em = si::env::str("PF_MTP")) {
         const int v = atoi(em);
         if (v >= 0) {
             mtp_k = v;
@@ -126,13 +127,13 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     }
     mtp_on = mtp_k > 0;
     {
-        const char * e = getenv("PF_MTP_SPLITS");
+        const char * e = si::env::str("PF_MTP_SPLITS");
         if (e) {
             mtp_splits = atoi(e);
         }
         mtp_splits = std::min(std::max(mtp_splits, 1), kMaxDecSplits);
     }
-    if (mtp_on && getenv("PF_MTP_FORCE_INT8") != nullptr) {
+    if (mtp_on && si::env::flag("PF_MTP_FORCE_INT8")) {
         // Historical: the native q5/cb4 stores used to prefill the tensor back to
         // int8 in a per-pass scratch, which a multi-token verify paid every cycle.
         // The batched native GEMM (nat_gemm_launch) now consumes the k5/cb4/u4
@@ -141,7 +142,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         setenv("PF_CB4", "0", 1);
         setenv("PF_K5", "0", 1);
     }
-    if (const char * ed = getenv("PF_MTP_DEV")) {
+    if (const char * ed = si::env::str("PF_MTP_DEV")) {
         mtp_dev = atoi(ed);
     }
     if (!layer_map.empty()) {
@@ -166,13 +167,13 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     // DFlash / DFlash2 drafter (--spec-type dflash2): its own GGUF, its own K/V
     // ring, and the feature-capture hook record_forward bakes into the graphs.
     df_kmax_ = draft_k_arg;
-    if (const char * e = getenv("PF_DFLASH_NMAX")) {
+    if (const char * e = si::env::str("PF_DFLASH_NMAX")) {
         const int v = atoi(e);
         if (v > 0) {
             df_kmax_ = v;
         }
     }
-    if (const char * e = getenv("PF_DFLASH_DEV")) {
+    if (const char * e = si::env::str("PF_DFLASH_DEV")) {
         df_dev_ = atoi(e);
     }
     if (draft_dev > 0) {
@@ -202,7 +203,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // The MTP draft does not depend on this gate: it has its own mtp_splits
         // cap (PF_MTP_SPLITS), because a single-token attention over a long KV
         // is the worst case for a fixed 1-split grid (13x at 128k).
-        const char * emd = getenv("PF_MD_SPLITS");
+        const char * emd = si::env::str("PF_MD_SPLITS");
         if (!(emd && atoi(emd) != 0)) {
             n_splits = 1;
             dec_splits = 1;
@@ -215,7 +216,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // fp32 scale side arrays: measured as a net loss on this GPU (the packed
         // scales share cache lines with the weights; a separate array adds a
         // memory stream) -> opt-in only (PF_META=1, ~260 MB)
-        const char * envm = getenv("PF_META");
+        const char * envm = si::env::str("PF_META");
         use_meta32 = !cpu_mode && !multi_dev && envm && atoi(envm) != 0;
         if (use_meta32) {
             build_meta32(q);
@@ -223,11 +224,11 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // int8 GEMM is on by default on both backends.  The GPU packs the SIn
         // w8 copies; the CPU's integer kernel reads the GGUF blocks directly,
         // so it does not build (or pay for) the w8 copies.
-        const char * env = getenv("PF_DP4A");
+        const char * env = si::env::str("PF_DP4A");
         const bool dp4a_env_off = env && atoi(env) == 0;
         pf8 = !multi_dev && !dp4a_env_off;
         // PF_DP4A_DEC=0 forces the fp32 decode (both backends)
-        const char * envd = getenv("PF_DP4A_DEC");
+        const char * envd = si::env::str("PF_DP4A_DEC");
         pf8_dec = pf8 && !(envd && atoi(envd) == 0);
         if (pf8 && !cpu_mode) {
             m.build_w8(q); // SI8 copies cost ~700 MB; only the GPU needs them
@@ -270,7 +271,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // GPU's sub-group lattice.  The old default was kMaxSplits (64); 128
         // (an earlier change) measured 2.177 ms at 64k depth against 160's
         // 1.699.
-        const char * e = getenv("PF_DEC_SPLIT");
+        const char * e = si::env::str("PF_DEC_SPLIT");
         if (e) {
             dec_splits = atoi(e);
         } else {
@@ -291,7 +292,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         if (dec_splits > kMaxDecSplits) {
             dec_splits = kMaxDecSplits;
         }
-        const char * ep = getenv("PF_PREFIX_CACHE");
+        const char * ep = si::env::str("PF_PREFIX_CACHE");
         pc_enabled = !(ep && atoi(ep) == 0);
         // multi-device note: block ids and recurrent-state checkpoints are global
         // (host-USM shared buffers), so the three-tier cache works here too; only
@@ -319,11 +320,11 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         }
         int states = -1;
         if (vram_mb < 0) {
-            if (const char * en = getenv("PF_PC_STATES")) {
+            if (const char * en = si::env::str("PF_PC_STATES")) {
                 states = atoi(en);
-            } else if (const char * ev = getenv("PF_PC_VRAM_MB")) {
+            } else if (const char * ev = si::env::str("PF_PC_VRAM_MB")) {
                 vram_mb = atoi(ev);
-            } else if (const char * em = getenv("PF_PC_MEM_MB")) {
+            } else if (const char * em = si::env::str("PF_PC_MEM_MB")) {
                 vram_mb = atoi(em);
             }
         }
@@ -337,9 +338,9 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         if (states < 0) {
             states = 8; // historical default
         }
-        const int ram_mb = pc_ram_mb >= 0 ? pc_ram_mb : (getenv("PF_PC_RAM_MB") ? atoi(getenv("PF_PC_RAM_MB")) : 512);
+        const int ram_mb = pc_ram_mb >= 0 ? pc_ram_mb : (si::env::str("PF_PC_RAM_MB") ? atoi(si::env::str("PF_PC_RAM_MB")) : 512);
         const int disk_mb =
-            pc_disk_mb >= 0 ? pc_disk_mb : (getenv("PF_PC_DISK_MB") ? atoi(getenv("PF_PC_DISK_MB")) : 1024);
+            pc_disk_mb >= 0 ? pc_disk_mb : (si::env::str("PF_PC_DISK_MB") ? atoi(si::env::str("PF_PC_DISK_MB")) : 1024);
         size_t ram_bytes = (size_t)std::max(ram_mb, 0) * 1024 * 1024;
         size_t disk_bytes = (size_t)std::max(disk_mb, 0) * 1024 * 1024;
         size_t vram_bytes = (size_t)std::max(states, 0) * per_node;
@@ -388,7 +389,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // "0 = unbounded" meaning).
         if (!pc_dir_arg.empty()) {
             pc_dir = pc_dir_arg;
-        } else if (const char * ed = getenv("PF_PC_DIR")) {
+        } else if (const char * ed = si::env::str("PF_PC_DIR")) {
             pc_dir = ed;
         }
         if (tiers_clamped && pc_disk_bytes == 0) {
@@ -414,37 +415,29 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
             }
         };
         for (auto & L : m.layers) {
-            add(L.ffn_gate, L.ffn_gate8);
-            add(L.ffn_up, L.ffn_up8);
-            add(L.ffn_down, L.ffn_down8);
-            if (L.recurrent) {
-                add(L.wqkv, L.wqkv8);
-                add(L.wgate, L.wgate8);
-                add(L.ssm_out, L.ssm_out8);
-            } else {
-                add(L.wq, L.wq8);
-                add(L.wk, L.wk8);
-                add(L.wv, L.wv8);
-                add(L.wo, L.wo8);
+            layer_t::wl wls[7];
+            const int nw = L.lay_wts(wls);
+            for (int i = 0; i < nw; i++) {
+                add(*wls[i].w, *wls[i].w8);
             }
         }
         // the LM head runs on the single-token dp4a GEMV in mode 2 (no conversion)
         // pre-execute every cached primitive once so the first real request does
         // not pay the one-time kernel load (measured as first-vs-later ttfr)
-        const char * envw = getenv("PF_DNNL_NOWARM");
+        const char * envw = si::env::str("PF_DNNL_NOWARM");
         if (!(envw && atoi(envw) != 0)) {
             dnnl->warmup();
         }
     } else if (multi_dev && !md_int8 && !md_xmx && dnnl_gemm_enabled() &&
                [&] {
-                   const char * en = getenv("PF_DP4A");
+                   const char * en = si::env::str("PF_DP4A");
                    return !(en && atoi(en) == 0); // PF_DP4A=0 forces the fp32 path
                }()) {
         // one dnnl_gemm per GPU backend, holding only the layers that device
         // computes (the CPU partitions keep the fp32/i8 host path).  Every
         // prefill GEMM tensor of a GPU layer is converted - including the
         // small ssm_beta/ssm_alpha, which ride in the wqkv call.
-        const char * envw = getenv("PF_DNNL_NOWARM");
+        const char * envw = si::env::str("PF_DNNL_NOWARM");
         const bool nowarm = envw && atoi(envw) != 0;
         dnnl_dev_.resize(backends_.size());
         for (size_t d = 0; d < backends_.size(); d++) {
@@ -478,22 +471,14 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
                 if (layer_dev_[(size_t)il] != (int)d) {
                     continue;
                 }
-                const layer_t & L = m.layers[il];
-                add(L.ffn_gate);
-                add(L.ffn_up);
-                add(L.ffn_down);
+                layer_t & L = m.layers[il];
+                layer_t::wl wls[7];
+                const int nw = L.lay_wts(wls, /*with_w8t=*/false);
+                for (int i = 0; i < nw; i++) {
+                    add(*wls[i].w);
+                }
                 add(L.ssm_beta);
                 add(L.ssm_alpha);
-                if (L.recurrent) {
-                    add(L.wqkv);
-                    add(L.wgate);
-                    add(L.ssm_out);
-                } else {
-                    add(L.wq);
-                    add(L.wk);
-                    add(L.wv);
-                    add(L.wo);
-                }
             }
             if (!nowarm) {
                 D->warmup();
@@ -534,7 +519,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         pool_initial = n_blocks_;
     }
     {
-        const char * eg = getenv("PF_KV_GROW");
+        const char * eg = si::env::str("PF_KV_GROW");
         if (eg) {
             pool_chunk = atoi(eg);
         }
@@ -628,6 +613,124 @@ engine::~engine() {
     f(d_segs_pf);
     f(d_segs_pf8);
     f(d_segs_pf8_nh);
+    // MTP / DFlash speculative-decoding buffers (both are pure device/USM
+    // allocations; the drafts share the verify machinery)
+    {
+        sycl::queue & qm = dev_queue(mtp_dev);
+        sycl::queue & qf0 = dev_queue(0);
+        sycl::queue & qd0 = dev_queue(df_dev_);
+        auto fm = [&](auto * p) {
+            if (p) {
+                sycl::free(p, qm);
+            }
+        };
+        auto f0 = [&](auto * p) {
+            if (p) {
+                sycl::free(p, qf0);
+            }
+        };
+        auto fd = [&](auto * p) {
+            if (p) {
+                sycl::free(p, qd0);
+            }
+        };
+        fm(d_mtp_cat);
+        fm(d_mtp_x);
+        fm(d_mtp_xnorm);
+        fm(d_mtp_qbuf);
+        fm(d_mtp_kbuf);
+        fm(d_mtp_vbuf);
+        fm(d_mtp_attn_out);
+        fm(d_mtp_ffn);
+        fm(d_mtp_hnorm);
+        fm(d_mtp_raw);
+        fm(d_mtp_partials);
+        fm(d_mtp_hprev);
+        // d_mtp_hnorm0 aliases d_mtp_hnorm whenever mtp_dev == 0
+        if (d_mtp_hnorm0 != d_mtp_hnorm) {
+            f0(d_mtp_hnorm0);
+        }
+        if (d_mtp_hnorm1) {
+            sycl::free(d_mtp_hnorm1, dev_queue(1));
+        }
+        f(d_mtp_main_h);
+        f0(d_mtp_tok_);
+        fm(d_mtp_tokx_);
+        f0(d_mtp_cand_);
+        f0(d_mtp_cvals_);
+        f0(d_mtp_cval1_);
+        f0(d_mtp_amv_);
+        f0(d_argmax_buf_);
+        f0(d_argval_buf_);
+        f0(d_am2_);
+        if (d_mtp_rinfo) {
+            sycl::free(d_mtp_rinfo, q);
+        }
+        if (d_mtp_info) {
+            sycl::free(d_mtp_info, q);
+        }
+        f(d_segs_vf);
+        f(d_segs_mtp);
+        f(d_segs_mtp_exact);
+        f(h_head_stage);
+        for (size_t d = 0; d < d_mtp_hist_.size(); d++) {
+            sycl::queue & qd = dev_queue((int)d);
+            auto fz = [&](auto * p) {
+                if (p) {
+                    sycl::free(p, qd);
+                }
+            };
+            fz(d_mtp_hist_[d]);
+            fz(d_mtp_convsave_[d]);
+            fz(d_mtp_rin_[d]);
+            fz(d_mtp_qsave_[d]);
+            fz(d_mtp_ssave_[d]);
+        }
+        d_mtp_hist_.clear();
+        d_mtp_convsave_.clear();
+        d_mtp_rin_.clear();
+        d_mtp_qsave_.clear();
+        d_mtp_ssave_.clear();
+        f(d_df_h);
+        f(d_df_b);
+        f(d_df_c);
+        f(d_df_qkv);
+        f(d_df_gu);
+        f(d_df_dyn);
+        f(d_df_gate);
+        f(d_df_partials);
+        f(d_df_feat);
+        f(d_df_feat_dev);
+        fd(d_df_kring);
+        fd(d_df_vring);
+        f(d_df_pos);
+        f(d_df_ids);
+        f(d_df_vals);
+        f(d_df_pids);
+        f(d_df_pvals);
+        f(d_df_lattice);
+        if (d_df_info) {
+            sycl::free(d_df_info, q);
+        }
+        d_mtp_cat = d_mtp_x = d_mtp_xnorm = d_mtp_qbuf = d_mtp_kbuf = d_mtp_vbuf = nullptr;
+        d_mtp_attn_out = d_mtp_ffn = d_mtp_hnorm = d_mtp_raw = nullptr;
+        d_mtp_partials = d_mtp_hprev = d_mtp_main_h = d_mtp_hnorm0 = nullptr;
+        d_mtp_rinfo = d_mtp_info = nullptr;
+        d_segs_vf = d_segs_mtp = d_segs_mtp_exact = nullptr;
+        d_mtp_tok_ = d_mtp_tokx_ = d_mtp_cand_ = nullptr;
+        d_mtp_cvals_ = d_mtp_cval1_ = d_mtp_amv_ = nullptr;
+        d_mtp_hnorm1 = nullptr;
+        d_argmax_buf_ = d_am2_ = nullptr;
+        d_argval_buf_ = nullptr;
+        h_head_stage = nullptr;
+        d_df_h = d_df_b = d_df_c = d_df_qkv = d_df_gu = d_df_dyn = d_df_gate = nullptr;
+        d_df_partials = d_df_feat = d_df_feat_dev = nullptr;
+        d_df_kring = d_df_vring = nullptr;
+        d_df_pos = nullptr;
+        d_df_ids = d_df_pids = nullptr;
+        d_df_vals = d_df_pvals = d_df_lattice = nullptr;
+        d_df_info = nullptr;
+    }
     for (int i = 0; i < kPfSlots; i++) {
         f(d_segs_pf_slot[i]);
         f(d_segs_pf_nh_slot[i]);
@@ -735,17 +838,49 @@ void engine::build_meta32(sycl::queue & q) {
     };
     add(m.tok_embd);
     for (auto & L : m.layers) {
-        add(L.ffn_gate);
-        add(L.ffn_up);
-        add(L.ffn_down);
-        add(L.wqkv);
-        add(L.wgate);
-        add(L.ssm_out);
-        add(L.wq);
-        add(L.wk);
-        add(L.wv);
-        add(L.wo);
+        layer_t::wl wls[7];
+        const int nw = L.lay_wts(wls, /*with_w8t=*/false);
+        for (int i = 0; i < nw; i++) {
+            add(*wls[i].w);
+        }
     }
+}
+
+std::vector<engine::md_phase> engine::split_md_phases() const {
+    std::vector<md_phase> phs;
+    md_phase p{};
+    p.dev = 0;
+    p.embed = true;
+    int il = 0;
+    while (il < m.hp.n_layer) {
+        const int d = layer_dev_[(size_t)il];
+        int j = il;
+        while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
+            j++;
+        }
+        if (p.l0 == p.l1 && p.dev == d) {
+            p.l1 = j; // the embedding-only phase continues into this run
+        } else {
+            phs.push_back(p);
+            md_phase q{};
+            q.dev = d;
+            q.l0 = il;
+            q.l1 = j;
+            p = q;
+        }
+        il = j;
+    }
+    if (p.dev == 0) {
+        p.head = true;
+        phs.push_back(p);
+    } else {
+        phs.push_back(p);
+        md_phase h{};
+        h.dev = 0;
+        h.head = true;
+        phs.push_back(h);
+    }
+    return phs;
 }
 
 void * engine::alloc_bytes(size_t bytes) {
@@ -1128,7 +1263,7 @@ bool engine::setup_md_dnnl() {
     if (!dnnl_gemm_enabled()) {
         return false;
     }
-    if (const char * en = getenv("PF_DP4A"); en && atoi(en) == 0) {
+    if (const char * en = si::env::str("PF_DP4A"); en && atoi(en) == 0) {
         return false; // PF_DP4A=0 forces the fp32 path
     }
     dnnl_dev_.clear();
@@ -1141,7 +1276,7 @@ bool engine::setup_md_dnnl() {
     // acceptance moves with it (p1 unchanged, p0 -6%, p2 -8%; net -0.3%
     // end-to-end over three prompts).  PF_MTP_HEAD_SPLIT=1 turns it on.
     const bool head_split = [] {
-        const char * e = getenv("PF_MTP_HEAD_SPLIT");
+        const char * e = si::env::str("PF_MTP_HEAD_SPLIT");
         return e && atoi(e) != 0;
     }();
     bool head_split_pending_ = false;
@@ -1167,18 +1302,18 @@ bool engine::setup_md_dnnl() {
         // bandwidth the card has relative to its compute -- a per-device
         // measurement, hence the profile default.  PF_W4=0 restores pure int8.
         static const bool w4_on = [] {
-            const char * e = getenv("PF_W4");
+            const char * e = si::env::str("PF_W4");
             return e ? atoi(e) != 0 : si::dev::active().wt.w4 != 0;
         }();
         int n_w4 = 0, n_i8 = 0, n_cb = 0, n_k5 = 0;
         // PF_K5=0 keeps Q5_K on the int8 conversion (A/B knob)
         static const bool add_k5 = [] {
-            const char * e = getenv("PF_K5");
+            const char * e = si::env::str("PF_K5");
             return e ? atoi(e) != 0 : si::dev::active().wt.k5 != 0;
         }();
         // PF_CB4=0 keeps IQ4_XS/IQ4_NL on the int8 conversion (A/B knob)
         static const bool add_cb = [] {
-            const char * e = getenv("PF_CB4");
+            const char * e = si::env::str("PF_CB4");
             return e ? atoi(e) != 0 : si::dev::active().wt.cb4 != 0;
         }();
         auto add = [&](const wt & t) {
@@ -1236,7 +1371,7 @@ bool engine::setup_md_dnnl() {
             // 0.5 ms/cycle more, because the layer's error compounds down the
             // draft chain (the head's single readout does not).
             static const bool layer_w4 = [] {
-                const char * e = getenv("PF_MTP_LAYER_W4");
+                const char * e = si::env::str("PF_MTP_LAYER_W4");
                 return !(e && atoi(e) == 0);
             }();
             const mtp_layer_t & M = m.mtp;
@@ -1249,7 +1384,7 @@ bool engine::setup_md_dnnl() {
             // int8 (acc 2.14 either way, PF_MTP_LAYER_EXACT) - so this localises
             // which tensor's u4 store is the problem.
             static const int w4_call = [] {
-                const char * e = getenv("PF_MTP_LAYER_W4_CALL");
+                const char * e = si::env::str("PF_MTP_LAYER_W4_CALL");
                 return e ? atoi(e) : -99;
             }();
             // PF_MTP_LAYER_W2=1: the 2-bit draft store (0.375 B/weight) for the
@@ -1258,11 +1393,11 @@ bool engine::setup_md_dnnl() {
             // cheapest correct store is the right one - and unlike the u4 store
             // this one does not need the even/odd activation planes.
             static const bool layer_w2 = [] {
-                const char * e = getenv("PF_MTP_LAYER_W2");
+                const char * e = si::env::str("PF_MTP_LAYER_W2");
                 return e && atoi(e) != 0;
             }();
             static const int w2_call = [] {
-                const char * e = getenv("PF_MTP_LAYER_W2_CALL");
+                const char * e = si::env::str("PF_MTP_LAYER_W2_CALL");
                 return e ? atoi(e) : -99;
             }();
             auto add_mtp = [&](const wt & t, int ci) {
@@ -1321,7 +1456,7 @@ bool engine::setup_md_dnnl() {
             // the verify always uses the int8 head).
             if (mtp_on) {
                 static const bool head_w4 = [] {
-                    const char * e = getenv("PF_MTP_HEAD_W4");
+                    const char * e = si::env::str("PF_MTP_HEAD_W4");
                     return !e || atoi(e) != 0;
                 }();
                 if (head_w4) {
@@ -1334,19 +1469,19 @@ bool engine::setup_md_dnnl() {
                     // ~2% of the acceptance with it, which cancels the saving
                     // end to end (32.4 vs 32.0 ms/token on a code prompt).
                     static const bool head_w2 = [] {
-                        const char * e = getenv("PF_MTP_HEAD_W2");
+                        const char * e = si::env::str("PF_MTP_HEAD_W2");
                         return e && atoi(e) != 0;
                     }();
                     if (head_w2 && mtp_head_w4_) {
-                        const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                        const wt & hd = draft_head();
                         mtp_head_w2_ = D->add_weight_w2(mtp_head_w2_key_, hd.data, hd.type, hd.K, hd.N);
-                        if (getenv("PF_MTP_MEM")) {
+                        if (si::env::flag("PF_MTP_MEM")) {
                             fprintf(stderr, "[mtp] draft LM head: %d rows x %d K, %s\n", (int)hd.N, (int)hd.K,
                                     mtp_head_w2_ ? "2-bit copy ok" : "2-bit copy failed");
                         }
                     }
-                    if (getenv("PF_MTP_MEM")) {
-                        const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                    if (si::env::flag("PF_MTP_MEM")) {
+                        const wt & hd = draft_head();
                         auto pr = [&](const char * nm, const wt & t) {
                             fprintf(stderr, "[mtp] layer %-12s K=%d N=%d type=%d\n", nm, (int)t.K, (int)t.N,
                                     (int)t.type);
@@ -1367,7 +1502,7 @@ bool engine::setup_md_dnnl() {
                     // dnnl_gemm owns the allocations).  PF_MTP_HEAD_SPLIT=0 keeps
                     // the whole readout on device 0.
                     if (head_split && mtp_head_w4_) {
-                        const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                        const wt & hd = draft_head();
                         head_split_N_ = hd.N;
                         head_split_K_ = hd.K;
                         head_split_pending_ = hd.N / 2 > 0;
@@ -1382,22 +1517,14 @@ bool engine::setup_md_dnnl() {
             if (layer_dev_[(size_t)il] != (int)d) {
                 continue;
             }
-            const layer_t & L = m.layers[(size_t)il];
-            add(L.ffn_gate);
-            add(L.ffn_up);
-            add(L.ffn_down);
+            layer_t & L = m.layers[(size_t)il];
+            layer_t::wl wls[7];
+            const int nw = L.lay_wts(wls, /*with_w8t=*/false);
+            for (int i = 0; i < nw; i++) {
+                add(*wls[i].w);
+            }
             add(L.ssm_beta);
             add(L.ssm_alpha);
-            if (L.recurrent) {
-                add(L.wqkv);
-                add(L.wgate);
-                add(L.ssm_out);
-            } else {
-                add(L.wq);
-                add(L.wk);
-                add(L.wv);
-                add(L.wo);
-            }
         }
         if (dev_ok) {
             fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
@@ -1408,7 +1535,7 @@ bool engine::setup_md_dnnl() {
             // identical GEMV over disjoint rows, so every logit is bit-identical
             // to the single-device readout and only the argmax pair crosses.
             if (d == 1 && head_split_pending_ && mtp_head_w4_) {
-                const wt & hd = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                const wt & hd = draft_head();
                 const int half = head_split_N_ / 2;
                 const size_t rb = (size_t)quant_row_bytes(hd.type, hd.K);
                 // device 0's low half replaces its full-tensor entry so it does
@@ -1427,7 +1554,7 @@ bool engine::setup_md_dnnl() {
                 }
                 head_split_pending_ = false;
             }
-            const char * envw = getenv("PF_DNNL_NOWARM");
+            const char * envw = si::env::str("PF_DNNL_NOWARM");
             if (!(envw && atoi(envw) != 0)) {
                 D->warmup();
             }
@@ -1596,39 +1723,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
     // partition split (device 0 with the embedding, device 1, device 0 with the
     // head); anything else keeps the synchronous path.
     {
-        std::vector<md_phase> phs;
-        md_phase p{};
-        p.dev = 0;
-        p.embed = true;
-        int il = 0;
-        while (il < m.hp.n_layer) {
-            const int d = layer_dev_[(size_t)il];
-            int j = il;
-            while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
-                j++;
-            }
-            if (p.l0 == p.l1 && p.dev == d) {
-                p.l1 = j;
-            } else {
-                phs.push_back(p);
-                md_phase q{};
-                q.dev = d;
-                q.l0 = il;
-                q.l1 = j;
-                p = q;
-            }
-            il = j;
-        }
-        if (p.dev == 0) {
-            p.head = true;
-            phs.push_back(p);
-        } else {
-            phs.push_back(p);
-            md_phase h{};
-            h.dev = 0;
-            h.head = true;
-            phs.push_back(h);
-        }
+        std::vector<md_phase> phs = split_md_phases();
         bool gpu_only = true;
         for (const md_phase & ph : phs) {
             if (ph.dev < 0 || (size_t)ph.dev >= dev_kind_.size() || dev_kind_[(size_t)ph.dev] != 0) {
@@ -1637,7 +1732,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
         }
         const bool two_phase = phs.size() == 3 && phs[0].dev == 0 && phs[0].embed && !phs[0].head
                                && phs[1].dev == 1 && !phs[1].head && phs[2].dev == 0 && phs[2].head;
-        const char * epp = getenv("PF_PF_PIPE");
+        const char * epp = si::env::str("PF_PF_PIPE");
         const bool pipe_env = !(epp && atoi(epp) == 0);
         md_pf_phases_ = phs;
         pf_pipe_ok_ = two_phase && gpu_only && pipe_env;
@@ -1648,7 +1743,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
     // support: oneDNN int8 (XMX, both prefill and decode) -> SIn/w8 dp4a (when
     // oneDNN is unavailable or PF_GEMM_DNNL=0) -> raw fp32 (PF_DP4A=0).
     {
-        const char * env = getenv("PF_DP4A");
+        const char * env = si::env::str("PF_DP4A");
         const bool dp4a_env_off = env && atoi(env) == 0;
         md_xmx = has_gpu && !dp4a_env_off && setup_md_dnnl();
         md_int8 = has_gpu && !dp4a_env_off && !md_xmx;
@@ -1854,11 +1949,11 @@ void engine::alloc_buffers() {
         // the time even at 16384 rows, and losing drafts costs more than the head
         // bytes save, so the default is off.  See the report.
         {
-            const char * ce = getenv("PF_MTP_CAND");
+            const char * ce = si::env::str("PF_MTP_CAND");
             // default OFF: measured a net loss (the candidate set only catches ~80% of the
             // next argmax even at 16384 rows, and lost drafts cost more than the head bytes save)
             const int cap = ce ? atoi(ce) : 0;
-            const char * me = getenv("PF_MTP_CANDM");
+            const char * me = si::env::str("PF_MTP_CANDM");
             mtp_cand_margin_ = me ? (float)atof(me) : 20.0f;
             // the device-resident draft chain's per-step token buffer (the head's
             // argmax -> the next step's concat); needed whether or not the
@@ -1872,12 +1967,12 @@ void engine::alloc_buffers() {
                 d_mtp_cval1_ = (float *)dev_alloc_on(0, 64);
                 d_mtp_amv_ = (float *)dev_alloc_on(0, 64);
                 {
-                    const char * se = getenv("PF_MTP_CANDSRC");
+                    const char * se = si::env::str("PF_MTP_CANDSRC");
                     mtp_cand_src_ = se ? atoi(se) : 1;
                 }
                 // the head's grouped int8 view (the gather reads it directly; the
                 // u4 draft copy is not needed for a 256-row readout)
-                const wt & head = m.mtp.shared_head.data ? m.mtp.shared_head : m.output;
+                const wt & head = draft_head();
                 dnnl_gemm * D0 = dnnl_for(0);
                 if (D0 != nullptr) {
                     const void * hk = wkey(0, head.data);
@@ -1909,7 +2004,7 @@ void engine::alloc_buffers() {
             if (ng <= 0) {
                 continue;
             }
-            if (getenv("PF_MTP_MEM") != nullptr) {
+            if (si::env::flag("PF_MTP_MEM")) {
                 auto ty = [&](void * p) {
                     switch (sycl::get_pointer_type(p, q.get_context())) {
                         case sycl::usm::alloc::host: return "host";
@@ -2050,7 +2145,7 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
         d_info->tokens[i] = toks[start + i];
     }
     // PF_NOGRAPH=1: run the recorded sequence directly (diagnostics/PF_PROF)
-    static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    static const bool nog = si::env::flag("PF_NOGRAPH");
     if (cpu_mode || multi_dev) {
         if (pf8 || multi_dev) {
             // full-chunk path: SI8 on single-device CPU, per-device oneDNN/w8
@@ -2172,7 +2267,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     if (cpu_mode) {
         throw std::runtime_error("prefill_batch: not supported on the CPU backend");
     }
-    static const bool dbg_pfb = getenv("PF_DBG_PFB") != nullptr;
+    static const bool dbg_pfb = si::env::flag("PF_DBG_PFB");
     if (multi_dev && pf_pipe_ok_) {
         // Pipelined: finish the previous chunk's device-1 phase, then enqueue
         // this chunk's device-0 phase, so the two devices run different chunks
@@ -2202,7 +2297,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     if (dbg_pfb) {
         fprintf(stderr, "[pfb] n=%d NCH=%d segs=%zu x8=%p\n", n, NCH, plan_pfb_.segs.size(), (void *)d_x8);
     }
-    static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    static const bool nog = si::env::flag("PF_NOGRAPH");
     // oneDNN primitives cannot be recorded into a SYCL command graph, so the
     // PF_GEMM_DNNL path always uses the direct (non-graph) replay of mode 2.
     // Multi-device has no recorded graphs at all, so it also always goes direct:
@@ -2486,11 +2581,11 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // PF_DUMP_GEN: log the decode loop's decisions (the sampled id, whether it
     // is an EOS, why the loop stopped) - a token that is never emitted (because
     // the EOS check runs before `cb`) is otherwise invisible from the CLI.
-    static const bool dbg_gen = getenv("PF_DUMP_GEN") != nullptr;
+    static const bool dbg_gen = si::env::flag("PF_DUMP_GEN");
     // PF_DUMP_DEC_LOGITS=<prefix>: write the logits the sampler sees at every
     // step (prefix.0.bin = the prompt prefill, prefix.1.bin = the first decode)
     // so a decode step can be diffed against a prefill of the same sequence.
-    const char * dbg_lg = getenv("PF_DUMP_DEC_LOGITS");
+    const char * dbg_lg = si::env::str("PF_DUMP_DEC_LOGITS");
     for (int step = 0; step < gp.max_tokens; step++) {
         if (dbg_lg) {
             char path[512];

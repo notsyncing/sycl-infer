@@ -10,12 +10,13 @@
 #include <cstdio>
 #include <vector>
 #include <cstdlib>
+#include "common/env.h"
 
 namespace si {
 
 bool w4_all_enabled() {
     static const bool on = [] {
-        const char * e = getenv("PF_W4_ALL");
+        const char * e = si::env::str("PF_W4_ALL");
         return e && atoi(e) != 0;
     }();
     return on;
@@ -23,7 +24,7 @@ bool w4_all_enabled() {
 
 bool w4_k5_only() {
     static const bool on = [] {
-        const char * e = getenv("PF_W4_K5");
+        const char * e = si::env::str("PF_W4_K5");
         return e && atoi(e) != 0;
     }();
     return on;

@@ -4,11 +4,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "common/env.h"
 
 namespace si {
 
 void cpu_rmsnorm(const float * x, const float * w, float * out, int n_rows, int n, float eps) {
-    if (getenv("PF_CPU_DBG")) {
+    if (si::env::flag("PF_CPU_DBG")) {
         fprintf(stderr, "[cpu_rmsnorm] x=%p w=%p out=%p rows=%d n=%d\n", (const void *)x, (const void *)w,
                 (void *)out, n_rows, n);
     }

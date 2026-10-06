@@ -9,25 +9,26 @@
 
 #include "chat.h"
 #include "engine.h"
+#include "common/env.h"
 
 using namespace si;
 
 int main(int argc, char ** argv) {
     const char * model_path = argc > 1 ? argv[1] : "/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf";
     const char * text = argc > 2 ? argv[2] : "What is the capital of France? Answer in one word.";
-    const char * lm = getenv("TEST_LAYER_MAP");
+    const char * lm = si::env::str("TEST_LAYER_MAP");
     engine e(model_path, 2048, 16, 512, 0, "", -1, -1, -1, -1, -1, lm ? lm : "");
 
     std::vector<chat_msg> msgs{chat_msg("user", text)};
     const std::string rendered = render_chat(e.m.chat_template, msgs, true, false);
     std::vector<int> toks = e.tk.encode(rendered, true);
-    const char * w4 = getenv("PF_W4");
+    const char * w4 = si::env::str("PF_W4");
     printf("PF_W4=%s  prompt_tokens=%zu\n", w4 ? w4 : "(unset)", toks.size());
 
     std::vector<float> lg = e.eval(toks);
     // PF_DUMP_LOGITS=<path>: write the full logit vector so the int8 / u4 / fp32
     // paths can be compared against each other offline.
-    if (const char * lp = getenv("PF_DUMP_LOGITS")) {
+    if (const char * lp = si::env::str("PF_DUMP_LOGITS")) {
         if (FILE * fp = fopen(lp, "wb")) {
             fwrite(lg.data(), sizeof(float), lg.size(), fp);
             fclose(fp);

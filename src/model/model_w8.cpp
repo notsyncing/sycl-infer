@@ -73,16 +73,11 @@ static void free_w8_tensor(sycl::queue & q, w8t & t) {
 void model::free_w8(sycl::queue & q) {
     free_w8_tensor(q, output8);
     for (auto & L : layers) {
-        free_w8_tensor(q, L.ffn_gate8);
-        free_w8_tensor(q, L.ffn_up8);
-        free_w8_tensor(q, L.ffn_down8);
-        free_w8_tensor(q, L.wqkv8);
-        free_w8_tensor(q, L.wgate8);
-        free_w8_tensor(q, L.ssm_out8);
-        free_w8_tensor(q, L.wq8);
-        free_w8_tensor(q, L.wk8);
-        free_w8_tensor(q, L.wv8);
-        free_w8_tensor(q, L.wo8);
+        layer_t::wl wls[7];
+        const int nw = L.lay_wts(wls);
+        for (int i = 0; i < nw; i++) {
+            free_w8_tensor(q, *wls[i].w8);
+        }
     }
 }
 
@@ -96,18 +91,10 @@ void model::build_w8_one(sycl::queue & q, const wt & t, w8t & out) {
 void model::build_w8(sycl::queue & q, bool host) {
     build_w8_tensor(q, output, output8, host);
     for (auto & L : layers) {
-        build_w8_tensor(q, L.ffn_gate, L.ffn_gate8, host);
-        build_w8_tensor(q, L.ffn_up, L.ffn_up8, host);
-        build_w8_tensor(q, L.ffn_down, L.ffn_down8, host);
-        if (L.recurrent) {
-            build_w8_tensor(q, L.wqkv, L.wqkv8, host);
-            build_w8_tensor(q, L.wgate, L.wgate8, host);
-            build_w8_tensor(q, L.ssm_out, L.ssm_out8, host);
-        } else {
-            build_w8_tensor(q, L.wq, L.wq8, host);
-            build_w8_tensor(q, L.wk, L.wk8, host);
-            build_w8_tensor(q, L.wv, L.wv8, host);
-            build_w8_tensor(q, L.wo, L.wo8, host);
+        layer_t::wl wls[7];
+        const int nw = L.lay_wts(wls);
+        for (int i = 0; i < nw; i++) {
+            build_w8_tensor(q, *wls[i].w, *wls[i].w8, host);
         }
     }
 }

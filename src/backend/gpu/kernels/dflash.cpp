@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include "common/env.h"
 
 namespace si {
 
@@ -71,7 +72,7 @@ void df_conv_launch(queue & q, const float * x, const float * dyn, const float *
     // of the draft block forward's 20.5 ms to them (20 convs, ~2.5 MB total) while
     // each one is only 6 rows x 5120 channels x 2 taps, so 0.38 ms apiece is not
     // explained by the traffic.
-    if (getenv("PF_DFLASH_NOCONV")) {
+    if (si::env::flag("PF_DFLASH_NOCONV")) {
         return;
     }
     if (n_rows <= 0 || conv_k <= 0 || width <= 0) {
@@ -280,8 +281,8 @@ void df_attn_launch(queue & q, const float * qbuf, const void * kpool, const voi
     // PF_DFLASH_NOCOMMIT=1: drop the committed (injected) keys so every row sees
     // only the block.  Diagnostic: if the mask rows' attention recovers, the
     // injected K/V are what differs from llama.cpp, not the block's own.
-    const int nocmt = getenv("PF_DFLASH_NOCOMMIT") ? atoi(getenv("PF_DFLASH_NOCOMMIT")) : 0;
-    const int causblk = getenv("PF_DFLASH_CAUSAL") ? atoi(getenv("PF_DFLASH_CAUSAL")) : 0;
+    const int nocmt = si::env::str("PF_DFLASH_NOCOMMIT") ? atoi(si::env::str("PF_DFLASH_NOCOMMIT")) : 0;
+    const int causblk = si::env::str("PF_DFLASH_CAUSAL") ? atoi(si::env::str("PF_DFLASH_CAUSAL")) : 0;
     q.parallel_for(nd_range<1>((size_t)ngroup * 32, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
         const int g = (int)it.get_group(0);
         const int r = g / (n_head * n_splits);

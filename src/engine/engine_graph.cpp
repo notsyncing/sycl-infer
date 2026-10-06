@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "common/env.h"
 
 namespace si {
 
@@ -36,7 +37,7 @@ struct dnnl_capture_guard {
 static double prof_ci_t[256];
 static long prof_ci_n[256];
 static bool prof_on() {
-    static bool p = getenv("PF_PROF") != nullptr && getenv("PF_NOGRAPH") != nullptr;
+    static bool p = si::env::flag("PF_PROF") && si::env::flag("PF_NOGRAPH");
     return p && !g_capturing;
 }
 static double prof_acc[16];
@@ -394,12 +395,12 @@ static void dbg_dump_kv(sycl::queue & q, const float * kbuf, const float * vbuf,
     q.memcpy(hk.data(), kbuf, total * 4).wait();
     q.memcpy(hv.data(), vbuf, total * 4).wait();
     char path[512];
-    snprintf(path, sizeof(path), "%s/k_%02d.bin", getenv("PF_DUMP_KV"), il);
+    snprintf(path, sizeof(path), "%s/k_%02d.bin", si::env::str("PF_DUMP_KV"), il);
     if (FILE * fp = fopen(path, "ab")) {
         fwrite(hk.data(), 4, total, fp);
         fclose(fp);
     }
-    snprintf(path, sizeof(path), "%s/v_%02d.bin", getenv("PF_DUMP_KV"), il);
+    snprintf(path, sizeof(path), "%s/v_%02d.bin", si::env::str("PF_DUMP_KV"), il);
     if (FILE * fp = fopen(path, "ab")) {
         fwrite(hv.data(), 4, total, fp);
         fclose(fp);
@@ -422,7 +423,7 @@ struct launch_count {
     const void * seg_prev_key = nullptr;
     int seg_prev_k = 0, seg_prev_out = 0;
     void flush(int mode) {
-        if (getenv("PF_LAUNCHCNT") == nullptr) {
+        if (!si::env::flag("PF_LAUNCHCNT")) {
             return;
         }
         pass++;
@@ -466,20 +467,20 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     double c_embed = 0, c_gemv = 0, c_head = 0, c_attn = 0, c_gdn = 0, c_norm = 0;
     // PF_HOSTPROF: the same buckets as PF_PROF but without the per-stamp device
     // wait, so they measure *submission* cost instead of device time.
-    static const bool hostprof = getenv("PF_HOSTPROF") != nullptr;
+    static const bool hostprof = si::env::flag("PF_HOSTPROF");
     static const bool dbg_dump = [] {
-        const char * e = getenv("PF_DUMP_LAYERS");
+        const char * e = si::env::str("PF_DUMP_LAYERS");
         return e && atoi(e) != 0;
     }();
     // PF_DUMP_SEGS=<layer>: dump that layer's per-segment fields + output
     // fingerprint (-1 = every layer, noisy).  Diagnostic only.
     static const int dbg_segs = [] {
-        const char * e = getenv("PF_DUMP_SEGS");
+        const char * e = si::env::str("PF_DUMP_SEGS");
         return e ? atoi(e) : -2;
     }();
     double c_g8 = 0, c_gf = 0; // w8 GEMM vs fp32/side GEMV time inside gemv
     size_t ci = 0;
-    static const bool dbg_pfb2 = getenv("PF_DBG_PFB") != nullptr;
+    static const bool dbg_pfb2 = si::env::flag("PF_DBG_PFB");
     // Per-group timing under PF_PROF (PF_NOGRAPH mode only: waits serialize).
     // Multi-device runs each partition on its own queue, so the wait must target
     // the queue the current layer was enqueued on - waiting on `q` (the primary
@@ -698,14 +699,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         tot += sj.n_rows;
                     }
                     if (all) {
-                        static const bool nogemv = getenv("PF_ABL_NOGEMV") != nullptr;
+                        static const bool nogemv = si::env::flag("PF_ABL_NOGEMV");
                         if (!nogemv) {
                             cur_be->i8_row_gemv_multi(d_segs + gr.off, gr.n, tot, aq, asc, D->act_sum());
                         }
                         decoded = true;
                     }
                 }
-                static const bool nofuse = getenv("PF_NOFUSE") != nullptr;
+                static const bool nofuse = si::env::flag("PF_NOFUSE");
                 if (!decoded && !nofuse && gr.n > 1 && tbm <= 13) {
                     // Narrow int8 group: one launch for the whole group.  The
                     // GDN puts ssm_alpha and ssm_beta (48 rows each) in one
@@ -731,7 +732,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     if (ok) {
                         decoded = D->gemm_i8_group(keys, nrows, outs, plan.segs[gr.off].out_stride, res, alphas, gr.n,
                                                    tbm, plan.segs[gr.off].K);
-                        if (getenv("PF_FUSEDBG") != nullptr) {
+                        if (si::env::flag("PF_FUSEDBG")) {
                             static long fused = 0, tried = 0;
                             tried++;
                             fused += decoded;
@@ -749,7 +750,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         // order works, try the 4-bit one first.
                         static long c_w4 = 0, c_i8 = 0, c_fb = 0;
                         static const bool w4dbg = [] {
-                            const char * e = getenv("PF_W4_DEBUG");
+                            const char * e = si::env::str("PF_W4_DEBUG");
                             return e && atoi(e) != 0;
                         }();
                         g_lc.seg++;
@@ -840,7 +841,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // debug stops: 1 = after the first sub-layer of a layer, 2 = after post-attn
     // norm, 3 = after the first FFN GEMM, 4 = right after the embedding
     const int dbg_mid = [] {
-        const char * e = getenv("PF_DBG_MID");
+        const char * e = si::env::str("PF_DBG_MID");
         return e ? atoi(e) : 0;
     }();
 
@@ -867,7 +868,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     }
 
     const int stop_layer = [] {
-        const char * e = getenv("STOP_AFTER_LAYER");
+        const char * e = si::env::str("STOP_AFTER_LAYER");
         return e ? atoi(e) : -1;
     }();
     int prev_dev = 0; // embedding runs on the primary device
@@ -906,18 +907,18 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             prev_dev = dev;
         }
         static const bool nogdn = [] {
-            const char * e = getenv("PF_ABL_NOGDN");
+            const char * e = si::env::str("PF_ABL_NOGDN");
             return e && atoi(e) != 0;
         }();
         static const bool noattn = [] {
-            const char * e = getenv("PF_ABL_NOATTN");
+            const char * e = si::env::str("PF_ABL_NOATTN");
             return e && atoi(e) != 0;
         }();
                 // DFlash draft: this layer is one of the drafter's target_layers, so save
         // its *input* hidden state into the interleaved feature buffer the draft
         // injects from.  It must come after the device handoff above (d_x belongs
         // to this layer's device) and before any kernel can overwrite d_x.
-        static const bool df_nocap = getenv("PF_DFLASH_NOCAP") != nullptr;
+        static const bool df_nocap = si::env::flag("PF_DFLASH_NOCAP");
         if (dflash_on_ && d_df_feat && !df_nocap) {
             const int df_slot = df_tgt_slot(il);
             if (df_slot >= 0) {
@@ -953,7 +954,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
             // MTP spec verify: redirect the per-token snapshots into this
             // partition's GDN-state history (device-local, dense layer layout)
-            if (getenv("PF_MTP_INFOCHK") != nullptr && inf->pc_active) {
+            if (si::env::flag("PF_MTP_INFOCHK") && inf->pc_active) {
                 static int cnt = 0;
                 if (cnt++ < 4) {
                     fprintf(stderr, "[mtp] infochk rf: mtp_dt=%d pc_active=%d dev=%d nhist=%zu hist=%p\n", inf->mtp_dt,
@@ -984,7 +985,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             // (0) does not survive graph recording (repeated identical kernels
             // with USM args are not replayed per node), so it is diagnosed only.
             static const int fuse_gdn = [] {
-                const char * e = getenv("PF_GDN_FUSE");
+                const char * e = si::env::str("PF_GDN_FUSE");
                 const int v = e ? atoi(e) : 2;
                 return v == 1 ? 1 : 2;
             }();
@@ -1000,7 +1001,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                                          /*last_row_only=*/true, snap);
                 stamp(prof_acc[12], a_sub);
                 a_sub = tnow();
-                static const bool tdbg = getenv("PF_TIME") != nullptr;
+                static const bool tdbg = si::env::flag("PF_TIME");
                 if (fuse_gdn >= 2) {
                     if (tdbg && !g_capturing) {
                         q.wait();
@@ -1023,7 +1024,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 stamp(prof_acc[13], a_sub);
                 a_sub = tnow();
             } else if (!nogdn) {
-                static const bool dbg_g = getenv("PF_GDN_DBG") != nullptr;
+                static const bool dbg_g = si::env::flag("PF_GDN_DBG");
                 for (int r0 = 0; r0 < gdn_rows; r0++) {
                     const int rr0 = (mode == 2) ? r0 : 0;
                     const int rn = (mode == 2) ? 1 : nrows;
@@ -1075,7 +1076,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
         } else {
             gemv();
-            // pool layer stride is in bytes (kv_layer_stride, see kv_setup);
+            // pool layer stride is in bytes (kv_layer_stride / kv_v_layer_stride, see kv_setup);
             // multi-device indexes the pool of the device that owns this layer
             // by its device-local attention-layer index
             void * kp;
@@ -1086,16 +1087,16 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 const int d = layer_dev_[il];
                 const int la = layer_attn_local_[il];
                 kp = (char *)dev_kpool_[(size_t)d] + (size_t)la * kv_layer_stride;
-                vp = (char *)dev_vpool_[(size_t)d] + (size_t)la * kv_layer_stride;
+                vp = (char *)dev_vpool_[(size_t)d] + (size_t)la * kv_v_layer_stride;
                 ksc0 = dev_kscales_[(size_t)d] ? (char *)dev_kscales_[(size_t)d] + (size_t)la * kv_scale_stride
                                                : nullptr;
-                vsc0 = dev_vscales_[(size_t)d] ? (char *)dev_vscales_[(size_t)d] + (size_t)la * kv_scale_stride
+                vsc0 = dev_vscales_[(size_t)d] ? (char *)dev_vscales_[(size_t)d] + (size_t)la * kv_v_scale_stride
                                                : nullptr;
             } else {
                 kp = (char *)d_kpool + (size_t)attn_idx * kv_layer_stride;
-                vp = (char *)d_vpool + (size_t)attn_idx * kv_layer_stride;
+                vp = (char *)d_vpool + (size_t)attn_idx * kv_v_layer_stride;
                 ksc0 = d_kscales ? (char *)d_kscales + (size_t)attn_idx * kv_scale_stride : nullptr;
-                vsc0 = d_vscales ? (char *)d_vscales + (size_t)attn_idx * kv_scale_stride : nullptr;
+                vsc0 = d_vscales ? (char *)d_vscales + (size_t)attn_idx * kv_v_scale_stride : nullptr;
             }
             const auto a_a = tnow();
             // Attention split count for this forward.
@@ -1106,11 +1107,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             //  mode 2 recorded variants  split chosen at record time (hint)
             //  mode 1 (single-row)       n_splits
             static const int at_split = [] {
-                const char * e = getenv("PF_ATTN_SPLIT");
+                const char * e = si::env::str("PF_ATTN_SPLIT");
                 return e ? atoi(e) : 0;
             }();
             static const int at_split_keys = [] {
-                const char * e = getenv("PF_ATTN_SPLIT_KEYS");
+                const char * e = si::env::str("PF_ATTN_SPLIT_KEYS");
                 const int dflt = si::dev::active().attn.split_keys;
                 const int v = e ? atoi(e) : dflt;
                 return v > 0 ? v : dflt;
@@ -1118,7 +1119,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             // PF_ATTN_FUSE=0: keep the separate attn_combine kernel even when
             // n_splits == 1 (A/B knob; fusion is the default)
             static const bool at_fuse = [] {
-                const char * e = getenv("PF_ATTN_FUSE");
+                const char * e = si::env::str("PF_ATTN_FUSE");
                 return !(e && atoi(e) == 0);
             }();
             int nsp;
@@ -1162,7 +1163,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             cur_be->qk_norm_rope(d_qbuf, d_kbuf, d_vbuf, wf32(dev, L.q_norm), wf32(dev, L.k_norm), kp, vp, d_tables,
                                 inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
                                 max_blocks, nrows, nreal, ksc, vsc);
-            static const bool dbg_kv = getenv("PF_DUMP_KV") != nullptr;
+            static const bool dbg_kv = si::env::flag("PF_DUMP_KV");
             if (dbg_kv && !g_capturing && mode != 0) {
                 dbg_dump_kv(dev_queue(cur_dev), d_kbuf, d_vbuf, mode, nrows, nreal, hp.n_head_kv, hp.head_dim, il);
             }
@@ -1212,7 +1213,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 dbg_dump_fp(dev_queue(cur_dev), d_x + (size_t)last_slot * hp.n_embd, hp.n_embd, "layerlast", il,
                             cur_dev);
             }
-            if (const char * rp = getenv("PF_DUMP_RAW")) {
+            if (const char * rp = si::env::str("PF_DUMP_RAW")) {
                 dbg_dump_raw(dev_queue(cur_dev), d_x, hp.n_embd, rp, dbg_call_no, il, 0);
                 if (last_slot > 0) {
                     dbg_dump_raw(dev_queue(cur_dev), d_x + (size_t)last_slot * hp.n_embd, hp.n_embd, rp, dbg_call_no, il,
@@ -1300,7 +1301,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             c_g8 = c_gf = 0;
             prof_calls = 0;
             // PF_PROF_ALL: dump every call group (ms/step = ms/call * calls/step)
-            static const bool prof_all = getenv("PF_PROF_ALL") != nullptr;
+            static const bool prof_all = si::env::flag("PF_PROF_ALL");
             int idx[256];
             for (int i = 0; i < 256; i++) {
                 idx[i] = i;
@@ -1444,46 +1445,14 @@ void engine::build_plans() {
 }
 
 void engine::build_md_dec_graphs() {
-    static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    static const bool nog = si::env::flag("PF_NOGRAPH");
     if (!multi_dev || !(md_int8 || md_xmx) || !d_segs_dec8 || m.hp.n_layer <= 0 || nog) {
         return; // PF_NOGRAPH=1 keeps the direct replay (diagnostics/PF_PROF)
     }
     // Split the layer loop into contiguous device runs.  The embedding always
     // runs on the primary device and the output norm + head after the loop do
     // too, so the first phase carries the embedding and the last one the head.
-    std::vector<md_phase> phs;
-    md_phase p{};
-    p.dev = 0;
-    p.embed = true;
-    int il = 0;
-    while (il < m.hp.n_layer) {
-        const int d = layer_dev_[(size_t)il];
-        int j = il;
-        while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
-            j++;
-        }
-        if (p.l0 == p.l1 && p.dev == d) {
-            p.l1 = j; // the embedding-only phase continues into this run
-        } else {
-            phs.push_back(p);
-            md_phase q{};
-            q.dev = d;
-            q.l0 = il;
-            q.l1 = j;
-            p = q;
-        }
-        il = j;
-    }
-    if (p.dev == 0) {
-        p.head = true;
-        phs.push_back(p);
-    } else {
-        phs.push_back(p);
-        md_phase h{};
-        h.dev = 0;
-        h.head = true;
-        phs.push_back(h);
-    }
+    std::vector<md_phase> phs = split_md_phases();
 
     // a CPU partition runs host code, not kernels on a queue, so it cannot be
     // recorded; fall back to the direct replay for any mixed map
@@ -1498,7 +1467,7 @@ void engine::build_md_dec_graphs() {
     // partitions).  Diagnostic/A-B knob while bringing the multi-device graphs
     // up - a phase without a graph falls back to the direct replay.
     static const int graph_dev = [] {
-        const char * e = getenv("PF_MD_GRAPH_DEV");
+        const char * e = si::env::str("PF_MD_GRAPH_DEV");
         return e ? atoi(e) : -1; // -1 = every phase
     }();
     capture_guard cg;
@@ -1567,9 +1536,9 @@ void engine::replay_md_dec_graphs() {
 //     graphs are simply dropped once the context crosses the threshold and the
 //     direct replay (which re-decides per call) takes over.
 void engine::build_md_verify_graphs() {
-    static const bool nog = getenv("PF_NOGRAPH") != nullptr;
+    static const bool nog = si::env::flag("PF_NOGRAPH");
     static const int xmx_min = [] {
-        const char * e = getenv("PF_ATTN_XMX_MIN");
+        const char * e = si::env::str("PF_ATTN_XMX_MIN");
         return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
     }();
     // The verify runs draft_len + 1 rows.  For MTP that is mtp_k + 1, but DFlash2
@@ -1582,39 +1551,7 @@ void engine::build_md_verify_graphs() {
         return;
     }
     // phase split: one graph per contiguous device run, the head on the primary
-    std::vector<md_phase> phs;
-    md_phase p{};
-    p.dev = 0;
-    p.embed = true;
-    int il = 0;
-    while (il < m.hp.n_layer) {
-        const int d = layer_dev_[(size_t)il];
-        int j = il;
-        while (j < m.hp.n_layer && layer_dev_[(size_t)j] == d) {
-            j++;
-        }
-        if (p.l0 == p.l1 && p.dev == d) {
-            p.l1 = j;
-        } else {
-            phs.push_back(p);
-            md_phase q2{};
-            q2.dev = d;
-            q2.l0 = il;
-            q2.l1 = j;
-            p = q2;
-        }
-        il = j;
-    }
-    if (p.dev == 0) {
-        p.head = true;
-        phs.push_back(p);
-    } else {
-        phs.push_back(p);
-        md_phase h{};
-        h.dev = 0;
-        h.head = true;
-        phs.push_back(h);
-    }
+    std::vector<md_phase> phs = split_md_phases();
     for (const md_phase & ph : phs) {
         if (ph.dev < 0 || (size_t)ph.dev >= dev_kind_.size() || dev_kind_[(size_t)ph.dev] != 0) {
             return; // a CPU partition runs host code
@@ -1690,11 +1627,11 @@ bool engine::vf_graph_usable(int rows, int pos0) const {
     // the recorded attention is the classic kernel; once oneDNN's int8 matmul
     // would win, hand the pass back to the direct replay (which re-decides)
     static const int xmx_min = [] {
-        const char * e = getenv("PF_ATTN_XMX_MIN");
+        const char * e = si::env::str("PF_ATTN_XMX_MIN");
         return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
     }();
     static const bool xmx_on = [] {
-        const char * e = getenv("PF_ATTN_XMX");
+        const char * e = si::env::str("PF_ATTN_XMX");
         return !(e && atoi(e) == 0) && si::dev::active().attn.xmx;
     }();
     if (xmx_on && pos0 + rows > xmx_min) {
@@ -1817,7 +1754,7 @@ void engine::build_graphs() {
                     // recorded); the variant only carries its token count so
                     // batched_prefill_fit() still selects the same sizes
                     if (!use_dnnl) {
-                        const char * ese = getenv("PF_ATTN_SPLIT");
+                        const char * ese = si::env::str("PF_ATTN_SPLIT");
                         const int fixed = ese ? atoi(ese) : 0;
                         const int hint = fixed > 0 ? fixed : std::min({n_splits, 4, std::max(1, v.ntok / 128)});
                         v.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(),

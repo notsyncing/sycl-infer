@@ -15,6 +15,7 @@
 #include "chat.h"
 #include "json.hpp"
 #include "minja/chat-template.hpp"
+#include "common/env.h"
 
 namespace si {
 
@@ -23,7 +24,7 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
     if (tmpl.empty()) {
         return false;
     }
-    static const bool dbg = getenv("PF_CHAT_TMPL_DEBUG") != nullptr;
+    static const bool dbg = si::env::flag("PF_CHAT_TMPL_DEBUG");
     try {
         minja::chat_template ct(tmpl, /*bos_token=*/"", /*eos_token=*/"");
 

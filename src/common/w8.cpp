@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "quant.h"
+#include "common/env.h"
 
 namespace si {
 
@@ -140,7 +141,7 @@ static inline void pack6(const uint8_t * q, uint8_t * out) {
 
 static bool w8_force4() {
     static const bool f = [] {
-        const char * e = getenv("PF_SI4");
+        const char * e = si::env::str("PF_SI4");
         return e && atoi(e) != 0;
     }();
     return f;

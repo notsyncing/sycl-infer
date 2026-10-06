@@ -20,6 +20,7 @@
 #include "device/device_profile.h"
 #include "quant.h"
 #include "w4.h"
+#include "common/env.h"
 
 namespace si {
 
@@ -294,7 +295,7 @@ bool dnnl_gemm_enabled() {
     // default ON (the mode-2 int8 GEMMs run on oneDNN); PF_GEMM_DNNL=0 forces
     // the dp4a chunk-batched path, e.g. for bit-exact dp4a validation
     static const bool on = [] {
-        const char * e = getenv("PF_GEMM_DNNL");
+        const char * e = si::env::str("PF_GEMM_DNNL");
         return !(e && atoi(e) == 0) && si::dev::active().wt.gemm_dnnl;
     }();
     return on;
@@ -511,7 +512,7 @@ struct dnnl_gemm::impl {
         // it, so results are wrong - the point is to see via DNNL_VERBOSE whether
         // oneDNN then selects an XMX kernel for this small-M int8 matmul.
         static const int blocked = [] {
-            const char * e = getenv("PF_DNNL_BLOCKED");
+            const char * e = si::env::str("PF_DNNL_BLOCKED");
             return e ? atoi(e) : 0;
         }();
         auto wmd = memory::desc({K, N}, memory::data_type::s8,
@@ -723,7 +724,7 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
     p->q.memcpy(w.dev, hw.data(), nvals).wait();
     p->q.memcpy(w.scales, hs.data(), (size_t)ng * N * 2).wait();
     static const int blocked = [] {
-        const char * e = getenv("PF_DNNL_BLOCKED");
+        const char * e = si::env::str("PF_DNNL_BLOCKED");
         return e ? atoi(e) : 0;
     }();
     w.wmem = sycl_interop::make_memory(memory::desc({K, N}, memory::data_type::s8,
@@ -938,7 +939,7 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // which keep their int8 conversion.
 bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
                               bool any_type, bool gemv_only, float scale_mul) {
-    const bool w4info = getenv("PF_W4_INFO") != nullptr;
+    const bool w4info = si::env::flag("PF_W4_INFO");
     if (!key || !host_data || !(any_type || si::w4_supported(ggml_type))) {
         if (w4info) {
             fprintf(stderr, "[w4] reject key=%p: precheck type=%u any=%d\n", key, ggml_type, (int)any_type);
@@ -1124,7 +1125,7 @@ bool dnnl_gemm::add_weight_w2(const void * key, const void * host_data, uint32_t
     p->q.memcpy(e.scales, w.scale.data(), w.scale.size() * 2).wait();
     p->q.memcpy(e.off, w.off.data(), w.off.size() * 2).wait();
     e.ok = true;
-    if (getenv("PF_W2_INFO")) {
+    if (si::env::flag("PF_W2_INFO")) {
         fprintf(stderr, "[w2] %s: K=%d N=%d  %.4f B/weight  rel L2 vs source = %.3f%%\n", (const char *)key, K, N,
                 (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N), 100.0 * w.rel_l2);
     }
@@ -1141,7 +1142,7 @@ bool dnnl_gemm::has_weight_w2(const void * key) const {
 // int8 dot product of the group's quantized activation with the 2-bit levels.
 bool dnnl_gemm::gemm_w2(const void * key, const float * residual, float alpha, int M, int K, float * out,
                         int out_stride) {
-    static const bool dbg = getenv("PF_W2_DEBUG") != nullptr;
+    static const bool dbg = si::env::flag("PF_W2_DEBUG");
     auto it = p->w2weights.find(key);
     if (it == p->w2weights.end() || !it->second.ok || M != 1 || it->second.K != K) {
         if (dbg) {
@@ -1176,7 +1177,7 @@ bool dnnl_gemm::gemm_w2(const void * key, const float * residual, float alpha, i
 // epilogue are launched once too: their SYCL kernels would otherwise be
 // JIT-compiled inside the first request.
 int dnnl_gemm::warmup() {
-    const bool tdbg = getenv("PF_DNNL_TIME") != nullptr;
+    const bool tdbg = si::env::flag("PF_DNNL_TIME");
     const auto t0 = std::chrono::high_resolution_clock::now();
     int n = 0;
     for (auto & it : p->prims) {
@@ -1266,7 +1267,7 @@ bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up
     // the whole row and cost ~13 ms/token across the 320 calls of a 27B decode.
     // PF_ROWACT=1 restores it for A/B.
     static const bool row_act = [] {
-        const char * e = getenv("PF_ROWACT");
+        const char * e = si::env::str("PF_ROWACT");
         return e && atoi(e) != 0;
     }();
     if (row_act) {
@@ -1339,7 +1340,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         // step-scaled matmul - tells whether the prefill cost is the expansion
         // kernel or the u4-style correction epilogue.
         static const bool nocorr = [] {
-            const char * ev = getenv("PF_K5_NOCORR");
+            const char * ev = si::env::str("PF_K5_NOCORR");
             return ev && atoi(ev) != 0;
         }();
         w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : e.off, p->asa, out, out_stride, residual, alpha, M,
@@ -1434,7 +1435,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         // the dedicated grouped-scale int8 GEMV instead (PF_I8_NOGEMV=1 restores
         // the matmul, for A/B).
         static const bool no_gemv = [] {
-            const char * e = getenv("PF_I8_NOGEMV");
+            const char * e = si::env::str("PF_I8_NOGEMV");
             return e && atoi(e) != 0;
         }();
         if (!no_gemv) {
@@ -1501,7 +1502,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
         pit = p->prims4.find(impl::pkey(M, K, w.N));
     }
     static const bool w4dbg = [] {
-        const char * e = getenv("PF_W4_DEBUG");
+        const char * e = si::env::str("PF_W4_DEBUG");
         return e && atoi(e) != 0;
     }();
     if (w4dbg) {
@@ -1519,7 +1520,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
         }
     }
     static const bool no_gemv = [] {
-        const char * e = getenv("PF_W4_NOGEMV");
+        const char * e = si::env::str("PF_W4_NOGEMV");
         return e && atoi(e) != 0;
     }();
     if (M == 1) {
@@ -1538,7 +1539,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
         // one decode pass and costing four.  Opt-in via PF_W4_GEMM_MAXM until
         // it beats the matmul on a given shape.
         static const int gemm_max_m = [] {
-            const char * e = getenv("PF_W4_GEMM_MAXM");
+            const char * e = si::env::str("PF_W4_GEMM_MAXM");
             return e ? atoi(e) : 1;
         }();
         // the kernel is instantiated for M <= 9 (the MTP verify range); larger
@@ -1561,7 +1562,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
     // PF_W4_NOCORR: bisection knob - drop the offset (zero-point) correction and
     // keep only the oneDNN step-scaled matmul, to tell which half is wrong.
     static const bool nocorr = [] {
-        const char * e = getenv("PF_W4_NOCORR");
+        const char * e = si::env::str("PF_W4_NOCORR");
         return e && atoi(e) != 0;
     }();
     // xs was produced by quantize() (same launch as the grouped activation)
@@ -1662,7 +1663,7 @@ const int32_t * dnnl_gemm::act_sum() const {
 // a per-matmul stream wait for A/B.
 static bool attn_wait_env() {
     static const bool v = [] {
-        const char * e = getenv("PF_ATTN_WAIT");
+        const char * e = si::env::str("PF_ATTN_WAIT");
         return e && atoi(e) != 0;
     }();
     return v;

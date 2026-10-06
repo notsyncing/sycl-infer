@@ -37,6 +37,7 @@
 #include "audio_model.h"
 #include "scheduler.h"
 #include "vision.h"
+#include "common/env.h"
 
 using json = nlohmann::json;
 
@@ -476,7 +477,7 @@ bool load_media_bytes(const media_part & part, std::vector<uint8_t> & bytes, std
             // Remote fetches turn the server into a proxy, so allow deployments
             // to opt out (e.g. when exposed beyond localhost); on by default.
             static const bool remote_ok = [] {
-                const char * v = getenv("PF_MM_URL_FETCH");
+                const char * v = si::env::str("PF_MM_URL_FETCH");
                 return !(v != nullptr && v[0] == '0' && v[1] == '\0');
             }();
             if (!remote_ok) {
@@ -900,7 +901,7 @@ void run_mm_choice(engine & e, const mm_prompt & mp, const gen_params & gp, cons
 // (only worth it for a strictly single-request workload).
 bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
     static const bool on = [] {
-        const char * v = getenv("PF_MTP_SERVER");
+        const char * v = si::env::str("PF_MTP_SERVER");
         return v && atoi(v) != 0;
     }();
     return on && e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
@@ -1702,7 +1703,7 @@ int serve(engine & e, const server_config & cfg) {
         }
 
         std::string text = render_chat(e.m.chat_template, msgs, true, thinking, tools_json);
-        static const bool srv_t = getenv("PF_SRV_TIME") != nullptr;
+        static const bool srv_t = si::env::flag("PF_SRV_TIME");
         const auto t_tok0 = std::chrono::steady_clock::now();
         auto prompt = e.tk.encode(text);
         if (srv_t) {
@@ -1800,7 +1801,7 @@ int serve(engine & e, const server_config & cfg) {
             bad_request(res, "invalid json", "invalid_request_error");
             return;
         }
-        static const bool srv_t = getenv("PF_SRV_TIME") != nullptr;
+        static const bool srv_t = si::env::flag("PF_SRV_TIME");
         const auto t_tok0 = std::chrono::steady_clock::now();
         completion_prompts cp = parse_completion_prompts(e, body);
         if (srv_t) {

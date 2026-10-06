@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "common/env.h"
 
 namespace si {
 
@@ -84,9 +85,9 @@ std::atomic<int> g_kv_k{-1};
 std::atomic<int> g_kv_v{-1};
 
 void from_env(kv_dtype_t & k, kv_dtype_t & v) {
-    const char * e = getenv("PF_KV_TYPE");
-    const char * f = getenv("PF_KV_F32");
-    const char * b = getenv("PF_KV_BF16");
+    const char * e = si::env::str("PF_KV_TYPE");
+    const char * f = si::env::str("PF_KV_F32");
+    const char * b = si::env::str("PF_KV_BF16");
     if ((f && atoi(f) != 0) || (b && atoi(b) == 0)) {
         k = v = kv_dtype_t::f32;
         return;

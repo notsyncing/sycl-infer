@@ -31,6 +31,7 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include "common/env.h"
 
 namespace si {
 
@@ -63,7 +64,7 @@ constexpr int kW4RB = 16;
 
 static int w4_rb_override() {
     static const int rb = [] {
-        const char * e = getenv("PF_W4_RB");
+        const char * e = si::env::str("PF_W4_RB");
         return e ? atoi(e) : 0;
     }();
     return rb;
@@ -282,7 +283,7 @@ void w2_gemv_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
     // the same 0.625 -> 0.375 B/weight byte count; the narrow one just keeps
     // fewer words live and issues more, smaller loads.
     static const bool pair = [] {
-        const char * e = getenv("PF_W2_PAIR");
+        const char * e = si::env::str("PF_W2_PAIR");
         return e && atoi(e) != 0;
     }();
     const bool p2 = pair && (K % 64) == 0;
@@ -1214,7 +1215,7 @@ void w4_gemm_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
                     int out_stride, const float * residual, float alpha, int M, int K, int N) {
     // PF_W4_GEMM_U: independent accumulator sets (latency hiding).
     static const int u = [] {
-        const char * e = getenv("PF_W4_GEMM_U");
+        const char * e = si::env::str("PF_W4_GEMM_U");
         const int v = e ? atoi(e) : 1;
         return (v == 1 || v == 2 || v == 4) ? v : 1;
     }();
@@ -1235,7 +1236,7 @@ void w4_gemm_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
     // 4-10x slower - the sub-group-covering-TN-columns mapping is a poor fit
     // here; PF_W4_GEMM_TN=2|4 selects them for further experiments).
     static const int tn_env = [] {
-        const char * e = getenv("PF_W4_GEMM_TN");
+        const char * e = si::env::str("PF_W4_GEMM_TN");
         const int v = e ? atoi(e) : 0;
         return (v == 0 || v == 2 || v == 3 || v == 4) ? v : 0;
     }();
@@ -1257,7 +1258,7 @@ void w4_gemm_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
         w4_gemm_c2<mm>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);  \
         return;
     static const int c2_env = [] {
-        const char * e = getenv("PF_W4_GEMM_TN");
+        const char * e = si::env::str("PF_W4_GEMM_TN");
         return e ? atoi(e) : 0;
     }();
     if (c2_env == 3) {
@@ -1861,7 +1862,7 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
     // PF_NAT=0 disables the batched native GEMM everywhere (fall back to the
     // oneDNN grouped-scale matmul + epilogue), for A/B and as an escape hatch.
     static const bool nat_on = [] {
-        const char * e = getenv("PF_NAT");
+        const char * e = si::env::str("PF_NAT");
         return e ? atoi(e) != 0 : true;
     }();
     if (!nat_on) {

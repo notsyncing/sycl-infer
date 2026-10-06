@@ -11,6 +11,7 @@
 
 #include <sys/types.h>
 #include <unistd.h>
+#include "common/env.h"
 
 namespace si {
 
@@ -19,7 +20,7 @@ namespace {
 constexpr const char * kFfmpegErr = "/tmp/opencode/ffmpeg_sycl_infer_err.log";
 
 const char * ffmpeg_cmd() {
-    const char * v = getenv("PF_AV_FFMPEG");
+    const char * v = si::env::str("PF_AV_FFMPEG");
     return (v && v[0]) ? v : "ffmpeg";
 }
 
@@ -244,11 +245,9 @@ bool mm_audio_decode_ffmpeg(const std::string & path, mm_audio & out, std::strin
 
 bool mm_audio_decode_bytes(const uint8_t * data, size_t len, const audio_preproc_cfg & cfg, mm_audio & out,
                            std::string * err) {
-    if (mm_audio_decode_mem(data, len, cfg, out, err)) {
+    std::string wav_err;
+    if (mm_audio_decode_mem(data, len, cfg, out, &wav_err)) {
         return true;
-    }
-    if (err) {
-        err->clear();
     }
     // Non-WAV (MP3/OGG/...): spill to a temp file for the ffmpeg CLI, which can
     // only read paths.  The extension is left .tmp so ffmpeg sniffs the magic.
@@ -281,11 +280,24 @@ bool mm_audio_decode_bytes(const uint8_t * data, size_t len, const audio_preproc
     }
     const bool decoded = mm_audio_decode_ffmpeg(path.data(), out, err);
     std::remove(path.data());
-    // the ffmpeg fallback already resamples to 16 kHz; stay within the cap
-    if (decoded && (int)out.samples.size() > cfg.sample_rate * cfg.max_seconds) {
+    if (!decoded) {
+        // keep both failure leaves: a corrupt WAV must not masquerade as an
+        // ffmpeg error, nor the other way round
+        if (err && *err != "") {
+            *err += " (WAV decode also failed: " + wav_err + ")";
+        }
+        return false;
+    }
+    // the ffmpeg fallback decodes at 16 kHz; resample if the config differs
+    if (out.sample_rate != cfg.sample_rate) {
+        mm_audio raw = out;
+        mm_audio_resample(raw, cfg.sample_rate, out);
+    }
+    // stay within the cap
+    if ((int)out.samples.size() > cfg.sample_rate * cfg.max_seconds) {
         out.samples.resize((size_t)cfg.sample_rate * cfg.max_seconds);
     }
-    return decoded;
+    return true;
 }
 
 void mm_audio_resample(const mm_audio & in, int out_rate, mm_audio & out) {

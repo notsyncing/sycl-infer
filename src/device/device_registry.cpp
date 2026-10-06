@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "common/env.h"
 
 namespace si::dev {
 
@@ -53,7 +54,7 @@ const profile & for_name(const std::string & device_name) {
 }
 
 void report(const profile & p, const char * how) {
-    if (getenv("PF_DEVICE_INFO")) {
+    if (si::env::flag("PF_DEVICE_INFO")) {
         fprintf(stderr,
                 "[dev] profile=%s  (%s)\n"
                 "      provenance: %s\n"
@@ -90,7 +91,7 @@ const profile & active() {
         // mislead.  PF_DEVICE_PROFILE is the runtime equivalent and wins, so a
         // baked binary can still be re-pointed for an A/B.
         const char * baked = SI_FORCE_DEVICE_PROFILE;
-        if (const char * forced = getenv("PF_DEVICE_PROFILE")) {
+        if (const char * forced = si::env::str("PF_DEVICE_PROFILE")) {
             baked = forced;
         }
         if (baked && *baked) {

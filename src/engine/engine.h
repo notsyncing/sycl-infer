@@ -23,6 +23,7 @@
 #include "sampler.h"
 #include "tokenizer.h"
 #include "dflash.h"
+#include "common/env.h"
 
 namespace si {
 
@@ -379,7 +380,7 @@ struct engine {
         if (use_dnnl || (multi_dev && dnnl_any_dev())) {
             // direct replay: any batch size up to kMaxB*kMaxT is valid (the
             // last row may be partial, see step_info::n_real_row)
-            if (getenv("PF_NO_PFB_PARTIAL")) { // A/B: old multiple-of-kMaxT only
+            if (si::env::flag("PF_NO_PFB_PARTIAL")) { // A/B: old multiple-of-kMaxT only
                 int n = (rem / kMaxT) * kMaxT;
                 if (n > kMaxB * kMaxT) {
                     n = kMaxB * kMaxT;
@@ -397,7 +398,7 @@ struct engine {
             // honors nreal_arg (like cpu_gdn), so mode-2 is correct at any M
             // and the cap is gone.  Keeping it at kMaxT cost ~7x on multi-device
             // pp512 (mode-1 chunked, ~91 t/s vs ~660 t/s mode-2 on 2x A770).
-            const char * em = getenv("PF_PFB_MAX_M");
+            const char * em = si::env::str("PF_PFB_MAX_M");
             const int mcap = em ? atoi(em) : 0;
             if (multi_dev && mcap > 0) {
                 return std::min(rem, mcap);
@@ -511,6 +512,9 @@ struct engine {
     // 1-row attention with n_head workgroups each looping the whole KV: 2451 vs
     // 183 ms/cycle at 128k.  PF_MTP_SPLITS overrides (1 = the old behaviour).
     int mtp_splits = kMaxDecSplits;
+    // The speculative draft's LM head: the MTP/NextN layer's shared head when
+    // the GGUF ships one, else the model's output projection.
+    const wt & draft_head() const { return m.mtp.shared_head.data ? m.mtp.shared_head : m.output; }
     void build_mtp_plan();
     void mtp_gemv(int ci, int M, int step = -1);
     // ---- MTP draft head (see mtp_argmax.cpp) -------------------------------
@@ -540,6 +544,9 @@ struct engine {
     float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
     int32_t * d_mtp_tokx_ = nullptr;  // 4-byte staging slot for a non-zero --mtp-device
     float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
+    int32_t * d_argmax_buf_ = nullptr; // verify-cycle argmax staging (device 0)
+    float * d_argval_buf_ = nullptr;   // ... and its value side
+    int32_t * d_am2_ = nullptr;        // PF_MTP_CANDDBG diagnostic staging
     int mtp_cand_src_ = 1;            // 1 = seed from the draft's own step-0 readout
     int mtp_cand_cap_ = 0;            // 0 = off (the full head readout)
     float mtp_cand_margin_ = 8.0f;
@@ -836,6 +843,10 @@ private:
         std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g;
         std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e;
     };
+    // Split the layer loop into contiguous device runs (embedding+head live on
+    // the primary device); shared by the decode/verify graph builders and the
+    // prefill pipeline.
+    std::vector<md_phase> split_md_phases() const;
     std::vector<md_cmd_graph> md_dec_;
     bool md_dec_ok = false;
     // The MTP verify's own command graphs.  Same phase split as the decode

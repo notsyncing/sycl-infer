@@ -1,4 +1,5 @@
 #include "cpu_isa.h"
+#include "common/env.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -44,7 +45,7 @@ cpu_features detect() {
 }
 
 cpu_isa forced_isa(const cpu_features & f) {
-    const char * e = getenv("PF_CPU_ISA");
+    const char * e = si::env::str("PF_CPU_ISA");
     if (!e || !*e || std::strcmp(e, "auto") == 0) {
         return cpu_isa::scalar; // sentinel: not forced
     }
@@ -75,7 +76,7 @@ cpu_isa cpu_best_isa() {
     const cpu_isa forced = forced_isa(f);
     // Any PF_CPU_ISA setting wins over the detected level; an unknown value
     // means scalar (conservative, used by the tests to force the fallback).
-    if (const char * e = getenv("PF_CPU_ISA")) {
+    if (const char * e = si::env::str("PF_CPU_ISA")) {
         if (*e && std::strcmp(e, "auto") != 0) {
             return forced;
         }
@@ -91,7 +92,7 @@ cpu_isa cpu_best_isa() {
 
 bool cpu_has_avxvnni() {
     const cpu_features & f = cpu_features_of();
-    if (const char * e = getenv("PF_CPU_ISA")) {
+    if (const char * e = si::env::str("PF_CPU_ISA")) {
         if (*e && std::strcmp(e, "scalar") == 0) {
             return false;
         }

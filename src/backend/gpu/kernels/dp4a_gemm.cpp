@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "common/env.h"
 
 namespace si {
 
@@ -834,20 +835,20 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
                       float * out, int out_stride, const float * residual, float alpha, int TB) {
     // default tile per weight type (measured, see README): Q4_K likes the
     // TP=1 x-coalescing, Q5_K/Q6_K prefer the wider TP=4 tile
-    const char * row_env = getenv("PF_GEMM_ROW");
+    const char * row_env = si::env::str("PF_GEMM_ROW");
     const bool use_row = !row_env || atoi(row_env) != 0;
     // M-tiled path: more than one 32-token tile in one dispatch (chunk-batched
     // prefill).  The token tiles of a row block are co-resident, so their weight
     // reads merge in L2, and the extra grid dimension supplies the workgroups
     // the chunked path had to get from K-splitting.
     if (use_row && TB > 32 && (TB % 32) == 0 && TB <= kMaxB * kMaxT && w.N > 0) {
-        static const bool dbg_mt = getenv("PF_DBG_MT") != nullptr;
+        static const bool dbg_mt = si::env::flag("PF_DBG_MT");
         if (dbg_mt) {
             fprintf(stderr, "[mt] K=%d N=%d TB=%d type=%u\n", w.K, w.N, TB, w.type);
         }
         // 2 rows per lane (halves the per-cell x/meta loads)
         static const int arch = [] {
-            const char * e = getenv("PF_GEMM_ARCH");
+            const char * e = si::env::str("PF_GEMM_ARCH");
             return e ? atoi(e) : 1;
         }();
         if (arch == 2) {
@@ -858,17 +859,17 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
             }
         }
         static const int mt_r = [] {
-            const char * e = getenv("PF_MT_R");
+            const char * e = si::env::str("PF_MT_R");
             if (e) {
                 return atoi(e);
             }
-            const char * e2 = getenv("PF_MT_R2");
+            const char * e2 = si::env::str("PF_MT_R2");
             return (e2 && atoi(e2) == 0) ? 1 : 2;
         }();
         // R=1 with a 16-token tile: 16 accumulators (half the register pressure
         // of the R=2 kernel) - the occupancy experiment for the dp4a GEMM
         static const int mt_tb1 = [] {
-            const char * e = getenv("PF_MT_TB");
+            const char * e = si::env::str("PF_MT_TB");
             return e ? atoi(e) : 16;
         }();
         if (mt_r == 1) {
@@ -934,7 +935,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
                 }
             }
             static const bool mt_pf = [] {
-                const char * e = getenv("PF_MT_PF");
+                const char * e = si::env::str("PF_MT_PF");
                 return e && atoi(e) != 0;
             }();
             if (mt_pf) {
@@ -954,7 +955,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
                 }
             }
             static const bool mt_slm = [] {
-                const char * e = getenv("PF_MT_SLM");
+                const char * e = si::env::str("PF_MT_SLM");
                 return e && atoi(e) != 0;
             }();
             if (mt_slm) {
@@ -974,11 +975,11 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
                 }
             }
             static const int mt_tb = [] {
-                const char * e = getenv("PF_MT_TB");
+                const char * e = si::env::str("PF_MT_TB");
                 return e ? atoi(e) : 16;
             }();
             static const int mt_wg2 = [] {
-                const char * e = getenv("PF_MT_WG2");
+                const char * e = si::env::str("PF_MT_WG2");
                 return e ? atoi(e) : 128;
             }();
             if (mt_tb == 8) {
@@ -1037,7 +1038,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
         }
         // PF_MT_WG=64: narrower workgroups (occupancy experiment)
         static const int mt_wg = [] {
-            const char * e = getenv("PF_MT_WG");
+            const char * e = si::env::str("PF_MT_WG");
             return e ? atoi(e) : 128;
         }();
         if (mt_wg == 64) {
@@ -1073,13 +1074,13 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     }
     // row kernel runs SIMD16 by default (measured faster and required for block
     // reads); PF_GEMM_SG=32 restores the old SIMD32 codegen
-    const char * sg_env = getenv("PF_GEMM_SG");
+    const char * sg_env = si::env::str("PF_GEMM_SG");
     const bool sg32 = sg_env && atoi(sg_env) == 32;
     // K-split row path: the row kernel wants ~16k output rows to fill the
     // machine; for smaller tensors split K (partial sums in a workspace, then a
     // flat reduce) so the same kernel gets enough workgroups per k-slice.
     if (use_row && TB == 32 && w.N <= 8192) {
-        const char * sp_env = getenv("PF_GEMM_SPLIT");
+        const char * sp_env = si::env::str("PF_GEMM_SPLIT");
         int S = sp_env ? atoi(sp_env) : 0;
         const si::dev::profile & dp = si::dev::active();
         if (S == 0) {
@@ -1091,7 +1092,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
         if (S > 1) {
             // smaller workgroups raise the resident warp count (a 128-thread WG
             // occupies one subslice but only supplies 0.5 warps/EU)
-            const char * wg_env = getenv("PF_GEMM_WG");
+            const char * wg_env = si::env::str("PF_GEMM_WG");
             const int wg = wg_env ? atoi(wg_env) : 128;
             // the partials are written with the segment's out_stride (which can
             // exceed w.N, e.g. ffn_gate/up into a 2*n_ff buffer), so size the
@@ -1100,7 +1101,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
             // SLM staging of x measured slower (staging + occupancy cost > the
             // saved L1 latency): opt-in only
             static const bool xslm = [] {
-                const char * e = getenv("PF_GEMM_XSLM");
+                const char * e = si::env::str("PF_GEMM_XSLM");
                 return e && atoi(e) != 0;
             }();
             if (ws && xslm && w.type != 14 && w.N >= 2048) {
@@ -1265,7 +1266,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
             }
         }
     }
-    const char * tile_env = getenv("PF_GEMM_TILE");
+    const char * tile_env = si::env::str("PF_GEMM_TILE");
     const int tile = tile_env ? atoi(tile_env) : (w.type == 12 ? 12 : 42);
     switch (tile) {
     case 12:

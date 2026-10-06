@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "common/env.h"
 
 namespace si {
 
@@ -254,13 +255,13 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     // PF_GDN_COLS=1/2/4/8: state rows per warp (1 = the original mapping).
     // The default is the device profile's gdn_cols (2).
     static const int cols = [] {
-        const char * e = getenv("PF_GDN_COLS");
+        const char * e = si::env::str("PF_GDN_COLS");
         const int c = e ? atoi(e) : si::dev::active().shape.gdn_cols;
         return c == 1 || c == 2 || c == 4 || c == 8 ? c : 2;
     }();
     // PF_GDN_WG=1/2/4/8: warps per workgroup (occupancy experiment)
     static const int wpw = [] {
-        const char * e = getenv("PF_GDN_WG");
+        const char * e = si::env::str("PF_GDN_WG");
         const int c = e ? atoi(e) : si::dev::active().shape.gdn_warps_per_wg;
         return c == 1 ? 1 : (c == 2 ? 2 : (c == 4 ? 4 : 8));
     }();
@@ -273,7 +274,7 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     // recurrence against the multi-column path (measured: every PF_GDN_COLS>1
     // variant is 1-1.7 ms slower there, so the gate is right).
     static const int cols_min = [] {
-        const char * e = getenv("PF_GDN_COLS_MIN");
+        const char * e = si::env::str("PF_GDN_COLS_MIN");
         return e ? atoi(e) : 8;
     }();
     const int c = (n_real >= cols_min && head_dim % cols == 0) ? cols : 1;
@@ -295,7 +296,7 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
     // faster.  PF_GDN_VEC: unset/-1 = this rule, 0 = always scalar, 1 = always
     // float4 (the old default, kept for A/B).
     static const int vec_mode = [] {
-        const char * e = getenv("PF_GDN_VEC");
+        const char * e = si::env::str("PF_GDN_VEC");
         return e ? atoi(e) : -1;
     }();
     const bool f4 = (vec_mode < 0) ? (n_real < dp.shape.gdn_vec_max_rows) : (vec_mode != 0);

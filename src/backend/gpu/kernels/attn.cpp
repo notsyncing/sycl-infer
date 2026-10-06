@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "common/env.h"
 
 namespace si {
 
@@ -16,7 +17,7 @@ using namespace si::kd;
 // PF_ATTN_VEC=0: classic per-lane strided mapping
 static inline bool attn_vec_env() {
     static const bool v = [] {
-        const char * e = getenv("PF_ATTN_VEC");
+        const char * e = si::env::str("PF_ATTN_VEC");
         const int dflt = si::dev::active().attn.vec;
         return (e ? atoi(e) != 0 : dflt != 0);
     }();
@@ -281,7 +282,7 @@ static void attn_flash_kernel(queue & q, const float * qbuf, const KV * kp_base,
 // and a key-per-lane mapping, not just tiling.
 static inline bool attn_flash_env() {
     static const bool v = [] {
-        const char * e = getenv("PF_ATTN_FLASH");
+        const char * e = si::env::str("PF_ATTN_FLASH");
         return e && atoi(e) != 0;
     }();
     return v;
@@ -294,7 +295,7 @@ static inline bool attn_flash_env() {
 // 256-wide head.
 static inline int dec_group_env() {
     static const int v = [] {
-        const char * e = getenv("PF_DEC_GROUP");
+        const char * e = si::env::str("PF_DEC_GROUP");
         // the grouped decode kernel has n_head_kv instead of n_head workgroups; it
         // is off on BOTH parts but for opposite measured reasons (A770: 5x slower
         // at 64k; Iris Xe: measurably faster for the classic kernel, which has 4x
@@ -331,7 +332,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
         && (n_head / n_head_kv == 4 || n_head / n_head_kv == 6) && kv_k_dtype() == kv_v_dtype()
         && kv_dtype_has_scales(kv_k_dtype())) {
         const int hpg = n_head / n_head_kv;
-        static const bool dbg = getenv("PF_ATTN_DBG") != nullptr;
+        static const bool dbg = si::env::flag("PF_ATTN_DBG");
         if (dbg) {
             fprintf(stderr, "[attn] flash kernel: hpg=%d n_splits=%d n_rows=%d n_real=%d\n", hpg, n_splits, n_rows,
                     n_real);

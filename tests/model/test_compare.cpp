@@ -8,6 +8,7 @@
 #include "model.h"
 
 #include "cpu_ref.h"
+#include "common/env.h"
 
 using namespace si;
 
@@ -41,7 +42,7 @@ static dump load_dump(const std::string & path) {
 static bool verbose = false;
 int main(int argc, char ** argv) {
     const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
-    verbose = getenv("VERBOSE") != nullptr;
+    verbose = si::env::flag("VERBOSE");
     std::string dumpdir = argc > 2 ? argv[2] : "/tmp/kilo/refdump";
     std::vector<int> toks;
     for (int i = 3; i < argc; i++) {
