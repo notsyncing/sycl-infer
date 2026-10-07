@@ -727,6 +727,9 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     if (!mtp.mtp_on) {
         return generate(prompt, gp, cb, first_logits);
     }
+    if (!gp.speculative_greedy()) {
+        throw std::invalid_argument("MTP requires greedy sampling without logit penalties or bias");
+    }
     reset_single();
     const hparams & hp = m.hp;
     static const bool dbg_gen = si::env::flag("PF_DUMP_GEN");
@@ -750,6 +753,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
     for (int i = 0; i < need; i++) {
         int b = alloc_block();
         if (b < 0) {
+            pc_retire(0, blocks); // release both newly allocated and cached/pinned blocks
             throw std::runtime_error("out of KV blocks");
         }
         blocks.push_back(b);
@@ -817,7 +821,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         }
         // mode 2 is the prefill path the multi-device engine actually uses; its
         // output norm leaves the per-position main hidden in d_xnorm
-        prefill_text(prompt, pos, nb);
+        prefill_text(prompt, /*slot=*/0, nb, /*start=*/pos);
         // The multi-device prefill pipeline defers the last chunk's device-1 and
         // head phases to the next call (or to prefill_flush).  The per-position
         // main hidden (and the capture) is only written by that head phase, so
@@ -842,21 +846,15 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             }
         }
         dev_queue(0).memcpy(mtp.d_mtp_hprev, mtp.d_mtp_main_h + (size_t)(nb - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
+        // Publish only after the target and MTP layer have completed this batch.
+        // The next batch's pc_capture_begin requires the preceding blocks to be
+        // registered; committing once after the entire prompt loses earlier
+        // checkpoint reservations when a prompt spans multiple batches.
+        if (mtp.mtp_dev != 0) {
+            dev_queue(mtp.mtp_dev).wait();
+        }
         pos += nb;
-    }
-
-    // Register the prompt's blocks and the checkpoints this prefill captured -
-    // same contract as the scheduler: pc_commit *after* the prefill, before
-    // generation.  Committing earlier (it used to sit right after set_table)
-    // was wrong twice over: pc_commit advances pc_slot_[0].registered to
-    // nprompt/32, so the pc_capture_begin inside every prefill chunk then failed
-    // its chain guard (`registered*kBlockSize == pos0`) and nothing was ever
-    // captured - the MTP prefix-cache support below silently did nothing; and the
-    // nodes were published while their KV blocks were still unwritten, so a
-    // prefill that threw would leave the cache claiming a prefix that holds
-    // stale KV.
-    if (nprompt > 0) {
-        pc_commit(0, prompt, blocks, nprompt);
+        pc_commit(0, prompt, blocks, pos);
     }
 
     if (si::env::flag("PF_MTP_HVEC")) {
@@ -1132,9 +1130,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         fprintf(stderr, "[mtp] step=0 pos=%d id=%d eos=%d\n", pos, tok, (int)is_eos(tok));
     }
     if ((!gp.ignore_eos && is_eos(tok)) || !cb(tok)) {
-        for (int b : blocks) {
-            free_block(b);
-        }
+        pc_retire(0, blocks);
         return out;
     }
 
@@ -1457,9 +1453,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             // emit the accepted drafts then the target's own token
             for (int i = 1; i <= j; i++) {
                 if ((int)out.size() >= gp.max_tokens) {
-                    for (int b : blocks) {
-                        free_block(b);
-                    }
+                    pc_retire(0, blocks);
                     return out;
                 }
                 out.push_back(cand[(size_t)i]);
@@ -1467,9 +1461,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     fprintf(stderr, "[mtp] accept pos=%d id=%d\n", pos + i, cand[(size_t)i]);
                 }
                 if ((!gp.ignore_eos && is_eos(cand[(size_t)i])) || !emit_cb(cand[(size_t)i])) {
-                    for (int b : blocks) {
-                        free_block(b);
-                    }
+                    pc_retire(0, blocks);
                     return out;
                 }
             }
@@ -1606,15 +1598,15 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // the main hidden at the last committed position seeds the next cycle
         dev_queue(0).memcpy(mtp.d_mtp_hprev, mtp.d_mtp_main_h + (size_t)j * hp.n_embd, (size_t)hp.n_embd * 4).wait();
         pos += j + 1;
-        // grow the block table if the draft window could cross a block boundary
-        ensure_block_headroom(blocks, pos, mtp.mtp_k + 1);
         if ((int)out.size() >= gp.max_tokens) {
             break;
         }
+        // Do not enter another draft/verify cycle without backed KV pages.
+        if (!ensure_block_headroom(blocks, pos, mtp.mtp_k + 1)) {
+            break;
+        }
     }
-    for (int b : blocks) {
-        free_block(b);
-    }
+    pc_retire(0, blocks);
     return out;
 }
 

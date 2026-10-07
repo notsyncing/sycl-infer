@@ -81,6 +81,29 @@ int main() {
         check(lp.top.empty(), "need_score skips top alternatives");
     }
 
+    {
+        gen_params gp;
+        gp.temperature = 0.f;
+        check(gp.speculative_greedy(), "plain greedy eligible for speculation");
+        gp.logit_bias[1] = 10.f;
+        check(!gp.speculative_greedy(), "greedy logit_bias bypasses speculation");
+        gp.logit_bias.clear();
+        gp.repeat_penalty = 1.1f;
+        check(!gp.speculative_greedy(), "greedy repeat penalty bypasses speculation");
+        gp.repeat_penalty = 1.f;
+        gp.presence_penalty = 0.1f;
+        check(!gp.speculative_greedy(), "greedy presence penalty bypasses speculation");
+        gp.presence_penalty = 0.f;
+        gp.frequency_penalty = 0.1f;
+        check(!gp.speculative_greedy(), "greedy frequency penalty bypasses speculation");
+        gp.frequency_penalty = 0.f;
+        gp.temperature = 1.f;
+        gp.top_k = 1;
+        check(gp.speculative_greedy(), "top_k=1 remains greedy eligible");
+        gp.top_k = 40;
+        check(!gp.speculative_greedy(), "sampled decode bypasses speculation");
+    }
+
     printf(g_fail ? "sampler test FAILED (%d)\n" : "sampler test OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

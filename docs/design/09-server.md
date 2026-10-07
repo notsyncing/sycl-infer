@@ -246,15 +246,16 @@ reasoning/content/tool_calls 片段（stop 处截断，`tool_calls[].index` 从 
 * httplib 每个连接派一个工作线程执行 handler。
 * 非流式 handler 阻塞在 `seq->pop_token(t)`（`sequence::token_out`，`scheduler.h:76-85`）；流式 handler
   为每个 choice 起一个生产者线程后立即返回，由 chunked provider 驱动。handler 返回时它捕获的一切
-  （prompt 副本、`shared_ptr<sse_session>`、多模态的 `mm_req` 锁）都由线程自己的 lambda 持有。
+  （prompt 副本、`shared_ptr<sse_session>`、多模态的共享许可）都由线程自己的 lambda 持有。
 * `scheduler::submit` 多线程安全（锁 `scheduler::m`）；每个 `sequence` 的输出由自带 mutex+cv 保护。
 * 所有引擎工作由 `engine::mtx` 串行化——调度器的两个阶段各自持 `e.mtx`（`scheduler.cpp:150`、
   `318`），`engine::generate` / `generate_mm` 也在入口加锁（`engine.cpp:2350`、`2356`）。
-* 多模态额外用 `serve()` 里的**函数局部** `std::mutex mm_req`（`server.cpp:1458`）串行化，因为这些
-  请求共享 `engine::d_img_embd`（编码与 prefill 都要写它）。锁的生命周期覆盖整个请求：非流式是
-  handler 内的 `unique_lock`（`server.cpp:1614`），流式则把 `shared_ptr<unique_lock>` 捕获进生产者
-  线程的 lambda（`server.cpp:1696`），所以 handler 返回后它仍然持有到生成结束。多模态的 `n` 个
-  choice 在一个线程里顺序生成；MTP 的 `n` 恒为 1（`mtp_direct` 的门控），代码里同样是顺序循环。
+* 多模态额外用 `serve()` 的共享 `media_gate` 许可串行化，因为请求共享
+  `engine::d_img_embd`。许可由 handler 线程获取，可由最后持有它的 SSE 生产者线程释放；
+  内部 mutex 只在获取/释放许可的瞬间持有，**不跨线程转移 `std::mutex` 的所有权**。
+  媒体设备编码在 `engine::mtx` 下提交，避免与调度器 forward 交错；之后
+  `generate_mm` 自己获取同一锁。多模态的 `n` 个 choice 在一个线程里顺序生成；
+  MTP 的 `n` 恒为 1（`mtp_direct` 门控）。
 
 ### 2.10 关闭与信号
 

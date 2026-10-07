@@ -832,24 +832,25 @@ MTP 层的 plan 是手工构造的 5 个 call（`build_mtp_plan`，`engine_mtp.c
 之后还要让 MTP 层跑一遍 prompt（填充它自己的 KV）：
 
 1. `pc_admit(0, prompt, blocks)`（`engine_mtp.cpp:736`）：恢复匹配链的 KV **与**递归状态。
-2. 按 `batched_prefill_fit(rem)` 取**能容纳的最大批量**，一次 `prefill_text` 走完，再
-   `prefill_flush()`（多设备流水线把最后一个 chunk 的 device-1 + head 相位推迟到下一次调用，
+2. 按 `batched_prefill_fit(rem)` 取**能容纳的最大批量**，从当前 token 偏移 `pos`
+   调 `prefill_text(prompt, /*slot=*/0, nb, /*start=*/pos)`，再 `prefill_flush()`
+   （多设备流水线把最后一个 chunk 的 device-1 + head 相位推迟到下一次调用，
    而每位置的隐状态与 capture 只由那个 head 相位写）。
 3. 把 MTP 层跑在它**捕获到的**隐状态上，按 `kMaxT` 一片一片（823-832）：每片把自己的 capture
    基址当 `h`，把同 capture 里的前一个 token（第一批时是 `d_mtp_hprev`）当 `h_prev`。
-4. `dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (nb-1)*n_embd)`，进入生成循环。
+4. `dev_queue(0).memcpy(d_mtp_hprev, d_mtp_main_h + (nb-1)*n_embd)`；
+   **待本批主干与 MTP KV 都写完，再 `pc_commit(..., pos+nb)`**，然后处理下一批。
 
 ⚠️ 旧实现按 `kMaxT` 分批走 prompt，每 32 个 token 付一次 `prefill_flush()` **加一次阻塞的
 `d_mtp_hprev` 主机 memcpy/wait**，把三相位多设备流水线彻底串行化：131k 深度的 e2e_ttft 是 1475 s，
 走调度器的同一 prompt 是 311 s；64k 是 697 vs 117 s（`engine_mtp.cpp:794-801`）。
 
-**前缀缓存**：`generate_mtp` 调 `pc_admit`（消费命中：恢复 KV 与递归状态），prefill 循环**之后**调
-`pc_commit(0, prompt, blocks, nprompt)`，与调度器同一套契约。顺序是承重的：`pc_commit` 会把
-`pc_slot_[0].registered` 推到 `nprompt/32`，而每个 prefill chunk 里的 `pc_capture_begin` 要求
-`ps.registered * kBlockSize == pos0`（`engine_prefix_cache.cpp:806-808`）——所以提前提交会让本次
-prefill 一个检查点也捕不到（`pc_active` 恒 0），这条路径的缓存支持等于没有；而且节点会在其 KV 块
-还没写完时就发布，prefill 中途抛错就会留下"声称常驻、实际是陈旧 KV"的记录。`pc_commit` 必须在
-prefill 之后、生成之前。
+**前缀缓存**：`generate_mtp` 调 `pc_admit`（消费命中：恢复 KV 与递归状态），每个 prefill 批次
+**及其 MTP 层写入**完成后调一次 `pc_commit(0, prompt, blocks, pos+nb)`，与调度器的逐批
+提交契约一致。顺序是承重的：`pc_capture_begin` 要求
+`ps.registered * kBlockSize == pos0`（`engine_prefix_cache.cpp`）；在本批前提交会让本批的
+检查点一个也捕不到，并且在 KV 未写完时发布节点；只在**整个 prompt** 后提交则让第二批开始
+时缺少前一批的注册链，下一次 capture 会释放前批的待提交检查点。
 
 实测（27B、`--layer-map 0-31:gpu.0,32-63:gpu.1`、`--mtp 4 gen --temp 0`、约 90 token 的 prompt、
 `PF_PC_DEBUG=1`，2x A770）：把 `pc_commit` 挪到 prefill 之后，退出统计从
@@ -857,10 +858,10 @@ prefill 之后、生成之前。
 "有链无状态"（`pc_admit` 只恢复到**有状态**的最深边界，所以这种节点下次根本接不上）变成带递归状态
 检查点的可续接命中。改动前那两个节点是既不可续接、又是在 KV 写完之前发布的。
 
-注意 CLI 的 `gen`（无论普通还是 MTP）**不走前缀缓存**：`pc_admit`/`pc_commit` 只有
-`src/server/scheduler.cpp:91,259` 调用，`generate_impl` 直接 `alloc_block`。所以这条契约只在
-`--temp 0 --mtp N`（`generate_impl` 分流到 `generate_mtp`，`engine.cpp:2365-2368`）与服务端
-`mtp_direct`（`PF_MTP_SERVER=1`）下生效。
+普通 `gen` 的 `generate_impl` 直接分配 KV 块，不用前缀缓存；若贪心请求被分流到
+`generate_mtp`，CLI 与启用了 `PF_MTP_SERVER=1` 的服务端 MTP 路径都会准入、逐批提交，
+并在退出时用 `pc_retire` 归还已缓存块的 pin。DFlash 不准入目标的前缀缓存，
+因为其草稿环尚无对应的已恢复状态。
 
 ### 12.7 cycle 的时间分解，以及 2x 是 acceptance 决定的
 

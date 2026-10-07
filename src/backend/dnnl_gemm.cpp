@@ -634,6 +634,26 @@ dnnl_gemm::~dnnl_gemm() {
             sycl::free(it.second.off, p->q);
         }
     }
+    for (auto & it : p->cb4weights) {
+        if (it.second.idx) {
+            sycl::free(it.second.idx, p->q);
+        }
+        if (it.second.scales) {
+            sycl::free(it.second.scales, p->q);
+        }
+    }
+    if (p->lut) {
+        sycl::free(p->lut, p->q);
+    }
+    if (p->lut16) {
+        sycl::free(p->lut16, p->q);
+    }
+    if (p->bit_lut) {
+        sycl::free(p->bit_lut, p->q);
+    }
+    if (p->cb4_scratch) {
+        sycl::free(p->cb4_scratch, p->q);
+    }
 }
 
 // Host-side conversion of one tensor: GGUF K-quant rows -> int8 + one

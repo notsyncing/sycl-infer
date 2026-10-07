@@ -191,8 +191,15 @@ bool mm_audio_decode_mem(const uint8_t * data, size_t len, const audio_preproc_c
 }
 
 bool mm_audio_decode_ffmpeg(const std::string & path, mm_audio & out, std::string * err) {
-    std::string cmd = std::string(av_ffmpeg_cmd()) + " -v error -i \"" + path + "\" -f f32le -ac 1 -ar 16000 2> "
-                      + av_ffmpeg_err_log() + " pipe:1";
+    av_error_log log;
+    if (log.path.empty()) {
+        if (err) {
+            *err = "cannot create ffmpeg error log";
+        }
+        return false;
+    }
+    std::string cmd = std::string(av_ffmpeg_cmd()) + " -v error -i " + av_shell_quote(path)
+                      + " -f f32le -ac 1 -ar 16000 2> " + av_shell_quote(log.path) + " pipe:1";
     FILE * p = popen(cmd.c_str(), "r");
     if (!p) {
         if (err) {
@@ -208,7 +215,7 @@ bool mm_audio_decode_ffmpeg(const std::string & path, mm_audio & out, std::strin
     }
     const int status = pclose(p);
     if (samples.empty() || status != 0) {
-        std::string tail = av_err_tail();
+        std::string tail = av_err_tail(log.path);
         if (err) {
             if (samples.empty() && status == 0) {
                 *err = "audio produced no samples";
@@ -238,9 +245,8 @@ bool mm_audio_decode_bytes(const uint8_t * data, size_t len, const audio_preproc
     }
     // Non-WAV (MP3/OGG/...): spill to a temp file for the ffmpeg CLI, which can
     // only read paths.  The extension is left .tmp so ffmpeg sniffs the magic.
-    const char * tmpl = "/tmp/opencode/sycl_infer_audio_XXXXXX";
-    std::vector<char> path(tmpl, tmpl + std::strlen(tmpl) + 1);
-    const int fd = mkstemp(path.data());
+    std::string path;
+    const int fd = av_make_temp_file("audio", path);
     if (fd < 0) {
         if (err) {
             *err = "cannot create temp file for audio decode";
@@ -259,14 +265,14 @@ bool mm_audio_decode_bytes(const uint8_t * data, size_t len, const audio_preproc
     }
     close(fd);
     if (!ok) {
-        std::remove(path.data());
+        std::remove(path.c_str());
         if (err) {
             *err = "cannot write audio temp file";
         }
         return false;
     }
-    const bool decoded = mm_audio_decode_ffmpeg(path.data(), out, err);
-    std::remove(path.data());
+    const bool decoded = mm_audio_decode_ffmpeg(path, out, err);
+    std::remove(path.c_str());
     if (!decoded) {
         // keep both failure leaves: a corrupt WAV must not masquerade as an
         // ffmpeg error, nor the other way round

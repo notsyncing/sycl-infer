@@ -64,6 +64,13 @@ std::shared_ptr<sequence> scheduler::submit(std::vector<int> prompt, const gen_p
 }
 
 bool scheduler::admit(std::shared_ptr<sequence> & s) {
+    // A direct scheduler caller may bypass HTTP validation.  Without this an
+    // empty sequence is admitted but neither the prefill nor decode loop can
+    // make progress, leaving its worker blocked in pop_token indefinitely.
+    if (s->prompt.empty()) {
+        retire(s, "stop");
+        return true;
+    }
     // a prompt that does not fit the configured context cannot be prefilled
     // (its block table row is only max_seq/kBlockSize entries long): retire it
     // cleanly instead of writing KV through table entries that do not exist

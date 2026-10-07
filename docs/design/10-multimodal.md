@@ -167,7 +167,9 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
   `up → gelu_tanh → down` + residual。token → patch 坐标的反推在 `vision.cpp:428-434`。
 * **merger**：`C = merge² = 4`，`hidden = C*n_embd`；`n_out` 行直接重解释为 `n_out` 个长度 `hidden`
   的向量（2×2 拼接是 stride 重解释，`vision.cpp:523-529`），然后 `mm.0 → gelu → mm.2`，输出
-  `n_out * proj_dim`。
+  `n_out * proj_dim`。文本引擎按 `n_embd` 为每行分配，所以 CLI/服务器加载 mmproj 时，
+  以及 `mm_build_prompt*` 编码前，均校验 `proj_dim == text n_embd`；不匹配直接报错，
+  不能把 `proj_dim` 个 float 写进 `n_embd` 行跨度。
 
 ### 3.5 device 前向（`encode_device`）
 

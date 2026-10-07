@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,14 +58,6 @@ uint32_t rd_u16(mem_reader & r) {
     return v;
 }
 
-void rd_bytes(mem_reader & r, void * dst, size_t len) {
-    if (r.p + len > r.n) {
-        throw std::runtime_error("truncated AVI");
-    }
-    std::memcpy(dst, r.d + r.p, len);
-    r.p += len;
-}
-
 // a fourcc is printable ASCII (used to detect chunk alignment padding)
 bool fourcc_ok(const uint8_t * c) {
     for (int i = 0; i < 4; i++) {
@@ -75,6 +68,48 @@ bool fourcc_ok(const uint8_t * c) {
     return true;
 }
 
+// biCompression is read little-endian, so a fourcc literal has to be built the
+// same way ('MJPG' as a multi-character literal is byte-swapped on x86)
+constexpr uint32_t fcc(char a, char b, char c, char d) {
+    return (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) | ((uint32_t)(uint8_t)c << 16)
+           | ((uint32_t)(uint8_t)d << 24);
+}
+
+bool is_mjpeg(uint32_t comp) {
+    return comp == fcc('M', 'J', 'P', 'G') || comp == fcc('m', 'j', 'p', 'g') || comp == fcc('M', 'J', 'P', 'D')
+           || comp == fcc('m', 'j', 'p', 'd');
+}
+
+// One RIFF chunk header: `id` points at the fourcc in the buffer, `size` is
+// the chunk's *data* size read from the four bytes after it, [body, end) is the
+// data (end may lie past the parent's limit when the file is truncated or the
+// size is bogus: callers must check).
+struct riff_chunk {
+    const uint8_t * id = nullptr;
+    uint32_t size = 0;
+    uint64_t body = 0;
+    uint64_t end = 0;
+};
+
+// read the 8-byte header at r.p (fourcc, then size); false when fewer than 8
+// bytes remain before `limit`.  Leaves r.p at the body.
+bool next_chunk(mem_reader & r, size_t limit, riff_chunk & c) {
+    if (limit > r.n || r.p > limit || limit - r.p < 8) {
+        return false;
+    }
+    c.id = r.d + r.p;
+    r.p += 4; // the fourcc comes first ...
+    c.size = rd_u32(r); // ... then the 32-bit little-endian size
+    c.body = r.p;
+    c.end = c.body + (uint64_t)c.size;
+    return true;
+}
+
+// start of the sibling after `c` (chunks are padded to an even length)
+size_t chunk_next(const riff_chunk & c) {
+    return (size_t)(c.end + (c.size & 1));
+}
+
 // Parse the hdrl list: finds the video BITMAPINFOHEADER (strf) and the first
 // avih header (for the frame rate).
 struct avi_header {
@@ -83,32 +118,24 @@ struct avi_header {
     int bpp = 0;
     uint32_t compression = 0;
     double fps = 0;
+    int stream = 0; // index of the video stream (its chunks are "<NN>dc"/"<NN>db")
 };
 
-// walk the RIFF/LIST nesting; `want` is the fourcc of the LIST we are looking for
-void seek_list(mem_reader & r, const char * want) {
-    while (r.p + 8 <= r.n) {
-        const char * id = (const char *)(r.d + r.p);
-        const uint32_t size = rd_u32(r);
-        if (std::memcmp(id, "LIST", 4) == 0) {
-            if (r.p + 4 > r.n) {
-                throw std::runtime_error("truncated AVI");
-            }
-            const char * type = (const char *)(r.d + r.p);
-            r.p += 4;
-            if (std::memcmp(type, want, 4) == 0) {
-                return;
-            }
-            r.p += size - 4;
-            if (size & 1) {
-                r.p++;
-            }
-        } else {
-            r.p += size;
-            if (size & 1) {
-                r.p++;
-            }
+// Walk the chunks in [r.p, limit) for the LIST whose type is `want`.  Returns
+// the end of that list's data (clamped to `limit`, so a truncated file is still
+// usable) with r.p just past the list type; throws when it is not found.
+size_t seek_list(mem_reader & r, const char * want, size_t limit) {
+    riff_chunk c;
+    while (next_chunk(r, limit, c)) {
+        if (std::memcmp(c.id, "LIST", 4) == 0 && c.size >= 4 && c.body + 4 <= limit
+            && std::memcmp(r.d + c.body, want, 4) == 0) {
+            r.p = (size_t)c.body + 4;
+            return (size_t)std::min<uint64_t>(c.end, limit);
         }
+        if (c.end > limit) {
+            break; // a chunk that runs past the buffer cannot be skipped
+        }
+        r.p = chunk_next(c);
     }
     throw std::runtime_error("AVI has no " + std::string(want) + " list");
 }
@@ -120,61 +147,46 @@ bool parse_avi_header(const uint8_t * data, size_t len, avi_header & h) {
             return false;
         }
         r.p = 12;
-        seek_list(r, "hdrl");
-        while (r.p + 8 <= r.n) {
-            const char * id = (const char *)(r.d + r.p);
-            const uint32_t size = rd_u32(r);
-            if (std::memcmp(id, "avih", 4) == 0) {
-                uint32_t uSec = rd_u32(r);
+        const size_t hdrl_end = seek_list(r, "hdrl", len);
+        int strl_idx = 0;
+        riff_chunk c;
+        while (next_chunk(r, hdrl_end, c)) {
+            if (c.end > hdrl_end) {
+                break;
+            }
+            if (std::memcmp(c.id, "avih", 4) == 0 && c.size >= 4) {
+                mem_reader s{data, (size_t)c.end, (size_t)c.body};
+                const uint32_t uSec = rd_u32(s);
                 if (uSec > 0) {
                     h.fps = 1e6 / uSec;
                 }
-                r.p += size - 4;
-                if (size & 1) {
-                    r.p++;
-                }
-            } else if (std::memcmp(id, "LIST", 4) == 0) {
+            } else if (std::memcmp(c.id, "LIST", 4) == 0 && c.size >= 4 && std::memcmp(data + c.body, "strl", 4) == 0) {
                 // nested strl list: strh tells the type, strf the format
-                mem_reader sub = r;
-                sub.p += 4; // list type
-                const size_t end = r.p + (size_t)size - 4;
+                mem_reader sub{data, (size_t)c.end, (size_t)c.body + 4};
                 bool is_vid = false;
-                while (sub.p + 8 <= end) {
-                    const char * sid = (const char *)(sub.d + sub.p);
-                    const uint32_t ssz = rd_u32(sub);
-                    if (std::memcmp(sid, "strh", 4) == 0 && ssz >= 12 && sub.p + 8 <= end) {
-                        char fcc[5] = {0, 0, 0, 0, 0};
-                        rd_bytes(sub, fcc, 4);
-                        is_vid = std::memcmp(fcc, "vids", 4) == 0;
-                        sub.p += ssz - 4;
-                    } else if (is_vid && std::memcmp(sid, "strf", 4) == 0 && ssz >= 40) {
-                        const uint32_t biSize = rd_u32(sub);
-                        h.width = (int)rd_u32(sub);
-                        h.height = (int)rd_u32(sub);
-                        rd_u32(sub); // planes
-                        h.bpp = (int)rd_u16(sub);
-                        rd_u16(sub);
-                        h.compression = rd_u32(sub);
-                        sub.p += biSize - 24;
-                        // full strh? strf only; we are done
-                        return true;
-                    } else {
-                        sub.p += ssz;
-                        if (ssz & 1) {
-                            sub.p++;
-                        }
+                riff_chunk sc;
+                while (next_chunk(sub, (size_t)c.end, sc)) {
+                    if (sc.end > c.end) {
+                        break;
                     }
+                    if (std::memcmp(sc.id, "strh", 4) == 0 && sc.size >= 4) {
+                        is_vid = std::memcmp(data + sc.body, "vids", 4) == 0;
+                    } else if (is_vid && std::memcmp(sc.id, "strf", 4) == 0 && sc.size >= 40) {
+                        mem_reader f{data, (size_t)sc.end, (size_t)sc.body};
+                        rd_u32(f); // biSize
+                        h.width = (int)rd_u32(f);
+                        h.height = (int)rd_u32(f);
+                        rd_u16(f); // planes
+                        h.bpp = (int)rd_u16(f);
+                        h.compression = rd_u32(f);
+                        h.stream = strl_idx;
+                        return true;
+                    }
+                    sub.p = chunk_next(sc);
                 }
-                r.p = end;
-                if (size & 1) {
-                    r.p++;
-                }
-            } else {
-                r.p += size;
-                if (size & 1) {
-                    r.p++;
-                }
+                strl_idx++;
             }
+            r.p = chunk_next(c);
         }
     } catch (const std::exception &) {
         return false;
@@ -188,47 +200,46 @@ bool collect_avi_frames(const uint8_t * data, size_t len, const avi_header & h, 
     mem_reader r{data, len};
     try {
         r.p = 12;
-        seek_list(r, "hdrl");
-        seek_list(r, "movi");
-        const size_t movi_start = r.p;
-        while (r.p + 8 <= len) {
-            const uint8_t * id = data + r.p;
-            const uint32_t size = rd_u32(r);
-            const bool is_frame = std::memcmp(id, "00dc", 4) == 0 || std::memcmp(id, "00db", 4) == 0
-                                  || std::memcmp(id, "01dc", 4) == 0 || std::memcmp(id, "01db", 4) == 0;
+        const size_t movi_end = seek_list(r, "movi", len);
+        // chunk ids of the video stream are two decimal digits + "dc"/"db"
+        const char s0 = (char)('0' + (h.stream / 10) % 10);
+        const char s1 = (char)('0' + h.stream % 10);
+        riff_chunk c;
+        while (next_chunk(r, movi_end, c)) {
+            if (std::memcmp(c.id, "LIST", 4) == 0) {
+                // "rec " grouping lists: descend, the frames inside are ordinary chunks
+                if (c.size < 4 || c.body + 4 > movi_end) {
+                    break;
+                }
+                r.p = (size_t)c.body + 4;
+                continue;
+            }
+            if (c.end > movi_end) {
+                break; // truncated chunk: its data is not all there
+            }
+            const bool is_frame = c.id[0] == (uint8_t)s0 && c.id[1] == (uint8_t)s1 && c.id[2] == 'd'
+                                  && (c.id[3] == 'c' || c.id[3] == 'b');
             if (is_frame) {
                 avi_frame_loc l;
-                l.off = r.p;
-                l.len = size;
+                l.off = c.body;
+                l.len = c.size;
                 l.pts = h.fps > 0 ? (double)frames.size() / h.fps : 0;
                 frames.push_back(l);
                 if (frames.size() >= max_frames) {
                     break;
                 }
             }
-            const uint64_t data_end = r.p + size;
-            if (data_end > len) {
-                break;
-            }
             // even alignment; bump to 4 if the next fourcc is not printable
-            r.p = data_end;
-            if (data_end & 1) {
-                r.p = data_end + 1;
-            }
-            if (r.p >= len) {
+            const uint64_t padded = chunk_next(c);
+            r.p = (size_t)padded;
+            if (r.p >= movi_end) {
                 break;
             }
-            if (r.p + 8 <= len) {
-                const char * nid = (const char *)(r.d + r.p);
-                if (std::memcmp(nid, "idx1", 4) == 0) {
-                    break; // index follows the movi list
-                }
+            if (movi_end - r.p >= 4 && std::memcmp(r.d + r.p, "idx1", 4) == 0) {
+                break; // index follows the movi list
             }
-            if (r.p + 4 <= len && !fourcc_ok(r.d + r.p)) {
-                r.p = (data_end + 3) & ~(uint64_t)3;
-            }
-            if (r.p == (size_t)movi_start) {
-                break; // no progress guard
+            if (movi_end - r.p >= 4 && !fourcc_ok(r.d + r.p)) {
+                r.p = (size_t)((c.end + 3) & ~(uint64_t)3);
             }
         }
         return !frames.empty();
@@ -237,13 +248,24 @@ bool collect_avi_frames(const uint8_t * data, size_t len, const avi_header & h, 
     }
 }
 
-bool decode_one(const uint8_t * data, size_t len, const avi_frame_loc & loc, const avi_header & h, mm_video_frame & f) {
+bool decode_one(const uint8_t * data, size_t len, const avi_frame_loc & loc, const avi_header & h,
+                const mm_video_fmt & fmt, mm_video_frame & f) {
+    if (loc.off > len || loc.len > len - loc.off) {
+        return false;
+    }
     const uint8_t * fr = data + loc.off;
     const uint32_t size = loc.len;
-    if (h.compression == 'MJPG' || h.compression == 'MJPD') {
+    if (is_mjpeg(h.compression)) {
+        if (size == 0 || size > (uint32_t)INT_MAX) {
+            return false;
+        }
         int w = 0, hh = 0, comp = 0;
         stbi_uc * px = stbi_load_from_memory(fr, (int)size, &w, &hh, &comp, 3);
         if (!px) {
+            return false;
+        }
+        if (w > fmt.max_side || hh > fmt.max_side) {
+            stbi_image_free(px);
             return false;
         }
         f.width = w;
@@ -252,45 +274,41 @@ bool decode_one(const uint8_t * data, size_t len, const avi_frame_loc & loc, con
         stbi_image_free(px);
         return true;
     }
-    // raw frames
+    // raw frames: DIB rows are padded to a multiple of 4 bytes
     const int w = h.width, hh = h.height < 0 ? -h.height : h.height;
     const bool bottom_up = h.height > 0;
-    f.width = w;
-    f.height = hh;
-    const size_t pix = (size_t)w * hh;
-    if (h.bpp == 24) {
-        if ((size_t)size < pix * 3) {
-            return false;
-        }
-        f.rgb.assign(fr, fr + pix * 3);
-    } else if (h.bpp == 16) {
-        if ((size_t)size < pix * 2) {
-            return false;
-        }
-        f.rgb.resize(pix * 3);
-        for (size_t i = 0; i < pix; i++) {
-            const uint16_t v = (uint16_t)fr[2 * i] | ((uint16_t)fr[2 * i + 1] << 8);
-            f.rgb[3 * i + 0] = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);
-            f.rgb[3 * i + 1] = (uint8_t)(((v >> 5) & 0x3F) * 255 / 63);
-            f.rgb[3 * i + 2] = (uint8_t)((v & 0x1F) * 255 / 31);
-        }
-    } else if (h.bpp == 32) {
-        if ((size_t)size < pix * 4) {
-            return false;
-        }
-        f.rgb.resize(pix * 3);
-        for (size_t i = 0; i < pix; i++) {
-            f.rgb[3 * i + 0] = fr[4 * i + 2];
-            f.rgb[3 * i + 1] = fr[4 * i + 1];
-            f.rgb[3 * i + 2] = fr[4 * i + 0];
-        }
-    } else {
+    if (w <= 0 || hh <= 0 || (h.bpp != 16 && h.bpp != 24 && h.bpp != 32)) {
         return false;
     }
-    if (bottom_up) {
-        for (int y = 0; y < hh / 2; y++) {
-            std::swap_ranges(f.rgb.begin() + (size_t)y * w * 3, f.rgb.begin() + (size_t)y * w * 3 + (size_t)w * 3,
-                             f.rgb.begin() + (size_t)(hh - 1 - y) * w * 3);
+    const size_t bpx = (size_t)h.bpp / 8;
+    const size_t stride = ((size_t)w * h.bpp + 31) / 32 * 4;
+    if ((size_t)size < stride * (size_t)hh) {
+        return false;
+    }
+    f.width = w;
+    f.height = hh;
+    f.rgb.resize((size_t)w * hh * 3);
+    // BI_RGB 16-bit is 5-5-5.  BI_BITFIELDS is left to ffmpeg because its
+    // masks can vary and this parser does not read/validate them.
+    for (int y = 0; y < hh; y++) {
+        const uint8_t * row = fr + (size_t)(bottom_up ? hh - 1 - y : y) * stride;
+        uint8_t * dst = f.rgb.data() + (size_t)y * w * 3;
+        for (int x = 0; x < w; x++) {
+            const uint8_t * px = row + (size_t)x * bpx;
+            if (h.bpp == 24) {
+                dst[3 * x + 0] = px[2]; // DIB pixels are BGR
+                dst[3 * x + 1] = px[1];
+                dst[3 * x + 2] = px[0];
+            } else if (h.bpp == 16) {
+                const uint16_t v = (uint16_t)px[0] | ((uint16_t)px[1] << 8);
+                dst[3 * x + 0] = (uint8_t)(((v >> 10) & 0x1F) * 255 / 31);
+                dst[3 * x + 1] = (uint8_t)(((v >> 5) & 0x1F) * 255 / 31);
+                dst[3 * x + 2] = (uint8_t)((v & 0x1F) * 255 / 31);
+            } else {
+                dst[3 * x + 0] = px[2];
+                dst[3 * x + 1] = px[1];
+                dst[3 * x + 2] = px[0];
+            }
         }
     }
     return true;
@@ -298,14 +316,29 @@ bool decode_one(const uint8_t * data, size_t len, const avi_frame_loc & loc, con
 
 bool try_avi(const uint8_t * data, size_t len, const mm_video_fmt & fmt, mm_video & out, std::string * err) {
     avi_header h;
-    if (!parse_avi_header(data, len, h) || h.width <= 0 || h.height == 0 || h.bpp == 0) {
+    if (!parse_avi_header(data, len, h) || h.width <= 0 || h.height == 0 || h.height == INT_MIN || h.bpp == 0) {
+        return false;
+    }
+    if (fmt.max_frames <= 0) {
+        if (err) {
+            *err = "max_frames must be positive";
+        }
         return false;
     }
     if (h.width > fmt.max_side || std::abs(h.height) > fmt.max_side) {
         if (err) {
             *err = "video frame too large";
         }
-        return false; // recognized but rejected: do not fall back to ffmpeg
+        return false; // recognized but rejected (ffmpeg's probe applies the same limit)
+    }
+    // MJPEG or uncompressed BI_RGB 16/24/32-bit; formats with explicit channel
+    // masks (BI_BITFIELDS) need ffmpeg unless their masks are parsed and checked.
+    const bool raw_ok = h.compression == 0 && (h.bpp == 16 || h.bpp == 24 || h.bpp == 32);
+    if (!is_mjpeg(h.compression) && !raw_ok) {
+        if (err) {
+            *err = "unsupported AVI video codec";
+        }
+        return false;
     }
     std::vector<avi_frame_loc> locs;
     if (!collect_avi_frames(data, len, h, locs, kMaxVideoDecodeFrames)) {
@@ -315,14 +348,15 @@ bool try_avi(const uint8_t * data, size_t len, const mm_video_fmt & fmt, mm_vide
         return false;
     }
     // uniform sample down to max_frames
-    const size_t step = (locs.size() + fmt.max_frames - 1) / fmt.max_frames;
+    const size_t max_frames = (size_t)std::min(fmt.max_frames, kMaxVideoDecodeFrames);
+    const size_t step = (locs.size() + max_frames - 1) / max_frames;
     for (size_t i = 0; i < locs.size(); i += step) {
         mm_video_frame f;
-        if (decode_one(data, len, locs[i], h, f)) {
+        if (decode_one(data, len, locs[i], h, fmt, f)) {
             f.pts = locs[i].pts;
             out.frames.push_back(std::move(f));
         }
-        if ((int)out.frames.size() >= fmt.max_frames) {
+        if (out.frames.size() >= max_frames) {
             break;
         }
     }
@@ -388,8 +422,8 @@ bool probe_video(const std::string & path, int & w, int & h, double & dur) {
     // ffprobe prints "width,height,duration" on one line with -of csv
     const std::string pcmd = std::string(av_ffprobe_cmd())
                              + " -v error -select_streams v:0 -show_entries stream=width,height:format=duration -of "
-                               "csv=p=0 \""
-                             + path + "\"";
+                               "csv=p=0 "
+                             + av_shell_quote(path);
     FILE * p = popen(pcmd.c_str(), "r");
     if (p) {
         char line[256] = {0};
@@ -419,11 +453,9 @@ bool probe_video(const std::string & path, int & w, int & h, double & dur) {
         } else {
             pclose(p);
         }
-    } else if (p) {
-        pclose(p);
     }
     // no ffprobe: parse `ffmpeg -i` stderr
-    const std::string fcmd = std::string(av_ffmpeg_cmd()) + " -v error -i \"" + path + "\" 2>&1";
+    const std::string fcmd = std::string(av_ffmpeg_cmd()) + " -v error -i " + av_shell_quote(path) + " 2>&1";
     FILE * fp = popen(fcmd.c_str(), "r");
     if (!fp) {
         return false;
@@ -440,6 +472,13 @@ bool probe_video(const std::string & path, int & w, int & h, double & dur) {
 }
 
 bool decode_ffmpeg(const std::string & path, const mm_video_fmt & fmt, mm_video & out, std::string * err) {
+    if (fmt.max_frames <= 0) {
+        if (err) {
+            *err = "max_frames must be positive";
+        }
+        return false;
+    }
+    const int max_frames = std::min(fmt.max_frames, kMaxVideoDecodeFrames);
     int w = 0, h = 0;
     double dur = 0;
     if (!probe_video(path, w, h, dur) || (w > fmt.max_side || h > fmt.max_side)) {
@@ -450,7 +489,19 @@ bool decode_ffmpeg(const std::string & path, const mm_video_fmt & fmt, mm_video 
         }
         return false;
     }
-    double fps = dur > 0 ? (double)fmt.max_frames / dur : 0;
+    // The filter below forces even sides, so the raw frames are not w x h: the
+    // output geometry is computed here and passed to ffmpeg explicitly (a
+    // 1-pixel side would otherwise truncate to 0 and fail), so the rawvideo
+    // stream is read with exactly the size it was written with.
+    const int ow = w < 2 ? 2 : (w & ~1);
+    const int oh = h < 2 ? 2 : (h & ~1);
+    if (ow > fmt.max_side || oh > fmt.max_side) {
+        if (err) {
+            *err = "cannot probe video with ffmpeg (frame too large)";
+        }
+        return false;
+    }
+    double fps = dur > 0 ? (double)max_frames / dur : 0;
     if (fps <= 0 || fps > 120) {
         if (fps > 120) {
             fps = 120;
@@ -460,10 +511,20 @@ bool decode_ffmpeg(const std::string & path, const mm_video_fmt & fmt, mm_video 
     }
     char with_odd[64];
     std::snprintf(with_odd, sizeof(with_odd), "%.4g", fps);
+    // -noautorotate: ffprobe reports the coded geometry, so a display-matrix
+    // rotation (which would swap the output sides) must not be applied here
+    av_error_log log;
+    if (log.path.empty()) {
+        if (err) {
+            *err = "cannot create ffmpeg error log";
+        }
+        return false;
+    }
     std::string cmd = std::string(av_ffmpeg_cmd())
-                      + " -v error -i \"" + path
-                      + "\" -an -sn -vf \"fps=" + with_odd
-                      + ",scale=trunc(iw/2)*2:trunc(ih/2)*2\" -pix_fmt rgb24 -f rawvideo 2> " + std::string(av_ffmpeg_err_log()) + " pipe:1";
+                      + " -v error -noautorotate -i " + av_shell_quote(path)
+                      + " -an -sn -vf \"fps=" + with_odd
+                      + ",scale=" + std::to_string(ow) + ":" + std::to_string(oh)
+                      + "\" -pix_fmt rgb24 -f rawvideo 2> " + av_shell_quote(log.path) + " pipe:1";
     FILE * p = popen(cmd.c_str(), "r");
     if (!p) {
         if (err) {
@@ -471,29 +532,29 @@ bool decode_ffmpeg(const std::string & path, const mm_video_fmt & fmt, mm_video 
         }
         return false;
     }
-    const size_t frame = (size_t)w * h * 3;
+    const size_t frame = (size_t)ow * oh * 3;
     std::vector<mm_video_frame> all;
-    all.reserve(fmt.max_frames);
+    all.reserve(max_frames);
     std::vector<uint8_t> buf(frame);
     // cap the received count so a frame-rate mismatch cannot blow memory
-    while ((int)all.size() < fmt.max_frames * 2 && std::fread(buf.data(), 1, frame, p) == frame) {
+    while ((int)all.size() < max_frames * 2 && std::fread(buf.data(), 1, frame, p) == frame) {
         mm_video_frame f;
-        f.width = w;
-        f.height = h;
+        f.width = ow;
+        f.height = oh;
         f.rgb = buf;
         f.pts = 0;
         all.push_back(std::move(f));
     }
     const int status = pclose(p);
     if (all.empty()) {
-        std::string tail = av_err_tail();
+        std::string tail = av_err_tail(log.path);
         if (err) {
             *err = "ffmpeg produced no frames" + (status != 0 ? (": " + tail) : std::string());
         }
         return false;
     }
     // the fps filter is approximate: subsample to exactly max_frames
-    const int want = std::min(fmt.max_frames, (int)all.size());
+    const int want = std::min(max_frames, (int)all.size());
     const size_t step = (all.size() + want - 1) / want;
     for (size_t i = 0; i < all.size() && (int)out.frames.size() < want; i += step) {
         out.frames.push_back(std::move(all[i]));
@@ -523,6 +584,12 @@ void mm_video_subsample(const std::vector<mm_video_frame> & src, int n, std::vec
 
 bool mm_video_decode_mem(const uint8_t * data, size_t len, const mm_video_fmt & fmt, mm_video & out, std::string * err) {
     out.frames.clear();
+    if (fmt.max_frames <= 0) {
+        if (err) {
+            *err = "max_frames must be positive";
+        }
+        return false;
+    }
     if (!data || len < 12) {
         if (err) {
             *err = "empty video data";
@@ -534,15 +601,14 @@ bool mm_video_decode_mem(const uint8_t * data, size_t len, const mm_video_fmt & 
         return true;
     }
     // not a decodable AVI (or failed): hand the bytes to ffmpeg via a tmp file
-    char tmpl[128] = "/tmp/opencode/sycl_infer_video_XXXXXX";
-    const int fd = mkstemp(tmpl);
+    std::string path;
+    const int fd = av_make_temp_file("video", path);
     if (fd < 0) {
         if (err) {
             *err = "cannot write video temp file";
         }
         return false;
     }
-    const std::string path = tmpl;
     bool ok = true;
     size_t off = 0;
     while (off < len) {
@@ -568,6 +634,12 @@ bool mm_video_decode_mem(const uint8_t * data, size_t len, const mm_video_fmt & 
 
 bool mm_video_decode_file(const std::string & path, const mm_video_fmt & fmt, mm_video & out, std::string * err) {
     out.frames.clear();
+    if (fmt.max_frames <= 0) {
+        if (err) {
+            *err = "max_frames must be positive";
+        }
+        return false;
+    }
     FILE * f = std::fopen(path.c_str(), "rb");
     if (!f) {
         if (err) {
@@ -578,6 +650,13 @@ bool mm_video_decode_file(const std::string & path, const mm_video_fmt & fmt, mm
     std::fseek(f, 0, SEEK_END);
     const long sz = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        std::fclose(f);
+        if (err) {
+            *err = "cannot size " + path;
+        }
+        return false;
+    }
     std::vector<uint8_t> buf((size_t)sz);
     const size_t rd = std::fread(buf.data(), 1, buf.size(), f);
     std::fclose(f);

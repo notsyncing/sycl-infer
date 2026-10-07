@@ -134,8 +134,15 @@ mm_prompt mm_expand_prompt(const tokenizer & tk, const std::string & rendered, c
 // ---------------------------------------------------------------------------
 // Images.
 // ---------------------------------------------------------------------------
+static void check_vision_width(const vision_model & vm, int n_embd) {
+    if (vm.hp.proj_dim != n_embd) {
+        throw std::runtime_error("mm: vision projector output width != text n_embd");
+    }
+}
+
 static mm_prompt build_image_prompt(const tokenizer & tk, const std::string & rendered,
                                     const std::vector<mm_image> & images, const vision_model & vm, int n_embd) {
+    check_vision_width(vm, n_embd);
     const int n_img = (int)images.size();
     std::vector<mm_block> blocks(n_img);
     std::vector<vision_input> vin(n_img);
@@ -177,6 +184,7 @@ mm_prompt mm_build_prompt(const tokenizer & tk, const std::string & rendered, co
 
 mm_prompt mm_build_prompt_device(vision_model & vm, sycl::queue & q, const tokenizer & tk, const std::string & rendered,
                                  const std::vector<mm_image> & images, int n_embd, float * d_out) {
+    check_vision_width(vm, n_embd);
     const int n_img = (int)images.size();
     std::vector<mm_block> blocks(n_img);
     std::vector<vision_input> vin(n_img);
@@ -282,6 +290,7 @@ vid_plan plan_videos(const tokenizer & tk, const std::vector<mm_video> & vids, c
 
 mm_prompt mm_build_prompt_video(const tokenizer & tk, const std::string & rendered, const std::vector<mm_video> & vids,
                                 const vision_model & vm, int n_embd, int max_frames) {
+    check_vision_width(vm, n_embd);
     vid_plan pl = plan_videos(tk, vids, vm, max_frames);
     mm_prompt p = mm_expand_prompt(tk, rendered, pl.blocks, pl.total_rows);
     p.embd.resize((size_t)pl.total_rows * n_embd);
@@ -301,6 +310,7 @@ mm_prompt mm_build_prompt_video(const tokenizer & tk, const std::string & render
 mm_prompt mm_build_prompt_video_device(vision_model & vm, sycl::queue & q, const tokenizer & tk,
                                        const std::string & rendered, const std::vector<mm_video> & vids, int n_embd,
                                        float * d_out, int max_frames) {
+    check_vision_width(vm, n_embd);
     vid_plan pl = plan_videos(tk, vids, vm, max_frames);
     for (size_t v = 0; v < vids.size(); v++) {
         int row = pl.off[v];
@@ -427,6 +437,13 @@ mm_prompt mm_build_prompt_mixed_device(vision_model & vm, audio_model & am, sycl
     // ---- plan every block in pad order (mixed image/video/audio) -----------
     const int E = n_embd;
     bool any_audio = false;
+    bool any_visual = false;
+    for (const mm_media_ref & mr : order) {
+        any_visual |= mr.kind == MM_KIND_IMAGE || mr.kind == MM_KIND_VIDEO;
+    }
+    if (any_visual) {
+        check_vision_width(vm, E);
+    }
     std::vector<mm_block> blocks(order.size());
     std::vector<int> off(order.size());
     // per-kind pre-encoded data: video uses subsampled+preprocessed frames,
@@ -440,7 +457,7 @@ mm_prompt mm_build_prompt_mixed_device(vision_model & vm, audio_model & am, sycl
     std::vector<anim_input> ains;
     ains.resize(auds.size());
 
-    const image_preproc_cfg vcfg = vision_cfg(vm);
+    const image_preproc_cfg vcfg = any_visual ? vision_cfg(vm) : image_preproc_cfg{};
     int rows = 0;
     for (size_t k = 0; k < order.size(); k++) {
         const mm_media_ref & mr = order[k];

@@ -24,16 +24,23 @@ int main(int argc, char ** argv) {
         "emoji 🚀 test 🎉",
         "Ġweird Ġtokens",
     };
+    int n_mismatch = 0;
     for (const auto & t : tests) {
         auto ids = tk.encode(t);
         printf("\n[%s]\n  n=%zu ids=", t.c_str(), ids.size());
         for (int id : ids) {
             printf("%d ", id);
         }
-        printf("\n  roundtrip: %s\n", tk.decode(ids) == t ? "OK" : "MISMATCH");
-        if (tk.decode(ids) != t) {
-            printf("  got: [%s]\n", tk.decode(ids).c_str());
+        const std::string back = tk.decode(ids);
+        printf("\n  roundtrip: %s\n", back == t ? "OK" : "MISMATCH");
+        if (back != t) {
+            printf("  got: [%s]\n", back.c_str());
+            n_mismatch++;
         }
+    }
+    if (n_mismatch != 0) {
+        fprintf(stderr, "FAIL: %d round-trip mismatch(es)\n", n_mismatch);
+        return 1;
     }
     return 0;
 }

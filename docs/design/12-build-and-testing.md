@@ -179,13 +179,27 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_decode_vs_prefill` | 0.8B | GPU | **单 token decode 与同序列重新 prefill 必须给出同一预测**；纯 prefill 的测试对解码路径是盲区，这个测试是唯一覆盖 |
 | `test_pc_gpu` | 0.8B | GPU | 磁盘 spill + promote 往返，第二次相同 prompt 从磁盘恢复需与首次 logits 一致 |
 | `test_pc_ram_gpu` | 0.8B | GPU | VRAM→RAM→VRAM 往返；新引擎不得看到陈旧 RAM 条目 |
+| `test_dflash_kernels` | 无 | GPU | DFlash top-k 与卷积的合成输入对照 |
+| `test_spec` | 27B + draft GGUF | 双 GPU | MTP/DFlash2 对**显式绕过投机**的 plain greedy oracle；`TEST_SPEC_LONG=1` 另测跨 512-token prefill 和缓存复用 |
 
 `TEST_LAYER_MAP` 是多设备 split 的通用开关（`test_w4_vs_cpuref`、`test_w4_topk`、`test_27b_prefill` 读它），
 `TEST_DEVICE` 只有 `test_27b_prefill` 读。`test_gpu_stages` 除了 `argv[1]` 的模型，还从 `argv[2..]`
 读要跑 stage 的 token id 列表（不传则用 `stage_test.h` 的默认集合）——它也是唯一一个默认模型路径不写
 在 `main()` 里而藏在 `stage_arg_model()` 的测试。
 
-### 2.1 stage 测试脚手架
+### 2.1 CTest 分层注册
+
+默认 `ctest --test-dir build -L hermetic --output-on-failure` 仅运行不依赖
+GGUF 的五个 CPU 测试及 `test_multimodal --video-only` 的合成视频/视觉宽度
+测试（ffmpeg 可缺席，AVI 测试仍运行）；它们必须已构建。模型测试必须显式配置
+`-DSI_REGISTER_GPU_TESTS=ON -DSI_TEST_08B_MODEL=/path/to/0.8b.gguf`；
+另外给 `SI_TEST_27B_MODEL`（可再给 `SI_TEST_DFLASH_MODEL`）才注册双卡 27B
+测试，自动设置 `TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1`。用
+`ctest --test-dir build -L model-0.8b` / `-L model-27b` 分档运行，
+不得把没注册或没运行的模型档称为通过。`test_pc_cpu` 是已知失败，
+修复前没有纳入 hermetic 默认档。
+
+### 2.2 stage 测试脚手架
 
 * `tests/backend/gpu/kernels/stage_tests.h` 声明七个 stage 入口。
 * 每个 `*_stage.cpp` 定义 `void stage_<kernel>(si::stage_env & env)`，用 `env.get(...)` 取快照、
@@ -217,7 +231,7 @@ cmake --build build -j$(nproc)
 ```bash
 ./build/test_gpu_stages     # all stages OK
 ./build/test_gpu_vs_ref     # argmax ... SAME
-./build/test_forward        # stable last_id
+./build/test_forward        # default prompt predicted_argmax=248068 (input_last_id is not a prediction)
 ./build/test_decode_vs_prefill   # OK
 ```
 
@@ -265,7 +279,8 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 ### 3.5 include-cleaner lint（`Diagnostics.UnusedIncludes: Strict` 必须干净）
 
 ```bash
-clang-tidy -p build -checks='-*,misc-include-cleaner' <changed files>
+clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include \
+  -checks='-*,misc-include-cleaner' <changed files>
 ```
 
 ### 3.6 构建"看起来没生效"时

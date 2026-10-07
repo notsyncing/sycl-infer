@@ -82,8 +82,10 @@ token 校验，所以三层之间传递的 key 永远是 (hash, 32 个 token)。
 [05-kv-cache.md](05-kv-cache.md) §5）。
 
 `pc_evict_node(ni)`（`:574-593`）释放检查点（`pc_state_drop`）、清 `pc_block_node_`、从 `pc_map_`
-删除，然后 **swap-remove**：若删的不是最后一个元素，要把末元素搬到 `ni` 并同步修 `pc_map_` 以及它的
-`pc_state_owner`。最后 `free_block(nd.block)` 把 KV 块还给池子。
+删除，然后 **swap-remove**：若删的不是最后一个元素，要把末元素搬到 `ni` 并同步修 `pc_map_`、
+被搬移块的 `pc_block_node_` 以及 `pc_state_owner`。遗漏反向块索引会使后续 `pc_retire` 读到
+已经越界的节点下标；`test_pc_gpu` 用非末节点驱逐覆盖此不变量。最后 `free_block(nd.block)`
+把 KV 块还给池子。
 
 ---
 
@@ -159,6 +161,15 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
    `pc_attach_state_from_lower` 从 RAM/磁盘拉回；失败则 unpin 并 miss。然后 `pc_restore_state`。
 8. `pcr->touch` / `pcd->touch` 记一次命中，设 `pc_slot_[slot].chain = hashes[deep-1]`、
    `registered = deep`，更新统计，返回 `deep * kBlockSize`。
+
+> 只认分批前缀：`deep` 还要收敛到“从零算起的分批前缀”。batched GEMM 的激活 scales
+> 随 M 变，混着“新整块+零散尾巴”的一批（如 33-token 的 512..544）与其前 32 行同 token
+> 的纯 32 批算出不同的 qkv，经 GDN 递推放大到检查点可测分叉（0.8B 双卡 depth=17：
+> sum 1231.91 vs 1237.31），恢复+不同 M 尾巴再放大到 logit 换 argmax（27B 双卡 25.8）。
+> `pc_admit` 重算与 `prefill_text` 相同的 cold splits（只依赖 prompt 长度），在有状态的
+> 边界里取最深且落在前缀上的（如 545 取 512 而非 544），暖重做与 cold 完全相同的后缀批。
+> 100-token 单批没有中间前缀时按设计 miss（宁可重算，不做错恢复）；`test_spec
+> TEST_SPEC_LONG`（545-token，cold/warm/plain 三方 max|diff|=0）是常设覆盖。
 
 `PF_PC_DEBUG`（与 `SCHED_DEBUG` 一样是“环境变量存在即开”，不看值）会逐块打印
 `[pcdbg] admit L=.. blk=.. h=.. vram=.. ram=.. disk=..`（`:653-656`）与

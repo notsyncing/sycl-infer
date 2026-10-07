@@ -3,9 +3,9 @@
 // Host-side video decoding and frame sampling.
 //
 // Two backends:
-//   * the built-in AVI demuxer (RIFF/AVI + MJPEG or raw BI_RGB/BI_RGB565 video
-//     streams), decoded with stb_image — enough for the test suite and for
-//     simple MJPEG clips with no external tools;
+//   * the built-in AVI demuxer (RIFF/AVI + MJPEG or uncompressed BI_RGB
+//     16-bit 5-5-5 / 24-bit / 32-bit streams), decoded with stb_image — enough
+//     for simple MJPEG clips with no external tools;
 //   * the `ffmpeg` CLI subprocess for anything else (detected by extension /
 //     header sniffing), which pipes raw rgb24 frames.  No new compile-time
 //     dependency: ffmpeg is just a subprocess, exactly like llama.cpp's audio

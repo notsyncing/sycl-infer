@@ -572,6 +572,30 @@ void engine::pc_state_release(int st) {
     pc_state_free.push_back(st);
 }
 
+bool engine::pc_indices_valid() const {
+    if (pc_map_.size() != pc_nodes_.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < pc_nodes_.size(); i++) {
+        const pc_node & nd = pc_nodes_[i];
+        const auto it = pc_map_.find(nd.hash);
+        if (it == pc_map_.end() || it->second != (int)i || nd.block < 0
+            || nd.block >= (int)pc_block_node_.size() || pc_block_node_[nd.block] != (int)i) {
+            return false;
+        }
+        if (nd.state >= 0 && (nd.state >= (int)pc_state_owner.size() || pc_state_owner[nd.state] != (int)i)) {
+            return false;
+        }
+    }
+    for (size_t b = 0; b < pc_block_node_.size(); b++) {
+        const int ni = pc_block_node_[b];
+        if (ni >= 0 && (ni >= (int)pc_nodes_.size() || pc_nodes_[ni].block != (int)b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void engine::pc_evict_node(int ni) {
     const pc_node nd = pc_nodes_[ni];
     if (nd.state >= 0) {
@@ -585,6 +609,9 @@ void engine::pc_evict_node(int ni) {
     if (ni != last) {
         pc_nodes_[ni] = pc_nodes_[last];
         pc_map_[pc_nodes_[ni].hash] = ni;
+        // The moved node still owns its KV block.  pc_retire uses this reverse
+        // index to release pins; leaving `last` here can index past pc_nodes_.
+        pc_block_node_[pc_nodes_[ni].block] = ni;
         if (pc_nodes_[ni].state >= 0) {
             pc_state_owner[pc_nodes_[ni].state] = ni;
         }
@@ -675,6 +702,72 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
     if (avail <= 0 || deep <= 0) {
         pc_stat_misses++;
         return 0;
+    }
+    // Only resume at a boundary that is also a prefill split prefix from
+    // scratch: the batched GEMM's activation scales depend on M, so a boundary
+    // captured inside a mixed block+tail batch (e.g. 544 within a 33-token
+    // 512..544 batch) quantizes its prefix rows differently from a pure
+    // block batch holding the same tokens (depth-17 sums 1231.91 vs 1237.31).
+    // Resuming there replays the tail with a different M than the cold run
+    // used, which amplifies to a 23-logit flip on multi-device.  Recomputing
+    // the cold splits for this prompt length (identical to prefill_text with
+    // ample pool) and picking the deepest cached state among those prefixes
+    // keeps warm on the exact suffix batching cold used (512+33, not 544+1).
+    {
+        std::vector<int> prefixes;
+        prefixes.push_back(0);
+        int ppos = 0;
+        while (ppos < L) {
+            const int prem = L - ppos;
+            const int pfit = cpu_mode ? 0 : batched_prefill_fit(prem);
+            int step = 0;
+            if (pfit >= 1 && pfit <= prem) {
+                step = pfit;
+            } else {
+                step = std::min<int>(kMaxT, prem);
+            }
+            ppos += step;
+            prefixes.push_back(ppos);
+        }
+        int aligned = 0;
+        for (int b = deep; b >= 1; b--) {
+            const int tok = b * kBlockSize;
+            if (tok > max_full) {
+                continue;
+            }
+            bool is_prefix = false;
+            for (int px : prefixes) {
+                if (px == tok) {
+                    is_prefix = true;
+                    break;
+                }
+            }
+            if (!is_prefix) {
+                continue;
+            }
+            // Prefix boundary with a resumable state (same tier check as Pass 1).
+            const int32_t * tk = tok_at(b - 1);
+            const uint64_t h = hashes[b - 1];
+            const int ni = pc_find(h, tk);
+            bool has_state = ni >= 0 && pc_nodes_[ni].state >= 0;
+            if (!has_state && pcr_enabled) {
+                const pc_ram_entry * re = pcr->find(h, tk);
+                has_state = re && re->meta.has_state;
+            }
+            if (!has_state && pcd_enabled) {
+                const pc_disk_meta * de = pcd->find(h, tk);
+                has_state = de && de->has_state;
+            }
+            if (has_state) {
+                aligned = b;
+                break;
+            }
+        }
+        deep = aligned;
+        if (deep <= 0) {
+            pc_stat_misses++;
+            return 0;
+        }
     }
 
     auto unpin = [&](int n) {

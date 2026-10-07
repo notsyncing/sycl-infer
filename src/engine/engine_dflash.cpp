@@ -459,11 +459,24 @@ static inline float silu_test(float x) {
 // Load the drafter, register its weights, size its buffers.
 void engine::setup_dflash(const std::string & draft_path) {
     dfl.dflash_path_ = draft_path;
+    // Draft weights use the primary GPU's oneDNN/native-store table.  A
+    // single-device setup reaches this method before that table exists, and a
+    // non-primary draft cannot use the shared LM head's primary-device logits.
+    if (!multi_dev || !md_xmx || dfl.df_dev_ != 0 || !dnnl_for(0)) {
+        fprintf(stderr, "[dflash] needs a multi-device oneDNN GPU partition with draft on device 0 - disabled\n");
+        return;
+    }
     auto dm = std::make_unique<dflash_model>();
     try {
         dm->load(draft_path, m.hp.n_embd, m.hp.n_vocab);
     } catch (const std::exception & e) {
         fprintf(stderr, "[dflash] draft model rejected: %s\n", e.what());
+        return;
+    }
+    // The draft block itself fits the per-call token buffer, and the verifier
+    // needs one logits row for the anchor plus each drafted token.
+    if (dm->hp.block_size < 2 || dm->hp.block_size > kMaxT) {
+        fprintf(stderr, "[dflash] draft block_size=%d is outside [2,%d] - disabled\n", dm->hp.block_size, kMaxT);
         return;
     }
     // every dflash.target_layers entry must be a real target layer *input*
@@ -663,7 +676,7 @@ void engine::setup_dflash(const std::string & draft_path) {
     //     ms/t 48.6  41.9  34.1  32.5  31.5  33.3
     //
     // so k=5 wins, at 31.5 ms/token against the ~68 ms/token plain decode.
-    dfl.df_k_ = std::min(dfl.df_kmax_ > 0 ? dfl.df_kmax_ : 5, dfl.df_block_ - 1);
+    dfl.df_k_ = std::min({dfl.df_kmax_ > 0 ? dfl.df_kmax_ : 5, dfl.df_block_ - 1, kMaxB - 1});
         // The draft attends over [committed window, whole block]; the ring must hold
     // the window plus the block or a live committed cell would alias a block one.
     const int swa = hp.swa > 0 ? hp.swa : 2048;
@@ -1820,6 +1833,12 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
 // Speculative generation with a DFlash/DFlash2 drafter (greedy).
 std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const gen_params & gp,
                                          const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
+    if (!dfl.dflash_on_) {
+        return generate(prompt, gp, cb, first_logits);
+    }
+    if (!gp.speculative_greedy()) {
+        throw std::invalid_argument("DFlash2 requires greedy sampling without logit penalties or bias");
+    }
     reset_single();
     const hparams & hp = m.hp;
     sampler_state ss;
@@ -2033,7 +2052,7 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         const auto tc5 = now_t();
         t_inj += ms_t(tc4, tc5);
         pos += j + 1;
-        ensure_block_headroom(blocks, pos, dfl.df_k_ + 1);
+        const bool have_headroom = (int)out.size() >= gp.max_tokens || ensure_block_headroom(blocks, pos, dfl.df_k_ + 1);
         t_cyc += ms_t(tc0, tc5);
         t_cycles++;
         t_tok += j + 1;
@@ -2046,8 +2065,8 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
                     t_rb / t_cycles, t_inj / t_cycles, t_emit / t_cycles, t_cyc / t_cycles,
                     (t_draft + t_verify + t_rb + t_inj + t_emit) / t_tok);
         }
-        if ((int)out.size() >= gp.max_tokens) {
-            break;
+        if ((int)out.size() >= gp.max_tokens || !have_headroom) {
+            break; // never draft against a block table without KV headroom
         }
     }
     for (int b : blocks) {

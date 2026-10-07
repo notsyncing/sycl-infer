@@ -29,10 +29,12 @@
 // usage: test_spec <target.gguf> <draft.gguf> [n_tokens]
 //   TEST_SPEC_K      comma-separated draft lengths (default 1,2,4)
 //   TEST_SPEC_PROMPT "text"   (default a fixed prompt)
+//   TEST_SPEC_LONG=1         also test a 545-token MTP prompt and cache reuse
 #include <stdlib.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,7 +81,9 @@ static void diff_at(const char * label, const std::vector<int> & a, const std::v
     }
 }
 
-// one engine, one prompt: plain greedy, then each speculative path
+// one engine, one prompt: bypass speculation for the independent greedy oracle,
+// then run the requested drafter explicitly.  generate() would route right back
+// to that same drafter and compare it against itself.
 struct run_ctx {
     engine * e = nullptr;
     std::vector<int> toks;
@@ -96,24 +100,28 @@ static gen_params greedy(int n) {
     return gp;
 }
 
-static std::vector<int> gen(engine & e, const std::vector<int> & toks, int n) {
+static std::vector<int> gen(engine & e, const std::vector<int> & toks, int n, std::vector<float> * first = nullptr) {
     gen_params gp = greedy(n);
     std::vector<int> out;
-    e.generate(toks, gp, [&](int t) {
+    e.generate_plain(toks, gp, [&](int t) {
         out.push_back(t);
         return true;
-    });
+    }, first);
     return out;
 }
 
-static std::vector<int> gen_mtp(engine & e, const std::vector<int> & toks, int n) {
+static std::vector<int> gen_mtp(engine & e, const std::vector<int> & toks, int n, std::vector<float> * first = nullptr) {
     gen_params gp = greedy(n);
     std::vector<int> out;
     e.generate_mtp(toks, gp, [&](int t) {
         out.push_back(t);
         return true;
-    }, nullptr);
+    }, first);
     return out;
+}
+
+static int argmax(const std::vector<float> & v) {
+    return v.empty() ? -1 : (int)(std::max_element(v.begin(), v.end()) - v.begin());
 }
 
 static std::vector<int> gen_dflash(engine & e, const std::vector<int> & toks, int n) {
@@ -288,6 +296,10 @@ int main(int argc, char ** argv) {
         if (want("mtp")) {
             auto ep = make_engine(target, nullptr, lm, 4, 0, 0, 1024);
             engine & e = *ep;
+            check(e.mtp.mtp_on, "MTP drafter enabled for stream comparison");
+            if (!e.mtp.mtp_on) {
+                return 1;
+            }
             const std::vector<int> toks = e.tk.encode(text, true);
             printf("\n");
             run_mtp("mtp short prompt", e, toks, n);
@@ -295,12 +307,128 @@ int main(int argc, char ** argv) {
             run_mtp("mtp long prompt", e, e.tk.encode(text2, true), n);
             printf("\n");
             run_mtp("mtp n=1 (commit edge)", e, toks, 1);
+            if (si::env::flag("TEST_SPEC_LONG")) {
+                // Main-only mode-2 + cache first, on an empty cache: 100 tokens
+                // fit one batch and all three boundaries keep states, so warm
+                // must hit.  This runs before the 545-token MTP pair populates
+                // the deep chain, avoiding pool pressure and state eviction.
+                std::vector<int> long_toks = toks;
+                long_toks.resize(545, 198);
+                const std::vector<int> toks100(long_toks.begin(),
+                                               long_toks.begin() + std::min<size_t>(100, long_toks.size()));
+                auto manual_one = [&](const std::vector<int> & tt, bool use_cache, std::vector<float> & lg,
+                                      int & matched_out) {
+                    std::vector<int> blocks;
+                    if (use_cache) {
+                        matched_out = e.pc_admit(1, tt, blocks);
+                        if (matched_out <= 0) {
+                            e.zero_slot(1);
+                        }
+                    } else {
+                        matched_out = 0;
+                        e.zero_slot(1);
+                    }
+                    const int need = ((int)tt.size() + kBlockSize - 1) / kBlockSize + 2;
+                    for (int i = (int)blocks.size(); i < need; i++) {
+                        const int b = e.alloc_block();
+                        if (b < 0) {
+                            if (use_cache) {
+                                e.pc_retire(1, blocks);
+                            } else {
+                                for (int x : blocks) {
+                                    e.free_block(x);
+                                }
+                            }
+                            return false;
+                        }
+                        blocks.push_back(b);
+                    }
+                    e.set_table(1, blocks);
+                    int pos = matched_out;
+                    while (pos < (int)tt.size()) {
+                        const int rem = (int)tt.size() - pos;
+                        const int fit = e.batched_prefill_fit(rem);
+                        const int nb = (fit >= 1 && fit <= rem) ? fit : std::min(kMaxT, rem);
+                        e.prefill_text(tt, 1, nb, pos);
+                        e.prefill_flush();
+                        pos += nb;
+                        if (use_cache) {
+                            e.pc_commit(1, tt, blocks, pos);
+                        }
+                    }
+                    lg = e.run_head();
+                    if (use_cache) {
+                        e.pc_retire(1, blocks);
+                    } else {
+                        for (int x : blocks) {
+                            e.free_block(x);
+                        }
+                    }
+                    return true;
+                };
+                {
+                    // Both through admit: cold misses and populates (tracking on,
+                    // so checkpoints are captured), warm must then hit.  Bypassing
+                    // admit for cold would leave nothing for warm to hit.
+                    std::vector<float> mcold, mwarm;
+                    int m0 = -1, m1 = -1;
+                    const bool ok0 = manual_one(toks100, true, mcold, m0);
+                    const bool ok1 = manual_one(toks100, true, mwarm, m1);
+                    double md = 0;
+                    for (size_t i = 0; ok0 && ok1 && i < mcold.size() && i < mwarm.size(); i++) {
+                        md = std::max(md, (double)std::fabs(mcold[i] - mwarm[i]));
+                    }
+                    printf("  manual100 main-only: ok=%d/%d matched=%d/%d argmax=%d/%d max|diff|=%.6f nodes=%d\n",
+                           (int)ok0, (int)ok1, m0, m1, argmax(mcold), argmax(mwarm), md, e.pc_nodes());
+                    check(ok0 && ok1 && argmax(mcold) >= 0 && argmax(mcold) == argmax(mwarm),
+                          "main-only 100-token mode-2 equals cold");
+                    // A single 100-token mode-2 batch has no intermediate split
+                    // prefix (prefixes are 0,100), so admit correctly misses
+                    // rather than restoring a boundary captured under a
+                    // different M. No hit is expected here; the 545 pair below
+                    // is the one that must hit at 512.
+                }
+                // Cross a whole 512-token prefill batch, then reuse its cached
+                // prefix.  One token avoids conflating with long-stream drift.
+                std::vector<float> plain_lg, cold_lg, warm_lg;
+                gen(e, long_toks, 1, &plain_lg);
+                gen_mtp(e, long_toks, 1, &cold_lg);
+                {
+                    const int pa = argmax(plain_lg), ca = argmax(cold_lg);
+                    double md = 0;
+                    for (size_t i = 0; i < plain_lg.size() && i < cold_lg.size(); i++) {
+                        md = std::max(md, (double)std::fabs(plain_lg[i] - cold_lg[i]));
+                    }
+                    printf("  long cold: plain=%d cold=%d max|diff|=%.6f nodes=%d hits=%llu\n", pa, ca, md,
+                           e.pc_nodes(), (unsigned long long)e.pc_stat_hits);
+                }
+                check(argmax(plain_lg) >= 0 && argmax(plain_lg) == argmax(cold_lg),
+                      "MTP >512-token prefill equals plain first token");
+                const uint64_t hits = e.pc_stat_hits;
+                gen_mtp(e, long_toks, 1, &warm_lg);
+                {
+                    const int pa = argmax(plain_lg), wa = argmax(warm_lg);
+                    double md = 0;
+                    for (size_t i = 0; i < plain_lg.size() && i < warm_lg.size(); i++) {
+                        md = std::max(md, (double)std::fabs(plain_lg[i] - warm_lg[i]));
+                    }
+                    printf("  long warm: plain=%d warm=%d max|diff|=%.6f nodes=%d hits=%llu\n", pa, wa, md,
+                           e.pc_nodes(), (unsigned long long)e.pc_stat_hits);
+                }
+                check(argmax(plain_lg) >= 0 && argmax(plain_lg) == argmax(warm_lg),
+                      "MTP cached long prompt equals plain first token");
+                check(e.pc_stat_hits > hits, "MTP repeated long prompt reuses a prefix checkpoint");
+            }
         }
 
         // --- DFlash2: a draft GGUF, MTP off ---
         if (have_draft && want("dflash")) {
             auto ep = make_engine(target, draft, lm, 0, 4, 0, 1024);
             engine & e = *ep;
+            check(e.dfl.dflash_on_, "DFlash2 drafter enabled for stream comparison");
+            if (!e.dfl.dflash_on_) {
+                return 1;
+            }
             const std::vector<int> toks = e.tk.encode(text, true);
             printf("\n");
             run_dflash("dflash short prompt", e, toks, n);

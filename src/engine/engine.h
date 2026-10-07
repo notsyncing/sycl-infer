@@ -669,7 +669,9 @@ struct engine {
     // chunked mode 1 only for the <kMaxT tail (or when no batched variant
     // exists, e.g. the CPU backend).  The sequence's KV blocks must already be
     // assigned in table row `slot`.
-    void prefill_text(const std::vector<int> & toks, int slot, int n);
+    // Prefill `n` tokens starting at their absolute token/KV position `start`.
+    // The default covers the ordinary whole-prompt single-sequence path.
+    void prefill_text(const std::vector<int> & toks, int slot, int n, int start = 0);
     // chunk-batched prefill: one row per kMaxT chunk, all chunks of one prompt
     // in a single forward (GEMMs segment-major, weights L2-hot).  Replayed
     // directly (mode 2): recorded graphs on single-device dp4a, oneDNN direct on
@@ -684,6 +686,9 @@ struct engine {
     void decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows);
     // copy the logits of row r to the host
     void fetch_logits(int row, float * out);
+    // LM head on the last prefill hidden (tests/diagnostics; generate_mtp uses
+    // it for the prompt's first token after its multi-batch prefill).
+    std::vector<float> run_head();
     // run the prefill forward without a graph (diagnostics / fallback)
 
     // ---- simple single-sequence API (kept for tests / CLI) ----
@@ -691,6 +696,10 @@ struct engine {
     std::vector<float> eval(const std::vector<int> & tokens);
     std::vector<int> generate(const std::vector<int> & prompt, const gen_params & gp,
                               const std::function<bool(int)> & cb, std::vector<float> * first_logits = nullptr);
+    // Bypass the speculative router for an independent greedy baseline (tests
+    // and diagnostics).  Uses the same single-sequence forward and sampler.
+    std::vector<int> generate_plain(const std::vector<int> & prompt, const gen_params & gp,
+                                    const std::function<bool(int)> & cb, std::vector<float> * first_logits = nullptr);
     // multimodal variant: `p` carries the expanded tokens, the vision
     // embeddings and the M-RoPE positions of the prompt
     std::vector<int> generate_mm(const mm_prompt & p, const gen_params & gp, const std::function<bool(int)> & cb,
@@ -793,6 +802,9 @@ struct engine {
     int pc_nodes() const {
         return (int)pc_nodes_.size();
     }
+    // Test/diagnostic: all cache indexes must name the current node after a
+    // swap-remove eviction.  Not called from the hot path.
+    bool pc_indices_valid() const;
     size_t pc_disk_records() const {
         return (pcd_enabled && pcd) ? pcd->count() : 0;
     }
@@ -879,11 +891,10 @@ private:
     void record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, int rows, gemv_seg * d_segs_rows = nullptr,
                         int at_nsp_hint = 0, const md_phase * ph = nullptr, const step_info * info = nullptr);
 
-    std::vector<float> run_head();
-
     // shared body of generate/generate_mm (mm == nullptr for text-only prompts)
     std::vector<int> generate_impl(const std::vector<int> & prompt, const mm_prompt * mm, const gen_params & gp,
-                                   const std::function<bool(int)> & cb, std::vector<float> * first_logits);
+                                   const std::function<bool(int)> & cb, std::vector<float> * first_logits,
+                                   bool allow_spec = true);
 
     // dynamic pool internals
     struct kv_extent {

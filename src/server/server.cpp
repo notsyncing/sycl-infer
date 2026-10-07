@@ -45,6 +45,41 @@ namespace si {
 
 namespace {
 
+// A request may be prepared on the HTTP worker and finished on an SSE producer
+// thread.  std::mutex ownership cannot cross that boundary; this permit holds
+// only a logical busy flag, taking its internal mutex separately on acquire and
+// release, so its last owner may safely be either thread.
+struct media_gate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool busy = false;
+
+    void acquire() {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return !busy; });
+        busy = true;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            busy = false;
+        }
+        cv.notify_one();
+    }
+};
+
+struct media_permit {
+    std::shared_ptr<media_gate> gate;
+    explicit media_permit(std::shared_ptr<media_gate> g) : gate(std::move(g)) {
+        gate->acquire();
+    }
+    ~media_permit() {
+        gate->release();
+    }
+    media_permit(const media_permit &) = delete;
+    media_permit & operator=(const media_permit &) = delete;
+};
+
 struct lp_fragment {
     std::string text;
     float logprob = 0.f;
@@ -688,11 +723,18 @@ std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> 
     return msgs;
 }
 
-// A prompt that does not fit max_seq cannot be prefilled (its block table row
-// only has max_seq/kBlockSize entries).  Reject it with an explicit HTTP 400
-// instead of letting scheduler::admit retire the sequence silently (HTTP 200,
-// empty stream, finish_reason=length, 0 tokens).
+// A prompt that does not fit max_seq cannot be prefilled; an empty prompt
+// cannot be decoded either (the scheduler would leave its sequence active
+// forever).  Reject both before admission instead of hanging or returning an
+// empty HTTP 200 response.
 bool reject_too_long(const engine & e, size_t prompt_tokens, httplib::Response & res) {
+    if (prompt_tokens == 0) {
+        res.status = 400;
+        json j = {{"error", {{"message", "prompt must contain at least one token"},
+                              {"type", "invalid_request_error"}}}};
+        res.set_content(dump_json(j), "application/json");
+        return true;
+    }
     if ((int)prompt_tokens <= e.max_seq) {
         return false;
     }
@@ -895,7 +937,7 @@ bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
         const char * v = si::env::str("PF_MTP_SERVER");
         return v && atoi(v) != 0;
     }();
-    return on && e.mtp.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1);
+    return on && e.mtp.mtp_on && n == 1 && !logprobs && gp.speculative_greedy();
 }
 
 static void run_choice_engine(engine & e, const mm_prompt * mp, const std::vector<int> & prompt, const gen_params & gp,
@@ -1423,11 +1465,14 @@ completion_prompts parse_completion_prompts(engine & e, const json & body) {
 int serve(engine & e, const server_config & cfg) {
     scheduler sched(e);
     sched.start();
-    std::mutex mm_req;
+    auto mm_req = std::make_shared<media_gate>();
     mm_server mm;
     if (!cfg.mmproj_path.empty()) {
         try {
             mm.vm.load(cfg.mmproj_path);
+            if (mm.vm.hp.proj_dim != e.m.hp.n_embd) {
+                throw std::runtime_error("vision projector output width != text n_embd");
+            }
             mm.cfg.patch_size = mm.vm.hp.patch_size;
             mm.cfg.merge = mm.vm.hp.merge;
             const int patch_area = mm.cfg.patch_size * mm.cfg.patch_size * mm.cfg.merge * mm.cfg.merge;
@@ -1563,15 +1608,14 @@ int serve(engine & e, const server_config & cfg) {
         const std::string model = body.value("model", model_id);
 
         if (!media.empty()) {
-            if (!mm.ready) {
+            bool need_visual = false, need_audio = false;
+            for (const media_part & p : media) {
+                need_visual |= p.kind == chat_part_kind::IMAGE || p.kind == chat_part_kind::VIDEO;
+                need_audio |= p.kind == chat_part_kind::AUDIO;
+            }
+            if (need_visual && !mm.ready) {
                 bad_request(res, "image/video input requires --mmproj", "invalid_request_error");
                 return;
-            }
-            bool need_audio = false;
-            for (const media_part & p : media) {
-                if (p.kind == chat_part_kind::AUDIO) {
-                    need_audio = true;
-                }
             }
             if (need_audio && !mm.audio_ready) {
                 bad_request(res, "audio input requires --audio-mmproj", "invalid_request_error");
@@ -1579,7 +1623,7 @@ int serve(engine & e, const server_config & cfg) {
             }
             // multimodal requests share the engine's image-embedding buffer, so
             // they are serialized for their whole lifetime (build + generate)
-            auto req_lk = std::make_shared<std::unique_lock<std::mutex>>(mm_req);
+            auto req_lk = std::make_shared<media_permit>(mm_req);
             mm_prompt mp;
             try {
                 std::vector<mm_image> imgs;
@@ -1618,6 +1662,10 @@ int serve(engine & e, const server_config & cfg) {
                     }
                 }
                 const std::string rendered = render_chat(e.m.chat_template, msgs, true, thinking, tools_json);
+                // Vision/audio encoding shares the engine queue and embedding
+                // buffer with generation; do not enqueue it alongside a
+                // scheduler forward even though only MM requests use that buffer.
+                std::lock_guard<std::mutex> engine_lk(e.mtx);
                 mp = mm_build_prompt_mixed_device(mm.vm, mm.am, e.q, e.tk, rendered, imgs, vids, auds, order,
                                                   e.m.hp.n_embd, e.d_img_embd, mm.max_video_frames);
             } catch (const std::exception & ex) {

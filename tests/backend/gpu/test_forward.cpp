@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -38,6 +39,10 @@ int main(int argc, char ** argv) {
             printf("\n");
         }
         auto logits = e.eval(toks);
+        if (logits.size() < 10) {
+            fprintf(stderr, "FAIL: logits size %zu (need >= 10)\n", logits.size());
+            return 1;
+        }
         // top 10
         std::vector<int> idx(logits.size());
         for (size_t i = 0; i < idx.size(); i++) {
@@ -53,7 +58,10 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < 10; i++) {
             printf("  top%d: id=%-7d logit=%.6f\n", i, idx[i], logits[idx[i]]);
         }
-        printf("last_id=%d last_logit=%.6f\n", toks.back(), logits[toks.back()]);
+        // input_last_id is the final *input* token (not a prediction); the
+        // model's prediction for the next token is the top-1 / argmax below.
+        printf("input_last_id=%d input_last_id_logit=%.6f\n", toks.back(), logits[toks.back()]);
+        printf("predicted_argmax=%d predicted_top1_logit=%.6f\n", idx[0], logits[idx[0]]);
     } catch (const std::exception & ex) {
         fprintf(stderr, "error: %s\n", ex.what());
         return 1;

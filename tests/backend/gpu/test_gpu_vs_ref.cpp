@@ -27,6 +27,21 @@ int main(int argc, char ** argv) {
     ref.forward(toks);
     ref.head();
 
+    if (gpu.empty() || gpu.size() != ref.logits.size()) {
+        fprintf(stderr, "FAIL: logits size mismatch/empty: gpu=%zu ref=%zu\n", gpu.size(), ref.logits.size());
+        return 1;
+    }
+    size_t n_nonfinite = 0;
+    for (size_t i = 0; i < gpu.size(); i++) {
+        if (!std::isfinite(gpu[i]) || !std::isfinite(ref.logits[i])) {
+            n_nonfinite++;
+        }
+    }
+    if (n_nonfinite != 0) {
+        fprintf(stderr, "FAIL: %zu nonfinite logit value(s) (gpu or ref)\n", n_nonfinite);
+        return 1;
+    }
+
     double maxd = 0, maxv = 0;
     int argmax_gpu = 0, argmax_ref = 0;
     for (size_t i = 0; i < gpu.size(); i++) {
@@ -46,5 +61,5 @@ int main(int argc, char ** argv) {
     }
     printf("logits: max|diff|=%.6f (max|ref|=%.2f) argmax gpu=%d ref=%d %s\n", maxd, maxv, argmax_gpu, argmax_ref,
            argmax_gpu == argmax_ref ? "SAME" : "DIFFERENT");
-    return 0;
+    return argmax_gpu == argmax_ref ? 0 : 1;
 }

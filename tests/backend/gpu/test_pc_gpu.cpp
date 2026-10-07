@@ -87,6 +87,50 @@ int main(int argc, char ** argv) {
 
     const std::string prompt_text = "<|im_start|>user\nThe quick brown fox jumps over the lazy dog.";
     try {
+        // Keep the most recently appended node pinned, then evict the older
+        // (non-last) node.  Swap-removal must update the moved node's block
+        // reverse index as well as its hash and checkpoint owner indexes.
+        {
+            engine idx(model_path, 512, 16, 16, -1, "", -1, -1);
+            std::vector<int> a(33, 198), b(33, 198);
+            a[0] = 846;
+            b[0] = 9419;
+            int matched = -1;
+            CHECK(!run_prompt(idx, a, matched).empty());
+            CHECK(matched == 0);
+            CHECK(!run_prompt(idx, b, matched).empty());
+            CHECK(matched == 0);
+            CHECK(idx.pc_nodes() == 2);
+            CHECK(idx.pc_indices_valid());
+            std::vector<int> pinned;
+            CHECK(idx.pc_admit(1, b, pinned) == 32);
+            CHECK(pinned.size() == 1);
+            std::vector<int> busy;
+            while (idx.pool_free_blocks() > 0) {
+                const int block = idx.alloc_block();
+                if (block < 0) {
+                    break;
+                }
+                busy.push_back(block);
+            }
+            const int evicted = idx.alloc_block();
+            CHECK(evicted >= 0);
+            CHECK(idx.pc_nodes() == 1);
+            if (!idx.pc_indices_valid()) {
+                fprintf(stderr, "FAIL: non-last cache eviction left an invalid block index\n");
+                return 1; // do not pass a stale index through pc_retire
+            }
+            idx.pc_retire(1, pinned);
+            std::vector<int> again;
+            CHECK(idx.pc_admit(2, b, again) == 32);
+            idx.pc_retire(2, again);
+            for (int block : busy) {
+                idx.free_block(block);
+            }
+            if (evicted >= 0) {
+                idx.free_block(evicted);
+            }
+        }
         // 64 MB disk (one state checkpoint is ~19 MB); the block pool rounds
         // its reserve up to the 2 MB mapping granule
         std::vector<int> prompt;

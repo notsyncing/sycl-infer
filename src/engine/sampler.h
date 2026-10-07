@@ -33,6 +33,13 @@ struct gen_params {
     bool wants_logprobs() const {
         return logprobs || need_score;
     }
+    // Speculative acceptance compares raw target argmaxes.  Biases and
+    // penalties change the sampled greedy token, so those requests must use
+    // the ordinary decoder until acceptance applies the same processing.
+    bool speculative_greedy() const {
+        return (temperature <= 0.f || top_k == 1) && repeat_penalty == 1.f && presence_penalty == 0.f
+               && frequency_penalty == 0.f && logit_bias.empty();
+    }
 };
 
 // Per-token sampling detail.  Filled only when sample_token is given a

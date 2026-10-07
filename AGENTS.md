@@ -187,6 +187,7 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 ./build/test_sampler       # logit_bias + logprob reporting (CPU only)
 ./build/test_multimodal    # image/video prompt, audio decode+mels, vision + audio
                               # encoders (host + device), positions (CPU+GPU)
+./build/test_multimodal --video-only  # model-free AVI/odd-size ffmpeg + vision width guard
 ./build/test_compare       # CPU reference vs llama.cpp dumps (CPU only)
 ./build/test_cpuref        # CPU reference head (CPU only)
 ./build/test_cpu_gdn       # cpu_gdn with an *asymmetric* head count (CPU only)
@@ -208,7 +209,7 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 
 Always run at least `test_gpu_stages`, `test_gpu_vs_ref` and `test_forward`
 after touching kernels/engine, and confirm they still pass (they print
-`all stages OK`, `argmax ... SAME`, a stable `last_id`).  **Any change that can
+`all stages OK`, `argmax ... SAME`, and the default prompt's predicted argmax).  **Any change that can
 affect the single-token path must also run `test_decode_vs_prefill`**: the three
 tests above are prefill-only and are blind to a decode-only bug (that is how the
 fixed head-segment binding bug stayed invisible).
@@ -490,18 +491,17 @@ tracked down.  The pieces:
   row (llama.cpp's `n_rs_seq`); the conv window is rebuilt from the raw taps
   saved in `d_mtp_qsave_`;
 * the prefix cache is supported: `generate_mtp` calls `pc_admit` for the prompt
-  (which restores the matched chain's KV *and* recurrent state) and `pc_commit`
-  after the prefill.  **The order is load-bearing** - `pc_commit` advances
-  `pc_slot_[0].registered`, which every chunk's `pc_capture_begin` checks against
-  `pos0` (`engine_prefix_cache.cpp:806-808`), so committing before the prefill
-  captures nothing.  Measured on the 27B / 2x A770 with `--mtp 4 gen --temp 0`
-  (~90-token prompt): committing after the prefill moves the exit stats from
-  `nodes=2 (with state 0) ... captured=0` to `nodes=2 (with state 2) ...
-  captured=2`, i.e. the nodes become resumable (only boundaries *with* a state
-  can be resumed).  Note the CLI `gen` never reaches this: `pc_admit`/`pc_commit`
-  are only called from `src/server/scheduler.cpp`, so the contract applies to
-  `--temp 0 --mtp N` (which `generate_impl` routes to `generate_mtp`) and to the
-  server's `mtp_direct` (`PF_MTP_SERVER=1`).
+  (which restores the matched chain's KV *and* recurrent state), then commits
+  **after each completed prefill batch and its MTP-layer KV writes**.  The order
+  is load-bearing: `pc_commit` advances `pc_slot_[0].registered`, which the
+  next batch's `pc_capture_begin` checks against `pos0`; committing before a
+  batch captures nothing, whereas committing only after a multi-batch prompt
+  discards the earlier pending checkpoints.  Measured on the 27B / 2x A770
+  with `--mtp 4 gen --temp 0` (~90-token prompt): moving the commit after the
+  prefill moved the exit stats from `nodes=2 (with state 0) ... captured=0` to
+  `nodes=2 (with state 2) ... captured=2`.  A greedy CLI `gen` routed through
+  `generate_mtp` does reach this path, as does the server's `mtp_direct`
+  (`PF_MTP_SERVER=1`); ordinary `gen` does not use the prefix cache.
 
 The path is opt-in (`--mtp 0`/absent is the plain decode) and no longer
 experimental.  On the 27B (2x A770, `--layer-map 0-31:gpu.0,32-63:gpu.1`,
@@ -1430,7 +1430,8 @@ and that nothing in the product path happens to exercise.**
    because `main.cpp` builds one engine and routes by `--spec-type`.
 
 Two things `test_spec` does that are worth stating.  It asserts **stream
-equality against the plain greedy decode**, not acceptance: a broken verify can
+equality against an explicitly non-speculative `generate_plain` decode**, not
+acceptance: a broken verify can
 accept at a perfectly healthy rate and still emit the wrong text, because
 acceptance only compares against the target's own argmax on the rows it kept.
 And it runs **one engine per process** (re-execing itself per configuration),
@@ -1439,9 +1440,12 @@ MTP-enabled engine followed by a DFlash one fails at construction, while each
 alone and the reverse order both work.  The CLI never hits that because it builds
 one engine; the test would otherwise have encoded the limitation as a failure.
 
-Verified: `test_dflash_kernels` 50 checks / 0 failures; `test_spec` all four
-configurations OK; `test_gpu_stages` all stages OK; `test_gpu_vs_ref` argmax SAME;
-`test_forward` last_id=198; `test_decode_vs_prefill` OK.  A 48-token greedy DFlash
+Historical verification (before `test_spec` acquired an independent plain
+oracle): `test_dflash_kernels` 50 checks / 0 failures; `test_spec` four
+configurations returned OK, but their old `generate()` oracle routed through
+the same drafter and did not prove stream equivalence; `test_gpu_stages` all
+stages OK; `test_gpu_vs_ref` argmax SAME;
+`test_forward` reported input last_id=198 (not a prediction); `test_decode_vs_prefill` OK.  A 48-token greedy DFlash
 generation is byte-identical before and after all three fixes (stdout md5
 `19edba39...`) - note the earlier md5 comparison that "changed" was including
 stderr's variable KV/prefix-cache exit lines, not the generated text.
@@ -2049,9 +2053,9 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
 cmake --build build -j$(nproc)          # must be warning-free (except the linker notes)
 ./build/test_gpu_stages                 # all stages OK
 ./build/test_gpu_vs_ref                 # argmax SAME
-./build/test_forward                    # stable last_id
+./build/test_forward                    # default prompt predicted_argmax=248068
 ./build/test_decode_vs_prefill          # decode == re-prefill (any single-token change)
-clang-tidy -p build -checks='-*,misc-include-cleaner' <changed files>
+clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include -checks='-*,misc-include-cleaner' <changed files>
 ```
 
 For the 27B (needs the layer split - it does not fit on one card), also run:

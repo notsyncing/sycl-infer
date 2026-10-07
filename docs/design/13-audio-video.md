@@ -32,20 +32,23 @@
 `mm_video_decode_file` / `mm_video_decode_mem`（`video.cpp:543-597`）把原始容器解码为
 `mm_video{ frames[] }`，每帧仍是原始分辨率的 RGB8（视觉预处理负责缩放）：
 
-* **内置路径**：RIFF/AVI 解复用器（`parse_avi_header` + `collect_avi_frames`，`video.cpp:112-234`），
-  只收集帧偏移，随后用 stb 解码——MJPG/MJPD 走 `stbi_load_from_memory`，原始帧支持 24/16/32 bpp
-  （`decode_one`，`video.cpp:236-293`，16 bpp 是 RGB565，32 bpp 是 BGRA，且按 `strf` 的高度符号处理
-  bottom-up）。够测试套件与简单的 MJPEG 片段用，不引入新的编译期依赖。
+* **内置路径**：RIFF/AVI 解复用器（`parse_avi_header` + `collect_avi_frames`）按
+  fourcc、little-endian 大小、数据与偶数字节 padding 逐层解析 `hdrl`/`strl`/`movi`，并按
+  视频流编号挑帧；坏块大小会被文件和父 LIST 边界拒绝。MJPG/MJPD 走
+  `stbi_load_from_memory`，原始 **BI_RGB** 支持 16-bit 5-5-5、24-bit BGR 和
+  32-bit BGRX（DIB 行四字节对齐，按高度符号决定上下方向）；带自定义 mask 的
+  BI_BITFIELDS 和其他编码退回 ffmpeg。够测试套件与简单 MJPEG 片段用，不引入
+  新的编译期依赖。
 * **回退路径**：其余容器（MP4/H.264 等）交给 `ffmpeg` CLI（`PF_AV_FFMPEG`，与音频共用）。先
   `probe_video`（`video.cpp:393-446`）拿几何与时长：优先 `ffprobe -of csv=p=0`
   （`PF_AV_FFPROBE`，`video.cpp:344-347`），无 ffprobe 时退回解析 `ffmpeg -i` 的 stderr。然后按
-  `fps = max_frames/duration`（上限 120，时长未知时取 10）加
-  `scale=trunc(iw/2)*2:trunc(ih/2)*2` 管道输出 rgb24（`video.cpp:459-474`）。`fps` 过滤是近似的，所以
-  收尾再用等间隔抽样压到恰好 `min(max_frames, 已收帧数)`（`video.cpp:514-519`）。
-  in-memory 的输入先落到 `/tmp/opencode/video_input_<ptr>.bin`（`video.cpp:556`）再走同一条路径。
-* **尺寸约束**：`max_side` 是**解码前**的硬拒绝——内置路径在识别出 AVI 头后立刻拒绝并且**不再回退**
-  ffmpeg（`video.cpp:300-305` 的注释 “recognized but rejected”），ffmpeg 路径在 probe 之后拒绝
-  （`video.cpp:451-458`）。帧数约束在采样之后：`mm_video_fmt::max_frames`（CLI `--max-video-frames`
+  `fps = max_frames/duration`（上限 120，时长未知时取 10）加偶数尺寸缩放管道输出
+  rgb24；代码用**同一个缩放后宽高**计算每帧读取字节数，不会将奇数输入尺寸的后续帧
+  错位。`fps` 过滤是近似的，收尾再等间隔抽样到 `min(max_frames, 已收帧数)`。
+  in-memory 输入先通过 `mkstemp` 写到系统临时目录再走同一条路径，操作结束即删。
+* **尺寸约束**：`max_side` 在内置路径与 ffmpeg probe 后均拒绝超限尺寸；
+  不能内置解码的 AVI 会尝试 ffmpeg（因此不是“识别即不回退”）。
+  `max_frames <= 0` 会在采样前拒绝；`mm_video_fmt::max_frames`（CLI `--max-video-frames`
   默认 16，`main.cpp:158`；结构体默认也是 16，`video.h:46`），`max_side` 的 CLI 默认是 768
   （`main.cpp:159`、`--max-video-side`），而 `mm_video_fmt` 结构体默认是 1024（`video.h:47`）——
   两个默认值不一样，实际生效的是 CLI 传下来的那个。
@@ -79,13 +82,12 @@
   PCM 8/16/24/32 与 IEEE float 32/64，立体声下混成单声道（`audio.cpp:73-134`）。其它格式 tag
   （ADPCM 等）与位深一律拒绝，让调用方回退 ffmpeg（`audio.cpp:147-158`）。
 * ffmpeg 回退：`mm_audio_decode_ffmpeg` 走
-  `ffmpeg -v error -i <path> -f f32le -ac 1 -ar 16000 ... pipe:1`（`audio.cpp:198-199`），失败时把
-  stderr 尾部（上限 600 字节）读进错误信息（`audio.cpp:214-232`；ffmpeg 的 stderr 落在
-  `/tmp/opencode/ffmpeg_sycl_infer_err.log`，`audio.cpp:19`），并对非有限/越界样本做清洗
-  （`audio.cpp:235-241`）。
-* 内存中的非 WAV 数据：`mm_audio_decode_bytes` 先试原生解码，失败则 `mkstemp` 一个
-  `/tmp/opencode/sycl_infer_audio_XXXXXX` 临时文件（扩展名留 `.tmp`，让 ffmpeg 嗅探 magic），
-  写完交给 ffmpeg 再删（`audio.cpp:245-289`）。服务端 `input_audio` 的 base64 走的正是这条。
+  `ffmpeg -v error -i <path> -f f32le -ac 1 -ar 16000 ... pipe:1`；失败时读取本次解码
+  独有的 stderr 临时文件尾部（上限 600 字节），不会与其他请求争同一日志；
+  路径做 shell 单参数引用，操作完成即删除 stderr 文件。样本中的非有限/越界值被清洗。
+* 内存中的非 WAV 数据：`mm_audio_decode_bytes` 先试原生解码，失败则通过
+  `av_make_temp_file` 在系统临时目录创建文件，写完交给 ffmpeg 后删除。
+  服务端 `input_audio` 的 base64 走的正是这条；无需预建 `/tmp/opencode`。
 * 时长上限 `audio_preproc_cfg::max_seconds`（默认 60，`audio.h:31`）在 `mm_audio_decode_mem`
   （`audio.cpp:190-193`）和 `mm_audio_decode_bytes`（`audio.cpp:285-287`）里生效。
   `mm_audio_decode_ffmpeg` 自身**不**截断——CLI 的 `--audio` 先试 `mm_audio_decode_mem` 再直接调
@@ -238,7 +240,8 @@ max_video_frames)`（`multimodal.cpp:422-541`，声明在 `multimodal.h:117-121`
 | `test_audio_encoder` | 合成 mel + `argv[3]` 的音频 mmproj：host 输出形状 `n_out * audio_out_width`、host 嵌入有限非零、host vs device 最大差 `<= 5e-3 * max(1, max\|host\|)`；未给路径则 skip（`test_multimodal.cpp:758-812`） |
 
 没有真实的音频 mmproj 权重时，音频端到端（真实语音）不能本地验证，测试以合成权重/skip 覆盖。
-视频解码本身（AVI 解复用 / ffmpeg）没有单元测试——`test_prompt_video` 直接构造 `mm_video_frame`
+视频解码已有 `test_multimodal --video-only`：内存合成 AVI 验证 chunk 边界、流选择、BGR/行填充和采样；
+有 ffmpeg 时还验证奇数宽高的管道帧尺寸。`test_prompt_video` 仍直接构造 `mm_video_frame`
 列表，只测 prompt 布局这一层。
 
 ## 8. 环境变量

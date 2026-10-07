@@ -309,7 +309,7 @@ prefill；prefill 走 oneDNN 的 `PF_GEMM_DNNL` 路径。见 §9 不变量 3 与
 | httplib 工作线程池 | JSON 解析、chat 渲染、分词、SSE/non-stream 输出 | 每个 `sequence` 自带 mutex+cv（`src/server/scheduler.h:51`） |
 | 调度器线程（1 个） | 准入、prefill、decode、采样、推送 token | 先 `engine::mtx`，再取 `scheduler::m`；引擎调用前后释放 `m` |
 | CLI 主线程 | 单序列生成 | `engine::mtx`（在 `generate` 内部获取） |
-| httplib 多模态生产者线程 | `generate_mm` 流式输出 | `serve()` 里的函数局部 `mm_req` mutex（对所有请求唯一，`src/server/server.cpp:1458`）+ `engine::mtx` |
+| httplib 多模态生产者线程 | `generate_mm` 流式输出 | `serve()` 的共享 `media_gate` 请求许可 + 设备编码/生成时的 `engine::mtx` |
 | 信号 watchdog 线程 | 每 100 ms 轮询终止标志，调用 `srv.stop()` | 原子标志 `g_term_requested` |
 
 * **所有引擎执行由 `engine::mtx` 串行化**。调用 `prefill_*`/`decode_batch` 的代码必须持有该锁。
@@ -322,7 +322,9 @@ prefill；prefill 走 oneDNN 的 `PF_GEMM_DNNL` 路径。见 §9 不变量 3 与
 * 代价：并发会牺牲逐位一致——同一贪心提示在 N 个并发请求下有 1 行逐字节相同，其余可能在近似的
   argmax 平局处翻转（实测翻在 "attention mechanism" / "**Scaled Dot-Product Attention**" 一处），
   是批量 GEMM 的 fp 累加顺序不同，不是竞态。细节见 [AGENTS.md](../AGENTS.md)。
-* 多模态请求全程持有 `mm_req`，因为所有请求共享 `engine::d_img_embd`。
+* 多模态请求全程持有 `media_gate` 许可，因为所有请求共享 `engine::d_img_embd`。
+  许可可以在另一个线程释放；底层 `std::mutex` 不跨线程转交。媒体设备编码另持
+  `engine::mtx`，避免与调度器的前向执行交错。
 * 信号处理器只置原子标志（async-signal-safe）；watchdog 线程每 100 ms 轮询后正常停止服务器
   （`src/server/server.cpp:1919`），从而保证 `~engine` 里 `pc_flush_to_disk()` 把前缀缓存
   VRAM/RAM 层落盘（`src/engine/engine.cpp:523`）。

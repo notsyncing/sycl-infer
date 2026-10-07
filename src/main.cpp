@@ -492,6 +492,9 @@ int main(int argc, char ** argv) {
                             throw std::runtime_error("--image/--video requires --mmproj <mmproj.gguf>");
                         }
                         vm_owned.load(mmproj_path);
+                        if (vm.hp.proj_dim != e.m.hp.n_embd) {
+                            throw std::runtime_error("vision projector output width != text n_embd");
+                        }
                         img_cfg.patch_size = vm.hp.patch_size;
                         img_cfg.merge = vm.hp.merge;
                         const int patch_area = img_cfg.patch_size * img_cfg.patch_size * img_cfg.merge * img_cfg.merge;

@@ -42,6 +42,21 @@ int main(int argc, char ** argv) {
     ref.forward(toks);
     ref.head();
 
+    if (gpu.empty() || gpu.size() != ref.logits.size()) {
+        fprintf(stderr, "FAIL: logits size mismatch/empty: gpu=%zu ref=%zu\n", gpu.size(), ref.logits.size());
+        return 1;
+    }
+    size_t n_nonfinite = 0;
+    for (size_t i = 0; i < gpu.size(); i++) {
+        if (!std::isfinite(gpu[i]) || !std::isfinite(ref.logits[i])) {
+            n_nonfinite++;
+        }
+    }
+    if (n_nonfinite != 0) {
+        fprintf(stderr, "FAIL: %zu nonfinite logit value(s) (gpu or ref)\n", n_nonfinite);
+        return 1;
+    }
+
     // metrics against the fp32 reference
     double maxd = 0, sumd = 0;
     int arg_gpu = 0, arg_ref = 0;
@@ -60,5 +75,5 @@ int main(int argc, char ** argv) {
     printf("vs fp32 cpu ref: max|diff|=%.4f  mean|diff|=%.4f  argmax gpu=%d ref=%d %s\n", maxd, sumd / n, arg_gpu,
            arg_ref, arg_gpu == arg_ref ? "SAME" : "DIFFERENT");
     printf("  gpu[argmax]=%.4f  ref[argmax]=%.4f\n", (double)gpu[arg_gpu], (double)ref.logits[arg_ref]);
-    return 0;
+    return arg_gpu == arg_ref ? 0 : 1;
 }

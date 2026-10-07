@@ -2180,10 +2180,11 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // mode 2 (chunk-batched) for every full kMaxT multiple it supports, mode 1
 // (chunked) only for the tail: mode 2 reads each weight once per forward, so it
 // is ~2x the chunked throughput for the same tokens
-void engine::prefill_text(const std::vector<int> & toks, int slot, int n) {
-    int pos = 0;
-    while (pos < n) {
-        const int rem = n - pos;
+void engine::prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
+    int pos = start;
+    const int end = start + n;
+    while (pos < end) {
+        const int rem = end - pos;
         const int fit = cpu_mode ? 0 : batched_prefill_fit(rem);
         if (fit >= 1 && fit <= rem) {
             prefill_batch(toks, pos, fit, slot, pos);
@@ -2468,6 +2469,12 @@ std::vector<int> engine::generate(const std::vector<int> & prompt, const gen_par
     return generate_impl(prompt, nullptr, gp, cb, first_logits);
 }
 
+std::vector<int> engine::generate_plain(const std::vector<int> & prompt, const gen_params & gp,
+                                        const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
+    std::lock_guard<std::mutex> lk(mtx);
+    return generate_impl(prompt, nullptr, gp, cb, first_logits, false);
+}
+
 std::vector<int> engine::generate_mm(const mm_prompt & p, const gen_params & gp, const std::function<bool(int)> & cb,
                                      std::vector<float> * first_logits) {
     std::lock_guard<std::mutex> lk(mtx);
@@ -2475,14 +2482,15 @@ std::vector<int> engine::generate_mm(const mm_prompt & p, const gen_params & gp,
 }
 
 std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm_prompt * mm, const gen_params & gp,
-                                       const std::function<bool(int)> & cb, std::vector<float> * first_logits) {
+                                       const std::function<bool(int)> & cb, std::vector<float> * first_logits,
+                                       bool allow_spec) {
     // MTP speculative decoding: greedy requests only (the acceptance test is an
     // equality against the target's own next token; a sampled target would need
     // rejection sampling to stay exact).  Multimodal prompts bypass it too.
-    if (dfl.dflash_on_ && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
+    if (allow_spec && dfl.dflash_on_ && mm == nullptr && gp.speculative_greedy()) {
         return generate_dflash(prompt, gp, cb, first_logits);
     }
-    if (mtp.mtp_on && mm == nullptr && (gp.temperature <= 0.f || gp.top_k == 1)) {
+    if (allow_spec && mtp.mtp_on && mm == nullptr && gp.speculative_greedy()) {
         return generate_mtp(prompt, gp, cb, first_logits);
     }
     reset_single();

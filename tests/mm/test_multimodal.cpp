@@ -4,10 +4,16 @@
 // reference out of band; this test guards the integration logic.
 //
 // usage: test_multimodal [text.gguf] [mmproj.gguf]
+#include <unistd.h>
+
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -49,6 +55,232 @@ static void test_target_size() {
     // a tiny image is upscaled above min_pixels
     mm_image_target_size(16, 16, cfg, w, h);
     check(w * h >= cfg.min_pixels && w % 32 == 0 && h % 32 == 0, "16x16 upscaled above min_pixels");
+}
+
+static void test_vision_width_guard() {
+    vision_model vm;
+    vm.hp.proj_dim = 7;
+    tokenizer tk;
+    bool rejected = false;
+    try {
+        mm_build_prompt(tk, "", {}, vm, /*text n_embd=*/8);
+    } catch (const std::runtime_error & ex) {
+        rejected = std::string(ex.what()).find("output width") != std::string::npos;
+    }
+    check(rejected, "vision width mismatch rejected before copying embeddings");
+}
+
+// ---------------------------------------------------------------------------
+// Video decode (hermetic: synthetic AVI built in memory, no model files)
+// ---------------------------------------------------------------------------
+static void avi_put32(std::vector<uint8_t> & b, uint32_t v) {
+    for (int i = 0; i < 4; i++) {
+        b.push_back((uint8_t)(v >> (8 * i)));
+    }
+}
+
+static void avi_put16(std::vector<uint8_t> & b, uint32_t v) {
+    b.push_back((uint8_t)v);
+    b.push_back((uint8_t)(v >> 8));
+}
+
+// fourcc, little-endian size, data, pad to even
+static void avi_chunk(std::vector<uint8_t> & b, const char * id, const std::vector<uint8_t> & data) {
+    b.insert(b.end(), id, id + 4);
+    avi_put32(b, (uint32_t)data.size());
+    b.insert(b.end(), data.begin(), data.end());
+    if (data.size() & 1) {
+        b.push_back(0);
+    }
+}
+
+static void avi_list(std::vector<uint8_t> & b, const char * type, const std::vector<uint8_t> & data) {
+    std::vector<uint8_t> body(type, type + 4);
+    body.insert(body.end(), data.begin(), data.end());
+    avi_chunk(b, "LIST", body);
+}
+
+// One video stream of uncompressed BI_RGB frames, preceded by an audio stream
+// (so the video is stream 1: "01db" chunks, and "00wb" audio chunks to skip).
+static std::vector<uint8_t> make_avi(int w, int h, int bpp, const std::vector<std::vector<uint8_t>> & frames) {
+    std::vector<uint8_t> avih;
+    avi_put32(avih, 100000); // 10 fps
+    for (int i = 0; i < 13; i++) {
+        avi_put32(avih, 0);
+    }
+    std::vector<uint8_t> strl_a, strh_a(56, 0), strf_a(16, 0);
+    std::memcpy(strh_a.data(), "auds", 4);
+    avi_chunk(strl_a, "strh", strh_a);
+    avi_chunk(strl_a, "strf", strf_a);
+    std::vector<uint8_t> strl_v, strh_v(56, 0), strf_v;
+    std::memcpy(strh_v.data(), "vids", 4);
+    avi_put32(strf_v, 40);
+    avi_put32(strf_v, (uint32_t)w);
+    avi_put32(strf_v, (uint32_t)h);
+    avi_put16(strf_v, 1);
+    avi_put16(strf_v, (uint32_t)bpp);
+    avi_put32(strf_v, 0); // BI_RGB
+    for (int i = 0; i < 5; i++) {
+        avi_put32(strf_v, 0);
+    }
+    avi_chunk(strl_v, "strh", strh_v);
+    avi_chunk(strl_v, "strf", strf_v);
+    std::vector<uint8_t> hdrl;
+    avi_chunk(hdrl, "avih", avih);
+    avi_list(hdrl, "strl", strl_a);
+    avi_list(hdrl, "strl", strl_v);
+    std::vector<uint8_t> movi;
+    avi_chunk(movi, "JUNK", std::vector<uint8_t>(5, 0xEE)); // odd size: padded
+    for (const auto & f : frames) {
+        avi_chunk(movi, "00wb", std::vector<uint8_t>(7, 0x55)); // audio, odd size
+        avi_chunk(movi, "01db", f);
+    }
+    std::vector<uint8_t> body{'A', 'V', 'I', ' '};
+    avi_list(body, "hdrl", hdrl);
+    avi_list(body, "movi", movi);
+    avi_chunk(body, "idx1", std::vector<uint8_t>(16, 0));
+    std::vector<uint8_t> file{'R', 'I', 'F', 'F'};
+    avi_put32(file, (uint32_t)body.size());
+    file.insert(file.end(), body.begin(), body.end());
+    return file;
+}
+
+static void test_video_avi() {
+    printf("video: synthetic AVI\n");
+    // 3x2 bottom-up 24-bit: each DIB row is 9 bytes padded to 12
+    const int W = 3, H = 2;
+    std::vector<std::vector<uint8_t>> frames;
+    for (int t = 0; t < 3; t++) {
+        std::vector<uint8_t> f(12 * H, 0xAA); // padding stays 0xAA
+        for (int y = 0; y < H; y++) {      // stored row y = image row H-1-y
+            for (int x = 0; x < W; x++) {
+                const int iy = H - 1 - y;
+                // BGR order in the file
+                f[(size_t)y * 12 + x * 3 + 0] = (uint8_t)(30 * t + 3);      // B
+                f[(size_t)y * 12 + x * 3 + 1] = (uint8_t)(10 * iy + x);     // G
+                f[(size_t)y * 12 + x * 3 + 2] = (uint8_t)(100 + t);         // R
+            }
+        }
+        frames.push_back(f);
+    }
+    const std::vector<uint8_t> avi = make_avi(W, H, 24, frames);
+    mm_video_fmt fmt;
+    fmt.max_frames = 16;
+    mm_video v;
+    std::string err;
+    bool ok = mm_video_decode_mem(avi.data(), avi.size(), fmt, v, &err);
+    check(ok && v.frames.size() == 3, "3 frames decoded");
+    if (ok && v.frames.size() == 3) {
+        check(v.width() == W && v.height() == H, "geometry 3x2 (odd width)");
+        bool px = true;
+        for (int t = 0; t < 3; t++) {
+            const auto & f = v.frames[t];
+            px = px && f.rgb.size() == (size_t)W * H * 3;
+            for (int y = 0; y < H && px; y++) {
+                for (int x = 0; x < W; x++) {
+                    const uint8_t * p = &f.rgb[((size_t)y * W + x) * 3];
+                    if (p[0] != 100 + t || p[1] != 10 * y + x || p[2] != 30 * t + 3) {
+                        px = false;
+                    }
+                }
+            }
+        }
+        check(px, "pixels: BGR->RGB, row padding, bottom-up");
+        check(std::fabs(v.frames[2].pts - 0.2) < 1e-6, "pts from avih frame rate");
+    }
+    // uniform sampling to max_frames
+    fmt.max_frames = 2;
+    mm_video v2;
+    ok = mm_video_decode_mem(avi.data(), avi.size(), fmt, v2, &err);
+    check(ok && v2.frames.size() == 2 && v2.frames[1].rgb[0] == 102, "max_frames=2 samples frames 0 and 2");
+    // max_frames <= 0 is rejected before any division
+    for (int mf : {0, -4}) {
+        fmt.max_frames = mf;
+        mm_video v3;
+        err.clear();
+        ok = mm_video_decode_mem(avi.data(), avi.size(), fmt, v3, &err);
+        check(!ok && v3.frames.empty() && !err.empty(), "max_frames <= 0 fails cleanly");
+    }
+    fmt.max_frames = 16;
+    // a file cut in the middle of the last frame keeps the complete ones
+    {
+        std::vector<uint8_t> cut(avi.begin(), avi.end());
+        // find the third "01db" chunk and truncate inside its data
+        size_t pos = 0;
+        int seen = 0;
+        for (size_t i = 12; i + 4 <= cut.size(); i++) {
+            if (std::memcmp(cut.data() + i, "01db", 4) == 0 && ++seen == 3) {
+                pos = i;
+                break;
+            }
+        }
+        cut.resize(pos + 8 + 5);
+        mm_video v4;
+        ok = mm_video_decode_mem(cut.data(), cut.size(), fmt, v4, &err);
+        check(ok && v4.frames.size() == 2, "truncated last frame is dropped");
+    }
+    // 16-bit BI_RGB is 5-5-5, rows padded to 4 bytes (3 px = 6 -> 8 bytes)
+    {
+        std::vector<uint8_t> f(8 * 2, 0);
+        for (int y = 0; y < 2; y++) {
+            for (int x = 0; x < 3; x++) {
+                const uint16_t val = (uint16_t)(31 << 10); // pure red in 5-5-5
+                f[(size_t)y * 8 + x * 2] = (uint8_t)val;
+                f[(size_t)y * 8 + x * 2 + 1] = (uint8_t)(val >> 8);
+            }
+        }
+        const std::vector<uint8_t> a16 = make_avi(3, 2, 16, {f});
+        mm_video v5;
+        ok = mm_video_decode_mem(a16.data(), a16.size(), fmt, v5, &err);
+        check(ok && v5.frames.size() == 1 && v5.frames[0].rgb[0] == 255 && v5.frames[0].rgb[1] == 0
+                  && v5.frames[0].rgb[2] == 0,
+              "16-bit BI_RGB decodes as 5-5-5");
+    }
+    // chunk sizes that run far past the buffer must neither crash nor hang
+    {
+        std::vector<uint8_t> bad = avi;
+        // the first chunk inside the RIFF body is "LIST hdrl": corrupt its size
+        const uint32_t huge = 0xFFFFFFF0u;
+        std::memcpy(bad.data() + 16, &huge, 4);
+        mm_video v6;
+        ok = mm_video_decode_mem(bad.data(), bad.size(), fmt, v6, &err);
+        check(!ok || v6.frames.size() <= 3, "oversized hdrl chunk is bounded");
+        std::vector<uint8_t> bad2 = avi;
+        std::memcpy(bad2.data() + 4, &huge, 4); // bogus RIFF size is ignored
+        mm_video v7;
+        ok = mm_video_decode_mem(bad2.data(), bad2.size(), fmt, v7, &err);
+        check(ok && v7.frames.size() == 3, "bogus RIFF size does not matter");
+    }
+}
+
+// ffmpeg forces even sides; the raw frame read must use the filtered size.
+static void test_video_ffmpeg_odd() {
+    printf("video: ffmpeg odd-size clip\n");
+    const char * ff = std::getenv("PF_AV_FFMPEG");
+    const std::string ffmpeg = (ff && ff[0]) ? ff : "ffmpeg";
+    const std::string tmp = (std::filesystem::temp_directory_path()
+                             / ("test_mm_odd_" + std::to_string((long)getpid()) + ".nut")).string();
+    const std::string gen = ffmpeg + " -v error -y -f lavfi -i \"color=c=red:s=33x21:r=5:d=1\" -c:v rawvideo "
+                            "-pix_fmt rgb24 \"" + tmp + "\" 2>/dev/null";
+    const int rc = std::system(gen.c_str());
+    if (rc != 0) {
+        printf("  skip (ffmpeg not available or cannot create the clip)\n");
+        std::remove(tmp.c_str());
+        return;
+    }
+    mm_video_fmt fmt;
+    fmt.max_frames = 4;
+    mm_video v;
+    std::string err;
+    const bool ok = mm_video_decode_file(tmp, fmt, v, &err);
+    std::remove(tmp.c_str());
+    check(ok && !v.frames.empty(), "33x21 clip decodes");
+    if (ok && !v.frames.empty()) {
+        const auto & f = v.frames[0];
+        check(f.width == 32 && f.height == 20 && f.rgb.size() == (size_t)32 * 20 * 3, "frame geometry is the even 32x20");
+        check(f.rgb.size() >= 3 && f.rgb[0] > 200 && f.rgb[1] < 60 && f.rgb[2] < 60, "pixels are not shifted/garbled");
+        check(v.frames.size() <= 4, "at most max_frames");
+    }
 }
 
 static void test_vision(const std::string & mmproj_path) {
@@ -816,6 +1048,17 @@ int main(int argc, char ** argv) {
     const std::string mmproj_path = argc > 2 ? argv[2] : "/home/sfc/临时/Qwen3.5-0.8B-mmproj-BF16.gguf";
     const std::string audio_path = argc > 3 ? argv[3] : "";
     test_target_size();
+    test_vision_width_guard();
+    test_video_avi();
+    test_video_ffmpeg_odd();
+    if (argc > 1 && std::strcmp(argv[1], "--video-only") == 0) {
+        if (fails) {
+            printf("test_multimodal: FAILURES: %d\n", fails);
+            return 1;
+        }
+        printf("test_multimodal: video OK\n");
+        return 0;
+    }
     test_kernels();
     bench_kernels();
     test_vision(mmproj_path);

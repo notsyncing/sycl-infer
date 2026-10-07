@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+include(CTest) # opt-in model/GPU registrations below; default ctest stays hermetic
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -282,3 +283,46 @@ si_add_test(test_gpu_stages
     tests/backend/gpu/kernels/gdn_stage.cpp
     tests/backend/gpu/kernels/gated_norm_stage.cpp
 )
+
+if(BUILD_TESTING)
+    foreach(name IN ITEMS test_response_parser test_sampler test_pc_disk test_pc_ram test_cpu_gdn)
+        add_test(NAME ${name} COMMAND ${name})
+        set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
+    endforeach()
+    add_test(NAME test_video_hermetic COMMAND test_multimodal --video-only)
+    set_tests_properties(test_video_hermetic PROPERTIES LABELS "hermetic;media")
+
+    # Model-backed tests are explicit: a machine without the GGUF or GPU must
+    # not claim a green run by silently skipping them.  Keep the 27B split out
+    # of the default ctest selection (it requires both A770s and a draft GGUF).
+    option(SI_REGISTER_GPU_TESTS "register GPU/model-backed tests with CTest" OFF)
+    set(SI_TEST_08B_MODEL "" CACHE FILEPATH "0.8B GGUF for GPU tests")
+    set(SI_TEST_27B_MODEL "" CACHE FILEPATH "27B GGUF for two-GPU tests")
+    set(SI_TEST_DFLASH_MODEL "" CACHE FILEPATH "DFlash2 GGUF for speculative tests")
+    if(SI_REGISTER_GPU_TESTS)
+        if(NOT EXISTS "${SI_TEST_08B_MODEL}")
+            message(FATAL_ERROR "SI_REGISTER_GPU_TESTS requires SI_TEST_08B_MODEL")
+        endif()
+        foreach(name IN ITEMS test_gpu_stages test_gpu_vs_ref test_forward test_decode_vs_prefill test_pc_gpu)
+            add_test(NAME ${name} COMMAND ${name} "${SI_TEST_08B_MODEL}")
+            set_tests_properties(${name} PROPERTIES LABELS "gpu;model-0.8b")
+        endforeach()
+        if(SI_TEST_27B_MODEL)
+            if(NOT EXISTS "${SI_TEST_27B_MODEL}")
+                message(FATAL_ERROR "SI_TEST_27B_MODEL does not exist")
+            endif()
+            add_test(NAME test_27b_vs_ref COMMAND test_w4_vs_cpuref "${SI_TEST_27B_MODEL}")
+            add_test(NAME test_27b_decode_vs_prefill COMMAND test_decode_vs_prefill "${SI_TEST_27B_MODEL}")
+            set_tests_properties(test_27b_vs_ref test_27b_decode_vs_prefill
+                PROPERTIES LABELS "gpu;model-27b" ENVIRONMENT "TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1")
+            if(SI_TEST_DFLASH_MODEL)
+                if(NOT EXISTS "${SI_TEST_DFLASH_MODEL}")
+                    message(FATAL_ERROR "SI_TEST_DFLASH_MODEL does not exist")
+                endif()
+                add_test(NAME test_27b_spec COMMAND test_spec "${SI_TEST_27B_MODEL}" "${SI_TEST_DFLASH_MODEL}")
+                set_tests_properties(test_27b_spec PROPERTIES LABELS "gpu;model-27b;spec"
+                    ENVIRONMENT "TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1")
+            endif()
+        endif()
+    endif()
+endif()
