@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include "common/env.h"
 
 namespace si {
@@ -65,6 +66,67 @@ static gemv_seg row_offset_seg(const gemv_seg & s, int r, int tpb) {
     return c;
 }
 // ---------------------------------------------------------------------------
+// The plan is a contract with record_forward: 4 calls per layer in build
+// order plus an optional device-0 head call, with layer_c0 marking each
+// layer's first call.  record_forward consumes it through an incrementing
+// cursor, so any skew miswires activations silently - validate both ends.
+void seg_plan::validate(int n_layer, const char * what) const {
+    auto fail = [&](const std::string & msg) {
+        throw std::runtime_error(std::string("seg_plan::validate[") + what + "]: " + msg);
+    };
+    if (n_layer >= 0) {
+        const int nl = n_layer;
+        if ((int)layer_c0.size() != nl + 1) {
+            fail("layer_c0 has " + std::to_string(layer_c0.size()) + " entries for " + std::to_string(nl) +
+                 " layers");
+        }
+        if (layer_c0[0] != 0) {
+            fail("layer_c0[0] != 0");
+        }
+        for (int il = 0; il < nl; il++) {
+            const int span = layer_c0[(size_t)il + 1] - layer_c0[(size_t)il];
+            if (span != 4) {
+                fail("layer " + std::to_string(il) + " spans " + std::to_string(span) + " calls, not 4");
+            }
+        }
+        const int ncalls = 4 * nl + (has_head ? 1 : 0);
+        if ((int)call_tb.size() != ncalls) {
+            fail("call_tb has " + std::to_string(call_tb.size()) + " calls, expected " + std::to_string(ncalls));
+        }
+        // begin_call pushes all six per-call vectors together
+        if (call_offsets.size() != call_tb.size() || call_counts.size() != call_tb.size()
+            || call_total_rows.size() != call_tb.size() || call_nsb.size() != call_tb.size()
+            || call_xq.size() != call_tb.size()) {
+            fail("per-call vectors disagree in size");
+        }
+        if (layer_c0[(size_t)nl] != 4 * nl) {
+            fail("head index is not 4*n_layer");
+        }
+        if (has_head) {
+            // the head call is last and pinned to the primary device: it reads
+            // the primary's buffers after record_forward's bind_acts(0)
+            for (size_t i = (size_t)call_offsets.back(); i < segs.size(); i++) {
+                if (segs[i].dev != 0) {
+                    fail("head segment on device " + std::to_string(segs[i].dev));
+                }
+            }
+        }
+    }
+    if (!groups.empty()) {
+        if (call_group_begin.size() != call_tb.size() || call_group_count.size() != call_tb.size()) {
+            fail("group index vectors disagree with the call list");
+        }
+        for (size_t g = 0; g < groups.size(); g++) {
+            const auto & gr = groups[g];
+            for (int j = 1; j < gr.n; j++) {
+                if (segs[(size_t)gr.off + j].dev != segs[(size_t)gr.off].dev) {
+                    fail("call group spans devices");
+                }
+            }
+        }
+    }
+}
+
 seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool with_head) {
     seg_plan plan;
     const hparams & hp = m.hp;
@@ -310,6 +372,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         }
         plan.add(s);
     }
+    plan.validate(hp.n_layer, "build_plan");
     return plan;
 }
 // PF_DUMP_SEGS: fingerprint of one GEMV segment's whole field set plus its
@@ -881,10 +944,23 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     }
     const int il_beg = phased ? ph->l0 : 0;
     const int il_end = phased ? ph->l1 : hp.n_layer;
+    const bool head_only = phased && ph->head && ph->l0 == ph->l1;
     if (phased && (size_t)hp.n_layer + 1 <= plan.layer_c0.size()) {
         // a phase starts at its first layer's call, not at call 0
-        const bool head_only = ph->head && ph->l0 == ph->l1;
         ci = (size_t)plan.layer_c0[head_only ? (size_t)hp.n_layer : (size_t)il_beg];
+    }
+    // The plan is consumed in build order through ci (gemv() advances it once
+    // per call, 4 per layer).  A cursor starting anywhere else makes the
+    // partition read another layer's call metadata while executing its own
+    // segments - the silent-wrong-layers failure.  Plans without a layer_c0
+    // (plan_mtp_, consumed by direct index, never here) skip the check.
+    const bool have_c0 = plan.layer_c0.size() == (size_t)hp.n_layer + 1;
+    if (have_c0) {
+        const size_t ci_beg = phased ? (size_t)plan.layer_c0[head_only ? (size_t)hp.n_layer : (size_t)il_beg] : 0;
+        if (ci != ci_beg) {
+            throw std::runtime_error("record_forward: call cursor starts at " + std::to_string(ci) + ", phase needs " +
+                                     std::to_string(ci_beg));
+        }
     }
     // debug: 1 = after the first sub-layer of a layer, 2 = after post-attn
     // norm, 3 = after the first FFN GEMM, 4 = right after the embedding
@@ -1223,6 +1299,17 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         }
         if (il == stop_layer) {
             break;
+        }
+    }
+    // Production path consumes exactly its phase's calls (4 per layer: the
+    // head runs separately off the cursor).  Diagnostic truncations
+    // (STOP_AFTER_LAYER / PF_DBG_MID) exit early by construction and skip this.
+    if (have_c0 && stop_layer < 0 && dbg_mid == 0) {
+        const size_t ci_end =
+            (size_t)plan.layer_c0[phased ? (head_only ? (size_t)hp.n_layer : (size_t)il_end) : (size_t)hp.n_layer];
+        if (ci != ci_end) {
+            throw std::runtime_error("record_forward: call cursor ends at " + std::to_string(ci) + ", phase needs " +
+                                     std::to_string(ci_end));
         }
     }
 

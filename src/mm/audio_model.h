@@ -90,7 +90,17 @@ struct audio_model {
     // device copy of the weights (one blob)
     void * dev_weights = nullptr;
     size_t dev_weights_size = 0;
+    // Queue every device allocation below was made on (see vision.h: same
+    // one-queue-per-model rule, shared helpers in enc_common.h).
+    sycl::queue * dev_q = nullptr;
     void upload(sycl::queue & q);
+    // releases dev_weights + conv blob + scratch on dev_q (no-op when nothing
+    // was ever uploaded).  Models are never copied, only referenced - and the
+    // deleted copy ctor suppresses the implicit default ctor, so default it.
+    audio_model() = default;
+    ~audio_model();
+    audio_model(const audio_model &) = delete;
+    audio_model & operator=(const audio_model &) = delete;
     const void * dev_ptr(const void * host_ptr) const {
         return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
     }

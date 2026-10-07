@@ -122,7 +122,9 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
   `vision_model::make_input` 填写（`vision.cpp:260-272`）。
 * `vision_model`（`vision.h:76-127`）：权重 + 设备状态；`patch_w` 是两个 patch conv 相加后反量化的 f32
   `[n_embd][3*P²]`；`pos_embd_host` 是反量化的 learned position；`dev_weights` 是整块 GGUF 的设备副本；
-  `d_patch_w` 与 8 个 scratch 缓冲是模型自有的设备内存。
+  `d_patch_w` 与 8 个 scratch 缓冲是模型自有的设备内存。所有权：`dev_q` pin 住首次传入的
+  engine queue（换 queue 直接抛，跨 queue 释放是 UB），析构按成员表全释放
+  （`free_dev_ptrs`，`enc_common.h`；audio 塔同构）。模型禁拷贝，只传引用。
 
 ### 3.2 mmproj 加载
 

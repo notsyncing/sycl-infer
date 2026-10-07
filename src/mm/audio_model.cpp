@@ -154,7 +154,12 @@ void audio_model::load(const std::string & path) {
     out_b = bind_f32_opt(f, "a.out.bias");
 }
 
+audio_model::~audio_model() {
+    free_dev_ptrs(dev_q, {dev_weights, d_cw, d_mel, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_post});
+}
+
 void audio_model::upload(sycl::queue & q) {
+    pin_dev_queue(dev_q, q, "audio tower");
     dev_weights_size = gguf.map_size;
     dev_weights = sycl::malloc_device(dev_weights_size, q);
     if (!dev_weights) {
@@ -309,6 +314,7 @@ void audio_model::encode_host(const audio_input & in, std::vector<float> & out) 
 // attn) and the 1D audio rope via at_rope1d_launch.
 // ---------------------------------------------------------------------------
 void audio_model::encode_device(sycl::queue & q, const audio_input & in, float * d_out) {
+    pin_dev_queue(dev_q, q, "audio tower");
     const int E = hp.n_embd;
     const int ff = hp.n_ff;
     const int HD = hp.head_dim;

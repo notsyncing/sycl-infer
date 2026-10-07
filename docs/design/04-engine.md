@@ -144,6 +144,14 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 
 ### 4.1 `seg_plan`（`engine.h:31-113`）
 
+`seg_plan::validate(n_layer, what)`（`engine_graph.cpp`）是 plan 与执行之间的契约检查，
+失败即抛错而不是静默错位：每层恰好 4 个 call、各 per-call 向量等长、有 head 时其段全在
+device 0、已分组的 call 组内 device 一致。`build_plan` 返回前与 `finalize()` 末尾各调一次
+（后者只查分组，前者分组尚不存在则空过）；`record_forward` 在 phase 起点与层循环终点核对
+游标 `ci`（诊断截断 `STOP_AFTER_LAYER`/`PF_DBG_MID` 下跳过终点检查）。`plan_mtp_` 不走
+`record_forward`（`mtp_gemv` 直接下标），只受分组检查约束。
+
+
 一次完整 forward 的全部 GEMV/GEMM 工作：
 
 * `segs` — 扁平的 `gemv_seg` 列表。

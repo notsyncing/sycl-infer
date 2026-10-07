@@ -149,7 +149,12 @@ void vision_model::load(const std::string & path) {
     mm2_b = bind_f32_opt(f, "mm.2.bias");
 }
 
+vision_model::~vision_model() {
+    free_dev_ptrs(dev_q, {dev_weights, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0});
+}
+
 void vision_model::upload(sycl::queue & q) {
+    pin_dev_queue(dev_q, q, "vision");
     dev_weights_size = gguf.map_size;
     dev_weights = sycl::malloc_device(dev_weights_size, q);
     if (!dev_weights) {
@@ -447,6 +452,7 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
 // post LayerNorm and the 2x2 merger (concat is a stride reinterpretation).
 // ---------------------------------------------------------------------------
 void vision_model::encode_device(sycl::queue & q, const vision_input & in, float * d_out) {
+    pin_dev_queue(dev_q, q, "vision");
     const int E = hp.n_embd;
     const int ff = hp.n_ff;
     const int HD = hp.head_dim;

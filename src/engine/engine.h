@@ -111,7 +111,17 @@ struct seg_plan {
             }
             call_group_count.push_back((int)groups.size() - call_group_begin.back());
         }
+        // grouping continues on `type` only after a (dev,type) sort, so a group
+        // spanning two devices would silently merge two backends' segments -
+        // fail fast here instead of miswiring a future cross-device call.
+        // n_layer < 0 skips the layer-count checks (plan_mtp_ has no layer_c0).
+        validate(-1, "finalize");
     }
+    // Structural self-check, defined in engine_graph.cpp: 4 calls per layer,
+    // per-call vectors in lockstep, the head call (if any) pinned to device 0,
+    // and device-homogeneous groups.  Throws naming the first violation.
+    // Pure integer compares; no behavior change when passing.
+    void validate(int n_layer, const char * what) const;
 };
 
 struct engine {

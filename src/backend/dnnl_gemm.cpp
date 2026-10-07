@@ -291,6 +291,32 @@ void dnnl_capture_guard() {
     }
 }
 
+// Owning pointer for a *per-call* device temporary.  Long-lived allocations go
+// through impl::dev_alloc / impl::owned_ instead; this exists for the few
+// malloc/free pairs that live inside one function and must still be released
+// when that function unwinds (a warmup execute can throw from
+// dnnl_capture_guard).  sycl::free needs the allocating queue, hence the
+// by-reference member instead of a function-pointer deleter.
+template <typename T> struct qfree {
+    T * p = nullptr;
+    sycl::queue * q = nullptr;
+    qfree() = default;
+    qfree(T * p_, sycl::queue & q_) : p(p_), q(&q_) {}
+    qfree(const qfree &) = delete;
+    qfree & operator=(const qfree &) = delete;
+    ~qfree() {
+        if (p) {
+            sycl::free(p, *q);
+        }
+    }
+    T * get() const {
+        return p;
+    }
+    explicit operator bool() const {
+        return p != nullptr;
+    }
+};
+
 bool dnnl_gemm_enabled() {
     // default ON (the mode-2 int8 GEMMs run on oneDNN); PF_GEMM_DNNL=0 forces
     // the dp4a chunk-batched path, e.g. for bit-exact dp4a validation
@@ -396,6 +422,35 @@ struct dnnl_gemm::impl {
     uint16_t * lut16 = nullptr;      // 256-entry byte-pair table over it (see cb4_gemv_launch)
     int8_t * cb4_scratch = nullptr;  // shared int8 expansion for prefill
     size_t cb4_scratch_cap = 0;
+
+    // Ownership: every long-lived device allocation is registered here at
+    // creation (dev_alloc) and unregistered on grow-realloc (dev_erase); the
+    // destructor frees the registry, so a newly added store cannot leak by
+    // forgetting the dtor the way cb4weights/LUTs once did.  Allocation timing
+    // and counts are unchanged - only the manual field-by-field frees go away.
+    // Short-lived per-call temporaries (dsc, dx/dsw/dout) stay manual: they
+    // are malloc/free balanced inside one function.
+    std::vector<void *> owned_;
+    template <typename T> T * dev_alloc(size_t n) {
+        T * ptr = sycl::malloc_device<T>(n, q);
+        if (ptr) {
+            owned_.push_back(ptr);
+        }
+        return ptr;
+    }
+    void dev_erase(void * ptr) {
+        if (!ptr) {
+            return;
+        }
+        sycl::free(ptr, q);
+        for (size_t i = 0; i < owned_.size(); i++) {
+            if (owned_[i] == ptr) {
+                owned_[i] = owned_.back();
+                owned_.pop_back();
+                return;
+            }
+        }
+    }
 
     struct prim4_entry {
         matmul prim;
@@ -547,112 +602,33 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     p->st_a = sycl_interop::make_stream(p->eng, q);
     p->cap_M = kMaxB * kMaxT; // max rows of one chunk-batched prefill
     p->cap_K = kActMaxK;
-    p->ax = sycl::malloc_device<int8_t>((size_t)p->cap_M * p->cap_K, q);
-    p->axs = sycl::malloc_device<float>(p->cap_M, q);
-    p->axsum = sycl::malloc_device<int32_t>(p->cap_M, q);
+    p->ax = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K);
+    p->axs = p->dev_alloc<float>(p->cap_M);
+    p->axsum = p->dev_alloc<int32_t>(p->cap_M);
     // widest N any converted tensor has (27B ffn_gate/up = 17408; rounded to a
     // power of two), so every (M,N) up to a full kMaxB*kMaxT prefill tile can
     // create its primitive
     p->acc_cap = (size_t)p->cap_M * 32768;
-    p->acc = sycl::malloc_device<int32_t>(p->acc_cap, q);
+    p->acc = p->dev_alloc<int32_t>(p->acc_cap);
     // 4-bit path scratch: f32 accumulator over the same [M][N] range plus the
     // per-group activation sums (K/32 per row, at most 1024)
-    p->accf = sycl::malloc_device<float>(p->acc_cap, q);
-    p->xs = sycl::malloc_device<float>((size_t)p->cap_M * (p->cap_K / kW4Group), q);
-    p->axg = sycl::malloc_device<int8_t>((size_t)p->cap_M * p->cap_K, q);
-    p->asa = sycl::malloc_device<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group), q);
-    p->axe = sycl::malloc_device<int8_t>((size_t)p->cap_M * p->cap_K / 2, q);
-    p->axo = sycl::malloc_device<int8_t>((size_t)p->cap_M * p->cap_K / 2, q);
+    p->accf = p->dev_alloc<float>(p->acc_cap);
+    p->xs = p->dev_alloc<float>((size_t)p->cap_M * (p->cap_K / kW4Group));
+    p->axg = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K);
+    p->asa = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group));
+    p->axe = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K / 2);
+    p->axo = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K / 2);
     if (!p->ax || !p->axs || !p->acc || !p->accf || !p->xs || !p->axg || !p->asa || !p->axe || !p->axo) {
         throw std::runtime_error("dnnl scratch alloc failed");
     }
 }
 
 dnnl_gemm::~dnnl_gemm() {
-    for (auto & it : p->weights) {
-        if (it.second.dev) {
-            sycl::free(it.second.dev, p->q);
-        }
-        if (it.second.scales) {
-            sycl::free(it.second.scales, p->q);
-        }
-    }
-    if (p->ax) {
-        sycl::free(p->ax, p->q);
-    }
-    if (p->axs) {
-        sycl::free(p->axs, p->q);
-    }
-    if (p->axsum) {
-        sycl::free(p->axsum, p->q);
-    }
-    if (p->acc) {
-        sycl::free(p->acc, p->q);
-    }
-    if (p->accf) {
-        sycl::free(p->accf, p->q);
-    }
-    if (p->xs) {
-        sycl::free(p->xs, p->q);
-    }
-    if (p->axg) {
-        sycl::free(p->axg, p->q);
-    }
-    if (p->asa) {
-        sycl::free(p->asa, p->q);
-    }
-    if (p->axe) {
-        sycl::free(p->axe, p->q);
-    }
-    if (p->axo) {
-        sycl::free(p->axo, p->q);
-    }
-    for (auto * wm : {&p->w4weights, &p->w2weights}) {
-        for (auto & it : *wm) {
-            if (it.second.vals) {
-                sycl::free(it.second.vals, p->q);
-            }
-            if (it.second.scales) {
-                sycl::free(it.second.scales, p->q);
-            }
-            if (it.second.off) {
-                sycl::free(it.second.off, p->q);
-            }
-        }
-    }
-    for (auto & it : p->k5weights) {
-        if (it.second.vals) {
-            sycl::free(it.second.vals, p->q);
-        }
-        if (it.second.hi) {
-            sycl::free(it.second.hi, p->q);
-        }
-        if (it.second.scales) {
-            sycl::free(it.second.scales, p->q);
-        }
-        if (it.second.off) {
-            sycl::free(it.second.off, p->q);
-        }
-    }
-    for (auto & it : p->cb4weights) {
-        if (it.second.idx) {
-            sycl::free(it.second.idx, p->q);
-        }
-        if (it.second.scales) {
-            sycl::free(it.second.scales, p->q);
-        }
-    }
-    if (p->lut) {
-        sycl::free(p->lut, p->q);
-    }
-    if (p->lut16) {
-        sycl::free(p->lut16, p->q);
-    }
-    if (p->bit_lut) {
-        sycl::free(p->bit_lut, p->q);
-    }
-    if (p->cb4_scratch) {
-        sycl::free(p->cb4_scratch, p->q);
+    // Every long-lived allocation was registered in owned_ at creation;
+    // freeing the registry (not a per-field list) is what keeps a newly
+    // added store from leaking by forgetting this function.
+    for (void * ptr : p->owned_) {
+        sycl::free(ptr, p->q);
     }
 }
 
@@ -730,15 +706,11 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
     w.K = K;
     w.N = N;
     w.ng = ng;
-    w.dev = sycl::malloc_device<int8_t>(nvals, p->q);
-    w.scales = sycl::malloc_device<uint16_t>((size_t)ng * N, p->q);
+    w.dev = p->dev_alloc<int8_t>(nvals);
+    w.scales = p->dev_alloc<uint16_t>((size_t)ng * N);
     if (!w.dev || !w.scales) {
-        if (w.dev) {
-            sycl::free(w.dev, p->q);
-        }
-        if (w.scales) {
-            sycl::free(w.scales, p->q);
-        }
+        p->dev_erase(w.dev);
+        p->dev_erase(w.scales);
         return false;
     }
     p->q.memcpy(w.dev, hw.data(), nvals).wait();
@@ -835,10 +807,10 @@ bool dnnl_gemm::add_weight_k5(const void * key, const void * host_data, uint32_t
     e.K = K;
     e.N = N;
     e.ng = K / kW4Group;
-    e.vals = sycl::malloc_device<uint8_t>(b.vals.size(), p->q);
-    e.hi = sycl::malloc_device<uint8_t>(b.hi.size(), p->q);
-    e.scales = sycl::malloc_device<uint16_t>(b.scale.size(), p->q);
-    e.off = sycl::malloc_device<uint16_t>(b.off.size(), p->q);
+    e.vals = p->dev_alloc<uint8_t>(b.vals.size());
+    e.hi = p->dev_alloc<uint8_t>(b.hi.size());
+    e.scales = p->dev_alloc<uint16_t>(b.scale.size());
+    e.off = p->dev_alloc<uint16_t>(b.off.size());
     if (!e.vals || !e.hi || !e.scales || !e.off) {
         return false;
     }
@@ -854,7 +826,9 @@ bool dnnl_gemm::add_weight_k5(const void * key, const void * host_data, uint32_t
             host[i] = (uint32_t)((i >> 0) & 1) | ((uint32_t)((i >> 1) & 1) << 8) | ((uint32_t)((i >> 2) & 1) << 16)
                       | ((uint32_t)((i >> 3) & 1) << 24);
         }
-        p->bit_lut = sycl::malloc_device<uint32_t>(16, p->q);
+        // On this OOM path the entry planes stay registered (never emplaced),
+        // so the destructor still frees them - previously they leaked.
+        p->bit_lut = p->dev_alloc<uint32_t>(16);
         if (!p->bit_lut) {
             return false;
         }
@@ -863,12 +837,10 @@ bool dnnl_gemm::add_weight_k5(const void * key, const void * host_data, uint32_t
     // the prefill expansion needs the int8-sized scratch (shared with cb4)
     const size_t need = (size_t)K * (size_t)N;
     if (need > p->cb4_scratch_cap) {
-        if (p->cb4_scratch) {
-            sycl::free(p->cb4_scratch, p->q);
-            p->cb4_scratch = nullptr;
-            p->cb4_scratch_cap = 0;
-        }
-        p->cb4_scratch = sycl::malloc_device<int8_t>(need, p->q);
+        p->dev_erase(p->cb4_scratch);
+        p->cb4_scratch = nullptr;
+        p->cb4_scratch_cap = 0;
+        p->cb4_scratch = p->dev_alloc<int8_t>(need);
         if (!p->cb4_scratch) {
             return false;
         }
@@ -903,21 +875,17 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
     e.K = K;
     e.N = N;
     e.ng = K / kW4Group;
-    e.idx = sycl::malloc_device<uint8_t>(b.idx.size(), p->q);
-    e.scales = sycl::malloc_device<uint16_t>(b.scale.size(), p->q);
+    e.idx = p->dev_alloc<uint8_t>(b.idx.size());
+    e.scales = p->dev_alloc<uint16_t>(b.scale.size());
     if (!e.idx || !e.scales) {
-        if (e.idx) {
-            sycl::free(e.idx, p->q);
-        }
-        if (e.scales) {
-            sycl::free(e.scales, p->q);
-        }
+        p->dev_erase(e.idx);
+        p->dev_erase(e.scales);
         return false;
     }
     p->q.memcpy(e.idx, b.idx.data(), b.idx.size()).wait();
     p->q.memcpy(e.scales, b.scale.data(), b.scale.size() * sizeof(uint16_t)).wait();
     if (!p->lut) {
-        p->lut = sycl::malloc_device<int8_t>(16, p->q);
+        p->lut = p->dev_alloc<int8_t>(16);
         if (!p->lut) {
             return false;
         }
@@ -928,7 +896,7 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
         for (int b = 0; b < 256; b++) {
             h16[b] = (uint16_t)((uint8_t)kvalues_iq4nl[b & 0xF] | ((uint16_t)(uint8_t)kvalues_iq4nl[b >> 4] << 8));
         }
-        p->lut16 = sycl::malloc_device<uint16_t>(256, p->q);
+        p->lut16 = p->dev_alloc<uint16_t>(256);
         if (!p->lut16) {
             return false;
         }
@@ -938,12 +906,10 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
     // converted tensor (the biggest is ffn_gate/up, ~95 MB, not the full model)
     const size_t need = (size_t)K * (size_t)N;
     if (need > p->cb4_scratch_cap) {
-        if (p->cb4_scratch) {
-            sycl::free(p->cb4_scratch, p->q);
-            p->cb4_scratch = nullptr;
-            p->cb4_scratch_cap = 0;
-        }
-        p->cb4_scratch = sycl::malloc_device<int8_t>(need, p->q);
+        p->dev_erase(p->cb4_scratch);
+        p->cb4_scratch = nullptr;
+        p->cb4_scratch_cap = 0;
+        p->cb4_scratch = p->dev_alloc<int8_t>(need);
         if (!p->cb4_scratch) {
             return false;
         }
@@ -1002,19 +968,13 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
         fprintf(stderr, "[w4] register key=%p type=%u K=%d N=%d (%.4f B/weight)\n", key, ggml_type, K, N,
                 (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
     }
-    e.vals = sycl::malloc_device<uint8_t>(w.vals.size(), p->q);
-    e.scales = sycl::malloc_device<uint16_t>(w.scale.size(), p->q);
-    e.off = sycl::malloc_device<uint16_t>(w.off.size(), p->q);
+    e.vals = p->dev_alloc<uint8_t>(w.vals.size());
+    e.scales = p->dev_alloc<uint16_t>(w.scale.size());
+    e.off = p->dev_alloc<uint16_t>(w.off.size());
     if (!e.vals || !e.scales || !e.off) {
-        if (e.vals) {
-            sycl::free(e.vals, p->q);
-        }
-        if (e.scales) {
-            sycl::free(e.scales, p->q);
-        }
-        if (e.off) {
-            sycl::free(e.off, p->q);
-        }
+        p->dev_erase(e.vals);
+        p->dev_erase(e.scales);
+        p->dev_erase(e.off);
         return false;
     }
     p->q.memcpy(e.vals, w.vals.data(), w.vals.size()).wait();
@@ -1045,9 +1005,9 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     const int ladder[] = {1, kMaxT, 2 * kMaxT, 3 * kMaxT, 4 * kMaxT, 8 * kMaxT, 16 * kMaxT};
     if (!(any_type || gemv_only)) {
         if ((size_t)p->cap_M * (size_t)N > p->acc_cap) {
-            sycl::free(e.vals, p->q);
-            sycl::free(e.scales, p->q);
-            sycl::free(e.off, p->q);
+            p->dev_erase(e.vals);
+            p->dev_erase(e.scales);
+            p->dev_erase(e.off);
             return false;
         }
         // M=1 is the decode shape (the 4-bit path has no dedicated GEMV yet, so the
@@ -1126,19 +1086,13 @@ bool dnnl_gemm::add_weight_w2(const void * key, const void * host_data, uint32_t
     impl::w4_entry e;
     e.K = K;
     e.N = N;
-    e.vals = sycl::malloc_device<uint8_t>(w.vals.size(), p->q);
-    e.scales = sycl::malloc_device<uint16_t>(w.scale.size(), p->q);
-    e.off = sycl::malloc_device<uint16_t>(w.off.size(), p->q);
+    e.vals = p->dev_alloc<uint8_t>(w.vals.size());
+    e.scales = p->dev_alloc<uint16_t>(w.scale.size());
+    e.off = p->dev_alloc<uint16_t>(w.off.size());
     if (!e.vals || !e.scales || !e.off) {
-        if (e.vals) {
-            sycl::free(e.vals, p->q);
-        }
-        if (e.scales) {
-            sycl::free(e.scales, p->q);
-        }
-        if (e.off) {
-            sycl::free(e.off, p->q);
-        }
+        p->dev_erase(e.vals);
+        p->dev_erase(e.scales);
+        p->dev_erase(e.off);
         return false;
     }
     p->q.memcpy(e.vals, w.vals.data(), w.vals.size()).wait();
@@ -1215,24 +1169,31 @@ int dnnl_gemm::warmup() {
             continue;
         }
         impl::prim_entry & pe = it.second;
+        // dnnl_capture_guard() below throws when a oneDNN execute is reached
+        // during a declared-all-SYCL capture; a manual free would then be
+        // skipped and leak this dummy plane (ng*N f16, up to ~1 MB) for every
+        // M in the ladder, i.e. exactly when the run is already failing.  The
+        // guard is declared outside the try so unwinding still releases it,
+        // and the alloc stays inside so the catch still swallows a throw.
+        qfree<uint16_t> dsc;
         try {
             const auto t1 = std::chrono::high_resolution_clock::now();
             // the grouped scales must be supplied now; dummy planes are fine
-            uint16_t * dsc = sycl::malloc_device<uint16_t>((size_t)(K / kW4Group) * N, p->q);
+            dsc.p    = sycl::malloc_device<uint16_t>((size_t)(K / kW4Group) * N, p->q);
+            dsc.q    = &p->q;
             if (!dsc) {
                 continue;
             }
             auto scmem = sycl_interop::make_memory(
                 memory::desc({1, (memory::dim)((K / kW4Group) * N)}, memory::data_type::f16, memory::format_tag::ab),
                 p->eng,
-                sycl_interop::memory_kind::usm, (void *)dsc);
+                sycl_interop::memory_kind::usm, (void *)dsc.get());
             dnnl_capture_guard();
             pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                                     {DNNL_ARG_WEIGHTS, *wmem},
                                     {DNNL_ARG_DST, pe.dst},
                                     {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scmem},
                                     {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe.sscales}});
-            sycl::free(dsc, p->q);
             if (tdbg) {
                 p->q.wait();
                 fprintf(

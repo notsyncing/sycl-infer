@@ -105,7 +105,19 @@ struct vision_model {
     // device copy of the weights (one blob)
     void * dev_weights = nullptr;
     size_t dev_weights_size = 0;
+    // Queue every device allocation below was made on (set on first upload):
+    // sycl::free needs it, and freeing on another queue is UB.  All callers
+    // pass the engine queue, so one queue per model holds in practice.
+    sycl::queue * dev_q = nullptr;
     void upload(sycl::queue & q);
+    // releases dev_weights + patch weights + scratch on dev_q (no-op when
+    // nothing was ever uploaded).  Models are never copied (a copy would
+    // double-free), only referenced - and the deleted copy ctor suppresses
+    // the implicit default ctor, so it is defaulted explicitly.
+    vision_model() = default;
+    ~vision_model();
+    vision_model(const vision_model &) = delete;
+    vision_model & operator=(const vision_model &) = delete;
     const void * dev_ptr(const void * host_ptr) const {
         return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
     }

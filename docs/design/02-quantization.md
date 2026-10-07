@@ -353,6 +353,9 @@ scalar 下是 `nullptr`（`common.cpp:546`），而 `i8_supported` 要求
 * `weights` map（key = `w8t.vals` 指针 → `{int8 [N][K], scales, memory}`）、`w4weights`/`w2weights`/
   `k5weights`/`cb4weights` 四张原生位宽表（§9-§12）、共享的 `cb4_scratch`；
 * `prims` map（key = `(M,K,N)` → `{matmul, src, dst, sscales}`）与 `prims4`（u4 版本）；
+* `owned_` 注册表（`dev_alloc`/`dev_erase`）：所有长生命周期的设备分配在创建时登记，
+  析构只扫表——新权重存储再也不会因漏改析构而泄漏（cb4/LUT 漏的就是这么补上的）。
+  分配时机与数量不变，单函数内平衡的临时量（`dsc`、`dx/dsw/dout`）仍手动管理；
 * 两条 oneDNN stream：`st`（稠密 GEMM）与 `st_a`（只服务 attention 的 int8 matmul）。
   两者包同一个 in-order 队列，所以提交仍有序，但在 `st_a` 上等不会把 `st` 上排队的稠密 GEMM
   一起抽干（`dnnl_gemm.cpp:308-312`）。

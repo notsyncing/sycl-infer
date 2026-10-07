@@ -1,6 +1,8 @@
 #pragma once
 
+#include <initializer_list>
 #include <stdexcept>
+#include <string>
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -81,6 +83,29 @@ inline void dequant_row(const vt & t, int row, float * dst) {
         }
         break;
     default: throw std::runtime_error("encoder: unsupported weight type " + std::to_string(t.type));
+    }
+}
+// Device-memory ownership for the encoder towers: every device allocation a
+// model makes is pinned to one queue (pin_dev_queue throws if a second queue
+// ever shows up - freeing on another queue is UB), and free_dev_ptrs releases
+// a whole member list on it.  The model destructors are the only other caller,
+// so a newly added scratch buffer only needs one more entry in that list.
+inline sycl::queue & pin_dev_queue(sycl::queue *& slot, sycl::queue & q, const char * who) {
+    if (!slot) {
+        slot = &q;
+    } else if (slot != &q) {
+        throw std::runtime_error(std::string(who) + ": device queue changed mid-model");
+    }
+    return *slot;
+}
+inline void free_dev_ptrs(sycl::queue * q, std::initializer_list<void *> ps) {
+    if (!q) {
+        return;
+    }
+    for (void * p : ps) {
+        if (p) {
+            sycl::free(p, *q);
+        }
     }
 }
 inline void matmul_all(const vt & w, const float * bias, const float * x, float * out, int ntok) {
