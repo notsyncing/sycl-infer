@@ -44,7 +44,7 @@
   （`max(8, hardware_concurrency()-1)`，`third_party/httplib.h:183-190`，由
   `Server::Server()` 在 `httplib.h:12787-12788` 构造）。没有安装自定义 task queue。
 * `model_id` 默认 `"qwen3.5-0.8b"`（`server.h:9`），但 `/v1/models` 实际用 GGUF `general.name` 覆盖
-  （`server.cpp:1502-1505`）；`host` 默认 `0.0.0.0`、`port` 默认 8080（`server.h:10-11`，由
+  （`server.cpp`）；`host` 默认 `127.0.0.1`、`port` 默认 8080（`server.h`，由
   `--host`/`--port` 填充）。
 
 ### 2.2 CORS
@@ -528,12 +528,10 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 * `parse_messages` 按顺序收集媒体的 `media_part`（`image_url`/`image`、`video_url`/`video`、
   `input_audio`（带 `data`+`format`）、`audio_url`），保留文本/媒体交错（`cm.parts` 的顺序就是模板
   看到的顺序），`chat_part` 带 `kind` 标记。
-* `load_media_bytes`（`server.cpp:455-500`）接受 `data:`（要求 `;base64`；`b64_decode` 容忍空白、遇到
-  `=` 停止）、内联 `input_audio` base64 与 `http(s)://`（`fetch_http_image` 用 httplib 下载，跟随
-  重定向，连接/读/写各 10 s 超时、10 MB 上限——超过即中断传输；HTTPS 需要构建时找到 OpenSSL，否则
-  报错；`PF_MM_URL_FETCH=0` 可整体关闭远程抓取）。其它 scheme 一律 400。`parse_http_url` 解析
-  `scheme://host[:port]/path`，丢弃 userinfo、支持 `[IPv6]` 字面量、默认端口 443/80，缺 host 或
-  端口含非数字即拒绝。
+* `load_media_bytes` 接受 `data:`（要求 `;base64`；`b64_decode` 容忍空白、遇到 `=` 停止）、
+  内联 `input_audio` base64 与 `http(s)://`。其它 scheme 一律 400。远程抓取的策略见
+  [§5 远程媒体抓取与 SSRF 边界](#5-远程媒体抓取与-ssrf-边界)（`src/server/url_fetch.{h,cpp}`，
+  默认关闭，开启时只允许公网可达地址且逐跳复检跳转）。
 * 图片 `mm_image_decode_mem` → `mm_image_preprocess`；视频 `mm_video_decode_mem`（`max_frames`/
   `max_side` 由上面两个字段控制，探测/解码分别走 `PF_AV_FFPROBE`/`PF_AV_FFMPEG`）；音频
   `mm_audio_decode_bytes`（WAV 原生解析 PCM 8/16/24/32 与 IEEE float 32/64、立体声下混，其它容器落
@@ -550,6 +548,53 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
   `logprobs` 恒为 `null`（§2.6）。多模态请求也**不会**走 MTP——`handle_chat` 先判媒体分支再判
   `mtp_direct`，引擎侧也显式排除（`engine.cpp:2365`）。
 
+### 6.1 远程媒体抓取与 SSRF 边界（`src/server/url_fetch.{h,cpp}`）
+
+HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于把引擎交给所有能连到端口的人。
+在这个前提下，「让服务端 GET 任意 URL」就是一把 SSRF 枪：它能碰到调用方碰不到的一切——
+云实例元数据（`169.254.169.254`）、集群内管理接口、同机上没加保护的推理端口。抓取发生在持有
+`mm_req` 期间，每个 URL 最多 10 s，因此一个慢 URL 还能串行化其它所有多模态请求。
+
+三层防御，默认全部关闭：
+
+| 层 | 默认 | 开启方式 | 挡住什么 |
+|---|---|---|---|
+| 远程抓取总开关 | **关** | `PF_MM_URL_FETCH=1` | 默认配置下不存在任何出网请求 |
+| 目的地址过滤 | 开（仅在抓取开启时生效） | `PF_MM_URL_ALLOW_PRIVATE=1` 放行内网 | 直接写 `http://169.254.169.254/...` |
+| 逐跳跳转复检 | 开（仅在抓取开启时生效） | 无 | 「一个公网 URL 302 跳到内网地址」 |
+
+**地址分类**（`addr_is_public`）拒绝：unspecified、`127.0.0.0/8`、`10/8`、`172.16/12`、
+`192.168/16`、`169.254/16`（含元数据地址）、CGNAT `100.64/10`、multicast、reserved，
+以及 special-use/文档段（`192.0.0.0/24`、`192.0.2.0/24`、`192.88.99.0/24`、
+`198.18.0.0/15`、`198.51.100.0/24`、`203.0.113.0/24`）；IPv6 侧拒绝 `::`、`::1`、
+`fe80::/10`、`fc00::/7`、`ff00::/8`，以及 6to4 包裹非公网 v4 的 `2002::/16`。
+
+两个容易写错、测试里专门盯住的点：
+
+* **用解析而不是字符串匹配**。`host_is_public` 走 `getaddrinfo`，所以十进制
+  （`2130706433`）、八进制（`0177.0.0.1`）写法的 loopback 会被挡住，任何文本过滤都会漏。
+  一个名字返回多条 A 记录时，**只要有一条非公网就整体拒绝**。
+* **IPv4-mapped IPv6 按内嵌的 IPv4 判定**，否则 `::ffff:127.0.0.1` 直接绕过整个 IPv4 表
+  （`v6_is_public` 里先查 `IN6_IS_ADDR_V4MAPPED`）。同理 `2002::/16` 拆出被包裹的 v4 再判。
+
+**跳转必须自己走**。原实现用 `cli.set_follow_location(true)`，而 httplib 的跳转循环自己
+重新解析并重新连接，**不给调用方任何钩子**——一个校验过的 URL 因此可以变成任意 URL，这正是
+最常见的绕过方式。现在 `set_follow_location(false)`，`url_fetch` 自己走至多 5 跳，每跳重新
+解析 + 重新分类；`resolve_redirect` 支持绝对 / scheme-relative / 根相对 / 路径相对，并拒绝
+`https → http` 降级（否则允许它的理由——传输保证——被悄悄丢掉）。重定向响应体不进 payload。
+
+**已知残留**：`host_is_public` 在校验时解析一次，httplib 连接时再解析一次，恶意 DNS 服务器仍能
+赢下这个竞争（DNS rebinding）。彻底关掉需要把连接钉在校验过的 IP 上，httplib 没有这个钩子，
+本轮不做。默认关闭意味着要触发它必须先显式开启远程抓取——所以这里如实记录为残留，而不是宣称
+已经消除。上限 10 MB 与各 10 s 超时不变。
+
+测试 `tests/server/test_url_fetch.cpp`（无模型、无 GPU）：地址分类逐条列出被拒范围并检查
+172.15/172.32 等相邻公网段**没有**被过度拦截；`url_parse`/`resolve_redirect` 的接受与拒绝；
+以及用进程内 httplib 服务做的集成测试——它监听 `127.0.0.1`，所以既是「调用方控制的端点」
+也是「跳转目标」，整条链不离开本机。策略由 `url_fetch_mode()` 的静态缓存决定，故三种策略各跑
+一个进程（`test_url_fetch_default|public|private`），测试自己 setenv/unsetenv，shell 里已有的
+`PF_MM_URL_FETCH` 影响不到 default 那档。
+
 ---
 
 ## 7. 诊断环境变量
@@ -560,7 +605,8 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 | `SCHED_DEBUG` | 准入/prefill/decode 决策日志，含每行 decode 的 `seq/slot/pos/tok`（`scheduler.cpp:129-132`、`252-255`、`363-369`、`378-380`） |
 | `PF_CHAT_TMPL_DEBUG` | 记录导致回退 ChatML 的模板异常（也记录 `tools_json` 解析失败，`chat_template.cpp:26`、`90-92`、`102-104`） |
 | `PF_MTP_SERVER` | `1` 让 `mtp_direct` 把 greedy 单请求路由进单序列 MTP 循环，绕过调度器；**默认关**，理由与实测见 §3.6（`server.cpp:901-907`） |
-| `PF_MM_URL_FETCH` | `0` 禁止下载远程 `http(s)://` 图片/视频/音频（base64 `data:` 不受影响），默认开（`server.cpp:475-487`） |
+| `PF_MM_URL_FETCH` | 允许下载远程 `http(s)://` 图片/视频/音频（base64 `data:` 不受影响），**默认关闭**；设 `1` 开启且只允许公网可达地址 |
+| `PF_MM_URL_ALLOW_PRIVATE` | 仅在 `PF_MM_URL_FETCH=1` 时有意义：`1` 放行 loopback/私有/link-local 目标（内网媒体服务器场景，等于重新暴露 SSRF） |
 | `PF_AV_FFMPEG` | 音频/视频解码的 ffmpeg 可执行路径（默认 `ffmpeg`，`video.cpp:340`、`audio.cpp:22`） |
 | `PF_AV_FFPROBE` | 视频探测（时长/帧率）的 ffprobe 可执行路径（默认 `ffprobe`，`video.cpp:345`） |
 | `PF_GEMM_DNNL` | 不是服务端旋钮，但通过 `engine::batched_prefill_fit` 决定 prefill chunk 尺寸（见 §3.4） |
@@ -607,7 +653,7 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 | `modalities` / `audio` / `prediction` | ❌ | 忽略 |
 | `web_search_options` | ❌ | 忽略 |
 | `best_of`（chat 端） | ❌ | 忽略；只有 `/v1/completions` 实现（§8.3） |
-| 图片 part `{"type":"image_url","image_url":{"url":...}}` | ✅ | `data:` base64 或 `http(s)://`（远程默认允许，`PF_MM_URL_FETCH=0` 关闭）；需要 `--mmproj` |
+| 图片 part `{"type":"image_url","image_url":{"url":...}}` | ✅ | `data:` base64 或 `http(s)://`（远程**默认关闭**，`PF_MM_URL_FETCH=1` 开启且限公网地址）；需要 `--mmproj` |
 | 视频 part `{"type":"video_url","video_url":{"url":...}}` | ✅ | 同 `image_url`，需 `--mmproj`，由 `max_video_frames`/`max_video_side` 控制采样 |
 | 音频 part `{"type":"input_audio","input_audio":{"data":...,"format":"wav"}}` | ✅ | `data` 为 base64 内联音频（WAV 原生，MP3/OGG 等经 ffmpeg CLI）；需 `--audio-mmproj`，且因为媒体分支先查视觉塔，**实际还需要 `--mmproj`**（§2.5）；`format` 只被记录、不参与解码 |
 | 音频 part `{"type":"audio_url","audio_url":{"url":...,"format":...}}` | ✅ | `data:` 或 `http(s)://`，同上 |

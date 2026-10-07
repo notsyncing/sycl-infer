@@ -33,6 +33,7 @@
 #include "response_parser.h"
 #include "sampler.h"
 #include "sse.h"
+#include "url_fetch.h"
 #include "video.h"
 #include "audio.h"
 #include "audio_model.h"
@@ -398,112 +399,6 @@ bool b64_decode(const std::string & s, std::vector<uint8_t> & out) {
     return true;
 }
 
-// Split an absolute http(s) URL into the "scheme://host:port" base that
-// httplib::Client expects and the request path.  Only http/https with an
-// explicit host are accepted.
-bool parse_http_url(const std::string & url, std::string & base, std::string & path, std::string & err) {
-    const size_t scheme_end = url.find("://");
-    if (scheme_end == std::string::npos) {
-        err = "malformed image URL";
-        return false;
-    }
-    const std::string scheme = url.substr(0, scheme_end);
-    if (scheme != "http" && scheme != "https") {
-        err = "unsupported image URL scheme: " + scheme;
-        return false;
-    }
-    const size_t host_start = scheme_end + 3;
-    const size_t path_start = url.find('/', host_start);
-    std::string authority =
-        (path_start == std::string::npos) ? url.substr(host_start) : url.substr(host_start, path_start - host_start);
-    path = (path_start == std::string::npos) ? "/" : url.substr(path_start);
-    const size_t at = authority.rfind('@'); // drop any userinfo
-    if (at != std::string::npos) {
-        authority = authority.substr(at + 1);
-    }
-    int port = (scheme == "https") ? 443 : 80;
-    std::string host = authority;
-    std::string port_s;
-    if (!authority.empty() && authority[0] == '[') { // IPv6 literal
-        const size_t br = authority.find(']');
-        if (br == std::string::npos) {
-            err = "malformed IPv6 host in image URL";
-            return false;
-        }
-        host = authority.substr(0, br + 1);
-        if (br + 1 < authority.size() && authority[br + 1] == ':') {
-            port_s = authority.substr(br + 2);
-        }
-    } else {
-        const size_t colon = authority.rfind(':');
-        if (colon != std::string::npos) {
-            host = authority.substr(0, colon);
-            port_s = authority.substr(colon + 1);
-        }
-    }
-    if (host.empty()) {
-        err = "image URL has no host";
-        return false;
-    }
-    if (!port_s.empty()) {
-        if (port_s.find_first_not_of("0123456789") != std::string::npos) {
-            err = "malformed port in image URL";
-            return false;
-        }
-        port = std::atoi(port_s.c_str());
-    }
-    base = scheme + "://" + host + ":" + std::to_string(port);
-    return true;
-}
-
-// Download a remote image.  The 10 s timeout and 10 MB cap keep a slow or
-// hostile URL from stalling the handler thread or exhausting memory; the size
-// is enforced by aborting the transfer once the limit is crossed.
-bool fetch_http_bytes(const std::string & url, std::vector<uint8_t> & bytes, std::string & err) {
-    std::string base, path;
-    if (!parse_http_url(url, base, path, err)) {
-        return false;
-    }
-    constexpr size_t kMaxBytes = 10 * 1024 * 1024;
-    try {
-        httplib::Client cli(base);
-        cli.set_follow_location(true);
-        cli.set_connection_timeout(10, 0);
-        cli.set_read_timeout(10, 0);
-        cli.set_write_timeout(10, 0);
-        bool too_large = false;
-        auto res = cli.Get(path, httplib::Headers{{"User-Agent", "sycl-infer"}},
-                           [&](const char * data, size_t len) {
-                               if (bytes.size() + len > kMaxBytes) {
-                                   too_large = true;
-                                   return false;
-                               }
-                               bytes.insert(bytes.end(), data, data + len);
-                               return true;
-                           });
-        if (too_large) {
-            err = "image URL exceeds the 10 MB limit";
-            return false;
-        }
-        if (!res) {
-            err = "cannot fetch image URL: " + httplib::to_string(res.error());
-            return false;
-        }
-        if (res->status < 200 || res->status >= 300) {
-            err = "image URL returned HTTP " + std::to_string(res->status);
-            return false;
-        }
-    } catch (const std::exception & ex) {
-        err = std::string("cannot fetch image URL: ") + ex.what();
-        return false;
-    }
-    if (bytes.empty()) {
-        err = "image URL returned no data";
-        return false;
-    }
-    return true;
-}
-
 // Resolve a media part to raw bytes.  `data:` URLs are decoded locally;
 // http(s) URLs are downloaded (like llama.cpp's server), bounded so the
 // endpoint cannot be used as an unbounded download proxy; `input_audio`'s
@@ -529,17 +424,11 @@ bool load_media_bytes(const media_part & part, std::vector<uint8_t> & bytes, std
             return true;
         }
         if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
-            // Remote fetches turn the server into a proxy, so allow deployments
-            // to opt out (e.g. when exposed beyond localhost); on by default.
-            static const bool remote_ok = [] {
-                const char * v = si::env::str("PF_MM_URL_FETCH");
-                return !(v != nullptr && v[0] == '0' && v[1] == '\0');
-            }();
-            if (!remote_ok) {
-                err = "remote media URLs are disabled (PF_MM_URL_FETCH=0)";
-                return false;
-            }
-            return fetch_http_bytes(url, bytes, err);
+            // Remote fetches turn the server into an SSRF proxy (unauthenticated
+            // endpoint + routable bind address), so they are OFF unless
+            // PF_MM_URL_FETCH is set, and even then only to publicly routable
+            // addresses.  See src/server/url_fetch.h for the policy.
+            return url_fetch(url, bytes, err);
         }
         err = "unsupported media URL (expected data:, http:// or https://)";
         return false;
@@ -1855,6 +1744,25 @@ int serve(engine & e, const server_config & cfg) {
     srv.Post("/v1/completions", handle_completion);
 
     printf("server listening on %s:%d\n", cfg.host.c_str(), cfg.port);
+    // State the two things an operator has to know are not on by default:
+    // there is no authentication, and remote media fetches are off.
+    switch (url_fetch_mode()) {
+    case url_fetch_policy::disabled:
+        fprintf(stderr, "[http] remote media URLs are OFF (data: URLs still work);"
+                        " set PF_MM_URL_FETCH=1 to allow http(s)\n");
+        break;
+    case url_fetch_policy::public_only:
+        fprintf(stderr, "[http] remote media URLs: publicly routable addresses only\n");
+        break;
+    case url_fetch_policy::allow_private:
+        fprintf(stderr, "[http] remote media URLs: PF_MM_URL_ALLOW_PRIVATE=1 -"
+                        " private/loopback destinations reachable (SSRF exposure)\n");
+        break;
+    }
+    if (cfg.host != "127.0.0.1" && cfg.host != "localhost") {
+        fprintf(stderr, "[http] bound to %s with NO authentication - put a reverse proxy in front\n",
+                cfg.host.c_str());
+    }
     fflush(stdout);
     std::signal(SIGINT, on_term_signal);
     std::signal(SIGTERM, on_term_signal);

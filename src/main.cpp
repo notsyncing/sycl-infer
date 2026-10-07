@@ -101,7 +101,8 @@ static void usage(const char * prog) {
             "                               stays fp32, i4 packs two values per byte)\n"
             "\n"
             "serve:\n"
-            "  --host H                     bind address (default 0.0.0.0)\n"
+            "  --host H                     bind address (default 127.0.0.1; pass 0.0.0.0\n"
+            "                               to expose it - the API has no authentication)\n"
             "  --port N                     HTTP port (default 8080)\n"
             "\n"
             "gen:\n"
@@ -142,7 +143,9 @@ static void usage(const char * prog) {
 int main(int argc, char ** argv) {
     std::string model_path = kDefaultModel;
     std::string prompt;
-    std::string host = "0.0.0.0";
+    // loopback by default: the HTTP API is unauthenticated, so a routable bind
+    // address hands anyone who can reach the port a free inference engine
+    std::string host = "127.0.0.1";
     int port = 8080;
     int ctx = 0; // 0 = auto (kDefaultCtx)
     if (const char * e = si::env::str("PF_CTX")) {

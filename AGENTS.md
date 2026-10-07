@@ -1670,9 +1670,11 @@ tiers are the budget.  The shutdown path (`~engine` / SIGINT-SIGTERM handled in
 `serve`) flushes RAM and the resident VRAM nodes into the disk tier.
 
 **Server**
-`PF_MM_URL_FETCH` (`0` rejects remote `http(s)://` `image_url`/`video_url`/`audio_url`
-parts; base64 `data:` URLs still work), `PF_AV_FFMPEG` (audio/video decode CLI
-path, default `ffmpeg`).
+`PF_MM_URL_FETCH` (`1` allows remote `http(s)://` `image_url`/`video_url`/`audio_url`
+parts, **default off**; base64 `data:` URLs always work),
+`PF_MM_URL_ALLOW_PRIVATE` (`1` lets an enabled fetch reach loopback/private
+addresses - an internal media server, and SSRF exposure again),
+`PF_AV_FFMPEG` (audio/video decode CLI path, default `ffmpeg`).
 
 **Diagnostics**
 `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
@@ -2038,6 +2040,20 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   (`engine::kv_layer_stride`, `kv_scale_stride`).
 * `ld.bfd` warnings about `libsvml.so`/`libimf.so`/`libintlc.so.5` needed by
   `libdnnl.so` are benign (resolved from the oneAPI runtime path at run time).
+* **The HTTP API has no authentication, so the bind address and the remote-media
+  fetch are the security boundary.**  Both default to closed:
+  `--host` is `127.0.0.1` (pass `0.0.0.0` to expose, behind a reverse proxy),
+  and `image_url`/`video_url`/`audio_url` `http(s)://` fetches need
+  `PF_MM_URL_FETCH=1`.  With it on, `src/server/url_fetch.cpp` requires every
+  address the hostname resolves to to be publicly routable
+  (`PF_MM_URL_ALLOW_PRIVATE=1` lifts that for an internal media server) and
+  walks redirects **by hand** - httplib's `set_follow_location` re-resolves and
+  re-connects without a hook, so a validated URL becomes an arbitrary one,
+  which is the usual bypass.  Two traps the test pins: resolve rather than
+  string-match (decimal `2130706433` and octal `0177.0.0.1` are loopback), and
+  classify an IPv4-mapped IPv6 by its embedded address (`::ffff:127.0.0.1`).
+  Residual and *not* claimed fixed: the address is checked once and httplib
+  resolves again to connect, so a hostile DNS server can still win that race.
 * **httplib signals a client disconnect in exactly one place, and it is easy to
   miss.**  `ContentProviderResourceReleaser`'s `bool` is false both when a write
   fails and when the peer hung up - `content_provider_success_` is set only if

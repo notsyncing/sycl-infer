@@ -154,6 +154,7 @@ add_library(sycl_infer_core STATIC
     src/server/response_parser.cpp
     src/server/scheduler.cpp
     src/server/server.cpp
+    src/server/url_fetch.cpp
 )
 target_include_directories(sycl_infer_core PUBLIC
     src                       # so "device/device_profile.h" resolves everywhere
@@ -245,6 +246,7 @@ si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_response_parser tests/server/test_response_parser.cpp)
 si_add_test(test_sse_cancel     tests/server/test_sse_cancel.cpp)
+si_add_test(test_url_fetch     tests/server/test_url_fetch.cpp)
 si_add_test(test_sampler tests/engine/test_sampler.cpp)
 si_add_test(test_27b_prefill tests/engine/test_27b_prefill.cpp)
 si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
@@ -293,6 +295,14 @@ if(BUILD_TESTING)
     endforeach()
     add_test(NAME test_video_hermetic COMMAND test_multimodal --video-only)
     set_tests_properties(test_video_hermetic PROPERTIES LABELS "hermetic;media")
+
+    # One binary, three processes: url_fetch_mode() caches its answer in a
+    # static, so each policy needs its own process.  The test sets/clears the
+    # env itself, so an ambient PF_MM_URL_FETCH cannot skew the default case.
+    foreach(mode default public private)
+        add_test(NAME test_url_fetch_${mode} COMMAND test_url_fetch 18141 ${mode})
+        set_tests_properties(test_url_fetch_${mode} PROPERTIES LABELS "hermetic;cpu")
+    endforeach()
 
     # Model-backed tests are explicit: a machine without the GGUF or GPU must
     # not claim a green run by silently skipping them.  Keep the 27B split out
