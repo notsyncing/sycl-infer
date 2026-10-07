@@ -64,6 +64,12 @@ std::shared_ptr<sequence> scheduler::submit(std::vector<int> prompt, const gen_p
 }
 
 bool scheduler::admit(std::shared_ptr<sequence> & s) {
+    // the client disconnected before this sequence was admitted: retire it
+    // instead of giving it a slot (and a prefix-cache admit) it will not use
+    if (s->cancelled) {
+        retire(s, "stop");
+        return true;
+    }
     // A direct scheduler caller may bypass HTTP validation.  Without this an
     // empty sequence is admitted but neither the prefill nor decode loop can
     // make progress, leaving its worker blocked in pop_token indefinitely.
@@ -178,6 +184,13 @@ void scheduler::loop() {
             // ---- one chunked prefill step (round robin) ----
             for (auto & s : active) {
                 if (s->finished) {
+                    continue;
+                }
+                // client gone: hand the slot and blocks back now rather than
+                // after the rest of max_tokens (retire is the only path that
+                // runs pc_retire)
+                if (s->cancelled) {
+                    retire(s, "stop");
                     continue;
                 }
                 if (s->prompt_pos < (int)s->prompt.size()) {
@@ -329,6 +342,12 @@ void scheduler::loop() {
             std::vector<std::shared_ptr<sequence>> batch;
             for (auto & s : active) {
                 if (s->finished) {
+                    continue;
+                }
+                // drop it from the batch: the KV write below would otherwise
+                // run for a client that is not listening
+                if (s->cancelled) {
+                    retire(s, "stop");
                     continue;
                 }
                 if (s->prompt_pos < (int)s->prompt.size()) {

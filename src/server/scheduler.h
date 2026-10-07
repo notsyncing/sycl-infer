@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -37,6 +38,12 @@ struct sequence {
     int n_chunks = 0;
     int reused = 0; // prompt tokens served from the prefix cache
 
+    // Set when the client is gone and this sequence should stop at the next
+    // scheduler iteration: the loop retires it (freeing the slot and its KV
+    // blocks) instead of decoding to max_tokens.  An atomic because the SSE
+    // releaser sets it from the HTTP thread while the loop reads it.
+    std::atomic<bool> cancelled{false};
+
     // One generated token: `text` is the UTF-8-safe piece (empty when the
     // token's bytes are still incomplete) and carries the sampled token id /
     // logprob when the request asked for logprobs or best_of scoring.
@@ -53,6 +60,11 @@ struct sequence {
     std::deque<token_out> out_q;
     int prompt_tokens = 0;
 
+    void cancel() {
+        cancelled.store(true, std::memory_order_relaxed);
+        // wake a producer blocked in pop_token
+        cv.notify_all();
+    }
     void push(std::string s) {
         token_out t;
         t.text = std::move(s);
@@ -75,8 +87,9 @@ struct sequence {
     }
     bool pop_token(token_out & out) {
         std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return !out_q.empty() || finished; });
-        if (out_q.empty()) {
+        cv.wait(lk, [&] { return !out_q.empty() || finished || cancelled.load(std::memory_order_relaxed); });
+        // drain nothing after a cancel: the client that wanted these is gone
+        if (cancelled.load(std::memory_order_relaxed) || out_q.empty()) {
             return false;
         }
         out = std::move(out_q.front());

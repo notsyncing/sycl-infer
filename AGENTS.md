@@ -184,6 +184,8 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 ./build/test_tokenizer     # tokenizer round-trips (CPU only, no GPU work)
 ./build/test_chat_template # GGUF chat template vs reference Jinja2 output (CPU only)
 ./build/test_response_parser # reasoning_content / tool_call splitter (CPU only)
+./build/test_sse_cancel     # SSE client-disconnect cancels generation (real socket,
+                              # real httplib, no model needed)
 ./build/test_sampler       # logit_bias + logprob reporting (CPU only)
 ./build/test_multimodal    # image/video prompt, audio decode+mels, vision + audio
                               # encoders (host + device), positions (CPU+GPU)
@@ -277,6 +279,8 @@ src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 chat_template.{h,cpp} (minja Jinja wrapper for the GGUF
                 tokenizer.chat_template), response_parser.{h,cpp} (streaming
                 reasoning_content / content / tool_calls split), chat_util.h,
+                sse.h (SSE queue/session + disconnect cancellation, kept out
+                of server.cpp so it is testable without a model),
                 scheduler.{h,cpp}, server.{h,cpp} (OpenAI chat/completions +
                 /v1/models)
 src/main.cpp    CLI
@@ -297,7 +301,9 @@ tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
                 test_dflash_kernels.cpp (DFlash2 top-k + conv vs host references)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp,
                 test_w4.cpp (u4 packing round-trip)
-tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter)
+tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter),
+                test_sse_cancel.cpp (SSE disconnect cancellation: real httplib +
+                real socket reset, no model)
 tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
                 test_decode_vs_prefill.cpp (single-token decode vs re-prefill),
                 test_spec.cpp (MTP + DFlash2 stream == the plain greedy decode;
@@ -2032,6 +2038,20 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   (`engine::kv_layer_stride`, `kv_scale_stride`).
 * `ld.bfd` warnings about `libsvml.so`/`libimf.so`/`libintlc.so.5` needed by
   `libdnnl.so` are benign (resolved from the oneAPI runtime path at run time).
+* **httplib signals a client disconnect in exactly one place, and it is easy to
+  miss.**  `ContentProviderResourceReleaser`'s `bool` is false both when a write
+  fails and when the peer hung up - `content_provider_success_` is set only if
+  `write_content_with_provider` returned true, and that loop's
+  `is_peer_alive()` pre-check is what catches a client that vanished *between*
+  two items (no `sink.write` ever returns false in that case).  A streaming
+  handler that ignores it (and `sink.write`'s own return) runs the whole
+  generation against a dead socket while the worker thread sits in the
+  releaser's `join()` - and **the emitted text is identical either way**, so no
+  generation test can catch it.  `serve_sse_chunked` (`src/server/sse.h`) is the
+  production wiring and `test_sse_cancel` drives it over a real socket with a
+  TCP RST; the cancel has to reach the producers too, because the engine
+  callback's return value is the only cancellation point inside a forward, so
+  a cancelled generation still finishes the decode step it is in (~65 ms).
 * **Multimodal**: an image consumes `max(nx, ny)` positions, not one per token,
   and the text model uses *interleaved* M-RoPE (`rope.dimension_sections`, e.g.
   `[11,11,10,0]`) where the pair index picks the temporal/row/col position

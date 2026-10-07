@@ -171,24 +171,57 @@ RIFF/WAV 头，所以写错 `format` 不会导致解码失败。
 
 ### 2.7 流式 SSE
 
+传输与取消机制在 `src/server/sse.h`（`sse_queue` / `sse_session` / `serve_sse_chunked`），
+单独成头文件是为了让取消契约**不依赖模型**即可测（见 `tests/server/test_sse_cancel.cpp`）：
+它的失败症状（对着死 socket 继续解码、worker 线程卡在 `join()`）在生成测试里完全不可见，
+因为两种情形的输出文本完全一样。
+
 通用形态：
 
 * 响应头 `text/event-stream`（`set_chunked_content_provider` 的第一个参数）加上 CORS、
-  `Cache-Control: no-cache`、`Connection: keep-alive`（`cors_sse`，`server.cpp:1555-1558`）；
-* 用 `set_chunked_content_provider`，内容 reader 从 `sse_queue` 取，队列结束调 `sink.done()`；资源释放
-  回调 join 生产者线程（`sse_session::join`，`server.cpp:1571`）。
-* 每个事件是 `"data: " + dump_json(j) + "\n\n"`；`dump_json` 用 `error_handler_t::replace` 防止坏
-  UTF-8 抛异常（`server.cpp:58-60`）。
-* 纯文本 chat 每 choice 一个生产者线程（`n` 个，`server.cpp:1784-1788`）；completion 是
-  `prompt 数 × n` 个线程（`server.cpp:1899-1908`）；多模态与 MTP 路径只有**一个**线程在同一个循环里
-  顺序跑完 `n` 个 choice。最后一个调用 `choice_done` 的 choice 负责发 usage chunk（若
-  `stream_options.include_usage`）与 `data: [DONE]`，然后 `q->finish()`（`server.cpp:995-1015`）。
-* 请求 logprobs 时，每个 content/text chunk 附带 `choices[].logprobs`（chat 为 `{content:[...],refusal:null}`，
-  completion 为 `{tokens,token_logprobs,top_logprobs,text_offset}`）。
-* **异常**：chat 的生产者线程 catch 后发一个 `delta:{"error":{"message":"generation failed","type":"server_error"}}`
-  且 `finish_reason:"stop"` 的 chunk（`sse_error`，`server.cpp:1025-1030`，多模态/MTP 是
-  `multimodal generation failed` / `mtp generation failed`）；completion 的 catch **不发任何事件**，
-  直接 `choice_done(0,0)`（`server.cpp:1285-1287`），客户端只会看到流提前结束。
+  `Cache-Control: no-cache`、`Connection: keep-alive`（`cors_sse`）；
+* 用 `set_chunked_content_provider`，内容 reader 从 `sse_queue` 取，队列结束调 `sink.done()`；
+  资源释放回调先处理断连、再 join 生产者线程（`serve_sse_chunked`）。
+* 每个事件是 `"data: " + dump_json(j) + "\n\n"`；`dump_json` 用 `error_handler_t::replace`
+  防止坏 UTF-8 抛异常。
+* 纯文本 chat 每 choice 一个生产者线程；completion 是 `prompt 数 × n` 个线程；
+  多模态与 MTP 路径只有**一个**线程在同一个循环里顺序跑完 `n` 个 choice。最后一个调用
+  `choice_done` 的 choice 负责发 usage chunk（若 `stream_options.include_usage`）与
+  `data: [DONE]`，然后 `q->finish()`。usage chunk 的 JSON 由 server.cpp 的 `sse_usage_frame`
+  经 `sse_session::usage_emitter` 注入——这样 `sse.h` 不必依赖那些 file-local 的 JSON helper。
+* 请求 logprobs 时，每个 content/text chunk 附带 `choices[].logprobs`（chat 为
+  `{content:[...],refusal:null}`，completion 为 `{tokens,token_logprobs,top_logprobs,text_offset}`）。
+* **异常**：chat 的生产者线程 catch 后发一个
+  `delta:{"error":{"message":"generation failed","type":"server_error"}}` 且 `finish_reason:"stop"`
+  的 chunk（`sse_error`，多模态/MTP 是 `multimodal generation failed` /
+  `mtp generation failed`）；completion 的 catch **不发任何事件**，直接 `choice_done(0,0)`，
+  客户端只会看到流提前结束。
+
+#### 断连取消
+
+唯一的断连信号是 httplib 的 `ContentProviderResourceReleaser` 那个 `bool`：写失败与对端挂断
+都会让它为 false（httplib 只在 `write_content_with_provider` 返回成功后置
+`content_provider_success_`）。三处消费它：
+
+1. **`sink.write` 返回 false** → `sc->cancel()` 并让 provider 返回 `false`（转成
+   `Error::Canceled`），否则 httplib 会把这次断流记成成功；
+2. **releaser 的 `ok == false`** → `sc->cancel()`。这是覆盖「客户端在两个 token 之间消失、
+   一次 write 都没发生」的主路径；
+3. `cancel()` 置 `sse_session::stop`、`sse_queue::cancel()`（唤醒可能阻塞在 `pop` 的 writer，
+   并丢弃已排队的事件）、并 `cancel()` 本响应登记过的所有 `sequence`。
+
+生产者侧每个 token 边界检查一次 `sc->cancelled()`：scheduler 路径靠 `pop_token` 返回 false
+（`sequence::cancelled` 同时唤醒等待者），直连 engine 路径靠回调返回 `false`
+（`!sf.stopped && !sc->cancelled()`）——回调返回值是一次 forward 内部**唯一**的取消点，
+所以被取消的生成最多多跑完当前那一步 decode（27B 上约 65 ms）。
+
+`sequence::cancelled` 让调度器在下一轮迭代就 `retire`（`admit`、prefill 轮、decode 组批三处），
+slot 与 KV 块立刻归还，而不是等 `max_tokens` 跑完。`sse_session::track` 会在注册后复查 `stop`，
+覆盖「取消先于 `submit` 到达」的时序。
+
+**未覆盖**：非流式路径在 handler 线程内同步生成，httplib 在 handler 返回前不给任何断连信号，
+因此那里无法取消（一次非流式请求必然跑完）。这是 httplib 的限制，不是本实现的取舍。
+
 
 chat chunk schema：
 

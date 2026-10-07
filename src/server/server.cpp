@@ -32,6 +32,7 @@
 #include "multimodal.h"
 #include "response_parser.h"
 #include "sampler.h"
+#include "sse.h"
 #include "video.h"
 #include "audio.h"
 #include "audio_model.h"
@@ -145,38 +146,6 @@ void on_term_signal(int) {
 std::string dump_json(const json & j) {
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
-
-struct sse_queue {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::string> items;
-    bool done = false;
-
-    void push(std::string s) {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            items.push_back(std::move(s));
-        }
-        cv.notify_one();
-    }
-    void finish() {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            done = true;
-        }
-        cv.notify_one();
-    }
-    bool pop(std::string & out) {
-        std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return !items.empty() || done; });
-        if (items.empty()) {
-            return false;
-        }
-        out = std::move(items.front());
-        items.pop_front();
-        return true;
-    }
-};
 
 // ------------------------------------------------------------- request parsing
 
@@ -1021,52 +990,18 @@ json text_chunk(const std::string & id, const std::string & model, uint64_t crea
     return {{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", model}, {"choices", ch}};
 }
 
-// One SSE stream shared by all choices of a request; the last choice to finish
-// emits the usage chunk (optional) and the terminating [DONE].
-struct sse_session {
-    std::shared_ptr<sse_queue> q;
-    std::vector<std::thread> ths;
-    std::mutex m;
-    int remaining = 0;
-    long long prompt_tokens = 0;
-    long long completion_tokens = 0;
-    long long reasoning_tokens = 0;
-    long long cached_tokens = 0;
-    bool include_usage = false;
-    bool chat = true;
-    std::string id;
-    std::string model;
-    uint64_t created = 0;
-
-    void choice_done(long long pt, long long ct, long long rt = 0, long long cached = 0) {
-        std::lock_guard<std::mutex> lk(m);
-        prompt_tokens += pt;
-        completion_tokens += ct;
-        reasoning_tokens += rt;
-        cached_tokens += cached;
-        if (--remaining > 0) {
-            return;
-        }
-        if (include_usage) {
-            json uj = {{"id", id},
-                       {"object", chat ? "chat.completion.chunk" : "text_completion"},
-                       {"created", created},
-                       {"model", model},
-                       {"choices", json::array()},
-                       {"usage", usage_json(prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens)}};
-            q->push("data: " + dump_json(uj) + "\n\n");
-        }
-        q->push("data: [DONE]\n\n");
-        q->finish();
-    }
-    void join() {
-        for (auto & t : ths) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
-    }
-};
+// The usage chunk sse_session::choice_done emits before [DONE]; it lives here
+// because sse.h stays free of the JSON chunk helpers.  A disconnected client
+// never sees it: q->push drops everything after a cancel.
+static std::string sse_usage_frame(const sse_session & sc) {
+    json uj = {{"id", sc.id},
+               {"object", sc.chat ? "chat.completion.chunk" : "text_completion"},
+               {"created", sc.created},
+               {"model", sc.model},
+               {"choices", json::array()},
+               {"usage", usage_json(sc.prompt_tokens, sc.completion_tokens, sc.reasoning_tokens, sc.cached_tokens)}};
+    return "data: " + dump_json(uj) + "\n\n";
+}
 
 void sse_error(const std::shared_ptr<sse_session> & sc, int index, const char * msg) {
     json d = {{"error", {{"message", msg}, {"type", "server_error"}}}};
@@ -1080,6 +1015,7 @@ void stream_chat_text_choice(std::shared_ptr<sse_session> sc, scheduler & sched,
                              bool parse_tools) {
     try {
         auto seq = sched.submit(std::move(prompt), gp, stops);
+        sc->track(seq); // a client disconnect must free the slot too
         sc->q->push(
             "data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, index, {{"role", "assistant"}}, nullptr))
             + "\n\n");
@@ -1168,7 +1104,7 @@ void stream_chat_mm_choices(std::shared_ptr<sse_session> sc, engine & e, const m
                 if (!emit.empty()) {
                     parser.feed(emit);
                 }
-                return !sf.stopped;
+                return !sf.stopped && !sc->cancelled();
             };
             e.generate_mm(mp, gp_for_choice(gp, c), cb);
             const std::string tail = ub.flush();
@@ -1227,7 +1163,7 @@ void stream_chat_mtp_choices(std::shared_ptr<sse_session> sc, engine & e, std::v
                 if (!emit.empty()) {
                     parser.feed(emit);
                 }
-                return !sf.stopped;
+                return !sf.stopped && !sc->cancelled();
             };
             e.generate(prompt, gp_for_choice(gp, c), cb);
             const std::string tail = ub.flush();
@@ -1271,6 +1207,7 @@ void stream_completion_text_choice(std::shared_ptr<sse_session> sc, scheduler & 
             send(prompt_text);
         }
         auto seq = sched.submit(std::move(prompt), gp, stops);
+        sc->track(seq); // a client disconnect must free the slot too
         stop_filter sf(stops);
         sequence::token_out t;
         while (!sf.stopped && seq->pop_token(t)) {
@@ -1569,20 +1506,6 @@ int serve(engine & e, const server_config & cfg) {
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
     };
-    auto serve_sse = [](httplib::Response & res, const std::shared_ptr<sse_session> & sc) {
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [sc](size_t, httplib::DataSink & sink) {
-                std::string item;
-                if (!sc->q->pop(item)) {
-                    sink.done();
-                    return true;
-                }
-                sink.write(item.data(), item.size());
-                return true;
-            },
-            [sc](bool) { sc->join(); });
-    };
 
     auto handle_chat = [&](const httplib::Request & req, httplib::Response & res) {
         cors(res);
@@ -1705,6 +1628,7 @@ int serve(engine & e, const server_config & cfg) {
             sc->q = std::make_shared<sse_queue>();
             sc->remaining = n;
             sc->include_usage = include_usage;
+            sc->usage_emitter = [](const sse_session & sc2) { sc2.q->push(sse_usage_frame(sc2)); };
             sc->chat = true;
             sc->id = id;
             sc->model = model;
@@ -1713,7 +1637,7 @@ int serve(engine & e, const server_config & cfg) {
                 stream_chat_mm_choices(sc, e, mp, gp, stops, n, thinking, parse_tools);
             });
             cors_sse(res);
-            serve_sse(res, sc);
+            serve_sse_chunked(res, sc);
             return;
         }
 
@@ -1751,6 +1675,7 @@ int serve(engine & e, const server_config & cfg) {
             sc->q = std::make_shared<sse_queue>();
             sc->remaining = n;
             sc->include_usage = include_usage;
+            sc->usage_emitter = [](const sse_session & sc2) { sc2.q->push(sse_usage_frame(sc2)); };
             sc->chat = true;
             sc->id = id;
             sc->model = model;
@@ -1759,7 +1684,7 @@ int serve(engine & e, const server_config & cfg) {
                 stream_chat_mtp_choices(sc, e, prompt, gp, stops, 1, thinking, parse_tools);
             });
             cors_sse(res);
-            serve_sse(res, sc);
+            serve_sse_chunked(res, sc);
             return;
         }
 
@@ -1793,6 +1718,7 @@ int serve(engine & e, const server_config & cfg) {
         sc->q = std::make_shared<sse_queue>();
         sc->remaining = n;
         sc->include_usage = include_usage;
+        sc->usage_emitter = [](const sse_session & sc2) { sc2.q->push(sse_usage_frame(sc2)); };
         sc->chat = true;
         sc->id = id;
         sc->model = model;
@@ -1803,7 +1729,7 @@ int serve(engine & e, const server_config & cfg) {
             });
         }
         cors_sse(res);
-        serve_sse(res, sc);
+        serve_sse_chunked(res, sc);
     };
     srv.Post("/v1/chat/completions", handle_chat);
 
@@ -1907,6 +1833,7 @@ int serve(engine & e, const server_config & cfg) {
         sc->q = std::make_shared<sse_queue>();
         sc->remaining = (int)jobs;
         sc->include_usage = include_usage;
+        sc->usage_emitter = [](const sse_session & sc2) { sc2.q->push(sse_usage_frame(sc2)); };
         sc->chat = false;
         sc->id = id;
         sc->model = model;
@@ -1923,7 +1850,7 @@ int serve(engine & e, const server_config & cfg) {
             }
         }
         cors_sse(res);
-        serve_sse(res, sc);
+        serve_sse_chunked(res, sc);
     };
     srv.Post("/v1/completions", handle_completion);
 
