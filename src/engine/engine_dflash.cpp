@@ -98,15 +98,6 @@ static inline double df_ts_ms(const sycl::event & e, bool start) {
 
 // PF_DFLASH_OPTIME: per-op accumulation over one draft block forward.  Inserted by
 // LINE NUMBER inside df_block's layer loop - text-anchored inserts kept landing in
-// the injection path, which shares this code, and produced two confidently wrong
-// readings before that was noticed.
-struct df_op_t {
-    double norm = 0, cproj = 0, conv0 = 0, qkv = 0, rope = 0, attn = 0, wo = 0, conv1 = 0, fnorm = 0, fproj = 0,
-           fconv0 = 0, fgu = 0, fdown = 0, fconv1 = 0;
-};
-static df_op_t df_op;
-static bool df_op_on = false;
-
 bool df_dbg() {
     static const bool b = si::env::flag("PF_DFLASH_DEBUG");
     return b;
@@ -1012,8 +1003,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 (void *)dfl.d_df_gu);
     }
 
-    df_op = df_op_t();
-    df_op_on = si::env::flag("PF_DFLASH_OPTIME");
     df_seg_on = si::env::flag("PF_DFLASH_SEGTIME");
     for (int i = 0; i < 8; i++) {
         df_seg[i] = 0;
@@ -1045,7 +1034,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         }
     }
         // 2. the 5 draft layers
-    auto dq_t = df_op_on ? now_t() : t_b0;
     sycl::event seg_e[8];
     sycl::event ffn_e[2];
     for (int il = 0; il < hp.n_layer; il++) {
@@ -1073,7 +1061,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         static const bool nocv = si::env::flag("PF_DFLASH_NOCONV");
         const bool d2 = hp.is_dflash2 && !nocv;
         if (d2) {
-        if (df_op_on) { df_op.norm += ms_t(dq_t, now_t()); dq_t = now_t(); }
             if (!df_gemm(L.attn_conv_proj, dfl.d_df_b, hp.n_embd, dfl.d_df_dyn, hp.conv_proj, nullptr, M)) {
                 throw std::runtime_error("dflash: attn_conv_proj GEMM failed");
             }
@@ -1149,7 +1136,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                     fclose(f);
                 }
             }
-        if (df_op_on) { df_op.cproj += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, dfl.d_df_b, dfl.d_df_dyn, dfl.dfm_->dev_f32(L.attn_conv_base), dfl.d_df_c, nullptr, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/0);
             if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
@@ -1177,7 +1163,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         // with the Q segment left at zero every score is 0, the softmax becomes a
         // uniform average over all keys, and the attention output comes out several
         // times too small - which silently wrecks the whole draft.
-        if (df_op_on) { df_op.conv0 += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { seg_e[1] = dq.ext_oneapi_submit_barrier(); }
         if (!df_gemm(L.wq, dfl.d_df_c, hp.n_embd, dfl.d_df_qkv, qkv_stride, nullptr, M)) {
             throw std::runtime_error("dflash: wq GEMM failed");
@@ -1200,14 +1185,12 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         static const float k1w[1] = {1.0f};
         const float * qw = nonorm ? k1w : dfl.dfm_->dev_f32(L.q_norm);
         const float * kw = nonorm ? k1w : dfl.dfm_->dev_f32(L.k_norm);
-        if (df_op_on) { df_op.qkv += ms_t(dq_t, now_t()); dq_t = now_t(); }
         df_qknorm_rope_store_launch(dq, dfl.d_df_qkv, dfl.d_df_qkv + nh, dfl.d_df_qkv + nh + nkv, qw,
                                     kw, (char *)dfl.d_df_kring + (size_t)il * df_ring_stride_bytes(),
                                     (char *)dfl.d_df_vring + (size_t)il * df_ring_stride_bytes(), dfl.d_df_pos, M, hp.n_head,
                                     hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps, dfl.df_ring_,
                                     dfl.df_kv_bytes_, /*do_q=*/true, qkv_stride, df_dn_norm);
 
-        if (df_op_on) { df_op.rope += ms_t(dq_t, now_t()); dq_t = now_t(); }
         df_attn_launch(dq, dfl.d_df_qkv, (char *)dfl.d_df_kring + (size_t)il * df_ring_stride_bytes(),
                        (char *)dfl.d_df_vring + (size_t)il * df_ring_stride_bytes(), dfl.d_df_partials, dfl.d_df_pos, M, M,
                        hp.n_head, hp.n_head_kv, hp.head_dim, dfl.df_ring_, dfl.df_swa_, dfl.df_splits_, attn_scale,
@@ -1230,7 +1213,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
 
         // wo -> (DFlash2 conv) -> residual add
         if (d2) {
-        if (df_op_on) { df_op.attn += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { seg_e[2] = dq.ext_oneapi_submit_barrier(); }
             if (!df_gemm(L.wo, dfl.d_df_b, nh, dfl.d_df_c, hp.n_embd, nullptr, M)) {
                 throw std::runtime_error("dflash: wo GEMM failed");
@@ -1323,7 +1305,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 }
                 fprintf(stderr, "\n");
             }
-        if (df_op_on) { df_op.wo += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, dfl.d_df_c, dfl.d_df_dyn, dfl.dfm_->dev_f32(L.attn_conv_base), dfl.d_df_h, dfl.d_df_h, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/1);
             if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
@@ -1345,11 +1326,9 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             df_rowrms(dq, dfl.d_df_h, M, hp.n_embd, "ffn_inp");
         }
         // FFN: norm -> conv -> gate/up -> down -> conv -> residual add
-        if (df_op_on) { df_op.conv1 += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { seg_e[3] = dq.ext_oneapi_submit_barrier(); }
         rmsnorm_launch(dq, dfl.d_df_h, dfl.dfm_->dev_f32(L.ffn_norm), dfl.d_df_b, M, hp.n_embd, hp.rms_eps);
         if (d2) {
-        if (df_op_on) { df_op.fnorm += ms_t(dq_t, now_t()); dq_t = now_t(); }
             if (!df_gemm(L.ffn_conv_proj, dfl.d_df_b, hp.n_embd, dfl.d_df_dyn, hp.conv_proj, nullptr, M)) {
                 throw std::runtime_error("dflash: ffn_conv_proj GEMM failed");
             }
@@ -1357,7 +1336,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 dq.wait();
                 df_proj_check(dq, L.ffn_conv_proj, dfl.d_df_b, M, dfl.d_df_dyn, "ffn_proj");
             }
-        if (df_op_on) { df_op.fproj += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, dfl.d_df_b, dfl.d_df_dyn, dfl.dfm_->dev_f32(L.ffn_conv_base), dfl.d_df_c, nullptr, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/0);
             if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
@@ -1378,7 +1356,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         }
         // gate and up in one fused [M][2*n_ff] buffer, laid out [gate | up] per row
         // so ffn_down below can read the up half as its own activation
-        if (df_op_on) { df_op.fconv0 += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { ffn_e[0] = dq.ext_oneapi_submit_barrier(); }
         if (!df_gemm(L.ffn_gate, dfl.d_df_c, hp.n_embd, dfl.d_df_gu, 2 * hp.n_ff, nullptr, M)
             || !df_gemm(L.ffn_up, dfl.d_df_c, hp.n_embd, dfl.d_df_gu + hp.n_ff, 2 * hp.n_ff, nullptr, M)) {
@@ -1407,7 +1384,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             dq.memcpy(chk_gu.data(), dfl.d_df_gu, chk_gu.size() * 4).wait();
         }
         static const bool nosilu = si::env::flag("PF_DFLASH_NOSILU");
-        if (df_op_on) { df_op.fgu += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { ffn_e[1] = dq.ext_oneapi_submit_barrier(); }
         if (!df_gemm(L.ffn_down, dfl.d_df_gu, 2 * hp.n_ff, dfl.d_df_b, hp.n_embd, nullptr, M,
                      nosilu ? nullptr : dfl.d_df_gu + hp.n_ff, 2 * hp.n_ff)) {
@@ -1472,7 +1448,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             // the conv writes the new residual stream; dfl.d_df_h is both the input
             // (the residual term) and the destination
             df_stage(dq, il == 0 ? "l0 ffn_down" : "ffn_down", dfl.d_df_b, (size_t)M * hp.n_embd);
-        if (df_op_on) { df_op.fdown += ms_t(dq_t, now_t()); dq_t = now_t(); }
             df_conv_launch(dq, dfl.d_df_b, dfl.d_df_dyn, dfl.dfm_->dev_f32(L.ffn_conv_base), dfl.d_df_c, dfl.d_df_h, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/1);
             if (si::env::flag("PF_DFLASH_CONVCHK") && (il == 0 || si::env::flag("PF_DFLASH_CONVCHKALL"))) {
@@ -1496,7 +1471,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         // output the next layer's input - and it must happen on EVERY layer,
         // including the last, or the final norm below reads input+attention
         // instead of the last layer's output.
-        if (df_op_on) { df_op.fconv1 += ms_t(dq_t, now_t()); dq_t = now_t(); }
         if (df_seg_on) { seg_e[4] = dq.ext_oneapi_submit_barrier(); }
         if (df_seg_on) {
             // The markers are NOT in index order - program order is 0, 6, 5, 1, 3, 4 -
@@ -1536,7 +1510,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     // 3. final norm (also the selector's gate input), the shared LM head, the
     //    candidate sets and the transition lattice
     df_stage(dq, "pre_out_norm", dfl.d_df_h, (size_t)M * hp.n_embd);
-    const auto t_b2 = now_t();
     rmsnorm_launch(dq, dfl.d_df_h, dfl.dfm_->dev_f32(dfl.dfm_->output_norm), dfl.d_df_b, M, hp.n_embd, hp.rms_eps);
     if (df_dbg() && si::env::flag("PF_DFLASH_SIG") && si::env::flag("PF_DFLASH_BIN")) {
         // The final normed hidden, i.e. what the head and the selector's gate both
@@ -1555,7 +1528,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         if (!df_gemm_head(dfl.d_df_b, M)) {
         throw std::runtime_error("dflash: LM head GEMM failed");
     }
-    const auto t_b3 = now_t();
         if (!hp.is_dflash2) {
         return;
     }
@@ -1630,18 +1602,6 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     df_sel_launch(dq, dfl.d_df_ids, dfl.d_df_vals, dfl.d_df_gate, dfl.df_sel_pv_, dfl.df_sel_ps_, dfl.df_sel_po_, dfl.df_sel_nv_, dfl.df_sel_ns_,
                   dfl.df_sel_no_, dfl.d_df_lattice, toks[0], M, m.hp.n_vocab, hp.sel_rank, K);
     if (tt_dbg) { tt_e[2] = dq.ext_oneapi_submit_barrier(); }
-    const auto t_bs = now_t();
-    if (df_op_on) {
-        const double sum = df_op.norm + df_op.cproj + df_op.conv0 + df_op.qkv + df_op.rope + df_op.attn + df_op.wo
-                           + df_op.conv1 + df_op.fnorm + df_op.fproj + df_op.fconv0 + df_op.fgu + df_op.fdown
-                           + df_op.fconv1;
-        fprintf(stderr,
-                "[dflash-ot] norm=%.1f cproj=%.1f conv0=%.1f qkv=%.1f rope=%.1f attn=%.1f wo=%.1f conv1=%.1f "
-                "fnorm=%.1f fproj=%.1f fconv0=%.1f fgu=%.1f fdown=%.1f fconv1=%.1f | sum=%.1f layers=%.1f ms\n",
-                df_op.norm, df_op.cproj, df_op.conv0, df_op.qkv, df_op.rope, df_op.attn, df_op.wo, df_op.conv1,
-                df_op.fnorm, df_op.fproj, df_op.fconv0, df_op.fgu, df_op.fdown, df_op.fconv1, sum,
-                ms_t(t_b0, t_b1));
-    }
     if (si::env::flag("PF_DFLASH_BTIME")) {
         const auto t_b4 = now_t();
         fprintf(stderr, "[dflash-bt] embed+layers=%.1f outnorm+head+topk+sel=%.1f | total=%.1f ms\n",
