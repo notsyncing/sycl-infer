@@ -46,15 +46,13 @@ using namespace si::kd;
 // (out != nullptr, n_splits == 1) and the split (partials) shapes.
 // ===========================================================================
 
-bool attn_xmx_enabled() {
-    static const bool v = [] {
-        const char * e = si::env::str("PF_ATTN_XMX");
-        // default from the device profile: the oneDNN int8 matmul path pays off
-        // on a part with a fast int8 GEMM and is untested on a part where DP4A
-        // was worth 4x over the scalar path to begin with
-        return !(e && atoi(e) == 0) && si::dev::active().attn.xmx; // default on; PF_ATTN_XMX=0 restores classic
-    }();
-    return v;
+// Per queue, not process-wide: the default comes from that queue's device
+// profile (the oneDNN int8 matmul path pays off on a part with a fast int8 GEMM
+// and is untested where DP4A was worth 4x over the scalar path), and a split
+// across two cards must be able to enable it on one and not the other.
+// PF_ATTN_XMX=0 restores the classic kernel.
+bool attn_xmx_enabled(const sycl::queue & q) {
+    return si::dev::profile_flag(q, "PF_ATTN_XMX", si::dev::for_queue(q).attn.xmx);
 }
 
 // XMX only pays off once the classic kernel's per-score work dominates the
@@ -64,15 +62,8 @@ bool attn_xmx_enabled() {
 // ~480-560 ms.  A 16k cold prefill totals 16.7 s at 2048 vs 18.4 s at 6144,
 // and 1024/0 are within noise (16.7-16.8 s) while being slower on short
 // prompts.  Below this key count the classic kernel is used.
-static int xmx_min_keys_dev() {
-    return si::dev::active().attn.xmx_min_keys;
-}
-static int xmx_min_keys() {
-    static const int v = [] {
-        const char * e = si::env::str("PF_ATTN_XMX_MIN");
-        return e ? atoi(e) : xmx_min_keys_dev();
-    }();
-    return v;
+static int xmx_min_keys(const sycl::queue & q) {
+    return si::dev::profile_int(q, "PF_ATTN_XMX_MIN", si::dev::for_queue(q).attn.xmx_min_keys);
 }
 
 static constexpr int kD = 256;    // head_dim (fixed for this model)
@@ -85,8 +76,16 @@ static constexpr int kMaxQ = kMaxT * kMaxB;
 // come from the device profile (src/device/profile_*.cpp): it is a latency fix,
 // so the right value depends on how many EUs there are to hide it with.
 // PF_XMX_GRED=N overrides the work-group count for A/B.
-static const int kGatherRedMax = si::dev::active().attn.xmx_gather_red_max;
-static const int kGatherRed = si::dev::active().attn.xmx_gather_red;
+// Read from the queue's own profile where they are used (see below) rather than
+// frozen at namespace scope: the scratch buffer is sized per queue, so a
+// process-wide count would both mis-size one card's buffer and pick the wrong
+// work-group count for the other.
+static int gather_red_max(const sycl::queue & q) {
+    return si::dev::for_queue(q).attn.xmx_gather_red_max;
+}
+static int gather_red(const sycl::queue & q) {
+    return si::dev::profile_int(q, "PF_XMX_GRED", si::dev::for_queue(q).attn.xmx_gather_red);
+}
 
 // Width used for the *last* key block of a call.  The oneDNN matmuls always run
 // at a fixed width (primitive creation is ~15 ms per new shape, so a width that
@@ -197,7 +196,7 @@ static xmx_bufs & xmx_get(queue & q, int m_cap, int key_cap) {
         b.cap_keys = key_cap;
         b.k = sycl::malloc_device<int8_t>((size_t)kBlk * kD, q);
         b.v = sycl::malloc_device<int8_t>((size_t)kBlk * kD, q);
-        b.bs = sycl::malloc_device<float>(2 + 2 * kGatherRedMax, q);
+        b.bs = sycl::malloc_device<float>(2 + 2 * gather_red_max(q), q);
         b.q8 = sycl::malloc_device<int8_t>((size_t)m_cap * kD, q);
         b.qsc = sycl::malloc_device<float>(m_cap, q);
         b.orow = sycl::malloc_device<int32_t>(m_cap, q);
@@ -265,13 +264,10 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
     // slice into `part`, then one small group folds those.  fmax is exact and
     // associative, so the resulting block scale -- and therefore the whole
     // requantized block, bit for bit -- is unchanged.
-    static const int nslice_cfg = [] {
-        const char * e = si::env::str("PF_XMX_GRED");
-        int n = e ? atoi(e) : kGatherRed;
-        return n < 1 ? 1 : (n > kGatherRedMax ? kGatherRedMax : n);
-    }();
-    const int nslice = nslice_cfg; // by-value copy: a kernel lambda cannot capture it
-    float * part = bs + 2;         // [2 * kGatherRedMax] partials, past bs[0..1]
+    // per call, because it comes from this queue's device; by value because a
+    // kernel lambda cannot capture a runtime-initialised global
+    const int nslice = gather_red(q);
+    float * part = bs + 2;         // [2 * gather_red_max(q)] partials, past bs[0..1]
     q.submit([&](sycl::handler & h) {
         h.parallel_for(nd_range<1>((size_t)nslice * 64, 64), [=](nd_item<1> it) {
             const int s = it.get_group(0);
@@ -515,7 +511,7 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
                      float * partials, const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
                      const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out,
                      const void * kscales, const void * vscales) {
-    if (!attn_xmx_enabled() || head_dim != kD || kpool == nullptr || kscales == nullptr || vscales == nullptr) {
+    if (!attn_xmx_enabled(q) || head_dim != kD || kpool == nullptr || kscales == nullptr || vscales == nullptr) {
         return false;
     }
     dnnl_gemm * D = dnnl_for_queue(q);
@@ -543,7 +539,7 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
     if (max_nkv <= 0) {
         return true; // nothing to do
     }
-    if (max_nkv < xmx_min_keys()) {
+    if (max_nkv < xmx_min_keys(q)) {
         return false; // classic is faster at short context
     }
     // every stacked query row is matched against the SAME paged K/V, so the

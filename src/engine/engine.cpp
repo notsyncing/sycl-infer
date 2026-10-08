@@ -148,12 +148,12 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
     }
-    // Every launch reads the process-wide profile (active(), resolved from the
-    // first GPU) and wg_clamped()'s cache is that card's work-group limit, so a
-    // split across cards that resolve differently would run the second card with
-    // the first card's tuning - and could launch a work-group it cannot accept
-    // (A770 1024 threads vs Iris Xe 512), which fails rather than slows down.
-    // Refuse instead, and say which cards disagree.
+    // A heterogeneous split is supported: every kernel launcher asks for the
+    // profile of the queue it is launching on (si::dev::for_queue) and clamps
+    // the work-group width against that same device, so each card gets its own
+    // tuning and its own hardware limit.  Report the split so it is visible - a
+    // mixed box is worth knowing about, since the tuned values now differ per
+    // partition and PF_DEVICE_INFO prints each one.
     {
         std::vector<std::string> gpu_names;
         for (size_t d = 0; d < backends_.size(); d++) {
@@ -163,13 +163,11 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         }
         const si::dev::profile_split sp = si::dev::check_profiles_homogeneous(gpu_names);
         if (!sp.homogeneous) {
-            throw std::runtime_error("layer map spans GPUs with different device profiles: '" + sp.first_name +
-                                     "' resolves to profile '" + sp.first_key + "' but '" + sp.other_name +
-                                     "' resolves to '" + sp.other_key +
-                                     "'.  Every kernel reads one process-wide profile, so a mixed split cannot "
-                                     "be tuned correctly (and wg_clamped() would clamp to the wrong card's "
-                                     "limit).  Use GPUs of the same model, or add/extend a profile under "
-                                     "src/device/profiles/.");
+            fprintf(stderr,
+                    "[dev] WARNING: the layer map spans GPUs with different device profiles: '%s' is '%s' but "
+                    "'%s' is '%s'.  Each partition now runs its own card's tuning, which is correct, but the "
+                    "two sides are measured on different hardware.\n",
+                    sp.first_name.c_str(), sp.first_key.c_str(), sp.other_name.c_str(), sp.other_key.c_str());
         }
         if (si::env::flag("PF_DEVICE_INFO")) {
             for (const std::string & n : gpu_names) {
@@ -304,7 +302,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         if (e) {
             dec_splits = atoi(e);
         } else {
-            const dev::profile & dp = dev::active();
+            const dev::profile & dp = dev::for_queue(q);
             uint32_t eus = q.get_device().get_info<sycl::info::device::max_compute_units>();
             if (!eus) {
                 eus = (uint32_t)dp.hw.compute_units; // unknown card: the profile's fallback
@@ -434,7 +432,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     // oneDNN int8 matmul for the prefill GEMMs (PF_GEMM_DNNL, default on).
     // The converted weights live in device USM and are built once here;
     // PF_GEMM_DNNL=0 keeps the dp4a/fp32 path bit-identical to before.
-    use_dnnl = !cpu_mode && !multi_dev && pf8 && dnnl_gemm_enabled();
+    use_dnnl = !cpu_mode && !multi_dev && pf8 && dnnl_gemm_enabled(q);
     if (use_dnnl) {
         dnnl = std::make_unique<dnnl_gemm>(q);
         dnnl_register_queue(q, dnnl.get());
@@ -457,7 +455,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         if (!(envw && atoi(envw) != 0)) {
             dnnl->warmup();
         }
-    } else if (multi_dev && !md_int8 && !md_xmx && dnnl_gemm_enabled() &&
+    } else if (multi_dev && !md_int8 && !md_xmx && dnnl_gemm_enabled(q) &&
                [&] {
                    const char * en = si::env::str("PF_DP4A");
                    return !(en && atoi(en) == 0); // PF_DP4A=0 forces the fp32 path
@@ -1287,7 +1285,7 @@ void engine::release_host_weight_pages() {
 // int8.  Returns false if no device can run the int8 matmul (caller falls back
 // to the SIn/dp4a path).
 bool engine::setup_md_dnnl() {
-    if (!dnnl_gemm_enabled()) {
+    if (!dnnl_gemm_enabled(q)) {
         return false;
     }
     if (const char * en = si::env::str("PF_DP4A"); en && atoi(en) == 0) {
@@ -1314,6 +1312,7 @@ bool engine::setup_md_dnnl() {
             continue; // CPU partitions stay on the host
         }
         auto D = std::make_unique<dnnl_gemm>(*dev_queues_[d]);
+        const sycl::queue & dq = *dev_queues_[d]; // this card's profile decides its stores
         bool dev_ok = false;
         // PF_W4: represent the types that have a native-width 4-bit packing
         // (Q4_K) as u4 + per-group f16 step/offset instead of int8.  Measured
@@ -1328,21 +1327,12 @@ bool engine::setup_md_dnnl() {
         // per weight), so whether they are worth it depends on how much read
         // bandwidth the card has relative to its compute -- a per-device
         // measurement, hence the profile default.  PF_W4=0 restores pure int8.
-        static const bool w4_on = [] {
-            const char * e = si::env::str("PF_W4");
-            return e ? atoi(e) != 0 : si::dev::active().wt.w4 != 0;
-        }();
+        const bool w4_on = si::dev::profile_flag(dq, "PF_W4", si::dev::for_queue(dq).wt.w4 != 0);
         int n_w4 = 0, n_i8 = 0, n_cb = 0, n_k5 = 0;
         // PF_K5=0 keeps Q5_K on the int8 conversion (A/B knob)
-        static const bool add_k5 = [] {
-            const char * e = si::env::str("PF_K5");
-            return e ? atoi(e) != 0 : si::dev::active().wt.k5 != 0;
-        }();
+        const bool add_k5 = si::dev::profile_flag(dq, "PF_K5", si::dev::for_queue(dq).wt.k5 != 0);
         // PF_CB4=0 keeps IQ4_XS/IQ4_NL on the int8 conversion (A/B knob)
-        static const bool add_cb = [] {
-            const char * e = si::env::str("PF_CB4");
-            return e ? atoi(e) != 0 : si::dev::active().wt.cb4 != 0;
-        }();
+        const bool add_cb = si::dev::profile_flag(dq, "PF_CB4", si::dev::for_queue(dq).wt.cb4 != 0);
         auto add = [&](const wt & t) {
             if (!t.data) {
                 return;

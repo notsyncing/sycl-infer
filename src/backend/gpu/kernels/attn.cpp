@@ -15,13 +15,12 @@ using namespace si::kd;
 
 // ---------------------------------------------------------------------------
 // PF_ATTN_VEC=0: classic per-lane strided mapping
-static inline bool attn_vec_env() {
-    static const bool v = [] {
-        const char * e = si::env::str("PF_ATTN_VEC");
-        const int dflt = si::dev::active().attn.vec;
-        return (e ? atoi(e) != 0 : dflt != 0);
-    }();
-    return v;
+// Per queue: both of these defaults are per-device measurements (attn.vec and
+// attn.dec_group are documented as off on both shipped parts for *opposite*
+// reasons), so a split across cards must read its own card's value.  The env is
+// the same everywhere and is cached by profile_flag.
+static inline bool attn_vec_env(const sycl::queue & q) {
+    return si::dev::profile_flag(q, "PF_ATTN_VEC", si::dev::for_queue(q).attn.vec != 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,18 +292,13 @@ static inline bool attn_flash_env() {
 // redundancy is served by L2 and the extra parallelism wins).  The grouped path
 // needs a non-fused call (out == nullptr) and n_head = 4 * n_head_kv with the
 // 256-wide head.
-static inline int dec_group_env() {
-    static const int v = [] {
-        const char * e = si::env::str("PF_DEC_GROUP");
-        // the grouped decode kernel has n_head_kv instead of n_head workgroups; it
-        // is off on BOTH parts but for opposite measured reasons (A770: 5x slower
-        // at 64k; Iris Xe: measurably faster for the classic kernel, which has 4x
-        // the warps).  The default still belongs in the profile because it is a
-        // per-device measurement, and the reasoning differs per device.
-        const int dflt = si::dev::active().attn.dec_group;
-        return (e ? atoi(e) : dflt) != 0 ? 1 : 0;
-    }();
-    return v;
+static inline int dec_group_env(const sycl::queue & q) {
+    // the grouped decode kernel has n_head_kv instead of n_head workgroups; it
+    // is off on BOTH parts but for opposite measured reasons (A770: 5x slower at
+    // 64k; Iris Xe: measurably faster for the classic kernel, which has 4x the
+    // warps).  The default belongs in the profile because it is a per-device
+    // measurement, so it is read from this queue's card, not the first one.
+    return si::dev::profile_flag(q, "PF_DEC_GROUP", si::dev::for_queue(q).attn.dec_group != 0) ? 1 : 0;
 }
 
 void attn_launch(queue & q, const float * qbuf, const float * gate, const void * kpool, const void * vpool,
@@ -312,7 +306,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                  const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out, int group,
                  const void * kscales, const void * vscales) {
     constexpr int HD = 256;
-    const bool avec = attn_vec_env();
+    const bool avec = attn_vec_env(q);
     const int qstride = n_head * 2 * head_dim;
     const int pstride = 2 + head_dim;
     const bool fuse = out != nullptr && n_splits == 1;
@@ -355,7 +349,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
         }
         return;
     }
-    const int grp = group >= 0 ? group : dec_group_env();
+    const int grp = group >= 0 ? group : dec_group_env(q);
     // the grouped kernel has no int8/int4 path (it reuses kv_ld4 on a full row)
     if (grp && !kv_dtype_has_scales(kv_k_dtype()) && !kv_dtype_has_scales(kv_v_dtype()) && !fuse && head_dim == HD
         && n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv == 4) {

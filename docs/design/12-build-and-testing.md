@@ -309,21 +309,41 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:gpu.1 ./build/test_decode_vs_prefill  # OK
 TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 ```
 
-### 3.4.1 异构 `--layer-map` 现在被拒绝（行为变化）
+### 3.4.1 异构 `--layer-map` 受支持：每个设备用自己的 profile
 
-**同一型号的 GPU 才能一起分卡。** 引擎构造时会把所有在用 GPU 的设备名交给
-`si::dev::check_profiles_homogeneous`（`src/device/device_registry.cpp`），只要解析出的
-device profile 不一致就抛错，消息里点名两张卡与各自的 profile。
+`--layer-map` 可以跨不同型号的 GPU 分层，每个分区读**自己那张卡**的 device profile。
 
-原因是**所有 kernel 读的是同一份进程级 profile**：`si::dev::active()` 只从**第一张** GPU 解析
-一次，`wg_clamped()` 缓存的也是那张卡的 `max_work_group_size`。所以异构分卡不只是"第二张卡调优值
-不对"，而是可能**发一个它不接受的工作组**——A770 允许 1024 线程、Iris Xe 只允许 512，第一张卡是
-A770 时就会往 Iris Xe 分区发 1024 宽的 kernel，那是 launch 失败不是变慢。
+**机制。** 以前每个 kernel launcher 调 `si::dev::active()`——一份进程级 profile，从**第一张** GPU 解析
+一次；`wg_clamped()` 缓存的也是那张卡的 `max_work_group_size`。所以异构分卡不只是"第二张卡调优值不对"，
+而是可能**发一个它不接受的工作组**：A770 允许 1024 线程、Iris Xe 只允许 512，第一张是 A770 时就会
+往 Iris Xe 分区发 1024 宽的 kernel——那是 launch 失败，不是变慢。
 
-**这是拒绝而不是支持**。真正支持异构需要按 queue/设备解析 profile（即让每个 launcher 用它那条
-队列的 profile，而不是 `active()`），那会触及每个 kernel launcher 的热路径，得单独测量，所以
-没有顺手做。`test_dev_profile` 无需 GPU，用合成设备名覆盖判定逻辑
-（同型号三张、A770+Iris Xe、Iris Xe+A770、冲突出现在非首位、unknown 卡与真卡的冲突）。
+现在 launcher 改用 `si::dev::for_queue(q)`（以及 `si::dev::wg_clamped_for_queue(q, want)`），取的是
+**它即将提交的那条队列**的设备的 profile。两条规则让这件事在 launch 路径上足够便宜：
+
+* 查找以 **sycl::device 相等**（比较底层 handle）为键，即几次指针比较，**不是** `get_devices()` 枚举
+  （那个版本实测 3.2 ms/次：一次 MTP verify 里 65 次 rmsnorm 就是 210 ms 主机时间，且在 graphed decode
+  里完全不可见，因为 graph 只录制一次）；
+* 设备名与 `max_work_group_size` 每张卡只查一次，之后命中缓存。
+
+`test_dev_resolve` 实测每次 launch 的查找 **0.039 µs**，比旧路径的 3200 µs 便宜约 8 万倍。
+
+**代价与核对。** 有四处原本是**进程级 static**、把每设备的形状固化了，它们必须改成按调用决定：
+`rmsnorm` 的工作组宽度、`attn_xmx` 的 gather 工作组数（它还决定 scratch 大小，而 scratch 是按 queue
+分配的）、`gdn` 的 `gdn_cols`/`gdn_warps_per_wg`、`attn` 的 `attn.vec`/`dec_group` 与
+`attn_xmx`/`gemm_dnnl` 的开关。为此加了 `si::dev::profile_int` / `profile_flag`：env 部分在所有卡上
+相同、读一次缓存，profile 默认值按调用从该卡的 queue 读——**不要**再写回 `static const = []{ active()... }()`，
+那正是把整个进程钉在第一张卡上的写法。
+
+`rmsnorm` 那处尤其要实测而不是假设：`AGENTS.md` 记录过 DFlash2 draft block 前向的 20.5 ms 里有
+16.4 ms 花在五次 attn_norm launch（那正是当初把它改成 static 的原因）。同机 A/B：
+`PF_DFLASH_SEGTIME` 下 `anorm` 基线 0.30/0.30/0.30，每设备版 0.31/0.30，**无可测差异**；
+且 `sum == devspan`、`hostwall - sum = 0.09 ms`，说明前向仍是 device-bound、没有把主机时间挪进来。
+
+**报告混合分卡。** 引擎构造时若在用 GPU 的 profile 不一致，会打一条 WARNING 点名两张卡与各自 profile
+（不再拒绝，见上一版的记录）。`test_dev_profile` 无需 GPU，用合成设备名覆盖判定逻辑；
+`test_dev_resolve` 需要 GPU，覆盖 per-device 缓存的稳定性、与 `for_name` 的一致性、
+按该设备上限的 clamp，以及查找的每次成本上限（5 µs，留足余量又能抓住"退回每次查驱动"）。
 
 ### 3.5 include-cleaner lint（`Diagnostics.UnusedIncludes: Strict` 必须干净）
 

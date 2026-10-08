@@ -164,7 +164,37 @@ const profile & unknown_profile();
 // The profile for the GPU we are running on, chosen once from the SYCL device
 // name and cached for the process.  `PF_DEVICE_PROFILE=<key>` forces one;
 // `PF_DEVICE_INFO=1` prints the resolved profile and its provenance.
+//
+// Prefer for_queue() in anything that is handed a queue: active() is
+// process-wide, so it silently applies the first GPU's tuning to a second one.
 const profile & active();
+
+// The profile of the device behind `q`, cached per device identity (SYCL's
+// device operator== compares handles, so the lookup is a pointer compare and
+// not the get_devices() enumeration that cost 3.2 ms per launch).  A kernel
+// launcher must use this, not active(), or a heterogeneous --layer-map runs
+// every card with the first card's tuning.
+const profile & for_queue(const sycl::queue & q);
+
+// Work-group width clamp against one specific device.  The device limit is a
+// hardware fact and cannot change over a run, but querying it is not free
+// (`device::get_devices()` measured 3.2 ms per call: 210 ms of host time in one
+// MTP verify pass, invisible in the graphed decode because the graph records the
+// launch once), so it is cached per device alongside the profile.
+int wg_clamped_for_queue(const sycl::queue & q, int want);
+
+// The "env overrides a profile default" pattern, per device.
+//
+// Nearly every tuning is `env ? atoi(env) : active().shape.x`, and the old form
+// of that - a function-local `static const` initialised from a profile value -
+// silently pins the whole process to whichever card resolved first.  These two
+// helpers make the correct shape the only one that is convenient: the env is the
+// same on every card so it is read once, the default is read per call from the
+// queue's own device (a pointer compare through for_queue, not a driver query).
+// Returns `profile_default` when the env is unset or parses to 0.
+int profile_int(const sycl::queue & q, const char * env_name, int profile_default);
+// `env=0` wins over a true default, anything else lets the default stand.
+bool profile_flag(const sycl::queue & q, const char * env_name, bool profile_default);
 
 // Resolve from a SYCL device name without touching any device state, by asking
 // each registered card's own matcher.

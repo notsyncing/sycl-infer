@@ -1186,12 +1186,10 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 const char * e = si::env::str("PF_ATTN_SPLIT");
                 return e ? atoi(e) : 0;
             }();
-            static const int at_split_keys = [] {
-                const char * e = si::env::str("PF_ATTN_SPLIT_KEYS");
-                const int dflt = si::dev::active().attn.split_keys;
-                const int v = e ? atoi(e) : dflt;
-                return v > 0 ? v : dflt;
-            }();
+            // per *device*: this is inside the per-layer loop, so a split across
+            // cards with different attn tuning must see its own default
+            const int at_split_keys = si::dev::profile_int(dev_queue(cur_dev), "PF_ATTN_SPLIT_KEYS",
+                                                          si::dev::for_queue(dev_queue(cur_dev)).attn.split_keys);
             // PF_ATTN_FUSE=0: keep the separate attn_combine kernel even when
             // n_splits == 1 (A/B knob; fusion is the default)
             static const bool at_fuse = [] {
@@ -1624,10 +1622,9 @@ void engine::replay_md_dec_graphs() {
 //     direct replay (which re-decides per call) takes over.
 void engine::build_md_verify_graphs() {
     static const bool nog = si::env::flag("PF_NOGRAPH");
-    static const int xmx_min = [] {
-        const char * e = si::env::str("PF_ATTN_XMX_MIN");
-        return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
-    }();
+    const sycl::queue & qv = dev_queue(0); // the verify's partition
+    const int xmx_min =
+        si::dev::profile_int(qv, "PF_ATTN_XMX_MIN", si::dev::for_queue(qv).attn.xmx_min_keys);
     // The verify runs draft_len + 1 rows.  For MTP that is mtp.mtp_k + 1, but DFlash2
     // has its own (CLI-tunable) draft length and leaves mtp.mtp_k at 0 - using it here
     // recorded a 1-row graph that vf_graph_usable() then rejected for every
@@ -1713,14 +1710,10 @@ bool engine::vf_graph_usable(int rows, int pos0) const {
     }
     // the recorded attention is the classic kernel; once oneDNN's int8 matmul
     // would win, hand the pass back to the direct replay (which re-decides)
-    static const int xmx_min = [] {
-        const char * e = si::env::str("PF_ATTN_XMX_MIN");
-        return e ? atoi(e) : si::dev::active().attn.xmx_min_keys;
-    }();
-    static const bool xmx_on = [] {
-        const char * e = si::env::str("PF_ATTN_XMX");
-        return !(e && atoi(e) == 0) && si::dev::active().attn.xmx;
-    }();
+    const sycl::queue & qv = dev_queue(0); // the verify's partition
+    const int xmx_min =
+        si::dev::profile_int(qv, "PF_ATTN_XMX_MIN", si::dev::for_queue(qv).attn.xmx_min_keys);
+    const bool xmx_on = si::dev::profile_flag(qv, "PF_ATTN_XMX", si::dev::for_queue(qv).attn.xmx);
     if (xmx_on && pos0 + rows > xmx_min) {
         return false;
     }

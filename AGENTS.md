@@ -1584,19 +1584,26 @@ name.
   so a card with no profile gets a smaller kernel instead of a launch failure.
   Work-group widths must be *template* parameters (a SYCL kernel cannot capture a
   runtime-initialised global), which also lets the strided load loops unroll.
-* **A layer map may only split across GPUs that resolve to the same profile.**
-  `active()` resolves one profile per process from the *first* GPU, and
-  `wg_clamped()` caches that card's `max_work_group_size`, so every launch on
-  every card reads the first card's tuning.  A heterogeneous split therefore
-  mis-tunes the second card *and* can launch a work-group it cannot accept
-  (A770 1024 threads vs Iris Xe 512) - a launch failure, not a slowdown.  The
-  engine constructor calls `si::dev::check_profiles_homogeneous` over the devices
-  in use and refuses a split that disagrees, naming both cards.  Actually
-  supporting heterogeneous cards means resolving a profile *per queue* (each
-  launcher using its own queue's profile instead of `active()`), which touches
-  every kernel launcher's hot path and needs its own measurement - a separate
-  step, deliberately not folded in here.  `test_dev_profile` covers the decision
-  logic with synthetic device names and no GPU.
+* **A layer map may split across GPUs that resolve to different profiles; each
+  device gets its own.**  Launchers must use `si::dev::for_queue(q)` and
+  `si::dev::wg_clamped_for_queue(q, want)`, never `active()` / `wg_clamped()`:
+  those resolve once per process from the *first* GPU, so a heterogeneous split
+  would mis-tune the second card *and* could launch a work-group it cannot accept
+  (A770 1024 threads vs Iris Xe 512) - a launch failure, not a slowdown.
+  The lookup keys on `sycl::device` equality (handle compare), and the name and
+  work-group limit are queried once per device, so it costs **0.039 us** per
+  launch (measured, `test_dev_resolve`) against 3.2 ms for the old
+  `get_devices()`-per-call version.  For the same reason, do **not** put a
+  profile read behind `static const = []{ ... active() ... }()`: that pins the
+  whole process to whichever card resolved first.  Use `si::dev::profile_int` /
+  `profile_flag`, which cache the (device-independent) env once and read the
+  default per call.  Four such statics existed and had to be converted - see
+  `docs/design/12-build-and-testing.md` §3.4.1 for the list and for the A/B that
+  keeps `rmsnorm`'s per-call lookup honest (the DFlash2 draft block forward had
+  16.4 of its 20.5 ms inside five attn_norm launches, which is why that one was
+  a static in the first place; `PF_DFLASH_SEGTIME` shows `anorm` unchanged at
+  0.30 ms).  `test_dev_profile` covers the homogeneity *reporting* with synthetic
+  names and no GPU; `test_dev_resolve` covers the cache itself.
 * `CMakeLists.txt`'s `SYCL_INFER_AOT_DEVICE` is the ocloc target and is
   device-specific for the same reason: it must agree with the profile the binary
   will select at runtime.

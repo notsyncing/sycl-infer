@@ -23,7 +23,9 @@
 namespace si {
 
 // true unless PF_GEMM_DNNL=0 (read once per process)
-bool dnnl_gemm_enabled();
+// Takes the queue so the default comes from that queue's device profile: a
+// heterogeneous split can have gemm_dnnl on one card and off another.
+bool dnnl_gemm_enabled(const sycl::queue & q);
 
 // While a SYCL command graph is recording, a oneDNN primitive must not run:
 // oneDNN owns its own stream and its execute() would either bypass the

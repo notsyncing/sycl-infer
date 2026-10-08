@@ -102,7 +102,7 @@ void dp4a_gemv_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     }();
     // how many output rows it takes to fill the machine: a device-profile value,
     // since it scales with the EU count
-    const si::dev::profile & dp = si::dev::active();
+    const si::dev::profile & dp = si::dev::for_queue(q);
     const int fill_rows = dp.split.gemv_rows;
     const int split_cap = dp.split.max;
     int S = 1;

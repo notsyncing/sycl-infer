@@ -251,20 +251,26 @@ void gdn_launch(queue & q, const float * conv_out, const float * alpha, const fl
                 int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0,
                 int tpb_arg, int nreal_arg, pc_snap snap) {
     (void)n_slots;
-    const si::dev::profile & dp = si::dev::active();
-    // PF_GDN_COLS=1/2/4/8: state rows per warp (1 = the original mapping).
-    // The default is the device profile's gdn_cols (2).
-    static const int cols = [] {
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    // PF_GDN_COLS=1/2/4/8: state rows per warp (1 = the original mapping), and
+    // PF_GDN_WG: warps per workgroup.  The *env* is the same on every card, so it
+    // is read once; the profile default is not - it comes from this queue's own
+    // device via `dp`, so a split across cards with different gdn tuning gets the
+    // right shape on each.  Baking either into a function-local static would pin
+    // the whole process to whichever card resolved first, which is the bug this
+    // whole per-device path exists to fix.
+    static const int cols_env = [] {
         const char * e = si::env::str("PF_GDN_COLS");
-        const int c = e ? atoi(e) : si::dev::active().shape.gdn_cols;
-        return c == 1 || c == 2 || c == 4 || c == 8 ? c : 2;
+        return e ? atoi(e) : 0;
     }();
-    // PF_GDN_WG=1/2/4/8: warps per workgroup (occupancy experiment)
-    static const int wpw = [] {
+    const int cols_src = cols_env ? cols_env : dp.shape.gdn_cols;
+    const int cols = (cols_src == 1 || cols_src == 2 || cols_src == 4 || cols_src == 8) ? cols_src : 2;
+    static const int wpw_env = [] {
         const char * e = si::env::str("PF_GDN_WG");
-        const int c = e ? atoi(e) : si::dev::active().shape.gdn_warps_per_wg;
-        return c == 1 ? 1 : (c == 2 ? 2 : (c == 4 ? 4 : 8));
+        return e ? atoi(e) : 0;
     }();
+    const int wpw_src = wpw_env ? wpw_env : dp.shape.gdn_warps_per_wg;
+    const int wpw = wpw_src == 1 ? 1 : (wpw_src == 2 ? 2 : (wpw_src == 4 ? 4 : 8));
     // decode has one token per row: halving the warp count costs more than the
     // shared q/k loads save, so only batch columns when the row has real work
     const int n_real = nreal_arg > 0 ? nreal_arg : info->n_real;

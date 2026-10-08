@@ -568,10 +568,9 @@ void engine::setup_dflash(const std::string & draft_path) {
     // ---- weights: the same native/int8 stores the main model uses, keyed by
     // the draft GGUF's host pointers (which are unique per tensor) ----
     int n_u4 = 0, n_int8 = 0, n_fail = 0;
-    static const bool w4_on = [] {
-        const char * e = si::env::str("PF_W4");
-        return e ? atoi(e) != 0 : si::dev::active().wt.w4 != 0;
-    }();
+    // per card: the draft runs on dfl.df_dev_, so its store choice follows that
+    // device's profile, not whichever GPU happened to be first
+    const bool w4_on = si::dev::profile_flag(dq, "PF_W4", si::dev::for_queue(dq).wt.w4 != 0);
     // PF_DFLASH_WSCALE: multiply every drafter weight's step plane.  Diagnostic
     // for the "is the drafter's weight scale what a trained model expects"
     // question; 1 = the GGUF as shipped.
@@ -707,7 +706,10 @@ void engine::setup_dflash(const std::string & draft_path) {
     dfl.d_df_vals = alloc_elems<float>((size_t)M * hp.sel_top_k);
     // topk slice partials: S slices per row.  Sized from the device's compute-unit
     // count so the slice pass fills the machine (M alone is 6 workgroups).
-    dfl.df_slices_ = (int)si::dev::active().hw.compute_units / std::max(1, M);
+    // sized from *this* device's compute-unit count so the slice pass fills that
+    // machine (M alone is 6 workgroups)
+    const sycl::queue & dq_s = dev_queue(dfl.df_dev_);
+    dfl.df_slices_ = (int)si::dev::for_queue(dq_s).hw.compute_units / std::max(1, M);
     dfl.df_slices_ = std::max(1, std::min(dfl.df_slices_, 256));
     if (const char * e = si::env::str("PF_DFLASH_SLICES")) {
         dfl.df_slices_ = atoi(e);

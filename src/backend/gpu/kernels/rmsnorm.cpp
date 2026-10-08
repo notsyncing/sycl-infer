@@ -66,14 +66,20 @@ static void rmsnorm_impl(queue & q, const float * x, const float * w, float * ou
 } // namespace
 
 void rmsnorm_launch(queue & q, const float * x, const float * w, float * out, int n_rows, int n, float eps) {
-    // the widest width the device accepts, from the profile (see the header
-    // comment); anything narrower than 256 is not worth an instantiation.
-    // Resolved ONCE here, not per call: the device registry's own statics make each
-    // lookup cheap in isolation, but the DFlash2 draft block forward is a direct
-    // replay (not a recorded graph), so unlike the decode it cannot hide host time -
-    // and device-side segment timing put 16.4 ms of its 20.5 ms inside the five
-    // attn_norm launches, i.e. 3.3 ms each.
-    static const int want = si::dev::wg_clamped(si::dev::active().shape.rmsnorm_wg);
+    // The widest width *this queue's* device accepts, from that device's profile
+    // (see the header comment); anything narrower than 256 is not worth an
+    // instantiation.  Resolved per call rather than in a function-local static,
+    // because the static pinned the whole process to whichever card resolved
+    // first - on a split across cards with different limits that is a launch
+    // failure, not a slowdown (A770 1024 threads, Iris Xe 512).
+    //
+    // This used to be expensive: wg_clamped() enumerated every GPU through the
+    // driver on each call (measured 3.2 ms), and the DFlash2 draft block forward -
+    // a direct replay, so it cannot hide host time - put 16.4 ms of its 20.5 ms
+    // inside the five attn_norm launches.  for_queue/wg_clamped_for_queue cache
+    // per device and compare sycl::device handles, so the lookup is a pointer
+    // compare; PF_DFLASH_SEGTIME is what keeps that honest.
+    const int want = si::dev::wg_clamped_for_queue(q, si::dev::for_queue(q).shape.rmsnorm_wg);
     if (want >= 1024) {
         rmsnorm_impl<1024>(q, x, w, out, n_rows, n, eps);
     } else if (want >= 512) {

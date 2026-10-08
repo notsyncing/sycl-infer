@@ -941,6 +941,11 @@ private:
     // queue whose device owns backend `d` (falls back to the primary queue for
     // CPU partitions and the single-device path)
     sycl::queue & dev_queue(int d) {
+        return const_cast<sycl::queue &>(std::as_const(*this).dev_queue(d));
+    }
+    // Same lookup, const: the decision functions only *read* it (e.g. which
+    // device profile applies), and a const_cast here would be papering over that.
+    const sycl::queue & dev_queue(int d) const {
         if (multi_dev && d >= 0 && d < (int)dev_queues_.size() && dev_queues_[(size_t)d] && dev_kind_[(size_t)d] == 0) {
             return *dev_queues_[(size_t)d];
         }

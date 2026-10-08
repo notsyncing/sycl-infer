@@ -317,14 +317,19 @@ template <typename T> struct qfree {
     }
 };
 
-bool dnnl_gemm_enabled() {
+bool dnnl_gemm_enabled(const sycl::queue & q) {
     // default ON (the mode-2 int8 GEMMs run on oneDNN); PF_GEMM_DNNL=0 forces
-    // the dp4a chunk-batched path, e.g. for bit-exact dp4a validation
-    static const bool on = [] {
+    // the dp4a chunk-batched path, e.g. for bit-exact dp4a validation.  The env
+    // is device-independent (read once); the default is not, so it is read per
+    // call from the queue's own card.
+    static const int forced = [] {
         const char * e = si::env::str("PF_GEMM_DNNL");
-        return !(e && atoi(e) == 0) && si::dev::active().wt.gemm_dnnl;
+        return e ? atoi(e) : -1;
     }();
-    return on;
+    if (forced == 0) {
+        return false;
+    }
+    return forced != 0 || si::dev::for_queue(q).wt.gemm_dnnl;
 }
 
 // ---------------------------------------------------------------------------

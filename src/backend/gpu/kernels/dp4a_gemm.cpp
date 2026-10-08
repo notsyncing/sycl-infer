@@ -1082,7 +1082,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     if (use_row && TB == 32 && w.N <= 8192) {
         const char * sp_env = si::env::str("PF_GEMM_SPLIT");
         int S = sp_env ? atoi(sp_env) : 0;
-        const si::dev::profile & dp = si::dev::active();
+        const si::dev::profile & dp = si::dev::for_queue(q);
         if (S == 0) {
             S = (int)((dp.split.gemm_rows + w.N - 1) / w.N);
         }
