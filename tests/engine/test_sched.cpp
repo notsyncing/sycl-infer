@@ -67,6 +67,14 @@ static gen_params greedy(int max_tokens, bool logprobs) {
 int main(int argc, char ** argv) {
     const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
     const char * lm = si::env::str("TEST_LAYER_MAP");
+    // Section 7's oracle only means anything with the decode batch pinned to one
+    // row: with several rows the fp accumulation order differs between two
+    // concurrent sequences and a greedy run may flip at a near-tie argmax, which is
+    // accepted behaviour and would drown out the prefill signal.  setenv, not a
+    // default argument: the scheduler reads it once, on first use.
+    if (!si::env::str("PF_SCHED_MAX_DECODE")) {
+        setenv("PF_SCHED_MAX_DECODE", "1", 1);
+    }
     try {
         engine_config ec;
         ec.model_path = model_path;
@@ -202,9 +210,51 @@ int main(int argc, char ** argv) {
             // joins a batch can flip at a near-tie argmax and then diverge for
             // the rest of the generation (documented in AGENTS.md).  That makes
             // this check about "both sequences finish and honour max_tokens",
-            // not about determinism across batching.
+            // not about determinism across batching.  Section 7 is the oracle that
+            // *can* assert determinism, with the decode batch pinned to one row so
+            // that prefill is the only thing left that can differ.
             printf("concurrent: a=%zu chars/%d tokens, b=%zu chars/%d tokens, identical=%d\n", da.text.size(),
                    da.tokens, db.text.size(), db.tokens, (int)(da.text == db.text));
+        }
+
+        // ---- 7. the prefill-only concurrency oracle ----
+        //
+        // Section 6 cannot assert equality, because two sequences decoding in one
+        // batch change the fp accumulation order and a greedy run can flip at a
+        // near-tie argmax.  That is a real, accepted property of batching - but it
+        // makes the test blind to the other thing that can differ between two
+        // identical concurrent requests: their *prefill*.
+        //
+        // So pin the decode batch to one row (PF_SCHED_MAX_DECODE, default 1 here)
+        // and require N concurrent identical requests to come back byte-identical.
+        // With one decode row the decode path is bit-for-bit the single-request
+        // path, so anything that differs is attributable to admission or prefill.
+        // This is the oracle any cross-sequence prefill batching has to be built
+        // against - a batched prefill that produced plausible-but-different output
+        // would pass every other check in this file.
+        {
+            const int nseq = 4;
+            scheduler s(e);
+            s.start();
+            std::vector<drained> rs;
+            std::vector<std::shared_ptr<sequence>> hs;
+            for (int i = 0; i < nseq; i++) {
+                hs.push_back(s.submit(prompt, greedy(12, false), {}));
+            }
+            for (auto & h : hs) {
+                rs.push_back(drain(h));
+            }
+            int done = 0, same = 0;
+            for (int i = 0; i < nseq; i++) {
+                done += rs[(size_t)i].finished ? 1 : 0;
+                if (rs[(size_t)i].text == rs[0].text && rs[(size_t)i].tokens == rs[0].tokens) {
+                    same++;
+                }
+            }
+            printf("prefill oracle: %d/%d finished, %d/%d byte-identical to the first (decode batch pinned)\n",
+                   done, nseq, same, nseq);
+            CHECK(done == nseq);
+            CHECK(same == nseq);
         }
 
         if (g_fail) {

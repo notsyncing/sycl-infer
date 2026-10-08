@@ -399,7 +399,13 @@ void scheduler::loop() {
                 if (s->recent.empty()) {
                     continue;
                 }
-                if (nb >= kMaxB) {
+                // PF_SCHED_MAX_DECODE caps the rows per decode forward.  It exists so a test can
+                // pin batching off and isolate what differs between two concurrent
+                // requests: with one row the decode path is bit-for-bit the
+                // single-request path, so any divergence is admission or prefill.
+                // Default 0 = no cap (kMaxB), the shipped behaviour.
+                static const int dbg_cap = si::env::i32("PF_SCHED_MAX_DECODE", 0);
+                if (nb >= (dbg_cap > 0 ? dbg_cap : kMaxB)) {
                     break;
                 }
                 // grow the block table if needed
