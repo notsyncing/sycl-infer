@@ -9,7 +9,10 @@
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| HTTP | `server.cpp` | httplib 服务、路由、JSON、SSE、CORS、stop 过滤、媒体下载/解码、视觉与音频 tower 调度、`mtp_direct` 路由 |
+| HTTP | `server.cpp` | httplib 服务与路由、SSE 发送、CORS、stop 过滤、视觉与音频 tower 调度、`mtp_direct` 路由 |
+| 请求解析 | `request.{h,cpp}` | OpenAI 请求体 → 引擎入参（纯函数，见 §2.4） |
+| 媒体获取 | `media_fetch.{h,cpp}` | 一个 media part → 字节：`data:`/内联 base64/url_fetch 策略 |
+| JSON 序列化 | `json_util.h` | `dump_json`（容忍非法 UTF-8，编码为 U+FFFD 而非抛异常） |
 | 批处理 | `scheduler.cpp` | `sequence` 生命周期、连续批处理、持有 `engine::mtx` |
 | Chat 模板 | `chat.cpp` / `chat_template.cpp` | minja Jinja 渲染 + 内置 ChatML 回退 |
 | 响应拆分 | `response_parser.cpp` | `reasoning_content` / `content` / `tool_calls` 流式状态机 |
@@ -73,6 +76,12 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 
 ### 2.4 请求解析
 
+解析全部在 `request.{h,cpp}` 里，是**纯函数**（JSON 进、普通值出）：不碰 httplib、不碰 engine 状态、
+不依赖全局量。这正是 `tests/server/test_request_parse.cpp`（hermetic，无模型无 socket）能存在的原因——
+这些别名与优先级规则此前只能在真实 HTTP 请求里触达，等于没有测试。其中两个函数刻意只收它们真正需要
+的字段：`parse_completion_prompts(tokenizer &, ...)`（不收 engine）与
+`prompt_rejected_json(int max_seq, size_t)`（不收 engine，也不设状态码、不打日志）。
+
 * JSON 解析失败 → 400 `{"error":{"message":"invalid json","type":"invalid_request_error"}}`
   （chat: `server.cpp:1576-1582`；completions: `server.cpp:1796-1802`）。
 * `parse_messages` 把 `role` 默认 `"user"`；`content` 可以是字符串、`null` 或 part 数组。part 按
@@ -126,10 +135,11 @@ chosen token 的 logprob（`sampler.h:29-35`）。
 
 ### 2.5 长度拒绝
 
-`reject_too_long` 返回 400 + `code:"context_length_exceeded"`，并带 `max_seq` 与
-`prompt_tokens`。原因（注释，`server.cpp:639-642`）：否则 `scheduler::admit` 会静默退役超长 prompt，
-返回空的 200 流。对 chat 文本、每个 completion prompt、以及**扩展后**的多模态 prompt 都调用
-（`server.cpp:1659`、`1713`、`1826-1830`）。
+`request.cpp` 的 `prompt_rejected_json(max_seq, n)` 返回应 400 的响应体，或 `""` 表示接受；判定理由是
+否则 `scheduler::admit` 会静默退役超长 prompt，返回空的 200 流。`server.cpp` 的 `reject_prompt` lambda
+把状态码、content type 与 `[http] 400 context_length_exceeded` 日志留在传输层（策略与日志分开，
+于是策略可被单测断言）。对 chat 文本、每个 completion prompt、以及**扩展后**的多模态 prompt 都调用
+（三个 handler 内各一处）。
 
 其它 400（`bad_request`，消息即 `error.message`，`type` 一律 `invalid_request_error`）：
 
