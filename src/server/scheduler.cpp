@@ -145,6 +145,55 @@ static bool dbg() {
     return d;
 }
 
+// Sample one token from `logits`, advance the sequence's state, and hand the
+// caller the UTF-8 piece (empty for EOS, or while a token's bytes are still
+// incomplete).  Shared by the two places a token is produced - the first one out
+// of the head prefill, and each row of a decode batch - which previously carried
+// two copies of the same sequence, including the two easy-to-diverge details:
+// the control token is never streamed, and want_logprobs decides whether the
+// piece is sent even when the UTF-8 buffer has nothing yet.
+//
+// `done` and `eos` are separate on purpose: `eos` says the sampled token was a
+// control token, `done` says the sequence must now be retired.  Collapsing them
+// is wrong, because the decode path's reason string tests `&& !eos` - a run that
+// ends by reaching max_tokens must report "length", and reusing `done` for `eos`
+// turns that into "stop".
+struct sample_outcome {
+    bool eos = false;  // the sampled token was EOS/EOT (never streamed)
+    bool done = false; // eos, or max_tokens reached
+};
+
+static sample_outcome sample_and_emit(engine & e, std::shared_ptr<sequence> & s, utf8_stream_buffer & ub,
+                                      const float * logits, int n_vocab) {
+    const bool want_lp = s->gp.wants_logprobs();
+    sample_logprobs lp;
+    const int tok = sample_token(logits, n_vocab, s->gp, s->recent, s->ss, want_lp ? &lp : nullptr);
+    if (dbg()) {
+        fprintf(stderr, "[sched]   sampled seq=%d tok=%d\n", s->id, tok);
+    }
+    s->recent.push_back(tok);
+    s->n_generated++;
+    // don't stream the EOS token itself: it is a control token, not content
+    const bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
+    if (!eos) {
+        std::string piece = ub.push(e.tk.token_piece(tok));
+        if (want_lp) {
+            sequence::token_out t;
+            t.text = std::move(piece);
+            t.id = tok;
+            t.logprob = lp.logprob;
+            t.top = std::move(lp.top);
+            s->push_token(std::move(t));
+        } else if (!piece.empty()) {
+            s->push(piece);
+        }
+    }
+    sample_outcome o;
+    o.eos = eos;
+    o.done = eos || s->n_generated >= s->gp.max_tokens;
+    return o;
+}
+
 void scheduler::loop() {
     std::vector<int32_t> toks(kMaxB, 0), poss(kMaxB, 0), slots(kMaxB, 0);
     std::vector<float> logits(e.m.hp.n_vocab);
@@ -289,12 +338,6 @@ void scheduler::loop() {
                         e.fetch_logits(0, logits.data());
                         s->recent = s->prompt;
                         const auto t_sm0 = std::chrono::steady_clock::now();
-                        const bool want_lp = s->gp.wants_logprobs();
-                        sample_logprobs lp;
-                        int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss,
-                                               want_lp ? &lp : nullptr);
-                        s->recent.push_back(tok);
-                        s->n_generated++;
                         if (tdbg) {
                             const auto t_now = std::chrono::steady_clock::now();
                             auto ms = [](auto a, auto b) {
@@ -309,23 +352,10 @@ void scheduler::loop() {
                                     ms(t_pf0, t_pf1), ms(t_fl0, t_sm0), ms(t_sm0, t_now), ms(t_pf0, t_now), s->wait_ms,
                                     s->admit_ms, s->pf_ms, s->n_chunks, s->reused, ms(s->t_submit, t_now));
                         }
-                        // don't stream the EOS token itself: it is a control
-                        // token, not content
-                        const bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
-                        if (!eos) {
-                            std::string piece = ubs[0].push(e.tk.token_piece(tok));
-                            if (want_lp) {
-                                sequence::token_out t;
-                                t.text = std::move(piece);
-                                t.id = tok;
-                                t.logprob = lp.logprob;
-                                t.top = std::move(lp.top);
-                                s->push_token(std::move(t));
-                            } else if (!piece.empty()) {
-                                s->push(piece);
-                            }
-                        }
-                        if (eos || s->n_generated >= s->gp.max_tokens) {
+                        // NB: this path's reason string differs from the decode one
+                        // below on purpose (no `&& !eos`), as it did before both used
+                        // their own copy of the rule.
+                        if (sample_and_emit(e, s, ubs[0], logits.data(), e.m.hp.n_vocab).done) {
                             retire(s, s->n_generated >= s->gp.max_tokens ? "length" : "stop");
                         }
                     }
@@ -411,33 +441,10 @@ void scheduler::loop() {
                 for (int r = 0; r < nb; r++) {
                     auto & s = batch[r];
                     e.fetch_logits(r, logits.data());
-                    const bool want_lp = s->gp.wants_logprobs();
-                    sample_logprobs lp;
-                    int tok = sample_token(logits.data(), e.m.hp.n_vocab, s->gp, s->recent, s->ss,
-                                           want_lp ? &lp : nullptr);
-                    if (dbg()) {
-                        fprintf(stderr, "[sched]   prefill-sampled seq=%d tok=%d\n", s->id, tok);
-                    }
-                    s->recent.push_back(tok);
-                    s->n_generated++;
-                    // don't stream the EOS token itself: it is a control token,
-                    // not content
-                    bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
-                    if (!eos) {
-                        std::string piece = ubs[r].push(e.tk.token_piece(tok));
-                        if (want_lp) {
-                            sequence::token_out t;
-                            t.text = std::move(piece);
-                            t.id = tok;
-                            t.logprob = lp.logprob;
-                            t.top = std::move(lp.top);
-                            s->push_token(std::move(t));
-                        } else if (!piece.empty()) {
-                            s->push(piece);
-                        }
-                    }
-                    if (eos || s->n_generated >= s->gp.max_tokens) {
-                        retire(s, s->n_generated >= s->gp.max_tokens && !eos ? "length" : "stop");
+                    // the same helper the prefill's first token uses
+                    const sample_outcome o = sample_and_emit(e, s, ubs[r], logits.data(), e.m.hp.n_vocab);
+                    if (o.done) {
+                        retire(s, s->n_generated >= s->gp.max_tokens && !o.eos ? "length" : "stop");
                     }
                 }
             }

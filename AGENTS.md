@@ -187,6 +187,9 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 ./build/test_sse_cancel     # SSE client-disconnect cancels generation (real socket,
                               # real httplib, no model needed)
 ./build/test_sampler       # logit_bias + logprob reporting (CPU only)
+./build/test_sched         # scheduler streaming path: greedy, logprobs, max_tokens,
+                           # ignore_eos=>"length", cancel, empty prompt,
+                           # concurrent sequences (model-backed, no HTTP)
 ./build/test_multimodal    # image/video prompt, audio decode+mels, vision + audio
                               # encoders (host + device), positions (CPU+GPU)
 ./build/test_multimodal --video-only  # model-free AVI/odd-size ffmpeg + vision width guard
@@ -2022,7 +2025,24 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   Attention**" tie ~20 tokens in; the multiset of outputs is identical across
   repeated runs, so it is accumulation-order numerics, not a race).  A sequence
   admitted first and decoded alone keeps the exact early tokens; batching only
-  changes the *order* of the fp accumulation in the batched GEMMs.
+  changes the *order* of the fp accumulation in the batched GEMMs.  That also
+  means a test must **not** assert two concurrent greedy runs of one prompt agree:
+  `test_sched` checks they both finish and honour `max_tokens`, nothing more.
+* **The scheduler's token-output path had no coverage at all until `test_sched`.**
+  `test_spec` drives `engine::generate`, which never enters `scheduler::loop`, so
+  the one place that turns a sampled token into a streamed piece - duplicated
+  between the head prefill's first token and every decode row - was untested, and
+  a refactor of it had no oracle.  `test_sched` (model-backed, no HTTP) covers:
+  a greedy run, the logprobs variant (pieces carry an id *and* a logprob),
+  `max_tokens`, an `ignore_eos` run that must report `finish_reason == "length"`,
+  cancellation via `sequence::cancel` (the SSE disconnect path), an empty prompt
+  (must retire rather than wedge), and two concurrent sequences.
+  It earned its keep immediately: factoring the duplication into
+  `sample_and_emit` initially returned one bool meaning both "was EOS" and
+  "should retire", and the decode path's `&& !eos` reason test then reported
+  `"stop"` where it must report `"length"` - a user-visible `finish_reason`
+  regression.  The helper returns a `sample_outcome { eos, done }` for exactly
+  that reason.
 * **Cross-sequence prefill batching is NOT enabled** (it corrupts).  Packing
   several prompts into one mode-2 forward (row-major over the concatenated
   tokens, per-row `slot`/`pos`/`n_real_row`, one `prefill_text` per batch) was
