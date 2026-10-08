@@ -40,6 +40,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <sycl/sycl.hpp>
 
 // Baked in by CMake (-DSYCL_INFER_AOT_PROFILE=<key>); empty means auto-detect.
@@ -168,6 +169,24 @@ const profile & active();
 // Resolve from a SYCL device name without touching any device state, by asking
 // each registered card's own matcher.
 const profile & for_name(const std::string & device_name);
+
+// Why a set of GPUs cannot share one profile, if it cannot.
+//
+// active() resolves once per process from the *first* GPU and wg_clamped() caches
+// that card's max_work_group_size, so every launch - on every card - reads the
+// first card's tuning.  A heterogeneous --layer-map therefore does not merely
+// run the second card with the wrong occupancy/SLM budget/split rows: it can
+// launch a work-group the second card cannot accept (the A770 takes 1024
+// threads, the Iris Xe only 512), which is a hard launch failure rather than a
+// slowdown.  So the split is refused rather than silently mis-tuned.
+//
+// Pure over device names, so a test can drive it without two cards in the box.
+struct profile_split {
+    bool homogeneous = true;
+    std::string first_name, first_key;
+    std::string other_name, other_key; // the first device that disagrees
+};
+profile_split check_profiles_homogeneous(const std::vector<std::string> & device_names);
 
 // The banner.  A shared helper so the auto-detect path and a forced
 // PF_DEVICE_PROFILE both report themselves; returning early from the forced

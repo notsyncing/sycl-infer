@@ -148,6 +148,35 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
     }
+    // Every launch reads the process-wide profile (active(), resolved from the
+    // first GPU) and wg_clamped()'s cache is that card's work-group limit, so a
+    // split across cards that resolve differently would run the second card with
+    // the first card's tuning - and could launch a work-group it cannot accept
+    // (A770 1024 threads vs Iris Xe 512), which fails rather than slows down.
+    // Refuse instead, and say which cards disagree.
+    {
+        std::vector<std::string> gpu_names;
+        for (size_t d = 0; d < backends_.size(); d++) {
+            if (dev_kind_[d] == 0 && dev_queues_[d]) {
+                gpu_names.push_back(dev_queues_[d]->get_device().get_info<sycl::info::device::name>());
+            }
+        }
+        const si::dev::profile_split sp = si::dev::check_profiles_homogeneous(gpu_names);
+        if (!sp.homogeneous) {
+            throw std::runtime_error("layer map spans GPUs with different device profiles: '" + sp.first_name +
+                                     "' resolves to profile '" + sp.first_key + "' but '" + sp.other_name +
+                                     "' resolves to '" + sp.other_key +
+                                     "'.  Every kernel reads one process-wide profile, so a mixed split cannot "
+                                     "be tuned correctly (and wg_clamped() would clamp to the wrong card's "
+                                     "limit).  Use GPUs of the same model, or add/extend a profile under "
+                                     "src/device/profiles/.");
+        }
+        if (si::env::flag("PF_DEVICE_INFO")) {
+            for (const std::string & n : gpu_names) {
+                si::dev::report(si::dev::for_name(n), ("device in use: " + n).c_str());
+            }
+        }
+    }
     if (!multi_dev) {
         be = cpu_mode ? make_cpu_backend() : make_gpu_backend(q);
     }

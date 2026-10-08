@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include "common/env.h"
 
 namespace si::dev {
@@ -51,6 +52,26 @@ const profile & for_name(const std::string & device_name) {
         }
     }
     return unknown_profile();
+}
+
+profile_split check_profiles_homogeneous(const std::vector<std::string> & device_names) {
+    profile_split r;
+    if (device_names.empty()) {
+        return r;
+    }
+    const profile & first = for_name(device_names[0]);
+    r.first_name = device_names[0];
+    r.first_key = first.key;
+    for (size_t i = 1; i < device_names.size(); i++) {
+        const profile & p = for_name(device_names[i]);
+        if (std::strcmp(p.key, first.key) != 0) {
+            r.homogeneous = false;
+            r.other_name = device_names[i];
+            r.other_key = p.key;
+            return r;
+        }
+    }
+    return r;
 }
 
 void report(const profile & p, const char * how) {

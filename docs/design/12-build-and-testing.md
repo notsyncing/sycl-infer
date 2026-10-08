@@ -309,6 +309,22 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:gpu.1 ./build/test_decode_vs_prefill  # OK
 TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 ```
 
+### 3.4.1 异构 `--layer-map` 现在被拒绝（行为变化）
+
+**同一型号的 GPU 才能一起分卡。** 引擎构造时会把所有在用 GPU 的设备名交给
+`si::dev::check_profiles_homogeneous`（`src/device/device_registry.cpp`），只要解析出的
+device profile 不一致就抛错，消息里点名两张卡与各自的 profile。
+
+原因是**所有 kernel 读的是同一份进程级 profile**：`si::dev::active()` 只从**第一张** GPU 解析
+一次，`wg_clamped()` 缓存的也是那张卡的 `max_work_group_size`。所以异构分卡不只是"第二张卡调优值
+不对"，而是可能**发一个它不接受的工作组**——A770 允许 1024 线程、Iris Xe 只允许 512，第一张卡是
+A770 时就会往 Iris Xe 分区发 1024 宽的 kernel，那是 launch 失败不是变慢。
+
+**这是拒绝而不是支持**。真正支持异构需要按 queue/设备解析 profile（即让每个 launcher 用它那条
+队列的 profile，而不是 `active()`），那会触及每个 kernel launcher 的热路径，得单独测量，所以
+没有顺手做。`test_dev_profile` 无需 GPU，用合成设备名覆盖判定逻辑
+（同型号三张、A770+Iris Xe、Iris Xe+A770、冲突出现在非首位、unknown 卡与真卡的冲突）。
+
 ### 3.5 include-cleaner lint（`Diagnostics.UnusedIncludes: Strict` 必须干净）
 
 ```bash
