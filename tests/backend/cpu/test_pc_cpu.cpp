@@ -75,6 +75,24 @@ static std::vector<float> run_prompt(engine & e, const std::vector<int> & prompt
     return logits;
 }
 
+// Exhaust the block pool, which is what forces every resident prefix-cache node
+// down a tier (the allocator's fallback path evicts LRU-first).  Returns how many
+// blocks it managed to take.
+static int evict_all(engine & e) {
+    std::vector<int> tmp;
+    for (;;) {
+        const int b = e.alloc_block();
+        if (b < 0) {
+            break;
+        }
+        tmp.push_back(b);
+    }
+    for (int b : tmp) {
+        e.free_block(b);
+    }
+    return (int)tmp.size();
+}
+
 // ---- chunk-boundary independence (no prefix cache anywhere in this) ----------
 //
 // The registered known failure compares a cold pass against a warm one, and the
@@ -220,21 +238,7 @@ int main(int argc, char ** argv) {
         }
 
         // exhaust the block pool, forcing every VRAM node down to disk
-        auto evict_all = [&]() {
-            std::vector<int> tmp;
-            for (;;) {
-                const int b = e.alloc_block();
-                if (b < 0) {
-                    break;
-                }
-                tmp.push_back(b);
-            }
-            for (int b : tmp) {
-                e.free_block(b);
-            }
-            return (int)tmp.size();
-        };
-        CHECK(evict_all() > 0);
+        CHECK(evict_all(e) > 0);
         CHECK(e.pc_nodes() == 0); // VRAM empty -> the next admit must hit disk
         CHECK(e.pc_disk_records() == 3);
 
@@ -316,7 +320,7 @@ int main(int argc, char ** argv) {
         CHECK(amax_cold == amax_warm);
         CHECK(maxd == 0.0); // resumed state + KV must reproduce the cold logits
         // push them back to disk so the restart below has records to load
-        CHECK(evict_all() > 0);
+        CHECK(evict_all(e) > 0);
         CHECK(e.pc_disk_records() == 3);
         } // engine e
         // a fresh engine must rebuild the index from the directory at startup
@@ -335,6 +339,58 @@ int main(int argc, char ** argv) {
         const std::vector<float> restart = run_prompt(e2, prompt, matched_restart);
         CHECK(!restart.empty());
         CHECK(matched_restart == 96);
+    // ---- the RAM tier: the third demotion path, and the only one this test
+        // never exercised (PF_PC_RAM_MB=0 until now, so pc_promote_ram never ran).
+        //
+        // One record is ~0.2 MB of blob plus ~19.3 MB of recurrent state, so a
+        // 21 MB budget holds exactly one and spills the rest - which is the point:
+        // a single run then exercises pc_promote_ram *and* pc_promote_disk, so the
+        // round-trip guards cover both paths.  A budget that held everything (or
+        // nothing) would cover only one.
+        {
+            const fs::path ram_dir = dir / "ram";
+            fs::remove_all(ram_dir, ec);
+            engine_config ec3;
+            ec3.model_path = model_path;
+            ec3.max_seq = 512;
+            ec3.n_blocks = 16;
+            ec3.kv_cap_mb = -1;
+            ec3.pc_dir = ram_dir.string();
+            ec3.pc_disk_mb = 64;
+            ec3.pc_ram_mb = 21; // ~1 record: RAM takes one, disk gets the overflow
+            ec3.device = 1;
+            engine e3(ec3);
+            CHECK(e3.pcr_enabled);
+            CHECK(e3.pcd_enabled);
+
+            std::vector<int> p3 = e3.tk.encode(prompt_text);
+            while ((int)p3.size() < 100) {
+                p3.push_back(198);
+            }
+            p3.resize(100);
+
+            int m3 = -1;
+            CHECK(!run_prompt(e3, p3, m3).empty());
+            CHECK(m3 == 0); // cold: nothing cached yet
+
+            CHECK(evict_all(e3) > 0);
+            printf("  RAM tier after eviction: %zu record(s) in RAM, %zu on disk\n", e3.pc_ram_records(),
+                   e3.pc_disk_records());
+            // both tiers must hold something, or this phase only covered one path
+            CHECK(e3.pc_ram_records() > 0);
+            CHECK(e3.pc_disk_records() > 0);
+
+            const uint64_t ram_loads0 = e3.pc_stat_ram_loads;
+            int m3w = -1;
+            const std::vector<float> warm3 = run_prompt(e3, p3, m3w);
+            printf("  RAM-tier warm resume: matched=%d, ram loads=%llu\n", m3w,
+                   (unsigned long long)(e3.pc_stat_ram_loads - ram_loads0));
+            CHECK(!warm3.empty());
+            CHECK(m3w > 0); // resumed from a lower tier rather than recomputing
+            // the whole point of the phase: the RAM record really was loaded
+            CHECK(e3.pc_stat_ram_loads > ram_loads0);
+        }
+        fs::remove_all(dir / "ram", ec);
     } catch (const std::exception & ex) {
         fprintf(stderr, "error: %s\n", ex.what());
         fs::remove_all(dir, ec);
