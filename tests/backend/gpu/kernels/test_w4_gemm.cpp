@@ -73,16 +73,17 @@ int main(int argc, char ** argv) {
                 float * xr = sycl::malloc_device<float>((size_t)MR * K, q);
                 float * orr = sycl::malloc_device<float>((size_t)MR * N, q);
                 q.memcpy(xr, xg.data(), (size_t)MR * K * 4).wait();
-                if (!D.quantize(xr, nullptr, K, 0, MR, K)) {
+                const si::act_view avr = D.quantize(xr, nullptr, K, 0, MR, K);
+                if (!avr.valid()) {
                     sycl::free(xr, q);
                     sycl::free(orr, q);
                     continue;
                 }
-                D.gemm_w4(key, nullptr, 1.f, MR, K, orr, N);
+                D.gemm_w4(avr, key, nullptr, 1.f, MR, K, orr, N);
                 q.wait();
                 auto t0 = std::chrono::high_resolution_clock::now();
                 for (int it = 0; it < iters; it++) {
-                    D.gemm_w4(key, nullptr, 1.f, MR, K, orr, N);
+                    D.gemm_w4(avr, key, nullptr, 1.f, MR, K, orr, N);
                 }
                 q.wait();
                 auto t1 = std::chrono::high_resolution_clock::now();
@@ -110,19 +111,20 @@ int main(int argc, char ** argv) {
         float * xd = sycl::malloc_device<float>((size_t)M * K, q);
         float * od = sycl::malloc_device<float>((size_t)M * N, q);
         q.memcpy(xd, x.data(), (size_t)M * K * 4).wait();
-        if (!D.quantize(xd, nullptr, K, 0, M, K)) {
+        si::act_view av = D.quantize(xd, nullptr, K, 0, M, K);
+        if (!av.valid()) {
             printf("quantize failed\n");
             return 1;
         }
         float * od8 = sycl::malloc_device<float>((size_t)M * N, q);
-        const bool have_i8 = D.gemm(key, nullptr, 1.f, M, K, od8, N);
+        const bool have_i8 = D.gemm(av, key, nullptr, 1.f, M, K, od8, N);
         std::vector<float> out8;
         if (have_i8) {
             out8.resize((size_t)M * N);
             q.memcpy(out8.data(), od8, (size_t)M * N * 4).wait();
         }
         sycl::free(od8, q);
-        if (!D.gemm_w4(key, nullptr, 1.f, M, K, od, N)) {
+        if (!D.gemm_w4(av, key, nullptr, 1.f, M, K, od, N)) {
             // this (M,N) has no primitive (M*N over the f32 accumulator budget)
             printf("  %-30s K=%5d N=%5d M=%3d  SKIP (no primitive)\n", t.name.c_str(), K, N, M);
             sycl::free(xd, q);
@@ -144,17 +146,19 @@ int main(int argc, char ** argv) {
             float * o1 = sycl::malloc_device<float>((size_t)N, q);
             for (int m = 0; m < MB; m++) {
                 q.memcpy(x1, x.data() + (size_t)m * K, (size_t)K * 4).wait();
-                if (!D.quantize(x1, nullptr, K, 0, 1, K)) {
+                const si::act_view av1 = D.quantize(x1, nullptr, K, 0, 1, K);
+                if (!av1.valid()) {
                     break;
                 }
-                if (!D.gemm_w4(key, nullptr, 1.f, 1, K, o1, N)) {
+                if (!D.gemm_w4(av1, key, nullptr, 1.f, 1, K, o1, N)) {
                     break;
                 }
                 q.memcpy(gb.data() + (size_t)m * N, o1, (size_t)N * 4).wait();
             }
             sycl::free(x1, q);
             sycl::free(o1, q);
-            if (D.quantize(xd, nullptr, K, 0, MB, K) && D.gemm_w4(key, nullptr, 1.f, MB, K, od, N)) {
+            const si::act_view avb = D.quantize(xd, nullptr, K, 0, MB, K);
+            if (avb.valid() && D.gemm_w4(avb, key, nullptr, 1.f, MB, K, od, N)) {
                 q.memcpy(gg.data(), od, (size_t)MB * N * 4).wait();
                 double mx = 0, ref = 0;
                 int bad = 0;
@@ -168,10 +172,18 @@ int main(int argc, char ** argv) {
                 }
                 printf("  %-30s K=%5d N=%5d M=%d  batched-vs-gemv maxdiff=%.3e |ref|=%.3f bad=%d\n",
                        t.name.c_str(), K, N, MB, mx, ref, bad);
-                if (!D.quantize(xd, nullptr, K, 0, M, K)) {
+                // Restore the M-row activation the reference below needs.  Its view
+                // has to be the one used afterwards: the batched (MB-row) pass above
+                // moved the generation on, so the earlier `av` is stale - and the
+                // accessors now refuse a stale view instead of handing back whatever
+                // happens to be in the scratch, which is exactly the silent
+                // dependency this type exists to remove.
+                const si::act_view av2 = D.quantize(xd, nullptr, K, 0, M, K);
+                if (!av2.valid()) {
                     printf("requantize failed\n");
                     return 1;
                 }
+                av = av2;
             }
         }
 
@@ -182,8 +194,8 @@ int main(int argc, char ** argv) {
         // the per-32-group form now, so the reference must use it too
         std::vector<int8_t> hxq((size_t)M * K);
         std::vector<uint16_t> hsa((size_t)M * (K / 32));
-        q.memcpy(hxq.data(), D.act_grp_data(), (size_t)M * K).wait();
-        q.memcpy(hsa.data(), D.act_grp_scales(), (size_t)M * (K / 32) * 2).wait();
+        q.memcpy(hxq.data(), D.act_grp_data(av), (size_t)M * K).wait();
+        q.memcpy(hsa.data(), D.act_grp_scales(av), (size_t)M * (K / 32) * 2).wait();
         auto h2f = [](uint16_t h) {
             sycl::half x;
             std::memcpy(&x, &h, 2);

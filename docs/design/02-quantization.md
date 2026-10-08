@@ -373,6 +373,29 @@ groups={1,32}`（= `asa`），见 `make_prim`（`dnnl_gemm.cpp:497-539`）。因
 理由记在 `dnnl_gemm.cpp:1222-1236`（两个权重路径现在都读每 32 组的形式，这个 kernel 只剩纯
 per-call 延迟，27B decode 的 320 个 call 实测 ~13 ms/token）。
 
+### 6.3.1 显式 activation view（`act_view`）
+
+「哪些 GEMM 可以读共享 scratch」过去是 `impl` 上的隐式协议：一个 `acts_valid` bool 加
+`(cur_M, cur_K)`，由 ~8 个入口各自重复检查，其中 `split_valid` 决定 native u4/k5/cb4 路径是否
+相信 scratch 里的偶/奇 k 平面。**这正是会静默出错的形状**：AGENTS.md 记着漏掉那个守卫曾静默
+损坏 0.8B 多设备 decode（gen0/gen1/ref 220/220/567 对 248068/271/271），而单设备测试全过。
+
+现在 `quantize()` 返回一个不透明的 `act_view { m, k, split, gen }`，每个 GEMM 入口
+（`gemm` / `gemm_w4` / `gemm_w2` / `gemm_i8_group` / 六个 `act_*` 访问器）都**必须**接收它：
+
+* **没有 view 的 GEMM 编译不过**——漏掉不再是一个能悄悄走错分支的运行时分支；
+* `view_is_current(v)` 是**一次整数比较**（generation 计数器）。只比对 M/K 只能发现"形状不同"，
+  发现不了"中间被别人重新量化过、形状恰好相同"，而调用方也无从知道自己拿的是哪一个；
+* `split_valid` 从对象状态变成 view 自己的字段，所以一个 view 自带它的偶/奇平面是否存在。
+
+`gen` 在每次 `quantize()`（**包括失败的那次**）都自增，所以失败返回的 view（`gen == 0`）
+天然失效。逐行 GEMM（`df_gemm` 的 rowed 模式）每行自己量化、自己带 view。
+
+顺带暴露了一处既有不对称（`engine_mtp.cpp` 的 `PF_MTP_HEAD_SPLIT` 路径）：D1 用
+`do_split=true` 量化而 D 的 view 带的是 `do_split=w4_draft`，所以 `w4_draft` 为假时两半走不同
+kernel 分支——**这是原 `split_valid` 就有的行为，本次刻意不改**（该路径 opt-in 且实测是 wash，
+不属于管道重构的范围），但现在它有注释说明。
+
 ### 6.4 为什么不能录制进图
 
 oneDNN primitive 无法被 SYCL command graph 捕获。除了靠 `use_dnnl` 不录图之外，还有三道保险：

@@ -2429,9 +2429,10 @@ std::vector<float> engine::run_head() {
         // wkey: the host (oneDNN) key when the head was converted, the uploaded
         // device pointer otherwise
         const void * hk = wkey(0, m.output.data);
-        if (hk && D->quantize(d_last_hidden, nullptr, hp.n_embd, hp.n_embd, 1, hp.n_embd)) {
-            head_done = D->gemm_w4(hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab)
-                        || D->gemm(hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab);
+        const act_view av = D->quantize(d_last_hidden, nullptr, hp.n_embd, hp.n_embd, 1, hp.n_embd);
+        if (hk && av.valid()) {
+            head_done = D->gemm_w4(av, hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab)
+                        || D->gemm(av, hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab);
         }
     }
     if (head_done) {

@@ -349,6 +349,12 @@ struct dnnl_gemm::impl {
     int cap_M = 0, cap_K = 0; // scratch capacity
     int cur_M = 0, cur_K = 0; // currently quantized activations
     bool acts_valid = false;
+    // Which quantize() last ran.  A view carries this back, so "is this the
+    // activation the caller thinks it is?" is one integer compare - and, unlike
+    // re-deriving M and K at every entry point, it also catches a view that went
+    // stale because something else quantized in between without changing the
+    // shape.
+    unsigned act_gen = 0;
     // whether the current activations include the even/odd k split (axe/axo)
     // that the native batched u4/k5 GEMM reads; false for the plain prefill
     // quantizer (PF_GEMM_DNNL mode-2), which skips the extra stores.
@@ -1119,7 +1125,7 @@ bool dnnl_gemm::has_weight_w2(const void * key) const {
 
 // out[n] = sum_g asa[g] * (scale[g][n] * qd[g] + off[g][n] * xs[g]), qd the
 // int8 dot product of the group's quantized activation with the 2-bit levels.
-bool dnnl_gemm::gemm_w2(const void * key, const float * residual, float alpha, int M, int K, float * out,
+bool dnnl_gemm::gemm_w2(const act_view & v, const void * key, const float * residual, float alpha, int M, int K, float * out,
                         int out_stride) {
     static const bool dbg = si::env::flag("PF_W2_DEBUG");
     auto it = p->w2weights.find(key);
@@ -1131,10 +1137,10 @@ bool dnnl_gemm::gemm_w2(const void * key, const float * residual, float alpha, i
         }
         return false;
     }
-    if (!p->acts_valid || M != p->cur_M || K != p->cur_K || !p->axg || !p->asa || !p->xs) {
+    if (!view_is_current(v) || M != v.m || K != v.k || !p->axg || !p->asa || !p->xs) {
         if (dbg) {
-            fprintf(stderr, "[w2] miss: acts_valid=%d curM=%d/%d curK=%d/%d axg=%p asa=%p xs=%p\n",
-                    (int)p->acts_valid, M, p->cur_M, K, p->cur_K, (void *)p->axg, (void *)p->asa, (void *)p->xs);
+            fprintf(stderr, "[w2] miss: view gen=%u/%u curM=%d/%d curK=%d/%d axg=%p asa=%p xs=%p\n", v.gen,
+                    p->act_gen, M, p->cur_M, K, p->cur_K, (void *)p->axg, (void *)p->asa, (void *)p->xs);
         }
         return false;
     }
@@ -1238,11 +1244,13 @@ int dnnl_gemm::warmup() {
     return n;
 }
 
-bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
-                         bool do_split) {
+act_view dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
+                             bool do_split) {
+    act_view v;
     p->acts_valid = false;
+    ++p->act_gen; // any view from before this call is now stale, valid or not
     if (!x || M <= 0 || M > p->cap_M || K <= 0 || K > p->cap_K) {
-        return false;
+        return v;
     }
     // The per-row int8 form (ax/axs/axsum) is no longer consumed: both weight
     // paths read the per-32-group form (axg + asa for the oneDNN matmul's
@@ -1269,16 +1277,24 @@ bool dnnl_gemm::quantize(const float * x, const float * up, int x_stride, int up
     p->cur_K = K;
     p->acts_valid = true;
     p->split_valid = do_split;
-    return true;
+    v.m = M;
+    v.k = K;
+    v.split = do_split;
+    v.gen = p->act_gen;
+    return v;
 }
 
-bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride) {
-    if (!p->acts_valid || M != p->cur_M || K != p->cur_K) {
+bool dnnl_gemm::view_is_current(const act_view & v) const {
+    return v.valid() && p->acts_valid && v.gen == p->act_gen;
+}
+
+bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride) {
+    if (!view_is_current(v) || M != v.m || K != v.k) {
         return false;
     }
     if (auto kit = p->k5weights.find(key); kit != p->k5weights.end() && kit->second.ok) {
         impl::k5_entry & e = kit->second;
-        if (e.K != K || !p->acts_valid || M != p->cur_M || K != p->cur_K) {
+        if (e.K != K || !view_is_current(v) || M != v.m || K != v.k) {
             return false;
         }
         if (M == 1) {
@@ -1288,7 +1304,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
             return true;
         }
         // batched verify: same native 5-bit stream (0.75 B/weight) for all M
-        if (p->split_valid && p->axe && p->axo && p->axg && p->asa && p->xs && p->bit_lut
+        if (v.split && p->axe && p->axo && p->axg && p->asa && p->xs && p->bit_lut
             && nat_gemm_launch(p->q, 1, e.vals, e.hi, nullptr, e.scales, e.off, nullptr, p->bit_lut, p->axe, p->axo,
                                p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, e.N)) {
             return true;
@@ -1335,7 +1351,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
     }
     if (auto cit = p->cb4weights.find(key); cit != p->cb4weights.end() && cit->second.ok) {
         impl::cb4_entry & e = cit->second;
-        if (e.K != K || !p->acts_valid || M != p->cur_M || K != p->cur_K) {
+        if (e.K != K || !view_is_current(v) || M != v.m || K != v.k) {
             return false;
         }
         if (M == 1) {
@@ -1345,7 +1361,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
         }
         // batched verify: the same index plane + in-kernel LUT, no int8 scratch
         // (split_valid as above: the same activation form as the decode/verify)
-        if (p->split_valid && p->axg && p->asa && p->xs && p->lut16
+        if (v.split && p->axg && p->asa && p->xs && p->lut16
             && nat_gemm_launch(p->q, 2, e.idx, nullptr, nullptr, e.scales, nullptr, p->lut16, nullptr, nullptr,
                                nullptr, p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, e.N)) {
             return true;
@@ -1397,7 +1413,7 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
     // quantizes with do_split=false and then reads *different* (stale) grouped
     // activation views - without the guard the 0.8B multi-device
     // decode-vs-prefill test fails with nat on and passes with PF_NAT=0.
-    if (M >= 2 && p->split_valid && p->axg && p->asa && p->xs) {
+    if (M >= 2 && v.split && p->axg && p->asa && p->xs) {
         if (nat_gemm_launch(p->q, 3, nullptr, nullptr, w.dev, w.scales, nullptr, nullptr, nullptr, nullptr, nullptr,
                             p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, w.N)) {
             return true;
@@ -1445,9 +1461,9 @@ bool dnnl_gemm::gemm(const void * key, const float * residual, float alpha, int 
 // residual.  acc4 comes from oneDNN with the grouped f16 step scales applied;
 // the offset (zero-point) part is added by w4_epilogue_launch from the group
 // sums of the same quantized activations.
-bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, int M, int K, float * out,
+bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * residual, float alpha, int M, int K, float * out,
                         int out_stride) {
-    if (!p->acts_valid || M != p->cur_M || K != p->cur_K) {
+    if (!view_is_current(v) || M != v.m || K != v.k) {
         return false;
     }
     auto it = p->w4weights.find(key);
@@ -1461,7 +1477,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
     // MTP speculative verify: read the 0.625 B/weight native u4 stream once for
     // all M rows at the card's read ceiling, instead of oneDNN's grouped
     // f32-dst matmul.  Needs the even/odd activation split (mtp_dry / decode).
-    if (M >= 2 && p->split_valid && p->axe && p->axo && p->axg && p->asa && p->xs) {
+    if (M >= 2 && v.split && p->axe && p->axo && p->axg && p->asa && p->xs) {
         if (nat_gemm_launch(p->q, 0, w.vals, nullptr, nullptr, w.scales, w.off, nullptr, nullptr, p->axe, p->axo,
                             p->axg, p->asa, p->xs, out, out_stride, residual, alpha, M, K, w.N)) {
             return true;
@@ -1501,7 +1517,7 @@ bool dnnl_gemm::gemm_w4(const void * key, const float * residual, float alpha, i
             fprintf(stderr,
                     "[w4] gemm_w4 M=%d K=%d N=%d key=%p actsv=%d split=%d axe=%d/%d out=%p res=%p alpha=%.2f "
                     "(buckets: 1=%ld 32=%ld 64=%ld big=%ld)\n",
-                    M, K, w.N, key, (int)p->acts_valid, (int)p->split_valid, (int)(p->axe != nullptr), (int)has_axe,
+                    M, K, w.N, key, (int)p->acts_valid, (int)v.split, (int)(p->axe != nullptr), (int)has_axe,
                     (void *)out, (void *)residual, alpha, hist[0], hist[1], hist[2], hist[3]);
         }
     }
@@ -1567,10 +1583,10 @@ const int8_t * dnnl_gemm::weight_data(const void * key) const {
 // dp4a) is what costs, and the batched path is better above it.
 static const int kNarrowRows = 2048;
 
-bool dnnl_gemm::gemm_i8_group(const void * const * keys, const int * n_rows, const float * const * outs,
+bool dnnl_gemm::gemm_i8_group(const act_view & v, const void * const * keys, const int * n_rows, const float * const * outs,
                               int out_stride, const float * const * residuals, const float * alphas, int n_segs,
                               int M, int K) {
-    if (n_segs < 1 || n_segs > 4 || !p->acts_valid || M < 1 || M > 13 || K <= 0 || K % 32) {
+    if (n_segs < 1 || n_segs > 4 || !view_is_current(v) || M != v.m || K != v.k || M < 1 || M > 13 || K <= 0 || K % 32) {
         return false;
     }
     i8_grp_seg segs[4];
@@ -1616,28 +1632,28 @@ const float * dnnl_gemm::weight_scales(const void * key) const {
     return nullptr;
 }
 
-const int8_t * dnnl_gemm::act_grp_data() const {
-    return p->axg;
+const int8_t * dnnl_gemm::act_grp_data(const act_view & v) const {
+    return view_is_current(v) ? p->axg : nullptr;
 }
 
-const uint16_t * dnnl_gemm::act_grp_scales() const {
-    return p->asa;
+const uint16_t * dnnl_gemm::act_grp_scales(const act_view & v) const {
+    return view_is_current(v) ? p->asa : nullptr;
 }
 
-const int8_t * dnnl_gemm::act_data() const {
-    return p->acts_valid ? p->ax : nullptr;
+const int8_t * dnnl_gemm::act_data(const act_view & v) const {
+    return view_is_current(v) ? p->ax : nullptr;
 }
 
-const float * dnnl_gemm::act_group_sums() const {
-    return p->acts_valid ? p->xs : nullptr;
+const float * dnnl_gemm::act_group_sums(const act_view & v) const {
+    return view_is_current(v) ? p->xs : nullptr;
 }
 
-const float * dnnl_gemm::act_scales() const {
-    return p->acts_valid ? p->axs : nullptr;
+const float * dnnl_gemm::act_scales(const act_view & v) const {
+    return view_is_current(v) ? p->axs : nullptr;
 }
 
-const int32_t * dnnl_gemm::act_sum() const {
-    return p->acts_valid ? p->axsum : nullptr;
+const int32_t * dnnl_gemm::act_sum(const act_view & v) const {
+    return view_is_current(v) ? p->axsum : nullptr;
 }
 
 // ---------------------------------------------------------------------------

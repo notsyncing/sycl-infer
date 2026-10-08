@@ -65,8 +65,8 @@ int main(int argc, char ** argv) {
         float * xd = sycl::malloc_device<float>((size_t)M * K, q);
         float * od = sycl::malloc_device<float>((size_t)M * N, q);
         q.memcpy(xd, x.data(), (size_t)M * K * 4).wait();
-        D.quantize(xd, nullptr, K, 0, M, K);
-        if (!D.gemm(key, nullptr, 1.f, M, K, od, N)) {
+        const si::act_view av = D.quantize(xd, nullptr, K, 0, M, K);
+        if (!av.valid() || !D.gemm(av, key, nullptr, 1.f, M, K, od, N)) {
             printf("  %-26s SKIP (gemm)\n", name);
             sycl::free(xd, q);
             sycl::free(od, q);
@@ -78,8 +78,8 @@ int main(int argc, char ** argv) {
         // reference must use it too
         std::vector<int8_t> hxq((size_t)M * K);
         std::vector<uint16_t> hsa((size_t)M * (K / 32));
-        q.memcpy(hxq.data(), D.act_grp_data(), (size_t)M * K).wait();
-        q.memcpy(hsa.data(), D.act_grp_scales(), (size_t)M * (K / 32) * 2).wait();
+        q.memcpy(hxq.data(), D.act_grp_data(av), (size_t)M * K).wait();
+        q.memcpy(hsa.data(), D.act_grp_scales(av), (size_t)M * (K / 32) * 2).wait();
         auto h2f = [](uint16_t h) {
             sycl::half x;
             std::memcpy(&x, &h, 2);

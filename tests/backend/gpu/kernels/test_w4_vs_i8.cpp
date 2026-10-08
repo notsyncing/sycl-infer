@@ -56,9 +56,9 @@ int main(int argc, char ** argv) {
         float * o1 = sycl::malloc_device<float>((size_t)M * N, q);
         float * o2 = sycl::malloc_device<float>((size_t)M * N, q);
         q.memcpy(xd, x.data(), (size_t)M * K * 4).wait();
-        D.quantize(xd, nullptr, K, 0, M, K);
-        const bool ok1 = D.gemm(key, nullptr, 1.f, M, K, o1, N);
-        const bool ok2 = D.gemm_w4(key, nullptr, 1.f, M, K, o2, N);
+        const si::act_view av = D.quantize(xd, nullptr, K, 0, M, K);
+        const bool ok1 = D.gemm(av, key, nullptr, 1.f, M, K, o1, N);
+        const bool ok2 = D.gemm_w4(av, key, nullptr, 1.f, M, K, o2, N);
         if (!ok1 || !ok2) {
             printf("  %-34s gemm int8=%d u4=%d\n", t.name.c_str(), (int)ok1, (int)ok2);
             sycl::free(xd, q);

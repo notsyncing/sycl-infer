@@ -36,6 +36,31 @@ bool dnnl_gemm_enabled(const sycl::queue & q);
 void dnnl_set_capturing(bool on);
 void dnnl_capture_guard();
 
+// What quantize() produced, and what every GEMM entry point requires.
+//
+// This used to be an implicit protocol on the object: a bool plus the (M, K)
+// last quantized, which each of ~8 entry points re-checked.  That is exactly the
+// shape that goes wrong silently - the u4/k5/cb4 paths read `split_valid` to
+// decide whether the even/odd k planes in the scratch are the operands they
+// expect, and a missing guard there corrupted the 0.8B multi-device decode
+// (gen0/gen1/ref 220/220/567 against 248068/271/271) while every single-device
+// test passed.  Mismatching M and K is only *half* detectable that way: a view
+// that went stale because something else quantized in between is not detectable,
+// and the caller cannot tell which one it is holding.
+//
+// So quantize() hands back an opaque view carrying the geometry and a generation
+// counter, and each entry point takes it.  A GEMM without an activation is now a
+// signature that does not compile, and a stale one fails a single integer
+// compare instead of being silently believed.
+struct act_view {
+    int m = 0, k = 0;
+    bool split = false; // the even/odd k planes are present
+    unsigned gen = 0;   // 0 = invalid; otherwise which quantize() produced it
+    bool valid() const {
+        return gen != 0;
+    }
+};
+
 struct dnnl_gemm {
     explicit dnnl_gemm(sycl::queue & q);
     ~dnnl_gemm();
@@ -75,7 +100,7 @@ struct dnnl_gemm {
     bool add_weight_w2(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
     bool has_weight_w2(const void * key) const;
     // Same contract as gemm_w4 but on the 2-bit store and M == 1 only.
-    bool gemm_w2(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
+    bool gemm_w2(const act_view & v, const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
 
     // ---- native-width 5-bit weights (Q5_K, see common/w4.h) ---------------
     // The 4-bit nibble plane plus a 1-bit fifth-bit plane and the same two
@@ -100,7 +125,7 @@ struct dnnl_gemm {
     // (int8 + u4 + codebook + the codebook prefill scratch)
     size_t weight_bytes() const;
     // Same contract as gemm(); out = alpha*sx[m]*(acc4 + correction) + residual.
-    bool gemm_w4(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
+    bool gemm_w4(const act_view & v, const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
 
     // Quantize one call's activations: x is token-major [M][x_stride]; if up is
     // non-null the value is silu(x)*up (ffn_down).  The result stays valid
@@ -108,12 +133,19 @@ struct dnnl_gemm {
     // do_split also produces the even/odd k deinterleave of the grouped
     // activation (the u4 decode GEMV's operands); prefill only needs xq + asa +
     // xs, so it passes false and skips the extra stores.
-    bool quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
-                  bool do_split = true);
+    // Returns the view it produced, or an invalid one (gen == 0) on failure.
+    act_view quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
+                      bool do_split = true);
+    // True when `v` is still the activation sitting in the scratch buffers, i.e.
+    // no quantize() has run since.  Every entry point that reads the scratch
+    // checks this first and returns false (its caller then falls back) if not.
+    bool view_is_current(const act_view & v) const;
     // out[m][row] = alpha * sx[m]*sw[row]*acc[m][row] + residual[m][row]
-    // (acc from the oneDNN matmul of the currently quantized activations).
-    // Returns false and writes nothing when the tensor/shape is unsupported.
-    bool gemm(const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
+    // (acc from the oneDNN matmul of `v`'s activations).
+    // Returns false and writes nothing when the tensor/shape is unsupported or
+    // `v` is not the current activation.
+    bool gemm(const act_view & v, const void * key, const float * residual, float alpha, int M, int K,
+              float * out, int out_stride);
 
     // Execute every cached primitive once on dummy data so the first real
     // request does not pay the one-time kernel load.  Call after all weights
@@ -135,22 +167,22 @@ struct dnnl_gemm {
     // without launching anything when the group is not eligible (a non-int8
     // segment, mixed K, more than four segments, or more rows than the narrow
     // cutoff), so the caller keeps its per-segment path.
-    bool gemm_i8_group(const void * const * keys, const int * n_rows, const float * const * outs,
+    bool gemm_i8_group(const act_view & v, const void * const * keys, const int * n_rows, const float * const * outs,
                        int out_stride, const float * const * residuals, const float * alphas, int n_segs, int M,
                        int K);
-    const int8_t * act_data() const;
+    const int8_t * act_data(const act_view & v) const;
     // u4 path: the per-32-group quantized activations and their f16 scales
     // (device pointers), produced alongside the per-row form when a u4 weight
     // has been registered.
-    const int8_t * act_grp_data() const;
-    const uint16_t * act_grp_scales() const;
-    const float * act_scales() const;
+    const int8_t * act_grp_data(const act_view & v) const;
+    const uint16_t * act_grp_scales(const act_view & v) const;
+    const float * act_scales(const act_view & v) const;
     // Per-32-group f32 sum of the quantized activations ([M][K/32]): the XOR-bias
     // correction the u4/k5/int8 grouped GEMVs apply, and the MTP candidate head's.
-    const float * act_group_sums() const;
+    const float * act_group_sums(const act_view & v) const;
     // per-row sum of the quantized activations (int32, device memory) used by
     // the dp4a decode GEMV's weight bias correction
-    const int32_t * act_sum() const;
+    const int32_t * act_sum(const act_view & v) const;
 
     // ---- XMX (int8) attention GEMMs (PF_ATTN_XMX, see attn.cpp) -----------
     // Plain int8 matmuls with an s32 accumulator for the two attention GEMMs:

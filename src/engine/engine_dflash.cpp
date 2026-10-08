@@ -824,23 +824,21 @@ bool engine::df_gemm(const wt & w, const float * x, int xs, float * out, int os,
         for (int m = 0; m < M; m++) {
             const float * xm = x ? x + (size_t)m * xs : nullptr;
             float * om = out + (size_t)m * os;
-            if (!D->quantize(xm, up ? up + (size_t)m * us : nullptr, xs, us, 1, w.K, dsplit)) {
-                return false;
-            }
-            if (!D->gemm_w4(w.data, res ? res + (size_t)m * os : nullptr, 1.0f, 1, w.K, om, os)
-                && !D->gemm(w.data, res ? res + (size_t)m * os : nullptr, 1.0f, 1, w.K, om, os)) {
+            // one row at a time, so each row gets its own view
+            const act_view avr =
+                D->quantize(xm, up ? up + (size_t)m * us : nullptr, xs, us, 1, w.K, dsplit);
+            if (!D->gemm_w4(avr, w.data, res ? res + (size_t)m * os : nullptr, 1.0f, 1, w.K, om, os)
+                && !D->gemm(avr, w.data, res ? res + (size_t)m * os : nullptr, 1.0f, 1, w.K, om, os)) {
                 return false;
             }
         }
         return true;
     }
-    if (!D->quantize(x, up, xs, us, M, w.K, dsplit)) {
-        return false;
-    }
-    if (D->gemm_w4(w.data, res, 1.0f, M, w.K, out, os)) {
+    const act_view av = D->quantize(x, up, xs, us, M, w.K, dsplit);
+    if (D->gemm_w4(av, w.data, res, 1.0f, M, w.K, out, os)) {
         return true;
     }
-    return D->gemm(w.data, res, 1.0f, M, w.K, out, os);
+    return D->gemm(av, w.data, res, 1.0f, M, w.K, out, os);
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,13 +1628,11 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
 bool engine::df_gemm_head(const float * x, int M) {
     dnnl_gemm * D = dnnl_for(dfl.df_dev_);
     const wt & head = m.output;
-    if (!D->quantize(x, nullptr, m.hp.n_embd, 0, M, head.K, /*do_split=*/true)) {
-        return false;
-    }
-    if (dfl.df_head_key_ && D->gemm_w4(dfl.df_head_key_, nullptr, 1.0f, M, head.K, d_logits, m.hp.n_vocab)) {
+    const act_view av = D->quantize(x, nullptr, m.hp.n_embd, 0, M, head.K, /*do_split=*/true);
+    if (dfl.df_head_key_ && D->gemm_w4(av, dfl.df_head_key_, nullptr, 1.0f, M, head.K, d_logits, m.hp.n_vocab)) {
         return true;
     }
-    if (D->gemm(wkey(dfl.df_dev_, head.data), nullptr, 1.0f, M, head.K, d_logits, m.hp.n_vocab)) {
+    if (D->gemm(av, wkey(dfl.df_dev_, head.data), nullptr, 1.0f, M, head.K, d_logits, m.hp.n_vocab)) {
         if (si::env::flag("PF_DFLASH_HEADCHK") && M <= 4) {
             // Compare against an exact fp32 dequant of the GGUF blocks: the head is
             // the one readout with no exact path (gemm_w4 / oneDNN int8 only), so

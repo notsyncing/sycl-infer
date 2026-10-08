@@ -644,14 +644,20 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             }
             return true;
         }();
+        // The view every GEMM below must carry: it names the one activation
+        // quantized for this call, so a later GEMM in the same call cannot
+        // accidentally read a different one - and a call that skipped the
+        // quantize no longer compiles.  Invalid when dnnl_call is false, which is
+        // exactly when the gemm paths below are not taken either.
+        act_view av;
         if (dnnl_call) {
             const seg_plan::xq_t & xq = plan.call_xq[idx];
             const auto a2 = tnow();
             // decode reads the even/odd split in the u4 GEMV; prefill does not
             // do_split also feeds the native-u4 GEMM's even/odd activation planes,
             // which the MTP speculative verify (a mode-2 batch) uses.
-            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K,
-                        /*do_split=*/mode == 0 || inf->mtp_dry != 0);
+            av = D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K,
+                             /*do_split=*/mode == 0 || inf->mtp_dry != 0);
             g_lc.calls++;
             g_lc.xq++;
             g_lc.xq_merge += (g_lc.xq_prev == xq.x) ? 1 : 0;
@@ -712,7 +718,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     for (int j = 0; j < gr.n; j++) {
                         const gemv_seg & sj = plan.segs[gr.off + j];
                         if (dnnl_call
-                            && D->gemm(sj.w8.vals, sj.residual, sj.alpha, tbm, sj.w8.K, sj.out, sj.out_stride)) {
+                            && D->gemm(av, sj.w8.vals, sj.residual, sj.alpha, tbm, sj.w8.K, sj.out, sj.out_stride)) {
                             continue;
                         }
                         // fallback: an unsupported oneDNN shape (unexpected) needs
@@ -745,8 +751,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 // verified every segment of the call is convertible; a gemm
                 // failure (unexpected) falls the whole group back to fp32.
                 bool dnnl_done = true;
-                const int8_t * aq = D->act_data();
-                const float * asc = D->act_scales();
+                const int8_t * aq = D->act_data(av);
+                const float * asc = D->act_scales(av);
                 bool decoded = false;
                 if (mode == 0 && aq && asc) {
                     // all segments of the call share the activation row: one
@@ -764,7 +770,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     if (all) {
                         static const bool nogemv = si::env::flag("PF_ABL_NOGEMV");
                         if (!nogemv) {
-                            cur_be->i8_row_gemv_multi(d_segs + gr.off, gr.n, tot, aq, asc, D->act_sum());
+                            cur_be->i8_row_gemv_multi(d_segs + gr.off, gr.n, tot, aq, asc, D->act_sum(av));
                         }
                         decoded = true;
                     }
@@ -793,7 +799,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         ok = sj.K == plan.segs[gr.off].K && sj.out_stride == plan.segs[gr.off].out_stride;
                     }
                     if (ok) {
-                        decoded = D->gemm_i8_group(keys, nrows, outs, plan.segs[gr.off].out_stride, res, alphas, gr.n,
+                        decoded = D->gemm_i8_group(av, keys, nrows, outs, plan.segs[gr.off].out_stride, res, alphas, gr.n,
                                                    tbm, plan.segs[gr.off].K);
                         if (si::env::flag("PF_FUSEDBG")) {
                             static long fused = 0, tried = 0;
@@ -824,11 +830,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         g_lc.seg_prev_key = sj.w;
                         g_lc.seg_prev_k = sj.K;
                         g_lc.seg_prev_out = sj.out_stride;
-                        if (D->gemm_w4(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
+                        if (D->gemm_w4(av, sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
                             c_w4++;
                             continue;
                         }
-                        if (D->gemm(sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
+                        if (D->gemm(av, sj.w, sj.residual, sj.alpha, tbm, sj.K, sj.out, sj.out_stride)) {
                             c_i8++;
                             continue;
                         }

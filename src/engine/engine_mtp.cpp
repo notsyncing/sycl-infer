@@ -184,9 +184,11 @@ void engine::mtp_gemv(int ci, int M, int step) {
         const bool gather = (mtp.mtp_cand_cap_ > 0 && mtp.mtp_cand_ok_);
         compute_backend & hb = *backends_[0];
         if (gather) {
-            D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/false);
-            hb.mtp_gather(mtp.d_mtp_cand_, mtp.mtp_cand_cap_, mtp.mtp_head_w8_, mtp.mtp_head_wsc_, D->act_grp_data(),
-                          D->act_grp_scales(), D->act_group_sums(), (int)xq.K, mtp.mtp_head_rows_, mtp.d_mtp_cvals_);
+            const act_view avc =
+                D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/false);
+            hb.mtp_gather(mtp.d_mtp_cand_, mtp.mtp_cand_cap_, mtp.mtp_head_w8_, mtp.mtp_head_wsc_,
+                          D->act_grp_data(avc), D->act_grp_scales(avc), D->act_group_sums(avc), (int)xq.K,
+                          mtp.mtp_head_rows_, mtp.d_mtp_cvals_);
             hb.mtp_gather_argmax(mtp.d_mtp_cvals_, mtp.d_mtp_cand_, mtp.mtp_cand_cap_, mtp.d_mtp_tok_ + step,
                                  si::env::str("PF_MTP_CANDV") ? mtp.d_mtp_cval1_ : nullptr);
             return;
@@ -245,7 +247,10 @@ void engine::mtp_gemv(int ci, int M, int step) {
         }
         return;
     }
-    D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
+    // Every dispatch below reads this activation, so it carries its view; a GEMM
+    // without one no longer compiles, and a view from an earlier quantize is
+    // rejected by the generation check instead of being silently believed.
+    const act_view av = D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
     static const bool head_split_dbg = si::env::flag("PF_MTP_HEAD_SPLIT_DEBUG");
     if (ci == 4 && M == 1 && step >= 0 && mtp.mtp_head_split_) {
         // The head readout split across both cards (opt-in, default off - it
@@ -266,21 +271,45 @@ void engine::mtp_gemv(int ci, int M, int step) {
         const size_t ab = (size_t)m.hp.n_embd * 4;
         dev_queue(1).memcpy(mtp.h_head_stage, mtp.d_mtp_hnorm0, ab).wait();
         dev_queue(1).memcpy(mtp.d_mtp_hnorm1, mtp.h_head_stage, ab);
-        D1->quantize(mtp.d_mtp_hnorm1, nullptr, m.hp.n_embd, 0, 1, m.hp.n_embd, /*do_split=*/true);
-        D1->gemm_w4(mtp.mtp_head_w4b_key_, nullptr, s.alpha, 1, s.K, s.out + n0, 1);
-        D->gemm_w4(mtp.mtp_head_w4lo_key_, nullptr, s.alpha, 1, s.K, s.out, 1);
-        backends_[0]->mtp_argmax(s.out, m.hp.n_vocab, mtp.d_mtp_tok_ + step, nullptr, 1);
-        if (head_split_dbg) {
-            std::vector<float> hl((size_t)m.hp.n_vocab);
-            dev_queue(0).memcpy(hl.data(), s.out, hl.size() * 4).wait();
-            int bh = 0;
-            for (int i = 1; i < m.hp.n_vocab; i++)
-                if (hl[(size_t)i] > hl[(size_t)bh]) bh = i;
-            int32_t di = -1;
-            dev_queue(0).memcpy(&di, mtp.d_mtp_tok_ + step, sizeof(di)).wait();
-            fprintf(stderr, "[mtp] head split step=%d dev=%d host=%d val=%.9g\n", step, di, bh, hl[(size_t)bh]);
+        // Two devices, two device-local copies of the same hidden (device USM is
+        // not shared), so each quantizes its own and each GEMM carries its own
+        // view.  This makes visible a pre-existing asymmetry: D1 quantizes with
+        // do_split=true while D's activation used do_split=w4_draft, so when
+        // w4_draft is false the two halves take different kernel paths - as they
+        // did before, via split_valid.  Left alone deliberately: the path is
+        // opt-in and measured as a wash, so it is not this change's business.
+        const act_view av1 =
+            D1->quantize(mtp.d_mtp_hnorm1, nullptr, m.hp.n_embd, 0, 1, m.hp.n_embd, /*do_split=*/true);
+        // Both halves must succeed or neither is used.  They used to be called
+        // without checking, which was only safe because gemm_w4 could not fail
+        // for a reason the caller could see; now a stale or wrong-shaped view is
+        // a legitimate false, and a half-written logits row would be argmaxed as
+        // if it were whole - silent corruption, not a slowdown.  Falling through
+        // instead of returning gives exactly the PF_MTP_HEAD_SPLIT=0 behaviour
+        // (one unsplit readout on device 0).
+        const bool lo_ok = D->gemm_w4(av, mtp.mtp_head_w4lo_key_, nullptr, s.alpha, 1, s.K, s.out, 1);
+        const bool hi_ok = D1->gemm_w4(av1, mtp.mtp_head_w4b_key_, nullptr, s.alpha, 1, s.K, s.out + n0, 1);
+        if (!lo_ok || !hi_ok) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[mtp] head split GEMM failed (lo=%d hi=%d) - falling back to the unsplit readout\n",
+                        (int)lo_ok, (int)hi_ok);
+            }
+        } else {
+            backends_[0]->mtp_argmax(s.out, m.hp.n_vocab, mtp.d_mtp_tok_ + step, nullptr, 1);
+            if (head_split_dbg) {
+                std::vector<float> hl((size_t)m.hp.n_vocab);
+                dev_queue(0).memcpy(hl.data(), s.out, hl.size() * 4).wait();
+                int bh = 0;
+                for (int i = 1; i < m.hp.n_vocab; i++)
+                    if (hl[(size_t)i] > hl[(size_t)bh]) bh = i;
+                int32_t di = -1;
+                dev_queue(0).memcpy(&di, mtp.d_mtp_tok_ + step, sizeof(di)).wait();
+                fprintf(stderr, "[mtp] head split step=%d dev=%d host=%d val=%.9g\n", step, di, bh, hl[(size_t)bh]);
+            }
+            return;
         }
-        return;
     }
     for (int g = 0; g < gc; g++) {
         const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
@@ -291,21 +320,20 @@ void engine::mtp_gemv(int ci, int M, int step) {
             // against the u4 copy's 0.625, so ~0.5 ms of the cycle per drafted
             // token.  It is the one place a lossy store is free of consequence
             // beyond the draft's own argmax accuracy (see PF_MTP_HEAD_W2).
-            if (ci == 4 && M == 1 && mtp.mtp_head_w2_ && D->gemm_w2(mtp.mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out,
-                                                               s.out_stride)) {
+            if (ci == 4 && M == 1 && mtp.mtp_head_w2_ && D->gemm_w2(av, mtp.mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
             if (ci < 4 && M == 1 && mtp.mtp_layer_w2_ && s.w_raw
-                && D->gemm_w2(s.w_raw, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+                && D->gemm_w2(av, s.w_raw, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
             // M == 1 only: the layer's native stores serve the draft's single-row
             // GEMV; the MTP prefill (M up to kMaxT) reads the int8 store, whose
             // oneDNN grouped matmul is the better shape there.
-            if (M == 1 && D->gemm_w4(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+            if (M == 1 && D->gemm_w4(av, wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
-            if (D->gemm(wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+            if (D->gemm(av, wk, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
             throw std::runtime_error("mtp: oneDNN GEMM failed for a layer tensor");
@@ -379,11 +407,12 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
         // they are left stale from the previous call - which is what made
         // PF_MTP_LAYER_W4 produce a *wrong* draft (acc 2.14 -> 0.08) rather than
         // a merely lossier one.  Bit-localised with PF_MTP_LAYER_W4_CALL=-1.
-        D->quantize(mtp.d_mtp_cat, nullptr, 2 * hp.n_embd, 0, n, 2 * hp.n_embd, mtp.mtp_layer_w4_ || mtp.mtp_head_w4_);
+        const act_view avp = D->quantize(mtp.d_mtp_cat, nullptr, 2 * hp.n_embd, 0, n, 2 * hp.n_embd,
+                                         mtp.mtp_layer_w4_ || mtp.mtp_head_w4_);
         const void * ek2 = mtp.mtp_layer_w2_ ? (const void *)M.eh_proj.data : ek;
-        if (!((n == 1 && D->gemm_w2(ek2, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))
-              || (n == 1 && D->gemm_w4(ek, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))
-              || D->gemm(ek, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))) {
+        if (!((n == 1 && D->gemm_w2(avp, ek2, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))
+              || (n == 1 && D->gemm_w4(avp, ek, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))
+              || D->gemm(avp, ek, nullptr, 1.0f, n, 2 * hp.n_embd, mtp.d_mtp_x, hp.n_embd))) {
             throw std::runtime_error("mtp: eh_proj GEMM failed");
         }
     }

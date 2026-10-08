@@ -767,8 +767,8 @@ this M**, which is why prefill needs a *blocked large-M* kernel and neither nat_
 GEMM - 24.5 GB of int8 weight bytes against 17.5 GB native, so at most -29 % of the
 weight traffic, on top of whatever oneDNN's own efficiency leaves - and no env knob
 measures it today (`PF_W4`, `PF_CB4` and `PF_K5` all leave prefill on the int8 `wmem`,
-because the native stores only win where `split_valid` is set, i.e. decode and the MTP
-verify).
+because the native stores only win where the activation's `split` form is set, i.e. decode and
+the MTP verify).
 
 **The dp4a path stays, and a DPAS verify kernel is now measured not to work.**  The
 operand-assembly problem was a *how*, not a *whether*: re-ordering the u4 plane once at
@@ -2000,13 +2000,23 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   Do not move the dense path onto `st_a`.
 * **`nat_gemm_launch`'s int8 (FMT 3) and cb4 (FMT 2) paths need the
   decode/verify activation form, not just "an activation".**  `gemm()`'s int8
-  nat call is guarded by `p->split_valid` (like the u4 one): a mode-1/mode-2
-  prefill quantizes with `do_split=false`, so the grouped views it would read
-  are the *previous* call's.  Missing that guard silently corrupted the 0.8B
-  multi-device decode-vs-prefill (`gen0`/`gen1`/`ref` 220/220/567 against
-  248068/271/271) while every single-device test passed, and it also made
-  `PF_MD_SPLITS=1` look broken.  `PF_NAT=0` is the bisection knob; the u4 path
-  (FMT 0) already had the guard.
+  nat call is gated on the activation's split form (like the u4 one): a
+  mode-1/mode-2 prefill quantizes with `do_split=false`, so the grouped views it
+  would read are the *previous* call's.  Missing that gate silently corrupted
+  the 0.8B multi-device decode-vs-prefill (`gen0`/`gen1`/`ref` 220/220/567
+  against 248068/271/271) while every single-device test passed, and it also
+  made `PF_MD_SPLITS=1` look broken.  `PF_NAT=0` is the bisection knob; the u4
+  path (FMT 0) already had the gate.  **This class of bug can no longer be
+  written**: `quantize()` returns a `si::act_view` (`{m, k, split, gen}`) and
+  every GEMM entry point *requires* it, so "forgot the gate" is a signature that
+  does not compile, and a view that went stale is one integer compare
+  (`view_is_current`) rather than a re-derived `M`/`K` check.  `split` is a
+  field of the view, so a GEMM can no longer read the even/odd planes off the
+  object and be wrong about whether they are there.  A stale view returns
+  `nullptr` from the `act_*` accessors (they used to hand back whatever was in
+  the scratch), so a caller that forgets to re-quantize now faults loudly instead
+  of reading the previous call's data - that is how the one real instance of
+  this shape was found, in `test_w4_gemm`.
 * **The MTP draft's attention split is `PF_MTP_SPLITS`, independent of
   `PF_MD_SPLITS`.**  The `--layer-map` path pins `n_splits`/`dec_splits` to 1
   (its split path is opt-in, and with the nat bug above fixed it verifies clean
