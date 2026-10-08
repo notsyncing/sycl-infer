@@ -1,6 +1,7 @@
 #include "engine.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -113,6 +114,25 @@ size_t engine::pc_block_blob_bytes() const {
     return per * (size_t)attn_layers();
 }
 
+// Runtime bounds check for the block blob (PF_PC_GUARD).
+//
+// The KV pool, the state pool and the conv/GDN per-layer slices are all sized to
+// exactly what the index arithmetic reaches, so re-deriving that arithmetic by
+// hand finds no slack - it is also exactly the kind of reasoning that misses a
+// bound in a *different* function.  This checks the real thing instead: every
+// memcpy that touches a host buffer records the range it wrote, and pc_disk_store
+// records the range it read from a file.  An overflow shows up as a name and a
+// byte offset at the moment it happens, rather than as glibc noticing a clobbered
+// chunk header at some unrelated free inside the OpenCL runtime.
+//
+// Off by default: it costs a branch per memcpy on the demote path.
+static std::atomic<uint64_t> g_pc_blob_max{0};
+static void pc_blob_note(size_t bytes) {
+    uint64_t prev = g_pc_blob_max.load(std::memory_order_relaxed);
+    while ((uint64_t)bytes > prev && !g_pc_blob_max.compare_exchange_weak(prev, (uint64_t)bytes)) {
+    }
+}
+
 void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
     const int na = attn_layers();
     const size_t kb = kv_block_bytes();
@@ -120,7 +140,9 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
     const size_t sb = (kv_dtype_has_scales(kv_k_dtype()) || kv_dtype_has_scales(kv_v_dtype()))
                           ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
                           : 0;
-    blob.resize((kb + vb + 2 * sb) * (size_t)na);
+    const size_t need = (kb + vb + 2 * sb) * (size_t)na;
+    blob.resize(need);
+    const bool guard = si::env::flag("PF_PC_GUARD");
     size_t off = 0;
     for (int l = 0; l < na; l++) {
         const char * kp, * vp, * ksc, * vsc;
@@ -128,15 +150,46 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
         // multi-device: the layer's pool may live on another device's queue
         sycl::queue & qd = dev_queue(attn_dev(l));
         qd.memcpy(blob.data() + off, kp + (size_t)block * kb, kb);
+        if (guard && off + kb > blob.size()) {
+            fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +kb=%zu > blob=%zu (need=%zu)\n", l, off,
+                    kb, blob.size(), need);
+        }
+        pc_blob_note(off + kb);
         off += kb;
         qd.memcpy(blob.data() + off, vp + (size_t)block * vb, vb);
+        if (guard && off + vb > blob.size()) {
+            fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +vb=%zu > blob=%zu (need=%zu)\n", l, off,
+                    vb, blob.size(), need);
+        }
+        pc_blob_note(off + vb);
         off += vb;
         if (sb) {
+            if (guard && (ksc == nullptr || vsc == nullptr)) {
+                // a null plane would make the memcpy's *source* pointer
+                // `nullptr + block*sb`, which is not null but an arbitrary small
+                // address - a silent read of unrelated memory, and the one place
+                // the scale planes are only conditionally present
+                fprintf(stderr, "[pcguard] SERIALIZE null scale plane: layer %d ksc=%p vsc=%p sb=%zu\n", l,
+                        (const void *)ksc, (const void *)vsc, sb);
+            }
             qd.memcpy(blob.data() + off, ksc + (size_t)block * sb, sb);
+            if (guard && off + sb > blob.size()) {
+                fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +sb=%zu > blob=%zu (need=%zu)\n", l, off,
+                        sb, blob.size(), need);
+            }
+            pc_blob_note(off + sb);
             off += sb;
             qd.memcpy(blob.data() + off, vsc + (size_t)block * sb, sb);
+            if (guard && off + sb > blob.size()) {
+                fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +sb=%zu > blob=%zu (need=%zu)\n", l, off,
+                        sb, blob.size(), need);
+            }
+            pc_blob_note(off + sb);
             off += sb;
         }
+    }
+    if (guard && off != need) {
+        fprintf(stderr, "[pcguard] SERIALIZE wrote %zu bytes but sized the blob %zu\n", off, need);
     }
     sync_all();
 }
@@ -148,16 +201,33 @@ void engine::pc_deserialize_block(const uint8_t * blob, int block) {
     const size_t sb = (kv_dtype_has_scales(kv_k_dtype()) || kv_dtype_has_scales(kv_v_dtype()))
                           ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
                           : 0;
+    const bool guard = si::env::flag("PF_PC_GUARD");
     size_t off = 0;
     for (int l = 0; l < na; l++) {
         const char * kp, * vp, * ksc, * vsc;
         kv_layer_ptrs(l, kp, vp, ksc, vsc);
         sycl::queue & qd = dev_queue(attn_dev(l));
+        if (guard && off + kb > pc_block_blob_bytes()) {
+            fprintf(stderr, "[pcguard] DESERIALIZE reads past blob: layer %d off=%zu +kb=%zu > blob_bytes=%zu\n", l, off,
+                    kb, pc_block_blob_bytes());
+        }
         qd.memcpy((void *)(kp + (size_t)block * kb), blob + off, kb);
         off += kb;
+        if (guard && off + vb > pc_block_blob_bytes()) {
+            fprintf(stderr, "[pcguard] DESERIALIZE reads past blob: layer %d off=%zu +vb=%zu > blob_bytes=%zu\n", l, off,
+                    vb, pc_block_blob_bytes());
+        }
         qd.memcpy((void *)(vp + (size_t)block * vb), blob + off, vb);
         off += vb;
         if (sb) {
+            if (guard && (ksc == nullptr || vsc == nullptr)) {
+                // writing through `nullptr + block*sb` is a wild write, not a null
+                // dereference - the offset makes the pointer a small valid-looking
+                // address, so this is exactly the kind of store that corrupts an
+                // unrelated heap block with no diagnostic
+                fprintf(stderr, "[pcguard] DESERIALIZE null scale plane: layer %d ksc=%p vsc=%p sb=%zu\n", l,
+                        (const void *)ksc, (const void *)vsc, sb);
+            }
             qd.memcpy((void *)(ksc + (size_t)block * sb), blob + off, sb);
             off += sb;
             qd.memcpy((void *)(vsc + (size_t)block * sb), blob + off, sb);
