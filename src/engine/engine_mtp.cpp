@@ -1401,14 +1401,9 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         const bool have_dev_argmax = greedy && no_penalty && gp.logit_bias.empty() && !mtp_dbg();
         // `dev_argmax` must be device memory: a kernel cannot write a host stack
         // array.
-        int32_t * d_argmax = mtp.d_argmax_buf_;
-        float * d_argval = mtp.d_argval_buf_;
-        if (!d_argmax) {
-            mtp.d_argmax_buf_ = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
-            mtp.d_argval_buf_ = sycl::malloc_device<float>(kMaxB, dev_queue(0));
-            d_argmax = mtp.d_argmax_buf_;
-            d_argval = mtp.d_argval_buf_;
-        }
+        mtp.verify.ensure(dev_queue(0));
+        int32_t * d_argmax = mtp.verify.d_argmax;
+        float * d_argval = mtp.verify.d_argval;
         const auto tam0 = now_t();
         if (have_dev_argmax) {
             backend().mtp_argmax(d_logits, hp.n_vocab, d_argmax, mtp.mtp_cand_cap_ > 0 ? d_argval : nullptr, k + 1);

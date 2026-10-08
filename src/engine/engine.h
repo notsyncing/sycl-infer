@@ -524,6 +524,31 @@ struct engine {
     // owns its own paged KV slice (attention layer index attn_layers()-1), so it
     // shares the block table, the prefix cache and the KV storage type.
     // ------------------------------------------------------------------
+    // The verify cycle's argmax staging.  This is the *only* device scratch the
+    // two drafters share: each allocates it lazily on first use (so a run that
+    // never verifies pays nothing) and both write the verify rows' argmax into
+    // it before copying back to h_argmax.
+    //
+    // Both buffers are created together, deliberately.  MTP's candidate readout
+    // (PF_MTP_CAND) additionally needs the value side, and it decides that from
+    // its own mtp_cand_cap_ - so if the value side could exist without the id
+    // side, a drafter that ran first and allocated only the ids would leave MTP
+    // writing through a null pointer.  That is not hypothetical: the two drafter
+    // sites each had their own `if (!d_argmax)` block, and only MTP's allocated
+    // both.  test_spec never caught it because it runs one drafter per process.
+    struct verify_scratch {
+        int32_t * d_argmax = nullptr; // [kMaxB] the verify rows' argmax ids
+        float * d_argval = nullptr;   // [kMaxB] ... and their values
+        void ensure(sycl::queue & q) {
+            if (!d_argmax) {
+                d_argmax = sycl::malloc_device<int32_t>(kMaxB, q);
+                d_argval = sycl::malloc_device<float>(kMaxB, q);
+            }
+            // the invariant this type exists to keep, asserted rather than assumed
+            assert(d_argmax != nullptr && d_argval != nullptr);
+        }
+    };
+
     struct mspec_state {
       bool mtp_on = false;
       int mtp_dev = 0; // backend index the MTP layer runs on (its KV follows)
@@ -613,8 +638,7 @@ struct engine {
       float * h_head_stage = nullptr;   // host staging for the 20 KB activation copy
       float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
       float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
-      int32_t * d_argmax_buf_ = nullptr; // verify-cycle argmax staging (device 0)
-      float * d_argval_buf_ = nullptr;   // ... and its value side
+      verify_scratch verify;             // the verify cycle's argmax staging
       int32_t * d_am2_ = nullptr;        // PF_MTP_CANDDBG diagnostic staging
       int mtp_cand_src_ = 1;            // 1 = seed from the draft's own step-0 readout
       int mtp_cand_cap_ = 0;            // 0 = off (the full head readout)

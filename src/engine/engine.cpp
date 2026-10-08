@@ -686,8 +686,8 @@ engine::~engine() {
         f0(mtp.d_mtp_cvals_);
         f0(mtp.d_mtp_cval1_);
         f0(mtp.d_mtp_amv_);
-        f0(mtp.d_argmax_buf_);
-        f0(mtp.d_argval_buf_);
+        f0(mtp.verify.d_argmax);
+        f0(mtp.verify.d_argval);
         f0(mtp.d_am2_);
         if (mtp.d_mtp_rinfo) {
             sycl::free(mtp.d_mtp_rinfo, q);
@@ -746,8 +746,9 @@ engine::~engine() {
         mtp.d_mtp_tok_ = mtp.d_mtp_cand_ = nullptr;
         mtp.d_mtp_cvals_ = mtp.d_mtp_cval1_ = mtp.d_mtp_amv_ = nullptr;
         mtp.d_mtp_hnorm1 = nullptr;
-        mtp.d_argmax_buf_ = mtp.d_am2_ = nullptr;
-        mtp.d_argval_buf_ = nullptr;
+        mtp.d_am2_ = nullptr;
+        mtp.verify.d_argmax = nullptr;
+        mtp.verify.d_argval = nullptr;
         mtp.h_head_stage = nullptr;
         dfl.d_df_h = dfl.d_df_b = dfl.d_df_c = dfl.d_df_qkv = dfl.d_df_gu = dfl.d_df_dyn = dfl.d_df_gate = nullptr;
         dfl.d_df_partials = dfl.d_df_feat = dfl.d_df_feat_dev = nullptr;

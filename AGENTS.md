@@ -2051,6 +2051,19 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   the scratch), so a caller that forgets to re-quantize now faults loudly instead
   of reading the previous call's data - that is how the one real instance of
   this shape was found, in `test_w4_gemm`.
+* **The two drafters share exactly one piece of device state, and it is allocated
+  as a pair.**  `engine::verify_scratch` owns the verify cycle's argmax staging
+  (`d_argmax` + `d_argval`); every other drafter buffer is MTP-only or lives in
+  the nested `dflash_state`.  The pair matters because MTP's candidate readout
+  (`PF_MTP_CAND`) needs the *value* side and decides that from its own
+  `mtp_cand_cap_` - so a value side that could be absent while the id side
+  existed would let it write through a null pointer.  Each drafter used to carry
+  its own `if (!d_argmax)` block and **only MTP's allocated both**, which is a bug
+  rather than a style note: had DFlash run first in a process that then ran MTP
+  with `PF_MTP_CAND=1`, the write would have gone through null.  `test_spec`
+  never caught it because it deliberately runs **one drafter per process** (a
+  second engine in the same process inherits state from the first).  Call
+  `mtp.verify.ensure(q)`; do not allocate these buffers at a call site.
 * **The MTP draft's attention split is `PF_MTP_SPLITS`, independent of
   `PF_MD_SPLITS`.**  The `--layer-map` path pins `n_splits`/`dec_splits` to 1
   (its split path is opt-in, and with the nat bug above fixed it verifies clean

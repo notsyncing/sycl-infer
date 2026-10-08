@@ -1920,11 +1920,8 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
                     (int)vf_dec_.size());
         }
         // ---- accept (greedy: the device argmax is exactly the greedy sample) ----
-        int32_t * d_argmax = mtp.d_argmax_buf_;
-        if (!d_argmax) {
-            mtp.d_argmax_buf_ = sycl::malloc_device<int32_t>(kMaxB, dev_queue(0));
-            d_argmax = mtp.d_argmax_buf_;
-        }
+        mtp.verify.ensure(dev_queue(0));
+        int32_t * d_argmax = mtp.verify.d_argmax;
         mtp_argmax_launch(dev_queue(0), d_logits, hp.n_vocab, d_argmax, nullptr, n_ver);
         dev_queue(0).memcpy(mtp.h_argmax, d_argmax, (size_t)n_ver * 4).wait();
         int j = 0;
