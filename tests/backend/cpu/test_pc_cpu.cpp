@@ -160,9 +160,37 @@ int main(int argc, char ** argv) {
             }
             const std::vector<float> now = read_block(warm_blocks[i]);
             double d = 0;
+            size_t at = 0, n_diff = 0, first = now.size(), n_warm_zero = 0, n_cold_zero = 0;
             for (size_t k = 0; k < now.size(); k++) {
-                d = std::max(d, (double)std::fabs(now[k] - cold_kv[i][k]));
+                if (now[k] == cold_kv[i][k]) {
+                    continue;
+                }
+                n_diff++;
+                first = std::min(first, k);
+                // all-zero on the warm side points at the *scale* plane being
+                // lost (every value in the block scales to 0); a scattered
+                // non-zero pattern points at the data plane instead
+                n_warm_zero += (now[k] == 0.0f) ? 1 : 0;
+                n_cold_zero += (cold_kv[i][k] == 0.0f) ? 1 : 0;
+                const double e = std::fabs((double)now[k] - (double)cold_kv[i][k]);
+                if (e > d) {
+                    d = e;
+                    at = k;
+                }
             }
+            // The bare `d == 0.0` below cannot localise this, and that turned out
+            // to matter: the registered known failure is TWO independent problems,
+            // and which one you are looking at decides where to look.
+            //   * n_diff close to the block size with warm_zero == n_diff means the
+            //     block came back as zeros - the quantized path only (f32 KV has no
+            //     scale planes and round-trips exactly), and it is intermittent.
+            //   * n_diff == 0 on every block while the logits still differ points
+            //     at the resumed *recurrent* state instead of the KV.
+            // Both have been observed on this box, so both are printed.
+            printf("  block %d: cold_blk=%d warm_blk=%d n_diff=%zu/%zu (warm_zero=%zu cold_zero=%zu) first=%zu "
+                   "max|d|=%.9g at %zu (cold=%.9g warm=%.9g)\n",
+                   i, cold_blocks[i], warm_blocks[i], n_diff, now.size(), n_warm_zero, n_cold_zero, first, d, at,
+                   (double)cold_kv[i][at], (double)now[at]);
             CHECK(d == 0.0); // the KV blob must round-trip bit-exactly
         }
 
