@@ -34,6 +34,23 @@ size_t engine::kv_v_block_bytes() const {
     return (size_t)m.hp.n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_v_dtype(), m.hp.head_dim);
 }
 
+size_t engine::kv_block_elem_off(int which, int layer, int block) const {
+    const kv_dtype_t dt = which ? kv_v_dtype() : kv_k_dtype();
+    const size_t esz = kv_dtype_bytes(dt);
+    const size_t stride = which ? kv_v_layer_stride : kv_layer_stride;
+    if (esz == 0 || stride < esz) {
+        return 0;
+    }
+    // kv_layer_stride is a *byte* stride over n_blocks blocks of one layer, and
+    // both storage types lay a layer out as exactly `stride / element size`
+    // elements, so the layer's element span is stride / esz.
+    const size_t layer_elems = stride / esz;
+    return (size_t)layer * layer_elems + (size_t)block * (kv_dtype_row_bytes(dt, m.hp.head_dim)
+                                                             ? (size_t)m.hp.n_head_kv * kBlockSize
+                                                                   * m.hp.head_dim
+                                                             : 0);
+}
+
 void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
     const kv_dtype_t dt = which ? kv_v_dtype() : kv_k_dtype();
     const int esz = kv_dtype_bytes(dt);

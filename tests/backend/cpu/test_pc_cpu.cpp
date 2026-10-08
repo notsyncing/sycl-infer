@@ -75,6 +75,67 @@ static std::vector<float> run_prompt(engine & e, const std::vector<int> & prompt
     return logits;
 }
 
+// ---- chunk-boundary independence (no prefix cache anywhere in this) ----------
+//
+// The registered known failure compares a cold pass against a warm one, and the
+// two do not prefill the same way: cold walks the prompt in kMaxT pieces
+// (32+32+32+4), warm restores 96 tokens and prefills only the 4-token tail.  So
+// a cold/warm difference is only evidence about the *cache* if prefill itself is
+// independent of where the chunk boundaries fall - and for a GDN model that is a
+// real question, not a formality: the recurrence is carried across chunks in
+// state, and the fused mode-2 GDN call has already had one bug where the kernel
+// read the chunk length from the wrong place and only the first row advanced.
+//
+// This runs the same tokens through the same engine and the same slot several
+// times with different boundaries and no cache at all, so a difference here
+// exonerates the cache and puts the fault in the prefill path.
+static std::vector<float> run_layout(engine & e, const std::vector<int> & prompt,
+                                     const std::vector<int> & bounds) {
+    const int slot = 0;
+    e.zero_slot(slot);
+    std::vector<int> blocks;
+    const int need = ((int)prompt.size() + kBlockSize - 1) / kBlockSize;
+    for (int i = 0; i < need; i++) {
+        const int b = e.alloc_block();
+        if (b < 0) {
+            return {};
+        }
+        blocks.push_back(b);
+    }
+    e.set_table(slot, blocks);
+    int pos = 0;
+    for (size_t i = 0; i + 1 < bounds.size(); i++) {
+        const int n = bounds[i + 1] - bounds[i];
+        if (n <= 0 || n > kMaxT) {
+            return {}; // not a legal chunk for this engine
+        }
+        e.prefill_chunk(prompt, pos, n, slot, i + 2 == bounds.size());
+        pos = bounds[i + 1];
+    }
+    std::vector<float> logits(e.m.hp.n_vocab);
+    e.fetch_logits(0, logits.data());
+    return logits;
+}
+
+static void compare_layouts(const char * tag, const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.empty() || b.empty() || a.size() != b.size()) {
+        printf("  chunk-layout %s: SKIP (empty result)\n", tag);
+        return;
+    }
+    double maxd = 0;
+    int ia = 0, ib = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        maxd = std::max(maxd, (double)std::fabs(a[i] - b[i]));
+        if (a[i] > a[ia]) {
+            ia = (int)i;
+        }
+        if (b[i] > b[ib]) {
+            ib = (int)i;
+        }
+    }
+    printf("  chunk-layout %-18s max|diff|=%.9g argmax %d/%d %s\n", tag, maxd, ia, ib, ia == ib ? "SAME" : "DIFFERENT");
+}
+
 int main(int argc, char ** argv) {
     setenv("PF_DP4A", "0", 1); // deterministic fp32 weight path (CPU default)
     setenv("PF_PC_STATES", "2", 1);
@@ -111,22 +172,51 @@ int main(int argc, char ** argv) {
         }
         prompt.resize(100);
 
+        // Chunk-boundary independence, before anything touches the cache.  A
+        // (what the cold pass below does) vs B (same tokens, boundaries moved).
+        // If these differ, the cold/warm comparison later in this file is
+        // measuring the prefill path and not the prefix cache at all.
+        printf("chunk-boundary independence (no prefix cache)\n");
+        const std::vector<float> lay_a = run_layout(e, prompt, {0, 32, 64, 96, 100});
+        const std::vector<float> lay_b = run_layout(e, prompt, {0, 32, 64, 80, 96, 100});
+        const std::vector<float> lay_c = run_layout(e, prompt, {0, 20, 52, 84, 100});
+        compare_layouts("A 32+32+32+4", lay_a, lay_b);   // A vs B
+        compare_layouts("A 32+32+32+4", lay_a, lay_c);   // A vs C
+        compare_layouts("B 32+32+16+16+4", lay_b, lay_c); // B vs C
+        CHECK(!lay_a.empty());
+
         int matched_cold = -1;
         std::vector<int> cold_blocks;
         const std::vector<float> cold = run_prompt(e, prompt, matched_cold, &cold_blocks);
         CHECK(!cold.empty());
         CHECK(matched_cold == 0);
 
-        // snapshot the layer-0 K of the cached blocks before they are spilled
+        // snapshot the KV of the cached blocks before they are spilled.
+        //
+        // Read *every* attention layer and both K and V.  The first version of
+        // this read layer 0's K only, and used to conclude "KV round-trips
+        // exactly" from that - while PF_PC_VERIFY, which compares the whole blob
+        // (all layers, K + V, both scale planes), reported a mismatch at byte 0
+        // on every single promote.  A narrow check reports "fine" whenever the
+        // corruption happens to miss the bytes it looks at.
         const size_t per_block = (size_t)e.m.hp.n_head_kv * kBlockSize * e.m.hp.head_dim;
-        auto read_block = [&](int b) {
+        auto read_block = [&](int b, int layer, int which) {
             std::vector<float> v(per_block);
-            e.kv_read_vec(0, (size_t)b * per_block, v.data(), (int)per_block);
+            e.kv_read_vec(which, e.kv_block_elem_off(which, layer, b), v.data(), (int)per_block);
             return v;
         };
-        std::vector<std::vector<float>> cold_kv;
+        // [block][K|V][layer] -> that unit's values
+        std::vector<std::vector<std::vector<std::vector<float>>>> cold_kv;
         for (int i = 0; i < 3; i++) {
-            cold_kv.push_back(cold_blocks[i] < 0 ? std::vector<float>() : read_block(cold_blocks[i]));
+            cold_kv.push_back({}); // [block]
+            for (int which = 0; which < 2; which++) {
+                cold_kv.back().push_back({}); // [K or V]
+                for (int l = 0; l < e.n_attn_layers(); l++) {
+                    cold_kv.back()[which].push_back(cold_blocks[i] < 0
+                                                        ? std::vector<float>()
+                                                        : read_block(cold_blocks[i], l, which));
+                }
+            }
         }
 
         // exhaust the block pool, forcing every VRAM node down to disk
@@ -154,45 +244,61 @@ int main(int argc, char ** argv) {
         CHECK(!warm.empty());
         CHECK(matched_warm == 96); // resumed from the deepest disk checkpoint
         CHECK(e.pc_disk_records() == 0); // disk -> VRAM is a move
+        // One line per (block, K/V, layer): which of them came back different.
+        int n_units = 0, n_units_bad = 0;
+        size_t worst_any = 0;
+        double worst_any_d = 0;
         for (int i = 0; i < 3; i++) {
-            if (warm_blocks[i] < 0 || cold_kv[i].empty()) {
+            if (warm_blocks[i] < 0) {
                 continue;
             }
-            const std::vector<float> now = read_block(warm_blocks[i]);
-            double d = 0;
-            size_t at = 0, n_diff = 0, first = now.size(), n_warm_zero = 0, n_cold_zero = 0;
-            for (size_t k = 0; k < now.size(); k++) {
-                if (now[k] == cold_kv[i][k]) {
-                    continue;
-                }
-                n_diff++;
-                first = std::min(first, k);
-                // all-zero on the warm side points at the *scale* plane being
-                // lost (every value in the block scales to 0); a scattered
-                // non-zero pattern points at the data plane instead
-                n_warm_zero += (now[k] == 0.0f) ? 1 : 0;
-                n_cold_zero += (cold_kv[i][k] == 0.0f) ? 1 : 0;
-                const double e = std::fabs((double)now[k] - (double)cold_kv[i][k]);
-                if (e > d) {
-                    d = e;
-                    at = k;
+            for (int which = 0; which < 2; which++) {
+                for (int l = 0; l < e.n_attn_layers(); l++) {
+                    const std::vector<float> & before = cold_kv[i][which][l];
+                    if (before.empty()) {
+                        continue;
+                    }
+                    const std::vector<float> now = read_block(warm_blocks[i], l, which);
+                    double d = 0;
+                    size_t at = 0, n_diff = 0, first = now.size(), n_warm_zero = 0, n_cold_zero = 0;
+                    for (size_t k = 0; k < now.size() && k < before.size(); k++) {
+                        if (now[k] == before[k]) {
+                            continue;
+                        }
+                        n_diff++;
+                        first = std::min(first, k);
+                        // all-zero on the warm side points at the *scale* plane being
+                        // lost (every value in the block scales to 0); a scattered
+                        // non-zero pattern points at the data plane instead
+                        n_warm_zero += (now[k] == 0.0f) ? 1 : 0;
+                        n_cold_zero += (before[k] == 0.0f) ? 1 : 0;
+                        const double diff = std::fabs((double)now[k] - (double)before[k]);
+                        if (diff > d) {
+                            d = diff;
+                            at = k;
+                        }
+                    }
+                    n_units++;
+                    const bool bad = (d != 0.0);
+                    n_units_bad += bad ? 1 : 0;
+                    if (d > worst_any_d) {
+                        worst_any_d = d;
+                        worst_any = at;
+                    }
+                    printf("  blk%d %s L%-2d cold_blk=%d warm_blk=%d n_diff=%zu/%zu (warm_zero=%zu cold_zero=%zu) "
+                           "first=%zu max|d|=%.9g at %zu (cold=%.9g warm=%.9g) %s\n",
+                           i, which ? "V" : "K", l, cold_blocks[i], warm_blocks[i], n_diff, now.size(), n_warm_zero,
+                           n_cold_zero, first, d, at, (double)before[at], (double)now[at], bad ? "DIFFERS" : "identical");
                 }
             }
-            // The bare `d == 0.0` below cannot localise this, and that turned out
-            // to matter: the registered known failure is TWO independent problems,
-            // and which one you are looking at decides where to look.
-            //   * n_diff close to the block size with warm_zero == n_diff means the
-            //     block came back as zeros - the quantized path only (f32 KV has no
-            //     scale planes and round-trips exactly), and it is intermittent.
-            //   * n_diff == 0 on every block while the logits still differ points
-            //     at the resumed *recurrent* state instead of the KV.
-            // Both have been observed on this box, so both are printed.
-            printf("  block %d: cold_blk=%d warm_blk=%d n_diff=%zu/%zu (warm_zero=%zu cold_zero=%zu) first=%zu "
-                   "max|d|=%.9g at %zu (cold=%.9g warm=%.9g)\n",
-                   i, cold_blocks[i], warm_blocks[i], n_diff, now.size(), n_warm_zero, n_cold_zero, first, d, at,
-                   (double)cold_kv[i][at], (double)now[at]);
-            CHECK(d == 0.0); // the KV blob must round-trip bit-exactly
         }
+        // The whole KV of every cached block, every layer, K and V, must come
+        // back bit-exact.  A per-layer-K-only check used to pass here while the
+        // blob was wrong from its first byte.
+        printf("  KV units compared: %d, differing: %d, worst max|d|=%.9g at element %zu of its unit\n", n_units, n_units_bad,
+               worst_any_d, worst_any);
+        CHECK(n_units > 0);
+        CHECK(n_units_bad == 0);
 
         double maxd = 0;
         int amax_cold = 0, amax_warm = 0;

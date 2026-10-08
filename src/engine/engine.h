@@ -844,6 +844,22 @@ struct engine {
     // copy `n` elements of one KV vector out of the pool into fp32 (converts
     // the storage type; used by the stage tests)
     void kv_read_vec(int which, size_t elem_off, float * dst, int n);
+    // Element offset of one block's K (which=0) or V (which=1) inside the paged
+    // pool, i.e. the `elem_off` to hand kv_read_vec to read that block.
+    //
+    // Exposed because kv_read_vec indexes the whole pool
+    // ([layer][block][kv head][token][dim]) while the per-layer element stride
+    // follows from the pool's private n_blocks and the storage type's element
+    // size.  A caller therefore cannot address layer != 0 without either
+    // guessing or duplicating the engine's layout - and a check that only ever
+    // reads layer 0 is exactly the kind of narrow check that reports "the KV
+    // round-trips fine" while a later layer is corrupt.
+    size_t kv_block_elem_off(int which, int layer, int block) const;
+    // Number of attention layers that own a paged KV slice (the main model's,
+    // plus the MTP draft head's when it is enabled).  Public because it is the
+    // layer count a caller must iterate to inspect the whole KV, and guessing it
+    // is how a check ends up reading one layer and calling the KV sound.
+    int n_attn_layers() const { return attn_layers(); }
 
     // ---- prefix cache (PF_PREFIX_CACHE=1) -------------------------------
     // A cache node is one full 32-token block of a prefilled prompt, keyed by a
