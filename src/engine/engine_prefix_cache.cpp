@@ -326,6 +326,43 @@ int engine::pc_promote_bytes(const pc_disk_meta & meta, const uint8_t * blob, co
         return -1;
     }
     pc_deserialize_block(blob, block);
+    // Round-trip integrity probe (PF_PC_VERIFY).  Re-serializes the block that
+    // was just restored and compares it against the record it came from, so the
+    // question "is the serialize/deserialize pair lossy, or does something
+    // clobber the block after the promote?" gets answered by the bytes instead
+    // of by more reading.  The two have very different fixes, and until now they
+    // were indistinguishable from the outside because both present as "the warm
+    // run's logits differ".
+    if (si::env::flag("PF_PC_VERIFY")) {
+        const size_t want = pc_block_blob_bytes();
+        std::vector<uint8_t> back;
+        pc_serialize_block(block, back);
+        size_t bad = want; // sentinel == "no difference found"
+        const size_t n = std::min(back.size(), want);
+        for (size_t i = 0; i < n; i++) {
+            if (back[i] != blob[i]) {
+                bad = i;
+                break;
+            }
+        }
+        // where in the blob does the first difference land?  kb per layer, so the
+        // layer and which of K/V/scales is obvious from the offset
+        const size_t kb = kv_block_bytes(), vb = kv_v_block_bytes();
+        const size_t sb = kv_dtype_has_scales(kv_k_dtype()) || kv_dtype_has_scales(kv_v_dtype())
+                              ? (size_t)m.hp.n_head_kv * kBlockSize * (m.hp.head_dim / kI8Q) * sizeof(sycl::half)
+                              : 0;
+        const size_t per = kb + vb + 2 * sb;
+        const size_t layer = bad == want ? 0 : bad / per;
+        const size_t within = bad == want ? 0 : bad % per;
+        const char * which = within < kb ? "K" : (within < kb + vb ? "V" : (within < kb + vb + sb ? "Kscale" : "Vscale"));
+        if (bad == want && back.size() == want) {
+            fprintf(stderr, "[pcverify] block=%d depth=%d %zu bytes: IDENTICAL\n", block, meta.depth, want);
+        } else {
+            fprintf(stderr, "[pcverify] block=%d depth=%d want=%zu got=%zu MISMATCH first_bad=%zu "
+                            "(layer %zu, %s, +%zu)\n",
+                    block, meta.depth, want, back.size(), bad, layer, which, within);
+        }
+    }
     int st = -1;
     if (meta.has_state && pc_state_floats > 0) {
         st = pc_state_take();

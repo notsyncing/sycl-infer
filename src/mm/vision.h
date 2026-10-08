@@ -125,6 +125,19 @@ struct vision_model {
     // Reference forward on the host: writes n_out * proj_dim embeddings.
     void encode_host(const vision_input & in, std::vector<float> & out) const;
 
+    // Whether this projector can actually be *run*, and why not if it cannot.
+    //
+    // The encode path used to be the only place that knew the constraint, so the
+    // check could only be discovered by running an encode - which threw from
+    // inside whatever the caller was doing, and a caller with more work after
+    // the vision section lost all of it.  `load` accepts a well-formed GGUF
+    // whose head_dim the encoder does not implement, so "it loaded" has always
+    // meant "the file is readable", never "this projector runs".
+    //
+    // encode_host/encode_device call this and throw the same message, so the
+    // query and the throw cannot drift apart.
+    bool runnable(std::string * why = nullptr) const;
+
     // Vision forward on the device.  `d_out` must hold n_out * proj_dim floats;
     // the weights are uploaded on first use and the scratch buffers are grown to
     // the largest image seen (bounded by kMaxImgPatches).

@@ -283,6 +283,22 @@ static void test_video_ffmpeg_odd() {
     }
 }
 
+// `load` accepts a well-formed projector whose geometry the encoder does not
+// implement - "it loaded" has always meant "the file is readable", never "this
+// projector runs".  The mismatch used to surface only as a throw from inside
+// encode_host, which escaped main() and aborted the process, so every check
+// after the vision section was lost without a word.  Ask up front instead: the
+// sections that only assemble layouts (test_prompt, test_prompt_video) do not go
+// near the encoder and keep running, which is the coverage we want to keep.
+static bool tower_runnable(const vision_model & vm, const char * section) {
+    std::string why;
+    if (vm.runnable(&why)) {
+        return true;
+    }
+    printf("  skip (%s: %s)\n", section, why.c_str());
+    return false;
+}
+
 static void test_vision(const std::string & mmproj_path) {
     printf("vision encoder\n");
     vision_model vm;
@@ -290,6 +306,9 @@ static void test_vision(const std::string & mmproj_path) {
         vm.load(mmproj_path);
     } catch (const std::exception & ex) {
         printf("  skip (cannot load %s: %s)\n", mmproj_path.c_str(), ex.what());
+        return;
+    }
+    if (!tower_runnable(vm, "vision encoder not runnable")) {
         return;
     }
     image_preproc_cfg cfg;
@@ -405,6 +424,9 @@ static void test_device(const std::string & mmproj_path) {
         vm.load(mmproj_path);
     } catch (const std::exception & ex) {
         printf("  skip (cannot load mmproj: %s)\n", ex.what());
+        return;
+    }
+    if (!tower_runnable(vm, "device vision encoder not runnable")) {
         return;
     }
     image_preproc_cfg cfg;

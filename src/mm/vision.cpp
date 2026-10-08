@@ -302,6 +302,16 @@ void vision_model::build_patch_input(const vision_input & in, std::vector<float>
     }
 }
 
+bool vision_model::runnable(std::string * why) const {
+    if (hp.head_dim != 64) {
+        if (why) {
+            *why = "vision: unsupported head_dim " + std::to_string(hp.head_dim) + " (the encoder implements 64)";
+        }
+        return false;
+    }
+    return true;
+}
+
 void vision_model::encode_host(const vision_input & in, std::vector<float> & out) const {
     const int E = hp.n_embd;
     const int M = hp.merge;
@@ -470,8 +480,12 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         throw std::runtime_error("vision: image needs " + std::to_string(np) + " patch tokens (max "
                                  + std::to_string(kMaxImgPatches) + ")");
     }
-    if (HD != 64) {
-        throw std::runtime_error("vision: unsupported head_dim");
+    // ask runnable() rather than repeating HD != 64 here, so the query a caller
+    // uses to decide "can I run this at all" and the throw cannot disagree
+    if (!runnable()) {
+        std::string why;
+        runnable(&why);
+        throw std::runtime_error(why);
     }
 
     if (!dev_weights) {
