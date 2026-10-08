@@ -128,6 +128,10 @@ struct pc_snap {
     int64_t layer_off = 0;
     int32_t gdn_per = 0;
     int32_t conv_per = 0;
+    // Total size of the checkpoint pool in floats, so a kernel that computes its
+    // offset from a slot index and a layer offset can bound the store.  0
+    // disables the check.  Set by the engine from pc_max_states * pc_state_floats.
+    int64_t cap_floats = 0;
 };
 
 void rmsnorm_launch(sycl::queue & q, const float * x, const float * w, float * out, int n_rows, int n, float eps);

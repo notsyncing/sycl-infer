@@ -83,7 +83,16 @@ struct cpu_pc_snap {
     int64_t layer_off = 0;
     int32_t gdn_per = 0;
     int32_t conv_per = 0;
+    // Total size of the checkpoint pool in floats.  The kernel computes its
+    // write offset from a slot index and a layer offset that it cannot otherwise
+    // bound, so the bound has to travel with the descriptor; 0 disables the
+    // check.  See the pcguard reports in cpu_gdn / cpu_conv_state_update.
+    int64_t cap_floats = 0;
 };
+
+// One flag for both snapshot sites, read once: the check is a single comparison
+// against a bound the kernel does not otherwise have.
+extern const bool cpu_pc_guard;
 
 void cpu_rmsnorm(const float * x, const float * w, float * out, int n_rows, int n, float eps);
 void cpu_copy_row(const float * src, float * dst, const cpu_step_info * info, int n, int row);

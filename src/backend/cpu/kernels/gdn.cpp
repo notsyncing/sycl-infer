@@ -3,6 +3,8 @@
 // the per-32-token prefix-cache state snapshot.
 #include "common.h"
 
+#include <cstdio>
+
 namespace si {
 
 void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias, const float * ssm_a, const float * beta,
@@ -72,8 +74,23 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
             if (pc_on && (info->mtp_dt || (pbase + t + 1) % kCpuBlk == 0)) {
                 const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kCpuBlk];
                 if (stt >= 0) {
-                    float * dst =
-                        snap.base + (size_t)stt * snap.stride + snap.layer_off + (size_t)head * head_dim * head_dim;
+                    const int64_t at = (int64_t)stt * snap.stride + snap.layer_off
+                                       + (int64_t)head * head_dim * head_dim;
+                    // The checkpoint pool is sized from pc_state_floats, which is
+                    // per *checkpoint slot*; a slot index that runs past the pool,
+                    // or a layer offset that runs past the slot, writes into
+                    // whatever follows the pool with no diagnostic at all.  Both
+                    // are one comparison against a bound the caller has to carry,
+                    // because the kernel cannot see the pool's size.
+                    if (cpu_pc_guard && snap.cap_floats > 0
+                        && at + (int64_t)head_dim * head_dim > snap.cap_floats) {
+                        fprintf(stderr,
+                                "[pcguard] GDN snapshot past pool: stt=%d head=%d at=%lld +%lld > cap=%lld "
+                                "(stride=%lld layer_off=%lld, gdn_per=%d)\n",
+                                stt, head, (long long)at, (long long)(head_dim * head_dim), (long long)snap.cap_floats,
+                                (long long)snap.stride, (long long)snap.layer_off, snap.gdn_per);
+                    }
+                    float * dst = snap.base + at;
                     std::memcpy(dst, st, (size_t)head_dim * head_dim * 4);
                 }
             }

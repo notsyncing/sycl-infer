@@ -4,7 +4,14 @@
 // prefix-cache snapshot at a 32-token block boundary.
 #include "common.h"
 
+#include "common/env.h"
+
 namespace si {
+
+// PF_PC_GUARD: bound the prefix-cache snapshot stores (see cpu_pc_snap::cap_floats).
+// Read once - the checks are a single comparison against a bound the kernel does
+// not otherwise have, and this path is the hot one.
+const bool cpu_pc_guard = si::env::flag("PF_PC_GUARD");
 
 void cpu_conv_l2(const float * qkv_raw, float * conv_state, const float * conv_w, float * conv_out,
                  const cpu_step_info * info, int conv_dim, int kernel_size, int head_k_dim, int n_k_heads, float eps,
@@ -91,7 +98,19 @@ void cpu_conv_state_update(const float * qkv_raw, float * conv_state, const cpu_
                 cstate[(size_t)2 * conv_dim + i] = v2;
             }
             if (cap >= 0) {
-                float * dst = snap.base + (size_t)cap * snap.stride + snap.layer_off + snap.gdn_per;
+                const int64_t at = (int64_t)cap * snap.stride + snap.layer_off + snap.gdn_per
+                                   + (int64_t)2 * conv_dim;
+                // the conv plane sits *after* the GDN plane inside the same slot,
+                // so an offset that fits the GDN half can still overrun the slot;
+                // see the matching check in cpu_gdn
+                if (cpu_pc_guard && snap.cap_floats > 0 && at + 1 > snap.cap_floats) {
+                    fprintf(stderr,
+                            "[pcguard] conv snapshot past pool: cap=%d at=%lld > cap_floats=%lld "
+                            "(stride=%lld layer_off=%lld gdn_per=%d conv_dim=%d)\n",
+                            cap, (long long)at, (long long)snap.cap_floats, (long long)snap.stride,
+                            (long long)snap.layer_off, snap.gdn_per, conv_dim);
+                }
+                float * dst = snap.base + at - (int64_t)2 * conv_dim;
                 dst[(size_t)0 * conv_dim + i] = v0;
                 dst[(size_t)1 * conv_dim + i] = v1;
                 dst[(size_t)2 * conv_dim + i] = v2;

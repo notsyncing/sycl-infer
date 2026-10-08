@@ -70,6 +70,10 @@ cpu_pc_snap to_cpu_snap(const pc_snap & s) {
     c.layer_off = s.layer_off;
     c.gdn_per = s.gdn_per;
     c.conv_per = s.conv_per;
+    // The pool's real size has to reach the kernel: it computes its snapshot
+    // offset from a slot index and a layer offset that it cannot bound on its own,
+    // and an out-of-range one writes into whatever follows the pool.
+    c.cap_floats = s.cap_floats;
     return c;
 }
 

@@ -1037,6 +1037,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 snap.layer_off = (int64_t)gi * ((int64_t)gdn_per + (int64_t)conv_per);
                 snap.gdn_per = (int32_t)gdn_per;
                 snap.conv_per = (int32_t)conv_per;
+                // the pool's real extent, so the kernels can bound their stores
+                snap.cap_floats = (int64_t)pc_max_states * (int64_t)pc_state_floats;
             }
             // MTP spec verify: redirect the per-token snapshots into this
             // partition's GDN-state history (device-local, dense layer layout)
@@ -1057,6 +1059,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 snap.layer_off = (int64_t)gl * ((int64_t)gdn_per + (int64_t)conv_per);
                 snap.gdn_per = (int32_t)gdn_per;
                 snap.conv_per = (int32_t)conv_per;
+                snap.cap_floats = (int64_t)mtp.mtp_nsnap * snap.stride;
             }
             // the GDN recurrence is sequential over tokens.  In chunk-batched
             // prefill the whole batch is *materialized* (qkv), so one call per
