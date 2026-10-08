@@ -153,6 +153,7 @@ add_library(sycl_infer_core STATIC
     src/server/chat_template.cpp
     src/server/media_fetch.cpp
     src/server/request.cpp
+    src/server/response.cpp
     src/server/response_parser.cpp
     src/server/scheduler.cpp
     src/server/server.cpp
@@ -248,6 +249,7 @@ si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_response_parser tests/server/test_response_parser.cpp)
 si_add_test(test_request_parse  tests/server/test_request_parse.cpp)
+si_add_test(test_response_json   tests/server/test_response_json.cpp)
 si_add_test(test_sse_cancel     tests/server/test_sse_cancel.cpp)
 si_add_test(test_url_fetch     tests/server/test_url_fetch.cpp)
 si_add_test(test_sampler tests/engine/test_sampler.cpp)
@@ -297,7 +299,7 @@ si_add_test(test_gpu_stages
 )
 
 if(BUILD_TESTING)
-    foreach(name IN ITEMS test_response_parser test_request_parse test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_hparams test_f16conv test_dev_profile)
+    foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_hparams test_f16conv test_dev_profile)
         add_test(NAME ${name} COMMAND ${name})
         set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
     endforeach()

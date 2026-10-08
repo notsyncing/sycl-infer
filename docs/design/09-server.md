@@ -15,6 +15,7 @@
 | JSON 序列化 | `json_util.h` | `dump_json`（容忍非法 UTF-8，编码为 U+FFFD 而非抛异常） |
 | 批处理 | `scheduler.cpp` | `sequence` 生命周期、连续批处理、持有 `engine::mtx` |
 | Chat 模板 | `chat.cpp` / `chat_template.cpp` | minja Jinja 渲染 + 内置 ChatML 回退 |
+| 响应构建 | `response.{h,cpp}` | OpenAI 响应体与 SSE 帧（纯函数，见 §2.6/§2.7） |
 | 响应拆分 | `response_parser.cpp` | `reasoning_content` / `content` / `tool_calls` 流式状态机 |
 | 流式辅助 | `chat_util.h` | UTF-8 边界安全的 token piece 缓冲 |
 | 采样 | `sampler.cpp` | 采样算法 |
@@ -98,11 +99,11 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
   `enable_thinking`/`thinking`，最后 `reasoning_effort`（非 `"none"` 即开启）。
 * `tools_json`（`parse_tools_json`）：把请求 `tools` 数组回传给模板；`tool_choice == "none"`
   时清空，指定函数对象时只保留该函数，其它字符串值（`auto`/`required`/`any`）原样放行全部工具。
-  `parse_tools = !tools_json.empty()`（`server.cpp:1587`）——它同时决定 response_parser 是否拆工具调用。
+  `parse_tools = !tools_json.empty()`（`parse_tools_json`，`request.cpp`）——它同时决定 response_parser 是否拆工具调用。
 * `gen_params` 来自 `parse_params`，`stops` 来自 `parse_stop`（字符串或字符串数组，数组最多 16 条，
-  `kMaxStops`，`server.cpp:98`），`n` 来自 `parse_n`（1..16，`kMaxN`）。
-* `/v1/completions` 另有 `parse_best_of`（默认等于 `n`，clamp 到 1..16，`server.cpp:176-188`）、
-  `parse_include_usage`（只读 `stream_options.include_usage`，`server.cpp:190-195`）、
+  `kMaxStops`），`n` 来自 `parse_n`（1..16，`kMaxN`）；两者与 `kMaxJobs` 都在 `request.h`。
+* `/v1/completions` 另有 `parse_best_of`（默认等于 `n`，clamp 到 1..16）、
+  `parse_include_usage`（只读 `stream_options.include_usage`）、
   `echo`、`suffix`（`server.cpp:1820-1821`）。
 * `model` 只被回显进响应（`body.value("model", model_id)`，`server.cpp:1595`）；请求里写错 model 名
   **不报错**。`created` 是每次请求 `time(nullptr)`。
@@ -127,7 +128,7 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 | `logprobs`（chat: bool / completion: int） + `top_logprobs` | `logprobs` / `top_logprobs`（≤20） | 关闭 |
 
 `/v1/completions` 的 `prompt` 支持字符串、字符串数组、token id 数组、token id 数组的数组
-（`parse_completion_prompts`，`server.cpp:1399-1449`；缺失/空/类型不识别都退化成一条空 prompt）；
+（`parse_completion_prompts`，`request.cpp`；缺失/空/类型不识别都退化成一条空 prompt）；
 `echo` 把 prompt 文本前置，`suffix` 追加到生成文本后。`best_of > n` 时每个 prompt 生成 `best_of`
 条候选，按 chosen token 的 logprob 之和（`choice_out::score`）`stable_sort` 降序后取前 `n`
 （`server.cpp:1850-1867`）；评分走 `gp.need_score`，它让调度器即使在客户端没要 logprobs 时也算
@@ -158,10 +159,17 @@ chosen token 的 logprob（`sampler.h:29-35`）。
 **音频请求同时需要两个 mmproj**：`!media.empty()` 就先查 `mm.ready`，所以只加载了
 `--audio-mmproj` 而没加载 `--mmproj` 的部署，纯音频请求也会拿到
 `image/video input requires --mmproj`。`input_audio.format` / `audio_url.format` 被解析并存进
-`media_part::format`（`server.cpp:554-569`），但解码端不用它——`mm_audio_decode_bytes` 自己嗅探
+`media_part::format`（`parse_messages` 填，`media_fetch.cpp` 不用），但解码端不用它——`mm_audio_decode_bytes` 自己嗅探
 RIFF/WAV 头，所以写错 `format` 不会导致解码失败。
 
 ### 2.6 非流式响应
+
+响应体与 SSE 帧的构建都在 `response.{h,cpp}`（纯函数，无 httplib），随它一起搬走的还有两个**响应状态**
+类型：`lp_tracker`（把采样 token 的 logprob 配对到它最终落入的 parser 分片）与 `choice_out`
+（一个 choice 产出的全部内容，流式与非流式共用）。因此 `tests/server/test_response_json.cpp`
+（hermetic）能直接断言线上格式——`reasoning` 与 `content` 的分流、`tool_calls` 的 index 递增、
+logprob 只挂载一次、usage 的各计数器——这些此前只能靠驱动一次真实生成来观察。两个 logprob 构建器需要
+真 tokenizer，钉在 `test_tokenizer` 里。
 
 * chat：`object:"chat.completion"`，每个 choice `{message:{role,content[,reasoning_content][,tool_calls]},finish_reason,logprobs}`，
   含 `usage`；`n` 个 choice 的 token 统计求和。仅有工具调用时 `content` 为 `null`；未请求 logprobs 时为
@@ -171,7 +179,7 @@ RIFF/WAV 头，所以写错 `format` 不会导致解码失败。
 * 非流式路径同样先过 stop 过滤与 `response_parser`，因此与流式输出一致。
 * **多模态与 MTP 路径的响应形状相同，但 `logprobs` 恒为 `null`**（`server.cpp:1672`、`1729`）——
   这两条路径不走调度器，拿不到 per-token 的采样细节；`mtp_direct` 因此也把 `logprobs` 列为排除条件。
-* `usage` 由 `usage_json(prompt, completion, reasoning, cached)` 生成（`server.cpp:1367-1383`）：
+* `usage` 由 `usage_json(prompt, completion, reasoning, cached)` 生成（`response.cpp`）：
   `prompt_tokens_details.cached_tokens` = 前缀缓存命中的 prompt token 数（`sequence::reused`）、
   `completion_tokens_details.reasoning_tokens` = 计入 `reasoning_content` 的生成片段数，
   外加 DeepSeek 风格的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（同义，miss = prompt -
@@ -197,7 +205,7 @@ RIFF/WAV 头，所以写错 `format` 不会导致解码失败。
 * 纯文本 chat 每 choice 一个生产者线程；completion 是 `prompt 数 × n` 个线程；
   多模态与 MTP 路径只有**一个**线程在同一个循环里顺序跑完 `n` 个 choice。最后一个调用
   `choice_done` 的 choice 负责发 usage chunk（若 `stream_options.include_usage`）与
-  `data: [DONE]`，然后 `q->finish()`。usage chunk 的 JSON 由 server.cpp 的 `sse_usage_frame`
+  `data: [DONE]`，然后 `q->finish()`。usage chunk 的 JSON 由 `response.cpp` 的 `sse_usage_frame`
   经 `sse_session::usage_emitter` 注入——这样 `sse.h` 不必依赖那些 file-local 的 JSON helper。
 * 请求 logprobs 时，每个 content/text chunk 附带 `choices[].logprobs`（chat 为
   `{content:[...],refusal:null}`，completion 为 `{tokens,token_logprobs,top_logprobs,text_offset}`）。
