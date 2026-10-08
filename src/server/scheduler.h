@@ -55,10 +55,31 @@ struct sequence {
     };
 
     // token/text stream out
-    std::mutex m;
+    mutable std::mutex m;
     std::condition_variable cv;
     std::deque<token_out> out_q;
     int prompt_tokens = 0;
+
+    // Backlog cap for out_q.  A client that reads slower than the engine
+    // decodes would otherwise grow this deque without bound - and the HTTP
+    // writer is the only consumer, so nothing else ever fails.  The scheduler
+    // loop is shared by every sequence, so it must NOT block here (one slow
+    // client would freeze every other request); instead a full sequence is left
+    // out of the decode batch until its consumer drains it, which bounds memory
+    // without letting one client stall the others.  256 tokens is ~17 s of
+    // decode on a 27B, far beyond any healthy TCP backlog.
+    static constexpr size_t kMaxOutQueue = 256;
+    // Hard ceiling enforced by push_token itself, twice the pause threshold.
+    // The scheduler pausing a full sequence is what normally keeps out_q under
+    // kMaxOutQueue, but that is a property of the *call site*; a new producer
+    // that forgets the gate would otherwise reintroduce the unbounded buffer.
+    // Refusing to grow past this point cancels the sequence instead of dropping
+    // tokens, because a dropped token silently truncates the response.
+    static constexpr size_t kHardOutCap = 2 * kMaxOutQueue;
+    bool out_queue_full() const {
+        std::lock_guard<std::mutex> lk(m);
+        return out_q.size() >= kMaxOutQueue;
+    }
 
     void cancel() {
         cancelled.store(true, std::memory_order_relaxed);
@@ -73,6 +94,13 @@ struct sequence {
     void push_token(token_out t) {
         {
             std::lock_guard<std::mutex> lk(m);
+            if (out_q.size() >= kHardOutCap) {
+                // See kHardOutCap: end the request rather than truncate it or
+                // grow forever.  The token is discarded; nobody can read it.
+                cancelled.store(true, std::memory_order_relaxed);
+                cv.notify_all();
+                return;
+            }
             out_q.push_back(std::move(t));
         }
         cv.notify_all();

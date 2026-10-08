@@ -197,6 +197,25 @@ RIFF/WAV 头，所以写错 `format` 不会导致解码失败。
   `mtp generation failed`）；completion 的 catch **不发任何事件**，直接 `choice_done(0,0)`，
   客户端只会看到流提前结束。
 
+#### 背压：两个队列都有上限
+
+`sequence::out_q` 与 `sse_queue::items` 的唯一消费者是 HTTP writer 线程，所以客户端读得比引擎慢时
+它们是**无界缓冲**。两边都不能阻塞：调度器循环是所有序列**共享**的单线程（阻塞等于一个慢客户端
+冻住全部请求），而 MM/MTP 生产者在整个 forward 期间持有 `engine::mtx`（阻塞等于拖慢全部请求）。
+两边也都不能丢事件——丢掉一个 token 就是静默截断响应。所以：
+
+* 调度器路径：`sequence::kMaxOutQueue = 256` 是**暂停阈值**，decode 组批时把满的序列排除在本轮
+  batch 之外（它保住 slot 与 KV，drain 之后自动恢复，§3.4 组批处 `out_queue_full()`）。
+  这个保证属于**调用点**，所以队列自身另有一个 `kHardOutCap = 2*kMaxOutQueue`，由 `push_token`
+  强制：越过它就取消该序列（结束请求而不是截断它），这样将来任何漏掉暂停判断的新生产者都不会把
+  无界缓冲重新引回来。
+* 流式路径：`sse_queue::kMaxQueue = 4096`，越过即自取消（`backpressure_cancelled()` 可区分它与
+  真正的断连）。drain 不掉 4096 个事件（几分钟 decode）的客户端与断连者同等对待。
+  `sse_session::cancelled()` 因此**同时**查 `stop` 和队列状态，否则生产者在溢出时收不到信号。
+
+`test_sse_cancel` 的 `test_backpressure_bounds` 钉住这些数字（到阈值时 full、越过硬上限后被取消、
+drain 一个即恢复、溢出取消能传达到 session 的生产者）。
+
 #### 断连取消
 
 唯一的断连信号是 httplib 的 `ContentProviderResourceReleaser` 那个 `bool`：写失败与对端挂断

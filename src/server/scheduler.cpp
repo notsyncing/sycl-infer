@@ -350,6 +350,19 @@ void scheduler::loop() {
                     retire(s, "stop");
                     continue;
                 }
+                // Backpressure, not a stall: a consumer that cannot keep up
+                // pauses this sequence (it keeps its slot and KV, and resumes
+                // once drained) instead of growing out_q without bound or
+                // blocking the loop for every other sequence.  The 2 ms wait
+                // fallback below is what re-checks it; that is negligible
+                // against a ~65 ms decode step.
+                if (s->out_queue_full()) {
+                    if (dbg()) {
+                        fprintf(stderr, "[sched] seq=%d paused: out_q >= %zu\n", s->id,
+                                sequence::kMaxOutQueue);
+                    }
+                    continue;
+                }
                 if (s->prompt_pos < (int)s->prompt.size()) {
                     continue; // still prefilling
                 }

@@ -36,12 +36,32 @@ struct sse_queue {
     std::deque<std::string> items;
     bool done = false;
     bool cancelled = false;
+    // Set the first time push() refuses an item, i.e. the consumer fell behind
+    // by more than the cap.  Observable so a test can assert the bound without
+    // counting threads.
+    bool overflowed = false;
+    // Backlog cap.  Same reasoning as sequence::kMaxOutQueue: the writer is the
+    // only consumer, so an unbounded queue is an unbounded buffer.  This path
+    // (multimodal / MTP) runs on one producer thread that holds engine::mtx for
+    // the whole forward, so blocking here would stall every other request -
+    // and dropping an SSE event would silently corrupt the stream.  Neither is
+    // acceptable, so exceeding the cap cancels the session instead: a client
+    // that cannot drain 4096 events (minutes of decode) is treated exactly
+    // like one that disconnected.  backpressure_cancelled() reports which.
+    static constexpr size_t kMaxQueue = 4096;
 
     void push(std::string s) {
         {
             std::lock_guard<std::mutex> lk(m);
             if (cancelled) {
                 return; // nobody is reading; drop rather than grow
+            }
+            if (items.size() >= kMaxQueue) {
+                overflowed = true;
+                cancelled = true;
+                items.clear();
+                cv.notify_all();
+                return;
             }
             items.push_back(std::move(s));
         }
@@ -67,6 +87,11 @@ struct sse_queue {
     bool is_cancelled() const {
         std::lock_guard<std::mutex> lk(m);
         return cancelled;
+    }
+    // True when the queue hit kMaxQueue rather than a client disconnect.
+    bool backpressure_cancelled() const {
+        std::lock_guard<std::mutex> lk(m);
+        return overflowed;
     }
     // false once finished or cancelled
     bool pop(std::string & out) {
@@ -123,7 +148,10 @@ struct sse_session {
         }
     }
     bool cancelled() const {
-        return stop.load(std::memory_order_relaxed);
+        // The queue also cancels itself when its backlog cap is hit, so
+        // producers must consult it: `stop` alone would miss the overflow and
+        // keep generating for a client that never caught up.
+        return stop.load(std::memory_order_relaxed) || q->is_cancelled();
     }
     void cancel() {
         stop.store(true, std::memory_order_relaxed);

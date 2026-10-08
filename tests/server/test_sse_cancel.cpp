@@ -98,6 +98,70 @@ static void test_track_after_cancel() {
 
 // ---------------------------------------------------------------- end to end
 
+// The writer is the only consumer of both queues, so neither may grow without
+// bound when that consumer stalls.  sequence::out_q pauses the sequence;
+// sse_queue cancels the session (dropping an event would corrupt the stream,
+// and blocking would stall every request, since the mm/MTP producer holds
+// engine::mtx for the whole forward).
+static void test_backpressure_bounds() {
+    // scheduler path: the queue stops growing, and the sequence reports full
+    {
+        auto s = std::make_shared<sequence>();
+        CHECK(!s->out_queue_full());
+        for (size_t i = 0; i < sequence::kMaxOutQueue; i++) {
+            s->push("t");
+            // the last push lands exactly on the cap, so "not full" only holds
+            // while there is still room after it
+            if (i + 1 < sequence::kMaxOutQueue) {
+                CHECK(!s->out_queue_full());
+            }
+        }
+        CHECK(s->out_queue_full()); // exactly at the cap, still bounded
+        // The pause threshold is only *consulted* by the scheduler, so the queue
+        // itself keeps accepting up to the hard cap - what it must never do is
+        // grow without bound, and it must not drop tokens silently either.
+        for (size_t i = sequence::kMaxOutQueue; i < sequence::kHardOutCap; i++) {
+            s->push("t");
+        }
+        CHECK(s->out_q.size() == sequence::kHardOutCap);
+        CHECK(!s->cancelled); // still healthy, the scheduler would be pausing
+        // past the hard cap the sequence ends instead of truncating
+        s->push("one too many");
+        CHECK(s->out_q.size() == sequence::kHardOutCap);
+        CHECK(s->cancelled);
+        // draining makes room again, which is what resumes a paused sequence
+        auto s2 = std::make_shared<sequence>();
+        for (size_t i = 0; i < sequence::kMaxOutQueue; i++) {
+            s2->push("t");
+        }
+        CHECK(s2->out_queue_full());
+        sequence::token_out t;
+        CHECK(s2->pop_token(t));
+        CHECK(!s2->out_queue_full());
+    }
+    // streaming path: the queue cancels itself instead of buffering
+    {
+        sse_queue q;
+        for (size_t i = 0; i < sse_queue::kMaxQueue; i++) {
+            q.push("data: x\n\n");
+            CHECK(!q.is_cancelled());
+        }
+        q.push("data: one too many\n\n");
+        CHECK(q.backpressure_cancelled());
+        CHECK(q.is_cancelled());
+        // and the items were released, not kept
+        std::string out;
+        CHECK(!q.pop(out));
+        // a session sharing that queue reports cancelled, so its producers stop
+        auto sc = std::make_shared<sse_session>();
+        sc->q = std::make_shared<sse_queue>();
+        for (size_t i = 0; i <= sse_queue::kMaxQueue; i++) {
+            sc->q->push("data: x\n\n");
+        }
+        CHECK(sc->cancelled());
+    }
+}
+
 // Real httplib server, real chunked SSE response, real client socket that is
 // closed with a TCP RST (SO_LINGER 0) in the middle of the stream.
 static void test_disconnect_cancels_generation(int port) {
@@ -197,6 +261,7 @@ int main(int argc, char ** argv) {
     const int port = argc > 1 ? atoi(argv[1]) : 18131;
     test_sequence_cancel_wakes_consumer();
     test_track_after_cancel();
+    test_backpressure_bounds();
     test_disconnect_cancels_generation(port);
     if (g_fail) {
         fprintf(stderr, "test_sse_cancel: %d check(s) failed\n", g_fail);
