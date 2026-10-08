@@ -167,6 +167,64 @@ static void run_dflash(const char * label, engine & e, const std::vector<int> & 
 }
 
 
+static std::unique_ptr<engine> make_engine(const char * target, const char * draft, const char * lm, int mtp_k,
+                                           int draft_k, int draft_dev, int ctx);
+
+// Two engines, one process, one after the other.
+//
+// Every other configuration in this file gets a fresh process, and that isolation
+// is itself a coverage gap: the MTP and DFlash2 drafters share exactly one piece of
+// device state (the verify cycle's argmax staging pair, allocated lazily by
+// verify_scratch::ensure), and a bug where one drafter ran before the other in the
+// same process would be invisible here.  It was - see the verify_scratch commit,
+// where "had DFlash run first in a process that then ran MTP, the write would have
+// gone through null".
+//
+// So construct both, in both orders, and require each to reproduce the plain greedy
+// stream.  If a second engine still inherits something from the first, this is
+// where it shows up rather than as an intermittent wrong answer in production.
+static void run_two_engines(const char * target, const char * draft, const char * lm, int n,
+                            const std::string & text) {
+    // The first engine is destroyed before the second is constructed, and that is
+    // deliberate: what this covers is state that outlives an engine (globals and
+    // function-local statics in the drafter paths), which survives destruction and
+    // is exactly what a per-process re-exec hides.  Keeping both alive at once would
+    // test something else and would not fit - two 27B models need ~2x17 GB against
+    // 2x16 GB of card, and Level Zero reports that as UR_RESULT_ERROR_DEVICE_LOST
+    // rather than as an out-of-memory message.
+    //
+    // order A: MTP first, then DFlash2
+    {
+        std::vector<int> toks;
+        {
+            auto e1 = make_engine(target, nullptr, lm, 4, 0, 0, 1024);
+            engine & a = *e1;
+            check(a.mtp.mtp_on, "first engine: MTP drafter enabled");
+            toks = a.tk.encode(text, true);
+            printf("engine 1 (MTP), then destroyed:\n");
+            run_mtp("  MTP in the first engine", a, toks, n);
+        }
+        auto e2 = make_engine(target, draft, lm, 0, 4, 0, 1024);
+        engine & b = *e2;
+        printf("engine 2 (DFlash2) in the same process, after engine 1 was destroyed:\n");
+        run_dflash("  DFlash2 after MTP", b, b.tk.encode(text, true), n);
+    }
+    // order B: the reverse - both must hold, or the property is order-dependent
+    {
+        {
+            auto e1 = make_engine(target, draft, lm, 0, 4, 0, 1024);
+            engine & a = *e1;
+            printf("engine 1 (DFlash2), then destroyed:\n");
+            run_dflash("  DFlash2 in the first engine", a, a.tk.encode(text, true), n);
+        }
+        auto e2 = make_engine(target, nullptr, lm, 4, 0, 0, 1024);
+        engine & b = *e2;
+        check(b.mtp.mtp_on, "second engine: MTP drafter enabled after a DFlash2 engine");
+        printf("engine 2 (MTP) in the same process, after engine 1 was destroyed:\n");
+        run_mtp("  MTP after DFlash2", b, b.tk.encode(text, true), n);
+    }
+}
+
 // Build an engine the way main.cpp does, so a failure here is the engine's and
 // not a ctor-argument difference.  main.cpp passes kv_cap_mb == -1 for "unset"
 // and the layer map / device straight through.
@@ -238,7 +296,7 @@ static void run_gating_k0(const char * target, const char * draft, const char * 
 // so the test re-execs itself per configuration rather than encoding that
 // limitation as a test failure.
 static int run_parent(const char * self, int argc, char ** argv) {
-    static const char * kConfigs[] = {"gate_nodraft", "gate_k0", "mtp", "dflash"};
+    static const char * kConfigs[] = {"gate_nodraft", "gate_k0", "mtp", "dflash", "two_engines"};
     int bad = 0;
     for (const char * cfg : kConfigs) {
         printf("\n================ configuration: %s ================\n", cfg);
@@ -302,6 +360,13 @@ int main(int argc, char ** argv) {
         }
 
         const std::string text = dftxt ? dftxt : "user\nThe capital of France is Paris. The capital of Germany is\nassistant\n";
+
+        // Two engines in one process: the per-configuration re-exec above means no
+        // other case covers cross-drafter state inheritance.  Last, so a failure
+        // here cannot be mistaken for one of the single-drafter results.
+        if (want("two_engines")) {
+            run_two_engines(target, have_draft ? draft : nullptr, lm, n, text);
+        }
         const std::string text2 =
             "user\nExplain in detail how attention works in a transformer model, step by step.\nassistant\n";
 
