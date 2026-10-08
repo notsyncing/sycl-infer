@@ -85,6 +85,9 @@ cpu_kv_dtype to_cpu_vkv() {
 }
 
 struct cpu_backend : compute_backend {
+    // Supplied by the engine: this TU is compiled with -fno-sycl so it cannot hold a
+    // sycl::queue, but it still has to be able to honour synchronize().
+    std::function<void()> sync_;
     const char * name() const override {
         return "cpu";
     }
@@ -251,13 +254,25 @@ struct cpu_backend : compute_backend {
         (void)sx;
         (void)xsum;
     }
-    void synchronize() override {}
+    // Not an empty override: engine::sync_all() funnels every "wait until the
+    // submitted work is done" through here, and two of its callers - the prefix
+    // cache's block serialize/deserialize - use it for correctness, not timing,
+    // because they hand a temporary host std::vector to an asynchronous
+    // queue::memcpy.  Empty here meant the vector could die with the copy still
+    // in flight.
+    void synchronize() override {
+        if (sync_) {
+            sync_();
+        }
+    }
 };
 
 } // namespace
 
-std::unique_ptr<compute_backend> make_cpu_backend() {
-    return std::make_unique<cpu_backend>();
+std::unique_ptr<compute_backend> make_cpu_backend(std::function<void()> sync) {
+    auto b = std::make_unique<cpu_backend>();
+    b->sync_ = std::move(sync);
+    return b;
 }
 
 } // namespace si

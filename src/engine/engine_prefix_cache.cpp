@@ -604,8 +604,14 @@ void engine::pc_restore_state(int slot, int st) {
         q.memcpy(d_gdn_state + ((size_t)gi * kMaxB + slot) * gp, src + (size_t)gi * per, gp * 4);
         q.memcpy(d_conv_state + ((size_t)gi * kMaxB + slot) * cp, src + (size_t)gi * per + gp, cp * 4);
     }
+    // `src` is the caller's temporary (a just-deserialized state buffer) and the
+    // memcpys above read from it asynchronously, so this must wait on both paths -
+    // the multi-device branch used to be covered by sync_all() but the single-device
+    // branch waited for nothing at all.
     if (multi_dev) {
         sync_all();
+    } else {
+        q.wait();
     }
 }
 

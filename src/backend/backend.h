@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -106,7 +107,12 @@ struct compute_backend {
 };
 
 std::unique_ptr<compute_backend> make_gpu_backend(sycl::queue & q);
-std::unique_ptr<compute_backend> make_cpu_backend();
+// The CPU backend takes a waiter rather than a queue: cpu_backend.cpp is compiled
+// with -fno-sycl (see SI_CPU_SOURCES) so it cannot hold a sycl::queue at all, which
+// is why its synchronize() used to be an empty override - and that made every
+// engine::sync_all() call site a silent no-op on the CPU path.  `sync` must block
+// until the work submitted to that backend's queue has completed.
+std::unique_ptr<compute_backend> make_cpu_backend(std::function<void()> sync = nullptr);
 
 inline const char * device_kind_name(device_kind k) {
     return k == device_kind::cpu ? "cpu" : "gpu";

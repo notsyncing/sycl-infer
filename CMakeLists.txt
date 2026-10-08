@@ -329,17 +329,16 @@ if(BUILD_TESTING)
             add_test(NAME ${name} COMMAND ${name} "${SI_TEST_08B_MODEL}")
             set_tests_properties(${name} PROPERTIES LABELS "gpu;model-0.8b")
         endforeach()
-        # Pre-existing failure, confirmed on the CPU backend (not caused by the
-        # GPU-side work): a prefix-cache warm resume on the CPU partition gives
-        # argmax 248046/198 with logits max|diff| ~3.2-3.8, i.e. the restored KV
-        # / recurrent state is not the one the cold run computed.  It runs, it
-        # exits nonzero, and WILL_FAIL records the waiver so that whoever fixes
-        # it gets told to drop the waiver instead of silently going green.  It
-        # is deliberately NOT in the hermetic or model-0.8b selections, so it
-        # cannot be mistaken for a passing test.
-        add_test(NAME test_pc_cpu_known_fail COMMAND test_pc_cpu "${SI_TEST_08B_MODEL}")
-        set_tests_properties(test_pc_cpu_known_fail PROPERTIES
-            LABELS "cpu;model-0.8b;known-fail" WILL_FAIL TRUE)
+        # Was a known failure with a WILL_FAIL waiver: a prefix-cache warm resume
+        # on the CPU partition gave argmax 248046/198 with logits max|diff| ~3.2-3.8.
+        # Root cause: cpu_backend::synchronize() was an empty override, so
+        # engine::sync_all() was a no-op on the CPU path and the block
+        # serialize/deserialize let an asynchronous queue::memcpy outlive the host
+        # std::vector it was reading from - a heap use-after-free, reported by glibc
+        # as a corrupted chunk at an unrelated free.  It now passes, so the waiver
+        # is gone and it is an ordinary test like the rest.
+        add_test(NAME test_pc_cpu COMMAND test_pc_cpu "${SI_TEST_08B_MODEL}")
+        set_tests_properties(test_pc_cpu PROPERTIES LABELS "cpu;model-0.8b")
         if(SI_TEST_27B_MODEL)
             if(NOT EXISTS "${SI_TEST_27B_MODEL}")
                 message(FATAL_ERROR "SI_TEST_27B_MODEL does not exist")

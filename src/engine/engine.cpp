@@ -177,7 +177,7 @@ engine::engine(const engine_config & cfg)
         }
     }
     if (!multi_dev) {
-        be = cpu_mode ? make_cpu_backend() : make_gpu_backend(q);
+        be = cpu_mode ? make_cpu_backend([this] { q.wait(); }) : make_gpu_backend(q);
     }
     if (mtp.mtp_on && !(multi_dev && md_xmx)) {
         // The draft head needs the oneDNN int8 row-major weight path (the same
@@ -1707,7 +1707,12 @@ void engine::setup_multi_device(const std::string & layer_map) {
     }
     if (cpu_backend_idx >= 0) {
         dev_kind_[(size_t)cpu_backend_idx] = 1;
-        backends_[(size_t)cpu_backend_idx] = make_cpu_backend();
+        // Go through dev_queue(): a CPU partition has no queue of its own (only GPU
+        // backends get an entry in dev_queues_ - see the same fallback in
+        // dev_queue and the device-memory frees), so naming dev_queues_ directly
+        // dereferenced null.  A CPU partition's work is submitted on the primary q.
+        backends_[(size_t)cpu_backend_idx] =
+            make_cpu_backend([this, cpu_backend_idx] { dev_queue(cpu_backend_idx).wait(); });
     }
 
     layer_dev_.assign((size_t)m.hp.n_layer, has_gpu ? 0 : 0);
