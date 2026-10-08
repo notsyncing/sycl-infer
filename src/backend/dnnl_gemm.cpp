@@ -268,17 +268,6 @@ void epilogue_vec_launch(sycl::queue & q, const int32_t * acc, const float * sx,
     });
 }
 
-void epilogue_scalar_launch(sycl::queue & q, const int32_t * acc, const float * sx, const float * sw, float * out,
-                            int out_stride, const float * residual, float alpha, int M, int N) {
-    q.parallel_for(sycl::range<1>((size_t)M * N), [=](sycl::id<1> i) {
-        const int m = (int)(i / N);
-        const int n = (int)(i % N);
-        const size_t o = (size_t)m * out_stride + n;
-        const float v = alpha * sx[m] * sw[n] * (float)acc[(size_t)m * N + n] + (residual ? residual[o] : 0.f);
-        out[o] = v;
-    });
-}
-
 } // namespace
 
 static bool g_dnnl_capturing = false;

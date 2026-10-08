@@ -21,10 +21,10 @@
 | 采样 | `sampler.cpp` | 采样算法 |
 | 引擎 | `engine.h` | prefill/decode/logits、前缀缓存 API、`generate`（含内部 MTP 分流）、`generate_mm` |
 
-三条请求路径（`handle_chat` 的分派顺序，`server.cpp:1597`→`1717`→`1750`）：
+三条请求路径（`handle_chat`（`server.cpp` 的 `serve` 内 lambda）的分派顺序）：
 
 * **纯文本**（无媒体 part，默认）：在 httplib 工作线程渲染模板并分词 → `scheduler::submit` → 连续批处理
-  → 输出队列。`n > 1` 时每个 choice 一个生产者线程（`server.cpp:1784-1788`）。
+  → 输出队列。`n > 1` 时每个 choice 一个生产者线程（`server.cpp` 的 `run_text_choice` / `run_mm_choice` / `run_mtp_choice`）。
 * **多模态**（含任意媒体 part）：解码/预处理媒体 → 视觉/音频 tower → 在生产者线程 `engine::generate_mm`，
   **绕过调度器与前缀缓存**，`n` 个 choice 顺序生成。
 * **MTP**（`PF_MTP_SERVER=1` 且引擎开了 `--mtp`）：在生产者线程 `engine::generate`，**同样绕过调度器**；
@@ -40,11 +40,11 @@
 
 `serve(engine&, server_config)`：
 
-* `scheduler sched(e); sched.start();`（`server.cpp:1456-1457`），栈上对象，`serve` 返回时析构。
+* `scheduler sched(e); sched.start();`（`server.cpp` 的 `serve`），栈上对象，`serve` 返回时析构。
 * `httplib::Server srv;`，读/写超时 3600 s，`set_payload_max_length(64 MiB)`（base64 图片需要）
-  （`server.cpp:1513-1516`）。
+  （`server.cpp` 的 `serve`）。
 * `server_config`（`server.h:8-20`）的 `n_threads`（`server.h:12`）**从未被读取**——全仓库唯一出现处是这行
-  定义，`main.cpp:386-394` 也不填它；httplib 使用自己的默认线程池
+  定义，`main.cpp` 的 `serve` 调用处也不填它；httplib 使用自己的默认线程池
   （`max(8, hardware_concurrency()-1)`，`third_party/httplib.h:183-190`，由
   `Server::Server()` 在 `httplib.h:12787-12788` 构造）。没有安装自定义 task queue。
 * `model_id` 默认 `"qwen3.5-0.8b"`（`server.h:9`），但 `/v1/models` 实际用 GGUF `general.name` 覆盖
@@ -54,13 +54,13 @@
 ### 2.2 CORS
 
 每个响应设置 `Access-Control-Allow-Origin: *`、`Allow-Headers: *`、
-`Allow-Methods: GET, POST, OPTIONS`（`cors()`，`server.cpp:1518-1522`）；`srv.Options(".*", ...)` 返回 204
-（`server.cpp:1523-1526`）。调用 `cors(res)` 的处理器：`/v1/models`（`server.cpp:1541`）、
-`/v1/models/{id}`（`server.cpp:1545`）、`/v1/chat/completions`、`/v1/completions`（两个 handler 的第一句）。
-**只有 `GET /health` 不设 CORS**（`server.cpp:1536-1538`）。
+`Allow-Methods: GET, POST, OPTIONS`（`cors()`，`server.cpp`）；`srv.Options(".*", ...)` 返回 204
+（`server.cpp` 的 `serve`）。调用 `cors(res)` 的处理器：`/v1/models`（`server.cpp` 的 `/v1/models` 处理器）、
+`/v1/models/{id}`（`server.cpp` 的 `/v1/models/(.+)` 处理器）、`/v1/chat/completions`、`/v1/completions`（两个 handler 的第一句）。
+**只有 `GET /health` 不设 CORS**（`server.cpp` 的 `/health` 处理器）。
 
 SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-alive`（`cors_sse`，
-`server.cpp:1555-1558`），即流式响应同时带 CORS 与这两个头。
+`server.cpp` 的 SSE 处理器），即流式响应同时带 CORS 与这两个头。
 
 ### 2.3 端点
 
@@ -68,7 +68,7 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 |---|---|---|
 | GET | `/health` | `{"status":"ok"}`；**唯一不带 CORS 的端点** |
 | GET | `/v1/models` | OpenAI 列表；id 取 GGUF `general.name`（回退 `model_id`），附 `meta` |
-| GET | `/v1/models/{id}` | 单个模型（`srv.Get(R"(/v1/models/(.+))")`，`server.cpp:1544`）；id 既可等于 GGUF `general.name` 也可等于 CLI 默认 `model_id`，否则 404 |
+| GET | `/v1/models/{id}` | 单个模型（`srv.Get(R"(/v1/models/(.+))")`，`server.cpp` 的 `serve`）；id 既可等于 GGUF `general.name` 也可等于 CLI 默认 `model_id`，否则 404 |
 | POST | `/v1/chat/completions` | 流式 + 非流式；reasoning_content、工具调用/结果、`n`、stop、`stream_options.include_usage`、图片输入 |
 | POST | `/v1/completions` | 纯文本补全；string/string[]/token 数组 prompt、`n`、`echo`、`suffix`、流式 + 非流式 |
 | OPTIONS | `.*` | 204 + CORS |
@@ -84,17 +84,17 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 `prompt_rejected_json(int max_seq, size_t)`（不收 engine，也不设状态码、不打日志）。
 
 * JSON 解析失败 → 400 `{"error":{"message":"invalid json","type":"invalid_request_error"}}`
-  （chat: `server.cpp:1576-1582`；completions: `server.cpp:1796-1802`）。
+  （chat: `handle_chat`；completions: `handle_completion`，两个 lambda 都在 `server.cpp` 的 `serve` 内）。
 * `parse_messages` 把 `role` 默认 `"user"`；`content` 可以是字符串、`null` 或 part 数组。part 按
-  `type` 分派（`server.cpp:532-571`）：`image_url`/`image` → IMAGE、`video_url`/`video` → VIDEO、
+  `type` 分派（`parse_messages`，`request.cpp`）：`image_url`/`image` → IMAGE、`video_url`/`video` → VIDEO、
   `input_audio`（读 `data`+`format`）、`audio_url` → AUDIO、带 `text` 的 → TEXT（文本**追加**到
   `cm.content`）；未识别的 part 被静默丢弃。每个媒体 part 同时往 `media` 压一条 `media_part`（按出现
   顺序，这就是 §6 的 `order`），并往 `cm.parts` 压一个占位 `chat_part`。
   assistant 消息还可带 `reasoning_content`（或别名 `reasoning`）、`tool_calls`（OpenAI 形状，
   `function.arguments` 为字符串或对象）或旧式 `function_call`（解析成一个 tool_call）；
-  `tool` 消息读取 `tool_call_id`/`name`（`server.cpp:582-630`）。
-  若某消息**没有任何媒体 part**（`has_image`，`server.cpp:510`、该位对四种媒体都会置起），
-  则清空 `parts` 走纯文本快速路径（`server.cpp:631-633`）。
+  `tool` 消息读取 `tool_call_id`/`name`（`parse_messages`，`request.cpp`）。
+  若某消息**没有任何媒体 part**（`!media.empty()`，`server.cpp` 的 `handle_chat`；`parse_messages` 把四种媒体都 push 进 `media`，所以"有任一种媒体"与"有全部四种"在这里是同一个测试），
+  则清空 `parts` 走纯文本快速路径（`server.cpp` 的 `handle_chat`）。
 * `thinking`（`parse_thinking`）：`chat_template_kwargs.enable_thinking` 优先，其次平铺的
   `enable_thinking`/`thinking`，最后 `reasoning_effort`（非 `"none"` 即开启）。
 * `tools_json`（`parse_tools_json`）：把请求 `tools` 数组回传给模板；`tool_choice == "none"`
@@ -104,14 +104,14 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
   `kMaxStops`），`n` 来自 `parse_n`（1..16，`kMaxN`）；两者与 `kMaxJobs` 都在 `request.h`。
 * `/v1/completions` 另有 `parse_best_of`（默认等于 `n`，clamp 到 1..16）、
   `parse_include_usage`（只读 `stream_options.include_usage`）、
-  `echo`、`suffix`（`server.cpp:1820-1821`）。
-* `model` 只被回显进响应（`body.value("model", model_id)`，`server.cpp:1595`）；请求里写错 model 名
+  `echo`、`suffix`（`parse_completion_prompts`，`request.cpp`）。
+* `model` 只被回显进响应（`body.value("model", model_id)`，`server.cpp` 的 `handle_completion`）；请求里写错 model 名
   **不报错**。`created` 是每次请求 `time(nullptr)`。
 * **`seed`**：`gp.seed == 0` 表示“不指定”，此时每条序列用 `steady_clock` 计数播种
   （`scheduler.cpp:55`；单序列路径用 `std::random_device{}()`，`engine.cpp:2371`），即不可复现。
-  非 0 时第 `c` 个 choice 用 `seed + c`（`gp_for_choice`，`server.cpp:738-744`）。
+  非 0 时第 `c` 个 choice 用 `seed + c`（`gp_for_choice`，`server.cpp`）。
 * 请求若满足 `mtp_direct(e, gp, n, gp.logprobs)` 则不进调度器，改走 §3.6 的 MTP 路径
-  （`server.cpp:1717`）。
+  （`server.cpp` 的 `handle_chat`）。
 
 参数映射（`parse_params`）：
 
@@ -131,7 +131,7 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 （`parse_completion_prompts`，`request.cpp`；缺失/空/类型不识别都退化成一条空 prompt）；
 `echo` 把 prompt 文本前置，`suffix` 追加到生成文本后。`best_of > n` 时每个 prompt 生成 `best_of`
 条候选，按 chosen token 的 logprob 之和（`choice_out::score`）`stable_sort` 降序后取前 `n`
-（`server.cpp:1850-1867`）；评分走 `gp.need_score`，它让调度器即使在客户端没要 logprobs 时也算
+（`server.cpp` 的 `handle_completion`）；评分走 `gp.need_score`，它让调度器即使在客户端没要 logprobs 时也算
 chosen token 的 logprob（`sampler.h:29-35`）。
 
 ### 2.5 长度拒绝
@@ -146,12 +146,12 @@ chosen token 的 logprob（`sampler.h:29-35`）。
 
 | 条件 | 消息 | 位置 |
 |---|---|---|
-| 请求含任意媒体 part 但没有可用的 `--mmproj` | `image/video input requires --mmproj` | `server.cpp:1597-1601` |
-| 请求含音频 part 但没有可用的 `--audio-mmproj` | `audio input requires --audio-mmproj` | `server.cpp:1602-1611` |
-| 媒体下载/解码/预处理失败、prompt 装配失败（多模态 try 块） | 解码器给出的 `err` | `server.cpp:1616-1658` |
-| `best_of < n` | `best_of must be >= n` | `server.cpp:1832-1835` |
-| `stream && best_of > 1` | `best_of is not supported with stream` | `server.cpp:1836-1839` |
-| `prompt 数 × max(n, best_of) > 64`（`kMaxJobs`） | `prompt count * n (or best_of) exceeds the server limit` | `server.cpp:1840-1844` |
+| 请求含任意媒体 part 但没有可用的 `--mmproj` | `image/video input requires --mmproj` | `server.cpp` 的 `handle_chat` |
+| 请求含音频 part 但没有可用的 `--audio-mmproj` | `audio input requires --audio-mmproj` | `server.cpp` 的 `handle_chat` |
+| 媒体下载/解码/预处理失败、prompt 装配失败（多模态 try 块） | 解码器给出的 `err` | `server.cpp` 的 `handle_chat` 多模态 try 块 |
+| `best_of < n` | `best_of must be >= n` | `parse_best_of`，`request.cpp` |
+| `stream && best_of > 1` | `best_of is not supported with stream` | `server.cpp` 的 `handle_completion` |
+| `prompt 数 × max(n, best_of) > 64`（`kMaxJobs`） | `prompt count * n (or best_of) exceeds the server limit` | `check_prompt`，`request.cpp` |
 
 最后一条在 `if (!stream)` **之前**，所以流式与非流式都受限；流式时 `best_of` 必为 1，上限实际就是
 `prompt 数 × n <= 64`。
@@ -173,11 +173,11 @@ logprob 只挂载一次、usage 的各计数器——这些此前只能靠驱动
 
 * chat：`object:"chat.completion"`，每个 choice `{message:{role,content[,reasoning_content][,tool_calls]},finish_reason,logprobs}`，
   含 `usage`；`n` 个 choice 的 token 统计求和。仅有工具调用时 `content` 为 `null`；未请求 logprobs 时为
-  `null`（`server.cpp:1756-1760`）。
+  `null`（`stream_chat_text_choice`，`server.cpp`）。
 * completion：`object:"text_completion"`，choice `{index,text,finish_reason,logprobs}`；多个 prompt/`n`
-  展开为多个 choice，`index` 顺序编号（`server.cpp:1873-1874`）。
+  展开为多个 choice，`index` 顺序编号（`stream_completion_text_choice`，`server.cpp`）。
 * 非流式路径同样先过 stop 过滤与 `response_parser`，因此与流式输出一致。
-* **多模态与 MTP 路径的响应形状相同，但 `logprobs` 恒为 `null`**（`server.cpp:1672`、`1729`）——
+* **多模态与 MTP 路径的响应形状相同，但 `logprobs` 恒为 `null`**（`server.cpp` 的三条 `stream_chat_*_choices`）——
   这两条路径不走调度器，拿不到 per-token 的采样细节；`mtp_direct` 因此也把 `logprobs` 列为排除条件。
 * `usage` 由 `usage_json(prompt, completion, reasoning, cached)` 生成（`response.cpp`）：
   `prompt_tokens_details.cached_tokens` = 前缀缓存命中的 prompt token 数（`sequence::reused`）、
@@ -185,7 +185,7 @@ logprob 只挂载一次、usage 的各计数器——这些此前只能靠驱动
   外加 DeepSeek 风格的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（同义，miss = prompt -
   cached），`prompt_tokens_details.audio_tokens` 与
   `completion_tokens_details.{audio,accepted_prediction,rejected_prediction}_tokens` 恒为 0 占位。
-  `/v1/completions` 不做 reasoning 拆分，所以那里 `reasoning_tokens` 传 0（`server.cpp:1886`）。
+  `/v1/completions` 不做 reasoning 拆分，所以那里 `reasoning_tokens` 传 0（`stream_completion_text_choice`，`server.cpp`）。
 
 ### 2.7 流式 SSE
 
@@ -270,13 +270,13 @@ chat chunk schema：
   "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}
 ```
 
-每个 choice 先发一个 `delta:{"role":"assistant"}`（`server.cpp:1037-1039`）；随后是
+每个 choice 先发一个 `delta:{"role":"assistant"}`（`chat_delta_json`，`response.cpp`）；随后是
 reasoning/content/tool_calls 片段（stop 处截断，`tool_calls[].index` 从 0 递增）；再发带
 `finish_reason` 的最终 chunk（chat 为 `delta:{}`，completion 为 `text:""`）；
 最后（可选 usage +）`data: [DONE]`。usage chunk 的 `choices` 是**空数组**，只有 `usage`
-（`server.cpp:1005-1010`）。completion 的流式没有 role chunk，`echo` 的 prompt 文本作为第一个
-`text` chunk 发出（`server.cpp:1260-1262`），`suffix` 在生成结束后单独发一次
-（`server.cpp:1281`）。
+（`sse_usage_frame`，`response.cpp`；它的 `choices` 字面量就是 `json::array()`）。completion 的流式没有 role chunk，`echo` 的 prompt 文本作为第一个
+`text` chunk 发出（`text_chunk`，`response.cpp`），`suffix` 在生成结束后单独发一次
+（`stream_completion_text_choice`，`server.cpp`）。
 
 ### 2.8 回复拆分（`response_parser`）
 
@@ -305,9 +305,9 @@ reasoning/content/tool_calls 片段（stop 处截断，`tool_calls[].index` 从 
 
 `finish_reason` 分三条路径：
 
-* **文本/调度器**（`server.cpp:820-824`、`1097-1098`）：有工具调用 → `"tool_calls"`；否则 stop 命中
+* **文本/调度器**（`server.cpp` 的 `stream_chat_*_choices`；completion 侧 `stream_completion_text_choice`）：有工具调用 → `"tool_calls"`；否则 stop 命中
   → `"stop"`；否则用调度器的 `seq->finish_reason`（只有 `"stop"`/`"length"`，`scheduler.h:27`）。
-* **多模态**（`server.cpp:876-880`、`1165-1166`）与 **MTP**（`server.cpp:945-949`、`1237-1238`）：
+* **多模态**（`stream_chat_mm_choices` / `stream_chat_mtp_choices`，均在 `server.cpp`）：
   这两条路径没有调度器的 `finish_reason`，所以非 stop、非工具调用时**硬编码为 `"length"`**——
   即使是 EOS 或 `max_tokens` 结束也一样。这是两条路径与文本路径唯一的 `finish_reason` 差异。
 
@@ -329,11 +329,11 @@ reasoning/content/tool_calls 片段（stop 处截断，`tool_calls[].index` 从 
 
 ### 2.10 关闭与信号
 
-`SIGINT`/`SIGTERM` 处理器只置原子 `g_term_requested`（`server.cpp:50-53`、注册在 `1916-1917`）；
+`SIGINT`/`SIGTERM` 处理器只置原子 `g_term_requested`（`on_term_signal`，`server.cpp`；注册在 `serve` 内）；
 watchdog 线程每 100 ms 轮询 `g_term_requested` 与 `listen_done` 并调用 `srv.stop()`
-（`server.cpp:1918-1926`）。`srv.listen` 返回后 `listen_done` 置位让 watchdog 自己退出并 join，
+（`server.cpp` 的 `serve`）。`srv.listen` 返回后 `listen_done` 置位让 watchdog 自己退出并 join，
 `g_term_requested` 复位；listen 失败打印 `failed to listen on ...` 并返回 1，否则打印
-`[srv] shutting down, flushing prefix cache` 并返回 0（`server.cpp:1927-1936`）。栈上 `scheduler`
+`[srv] shutting down, flushing prefix cache` 并返回 0（`server.cpp` 的 `serve`）。栈上 `scheduler`
 析构调用 `shutdown()`（置 `stopping`、notify、join，`scheduler.cpp:34-43`），`serve` 返回后
 `~engine` 把 RAM/disk 与驻留 VRAM 节点 flush 到磁盘层。
 
@@ -465,7 +465,7 @@ submit/shutdown 时唤醒循环。
   不是竞争）。先被准入、单独 decode 的序列保持早期 token 精确；batch 只改变批量 GEMM 里 fp 累加的
   顺序。需要逐位可复现的客户端应串行发请求。
 
-### 3.6 MTP 路由（`mtp_direct`，`server.cpp:883-907`）
+### 3.6 MTP 路由（`mtp_direct`，`server.cpp`）
 
 `mtp_direct(e, gp, n, logprobs)` 决定请求是否走 §1 的第三条路径，五个条件全满足才为真：
 
@@ -473,7 +473,7 @@ submit/shutdown 时唤醒循环。
 on /* PF_MTP_SERVER */ && e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 0.f || gp.top_k == 1)
 ```
 
-* `PF_MTP_SERVER` **默认关**（`server.cpp:902-905`）；`e.mtp_on` 需要启动时 `--mtp N` 且模型带
+* `PF_MTP_SERVER` **默认关**（`mtp_direct`，`server.cpp`）；`e.mtp_on` 需要启动时 `--mtp N` 且模型带
   NextN 头 + 多设备 oneDNN int8 分区（见 `AGENTS.md` 的 MTP 一节）。
 * `n == 1 && !logprobs` 与 `greedy` 是必须的：MTP 的接受判据是“目标自身的下一 token 的精确相等”，
   采样目标需要 rejection sampling 才精确；而且这条路径拿不到 per-token 采样细节。
@@ -560,8 +560,8 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
   （`patch_size`/`merge`/`mean`/`std`，`max_pixels = kMaxImgTokens * patch²`），失败非致命（打日志，
   后续媒体请求 400）；若有 `audio_mmproj_path` 则 `mm.am.load()` 导出 `audio_preproc_cfg`
   （`sample_rate`/`n_fft`/`hop`/`n_mel`/`f_min`/`f_max`），失败同样非致命（音频请求 400）
-  （`server.cpp:1460-1497`）。`max_video_frames`/`max_video_side` 从 `server_config` 拷进 `mm_server`
-  （`server.cpp:1498-1499`）。
+  （`server.cpp` 的 `serve`）。`max_video_frames`/`max_video_side` 从 `server_config` 拷进 `mm_server`
+  （`server.cpp` 的 `serve`）。
 * `parse_messages` 按顺序收集媒体的 `media_part`（`image_url`/`image`、`video_url`/`video`、
   `input_audio`（带 `data`+`format`）、`audio_url`），保留文本/媒体交错（`cm.parts` 的顺序就是模板
   看到的顺序），`chat_part` 带 `kind` 标记。
@@ -638,10 +638,10 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 
 | 变量 | 作用 |
 |---|---|
-| `PF_SRV_TIME` | 端点侧打印 `tokenize=.. ms chars=.. tokens=..`；调度器侧每 chunk 一行 `chunk pos=.. n=.. ms=..`，每个序列结束时一行 `prefill/fetch/sample/to_first_tok (wait/admit/prefill_total/chunks/reused/total)`（`server.cpp:1705-1712`、`1803-1814`、`scheduler.cpp:242-250`、`285-290`） |
+| `PF_SRV_TIME` | 端点侧打印 `tokenize=.. ms chars=.. tokens=..`；调度器侧每 chunk 一行 `chunk pos=.. n=.. ms=..`，每个序列结束时一行 `prefill/fetch/sample/to_first_tok (wait/admit/prefill_total/chunks/reused/total)`（端点侧在 `server.cpp` 的 `handle_chat`，调度器侧在 `scheduler.cpp`、`1803-1814`、`scheduler.cpp:242-250`、`285-290`） |
 | `SCHED_DEBUG` | 准入/prefill/decode 决策日志，含每行 decode 的 `seq/slot/pos/tok`（`scheduler.cpp:129-132`、`252-255`、`363-369`、`378-380`） |
 | `PF_CHAT_TMPL_DEBUG` | 记录导致回退 ChatML 的模板异常（也记录 `tools_json` 解析失败，`chat_template.cpp:26`、`90-92`、`102-104`） |
-| `PF_MTP_SERVER` | `1` 让 `mtp_direct` 把 greedy 单请求路由进单序列 MTP 循环，绕过调度器；**默认关**，理由与实测见 §3.6（`server.cpp:901-907`） |
+| `PF_MTP_SERVER` | `1` 让 `mtp_direct` 把 greedy 单请求路由进单序列 MTP 循环，绕过调度器；**默认关**，理由与实测见 §3.6（`mtp_direct`，`server.cpp`） |
 | `PF_MM_URL_FETCH` | 允许下载远程 `http(s)://` 图片/视频/音频（base64 `data:` 不受影响），**默认关闭**；设 `1` 开启且只允许公网可达地址 |
 | `PF_MM_URL_ALLOW_PRIVATE` | 仅在 `PF_MM_URL_FETCH=1` 时有意义：`1` 放行 loopback/私有/link-local 目标（内网媒体服务器场景，等于重新暴露 SSRF） |
 | `PF_AV_FFMPEG` | 音频/视频解码的 ffmpeg 可执行路径（默认 `ffmpeg`，`video.cpp:340`、`audio.cpp:22`） |

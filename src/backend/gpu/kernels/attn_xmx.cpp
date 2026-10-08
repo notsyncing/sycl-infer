@@ -698,10 +698,15 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
         g_calls++;
         if ((acc_n % 64) == 0) {
             const double d = (double)g_calls;
+            // `blks/call` is the fixed-width kBlk chunk count, which is what makes
+            // the matmul cost a step function of the key length rather than linear
+            // (primitive creation is ~15 ms per new shape, so the width is fixed
+            // and padded instead) - the number that explains a surprising total.
             fprintf(stderr,
                     "[xmx] %ld calls %.2f ms total %.3f/call | gather %.3f  qk %.3f  softmax %.3f  pv %.3f "
-                    "(ms/call) cols/call %.0f\n",
-                    acc_n, acc_ms, acc_ms / acc_n, g_ga / d, g_qk / d, g_sm / d, g_pv / d, (double)g_cols / d);
+                    "(ms/call) cols/call %.0f  blks/call %.1f\n",
+                    acc_n, acc_ms, acc_ms / acc_n, g_ga / d, g_qk / d, g_sm / d, g_pv / d, (double)g_cols / d,
+                    (double)g_blk / d);
         }
     }
     return true;

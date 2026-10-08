@@ -86,7 +86,6 @@ static double df_seg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // layer's end barrier), against the host wall: the difference is host submission
 // time the device timeline cannot see.
 static sycl::event df_seg_dev0, df_seg_dev1;
-static sycl::event ffn_e[2];
 static sycl::event tt_e[4];
 static const bool tt_dbg = si::env::flag("PF_DFLASH_TOPTIME");
 static auto tt_now = [] { return std::chrono::high_resolution_clock::now(); };
@@ -289,7 +288,6 @@ void df_rowrms(sycl::queue & q, const float * p, int M, int width, const char * 
             fclose(f);
             fprintf(stderr, "[dflash-sig] %s written to %s (%zu bytes)\n", tag, bp2.c_str(), v.size() * 4);
         }
-    skip_bin:;
     }
     fprintf(stderr, "[dflash] rowrms %s:", tag);
     for (int m = 0; m < M; m++) {
@@ -851,7 +849,6 @@ bool engine::df_gemm(const wt & w, const float * x, int xs, float * out, int os,
 void engine::df_inject(int M, int pos0, int feat_row) {
     const dflash_hp & hp = dfl.dfm_->hp;
     sycl::queue & dq = dev_queue(dfl.df_dev_);
-    const int nkv = hp.n_head_kv * hp.head_dim;
     for (int off = 0; off < M; off += kDfInjMax) {
         const int n = std::min(kDfInjMax, M - off);
         const size_t bytes = (size_t)n * hp.n_feat * 4;
@@ -1264,15 +1261,10 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 {
                     std::vector<float> qv((size_t)M * (hp.n_head * hp.head_dim + 2 * hp.n_head_kv * hp.head_dim));
                     dq.memcpy(qv.data(), dfl.d_df_qkv, qv.size() * 4).wait();
-                    double qs2 = 0, ks2 = 0;
+                    double qs2 = 0;
                     const int nhq = hp.n_head * hp.head_dim;
                     for (int k2 = 0; k2 < nhq; k2++) {
                         qs2 += (double)qv[k2] * qv[k2];
-                    }
-                    for (int k2 = 0; k2 < hp.n_head_kv * hp.head_dim; k2++) {
-                        const size_t cell = (size_t)(pv % dfl.df_ring_) * hp.n_head_kv * hp.head_dim + k2;
-                        const double v = f16_bits(vr[cell]);
-                        ks2 += v * v;
                     }
                     // K in the qkv buffer (post norm+rope, pre ring write) vs K in
                     // the ring: rms(k_norm weights) is the invariant both must have,
@@ -1615,6 +1607,20 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     df_sel_launch(dq, dfl.d_df_ids, dfl.d_df_vals, dfl.d_df_gate, dfl.df_sel_pv_, dfl.df_sel_ps_, dfl.df_sel_po_, dfl.df_sel_nv_, dfl.df_sel_ns_,
                   dfl.df_sel_no_, dfl.d_df_lattice, toks[0], M, m.hp.n_vocab, hp.sel_rank, K);
     if (tt_dbg) { tt_e[2] = dq.ext_oneapi_submit_barrier(); }
+    // The host-side stamps above were collected but never printed, so
+    // PF_DFLASH_TOPTIME reported only the device span of this tail.  On an
+    // in-order queue the host blocks while the device drains (AGENTS.md,
+    // "gate+up reads 167 MB in a reported 0.2 ms"), so a device-only split is
+    // exactly the attribution that cannot be trusted - print both.
+    if (tt_dbg) {
+        const auto tt3 = tt_now();
+        fprintf(stderr,
+                "[dflash-tt] HOST topk=%.3f selhidden=%.3f sel=%.3f (total %.3f ms)\n",
+                std::chrono::duration<double, std::milli>(tt1 - tt0).count(),
+                std::chrono::duration<double, std::milli>(tt2 - tt1).count(),
+                std::chrono::duration<double, std::milli>(tt3 - tt2).count(),
+                std::chrono::duration<double, std::milli>(tt3 - tt0).count());
+    }
     if (si::env::flag("PF_DFLASH_BTIME")) {
         const auto t_b4 = now_t();
         fprintf(stderr, "[dflash-bt] embed+layers=%.1f outnorm+head+topk+sel=%.1f | total=%.1f ms\n",
@@ -1728,10 +1734,9 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
             return (df_ts_ms(hi, false) - df_ts_ms(lo, true));
         };
         fprintf(stderr,
-                "[dflash-tt] DEV topk=%.2f selhidden=%.2f sel=%.2f (total %.2f) | host_block=%.2f "
-                "host_tail=%.2f ms\n",
+                "[dflash-tt] DEV topk=%.2f selhidden=%.2f sel=%.2f (total %.2f) | host_block=%.2f ms\n",
                 de(tt_e[0], tt_e[1]), de(tt_e[1], tt_e[2]), de(tt_e[2], tt_e[3]), de(tt_e[0], tt_e[3]),
-                ms_t(tt_d0, tt_now()) - (de(tt_e[3], tt_e[3])), 0.0);
+                ms_t(tt_d0, tt_now()) - (de(tt_e[3], tt_e[3])));
     }
     if (df_dbg()) {
         // localize a wrong draft: the head's top-k per position and the

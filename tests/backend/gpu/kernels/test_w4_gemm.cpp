@@ -205,7 +205,7 @@ int main(int argc, char ** argv) {
         // reference: sx[m] * sum_k w_true[k][n] * xq[m][k]
         const size_t rb = ggml_row_bytes(t.type, K);
         std::vector<float> wr((size_t)K);
-        double tsum = 0, tworst = 0, ref_last = 0, got_last = 0;
+        double tsum = 0, tworst = 0;
         double tsum8 = 0, tworst8 = 0, tsum_ns = 0;
         std::vector<double> ref_no_sa((size_t)N, 0.0);
         for (int n = 0; n < N_CMP; n++) {
@@ -223,8 +223,6 @@ int main(int argc, char ** argv) {
                     ref_no_sa[(size_t)n] = acc_no_sa;
                 }
                 const double got = (double)out[(size_t)m * N + n];
-                ref_last = ref;
-                got_last = got;
                 const double e = std::fabs(got - ref) / std::fmax(1.0, std::fabs(ref));
                 if (m == 0) {
                     tsum_ns += std::fabs(got - ref_no_sa[(size_t)n]) / std::fmax(1.0, std::fabs(ref_no_sa[(size_t)n]));
