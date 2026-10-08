@@ -115,6 +115,14 @@ struct mtp_layer_t {
     w8t wq8, wk8, wv8, wo8, ffn_gate8, ffn_up8, ffn_down8, eh_proj8;
 };
 
+// Reject a model whose geometry the kernels do not implement, before anything
+// is uploaded or allocated.  Several kernels hardcode a head_dim (the generic
+// attention partial stride is literally 256) and would otherwise overrun their
+// buffers rather than merely lose accuracy.  Throws std::runtime_error naming
+// the first violated constraint.  Called by model::load for every architecture,
+// so a new loader inherits it; exposed so a test can drive it without a GGUF.
+void validate_hparams(const hparams & hp, const std::string & arch);
+
 struct model {
     gguf_file gguf;
     hparams hp;

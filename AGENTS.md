@@ -346,6 +346,15 @@ third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
    table in `src/model/model.cpp` (`general.architecture` value → loader).
 3. Add the file to `CMakeLists.txt`.  `model::load` dispatches automatically; an
    unknown architecture still throws `unsupported architecture: <name>`.
+4. `validate_hparams` runs after every loader, so a geometry the kernels do not
+   implement is refused at load time, before any device allocation.  This is a
+   memory-safety guard, not a precision one: `attn.cpp`'s generic attention sizes
+   each split's partials with a literal `constexpr int HD = 256` while indexing
+   them with `pstride = 2 + head_dim`, so `head_dim != 256` overruns the buffer
+   instead of merely losing accuracy - and every specialised kernel falls back to
+   that same one.  Also checked: `head_dim % 32`, the GQA ratio, the basic
+   extents, `full_attn_interval`, and the GDN geometry.  If your architecture
+   needs a geometry outside these, extend the check *and* the kernel together.
 
 See [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
 [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) for the full

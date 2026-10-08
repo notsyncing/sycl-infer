@@ -121,12 +121,35 @@ static const loader kLoaders[] = {
 一遍，只取 `<arch>.context_length`，**不构造 `model`**，因此可以在引擎之前用来给 `--ctx full` 定大小
 （见 §7.2）。它对没有该键的模型返回 0。
 
+### 3.2 加载期的几何校验（`validate_hparams`）
+
+`model::load` 在架构 loader 填完 `hp` 之后调用 `validate_hparams(hp, arch)`（`model.cpp:62-105`）。
+**几何不满足 kernel 硬编码假设的 GGUF 在加载期被拒绝**，而不是"算错"或"算零"。
+
+原因不是精度而是内存安全：`attn.cpp` 的通用（非特化）注意力 kernel 用**字面量**
+`constexpr int HD = 256` 计算每个 split 的 partials 长度，却用 `pstride = 2 + head_dim` 定位。
+所以 `head_dim = 128` 会让它往 130 个 float 的槽位里写 256 个 float，**越界写坏 partials 缓冲**。
+特化 kernel（oneDNN 注意力、flash、grouped）全部以 `head_dim == HD` 为条件，不满足时**回落到同一个
+通用 kernel**——因此除 256 以外没有任何受支持形状。`qk_norm_rope.cpp` 的 QK-norm 同理：RMSNorm 循环
+是 `head_dim / 32` 配 32 宽 sub-group，非 32 的倍数会静默漏掉尾部维度。
+
+当前校验项：`head_dim == 256`、`head_dim % 32 == 0`、
+`n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0`（GQA 比值被多处 kernel 整除）、
+`n_layer/n_embd/n_vocab > 0`、`full_attn_interval > 0`（`is_recr` 对它取模）、以及存在
+recurrent 层时 `d_state/n_group/dt_rank/conv_k > 0`。消息带架构名。
+
+**新增架构自动继承这一关**：只要 loader 通过 `kLoaders[]` 注册，填出一个 kernel 不支持的几何时
+报错发生在分配任何设备内存之前。测试 `tests/model/test_hparams.cpp` 不需要 GGUF 或 GPU，
+直接驱动该函数。
+
 ### 新增模型架构
 
 1. 新建 `src/model/<arch>.cpp`，定义 `si::arch::load_<arch>(model & m)`（照抄 `qwen35.cpp` 结构），
    用 `arch::bind_tensor` / `arch::bind_f32` 绑定张量。
 2. 在 `model_arch.h` 声明，在 `model.cpp` 的 `kLoaders[]` 注册。
 3. 在 `CMakeLists.txt` 加入该 `.cpp`。`model::load` 自动分发；未知架构仍抛异常。
+4. 若该架构的几何超出 §3.2 的约束，先扩展 `validate_hparams` 并放宽对应 kernel——**不要**让一个
+   不受支持的 head_dim 走到 kernel 里越界写内存。
 
 ---
 
