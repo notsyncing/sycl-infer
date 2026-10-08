@@ -1998,6 +1998,40 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
 * **`st_a` is the oneDNN-int8-matmul-only stream.**  The dense `PF_GEMM_DNNL` GEMMs still use
   `p->st`; `attn_qk`/`attn_pv` submit to `p->st_a` and wait only that stream.
   Do not move the dense path onto `st_a`.
+* **`ggml_float_to_half` used to flush the whole f16 subnormal range to zero,
+  which silently destroyed weight-store scales (`src/common/quant.h`).**  The
+  f16 subnormals represent `[2^-24, 2^-14)` with ten mantissa bits; the old code
+  had `if (exp <= 0) return sign;`, i.e. it threw away a thousand-fold range.  A
+  Q4_K super-block whose `d` is *itself* subnormal then produced `d*sc` below
+  `2^-14`, so `pack_q4_K` wrote a **step plane of identically zero** and the u4
+  reconstruction of that column collapsed onto the constant `-dmin*m`.
+  Measured on the 27B: `blk.16.attn_qkv.weight` has `d = 4.47e-6` (f16 `0x004b`)
+  in the offending super-block, and **21 of its 10240 columns (0.205%) sat at up
+  to 240% relative L2** against the exact GGUF dequant while every neighbouring
+  column measured the expected 0.08% (the f16 rounding of the two constants).
+  `blk.1`/`blk.2`/`blk.4` of the same tensor family had **zero** such columns, so
+  it is data-dependent and invisible in any aggregate.  The same flush reached
+  `w8.cpp`'s int8 per-group scales, the k5/cb4 and 2-bit packs, and the KV
+  scales.  `test_f16conv` (hermetic, no model) pins the bit patterns; the old
+  implementation fails it 68 ways, and it also asserts the *range* property
+  ("nothing in `[2^-24, 2^-14)` may encode as zero") rather than sampled points,
+  because a sampled test misses a boundary that moves.  **Lesson: the converter
+  kept truncating (not round-to-nearest) so that nothing on the normal range
+  moved - a correctness fix here did not need to be a numerics change.**
+* **A test criterion built on a per-element *relative* yardstick flags
+  cancellation, not defects.**  A dot product of K=17408 terms has an absolute
+  error set by the terms (`|dy| ~ eps * sum_k |w_k x_k|`), so an output that
+  nearly cancels to a small fraction of the tensor's max still differs between
+  two *correct* weight stores by their full ~1%.  `test_w4_vs_i8`'s original
+  `|dy| > 0.05 * max(1, |y|)` flagged 1 element in 163840 on one tensor and 2 in
+  163840 on another while the tensor-level figure stayed at 1.6% / 0.9%.  It now
+  screens against the *tensor's* output scale and adjudicates the survivors (and
+  each tensor's worst element) against the exact fp32 dot product of the same
+  quantized activation, judged on `|dy|` vs `sum_k |w_k x_k|`.  That criterion is
+  what found the `ggml_float_to_half` defect above, so the rewrite is load-bearing
+  rather than cosmetic - and `PF_W4_NOCORR=1` (drop the u4 zero-point
+  correction) is its red half: `diff/accum` 0.10-0.15 against ~0.01 for a correct
+  pair of stores, so the 0.05 threshold is not a loosened bar.
 * **`nat_gemm_launch`'s int8 (FMT 3) and cb4 (FMT 2) paths need the
   decode/verify activation form, not just "an activation".**  `gemm()`'s int8
   nat call is gated on the activation's split form (like the u4 one): a

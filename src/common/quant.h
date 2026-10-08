@@ -68,17 +68,43 @@ static inline float ggml_half_to_float(uint16_t h) {
     return f;
 }
 
+// f32 -> f16, truncating (the long-standing behaviour on the normal range, kept
+// so nothing that depends on it moves).
+//
+// The subnormal f16 range used to return plain zero, which is a real defect and
+// not a rounding nit: f16 subnormals represent [2^-24, 2^-14), ten bits of
+// mantissa, and every weight-store scale plane goes through here.  A Q4_K tensor
+// whose per-super-block `d` is itself subnormal (measured: `d = 4.47e-6`,
+// f16 0x004b, in blk.16.attn_qkv.weight) produces `d*sc = 3.13e-5 < 2^-14`, so
+// `pack_q4_K`'s step plane came out *identically zero* and the u4 reconstruction
+// of that column collapsed onto the constant `-dmin*m`: 21 of its 10240 columns
+// (0.205%) at up to 240% relative L2 against the exact GGUF dequant, while every
+// neighbouring column measured the expected 0.08% (f16 rounding of the two
+// constants).  The same flush reached w8.cpp's int8 per-group scales, k5/cb4 and
+// the 2-bit store.
+//
+// Derivation for the subnormal branch: an f32 value is `m * 2^(e32 - 150)` with
+// `m` the 24-bit significand, and a subnormal f16 is `h * 2^-24` with h in
+// [0, 1024), so `h = m * 2^(126 - e32)` and the shift is `126 - e32`.
 static inline uint16_t ggml_float_to_half(float f) {
     uint32_t bits;
     std::memcpy(&bits, &f, 4);
     uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
+    int32_t e32 = (int32_t)((bits >> 23) & 0xFF);
+    int32_t exp = e32 - 127 + 15;
     uint32_t mant = bits & 0x7FFFFFu;
-    if (exp <= 0) {
-        return (uint16_t)sign;
-    }
     if (exp >= 31) {
         return (uint16_t)(sign | 0x7C00u);
+    }
+    if (exp <= 0) {
+        // Subnormal f16 (IEEE 754 binary16 section 5.2), truncating like the
+        // normal path.  Anything below 2^-24 has no bits left and becomes 0,
+        // which is also what an f32 subnormal (e32 == 0) or zero must give.
+        const int32_t shift = 126 - e32;
+        if (shift >= 32) {
+            return (uint16_t)sign;
+        }
+        return (uint16_t)(sign | ((mant | 0x800000u) >> shift));
     }
     return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
 }
