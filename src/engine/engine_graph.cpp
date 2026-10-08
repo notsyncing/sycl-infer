@@ -90,14 +90,8 @@ void seg_plan::validate(int n_layer, const char * what) const {
             }
         }
         const int ncalls = 4 * nl + (has_head ? 1 : 0);
-        if ((int)call_tb.size() != ncalls) {
-            fail("call_tb has " + std::to_string(call_tb.size()) + " calls, expected " + std::to_string(ncalls));
-        }
-        // begin_call pushes all six per-call vectors together
-        if (call_offsets.size() != call_tb.size() || call_counts.size() != call_tb.size()
-            || call_total_rows.size() != call_tb.size() || call_nsb.size() != call_tb.size()
-            || call_xq.size() != call_tb.size()) {
-            fail("per-call vectors disagree in size");
+        if ((int)calls.size() != ncalls) {
+            fail("plan has " + std::to_string(calls.size()) + " calls, expected " + std::to_string(ncalls));
         }
         if (layer_c0[(size_t)nl] != 4 * nl) {
             fail("head index is not 4*n_layer");
@@ -105,23 +99,33 @@ void seg_plan::validate(int n_layer, const char * what) const {
         if (has_head) {
             // the head call is last and pinned to the primary device: it reads
             // the primary's buffers after record_forward's bind_acts(0)
-            for (size_t i = (size_t)call_offsets.back(); i < segs.size(); i++) {
+            for (size_t i = (size_t)calls.back().seg_off; i < segs.size(); i++) {
                 if (segs[i].dev != 0) {
                     fail("head segment on device " + std::to_string(segs[i].dev));
                 }
             }
         }
     }
-    if (!groups.empty()) {
-        if (call_group_begin.size() != call_tb.size() || call_group_count.size() != call_tb.size()) {
-            fail("group index vectors disagree with the call list");
+    // Each call's segment slice and group slice are half-open ranges written by
+    // begin_call/add and finalize.  Nothing in the type stops them running past
+    // their arrays, and a replay that trusted one would index out of bounds
+    // rather than miswire quietly - so check them once, here.
+    for (size_t ci = 0; ci < calls.size(); ci++) {
+        const call_t & c = calls[ci];
+        if (c.seg_off < 0 || c.seg_count < 0 || (size_t)(c.seg_off + c.seg_count) > segs.size()) {
+            fail("call " + std::to_string(ci) + " covers segs [" + std::to_string(c.seg_off) + ", +"
+                 + std::to_string(c.seg_count) + ") of " + std::to_string(segs.size()));
         }
-        for (size_t g = 0; g < groups.size(); g++) {
-            const auto & gr = groups[g];
-            for (int j = 1; j < gr.n; j++) {
-                if (segs[(size_t)gr.off + j].dev != segs[(size_t)gr.off].dev) {
-                    fail("call group spans devices");
-                }
+        if (c.group_begin < 0 || c.group_count < 0 || (size_t)(c.group_begin + c.group_count) > groups.size()) {
+            fail("call " + std::to_string(ci) + " covers groups [" + std::to_string(c.group_begin) + ", +"
+                 + std::to_string(c.group_count) + ") of " + std::to_string(groups.size()));
+        }
+    }
+    for (size_t g = 0; g < groups.size(); g++) {
+        const auto & gr = groups[g];
+        for (int j = 1; j < gr.n; j++) {
+            if (segs[(size_t)gr.off + j].dev != segs[(size_t)gr.off].dev) {
+                fail("call group spans devices");
             }
         }
     }
@@ -239,7 +243,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         const layer_t & L = m.layers[il];
         const int dev = multi_dev ? layer_dev_[il] : 0;
         bind_acts(dev); // per-device activations: the plan captures dev's buffers
-        plan.layer_c0.push_back((int)plan.call_tb.size());
+        plan.layer_c0.push_back((int)plan.calls.size());
         if (L.recurrent) {
             plan.begin_call(tb, hp.n_embd / 256);
             if (use_w8) {
@@ -294,7 +298,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         plan.begin_call(tb, hp.n_ff / 256);
         if (use_w8) {
             // ffn_down: activations are silu(gate)*up.  The quantizer applies it
-            // from call_xq.up; the fp32 GEMV (and the oneDNN fallback) apply it
+            // from calls.back().xq.up; the fp32 GEMV (and the oneDNN fallback) apply it
             // from the segment's act_up, so that must be set here as well -
             // otherwise the fp32 path multiplies by the raw gate.
             add8(dev, L.ffn_down, L.ffn_down8, d_ffn, ffn_stride, d_x, hp.n_embd, d_x);
@@ -310,7 +314,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
     // (the DP4A path keeps the head on the fp32 GEMV: only one row is needed)
     // Skipped entirely for non-final prefill chunks (with_head == false).
     plan.has_head = with_head || head_batched;
-    plan.layer_c0.push_back((int)plan.call_tb.size()); // the head call index
+    plan.layer_c0.push_back((int)plan.calls.size()); // the head call index
     if (with_head || head_batched) {
         // The head always runs on the primary backend, and bind_acts() only
         // rebinds the engine's members - the plan has already captured the
@@ -367,7 +371,7 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         // (measured on the 27B, 2x A770).  `head_batched` selects the activation
         // the segment points at: the batch-1 decode head reads d_xnorm, the
         // single-token prefill head reads d_last_hidden (see s.x above).
-        if (md_xmx && !plan.call_xq.back().x) {
+        if (md_xmx && !plan.calls.back().xq.x) {
             plan.set_xq(head_batched ? d_xnorm : d_last_hidden, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
         }
         plan.add(s);
@@ -568,13 +572,13 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         }
     };
     auto gemv_at = [&](size_t idx) {
-        const int gb = plan.call_group_begin[idx];
-        const int gc = plan.call_group_count[idx];
+        const int gb = plan.calls[idx].group_begin;
+        const int gc = plan.calls[idx].group_count;
         if (dbg_pfb2) {
             const gemv_seg & s0 = plan.segs[plan.groups[gb].off];
             fprintf(stderr, "[gemv_at] idx=%zu groups=%d first_w8=%d mode=%d rows=%d", idx, gc, s0.w8.vals ? 1 : 0,
                     mode, rows);
-            if (plan.call_tb[idx] == 1) {
+            if (plan.calls[idx].tb == 1) {
                 fprintf(stderr, " HEAD x=%p out=%p out_stride=%d n_rows=%d type=%u d_x=%p d_logits=%p",
                         (const void *)s0.x, (void *)s0.out, s0.out_stride, s0.n_rows, s0.type, (void *)d_x,
                         (void *)d_logits);
@@ -583,7 +587,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         }
         // DP4A path: quantize this call's activations once, then run the
         // int8 GEMMs (segments with a w8 view) and fp32 GEMVs (the rest)
-        const int tb = plan.call_tb[idx];
+        const int tb = plan.calls[idx].tb;
         // the head call runs on a single token (d_last_hidden) - never batched
         const bool single = (tb == 1);
         const auto a_grp = tnow();
@@ -618,11 +622,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             if (!D || (mode == 0 && !multi_dev)) {
                 return false;
             }
-            if (idx >= plan.call_xq.size() || !plan.call_xq[idx].x) {
+            if (idx >= plan.calls.size() || !plan.calls[idx].xq.x) {
                 return false;
             }
-            const int gb0 = plan.call_group_begin[idx];
-            const int gc0 = plan.call_group_count[idx];
+            const int gb0 = plan.calls[idx].group_begin;
+            const int gc0 = plan.calls[idx].group_count;
             for (int g = 0; g < gc0; g++) {
                 const seg_plan::group_t & gr0 = plan.groups[gb0 + g];
                 for (int j = 0; j < gr0.n; j++) {
@@ -637,7 +641,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     if (need
                         && (!(D->has_weight(key) || D->has_weight_w4(key) || D->has_weight_k5(key)
                               || D->has_weight_cb4(key))
-                            || kk != plan.call_xq[idx].K)) {
+                            || kk != plan.calls[idx].xq.K)) {
                         return false;
                     }
                 }
@@ -651,7 +655,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         // exactly when the gemm paths below are not taken either.
         act_view av;
         if (dnnl_call) {
-            const seg_plan::xq_t & xq = plan.call_xq[idx];
+            const seg_plan::xq_t & xq = plan.calls[idx].xq;
             const auto a2 = tnow();
             // decode reads the even/odd split in the u4 GEMV; prefill does not
             // do_split also feeds the native-u4 GEMM's even/odd activation planes,
@@ -666,8 +670,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 sync_cur();
                 prof_acc[5] += tms(a2, tnow());
             }
-        } else if (idx < plan.call_xq.size() && plan.call_xq[idx].x) {
-            const seg_plan::xq_t & xq = plan.call_xq[idx];
+        } else if (idx < plan.calls.size() && plan.calls[idx].xq.x) {
+            const seg_plan::xq_t & xq = plan.calls[idx].xq;
             const bool p2 = prof_on();
             const auto a2 = tnow();
             if (mode == 2 && !single) {
@@ -724,7 +728,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         // fallback: an unsupported oneDNN shape (unexpected) needs
                         // the dp4a x8 quantization the dnnl_call branch skipped
                         if (dnnl_call) {
-                            const seg_plan::xq_t & xq = plan.call_xq[idx];
+                            const seg_plan::xq_t & xq = plan.calls[idx].xq;
                             cur_be->xq(xq.x, xq.up, xq.x_stride, xq.up_stride, d_x8, d_xmeta, d_xsumq, inf, tbm,
                                       xq.K);
                         }
@@ -850,7 +854,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     }
                 }
                 if (!dnnl_done) {
-                    cur_be->gemv_group(gr.type, d_segs + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx],
+                    cur_be->gemv_group(gr.type, d_segs + gr.off, gr.n, gr.rows, tb, plan.calls[idx].nsb,
                                        (mode == 2 && !single) ? NCH : 0);
                 }
             } else if (mode == 2 && !single) {
@@ -858,18 +862,18 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 // the token-block grid.  Per-row calls of these (small) fp32
                 // tensors cost ~0.5 ms of dispatch tail each, so one call per
                 // group is much cheaper than NCH calls.
-                cur_be->gemv_group(gr.type, d_segs + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx], NCH);
+                cur_be->gemv_group(gr.type, d_segs + gr.off, gr.n, gr.rows, tb, plan.calls[idx].nsb, NCH);
             } else {
                 for (int r = 0; r < nb; r++) {
                     const gemv_seg * segs_r = (nb > 1 && d_segs_rows) ? d_segs_rows + (size_t)r * NSEG : d_segs;
-                    cur_be->gemv_group(gr.type, segs_r + gr.off, gr.n, gr.rows, tb, plan.call_nsb[idx], 0);
+                    cur_be->gemv_group(gr.type, segs_r + gr.off, gr.n, gr.rows, tb, plan.calls[idx].nsb, 0);
                 }
             }
             if (dbg_segs != -2 && (dbg_segs < 0 || dbg_segs == dbg_layer)) {
                 for (int j = 0; j < gr.n; j++) {
                     const gemv_seg & sj = plan.segs[gr.off + j];
-                    const seg_plan::xq_t & xq0 = plan.call_xq[idx];
-                    dbg_dump_seg(dev_queue(cur_dev), sj, idx, tb, plan.call_nsb[idx], NCH,
+                    const seg_plan::xq_t & xq0 = plan.calls[idx].xq;
+                    dbg_dump_seg(dev_queue(cur_dev), sj, idx, tb, plan.calls[idx].nsb, NCH,
                                  sj.act_up ? sj.x_stride : 0, xq0.x_stride, xq0.up_stride);
                 }
             }
@@ -1350,7 +1354,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     stamp(c_norm, a_out);
     if (plan.has_head) {
         const auto a = tnow();
-        gemv_at(plan.call_offsets.size() - 1); // head is the last call group
+        gemv_at(plan.calls.size() - 1); // head is the last call group
         if (prof) {
             dev_queue(0).wait(); // the head is pinned to the primary device
             c_head += tms(a, tnow());
@@ -1405,8 +1409,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 if (prof_ci_t[i] <= 0 || prof_ci_n[i] == 0) {
                     continue;
                 }
-                const seg_plan::xq_t & xq = plan.call_xq[i];
-                const gemv_seg & s0 = plan.segs[plan.groups[plan.call_group_begin[i]].off];
+                const seg_plan::xq_t & xq = plan.calls[i].xq;
+                const gemv_seg & s0 = plan.segs[plan.groups[plan.calls[i].group_begin].off];
                 const double per_step = prof_ci_t[i] / (double)every;
                 gemv_sum += per_step;
                 printf("   ci=%3d %7.3f ms/call  %5.1f calls/step  %6.2f ms/step  K=%-6d N=%-6d type=%-7s nr=%d xq=%d\n", i,

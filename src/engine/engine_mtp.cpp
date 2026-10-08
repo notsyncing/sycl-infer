@@ -169,7 +169,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
     const seg_plan & p = mtp.plan_mtp_;
     compute_backend & be = multi_dev ? *backends_[(size_t)mtp.mtp_dev] : backend();
     dnnl_gemm * D = dnnl_for(ci == 4 ? 0 : mtp.mtp_dev);
-    const seg_plan::xq_t & xq = p.call_xq[(size_t)ci];
+    const seg_plan::xq_t & xq = p.calls[(size_t)ci].xq;
     if (D == nullptr || xq.x == nullptr) {
         throw std::runtime_error("mtp: the oneDNN int8 weight path is required");
     }
@@ -230,20 +230,20 @@ void engine::mtp_gemv(int ci, int M, int step) {
     const bool exact = exact_env && ci != 4 && (M == 1 || M == 8 || M == 16 || M == 32)
                        && (exact_only < 0 || exact_only == ci);
 
-    const int gb = p.call_group_begin[(size_t)ci];
-    const int gc = p.call_group_count[(size_t)ci];
+    const int gb = p.calls[(size_t)ci].group_begin;
+    const int gc = p.calls[(size_t)ci].group_count;
     if (exact) {
         static const bool edbg = si::env::flag("PF_MTP_EXACT_DEBUG");
         if (edbg) {
             static int seen = 0;
             if (seen++ < 12) {
-                fprintf(stderr, "[exact] ci=%d M=%d groups=%d nsb=%d filter=%d\n", ci, M, gc, p.call_nsb[(size_t)ci],
+                fprintf(stderr, "[exact] ci=%d M=%d groups=%d nsb=%d filter=%d\n", ci, M, gc, p.calls[(size_t)ci].nsb,
                         exact_only);
             }
         }
         for (int g = 0; g < gc; g++) {
             const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
-            be.gemv_group(gr.type, mtp.d_segs_mtp_exact + gr.off, gr.n, gr.rows, M, p.call_nsb[(size_t)ci], 0);
+            be.gemv_group(gr.type, mtp.d_segs_mtp_exact + gr.off, gr.n, gr.rows, M, p.calls[(size_t)ci].nsb, 0);
         }
         return;
     }

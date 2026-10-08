@@ -142,31 +142,42 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 
 ## 4. `seg_plan` 与 `build_plan`
 
-### 4.1 `seg_plan`（`engine.h:31-113`）
+### 4.1 `seg_plan`（`engine.h:31-127`）
 
 `seg_plan::validate(n_layer, what)`（`engine_graph.cpp`）是 plan 与执行之间的契约检查，
-失败即抛错而不是静默错位：每层恰好 4 个 call、各 per-call 向量等长、有 head 时其段全在
-device 0、已分组的 call 组内 device 一致。`build_plan` 返回前与 `finalize()` 末尾各调一次
-（后者只查分组，前者分组尚不存在则空过）；`record_forward` 在 phase 起点与层循环终点核对
-游标 `ci`（诊断截断 `STOP_AFTER_LAYER`/`PF_DBG_MID` 下跳过终点检查）。`plan_mtp_` 不走
-`record_forward`（`mtp_gemv` 直接下标），只受分组检查约束。
+失败即抛错而不是静默错位：每层恰好 4 个 call、每个 call 的段切片与组切片都落在各自数组内、
+有 head 时其段全在 device 0、已分组的 call 组内 device 一致。（它早先还检查八个 per-call 向量
+是否等长；合成 `calls[]` 记录数组后那已是类型的不变量，见下面的说明。）`build_plan` 返回前与
+`finalize()` 末尾各调一次（后者只查切片范围与分组，前者分组尚不存在则组范围为空、跳过）；
+`record_forward` 在 phase 起点与层循环终点核对游标 `ci`（诊断截断
+`STOP_AFTER_LAYER`/`PF_DBG_MID` 下跳过终点检查）。`plan_mtp_` 不走 `record_forward`
+（`mtp_gemv` 直接下标），只受同一组检查约束。
 
 
 一次完整 forward 的全部 GEMV/GEMM 工作：
 
 * `segs` — 扁平的 `gemv_seg` 列表。
-* `call_offsets[i]` / `call_counts[i]` — call `i` 在 `segs` 中的切片。
-* `call_total_rows[i]`、`call_tb[i]`（token 块宽）、`call_nsb[i]`（K/256 split 提示）。
 * `groups[]` — call 内连续同 type 段的 `{type, off, n, rows}` 合并。
-* `call_group_begin/count[i]` — 每 call 在 `groups` 中的范围。
-* `call_xq[i]` — DP4A 路径的激活量化描述 `{x, up, x_stride, up_stride, K}`。
+* `calls[i]` — call `i` 的**全部**元数据，一个记录装下：
+  * `seg_off` / `seg_count` — 在 `segs` 中的切片；
+  * `total_rows`、`tb`（token 块宽）、`nsb`（K/256 split 提示）；
+  * `group_begin` / `group_count` — 在 `groups` 中的范围；
+  * `xq` — DP4A 路径的激活量化描述 `{x, up, x_stride, up_stride, K}`（`x == nullptr`
+    表示该 call 的激活已是 fp32）。
 * `layer_c0[il]` — 每层首个 call 的下标，末尾再附 head call 的下标；**plan 全局的 call 元数据按 call
   序索引，部分（按设备的）重放必须从这里起步**，见 §9.1 的不变量。
 * `has_head` — 非最终 prefill 变体置 false，`record_forward` 因此不重放最后一个 call。
 
+**为什么是一个记录而不是八个平行数组**：早先是 `call_offsets`/`call_counts`/`call_total_rows`/
+`call_tb`/`call_nsb`/`call_xq`/`call_group_begin`/`call_group_count` 八个按 call 下标的
+`std::vector`，于是"call 3 存在但没有 xq 条目"是一个**可表示的状态**——`validate()` 要用四次长度
+比较去排除它，`begin_call` 上那句注释（"pushes all six per-call vectors together"）本身就是"没有别的东西
+保证它们同步"的自白。合成一个记录数组后该状态不可表示，而对 `calls` 做一次边界检查就同时覆盖全部字段，
+不必像从前那样只查某个调用点恰好读到的那一个数组。
+
 辅助：`begin_call(tb,nsb)`、`add(seg)`、`set_xq(...)`、`set_act_up(up_base, x_base)`、
 `finalize()`。`set_act_up` 会就地给**当前 call 新加的**段打上 `act_up`（并保留每个切片的 x 偏移），
-因为 `ffn_down` 的激活是 `silu(gate)*up`：量化路径从 `call_xq.up` 施加，fp32 GEMV 和 oneDNN 回落
+因为 `ffn_down` 的激活是 `silu(gate)*up`：量化路径从 `calls.back().xq.up` 施加，fp32 GEMV 和 oneDNN 回落
 路径从段的 `act_up` 施加。`finalize()` 对每个 call 的段按 `(dev, type)` 稳定排序，再把连续同 type
 合并成 group 并记录每 call 的 group 范围。
 
@@ -184,7 +195,7 @@ device 0、已分组的 call 组内 device 一致。`build_plan` 返回前与 `f
   了每个被转换张量的原始上传。
 
 每层固定四个 call（`engine_graph.cpp:175-245`，逐层先 `bind_acts(dev)` 把 plan 快照到该设备的
-缓冲，并把 `layer_c0.push_back(call_tb.size())`）：
+缓冲，并把 `layer_c0.push_back(calls.size())`）：
 
 **GDN 层**
 
@@ -272,7 +283,7 @@ call 有 xq 描述）。
 
 ### 5.1 每个 plan call（`gemv_at`，`engine_graph.cpp:506-817`）
 
-1. `tb = call_tb[idx]`，`single = (tb==1)`，`nb = single?1:NCH`，`tbm = (mode==2 && !single) ? rows : tb`。
+1. `tb = calls[idx].tb`，`single = (tb==1)`，`nb = single?1:NCH`，`tbm = (mode==2 && !single) ? rows : tb`。
 2. **oneDNN 判定**（`dnnl_call`，542-582）：要 `dnnl_for(cur_dev)` 存在、**不是**"单设备 decode"
    （`mode == 0 && !multi_dev` 保留 dp4a GEMV；多设备 decode 也走 oneDNN，因为它的 M=1 路径就是
    `i8_row_gemv`）、call 有 xq 描述，且该 call 的每个需要转换的段都有匹配的权重（`has_weight` /
@@ -281,7 +292,7 @@ call 有 xq 描述）。
    而那时 head 的原始设备拷贝已被跳过，回落路径会在设备上解引用一个 host 指针。
 3. **激活量化**：oneDNN → `D->quantize(..., do_split = (mode == 0 || inf->mtp_dry != 0))`
    （589-590）——decode 与 dry verify 才产 even/odd 平面，原生存储的 GEMV 要读它；否则
-   `call_xq[idx].x` 存在时 `cur_be->xq`（模式 2 一次覆盖 `tbm` token，否则逐行 `r` 用 `TB=tb`）。
+   `calls[idx].xq.x` 存在时 `cur_be->xq`（模式 2 一次覆盖 `tbm` token，否则逐行 `r` 用 `TB=tb`）。
 4. **段分发**（按 `s0.i8` → `s0.w8.vals` → `multi_dev && dnnl_call` → fp32 的顺序）：
    * `i8`（CPU 分区）：mode≠0 且非 single 时逐段 `i8_gemm(sj, tbm)`，否则逐行 `i8_gemv` /
      `i8_gemm`（624-642）。
@@ -321,7 +332,7 @@ for il in 0..n_layer-1:
 rmsnorm(d_x, output_norm → d_xnorm)
 mtp_capture(d_x → d_mtp_main_h)                 # 仅 mtp_on：output_norm **之前**的隐状态（§12.2）
 if mode != 0: copy_row(d_xnorm → d_last_hidden, row=-1)
-gemv_at(call_offsets.size()-1)                   # LM head（固定在 primary 设备）
+gemv_at(calls.size()-1)                          # LM head（固定在 primary 设备）
 ```
 
 `rmsnorm`/`copy_row`/head 都在 `cur_be = backend()`（primary）上执行，且在此之前的 `bind_acts(0)` 把成员
@@ -531,7 +542,7 @@ decode-vs-prefill 不匹配即由此而来）。`PF_NO_PFB_PARTIAL=1` / `PF_PFB_
 分区**——含 CPU 分区的混合映射直接跳过整组录制并打印一行（CPU 分区跑的是主机代码，不是队列上的
 kernel）。`PF_MD_GRAPH_DEV=N` 只给设备 N 录（`99` = 都不录，用于 A/B），`PF_NOGRAPH` 关闭。
 
-**关键不变量**：`ci`（call 游标）索引 plan **全局**的 `call_tb`/`call_xq`/`call_group_*`，所以一个
+**关键不变量**：`ci`（call 游标）索引 plan **全局**的 `calls[]`，所以一个
 phase 必须从它首层的 call 下标开始——用 `seg_plan::layer_c0`（层 → 首个 call，末尾附 head 的 call；
 `engine_graph.cpp:883-887`）。从 0 重新计数会让后面的分区读到**第 0 层**的 call 元数据（激活指针、
 K）而执行自己的 segment：`dnnl_call` 变假、整组退回 fp32 `gemv_group`、层静默不写（一个重复
@@ -640,7 +651,7 @@ head 已经不再上传它。`d_segs_aux` 的 fp32 回落仍然保留，但只�
     `record_forward(2, ...)` 直接把一个 prompt 的所有 32-token 块合并进单次前向。GPU 分区可转换权
     重组走 oneDNN int8——`add_weight` 对 M=32..512 全部预建原语、`acc_cap` 覆盖最宽 N，`dnnl_call`
     成立且 `D->gemm` 在 M=批 token 数上命中；CPU 分区层走 `i8_gemm` 网格；其余没有 oneDNN 调用的
-    小张量（非 K-quant / 无 call_xq）每组合并成一次 fp32 网格分发（`mode == 2 && !single` 分支），
+    小张量（非 K-quant / `xq.x` 为空）每组合并成一次 fp32 网格分发（`mode == 2 && !single` 分支），
     省掉 mode 1 按行重复调度的开销。整块 batch 内 int8 GEMM ~3.9s、fp32 旁路 ~0.27s（PF_PROF 实测）。
   - **prefill 流水线**：恰好是"dev0（含 embed）/ dev1 / dev0（含 head）"三个相位且全 GPU 分区时，
     `pf_pipe_ok_` 打开（`engine.cpp:1551-1603`），`prefill_batch` 让 chunk *i*+1 的 device-0 相位与
