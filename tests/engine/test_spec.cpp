@@ -177,7 +177,12 @@ static std::unique_ptr<engine> make_engine(const char * target, const char * dra
     ec.max_seq = ctx;
     ec.n_blocks = 512;
     ec.kv_cap_mb = -1; // auto: size the pool for max_seq
-    ec.layer_map = lm;
+    // env::str is getenv, so an unset TEST_LAYER_MAP hands back nullptr and
+    // `std::string(nullptr)` is a strlen on null - a SIGSEGV before any check
+    // runs.  `draft` right above already handles the same case; this was the
+    // oversight, and it only hid because the 27B always needs the split, so every
+    // earlier run had TEST_LAYER_MAP set.
+    ec.layer_map = lm ? std::string(lm) : std::string();
     ec.mtp_k = mtp_k;
     ec.draft_path = draft ? std::string(draft) : std::string();
     ec.draft_k = draft_k;

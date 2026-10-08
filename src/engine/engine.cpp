@@ -2068,6 +2068,14 @@ void engine::zero_slot(int slot) {
     const hparams & hp = m.hp;
     const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
     const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
+    // `slot` indexes the slot axis of both recurrent-state arrays, and the
+    // address is computed as (layer*kMaxB + slot) below, so an out-of-range value
+    // memsets past the end of a USM pool - a silent heap overwrite rather than a
+    // no-op.  Every other per-slot entry point (pc_admit, pc_capture_begin,
+    // pc_commit) checks the same bound; this one did not.
+    if (slot < 0 || slot >= kMaxB) {
+        return;
+    }
     for (int il = 0; il < hp.n_layer; il++) {
         if (!hp.is_recr(il)) {
             continue;

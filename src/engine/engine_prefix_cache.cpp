@@ -759,6 +759,15 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
     if (!pc_enabled) {
         return 0;
     }
+    // The slot guard above protects the reset; this write needs the same one.
+    // `slot` crosses from the scheduler into three different per-slot arrays
+    // (pc_slot_, and the slot axis of d_gdn_state / d_conv_state via zero_slot),
+    // and an out-of-range value lands in the heap next to them with no
+    // diagnostic - the prefix cache's failure mode is a silently wrong answer, so
+    // a silent heap overwrite here would be much worse than a missed cache.
+    if (slot < 0 || slot >= kMaxB) {
+        return 0;
+    }
     pc_slot_[slot].tracking = true; // prefill of this slot captures checkpoints
     const int L = (int)prompt.size();
     // keep the last partial block (and at least one token) for the prefill:
