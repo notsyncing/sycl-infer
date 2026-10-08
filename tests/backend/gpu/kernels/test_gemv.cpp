@@ -108,7 +108,10 @@ int main(int argc, char ** argv) {
 
     const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
     try {
-        engine e(model_path, 512);
+        engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = 512;
+        engine e(ec);
         printf("model loaded: %d layers, embd=%d\n", e.m.hp.n_layer, e.m.hp.n_embd);
 
         check_gemv(e, "token_embd.weight", 1);

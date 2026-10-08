@@ -35,6 +35,16 @@ inline std::vector<int> stage_arg_tokens(int argc, char ** argv) {
     return t.empty() ? stage_default_tokens() : t;
 }
 
+// The stage harness only ever needs a model and a context; everything else takes
+// its default.  A named config reads better here than the two-argument call it
+// replaced, and it keeps working if engine_config grows a field.
+inline engine_config make_stage_config(const char * model_path, int max_seq) {
+    engine_config ec;
+    ec.model_path = model_path;
+    ec.max_seq = max_seq;
+    return ec;
+}
+
 struct stage_env {
     engine e;
     cpu_ref ref;
@@ -44,7 +54,7 @@ struct stage_env {
     std::map<std::string, std::vector<float>> snaps;
 
     stage_env(const char * model_path, const std::vector<int> & tokens, int max_seq = 512)
-        : e(model_path, max_seq), ref(e.m, max_seq), toks(tokens), T((int)tokens.size()) {
+        : e(make_stage_config(model_path, max_seq)), ref(e.m, max_seq), toks(tokens), T((int)tokens.size()) {
         ref.dbg_attn = true;
         ref.record = true;
         ref.forward(toks);

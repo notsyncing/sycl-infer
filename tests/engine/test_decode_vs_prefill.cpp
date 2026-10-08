@@ -205,7 +205,13 @@ int main(int argc, char ** argv) {
         }
         // max_seq must exceed the longest case plus the two generated tokens;
         // n_blocks (512 * kBlockSize = 16384) already covers the KV
-        engine e(model_path, 4096, 16, 512, 0, "", -1, -1, -1, -1, -1, lm ? lm : "");
+        engine_config ec;
+        ec.model_path = model_path;
+        // the length matrix goes past 2048, so the context must fit the longest
+        ec.max_seq = 4096;
+        ec.n_blocks = 512;
+        ec.layer_map = lm ? lm : "";
+        engine e(ec);
         if (!explicit_toks.empty()) {
             return one_case(e, explicit_toks, split) ? 0 : 1;
         }

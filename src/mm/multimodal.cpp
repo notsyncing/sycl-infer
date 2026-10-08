@@ -140,78 +140,62 @@ static void check_vision_width(const vision_model & vm, int n_embd) {
     }
 }
 
-static mm_prompt build_image_prompt(const tokenizer & tk, const std::string & rendered,
-                                    const std::vector<mm_image> & images, const vision_model & vm, int n_embd) {
-    check_vision_width(vm, n_embd);
+// Phase 1, images.  This loop used to be written out twice - once in the host
+// builder and once, verbatim, in the device one - so the two copies could drift
+// apart with nothing to notice.
+mm_image_plan mm_plan_images(const tokenizer & tk, const std::vector<mm_image> & images, const vision_model & vm) {
+    mm_image_plan pl;
     const int n_img = (int)images.size();
-    std::vector<mm_block> blocks(n_img);
-    std::vector<vision_input> vin(n_img);
-    std::vector<int> off(n_img);
-    int total_rows = 0;
+    pl.p.blocks.resize(n_img);
+    pl.p.off.resize(n_img);
+    pl.vin.resize(n_img);
     for (int k = 0; k < n_img; k++) {
-        vin[k] = vision_model::make_input(vm, images[k]);
-        if (vin[k].n_out <= 0) {
+        pl.vin[k] = vision_model::make_input(vm, images[k]);
+        if (pl.vin[k].n_out <= 0) {
             throw std::runtime_error("mm: image too small for the patch grid");
         }
-        mm_block & b = blocks[k];
+        mm_block & b = pl.p.blocks[k];
         b.pad_tok = pad_tok_of(tk, MM_KIND_IMAGE);
         b.kind = MM_KIND_IMAGE;
-        b.out_w = vin[k].out_w;
-        b.out_h = vin[k].out_h;
-        b.n_tok = vin[k].n_out;
-        b.n_pos = std::max(vin[k].out_w, vin[k].out_h);
-        off[k] = total_rows;
-        total_rows += vin[k].n_out;
+        b.out_w = pl.vin[k].out_w;
+        b.out_h = pl.vin[k].out_h;
+        b.n_tok = pl.vin[k].n_out;
+        b.n_pos = std::max(pl.vin[k].out_w, pl.vin[k].out_h);
+        pl.p.off[k] = pl.p.total_rows;
+        pl.p.total_rows += b.n_tok;
     }
-    if (total_rows > kMaxImgTokens) {
+    if (pl.p.total_rows > kMaxImgTokens) {
         throw std::runtime_error("mm: image tokens exceed the kMaxImgTokens budget");
     }
-
-    mm_prompt p = mm_expand_prompt(tk, rendered, blocks, total_rows);
-    p.embd.resize((size_t)total_rows * n_embd);
-    std::vector<float> e;
-    for (int k = 0; k < n_img; k++) {
-        vm.encode_host(vin[k], e);
-        std::memcpy(p.embd.data() + (size_t)off[k] * n_embd, e.data(), e.size() * sizeof(float));
-    }
-    return p;
+    return pl;
 }
 
 mm_prompt mm_build_prompt(const tokenizer & tk, const std::string & rendered, const std::vector<mm_image> & images,
                           const vision_model & vm, int n_embd) {
-    return build_image_prompt(tk, rendered, images, vm, n_embd);
+    check_vision_width(vm, n_embd);
+    const mm_image_plan pl = mm_plan_images(tk, images, vm);
+    // phase 3 first, so phase 2 writes into the buffer the prompt already sized
+    mm_prompt p = mm_expand_prompt(tk, rendered, pl.p.blocks, pl.p.total_rows);
+    p.embd.resize((size_t)pl.p.total_rows * n_embd);
+    // phase 2: host encode at the offsets phase 1 handed out
+    std::vector<float> e;
+    for (size_t k = 0; k < pl.p.blocks.size(); k++) {
+        vm.encode_host(pl.vin[k], e);
+        std::memcpy(p.embd.data() + (size_t)pl.p.off[k] * n_embd, e.data(), e.size() * sizeof(float));
+    }
+    return p;
 }
 
 mm_prompt mm_build_prompt_device(vision_model & vm, sycl::queue & q, const tokenizer & tk, const std::string & rendered,
                                  const std::vector<mm_image> & images, int n_embd, float * d_out) {
     check_vision_width(vm, n_embd);
-    const int n_img = (int)images.size();
-    std::vector<mm_block> blocks(n_img);
-    std::vector<vision_input> vin(n_img);
-    std::vector<int> off(n_img);
-    int total_rows = 0;
-    for (int k = 0; k < n_img; k++) {
-        vin[k] = vision_model::make_input(vm, images[k]);
-        if (vin[k].n_out <= 0) {
-            throw std::runtime_error("mm: image too small for the patch grid");
-        }
-        mm_block & b = blocks[k];
-        b.pad_tok = pad_tok_of(tk, MM_KIND_IMAGE);
-        b.kind = MM_KIND_IMAGE;
-        b.out_w = vin[k].out_w;
-        b.out_h = vin[k].out_h;
-        b.n_tok = vin[k].n_out;
-        b.n_pos = std::max(vin[k].out_w, vin[k].out_h);
-        off[k] = total_rows;
-        total_rows += vin[k].n_out;
+    const mm_image_plan pl = mm_plan_images(tk, images, vm);
+    // phase 2: encode at the offsets phase 1 handed out
+    for (size_t k = 0; k < pl.p.blocks.size(); k++) {
+        vm.encode_device(q, pl.vin[k], d_out + (size_t)pl.p.off[k] * n_embd);
     }
-    if (total_rows > kMaxImgTokens) {
-        throw std::runtime_error("mm: image tokens exceed the kMaxImgTokens budget");
-    }
-    for (int k = 0; k < n_img; k++) {
-        vm.encode_device(q, vin[k], d_out + (size_t)off[k] * n_embd);
-    }
-    mm_prompt p = mm_expand_prompt(tk, rendered, blocks, total_rows);
+    // phase 3
+    mm_prompt p = mm_expand_prompt(tk, rendered, pl.p.blocks, pl.p.total_rows);
     p.d_embd = d_out;
     return p;
 }
@@ -222,13 +206,6 @@ mm_prompt mm_build_prompt_device(vision_model & vm, sycl::queue & q, const token
 // vision tower encodes every frame into the embedding rows of the prompt.
 // ---------------------------------------------------------------------------
 namespace {
-
-struct vid_plan {
-    std::vector<mm_block> blocks;
-    std::vector<int> off;
-    std::vector<std::vector<mm_image>> imgs; // preprocessed selected frames
-    int total_rows = 0;
-};
 
 image_preproc_cfg vision_cfg(const vision_model & vm) {
     image_preproc_cfg cfg;
@@ -244,12 +221,16 @@ image_preproc_cfg vision_cfg(const vision_model & vm) {
     return cfg;
 }
 
-// subsample + preprocess; also lays out the blocks (grid derived from the
-// preprocessed frames, so it holds whatever smart-resize produced)
-vid_plan plan_videos(const tokenizer & tk, const std::vector<mm_video> & vids, const vision_model & vm, int max_frames) {
-    vid_plan pl;
-    pl.blocks.resize(vids.size());
-    pl.off.resize(vids.size());
+} // namespace
+
+// Phase 1, videos: subsample + preprocess, and lay out the blocks (the grid is
+// derived from the *preprocessed* frames, so it holds whatever smart-resize
+// produced).
+mm_video_plan mm_plan_videos(const tokenizer & tk, const std::vector<mm_video> & vids, const vision_model & vm,
+                             int max_frames) {
+    mm_video_plan pl;
+    pl.p.blocks.resize(vids.size());
+    pl.p.off.resize(vids.size());
     pl.imgs.resize(vids.size());
     const image_preproc_cfg cfg = vision_cfg(vm);
     for (size_t v = 0; v < vids.size(); v++) {
@@ -269,7 +250,7 @@ vid_plan plan_videos(const tokenizer & tk, const std::vector<mm_video> & vids, c
         if (n_out <= 0) {
             throw std::runtime_error("mm: video frame too small for the patch grid");
         }
-        mm_block & b = pl.blocks[v];
+        mm_block & b = pl.p.blocks[v];
         b.pad_tok = pad_tok_of(tk, MM_KIND_VIDEO);
         b.kind = MM_KIND_VIDEO;
         b.n_frames = (int)sel.size();
@@ -277,26 +258,24 @@ vid_plan plan_videos(const tokenizer & tk, const std::vector<mm_video> & vids, c
         b.out_h = vi0.out_h;
         b.n_tok = b.n_frames * n_out;
         b.n_pos = std::max(b.out_w, b.out_h);
-        pl.off[v] = pl.total_rows;
-        pl.total_rows += b.n_tok;
+        pl.p.off[v] = pl.p.total_rows;
+        pl.p.total_rows += b.n_tok;
     }
-    if (pl.total_rows > kMaxImgTokens) {
+    if (pl.p.total_rows > kMaxImgTokens) {
         throw std::runtime_error("mm: video tokens exceed the kMaxImgTokens budget");
     }
     return pl;
 }
 
-} // namespace
-
 mm_prompt mm_build_prompt_video(const tokenizer & tk, const std::string & rendered, const std::vector<mm_video> & vids,
                                 const vision_model & vm, int n_embd, int max_frames) {
     check_vision_width(vm, n_embd);
-    vid_plan pl = plan_videos(tk, vids, vm, max_frames);
-    mm_prompt p = mm_expand_prompt(tk, rendered, pl.blocks, pl.total_rows);
-    p.embd.resize((size_t)pl.total_rows * n_embd);
+    const mm_video_plan pl = mm_plan_videos(tk, vids, vm, max_frames);
+    mm_prompt p = mm_expand_prompt(tk, rendered, pl.p.blocks, pl.p.total_rows);
+    p.embd.resize((size_t)pl.p.total_rows * n_embd);
     std::vector<float> e;
     for (size_t v = 0; v < vids.size(); v++) {
-        int row = pl.off[v];
+        int row = pl.p.off[v];
         for (const mm_image & img : pl.imgs[v]) {
             vision_input vi = vision_model::make_input(vm, img);
             vm.encode_host(vi, e);
@@ -311,16 +290,16 @@ mm_prompt mm_build_prompt_video_device(vision_model & vm, sycl::queue & q, const
                                        const std::string & rendered, const std::vector<mm_video> & vids, int n_embd,
                                        float * d_out, int max_frames) {
     check_vision_width(vm, n_embd);
-    vid_plan pl = plan_videos(tk, vids, vm, max_frames);
+    const mm_video_plan pl = mm_plan_videos(tk, vids, vm, max_frames);
     for (size_t v = 0; v < vids.size(); v++) {
-        int row = pl.off[v];
+        int row = pl.p.off[v];
         for (const mm_image & img : pl.imgs[v]) {
             vision_input vi = vision_model::make_input(vm, img);
             vm.encode_device(q, vi, d_out + (size_t)row * n_embd);
             row += vi.n_out;
         }
     }
-    mm_prompt p = mm_expand_prompt(tk, rendered, pl.blocks, pl.total_rows);
+    mm_prompt p = mm_expand_prompt(tk, rendered, pl.p.blocks, pl.p.total_rows);
     p.d_embd = d_out;
     return p;
 }
@@ -353,40 +332,49 @@ audio_preproc_cfg cfg_of(const audio_model & am) {
 
 } // namespace
 
+// Phase 1, audio.  Also written out twice before (host and device), and the
+// pairing of `in` with `mel` is why items travel together: audio_input::mel is a
+// borrowed pointer, so splitting them into two parallel vectors would leave a
+// dangling one on any move.
+mm_audio_plan mm_plan_audios(const tokenizer & tk, const std::vector<mm_audio> & auds, const audio_model & am) {
+    const audio_preproc_cfg cfg = cfg_of(am);
+    mm_audio_plan pl;
+    pl.p.blocks.resize(auds.size());
+    pl.p.off.resize(auds.size());
+    pl.items.resize(auds.size());
+    for (size_t k = 0; k < auds.size(); k++) {
+        audio_prepare(auds[k], cfg, am, pl.items[k].in, pl.items[k].mel);
+        if (pl.items[k].in.n_out <= 0) {
+            throw std::runtime_error("mm: audio produced no embeddings");
+        }
+        mm_block & b = pl.p.blocks[k];
+        b.pad_tok = pad_tok_of(tk, MM_KIND_AUDIO);
+        b.kind = MM_KIND_AUDIO;
+        b.n_tok = pl.items[k].in.n_out;
+        b.n_pos = pl.items[k].in.n_out;
+        pl.p.off[k] = pl.p.total_rows;
+        pl.p.total_rows += b.n_tok;
+    }
+    if (pl.p.total_rows > kMaxImgTokens) {
+        throw std::runtime_error("mm: audio tokens exceed the kMaxImgTokens budget");
+    }
+    return pl;
+}
+
 mm_prompt mm_build_prompt_audio(const tokenizer & tk, const std::string & rendered, const std::vector<mm_audio> & auds,
                                 const audio_model & am, int n_embd) {
     if (audio_out_width(am) != n_embd) {
         throw std::runtime_error("mm: audio tower output width != text n_embd");
     }
-    const audio_preproc_cfg cfg = cfg_of(am);
-    std::vector<mm_block> blocks(auds.size());
-    std::vector<audio_input> ai(auds.size());
-    std::vector<std::vector<float>> mels(auds.size());
-    std::vector<int> off(auds.size());
-    int total_rows = 0;
-    for (size_t k = 0; k < auds.size(); k++) {
-        audio_prepare(auds[k], cfg, am, ai[k], mels[k]);
-        if (ai[k].n_out <= 0) {
-            throw std::runtime_error("mm: audio produced no embeddings");
-        }
-        mm_block & b = blocks[k];
-        b.pad_tok = pad_tok_of(tk, MM_KIND_AUDIO);
-        b.kind = MM_KIND_AUDIO;
-        b.n_tok = ai[k].n_out;
-        b.n_pos = ai[k].n_out;
-        off[k] = total_rows;
-        total_rows += ai[k].n_out;
-    }
-    if (total_rows > kMaxImgTokens) {
-        throw std::runtime_error("mm: audio tokens exceed the kMaxImgTokens budget");
-    }
+    const mm_audio_plan pl = mm_plan_audios(tk, auds, am);
 
-    mm_prompt p = mm_expand_prompt(tk, rendered, blocks, total_rows);
-    p.embd.resize((size_t)total_rows * n_embd);
-    for (size_t k = 0; k < auds.size(); k++) {
-        std::vector<float> e;
-        am.encode_host(ai[k], e);
-        std::memcpy(p.embd.data() + (size_t)off[k] * n_embd, e.data(), e.size() * sizeof(float));
+    // phase 3, then phase 2 into the buffer it sized
+    mm_prompt p = mm_expand_prompt(tk, rendered, pl.p.blocks, pl.p.total_rows);
+    p.embd.resize((size_t)pl.p.total_rows * n_embd);
+    std::vector<float> e;
+    for (size_t k = 0; k < pl.items.size(); k++) {
+        am.encode_host(pl.items[k].in, e);
+        std::memcpy(p.embd.data() + (size_t)pl.p.off[k] * n_embd, e.data(), e.size() * sizeof(float));
     }
     return p;
 }
@@ -397,34 +385,14 @@ mm_prompt mm_build_prompt_audio_device(audio_model & am, sycl::queue & q, const 
     if (audio_out_width(am) != n_embd) {
         throw std::runtime_error("mm: audio tower output width != text n_embd");
     }
-    const audio_preproc_cfg cfg = cfg_of(am);
-    std::vector<mm_block> blocks(auds.size());
-    std::vector<audio_input> ai(auds.size());
-    std::vector<std::vector<float>> mels(auds.size());
-    std::vector<int> off(auds.size());
-    int total_rows = 0;
-    for (size_t k = 0; k < auds.size(); k++) {
-        audio_prepare(auds[k], cfg, am, ai[k], mels[k]);
-        if (ai[k].n_out <= 0) {
-            throw std::runtime_error("mm: audio produced no embeddings");
-        }
-        mm_block & b = blocks[k];
-        b.pad_tok = pad_tok_of(tk, MM_KIND_AUDIO);
-        b.kind = MM_KIND_AUDIO;
-        b.n_tok = ai[k].n_out;
-        b.n_pos = ai[k].n_out;
-        off[k] = total_rows;
-        total_rows += ai[k].n_out;
-    }
-    if (total_rows > kMaxImgTokens) {
-        throw std::runtime_error("mm: audio tokens exceed the kMaxImgTokens budget");
-    }
+    const mm_audio_plan pl = mm_plan_audios(tk, auds, am);
 
-    for (size_t k = 0; k < auds.size(); k++) {
-        am.encode_device(q, ai[k], d_out + (size_t)off[k] * n_embd);
+    // phase 2: encode at the offsets phase 1 handed out
+    for (size_t k = 0; k < pl.items.size(); k++) {
+        am.encode_device(q, pl.items[k].in, d_out + (size_t)pl.p.off[k] * n_embd);
     }
-
-    mm_prompt p = mm_expand_prompt(tk, rendered, blocks, total_rows);
+    // phase 3
+    mm_prompt p = mm_expand_prompt(tk, rendered, pl.p.blocks, pl.p.total_rows);
     p.d_embd = d_out;
     return p;
 }
@@ -436,97 +404,70 @@ mm_prompt mm_build_prompt_mixed_device(vision_model & vm, audio_model & am, sycl
                                        int max_video_frames) {
     // ---- plan every block in pad order (mixed image/video/audio) -----------
     const int E = n_embd;
-    bool any_audio = false;
-    bool any_visual = false;
+    bool any_image = false, any_video = false, any_audio = false;
     for (const mm_media_ref & mr : order) {
-        any_visual |= mr.kind == MM_KIND_IMAGE || mr.kind == MM_KIND_VIDEO;
+        any_image |= mr.kind == MM_KIND_IMAGE;
+        any_video |= mr.kind == MM_KIND_VIDEO;
+        any_audio |= mr.kind == MM_KIND_AUDIO;
     }
-    if (any_visual) {
+    // Tower geometry first: it is a property of the deployment, not of this
+    // request, so it is the cheapest thing to rule out before any preprocessing.
+    if (any_image || any_video) {
         check_vision_width(vm, E);
+    }
+    if (any_audio && audio_out_width(am) != E) {
+        throw std::runtime_error("mm: audio tower output width != text n_embd");
     }
     std::vector<mm_block> blocks(order.size());
     std::vector<int> off(order.size());
-    // per-kind pre-encoded data: video uses subsampled+preprocessed frames,
-    // audio keeps the log-mel (the audio_input references it) for the encode pass
-    std::vector<std::vector<mm_image>> vimgs;
-    vimgs.resize(vids.size());
-    struct anim_input {
-        audio_input in;
-        std::vector<float> mel;
-    };
-    std::vector<anim_input> ains;
-    ains.resize(auds.size());
 
-    const image_preproc_cfg vcfg = any_visual ? vision_cfg(vm) : image_preproc_cfg{};
+    // Each kind is planned by its own planner, over the whole vector, so the grid
+    // derivation, the video frame subsampling and the audio preparation exist
+    // once.  What is left here is genuinely the mixed case's own job: laying the
+    // per-kind blocks out in *placeholder* order and checking the budget over all
+    // of them together (a per-kind subtotal can never exceed the total, so the
+    // planners' own checks are the earlier of the two rejections).
+    mm_image_plan ipl;
+    mm_video_plan vpl;
+    mm_audio_plan apl;
+    if (any_image) {
+        ipl = mm_plan_images(tk, images, vm);
+    }
+    if (any_video) {
+        vpl = mm_plan_videos(tk, vids, vm, max_video_frames);
+    }
+    if (any_audio) {
+        apl = mm_plan_audios(tk, auds, am);
+    }
+
     int rows = 0;
     for (size_t k = 0; k < order.size(); k++) {
         const mm_media_ref & mr = order[k];
         mm_block & b = blocks[k];
         const int idx = mr.idx;
+        // The block is whatever that kind's planner decided; this only checks
+        // that the reference is in range and places it in placeholder order.
         if (mr.kind == MM_KIND_IMAGE) {
             if (idx >= (int)images.size()) {
                 throw std::runtime_error("mm: image index out of range");
             }
-            vision_input vi = vision_model::make_input(vm, images[idx]);
-            if (vi.n_out <= 0) {
-                throw std::runtime_error("mm: image too small for the patch grid");
-            }
-            b.pad_tok = pad_tok_of(tk, MM_KIND_IMAGE);
-            b.kind = MM_KIND_IMAGE;
-            b.out_w = vi.out_w;
-            b.out_h = vi.out_h;
-            b.n_tok = vi.n_out;
-            b.n_pos = std::max(vi.out_w, vi.out_h);
+            b = ipl.p.blocks[idx];
         } else if (mr.kind == MM_KIND_VIDEO) {
             if (idx >= (int)vids.size()) {
                 throw std::runtime_error("mm: video index out of range");
             }
-            // subsample + preprocess once; reuse the frame list for encode
-            const mm_video & vid = vids[idx];
-            const int t = std::min((int)vid.frames.size(), max_video_frames);
-            std::vector<const mm_video_frame *> sel;
-            mm_video_subsample(vid.frames, t, sel);
-            if (sel.empty()) {
-                throw std::runtime_error("mm: video has no usable frames");
-            }
-            std::vector<mm_image> & fimgs = vimgs[idx];
-            fimgs.reserve(sel.size());
-            for (const mm_video_frame * f : sel) {
-                fimgs.push_back(mm_image_preprocess(f->rgb.data(), f->width, f->height, vcfg));
-            }
-            vision_input vi0 = vision_model::make_input(vm, fimgs[0]);
-            if (vi0.n_out <= 0) {
-                throw std::runtime_error("mm: video frame too small for the patch grid");
-            }
-            b.pad_tok = pad_tok_of(tk, MM_KIND_VIDEO);
-            b.kind = MM_KIND_VIDEO;
-            b.n_frames = (int)sel.size();
-            b.out_w = vi0.out_w;
-            b.out_h = vi0.out_h;
-            b.n_tok = (int)fimgs.size() * vi0.n_out;
-            b.n_pos = std::max(vi0.out_w, vi0.out_h);
+            b = vpl.p.blocks[idx];
         } else if (mr.kind == MM_KIND_AUDIO) {
             if (idx >= (int)auds.size()) {
                 throw std::runtime_error("mm: audio index out of range");
             }
             any_audio = true;
-            anim_input & ain = ains[idx];
-            audio_prepare(auds[idx], cfg_of(am), am, ain.in, ain.mel);
-            if (ain.in.n_out <= 0) {
-                throw std::runtime_error("mm: audio produced no embeddings");
-            }
-            b.pad_tok = pad_tok_of(tk, MM_KIND_AUDIO);
-            b.kind = MM_KIND_AUDIO;
-            b.n_tok = ain.in.n_out;
-            b.n_pos = ain.in.n_out;
+            b = apl.p.blocks[idx];
         } else {
             throw std::runtime_error("mm: unknown media kind");
         }
         off[k] = rows;
         rows += b.n_tok;
-    }
-    if (any_audio && audio_out_width(am) != E) {
-        throw std::runtime_error("mm: audio tower output width != text n_embd");
     }
     if (rows > kMaxImgTokens) {
         throw std::runtime_error("mm: media tokens exceed the kMaxImgTokens budget");
@@ -537,10 +478,11 @@ mm_prompt mm_build_prompt_mixed_device(vision_model & vm, audio_model & am, sycl
         const mm_media_ref & mr = order[k];
         float * base = d_out + (size_t)off[k] * E;
         if (mr.kind == MM_KIND_IMAGE) {
-            vision_input vi = vision_model::make_input(vm, images[mr.idx]);
-            vm.encode_device(q, vi, base);
+            // the plan already built this vision_input; the mixed path used to
+            // call make_input a second time for the same image
+            vm.encode_device(q, ipl.vin[mr.idx], base);
         } else if (mr.kind == MM_KIND_VIDEO) {
-            const std::vector<mm_image> & fimgs = vimgs[mr.idx];
+            const std::vector<mm_image> & fimgs = vpl.imgs[mr.idx];
             float * p = base;
             for (const mm_image & img : fimgs) {
                 vision_input vi = vision_model::make_input(vm, img);
@@ -548,7 +490,7 @@ mm_prompt mm_build_prompt_mixed_device(vision_model & vm, audio_model & am, sycl
                 p += vi.n_out * E;
             }
         } else if (mr.kind == MM_KIND_AUDIO) {
-            am.encode_device(q, ains[mr.idx].in, base);
+            am.encode_device(q, apl.items[mr.idx].in, base);
         }
     }
 

@@ -405,9 +405,25 @@ int main(int argc, char ** argv) {
         } else if (stype == "dflash2") {
             draft_k = spec_nmax;
         }
-        engine e(model_path, ctx, 16, n_blocks, kv_cap_mb == INT_MIN ? -1 : kv_cap_mb, pc_dir, pc_disk_mb, pc_mem_mb,
-                 pc_ram_mb, pc_vram_mb, device, layer_map, mtp_len,
-                 stype == "dflash2" ? spec_draft : std::string(), draft_k, spec_dev);
+        engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = ctx;
+        ec.n_splits = 16;
+        ec.n_blocks = n_blocks;
+        // INT_MIN is this file's "flag absent" marker; the config speaks -1
+        ec.kv_cap_mb = kv_cap_mb == INT_MIN ? -1 : kv_cap_mb;
+        ec.pc_dir = pc_dir;
+        ec.pc_disk_mb = pc_disk_mb;
+        ec.pc_mem_mb = pc_mem_mb;
+        ec.pc_ram_mb = pc_ram_mb;
+        ec.pc_vram_mb = pc_vram_mb;
+        ec.device = device;
+        ec.layer_map = layer_map;
+        ec.mtp_k = mtp_len;
+        ec.draft_path = stype == "dflash2" ? spec_draft : std::string();
+        ec.draft_k = draft_k;
+        ec.draft_dev = spec_dev;
+        engine e(ec);
         {
             const char * isa = cpu_isa_spec();
             if (e.cpu_mode) {

@@ -100,18 +100,19 @@ static std::shared_ptr<sycl::context> make_md_context(const std::string & layer_
     }
 }
 
-engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int n_blocks_, int kv_cap_mb,
-               const std::string & pc_dir_arg, int pc_disk_mb, int pc_mem_mb, int pc_ram_mb, int pc_vram_mb,
-               int device, const std::string & layer_map, int mtp_k_arg,
-               const std::string & draft_path, int draft_k_arg, int draft_dev)
-    : device_req(resolve_device(device, layer_map)), md_ctx_(make_md_context(layer_map)), q(make_queue(device_req, md_ctx_.get())),
-      max_seq(max_seq_), n_splits(n_splits_), n_blocks(n_blocks_) {
+engine::engine(const engine_config & cfg)
+    : device_req(resolve_device(cfg.device, cfg.layer_map)),
+      md_ctx_(make_md_context(cfg.layer_map)),
+      q(make_queue(device_req, md_ctx_.get())),
+      max_seq(cfg.max_seq), n_splits(cfg.n_splits), n_blocks(cfg.n_blocks) {
+    const std::string & model_path = cfg.model_path;
+    const std::string & layer_map = cfg.layer_map;
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     tk.load(m.gguf);
     // MTP draft length: --mtp N (0/absent = off), PF_MTP as an env override.
-    mtp.mtp_k = mtp_k_arg;
+    mtp.mtp_k = cfg.mtp_k;
     if (const char * em = si::env::str("PF_MTP")) {
         const int v = atoi(em);
         if (v >= 0) {
@@ -193,7 +194,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     }
     // DFlash / DFlash2 drafter (--spec-type dflash2): its own GGUF, its own K/V
     // ring, and the feature-capture hook record_forward bakes into the graphs.
-    dfl.df_kmax_ = draft_k_arg;
+    dfl.df_kmax_ = cfg.draft_k;
     if (const char * e = si::env::str("PF_DFLASH_NMAX")) {
         const int v = atoi(e);
         if (v > 0) {
@@ -203,16 +204,16 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     if (const char * e = si::env::str("PF_DFLASH_DEV")) {
         dfl.df_dev_ = atoi(e);
     }
-    if (draft_dev > 0) {
-        dfl.df_dev_ = draft_dev;
+    if (cfg.draft_dev > 0) {
+        dfl.df_dev_ = cfg.draft_dev;
     }
-    if (!draft_path.empty()) {
+    if (!cfg.draft_path.empty()) {
         if (mtp.mtp_on) {
             fprintf(stderr, "[dflash] --spec-draft-model and --mtp are exclusive; MTP off\n");
             mtp.mtp_on = false;
             mtp.mtp_k = 0;
         }
-        setup_dflash(draft_path);
+        setup_dflash(cfg.draft_path);
         if (!dfl.dflash_on_) {
             fprintf(stderr, "[dflash] speculative decoding unavailable - plain decode\n");
         }
@@ -340,10 +341,10 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // PF_PC_MEM_MB alias) is divided by the per-node bytes; default 8.
         const size_t per_node = (pc_state_floats ? pc_state_floats * 4 : 0) + pc_block_blob_bytes();
         int vram_mb = -1;
-        if (pc_vram_mb >= 0) {
-            vram_mb = pc_vram_mb;
-        } else if (pc_mem_mb >= 0) {
-            vram_mb = pc_mem_mb;
+        if (cfg.pc_vram_mb >= 0) {
+            vram_mb = cfg.pc_vram_mb;
+        } else if (cfg.pc_mem_mb >= 0) {
+            vram_mb = cfg.pc_mem_mb;
         }
         int states = -1;
         if (vram_mb < 0) {
@@ -365,9 +366,9 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         if (states < 0) {
             states = 8; // historical default
         }
-        const int ram_mb = pc_ram_mb >= 0 ? pc_ram_mb : (si::env::str("PF_PC_RAM_MB") ? atoi(si::env::str("PF_PC_RAM_MB")) : 512);
+        const int ram_mb = cfg.pc_ram_mb >= 0 ? cfg.pc_ram_mb : (si::env::str("PF_PC_RAM_MB") ? atoi(si::env::str("PF_PC_RAM_MB")) : 512);
         const int disk_mb =
-            pc_disk_mb >= 0 ? pc_disk_mb : (si::env::str("PF_PC_DISK_MB") ? atoi(si::env::str("PF_PC_DISK_MB")) : 1024);
+            cfg.pc_disk_mb >= 0 ? cfg.pc_disk_mb : (si::env::str("PF_PC_DISK_MB") ? atoi(si::env::str("PF_PC_DISK_MB")) : 1024);
         size_t ram_bytes = (size_t)std::max(ram_mb, 0) * 1024 * 1024;
         size_t disk_bytes = (size_t)std::max(disk_mb, 0) * 1024 * 1024;
         size_t vram_bytes = (size_t)std::max(states, 0) * per_node;
@@ -376,8 +377,8 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // then RAM, then the VRAM checkpoint count.  Without one the three
         // configured tiers define the budget themselves.
         bool tiers_clamped = false;
-        if (pc_enabled && kv_cap_mb > 0) {
-            const size_t cap = (size_t)kv_cap_mb * 1024 * 1024;
+        if (pc_enabled && cfg.kv_cap_mb > 0) {
+            const size_t cap = (size_t)cfg.kv_cap_mb * 1024 * 1024;
             const size_t total = vram_bytes + ram_bytes + disk_bytes;
             if (total > cap) {
                 tiers_clamped = true;
@@ -395,7 +396,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
                 }
                 fprintf(stderr,
                         "[pc] tiers clamped to --kv-cap-mb %d: vram=%d checkpoints, ram=%.0f MB, disk=%.0f MB\n",
-                        kv_cap_mb, states, (double)ram_bytes / (1024.0 * 1024.0), (double)disk_bytes / (1024.0 * 1024.0));
+                        cfg.kv_cap_mb, states, (double)ram_bytes / (1024.0 * 1024.0), (double)disk_bytes / (1024.0 * 1024.0));
             }
         }
         pc_max_states = states;
@@ -414,8 +415,8 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // disk tier: directory from the flag, else PF_PC_DIR.  A disk budget
         // clamped to zero by the KV cap disables the tier (instead of the usual
         // "0 = unbounded" meaning).
-        if (!pc_dir_arg.empty()) {
-            pc_dir = pc_dir_arg;
+        if (!cfg.pc_dir.empty()) {
+            pc_dir = cfg.pc_dir;
         } else if (const char * ed = si::env::str("PF_PC_DIR")) {
             pc_dir = ed;
         }
@@ -516,7 +517,7 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
     }
     ffn_stride = 2 * m.hp.n_ff;
     max_blocks = (max_seq + kBlockSize - 1) / kBlockSize;
-    // dynamic pool: `n_blocks_` is the initial committed size, the cap is the
+    // dynamic pool: `cfg.n_blocks` is the initial committed size, the cap is the
     // virtual address reservation (--kv-cap-mb / PF_KV_CAP_MB, default: no
     // growth).  kv_layer_stride is built from the *reservation*, so the
     // per-layer base pointers recorded in the graphs stay valid when the pool
@@ -533,17 +534,17 @@ engine::engine(const std::string & model_path, int max_seq_, int n_splits_, int 
         // kv_cap_mb < 0 = auto: reserve exactly what max_seq needs (the pool
         // still commits memory lazily in extents, so the extra range is only
         // virtual address space)
-        const int cap_blocks = kv_cap_mb > 0
-                                   ? (int)(((int64_t)kv_cap_mb * 1024 * 1024) / ((int64_t)blk_pair * n_attn))
-                                   : (kv_cap_mb < 0 ? max_blocks : 0);
-        pool_cap = std::max(n_blocks_, cap_blocks);
+        const int cap_blocks = cfg.kv_cap_mb > 0
+                                   ? (int)(((int64_t)cfg.kv_cap_mb * 1024 * 1024) / ((int64_t)blk_pair * n_attn))
+                                   : (cfg.kv_cap_mb < 0 ? max_blocks : 0);
+        pool_cap = std::max(cfg.n_blocks, cap_blocks);
         // the VRAM cache tier lives in this pool: the reservation must be able
         // to hold at least one KV block per cached checkpoint (the pool still
         // commits memory lazily, so this is address space, not committed RAM)
         if (pc_enabled) {
             pool_cap = std::max(pool_cap, pc_max_states);
         }
-        pool_initial = n_blocks_;
+        pool_initial = cfg.n_blocks;
     }
     {
         const char * eg = si::env::str("PF_KV_GROW");

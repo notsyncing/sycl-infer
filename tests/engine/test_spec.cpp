@@ -172,9 +172,17 @@ static void run_dflash(const char * label, engine & e, const std::vector<int> & 
 // and the layer map / device straight through.
 static std::unique_ptr<engine> make_engine(const char * target, const char * draft, const char * lm, int mtp_k,
                                            int draft_k, int draft_dev, int ctx) {
-    return std::make_unique<engine>(target, ctx, 16, 512, /*kv_cap_mb=*/-1, "", /*pc_disk_mb=*/-1, /*pc_mem_mb=*/-1,
-                                    /*pc_ram_mb=*/-1, /*pc_vram_mb=*/-1, /*device=*/-1, lm, mtp_k,
-                                    draft ? std::string(draft) : std::string(), draft_k, draft_dev);
+    engine_config ec;
+    ec.model_path = target;
+    ec.max_seq = ctx;
+    ec.n_blocks = 512;
+    ec.kv_cap_mb = -1; // auto: size the pool for max_seq
+    ec.layer_map = lm;
+    ec.mtp_k = mtp_k;
+    ec.draft_path = draft ? std::string(draft) : std::string();
+    ec.draft_k = draft_k;
+    ec.draft_dev = draft_dev;
+    return std::make_unique<engine>(ec);
 }
 
 // Gating: a disabled drafter must fall through to the plain decode rather than

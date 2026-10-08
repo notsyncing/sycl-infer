@@ -62,10 +62,66 @@ struct mm_prompt {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Three-phase assembly.  Prompt building is always the same three steps:
+//
+//   1. plan   - decide what each placeholder contributes (grid, token count,
+//               positions) and hand out its embedding-row offset, then check the
+//               kMaxImgTokens budget.  Nothing has run yet, so an over-budget
+//               request is refused before any tower work happens.
+//   2. encode - run the towers into the caller's buffer at those offsets.
+//   3. expand - mm_expand_prompt: tokens, M-RoPE positions, img_row mapping.
+//
+// The phases exist to be *shared*: the four planners used to inline the same
+// accumulate-blocks / assign-offsets / check-budget loop, and the image planner
+// was written out twice - once per host/device variant - with the two copies
+// free to drift.  A plan is also the only part of this that is checkable without
+// a GPU, so it is what the header exposes.
+// ---------------------------------------------------------------------------
+
+// Phase 1's output, shared by every media kind.
+struct mm_plan {
+    std::vector<mm_block> blocks; // in placeholder order
+    std::vector<int> off;          // first embedding row of each block
+    int total_rows = 0;            // == sum of blocks[].n_tok
+};
+
+// Images: `vin[k]` is what phase 2 encodes.
+struct mm_image_plan {
+    mm_plan p;
+    std::vector<vision_input> vin;
+};
+
+// Videos: `imgs[v]` are the subsampled, preprocessed frames.  All frames of one
+// video share a grid, so blocks[v].n_tok == frames * n_out.
+struct mm_video_plan {
+    mm_plan p;
+    std::vector<std::vector<mm_image>> imgs;
+};
+
+// Audio: `items[k].in.mel` points *into* `items[k].mel`, so the two must travel
+// together - which is why this is one struct and not two parallel vectors.
+struct mm_audio_plan {
+    struct item {
+        audio_input in;
+        std::vector<float> mel;
+    };
+    mm_plan p;
+    std::vector<item> items;
+};
+
+// Each planner validates its tower's output width against the text model and
+// throws on an over-budget or unencodable request.  `vm`/`am` must outlive the
+// plan only through phase 2's encode calls.
+mm_image_plan mm_plan_images(const tokenizer & tk, const std::vector<mm_image> & images, const vision_model & vm);
+mm_video_plan mm_plan_videos(const tokenizer & tk, const std::vector<mm_video> & vids, const vision_model & vm,
+                             int max_frames);
+mm_audio_plan mm_plan_audios(const tokenizer & tk, const std::vector<mm_audio> & auds, const audio_model & am);
+
 // Generic expansion: `rendered` must contain exactly as many of each pad token
 // as blocks with that pad token; the blocks appear in the order the pads do.
-// `total_rows` is the number of embedding rows the caller filled (the budget
-// check lives in the callers, which know their buffer size).
+// `total_rows` is the number of embedding rows the caller filled; the planners
+// above have already checked it against kMaxImgTokens.
 mm_prompt mm_expand_prompt(const tokenizer & tk, const std::string & rendered, const std::vector<mm_block> & blocks,
                            int total_rows);
 
@@ -113,7 +169,12 @@ struct mm_media_ref {
 //  * every media item is encoded into `d_out` at its block offset (images and
 //    videos through the vision tower, audio through the audio tower),
 //  * `audio_model` is required iff any order entry is MM_KIND_AUDIO.
-// The three vectors must contain every index referenced by `order`.
+// The three vectors must contain every index referenced by `order` - and, since
+// the planners now run over whole vectors, `order` must reference *every* index
+// too.  Both callers build `order` in lockstep with the vectors (each push is
+// followed by an order entry), so the two conditions hold together; an unused
+// trailing item would otherwise be planned (and could be rejected) without ever
+// appearing in the prompt.
 mm_prompt mm_build_prompt_mixed_device(vision_model & vm, audio_model & am, sycl::queue & q, const tokenizer & tk,
                                        const std::string & rendered, const std::vector<mm_image> & images,
                                        const std::vector<mm_video> & vids, const std::vector<mm_audio> & auds,

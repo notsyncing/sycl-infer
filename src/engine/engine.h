@@ -141,6 +141,55 @@ struct seg_plan {
     void validate(int n_layer, const char * what) const;
 };
 
+// engine's construction inputs, by name.
+//
+// This was seventeen positional arguments, eleven of them ints whose -1 meant
+// "not set, take the environment or the default" - so changing one value meant
+// counting positions, and a test's call read
+//     engine e(model, 2048, 16, 512, 0, "", -1, -1, -1, -1, -1, lm);
+// with five indistinguishable -1s in the middle.  Each sentinel is spelled out at
+// its field below, because the signature never said what any of them meant.
+struct engine_config {
+    std::string model_path;
+    int max_seq = 8192;
+    int n_splits = 16;  // decode attention splits per query head
+    int n_blocks = 512; // KV pool blocks
+
+    // Three states, which the bare int never conveyed - the comment explaining
+    // them used to live 430 lines away, at the pool sizing:
+    //   > 0  explicit cap in MB
+    //   < 0  auto: reserve exactly what max_seq needs (the pool still commits
+    //        lazily, so the extra range is only virtual address space)
+    //   == 0 unbounded (pool_cap falls back to n_blocks)
+    int kv_cap_mb = 0;
+
+    // Prefix cache.  An empty pc_dir disables the disk tier; the four budgets
+    // use -1 for "not set", which falls back to PF_PC_VRAM_MB / PF_PC_MEM_MB /
+    // PF_PC_RAM_MB / PF_PC_DISK_MB and then to the documented defaults.
+    // See docs/design/06-prefix-cache.md.
+    std::string pc_dir;
+    int pc_disk_mb = -1;
+    int pc_mem_mb = -1; // alias of pc_vram_mb
+    int pc_ram_mb = -1;
+    int pc_vram_mb = -1;
+
+    // -1 = not set (PF_DEVICE, then auto); 0 = gpu, 1 = cpu.
+    int device = -1;
+    // "begin-end:gpu.N[,begin-end:...]" closed layer ranges; empty puts every
+    // layer on one device.  See AGENTS.md's --layer-map section.
+    std::string layer_map;
+
+    // Speculative drafting.  mtp_k = 0 turns the MTP drafter off (the model
+    // must also bundle blk.N.nextn.* and the run must be a multi-device oneDNN
+    // int8 partition - the constructor downgrades to plain decoding otherwise).
+    // draft_k is the DFlash2 block length and draft_dev the partition its draft
+    // layer runs on.
+    int mtp_k = 0;
+    std::string draft_path;
+    int draft_k = 0;
+    int draft_dev = 0;
+};
+
 struct engine {
     model m;
     tokenizer tk;
@@ -679,10 +728,7 @@ struct engine {
     // turns on a DFlash/DFlash2 drafter loaded from its own GGUF (the two are
     // the two --spec-type values and are mutually exclusive).
 
-    engine(const std::string & model_path, int max_seq = 8192, int n_splits = 16, int n_blocks = 512,
-           int kv_cap_mb = 0, const std::string & pc_dir = "", int pc_disk_mb = -1, int pc_mem_mb = -1,
-           int pc_ram_mb = -1, int pc_vram_mb = -1, int device = -1, const std::string & layer_map = "",
-           int mtp_k_arg = 0, const std::string & draft_path = "", int draft_k = 0, int draft_dev = 0);
+    engine(const engine_config & cfg);
     ~engine();
 
     void reset_state();

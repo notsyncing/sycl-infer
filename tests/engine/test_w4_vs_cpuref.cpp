@@ -26,7 +26,12 @@ int main(int argc, char ** argv) {
     printf("PF_W4=%s  tokens=%zu\n", w4 ? w4 : "(unset)", toks.size());
 
     const char * lm = si::env::str("TEST_LAYER_MAP");
-    engine e(model_path, 2048, 16, 512, 0, "", -1, -1, -1, -1, -1, lm ? lm : "");
+    engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = 2048;
+        ec.n_blocks = 512;
+        ec.layer_map = lm ? lm : "";
+        engine e(ec);
     auto gpu = e.eval(toks);
     // PF_DUMP_LOGITS=<path>: write the engine's full logit vector so it can be
     // diffed against an independent implementation (ll_logits) offline.

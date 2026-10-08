@@ -91,7 +91,12 @@ int main(int argc, char ** argv) {
         // (non-last) node.  Swap-removal must update the moved node's block
         // reverse index as well as its hash and checkpoint owner indexes.
         {
-            engine idx(model_path, 512, 16, 16, -1, "", -1, -1);
+            engine_config c1;
+        c1.model_path = model_path;
+        c1.max_seq = 512;
+        c1.n_blocks = 16;
+        c1.kv_cap_mb = -1;
+        engine idx(c1);
             std::vector<int> a(33, 198), b(33, 198);
             a[0] = 846;
             b[0] = 9419;
@@ -135,7 +140,14 @@ int main(int argc, char ** argv) {
         // its reserve up to the 2 MB mapping granule
         std::vector<int> prompt;
         {
-        engine e(model_path, 512, 16, 16, -1, dir.string(), 64, -1);
+        engine_config c2;
+        c2.model_path = model_path;
+        c2.max_seq = 512;
+        c2.n_blocks = 16;
+        c2.kv_cap_mb = -1;
+        c2.pc_dir = dir.string();
+        c2.pc_disk_mb = 64;
+        engine e(c2);
         CHECK(e.pc_on());
         CHECK(e.pcd_enabled);
 
@@ -222,7 +234,14 @@ int main(int argc, char ** argv) {
         } // engine e
         // a fresh engine must rebuild the index from the directory at startup
         // and resume the same prefix from disk
-        engine e2(model_path, 512, 16, 16, -1, dir.string(), 64, -1);
+        engine_config c3;
+        c3.model_path = model_path;
+        c3.max_seq = 512;
+        c3.n_blocks = 16;
+        c3.kv_cap_mb = -1;
+        c3.pc_dir = dir.string();
+        c3.pc_disk_mb = 64;
+        engine e2(c3);
         CHECK(e2.pc_disk_records() == 3);
         int matched_restart = -1;
         const std::vector<float> restart = run_prompt(e2, prompt, matched_restart);

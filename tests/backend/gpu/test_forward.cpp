@@ -24,7 +24,12 @@ int main(int argc, char ** argv) {
         const char * lm = si::env::str("TEST_LAYER_MAP");
         const char * dv = si::env::str("TEST_DEVICE");
         const int dev = (dv && strcmp(dv, "cpu") == 0) ? 1 : -1;
-        engine e(model_path, 512, 16, 512, 0, "", -1, -1, -1, -1, dev, lm ? lm : "");
+        engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = 512;
+        ec.device = dev;
+        ec.layer_map = lm ? lm : "";
+        engine e(ec);
         std::vector<int> toks;
         for (int i = 2; i < argc; i++) {
             toks.push_back(atoi(argv[i]));

@@ -17,7 +17,12 @@ int main(int argc, char ** argv) {
     const char * model_path = argc > 1 ? argv[1] : "/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf";
     const char * text = argc > 2 ? argv[2] : "What is the capital of France? Answer in one word.";
     const char * lm = si::env::str("TEST_LAYER_MAP");
-    engine e(model_path, 2048, 16, 512, 0, "", -1, -1, -1, -1, -1, lm ? lm : "");
+    engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = 2048;
+        ec.n_blocks = 512;
+        ec.layer_map = lm ? lm : "";
+        engine e(ec);
 
     std::vector<chat_msg> msgs{chat_msg("user", text)};
     const std::string rendered = render_chat(e.m.chat_template, msgs, true, false);

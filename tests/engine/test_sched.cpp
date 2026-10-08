@@ -68,7 +68,12 @@ int main(int argc, char ** argv) {
     const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
     const char * lm = si::env::str("TEST_LAYER_MAP");
     try {
-        engine e(model_path, 2048, 16, 256, 0, "", -1, -1, -1, -1, -1, lm ? lm : "");
+        engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = 2048;
+        ec.n_blocks = 256;
+        ec.layer_map = lm ? lm : "";
+        engine e(ec);
         const std::vector<int> prompt = e.tk.encode("user\nHello\nassistant\n", /*parse_special=*/true);
         CHECK(!prompt.empty());
 

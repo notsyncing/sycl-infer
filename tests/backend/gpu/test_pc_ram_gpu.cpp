@@ -79,7 +79,13 @@ int main(int argc, char ** argv) {
     try {
         std::vector<int> prompt;
         {
-            engine e(model_path, 512, 16, 16, -1, /*pc_dir=*/"", -1, -1);
+            engine_config ec;
+        ec.model_path = model_path;
+        ec.max_seq = 512;
+        ec.n_blocks = 16;
+        ec.kv_cap_mb = -1; // auto: size the pool for max_seq
+        // no pc_dir: this test is VRAM -> RAM -> VRAM, with no disk tier
+        engine e(ec);
             CHECK(e.pc_on());
             CHECK(e.pcr_enabled);  // RAM tier on by default
             CHECK(!e.pcd_enabled); // no disk directory
@@ -134,7 +140,12 @@ int main(int argc, char ** argv) {
             CHECK(maxd == 0.0);
         }
         // RAM is process-local: a fresh engine starts with nothing cached
-        engine e2(model_path, 512, 16, 16, -1, "", -1, -1);
+        engine_config ec2;
+        ec2.model_path = model_path;
+        ec2.max_seq = 512;
+        ec2.n_blocks = 16;
+        ec2.kv_cap_mb = -1;
+        engine e2(ec2);
         CHECK(e2.pc_ram_records() == 0);
         int matched = -1;
         run_prompt(e2, prompt, matched);
