@@ -76,7 +76,7 @@ block_q8_0  { uint16 d; int8 qs[32]; }                                   // 34 B
 ```
 
 * `d` / `dmin` 是 fp16 的 super-block scale/min scale。
-* Q4_K/Q5_K 的 8 个子块 `(scale,min)` 以 6 bit 打包在 `scales[12]`，用 `get_scale_min_k4`（`quant.h:87-95`）解出。
+* Q4_K/Q5_K 的 8 个子块 `(scale,min)` 以 6 bit 打包在 `scales[12]`，用 `get_scale_min_k4`（`quant.h` 的 `get_scale_min_k4`）解出。
 * 每 256 元素一个 super-block，其中 8 个子块各 32 元素。
 * **Q6_K 的 min 是冗余的**：值域是 `w = d*sc*(q-32)`，`min` 恒等于 `32*scale`（§3.4 的
   scale-only 优化就是靠这一条）。
@@ -248,7 +248,7 @@ CPU 的 `cpu_xq`（`cpu/kernels/xq.cpp:10-45`）是同一格式的 host 版：�
 **核心不变量：任何喂给原生存储 GEMV 的激活都必须用 `do_split=true` 量化。** 少这一次拆分不会报错，
 只会静默读到**上一次 call** 留下的 `axe`/`axo`——这就是 MTP 层 `eh_proj` 曾给出 acc 0.08（草稿全是
 垃圾）的原因，`eh_proj` 现在的显式写法是 `mtp_layer_w4_ || mtp_head_w4_`
-（`engine_mtp.cpp:382`，注释在 `engine_mtp.cpp:377-381`）。同理，prefill 故意用 `do_split=false`
+（`engine_mtp.cpp` 里记 `do_split` 规则的那段注释，注释在 `engine_mtp.cpp:275-282`）。同理，prefill 故意用 `do_split=false`
 （oneDNN 只读连续形式 + 组和，省掉两次额外的存储），而消费这些平面的路径必须由 `split_valid`
 守卫，见 §6.5。
 
@@ -310,7 +310,7 @@ SIn 的展开辅助（`kernel_utils.h`，`si::kd`）：
 | `scalar` | 纯 C 循环 | 1 |
 
 `PF_CPU_ISA=scalar|avx2|avxvnni|avx512`（`cpu_isa.h:9`）可强制某一变体。注意 `qgemv_sb` 在
-scalar 下是 `nullptr`（`common.cpp:546`），而 `i8_supported` 要求
+scalar 下是 `nullptr`（CPU kernel `common.cpp` 的 scalar ISA 分支），而 `i8_supported` 要求
 `isa().qgemv_sb != nullptr`（`i8.cpp:159-161`）——所以 `PF_CPU_ISA=scalar` 会把 CPU 的整数 int8
 路径整体关掉、退回融合 fp32。
 
@@ -330,15 +330,15 @@ scalar 下是 `nullptr`（`common.cpp:546`），而 `i8_supported` 要求
 
 ### 6.1 启用与目的
 
-`dnnl_gemm_enabled()`（`dnnl_gemm.cpp:293-301`）= 环境变量 `PF_GEMM_DNNL` 未置 0 **且**设备 profile 的
+`dnnl_gemm_enabled()`（`dnnl_gemm.cpp` 的 `dnnl_gemm_enabled`）= 环境变量 `PF_GEMM_DNNL` 未置 0 **且**设备 profile 的
 `wt.gemm_dnnl` 为真（`src/device/profiles/arc_a770.cpp:85`、`iris_xe.cpp:98`，两张卡都是 1）——环境变量
 是 A/B，profile 是实测默认。
 
 单设备 GPU 走 `use_dnnl = !cpu_mode && !multi_dev && pf8 && dnnl_gemm_enabled()`
-（`engine.cpp:368`），那一个 `dnnl_gemm` 实例负责模式 1/2 的 prefill GEMM。
-`--layer-map` 的多设备路径另外为每个 GPU 分区建一个 `dnnl_gemm`（`engine.cpp:399-435`、
+（`engine.cpp` 里建 `dnnl` 实例那段），那一个 `dnnl_gemm` 实例负责模式 1/2 的 prefill GEMM。
+`--layer-map` 的多设备路径另外为每个 GPU 分区建一个 `dnnl_gemm`（`engine.cpp` 的 `setup_md_dnnl`、
 `engine.cpp:1115`），此时所有层 GEMM（含 decode）都由 oneDNN 服务，且 `pf8` 恒为 false
-（`engine.cpp:190`），SIn/dp4a 只作为 oneDNN 不可用时的回退
+（`engine.cpp` 的 `use_dnnl` / `md_xmx` 权重路径选择），SIn/dp4a 只作为 oneDNN 不可用时的回退
 （`md_xmx → md_int8 → fp32`，`engine.cpp:1611-1618`）。
 
 ### 6.2 权重转换
@@ -363,7 +363,7 @@ scalar 下是 `nullptr`（`common.cpp:546`），而 `i8_supported` 要求
 
 ### 6.3 执行
 
-`impl`（`dnnl_gemm.cpp:304-540`）持有：
+`impl`（`dnnl_gemm.cpp` 的 `impl`）持有：
 
 * 激活 scratch（`dnnl_gemm.cpp:547-564`，`cap_M = kMaxB*kMaxT = 512`、`cap_K = kActMaxK = 32768`）：
   每 32 组形式 `axg`（int8）+ `asa`（f16 组 scale）+ `xs`（组内 int32 和写成 f32）+ `axe`/`axo`
@@ -379,7 +379,7 @@ scalar 下是 `nullptr`（`common.cpp:546`），而 `i8_supported` 要求
   分配时机与数量不变，单函数内平衡的临时量（`dsc`、`dx/dsw/dout`）仍手动管理；
 * 两条 oneDNN stream：`st`（稠密 GEMM）与 `st_a`（只服务 attention 的 int8 matmul）。
   两者包同一个 in-order 队列，所以提交仍有序，但在 `st_a` 上等不会把 `st` 上排队的稠密 GEMM
-  一起抽干（`dnnl_gemm.cpp:308-312`）。
+  一起抽干（`dnnl_gemm.cpp` 里抽干 `impl` 的那处）。
 
 matmul 本身是 `src [M,K] s8 "ab"`、`weights [K,N] s8 "ba"`、`dst [M,N] **f32** "ab"`，**带两个
 grouped scale attribute**：WEIGHTS `mask=1, groups={32,1}`（= step 平面）、SRC `mask=2,
@@ -422,7 +422,7 @@ kernel 分支——**这是原 `split_valid` 就有的行为，本次刻意不�
 oneDNN primitive 无法被 SYCL command graph 捕获。除了靠 `use_dnnl` 不录图之外，还有三道保险：
 
 * `dnnl_set_capturing(true)` 期间每个 `execute` 站点都先调 `dnnl_capture_guard()`
-  （`dnnl_gemm.cpp:287-291`，调用点如 `dnnl_gemm.cpp:1408`），它直接抛异常，让调用方放弃录制并
+  （`dnnl_gemm.cpp` 的 `dnnl_capture_guard`，调用点如 `dnnl_gemm.cpp` 的 `dnnl_capture_guard()` 调用点），它直接抛异常，让调用方放弃录制并
   退回直接重放——否则会录下一条**悄悄少了工作**的 pass。
 * `record_forward` 的 `dnnl_call` 判定（`engine_graph.cpp:542-582`）：必须有绑到本 call 计算后端的
   `dnnl_gemm *D`，且**不是**（`mode == 0 && !multi_dev`）——即单设备的 decode 保留 dp4a GEMV，
@@ -469,9 +469,9 @@ primitive 与两个 SYCL kernel 各跑一次，把一次性 kernel 加载挡在�
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `PF_DP4A` | on | `0` 强制 fp32；否则单设备构建 `w8t` 副本并录制 SI8 prefill/decode 图。**多设备（`--layer-map`）下 `pf8` 恒为 false**（`engine.cpp:190`），此时 0 只是把整条 int8 路径关掉 |
-| `PF_DP4A_DEC` | on | `0` 只把 decode 退回 fp32（prefill 仍 int8，`engine.cpp:193`） |
-| `PF_META` | off | 构建 Q4_K/Q5_K 的 fp32 `(scale,min)` 旁路数组（约 260 MB）。实测净损失，且只在单设备生效（`engine.cpp:181`） |
+| `PF_DP4A` | on | `0` 强制 fp32；否则单设备构建 `w8t` 副本并录制 SI8 prefill/decode 图。**多设备（`--layer-map`）下 `pf8` 恒为 false**（`engine.cpp` 的 `use_dnnl` / `md_xmx` 权重路径选择），此时 0 只是把整条 int8 路径关掉 |
+| `PF_DP4A_DEC` | on | `0` 只把 decode 退回 fp32（prefill 仍 int8，`engine.cpp` 里解 `PF_DP4A_DEC` 的那段） |
+| `PF_META` | off | 构建 Q4_K/Q5_K 的 fp32 `(scale,min)` 旁路数组（约 260 MB）。实测净损失，且只在单设备生效（`engine.cpp` 的 `PF_META` fp32 旁路数组） |
 | `PF_SI4` | off | 全部重化为 4-bit SIn，副本减半、精度略降 |
 | `PF_W4` | on | Q4_K 走原生 4-bit 权重路径（§9）；`0` 恢复纯 int8（每 32 组权重 scale 仍生效） |
 | `PF_K5` | on | Q5_K 走**原生 5-bit** 存储（§11，0.75 B/w，无损）；`0` 回到 int8 转换 |
@@ -498,11 +498,11 @@ primitive 与两个 SYCL kernel 各跑一次，把一次性 kernel 加载挡在�
 
 ### `PF_META` fp32 side array
 
-`build_meta32`（`engine.cpp:666-710`）只为 Q4_K(12)/Q5_K(13) 构建 `sycl::float2` 设备数组
+`build_meta32`（`engine.cpp` 的 `build_meta32`）只为 Q4_K(12)/Q5_K(13) 构建 `sycl::float2` 设备数组
 （`N*(K/32)` 项，144/176 字节 super-block 解码），按主机张量指针登记在 `meta32_`。它被挂到
 `gemv_seg::meta32`，供 fp32 decode GEMV 跳过 6-bit packed scale 解码。实测为净损失：packed scale 与
 权重共享 cache line，而独立数组增加一个内存流；打开还要求 `!cpu_mode && !multi_dev`
-（`engine.cpp:181`）。
+（`engine.cpp` 的 `PF_META` fp32 旁路数组）。
 
 ### KV 缓存的量化（另一套格式）
 
@@ -634,7 +634,7 @@ zero-points（其布局未通过验证）。`act_quant_grp_launch` 顺带算出 
 
 | 开关 | 作用范围 | B/w | 有损？ |
 |---|---|---|---|
-| `PF_W4_K5=1` | **只有 Q5_K(13)**（`w4.cpp:43-45`） | 0.625 | 是：丢掉第 5 位 |
+| `PF_W4_K5=1` | **只有 Q5_K(13)**（`w4.cpp` 的 `w4_supported`） | 0.625 | 是：丢掉第 5 位 |
 | `PF_W4_ALL=1` | 其余所有量化类型（排除 type 0/1，`w4.cpp:48`） | 0.625 | 是 |
 
 `PF_W4_K5` 与**原生 5-bit 存储 `PF_K5`** 是两回事，别混：
@@ -767,7 +767,7 @@ w  = d·sc_j · q5 − dmin·m_j          （每 32 个一组，6-bit (sc,m) 由
 * **prefill**：oneDNN 只认 `u4`/`s8`（§10.4 的数据类型枚举），所以 `k5_expand_launch`
   （`w4_gemv.cpp:639-669`）把两个平面重排成元素序 int8 写进与 cb4 共享的 `cb4_scratch`
   （~95 MB，§10.4），再跑**已有的分组 scale int8 primitive**，最后用 u4 的修正 epilogue
-  （`w4_epilogue_launch`）把 `off` 项加回（`dnnl_gemm.cpp:1271-1309`）。代价是每 pass 多
+  （`w4_epilogue_launch`）把 `off` 项加回（`dnnl_gemm.cpp` 的 `w4_epilogue_launch`）。代价是每 pass 多
   0.75（读）+ 1.0（写）B/w 的**串行**流量（M=512 时 GEMM 自身的权重读被算力掩盖，展开流量
   则不能）；`PF_K5_NOCORR=1` 丢掉修正项做二分定位（`dnnl_gemm.cpp:1300-1308`）。
 * 展开内核本身必须是**向量写**：每 work-item 一次 32-bit 载入 + 两个 `uint4` 存储。

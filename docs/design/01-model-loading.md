@@ -110,14 +110,14 @@ static const loader kLoaders[] = {
 
 `arch::find`（`model.cpp:50-57`）线性扫这张表，返回 `nullptr` 表示未知架构。
 
-`model::load(path)`（`model.cpp:64-76`）：
+`model::load(path)`（`model.cpp` 的 `model::load`）：
 
 1. `gguf.load(path)`；
 2. 若存在 `tokenizer.chat_template` 则拷进 `model::chat_template`（空表示 GGUF 未携带）；
 3. 读 `general.architecture`（缺失按空串处理），`arch::find`；未知抛 `unsupported architecture: <name>`；
 4. 调用加载器填充 `hp`、绑定张量、构建 `layers`。
 
-`model_context_length(path)`（`model.cpp:78-86`）是加载器之外唯一独立读 GGUF 的入口：它自己 `load()`
+`model_context_length(path)`（`model.cpp` 的 `model_context_length`）是加载器之外唯一独立读 GGUF 的入口：它自己 `load()`
 一遍，只取 `<arch>.context_length`，**不构造 `model`**，因此可以在引擎之前用来给 `--ctx full` 定大小
 （见 §7.2）。它对没有该键的模型返回 0。
 
@@ -169,7 +169,7 @@ struct wt { const void *data; uint32_t type; int32_t K; int32_t N; }; // model.h
 
 ### 4.2 一次性上传与 `dev_ptr`
 
-`model::upload(q)`（`model.cpp:88-100`）：
+`model::upload(q)`（`model.cpp` 的 `model::upload`）：
 
 ```cpp
 dev_weights_size = gguf.map_size;                  // 整个文件，含元数据和 padding
@@ -193,7 +193,7 @@ const void * dev_ptr(const void * host_ptr) const {
 `model::upload(q, host)`（`model.h:113-115`）的 `host=true` 分支 **不做拷贝**：`dev_weights = nullptr`，
 `dev_ptr` 退化为恒等（直接返回 mmap 指针），这就是 CPU 后端的模式——权重留在 mmap 里，主机内核
 直接读（见 [architecture.md §11](../architecture.md)）。`engine` 构造时对 CPU 后端和多设备都传
-`host=true`（`engine.cpp:175`），所以多设备**不复用单一 `dev_weights`**：`engine::setup_multi_device`
+`host=true`（`engine.cpp` 里 `build_w8` 的 `host=true` 处），所以多设备**不复用单一 `dev_weights`**：`engine::setup_multi_device`
 只把每个 GPU 后端 **自己分区** 的张量（外加始终落在主设备上的 `tok_embd` / `output` / `output_norm`）
 拷到该设备，`engine::wptr(dev, host)`（`engine.cpp:842-859`）按层解析出该设备的指针（CPU 后端仍返回
 mmap 指针）。
@@ -201,7 +201,7 @@ mmap 指针）。
 ### 4.3 释放主机的 mmap 常驻页
 
 mmap 只在上传/转换阶段被读；GPU 分区一旦落到设备，主机就不再需要这些页，但内核会一直把它们算进
-进程 RSS（27B 的文件有 15.7 GB，`engine.cpp:1001-1003`）。`model::page_out_host`（`model.cpp:106-128`）
+进程 RSS（27B 的文件有 15.7 GB，`engine.cpp` 的 `engine::release_host_weight_pages`）。`model::page_out_host`（`model.cpp` 的 `model::page_out_host`）
 对一段映射先 `madvise(MADV_DONTNEED)`（把页从进程摘掉，映射本身仍有效，日后误读只会重新缺页），再
 `posix_fadvise(POSIX_FADV_DONTNEED)`（`gguf_file::drop_cache`，`gguf.cpp:188-193`；此时 PTE 已摘除，
 内核可真正回收 page cache；仍被映射的 CPU 分区页会被内核跳过）。范围会先对齐到页边界再裁剪到映射内。
@@ -232,14 +232,14 @@ mmap 只在上传/转换阶段被读；GPU 分区一旦落到设备，主机就�
 argmax SAME、`test_decode_vs_prefill` OK、`test_gpu_stages` all stages OK）。运行时会打印
 `[mem] released <MB> of host-resident GGUF pages (RSS)`，这是判断 `keep` 有没有写漏的第一手证据。
 
-`build_meta32`（`engine.cpp:666-710`）也用主机张量指针作为 `meta32_` 的 key（见
+`build_meta32`（`engine.cpp` 的 `build_meta32`）也用主机张量指针作为 `meta32_` 的 key（见
 [02-quantization.md](02-quantization.md)）。
 
 ### 4.4 多设备 LM head：key 取决于 tied 还是 untied
 
 这是加载/绑定侧最容易“静默变慢”的一处。`setup_md_dnnl` 建立的 oneDNN int8/u4 权重表**以 host 指针为
-key**（`engine.cpp:1150-1164`），而 `upload_device_weights` 会跳过任何已转换张量的裸设备拷贝
-（`engine.cpp:955-964`）——于是 `engine::wkey(dev, host)`（`engine.h:177-187`）的返回值有两种，取决于
+key**（`engine.cpp` 的 `engine::setup_md_dnnl`），而 `upload_device_weights` 会跳过任何已转换张量的裸设备拷贝
+（`engine.cpp` 的 `engine::upload_device_weights`）——于是 `engine::wkey(dev, host)`（`engine.h:255` 的 `wkey` lambda）的返回值有两种，取决于
 head 是否 tied：
 
 | 情况 | `m.output.data` | head 的 oneDNN key | 转换时机 |
@@ -252,7 +252,7 @@ tied 之所以要反过来：它与 `token_embd` 共用同一份存储，而 emb
 `wptr(0, m.output.data)` 取到它的 device 指针作为 key 做转换。
 
 漏掉任何一个前提（key 用错、或 head 的 GEMV 段没有 `xq` 条目）都不会报错，只会让 head **静默掉回
-fp32 dequant GEMV**：记录在 `engine_graph.cpp:301-306` 注释里的实测是 **27B / 2x A770 上 12.3 →
+fp32 dequant GEMV**：记录在 `engine_graph.cpp` 的 `build_plan` 里那段实测注释 注释里的实测是 **27B / 2x A770 上 12.3 →
 3.7 ms/token**。因此 plan 构建 head 段时必须用 `wkey` 而不是 `wptr`（`engine_graph.cpp:265-271`），
 并且 `gemv_at` 的 oneDNN 分支要覆盖单 token 调用。engine 侧的其它相关不变量（`bind_acts(0)` 必须在
 构建 head 段之前、`cur_dev` 复位）见 [04-engine.md](04-engine.md)。
@@ -301,7 +301,7 @@ fp32 dequant GEMV**：记录在 `engine_graph.cpp:301-306` 注释里的实测是
 `output.weight` 时才让 `m.output = m.tok_embd`（`qwen35.cpp:48-55`）。任何算 logits 的地方必须用
 `m.output`——两者的差别见 §4.4，以及 [11-qwen35-model.md §7](11-qwen35-model.md)。
 
-### 5.3 `mtp_layer_t`（`model.h:73-88`）
+### 5.3 `mtp_layer_t`（`model.h` 的 `mtp_layer_t`）
 
 > DFlash2 草稿器是**另一个 GGUF**，不在本节：`src/model/dflash.{h,cpp}` 加载
 > `--spec-draft-model` 指向的草稿模型，绑定它自己的张量（词表/embedding/LM head 借目标）。
@@ -341,15 +341,15 @@ int8 副本。格式与数学见 [02-quantization.md](02-quantization.md)。这�
   设备缓冲；以 **4096 行为一 slab** 在主机暂存区重排后 `memcpy` 到设备，每个 slab 后 `q.wait()`
   （暂存区复用，否则异步拷贝会与下一 slab 覆写竞争）。LM head 的副本最大（27B 约 1 GB 的 GGUF 行），
   slab 化用于限制主机暂存内存。
-* 覆盖集合（`model_w8.cpp:96-113`）：**LM head `m.output` → `m.output8`**（注意不是 `tok_embd`；
+* 覆盖集合（`model::build_w8`，`model_w8.cpp:91` 起）：**LM head `m.output` → `m.output8`**（注意不是 `tok_embd`；
   tied head 上二者同源）、每层的 3 个 FFN 线性、以及 GDN 层的 `wqkv/wgate/ssm_out` 或 attention 层的
   `wq/wk/wv/wo`。`ssm_beta`、`ssm_alpha` 和所有 f32 norm **不**复制。
-* CPU 后端不构建这些副本：`pf8` 只在非 CPU 且非多设备时为真（`engine.cpp:188-196`），CPU 的整数
+* CPU 后端不构建这些副本：`pf8` 只在非 CPU 且非多设备时为真（`engine.cpp` 里解 `pf8` 的那段），CPU 的整数
   kernel 直接读 GGUF 块。
 * `PF_SI4` 会影响 `w8_vals_bytes` / `w8_meta_bytes`（全 4-bit），因此副本尺寸随环境变化。
 * `PF_META` 是引擎级可选项（不是 `model_w8.cpp`）：`use_meta32` 要求非 CPU 且非多设备
-  （`engine.cpp:176-184`），`build_meta32` 为 Q4_K/Q5_K 构建 fp32 `(scale,min)` 旁路数组
-  （`engine.cpp:666-710`），实测为净损失（多一条内存流），默认关闭。
+  （`engine.cpp` 的 `build_meta32` 调用处），`build_meta32` 为 Q4_K/Q5_K 构建 fp32 `(scale,min)` 旁路数组
+  （`engine.cpp` 的 `build_meta32`），实测为净损失（多一条内存流），默认关闭。
 
 ---
 
@@ -426,7 +426,7 @@ int8 副本。格式与数学见 [02-quantization.md](02-quantization.md)。这�
 
 ### 7.4 `gen` 多模态路径
 
-任一 `--image`/`--video`/`--audio` 存在就走这条路径（`main.cpp:412-520`）：`--image`/`--video` 要求
+任一 `--image`/`--video`/`--audio` 存在就走这条路径（`main.cpp` 的多模态 CLI 分支）：`--image`/`--video` 要求
 `--mmproj`，`--audio` 要求 `--audio-mmproj`（两者分别抛清晰的错误信息，`main.cpp:428-460`）。视觉塔加载
 后从超参导出 `image_preproc_cfg`（`min_pixels = 8*patch_area`，`max_pixels = kMaxImgTokens*patch_area`），
 音频塔导出 `audio_preproc_cfg`（采样率/FFT/hop/mel/f_min/f_max）。三者解码后按 `mm_media_ref order`
@@ -437,6 +437,6 @@ int8 副本。格式与数学见 [02-quantization.md](02-quantization.md)。这�
 
 ### 7.5 信号处理
 
-`main` 不安装信号处理器；`serve()` 安装 `SIGINT`/`SIGTERM`（`server.cpp:1916-1917`，处理函数只置原子
+`main` 不安装信号处理器；`serve()` 安装 `SIGINT`/`SIGTERM`（`serve()` 的 `std::signal(SIGINT/SIGTERM, on_term_signal)`，处理函数只置原子
 标志 `g_term_requested`），watchdog 线程（100 ms 轮询）负责调 `srv.stop()` 正常停止服务，使 `~engine`
 能 flush 前缀缓存。详见 [09-server.md](09-server.md)。

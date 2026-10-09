@@ -85,20 +85,20 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
 
 | 组 | 字段 | 读点 | 作用 |
 |---|---|---|---|
-| `shape.*` | `rmsnorm_wg` | `rmsnorm.cpp:71` | 每行一个工作组；选 1024/512/256/128 哪个实例化 |
-| | `gemv_rows_per_wg` | `gemv.cpp:218` | 向量化 decode GEMV 每组的行数 |
-| | `gdn_cols` / `gdn_warps_per_wg` / `gdn_vec_max_rows` | `gdn.cpp:258` / `gdn.cpp:264` / `gdn.cpp:302` | GDN 每 warp 的状态行数、每组 warp 数、float4 变体的 `n_real` 门槛 |
+| `shape.*` | `rmsnorm_wg` | `rmsnorm_launch`（`gpu/kernels/rmsnorm.cpp`） | 每行一个工作组；选 1024/512/256/128 哪个实例化 |
+| | `gemv_rows_per_wg` | `gpu/kernels/gemv.cpp:219` | 向量化 decode GEMV 每组的行数 |
+| | `gdn_cols` / `gdn_warps_per_wg` / `gdn_vec_max_rows` | `gdn_launch` 里读 `gdn_cols`/`gdn_warps_per_wg`/`gdn_vec_max_rows` 处（`gpu/kernels/gdn.cpp`） | GDN 每 warp 的状态行数、每组 warp 数、float4 变体的 `n_real` 门槛 |
 | `occ.*` | `warps_per_eu_x2` | `engine.cpp:245` | decode attention 的 K-split：`dec_splits = (wpe/2)*EUs/n_head`，向下取 8 的倍数、下限 8、上限 `kMaxDecSplits` |
-| `split.*` | `gemv_rows` / `max` | `dp4a_gemv.cpp:105-113` | decode GEMV：`N <= 2*gemv_rows` 时切 K，`S = ceil(gemv_rows/N)`，上限 `max` |
-| | `gemm_rows` / `max` | `dp4a_gemm.cpp:1085-1088` | 同上，prefill row GEMM（仅 `TB==32 && N<=8192`） |
+| `split.*` | `gemv_rows` / `max` | `dp4a_gemv_launch` 读 `split.gemv_rows`/`split.max` 处 | decode GEMV：`N <= 2*gemv_rows` 时切 K，`S = ceil(gemv_rows/N)`，上限 `max` |
+| | `gemm_rows` / `max` | `dp4a_gemm_launch` 读 `split.gemm_rows`/`split.max` 处 | 同上，prefill row GEMM（仅 `TB==32 && N<=8192`） |
 | `slm.*` | `budget_bytes` | `w4_gemv.cpp:153/277/509/625/788` | staging tile 的 `fits(RB)` 判据；48 KB 是在 64 KB 硬件上限下的**主动预留** |
-| `attn.*` | `vec` / `dec_group` | `attn.cpp:20` / `attn.cpp:303` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
-| | `xmx` / `xmx_min_keys` | `attn_xmx.cpp:54` / `attn_xmx.cpp:72` | oneDNN prefill attention 开关与键数门槛 |
-| | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp:87-88` | gather 一级 max 归约的工作组数与上限 |
+| `attn.*` | `vec` / `dec_group` | `gpu/kernels/attn.cpp` / `gpu/kernels/attn.cpp` 的 `dec_group_env` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
+| | `xmx` / `xmx_min_keys` | `attn_xmx.cpp` / `attn_xmx.cpp` 的 `xmx_min_keys` | oneDNN prefill attention 开关与键数门槛 |
+| | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp` 里读 `xmx_gather_red`/`xmx_gather_red_max` 处 | gather 一级 max 归约的工作组数与上限 |
 | | `split_keys` | `engine_graph.cpp:1096-1101`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
 | `wt.*` | `w4` / `k5` / `cb4` | `engine.cpp:1132` / `1138` / `1143` | 原生 u4 / 5-bit / codebook 存储的默认 |
 | `hw.*` | `compute_units` | `engine.cpp:241` | SYCL 查不到 EU 数时的兜底 |
-| | `max_work_group_size` | `device_registry.cpp:153` | `wg_clamped()` 的兜底 |
+| | `max_work_group_size` | `device_registry.cpp` 的 `max_wg` 兜底 | `wg_clamped()` 的兜底 |
 
 四条规矩：
 
@@ -106,7 +106,7 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
    `attn.cpp:20`），顺序不要反——一个从未被实测过的 env 默认值就是 bug。
 2. **`shape.rmsnorm_wg` 是硬件差异，不是调优**。A770 接受 1024 线程的工作组，Iris Xe 只接受 512，
    无条件 1024 的 kernel 在后者上**根本 launch 不了**。`si::dev::wg_clamped()`
-   （`device_registry.cpp:134-163`）把 profile 想要的宽度减去设备真实上限再取整到 32 的倍数，于是未知卡
+   （`device_registry.cpp` 的 `wg_clamped_for_queue`）把 profile 想要的宽度减去设备真实上限再取整到 32 的倍数，于是未知卡
    拿到的是更小的 kernel 而不是一次 launch 失败。
 3. **work-group 宽度必须是模板参数**（`rmsnorm_impl<WG>`，`rmsnorm.cpp:26-65`）：SYCL kernel 不能捕获
    运行时初始化的全局量，而宽度本来就是**每卡编译期**的量；模板化还让 strided 载入循环能被展开
@@ -115,7 +115,7 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
    `sycl::device::get_devices()` 要走驱动枚举每一张 GPU。缓存前实测 **3.2 ms/次**，一次 MTP verify 里的
    65 次 rmsnorm 就是 **210 ms 纯主机开销**；普通 decode 完全看不到（图把 launch 录一次再重放），
    所以它在 decode 数字里隐形、在推测 cycle 里主导。查询只做一次（函数内 static，
-   `device_registry.cpp:143-159`），修好后 verify 221 → 85 ms、cycle 255 → 107 ms。
+   `device_registry.cpp` 的 `for_queue`），修好后 verify 221 → 85 ms、cycle 255 → 107 ms。
 
 **每张卡必须自己写全，包括 provenance。** `arc_a770.cpp` 的 `.provenance` 串（19-26 行）与逐字段注释给出
 了测量条件（1-2x A770 16 GB、512 EU、`--layer-map 0-31:gpu.0,32-63:gpu.1`、attn+combine 在 64k 深度下
@@ -214,7 +214,7 @@ out_i = x_i * (1/sqrt(mean(x²)+eps)) * w_i
   `NSB` = super-block 数（0 = `K/256`）；`SGW` = 每 work-group 子组数（默认 8）。
 * `rows_per_wg = RPS*SGW`，`n_wg = ceil(total_rows/rows_per_wg)`，线程数 `SGW*32`；另有 `n_tb` 网格维
   覆盖多 token 块（模式 2 一次 dispatch 覆盖全部 chunk 行）。
-* 每个 work-group 扫描 segment 列表定位自己的 `row_base`，把描述符缓存进寄存器（`gemv.cpp:52`：
+* 每个 work-group 扫描 segment 列表定位自己的 `row_base`，把描述符缓存进寄存器（`gpu/kernels/gemv.cpp` 的 `row_base` 扫描：
   重新从设备内存读比从寄存器读贵）。
 * lane 是 super-block 内 k 位置，`dequant_sb_lane_typed<QT>` 产出 `w[8]`（8 个子块）。
 * `TB==1` 直接读 `X`；`TB>1` 先把激活行（应用 `silu(gate)*up`）staging 进 SLM `xs[256*TB]` 并 barrier
@@ -222,7 +222,7 @@ out_i = x_i * (1/sqrt(mean(x²)+eps)) * w_i
 * 最后 `sg_sum` 归约 `(row,t)`，lane 0 写 `alpha*v (+residual)`。
 
 `gemv_dec_vec_kernel<QT>`（`gemv.cpp:214-312`）：仅 Q4_K/Q5_K 的单 token 向量化 decode。每工作组
-256 线程、每子组一行，**行数来自 profile**（`shape.gemv_rows_per_wg`，两卡都是 8，`gemv.cpp:218`：
+256 线程、每子组一行，**行数来自 profile**（`shape.gemv_rows_per_wg`，两卡都是 8，`gpu/kernels/gemv.cpp:219`：
 它是工作组大小，所以随“想让多少 warp 常驻”缩放）。lane 覆盖**一个子块内 8 个连续值**
 （`s=lane/4, m=lane%4`），因此每 lane 只需一个 `(scale,min)` 和一次 `uint2` 加载；激活是两次 `float4`
 加载。Q5_K 的第 5 位在这里是 8 字节 `qh` + 按 `2c+half` 取位，不需要 k5 的 SLM LUT。注释记录
@@ -274,7 +274,7 @@ kernel 家族（全部 int8、硬件 dp4a）：
 因此每个 row/split 必须有独立槽位。partial 布局 `ws[((s*TB_T + t)*N) + row]`，reduce 内核求和后应用
 alpha/residual，写 `out[t*out_stride + row]`。注意 partials 用张量自己的 `N` 而非 `out_stride`——
 后者可以更大（`ffn_gate`/`ffn_up` 共用 `2*n_ff` 缓冲），而 workspace 按 `S*TB*w.N` 定量。`n_rows`
-（张量行数）与 `out_stride` 不同这一点在 §5.3 与 `dp4a_gemm.cpp:1095-1098` 都要注意。
+（张量行数）与 `out_stride` 不同这一点在 §5.3 与 `dp4a_gemm_launch` 里处理 `out_stride` 处 都要注意。
 
 **TB 语义**：`TB` 是一次 call 的 token 数（模式 1 = 32，decode = 批大小，模式 2 = 整个扁平 token 数）。
 `TB_T` 是编译期 tile，`tstride` 是激活 token 步长；dispatcher 只在 `TB == TB_T`（或 MT 时
@@ -680,7 +680,7 @@ PV   : [M, blk] u8   x  [blk, 256] s8 -> [M, 256] s32
   模式 1 的 32-token 路径；每个阶段都带 `q.wait()`，绝对值被串行化放大了，只有份额有意义。
   `PF_XMX_TIME=1` 整个 call 的墙钟，`PF_XMX_DBG` 打印 `M`、`max_nkv` 与每块宽度。
 
-### 7.6 `attn_combine_launch`（`attn.cpp:604-632`）
+### 7.6 `attn_combine_launch`（`gpu/kernels/attn.cpp` 的 `attn_combine_launch`）
 
 按 `(r,t,h)` 归约 `n_splits` 个 partial：网格 `nd_range<1>(n_rows*n_real*n_head*head_dim, head_dim)`
 （一个 head 一个 256 线程工作组，每线程一个 head 维）。`M = max_s m_s`；
@@ -693,7 +693,7 @@ PV   : [M, blk] u8   x  [blk, 256] s8 -> [M, 256] s32
 
 GDN 的 depthwise 因果卷积 + q/k 部分的 L2 归一化。
 
-### 8.1 `conv_l2_launch`（`conv.cpp:17-71`）
+### 8.1 `conv_l2_launch`（`cpu/kernels/conv.cpp` 的 `cpu_conv_l2`）
 
 * 组维度 `group_dim = head_k_dim`（调用方传 `hp.d_state`），`n_groups = conv_dim/group_dim`，实现上
   tap 循环 `#pragma unroll` 固定为 4（即硬编码 GDN 的 4-tap 卷积）。网格

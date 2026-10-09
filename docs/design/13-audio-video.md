@@ -12,7 +12,7 @@
 
 三种输入共享同一条下游链路：`mm_prompt` → `img_row` → `d_img_embd` → `generate_mm`。
 一个请求可以**混合** image/video/audio，块按占位符出现顺序排列，由
-`mm_build_prompt_mixed_device`（`multimodal.cpp:422-541`）统一装配；位置几何与扩展规则见
+`mm_build_prompt_mixed_device`（`mm_build_prompt_mixed_device`）统一装配；位置几何与扩展规则见
 [10-multimodal.md §4.3](10-multimodal.md)（三种 kind 的 `(t,h,w)` 公式在那里，本篇只列差异）。
 
 ### 1.1 文件
@@ -29,7 +29,7 @@
 
 ### 2.1 解码（`video.cpp`）
 
-`mm_video_decode_file` / `mm_video_decode_mem`（`video.cpp:543-597`）把原始容器解码为
+`mm_video_decode_file` / `mm_video_decode_mem`（`video.cpp` 的 `mm_video_decode_file`/`mm_video_decode_mem`）把原始容器解码为
 `mm_video{ frames[] }`，每帧仍是原始分辨率的 RGB8（视觉预处理负责缩放）：
 
 * **内置路径**：RIFF/AVI 解复用器（`parse_avi_header` + `collect_avi_frames`）按
@@ -50,18 +50,18 @@
   不能内置解码的 AVI 会尝试 ffmpeg（因此不是“识别即不回退”）。
   `max_frames <= 0` 会在采样前拒绝；`mm_video_fmt::max_frames`（CLI `--max-video-frames`
   默认 16，`main.cpp:158`；结构体默认也是 16，`video.h:46`），`max_side` 的 CLI 默认是 768
-  （`main.cpp:159`、`--max-video-side`），而 `mm_video_fmt` 结构体默认是 1024（`video.h:47`）——
+  （`main.cpp` 的 `--max-video-frames`/`--max-video-side`、`--max-video_side`），而 `mm_video_fmt` 结构体默认是 1024（`video.h:47`）——
   两个默认值不一样，实际生效的是 CLI 传下来的那个。
 * `kMaxVideoDecodeFrames = 128`（`video.h:31`）是**内置 AVI 路径**扫描 `movi` 列表时的硬上限
   （`video.cpp:307`）；ffmpeg 路径另有一个 `max_frames * 2` 的收帧上限防内存爆掉
   （`video.cpp:487`）。
-* `mm_video_subsample`（`video.cpp:525-541`）在时间轴上等间隔取 `n` 帧（`step = ceil(size/n)`，从头
+* `mm_video_subsample`（`video.cpp` 的 `mm_video_subsample`）在时间轴上等间隔取 `n` 帧（`step = ceil(size/n)`，从头
   取），保证时序覆盖；帧数不足时原样返回。
 
 ### 2.2 预处理与网格
 
 每一帧独立走 `mm_image_preprocess`（与图像完全一致：Qwen 智能缩放、bicubic、归一化），cfg 由
-`vision_cfg(vm)` 派生（`multimodal.cpp:225-237`）：`patch_area = P²·merge²`，
+`vision_cfg(vm)` 派生（`multimodal.cpp` 的 `vision_cfg`）：`patch_area = P²·merge²`，
 `min_pixels = 8·patch_area`、`max_pixels = kMaxImgTokens·patch_area`，`mean/std` 取自视觉塔超参。
 
 块的 token/位置几何**只由第 0 帧决定**：`plan_videos` 用 `make_input(vm, imgs[0])` 得到
@@ -70,7 +70,7 @@
 **帧间网格必须一致**——这是前提而非检查：编码循环里每帧各自 `make_input` 并按 `vi.n_out` 递增行偏移
 （`multimodal.cpp:289-296`、`525-532`），若某一帧因分辨率不同拿到不同的网格，`n_tok` 与行偏移就会
 错位。实践中一个视频的所有帧分辨率相同，智能缩放结果一致，所以成立。总行数超 `kMaxImgTokens` 抛
-`video tokens exceed the kMaxImgTokens budget` / `media tokens exceed ...`（`multimodal.cpp:275-277`、
+`video tokens exceed the kMaxImgTokens budget` / `media tokens exceed ...`（`multimodal.cpp` 的 `check_vision_width` 预算报错处、
 `514-516`）——注意视频的总预算是**所有块共享**的 1024 行，`T` 帧 × 每帧 `nx·ny` 很容易吃掉它。
 
 ## 3. 音频路径
@@ -89,7 +89,7 @@
   `av_make_temp_file` 在系统临时目录创建文件，写完交给 ffmpeg 后删除。
   服务端 `input_audio` 的 base64 走的正是这条；无需预建 `/tmp/opencode`。
 * 时长上限 `audio_preproc_cfg::max_seconds`（默认 60，`audio.h:31`）在 `mm_audio_decode_mem`
-  （`audio.cpp:190-193`）和 `mm_audio_decode_bytes`（`audio.cpp:285-287`）里生效。
+  （`audio.cpp:186`）和 `mm_audio_decode_bytes`（`audio.cpp` 的 `mm_audio_decode_bytes`）里生效。
   `mm_audio_decode_ffmpeg` 自身**不**截断——CLI 的 `--audio` 先试 `mm_audio_decode_mem` 再直接调
   `mm_audio_decode_ffmpeg`（`main.cpp:490-495`），这条路径上没有 60 s 上限。
   真正兜底的是 `encode_device` 的断言：`n_frames <= kMaxImgTokens * 2 = 2048`
@@ -121,38 +121,38 @@ log-mel [n_frames][n_mel]
   `out_width(am) = proj_dim > 0 ? proj_dim : E`（`audio_model.cpp:131-133`）。
   **必须等于文本 `n_embd`**，否则入口抛 `audio tower output width != text n_embd`
   （`multimodal.cpp:348-350`、`387-389`；混合路径在 `any_audio` 时才检查，
-  `multimodal.cpp:511-513`）。`proj_dim == 0` 时 device 路径直接把 `d_x` 拷进 `d_out`
-  （`audio_model.cpp:519-520`）。
-* head_dim 由 `n_embd / n_head` 派生，加载时**强制等于 64**（`audio_model.cpp:158-160`，共享注意力
+  `mm_build_prompt_mixed_device` 的 `any_audio` 检查处）。`proj_dim == 0` 时 device 路径直接把 `d_x` 拷进 `d_out`
+  （`audio_model::encode_host` 末尾的 `W == E` 分支）。
+* head_dim 由 `n_embd / n_head` 派生，加载时**强制等于 64**（`audio_model.cpp` 里强制 `head_dim == 64` 处，共享注意力
   kernel 的固定 HD）；conv 形状也校验（`conv1.tap==3`、`conv1.in==n_mel`、`conv2.tap==3`、
   `conv2.in==C`、`conv2.out==E`，`audio_model.cpp:185-187`）。conv1 的通道数 `C` 在 forward 里由
-  `c2_w.size() / (E*3)` 反推（`audio_model.cpp:273`、`412`）。
+  `c2_w.size() / (E*3)` 反推（`audio_model.cpp` 的 `encode_device` conv 尺寸推导）。
 * `n_pos` 取 `a.position_embd.weight` 的行数，并与元数据 `audio.position_embd_length` 取小
   （`audio_model.cpp:206-212`）——注释说明这是为了让过大的元数据值不会把 `%` 索引带出张量。
-* **1D RoPE 的位置是 conv2 之后的帧序 `t`**（`audio_model.cpp:317`：`theta = t * base^(-2·ic/HD)`；
+* **1D RoPE 的位置是 conv2 之后的帧序 `t`**（`audio_model.cpp` 的 `at_rope1d_launch` 调用点：`theta = t * base^(-2·ic/HD)`；
   设备侧 `at.cpp:53` 写成 `exp2(-2·pair/head_dim · log2(base))`，两者等价）。注意这与
   learned position embedding 无关——后者是逐行**加上去的向量**（`audio_model.cpp:283-291` /
   `476-482`），不移动任何位置。
 * `n_out = (n_frames+1)/2`（`audio_model::make_input`，`audio_model.cpp:259-265`），即 ceil(n_frames/2)。
 * `encode_host` 是宿主参考；`encode_device` 与视觉一致——权重单 blob 上传、`dev_ptr` 翻译、
   scratch 增长至最大 `n_frames`、**in-order queue**。conv 权重/位置嵌入被打成一个 `d_cw` blob
-  （`c1_w | c1_b | c2_w | c2_b | pos`，`audio_model.cpp:441-462`），并且**每次调用都重拷**
-  （`audio_model.cpp:463-471`）——与视觉路径“只拷一次”的做法不同。
+  （`c1_w | c1_b | c2_w | c2_b | pos`，`audio_model::encode_device`），并且**每次调用都重拷**
+  （`audio_model::encode_device` 里每次调用重拷 `c1_w`/`c2_w`）——与视觉路径“只拷一次”的做法不同。
 * device 前向复用 `vit_gemm`/`vit_layernorm`/`vit_gelu`/`vit_add_bias`/`vit_add`/`vit_attn`/`vit_copy`
   加 `at_conv1d`/`at_rope1d`（见 §5）。块顺序逐字镜像视觉塔：`x += out_b` → out GEMM 带 residual →
-  ln2 → up → +bias → GELU → `x += down_b` → down GEMM 带 residual（`audio_model.cpp:493-510`，
+  ln2 → up → +bias → GELU → `x += down_b` → down GEMM 带 residual（`audio_model::encode_device` 的 FFN 段，
   `500-501` 的注释明说是"mirroring the vision encoder's block order"）。
 
 ### 3.3 缺权重时的行为
 
 `--audio` / `input_audio` 请求在音频塔未加载时收到明确错误：服务端返回 400
-`audio input requires --audio-mmproj`（`server.cpp:1602-1611`），CLI 抛
+`audio input requires --audio-mmproj`（`handle_chat` 的 `mm.audio_ready` 检查），CLI 抛
 `--audio requires --audio-mmproj <audio-mmproj.gguf>`（`main.cpp:448-450`）。服务不崩溃、视觉仍可用
-（两者是独立的加载与 ready 标志，`server.cpp:1460-1497`）。同理
-`image/video input requires --mmproj`（`server.cpp:1597-1601`）。
+（两者是独立的加载与 ready 标志，都在 `serve()` 的 mm 加载段）。同理
+`image/video input requires --mmproj`（`handle_chat` 的 `mm.ready` 检查）。
 
 注意服务端的检查顺序：**任何**媒体 part 都先查视觉塔的 `mm.ready`
-（`server.cpp:1597-1601`），所以纯音频请求在只加载了 `--audio-mmproj` 的部署上也会拿到
+（`handle_chat` 的 `mm.ready` 检查），所以纯音频请求在只加载了 `--audio-mmproj` 的部署上也会拿到
 `image/video input requires --mmproj` —— 服务端实际需要**两个** mmproj，而 CLI 的 `--audio` 只需要
 `--audio-mmproj`（`main.cpp:448-451`）。
 
@@ -175,20 +175,20 @@ M-RoPE 的 section 划分来自 GGUF 的 `rope.dimension_sections`（Qwen3.5 参
 ### 4.2 入口
 
 `mm_build_prompt_mixed_device(vm, am, q, tk, rendered, images, vids, auds, order, n_embd, d_out,
-max_video_frames)`（`multimodal.cpp:422-541`，声明在 `multimodal.h:117-121`）分三趟：
+max_video_frames)`（`mm_build_prompt_mixed_device`，声明在 `multimodal.h`）分三趟：
 
-1. **规划趟**（`multimodal.cpp:445-516`）：按 `order`（每个占位符一条 `mm_media_ref`，三个平行向量
+1. **规划趟**（`mm_build_prompt_mixed_device`）：按 `order`（每个占位符一条 `mm_media_ref`，三个平行向量
    的下标）逐块填 `mm_block`——image 直接 `make_input`；video 先 `mm_video_subsample` 再逐帧
    `mm_image_preprocess`（结果缓存进 `vimgs[idx]` 供第二趟复用）并用第 0 帧定几何；audio 先
    `audio_prepare`（重采样 → `mm_audio_preprocess` → `make_input`，`multimodal.cpp:324-331`，
    cfg 来自 `cfg_of(am)`，`multimodal.cpp:333-342`）并把 mel 存进 `ains[idx]`。同时累加 `off[k]`。
    越界下标、非音频的宽度检查（`any_audio && audio_out_width(am) != n_embd`）与
    `rows > kMaxImgTokens` 都在这一趟抛错。
-2. **编码趟**（`multimodal.cpp:518-536`）：按 `order` 把每个媒体编码进
+2. **编码趟**（`mm_build_prompt_mixed_device`）：按 `order` 把每个媒体编码进
    `d_out + off[k]*n_embd`——image/video 走 `vision_model::encode_device`（视频逐帧、每帧推进行
    偏移），audio 走 `audio_model::encode_device`。
 3. **扩展趟**：`mm_expand_prompt(tk, rendered, blocks, rows)` 并置 `p.d_embd = d_out`
-   （`multimodal.cpp:538-539`）。
+   （`mm_build_prompt_mixed_device` 末尾的 `mm_expand_prompt`）。
 
 因为三趟共用 `mm_expand_prompt`，混合装配与单媒体入口返回的 token/position 布局是同一套代码算出来的。
 `audio_model` 只有在 `order` 里出现 `MM_KIND_AUDIO` 时才被用到。
@@ -214,8 +214,8 @@ max_video_frames)`（`multimodal.cpp:422-541`，声明在 `multimodal.h:117-121`
 
 | 入口 | 代码 |
 |---|---|
-| CLI `gen --image/--video/--audio` | `main.cpp:412-520`（解码 → `order` → `render_chat` → `mm_build_prompt_mixed_device` → `generate_mm`） |
-| 服务端 `/v1/chat/completions` | `server.cpp:1597-1699`（`parse_messages` 收集 `image_url`/`video_url`/`input_audio`/`audio_url` → `load_media_bytes` → 按 kind 解码 → `mm_build_prompt_mixed_device`），细节见 [09-server.md §6](09-server.md) |
+| CLI `gen --image/--video/--audio` | `main.cpp` 的多模态 CLI 分支（解码 → `order` → `render_chat` → `mm_build_prompt_mixed_device` → `generate_mm`） |
+| 服务端 `/v1/chat/completions` | `handle_chat`（`parse_messages` 收集 `image_url`/`video_url`/`input_audio`/`audio_url` → `load_media_bytes` → 按 kind 解码 → `mm_build_prompt_mixed_device`），细节见 [09-server.md §6](09-server.md) |
 
 两个入口都在**媒体 part 全部就绪之后**才按顺序拼 `chat_part`，所以 `order` 与渲染结果里的占位符顺序
 天然一致。CLI 的 `--image`/`--video` 共用 `--mmproj`（`main.cpp:431`），`--audio` 单独要
@@ -250,6 +250,6 @@ max_video_frames)`（`multimodal.cpp:422-541`，声明在 `multimodal.h:117-121`
 
 | 变量 | 作用 |
 |---|---|
-| `PF_AV_FFMPEG` | ffmpeg 可执行路径（音频/视频都读，`video.cpp:339-342`、`audio.cpp:21-24`），默认 `ffmpeg` |
+| `PF_AV_FFMPEG` | ffmpeg 可执行路径（音频/视频都读，`mm/av_common.h` 的 `PF_AV_FFMPEG` 读取（音频/视频共用）），默认 `ffmpeg` |
 | `PF_AV_FFPROBE` | ffprobe 路径（视频探测优先走它，`video.cpp:344-347`），默认 `ffprobe` |
 | `PF_MM_URL_FETCH=0` | 禁 remote `http(s)` 媒体 URL（base64 `data:` 仍可用，`server.cpp:478-485`） |

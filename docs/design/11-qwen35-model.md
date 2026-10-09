@@ -57,7 +57,7 @@ paged KV slice。见 §3.2。
 `hp.n_layer = block_count - n_layer_nextn`（`qwen35.cpp:20-23`），所以：
 
 * 0.8B 的 GGUF **没有** `qwen35.nextn_predict_layers`，`hp.n_mtp == 0`、`hp.n_layer == 24`，
-  `--mtp` 在它上面是 no-op（`engine.cpp:108-111` 打一行 `[mtp] model has no NextN (blk.%d.nextn.*)
+  `--mtp` 在它上面是 no-op（`engine.cpp` 的「无 NextN 头」门控 打一行 `[mtp] model has no NextN (blk.%d.nextn.*)
   layer - MTP disabled`）；
 * 27B 的 GGUF 有 `qwen35.nextn_predict_layers == 1`，于是 `hp.n_layer = 65 - 1 = 64`，草稿头落在
   `blk.64.*`（与 `engine.cpp:1186` 注释里提到的 `blk.64.nextn.eh_proj` 一致），**主干里不存在第 65 层**。
@@ -159,7 +159,7 @@ eh_proj( concat( enorm(emb(t_p)), hnorm(h_{p-1}) ) ) -> 一个 full-attention Qw
 * 它的 f32 norm 上传到 `--mtp-device` 指定的那个分区，线性层（`eh_proj` 与 block 里的 7 个矩阵）的
   oneDNN/u4 转换也发生在该分区的权重表里；而草稿用的 shared LM head
   （`M.shared_head` 或 `m.output`）**永远在主设备 0 上**，因为它和主干 head 共用一张表
-  （`engine.cpp:877-912`、`engine_mtp.cpp:128-137`）。
+  （`engine.cpp` 的 `split_md_phases`、`engine_mtp.cpp` 的 MTP plan 原始拷贝）。
 
 ---
 
@@ -196,8 +196,8 @@ gemv: ssm_out -> d_x (+ residual d_x)
 * `gated_norm`：`out = a * rsqrt(mean(a²)+eps) * ssm_norm * silu(z)`。
 * 模式 2（chunk 批量 prefill）下 `PF_GDN_FUSE>=1`（默认 2）整批融合：**一次** `conv_l2` + **一次**
   `conv_state_update` + **一个** `gdn` dispatch（`engine_graph.cpp:978-1007`）。非融合路径是每行 3 次
-  dispatch（`conv_l2` + `conv_state_update` + `gdn`，`engine_graph.cpp:1010-1030`），而 `gated_norm`
-  两种路径都只调一次、覆盖整批（`engine_graph.cpp:1049-1053`）。
+  dispatch（`conv_l2` + `conv_state_update` + `gdn`，`engine_graph.cpp` 的 `record_forward` GDN dispatch 段），而 `gated_norm`
+  两种路径都只调一次、覆盖整批（`engine_graph.cpp` 的 `record_forward` 批级调用处）。
 * 融合路径的 `gdn` 用 `kMaxT` 作为行数、`tpb` 作为 token 数（`engine_graph.cpp:994-996`）；非融合路径
   逐行走 `row0 = r0`。`nreal_arg` 是这里唯一的例外开关：融合路径用一行走完整批
   （`nreal_arg > 0 ? nreal_arg : row_nr(...)`，`gdn.cpp:53-59`）——没有它，kernel 只处理第 0 行的
@@ -234,7 +234,7 @@ gemv: ffn_down (SiLU 门控)
 * 单设备布局：`[kMaxB][n_gdn][dt_rank][d_state][d_state]` 与
   `[kMaxB][n_gdn][conv_k-1][qkv_dim()]`，分配在 `engine.cpp:1722-1723`；`n_gdn` 只数 GDN 层
   （`attn_layers()` 数 attention 层，两者互斥，见 `engine_kvpool.cpp:102-124`）。
-* 多设备布局：**每个分区只分配自己那几层**的状态（`engine.cpp:759-764`，用 per-device 的
+* 多设备布局：**每个分区只分配自己那几层**的状态（`engine.cpp` 里按分区分配递归状态那段，用 per-device 的
   `n_gdn_dev_` 计数），并通过 `bind_acts(dev)` 在设备间切换（`engine.cpp:792-793`）。所以“层 n 的状态”
   在多设备下不是全局第 n 个 slot，而是“第 n 层所在分区的第 n_gdn_dev_[dev] 个”。
 * 前缀缓存检查点按层切分为 `[GDN gdn_per][conv conv_per]`，见
@@ -259,7 +259,7 @@ gemv: ffn_down (SiLU 门控)
   （0.8B 上是 Q8_0，形状 `[n_embd, dt_rank]`）。
 * `PF_DP4A` 时 `build_w8` 为 **`output`（LM head）**、FFN 三线性、GDN 的 `wqkv/wgate/ssm_out`、
   attention 的 `wq/wk/wv/wo` 构建 SIn int8 副本；`ssm_beta`/`ssm_alpha`/norm 不复制
-  （`model_w8.cpp:96-113`）。`output` 的 SIn 副本只有 8-bit 类型可精确表示，5/6-bit（Q5_K/Q6_K）与
+  （`model::build_w8`，`model_w8.cpp:91` 起）。`output` 的 SIn 副本只有 8-bit 类型可精确表示，5/6-bit（Q5_K/Q6_K）与
   codebook 型（IQ*）的精度损失见 [02-quantization.md](02-quantization.md)。
 * **`m.output` 与 `m.tok_embd` 未必是同一张量**：GGUF 没有 `output.weight` 时加载器把 `m.output`
   指向 `tok_embd`（0.8B），27B 则自带独立的 Q6_K `output.weight`。任何算 logits 的地方都必须用
@@ -295,7 +295,7 @@ gemv: ffn_down (SiLU 门控)
   `TEST_LAYER_MAP=0-11:gpu.0,12-23:gpu.1 ./build/test_decode_vs_prefill` 与
   `TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu`。head 掉回 fp32 dequant GEMV **不会让输出变错**，只慢 3 倍以上，
   所以对这条路径而言 `test_decode_vs_prefill` 只验正确性，性能要靠启动日志里
-  `[dev] tied LM head: oneDNN int8 conversion keyed by its device copy`（`engine.cpp:1670`）这行确认。
+  `[dev] tied LM head: oneDNN int8 conversion keyed by its device copy`（`engine.cpp` 里打印该行的 tied-LM-head 分支）这行确认。
 * MTP 路径目前**没有单元测试**（`tests/` 里只有 `test_w4_gemm.cpp` 引用了 MTP），验证靠 CLI 的
   `PF_MTP_TIME` / `PF_MTP_STEPS` 诊断与 `AGENTS.md` 里记录的测量。
 
