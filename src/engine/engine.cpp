@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "common/env.h"
+#include "common/yarn.h"
 
 namespace si {
 
@@ -104,13 +105,31 @@ engine::engine(const engine_config & cfg)
     : device_req(resolve_device(cfg.device, cfg.layer_map)),
       md_ctx_(make_md_context(cfg.layer_map)),
       q(make_queue(device_req, md_ctx_.get())),
-      max_seq(cfg.max_seq), n_splits(cfg.n_splits), n_blocks(cfg.n_blocks) {
+      max_seq(cfg.max_seq), max_slots(cfg.max_slots), n_splits(cfg.n_splits), n_blocks(cfg.n_blocks) {
+    // clamp before anything sizes an array: every per-slot stride is built from this
+    state_slots_ = std::max(1, std::min(max_slots, kMaxB));
+    // YaRN config, resolved now and consumed by build_rope_freqs() once the
+    // model's n_rot / rope_base are known.  The env overrides exist so a run can
+    // be A/B'd without changing the command line.
+    yarn_on_ = cfg.yarn || si::env::flag("PF_YARN");
+    yarn_orig_ctx_ = cfg.yarn_orig_ctx > 0 ? cfg.yarn_orig_ctx : si::env::i32("PF_YARN_ORIG_CTX", 0);
+    yarn_factor_ = cfg.yarn_factor > 0.0f ? cfg.yarn_factor : si::env::f32("PF_YARN_FACTOR", 0.0f);
+    yarn_beta_fast_ = si::env::f32("PF_YARN_BETA_FAST", cfg.yarn_beta_fast);
+    yarn_beta_slow_ = si::env::f32("PF_YARN_BETA_SLOW", cfg.yarn_beta_slow);
+    yarn_attn_factor_ = si::env::f32("PF_YARN_ATTN_FACTOR", cfg.yarn_attn_factor);
     const std::string & model_path = cfg.model_path;
     const std::string & layer_map = cfg.layer_map;
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     tk.load(m.gguf);
+    // YaRN: build the per-pair frequency table here, before *anything* allocates a
+    // buffer that embeds it.  alloc_act_set() (reached from setup_multi_device)
+    // copies the table onto each partition, so building it later would leave the
+    // per-device pointers null while d_rope_mscale_ was still set - i.e. YaRN's
+    // attention scaling applied without the frequency stretch, which is a silent
+    // wrong answer rather than a disabled feature.
+    build_rope_freqs(m.hp.n_rot, m.hp.rope_base);
     // MTP draft length: --mtp N (0/absent = off), PF_MTP as an env override.
     mtp.mtp_k = cfg.mtp_k;
     if (const char * em = si::env::str("PF_MTP")) {
@@ -611,6 +630,7 @@ engine::~engine() {
             sycl::free(a.xsumq, qd);
             fa(a.gdn_state);
             fa(a.conv_state);
+            fa(a.rope_freqs);
         }
         as_.clear();
         d_x = d_xnorm = d_qkv = d_z = d_beta = d_alpha = d_conv_out = nullptr;
@@ -790,6 +810,7 @@ engine::~engine() {
     f(d_last_hidden);
     f(d_gdn_state);
     f(d_conv_state);
+    f(d_rope_freqs);
     f(d_pc_states);
     pool_print("exit");
     pc_print_stats("exit");
@@ -961,8 +982,15 @@ engine::act_set engine::alloc_act_set(int dev) {
     const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
     const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
     const int ng = n_gdn_dev_[(size_t)dev];
-    a.gdn_state = (float *)dev_alloc_on(dev, (size_t)kMaxB * ng * gdn_per * sizeof(float));
-    a.conv_state = (float *)dev_alloc_on(dev, (size_t)kMaxB * ng * conv_per * sizeof(float));
+    a.gdn_state = (float *)dev_alloc_on(dev, (size_t)state_slots_ * ng * gdn_per * sizeof(float));
+    a.conv_state = (float *)dev_alloc_on(dev, (size_t)state_slots_ * ng * conv_per * sizeof(float));
+    if (!h_rope_freqs_.empty()) {
+        a.rope_freqs = (float *)dev_alloc_on(dev, h_rope_freqs_.size() * sizeof(float));
+        if (!a.rope_freqs) {
+            throw std::runtime_error("YaRN frequency table allocation failed");
+        }
+        dev_queue(dev).memcpy(a.rope_freqs, h_rope_freqs_.data(), h_rope_freqs_.size() * sizeof(float)).wait();
+    }
     return a;
 }
 
@@ -1193,6 +1221,118 @@ void engine::upload_device_weights(int dev) {
     }
     fprintf(stderr, "[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
             (double)bytes / (1024.0 * 1024.0));
+}
+
+// YaRN frequency table (src/common/yarn.h).  Called once from the constructor
+// before any device buffer that embeds it exists; leaves h_rope_freqs_ empty
+// when the feature is off, which is what makes every rope call take the plain
+// exp2 path.
+void engine::build_rope_freqs(int n_rot, float base) {
+    const int n_pairs = n_rot / 2;
+    if (yarn_orig_ctx_ <= 0) {
+        // The GGUF's declared context length is the trained window, and it is
+        // what the factor is measured against.  Read it here, not in the
+        // constructor: this runs after m.load(), which is what fills hparams.
+        yarn_orig_ctx_ = m.hp.n_ctx;
+        if (yarn_on_ && yarn_orig_ctx_ <= 0) {
+            const std::string * arch = m.gguf.get_str("general.architecture");
+            fprintf(stderr, "[yarn] model declares no %s.context_length - pass --yarn-orig-ctx, disabling\n",
+                    arch ? arch->c_str() : "?");
+            yarn_on_ = false;
+        }
+    }
+    h_rope_freqs_.clear();
+    d_rope_mscale_ = 1.0f;
+    d_rope_freqs = nullptr;
+    yarn_params yp;
+    yp.on = yarn_on_;
+    yp.orig_ctx = yarn_orig_ctx_;
+    yp.factor = yarn_factor_;
+    yp.beta_fast = yarn_beta_fast_;
+    yp.beta_slow = yarn_beta_slow_;
+    yp.attn_factor = yarn_attn_factor_;
+    if (n_pairs <= 0) {
+        if (yp.on) {
+            fprintf(stderr, "[yarn] model has n_rot=%d, nothing to scale - disabled\n", n_rot);
+        }
+        yarn_on_ = false;
+        return;
+    }
+    // Derive the factor from the context we were asked to serve: that is the
+    // whole point of the flag (a 1M --ctx on a 32k-trained model is factor 32).
+    float factor = yp.factor > 0.0f ? yp.factor
+                                    : (yp.orig_ctx > 0 ? (float)max_seq / (float)yp.orig_ctx : 1.0f);
+    if (yp.on && factor <= 1.0f) {
+        fprintf(stderr,
+                "[yarn] factor %.3f <= 1 (max_seq=%d, trained ctx=%d) - nothing to extend, disabled\n", factor, max_seq,
+                yp.orig_ctx);
+        yarn_on_ = false;
+        return;
+    }
+    yp.factor = factor;
+    // n_rot, not n_pairs: yarn_build derives the pair count from it, and passing
+    // the half-count silently builds a table of the wrong length - the kernels
+    // index it by `lane < n_rot/2`, so that reads past the end of the upload.
+    h_rope_freqs_ = yarn_build(yp, n_rot, base, &d_rope_mscale_);
+    if (!yp.on) {
+        // keep the *identity* table out of the hot path when off
+        h_rope_freqs_.clear();
+        d_rope_mscale_ = 1.0f;
+        return;
+    }
+    // The kernels index the table by pair index, so its length is not a detail:
+    // assert it here rather than let a kernel read past the upload.
+    if ((int)h_rope_freqs_.size() != n_pairs) {
+        fprintf(stderr, "[yarn] internal error: table has %zu entries, kernels will read %d - disabled\n",
+                h_rope_freqs_.size(), n_pairs);
+        h_rope_freqs_.clear();
+        d_rope_mscale_ = 1.0f;
+        yarn_on_ = false;
+        return;
+    }
+    // Report what the ramp actually did, because "factor 32" hides *which* pairs
+    // moved.  Three states, and the classification has to be exact: an untouched
+    // pair is bit-identical to the plain frequency, so any "is it smaller?"
+    // threshold counts it as ramped and the line then claims zero untouched
+    // pairs, which reads like the ramp covered everything.
+    // Classify by the analytic ramp mask, not by comparing magnitudes: a
+    // magnitude threshold makes the middle bucket factor-dependent (at factor 32
+    // a half-way pair is already 45% down, so it reads as "stretched" and the
+    // line reports 0 ramped), which is exactly the wrong thing to print when
+    // someone is trying to see how wide the ramp is.
+    int n_stretched = 0, n_ramped = 0, n_untouched = 0;
+    {
+        const float dim = (float)n_rot;
+        float lo = yarn_correction_dim(yp.beta_fast, dim, base, (float)yp.orig_ctx);
+        float hi = yarn_correction_dim(yp.beta_slow, dim, base, (float)yp.orig_ctx);
+        if (lo > hi) {
+            std::swap(lo, hi);
+        }
+        const float d = (hi - lo) / dim;
+        lo += d;
+        hi += d;
+        for (int i = 0; i < n_pairs; i++) {
+            const float mask_low = 1.0f - yarn_ramp(lo, hi, (float)i);
+            if (mask_low >= 1.0f) {
+                n_untouched++;
+            } else if (mask_low <= 0.0f) {
+                n_stretched++;
+            } else {
+                n_ramped++;
+            }
+        }
+    }
+    fprintf(stderr,
+            "[yarn] on: factor=%.3f (max_seq=%d, trained ctx=%d) base=%.0f n_rot=%d beta=%.0f/%.0f "
+            "mscale=%.4f pairs: %d stretched, %d ramped, %d untouched\n",
+            factor, max_seq, yp.orig_ctx, base, n_rot, yp.beta_fast, yp.beta_slow, d_rope_mscale_, n_stretched,
+            n_ramped, n_untouched);
+}
+
+void engine::free_rope_freqs() {
+    h_rope_freqs_.clear();
+    d_rope_freqs = nullptr;
+    d_rope_mscale_ = 1.0f;
 }
 
 const float * engine::wf32(int dev, const float * host) const {
@@ -1880,8 +2020,12 @@ void engine::alloc_buffers() {
     if (!multi_dev) {
         // single-device: one global recurrent-state array.  Multi-device keeps
         // each partition's slice in act_set (device USM, local indexing).
-        d_gdn_state = alloc_elems<float>((size_t)kMaxB * n_gdn * hp.dt_rank * hp.d_state * hp.d_state);
-        d_conv_state = alloc_elems<float>((size_t)kMaxB * n_gdn * (hp.conv_k - 1) * hp.qkv_dim());
+        d_gdn_state = alloc_elems<float>((size_t)state_slots_ * n_gdn * hp.dt_rank * hp.d_state * hp.d_state);
+        d_conv_state = alloc_elems<float>((size_t)state_slots_ * n_gdn * (hp.conv_k - 1) * hp.qkv_dim());
+        if (!h_rope_freqs_.empty()) {
+            d_rope_freqs = alloc_elems<float>(h_rope_freqs_.size());
+            q.memcpy(d_rope_freqs, h_rope_freqs_.data(), h_rope_freqs_.size() * sizeof(float)).wait();
+        }
     }
     h_tables.assign((size_t)kMaxB * max_blocks, 0);
     d_tables = alloc_elems<int32_t>((size_t)kMaxB * max_blocks);
@@ -2074,11 +2218,12 @@ void engine::zero_slot(int slot) {
     const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
     const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();
     // `slot` indexes the slot axis of both recurrent-state arrays, and the
-    // address is computed as (layer*kMaxB + slot) below, so an out-of-range value
-    // memsets past the end of a USM pool - a silent heap overwrite rather than a
-    // no-op.  Every other per-slot entry point (pc_admit, pc_capture_begin,
-    // pc_commit) checks the same bound; this one did not.
-    if (slot < 0 || slot >= kMaxB) {
+    // address is computed as (layer*state_slots_ + slot) below, so an out-of-range
+    // value memsets past the end of a USM pool - a silent heap overwrite rather
+    // than a no-op.  Every other per-slot entry point (pc_admit, pc_capture_begin,
+    // pc_commit) checks the same bound; this one did not.  The bound is
+    // state_slots_, not kMaxB: --max-slots sizes those arrays (engine.h).
+    if (slot < 0 || slot >= state_slots_) {
         return;
     }
     for (int il = 0; il < hp.n_layer; il++) {
@@ -2090,13 +2235,13 @@ void engine::zero_slot(int slot) {
             const int dev = layer_dev_[(size_t)il];
             const int gl = layer_gdn_local_[(size_t)il];
             sycl::queue & qd = dev_queue(dev);
-            qd.memset(as_[(size_t)dev].gdn_state + ((size_t)gl * kMaxB + slot) * gdn_per, 0, gdn_per * 4);
-            qd.memset(as_[(size_t)dev].conv_state + ((size_t)gl * kMaxB + slot) * conv_per, 0, conv_per * 4);
+            qd.memset(as_[(size_t)dev].gdn_state + ((size_t)gl * state_slots_ + slot) * gdn_per, 0, gdn_per * 4);
+            qd.memset(as_[(size_t)dev].conv_state + ((size_t)gl * state_slots_ + slot) * conv_per, 0, conv_per * 4);
             continue;
         }
         const int gi = m.gdn_layer_index[il];
-        q.memset(d_gdn_state + ((size_t)gi * kMaxB + slot) * gdn_per, 0, gdn_per * 4);
-        q.memset(d_conv_state + ((size_t)gi * kMaxB + slot) * conv_per, 0, conv_per * 4);
+        q.memset(d_gdn_state + ((size_t)gi * state_slots_ + slot) * gdn_per, 0, gdn_per * 4);
+        q.memset(d_conv_state + ((size_t)gi * state_slots_ + slot) * conv_per, 0, conv_per * 4);
     }
     if (multi_dev) {
         sync_all();
@@ -2110,8 +2255,8 @@ void engine::reset_state() {
         for (size_t d = 0; d < as_.size(); d++) {
             sycl::queue & qd = dev_queue((int)d);
             if (n_gdn_dev_[d] > 0) {
-                qd.memset(as_[d].gdn_state, 0, (size_t)kMaxB * n_gdn_dev_[d] * gdn_per * 4);
-                qd.memset(as_[d].conv_state, 0, (size_t)kMaxB * n_gdn_dev_[d] * conv_per * 4);
+                qd.memset(as_[d].gdn_state, 0, (size_t)state_slots_ * n_gdn_dev_[d] * gdn_per * 4);
+                qd.memset(as_[d].conv_state, 0, (size_t)state_slots_ * n_gdn_dev_[d] * conv_per * 4);
             }
         }
         sync_all();
@@ -2120,8 +2265,8 @@ void engine::reset_state() {
         for (int il = 0; il < hp.n_layer; il++) {
             n_gdn += hp.is_recr(il);
         }
-        q.memset(d_gdn_state, 0, (size_t)kMaxB * n_gdn * gdn_per * 4);
-        q.memset(d_conv_state, 0, (size_t)kMaxB * n_gdn * conv_per * 4);
+        q.memset(d_gdn_state, 0, (size_t)state_slots_ * n_gdn * gdn_per * 4);
+        q.memset(d_conv_state, 0, (size_t)state_slots_ * n_gdn * conv_per * 4);
         q.wait();
     }
     reset_step_info(d_info);

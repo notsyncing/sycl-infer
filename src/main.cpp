@@ -69,6 +69,29 @@ static void usage(const char * prog) {
             "                               --ctx; env PF_KV_CAP_MB).  Also caps the sum of\n"
             "                               the three prefix-cache tiers, shrinking disk,\n"
             "                               then RAM, then VRAM.\n"
+            "  --max-slots N                max concurrent sequences (default %d = the\n"
+            "                               engine's slot ceiling; env PF_MAX_SLOTS).\n"
+            "                               Sizes the *recurrent* state, which is the\n"
+            "                               largest non-weight allocation on a 27B\n"
+            "                               (1.125 GiB per card at 16 slots); a\n"
+            "                               single-stream long-context run needs one.\n"
+            "  --yarn                       YaRN context extension, NTK-by-parts\n"
+            "                               (default OFF; env PF_YARN).  It stretches\n"
+            "                               the low-frequency RoPE pairs so a context\n"
+            "                               longer than <arch>.context_length stays in\n"
+            "                               range; the factor defaults to\n"
+            "                               --ctx / <arch>.context_length.  Does NOT\n"
+            "                               save memory - see the capacity table in\n"
+            "                               AGENTS.md.  Zero-shot it extends the window\n"
+            "                               at some cost in quality; the paper's gains\n"
+            "                               come from long-context fine-tuning.\n"
+            "  --yarn-factor F              extension factor (default: derive)\n"
+            "  --yarn-orig-ctx N            trained context the factor is measured\n"
+            "                               against (default: the GGUF's value)\n"
+            "  --yarn-beta-fast F|--yarn-beta-slow S\n"
+            "                               ramp cutoffs in rotations (default 32 / 1)\n"
+            "  --yarn-attn-factor A         override the derived attention\n"
+            "                               temperature (default 1 + 0.1*log10(f))\n"
             "  --mmproj <mmproj.gguf>       vision projector needed by --image/--video\n"
             "  --spec-type T                 speculative decoding: none | mtp | dflash2\n"
             "                               (default none; env PF_SPEC_TYPE).  mtp runs\n"
@@ -136,8 +159,9 @@ static void usage(const char * prog) {
             "env: PF_CTX, PF_KV_CAP_MB, PF_KV_TYPE, PF_PREFIX_CACHE, PF_PC_STATES,\n"
             "  PF_DEVICE, PF_CPU_ISA, PF_CPU_THREADS, PF_DP4A, PF_DP4A_DEC,\n"
             "  PF_GEMM_DNNL, PF_W4, PF_K5, PF_CB4, PF_ATTN_XMX, PF_MTP,\n"
-            "  PF_NOGRAPH, PF_PROF, PF_TIME.  Full list: AGENTS.md.\n",
-            prog, kDefaultModel, kDefaultCtx, kBlockSize);
+            "  PF_NOGRAPH, PF_PROF, PF_TIME, PF_MAX_SLOTS, PF_YARN.\n"
+            "  Full list: AGENTS.md.\n",
+            prog, kDefaultModel, kDefaultCtx, kBlockSize, kMaxB);
 }
 
 int main(int argc, char ** argv) {
@@ -156,6 +180,15 @@ int main(int argc, char ** argv) {
     int kv_cap_mb = INT_MIN; // INT_MIN = auto (size the cap from --ctx)
     if (const char * e = si::env::str("PF_KV_CAP_MB")) {
         kv_cap_mb = atoi(e);
+    }
+    int max_slots = kMaxB;      // --max-slots: concurrent sequences (recurrent state)
+    bool yarn = false;          // --yarn: YaRN context extension
+    int yarn_orig_ctx = 0;      // 0 = the GGUF's declared context_length
+    float yarn_factor = 0.0f;   // 0 = derive from --ctx / trained context
+    float yarn_beta_fast = 32.0f, yarn_beta_slow = 1.0f, yarn_attn_factor = 0.0f;
+    bool head_split = false;    // --head-split: spread the LM head's rows over both cards
+    if (const char * e = si::env::str("PF_MAX_SLOTS")) {
+        max_slots = atoi(e);
     }
     int max_tokens = 256;
     float temp = 0.7f;
@@ -302,6 +335,29 @@ int main(int argc, char ** argv) {
             }
         } else if (a == "--mtp-device") {
             spec_dev = std::atoi(next().c_str());
+        } else if (a == "--max-slots") {
+            // Bounds the engine's per-slot recurrent state.  That state is the
+            // largest non-weight allocation on a 27B (1.125 GiB per card at 16
+            // slots), and a single-stream long-context run uses one slot, so this
+            // is the cheapest context headroom there is.  The server never hands
+            // out a slot index above it.
+            max_slots = std::atoi(next().c_str());
+        } else if (a == "--yarn") {
+            yarn = true;
+        } else if (a == "--yarn-orig-ctx") {
+            yarn_orig_ctx = std::atoi(next().c_str());
+            yarn = true;
+        } else if (a == "--yarn-factor") {
+            yarn_factor = (float)std::atof(next().c_str());
+            yarn = true;
+        } else if (a == "--yarn-beta-fast") {
+            yarn_beta_fast = (float)std::atof(next().c_str());
+        } else if (a == "--yarn-beta-slow") {
+            yarn_beta_slow = (float)std::atof(next().c_str());
+        } else if (a == "--yarn-attn-factor") {
+            yarn_attn_factor = (float)std::atof(next().c_str());
+        } else if (a == "--head-split") {
+            head_split = true;
         } else if (a == "--device") {
             const std::string v = next();
             if (v == "cpu" || v == "host") {
@@ -408,8 +464,16 @@ int main(int argc, char ** argv) {
         engine_config ec;
         ec.model_path = model_path;
         ec.max_seq = ctx;
+        ec.max_slots = max_slots;
         ec.n_splits = 16;
         ec.n_blocks = n_blocks;
+        ec.yarn = yarn;
+        ec.yarn_orig_ctx = yarn_orig_ctx;
+        ec.yarn_factor = yarn_factor;
+        ec.yarn_beta_fast = yarn_beta_fast;
+        ec.yarn_beta_slow = yarn_beta_slow;
+        ec.yarn_attn_factor = yarn_attn_factor;
+        ec.head_split = head_split;
         // INT_MIN is this file's "flag absent" marker; the config speaks -1
         ec.kv_cap_mb = kv_cap_mb == INT_MIN ? -1 : kv_cap_mb;
         ec.pc_dir = pc_dir;

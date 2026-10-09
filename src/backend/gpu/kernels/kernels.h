@@ -258,8 +258,8 @@ void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, in
 void qk_norm_rope_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vbuf, const float * q_norm,
                          const float * k_norm, void * kpool, void * vpool, const int32_t * tables,
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,
-                         float eps, int max_blocks, int n_rows, int n_real, const void * kscales = nullptr,
-                         const void * vscales = nullptr);
+                         const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
+                         int n_real, const void * kscales = nullptr, const void * vscales = nullptr);
 void attn_launch(sycl::queue & q, const float * qbuf, const float * gate, const void * kpool, const void * vpool,
                  float * partials, const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
                  const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out = nullptr,

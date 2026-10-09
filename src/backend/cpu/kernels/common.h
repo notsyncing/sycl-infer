@@ -131,11 +131,18 @@ inline int mrope_section(const cpu_step_info * info, int pair) {
     }
     return 3;
 }
-inline void rope_apply(float * v, int n_rot, float base, float rpos) {
+// `freqs` is the YaRN per-pair frequency table (src/common/yarn.h) or null for
+// plain RoPE; `mscale` is YaRN's attention-temperature factor (1.0 when off).
+// Multiplied into cos/sin rather than folded into the angle: the rotation stays
+// a rotation and only its magnitude is compensated, which is what the paper's
+// attention scaling does.
+inline void rope_apply(float * v, int n_rot, float base, float rpos, const float * freqs = nullptr,
+                       float mscale = 1.0f) {
     const int half = n_rot / 2;
+    const float log2_base = std::log2(base);
     for (int i = 0; i < half; i++) {
-        const float ang = rope_theta(rpos, i, n_rot, std::log2(base));
-        const float c = std::cos(ang), s = std::sin(ang);
+        const float ang = freqs ? rpos * freqs[i] : rope_theta(rpos, i, n_rot, log2_base);
+        const float c = std::cos(ang) * mscale, s = std::sin(ang) * mscale;
         const float x0 = v[i], x1 = v[i + half];
         v[i] = x0 * c - x1 * s;
         v[i + half] = x0 * s + x1 * c;

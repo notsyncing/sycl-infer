@@ -50,6 +50,7 @@ paged KV slice。见 §3.2。
 | `d_state` / `n_group` / `dt_rank` / `d_inner` / `conv_k` | `ssm.state_size` / `ssm.group_count` / `ssm.time_step_rank` / `ssm.inner_size` / `ssm.conv_kernel` |
 | `full_attn_interval` | `full_attention_interval`（默认 4） |
 | `rope_sections[4]` | `rope.dimension_sections`（如 `[11,11,10,0]`） |
+| `n_ctx` | `context_length`（**训练窗口**，0 = 该 GGUF 未声明）。YaRN 的 factor 就是 `max_seq / n_ctx`，所以缺这个 key 时 `--yarn` 会打印一行并关闭（可用 `--yarn-orig-ctx` 覆盖） |
 
 `attn_scale = 1/sqrt(head_dim)`；`rope_sections` 全零表示普通 RoPE，非零时启用文本模型的交错 M-RoPE。
 

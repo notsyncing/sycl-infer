@@ -161,6 +161,7 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_pc_cpu` | 0.8B | CPU | 主机后端的 paged 注意力 + 前缀缓存磁盘 spill/promote 往返（日志逐位一致） |
 | `test_pc_disk` | 无 | CPU | 磁盘层记录格式往返、token 校验、LRU 预算、重开持久化、损坏/未知记录 |
 | `test_pc_ram` | 无 | CPU | RAM 层 LRU 记录存储 |
+| `test_yarn` | 无 | CPU | YaRN 每对维度频率表（`src/common/yarn.h`）：factor=1 逐位等于原表、ramp 两个锚点按位、单调性、mscale 与 clamp、退化输入 |
 | `test_multimodal` | 0.8B + mmproj | CPU+GPU | 图像预处理几何、host/device 视觉编码器、位置与 prompt 布局、逐 kernel 对照；音频解码/mel、AuT 塔 |
 | `test_gpu_stages` | 0.8B | GPU | 每个 kernel vs CPU 参考（强制 `PF_DP4A=0`）；调用 rmsnorm/embed/qk_norm_rope/attn/conv/gdn/gated_norm |
 | `test_gemv` | 0.8B | GPU | 每个真实 GGUF 张量的 GEMV vs CPU 反量化参考，多 TB（强制 `PF_DP4A=0`） |
@@ -183,7 +184,14 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_spec` | 27B + draft GGUF | 双 GPU | MTP/DFlash2 对**显式绕过投机**的 plain greedy oracle；`TEST_SPEC_LONG=1` 另测跨 512-token prefill 和缓存复用 |
 
 `TEST_LAYER_MAP` 是多设备 split 的通用开关（`test_w4_vs_cpuref`、`test_w4_topk`、`test_27b_prefill` 读它），
-`TEST_DEVICE` 只有 `test_27b_prefill` 读。`test_gpu_stages` 除了 `argv[1]` 的模型，还从 `argv[2..]`
+`TEST_DEVICE` 只有 `test_27b_prefill` 读。`test_decode_vs_prefill` 另外读三个：
+`TEST_MAX_SLOTS`（走 `--max-slots`，覆盖 per-slot 递归状态 stride）、`TEST_YARN_FACTOR`（开 YaRN 并
+指定 factor，因此不依赖 GGUF 的 `context_length`）、以及既有的 `TEST_DVP_LENS`。这是这两个特性在
+decode 路径上**唯一**的覆盖——decode 是每 token 全量重读 KV 的路径，也正是 per-slot stride 与 rope
+表唯一会同时被读到的地方。判据有两条，缺一不可：`--max-slots` 必须**数值不可见**（只改分配，argmax
+不变），`--yarn` 必须**数值可见**（margin 变）。实测 2xA770 / 0.8B / `TEST_DVP_LENS=96,1056,2080`
+六种配置（单设备/分卡 x 默认/`--max-slots 1`/YaRN factor 4）全部 3/3 通过，且分卡 + `--max-slots 1`
+的 argmax 与分卡默认逐位相同。`test_gpu_stages` 除了 `argv[1]` 的模型，还从 `argv[2..]`
 读要跑 stage 的 token id 列表（不传则用 `stage_test.h` 的默认集合）——它也是唯一一个默认模型路径不写
 在 `main()` 里而藏在 `stage_arg_model()` 的测试。
 

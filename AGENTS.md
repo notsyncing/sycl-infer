@@ -180,6 +180,36 @@ the fp32 CPU reference, versus 0.035 for i8 and 0.183 for i4, at 24 KB/token
 near-i8 accuracy.  `i8:i4` is the mirror image and is *worse* than i4/i4
 (mean|diff| 1.49), confirming V is the sensitive side.
 
+`--max-slots N` bounds the concurrent sequences, which is what sizes the
+**recurrent** state; see *Long context: what actually fits* below for why that
+is the cheapest context headroom there is (1.125 GiB per card at the default 16).
+
+`--yarn` enables YaRN context extension (NTK-by-parts, `src/common/yarn.h`) and
+`--yarn-factor F` / `--yarn-orig-ctx N` / `--yarn-beta-fast F` /
+`--yarn-beta-slow S` / `--yarn-attn-factor A` override what it derives.
+**Default off**, and a factor <= 1 prints one `[yarn]` line and disables itself
+rather than running with a no-op table.  With no `--yarn-factor` the factor is
+`--ctx / <arch>.context_length`, so `--ctx 1048576 --yarn` on a 32k-trained
+model is factor 32.  The engine prints what the ramp actually did:
+
+```
+[yarn] on: factor=32.000 (max_seq=327680, trained ctx=262144) base=10000000 n_rot=64 \
+        beta=32/1 mscale=1.1505 pairs: 10 stretched, 7 ramped, 15 untouched
+```
+
+(verbatim from the 27B; the three buckets come from the analytic ramp mask, not a
+magnitude threshold, so they do **not** change with the factor - only the depth
+of the stretch does.  15 untouched of 32 pairs is `yarn_correction_dim(32, 64,
+1e7, 262144) = 14.24` rounded up, i.e. every pair whose period is shorter than
+the trained window keeps the trained frequency *bit for bit*.)
+
+Two caveats that are not optional.  **YaRN is a scaling method**: the paper's
+gains come from a small amount of long-context fine-tuning on top, so used
+zero-shot it extends the window but costs quality relative to the trained one -
+which is why the flag is opt-in and not folded into `--ctx`.  And it does **not**
+save memory: 1M tokens still need their KV resident (see the capacity table), so
+`--yarn` and `--max-slots`/`--kv-type` are independent levers.
+
 ## Testing
 
 The tests default to `/path/to/Qwen3.5-0.8B-Q4_K_M.gguf` and require the
@@ -495,6 +525,175 @@ CLI: `gen --image FILE` / `--video FILE` / `--audio FILE` (each repeatable, all
 mixable), `--audio-mmproj`, `--max-video-frames`, `--max-video-side`.  Server:
 OpenAI-style `image_url`/`video_url`/`input_audio`/`audio_url` parts in
 `/v1/chat/completions`, streaming and not.
+
+### Long context: what actually fits on 2x A770
+
+Everything below is measured, not derived, and the measurements are on the
+`bench-host` box (`ssh bench-host`, i9-10940X, 247 GB RAM, two Arc
+A770, driver 12.55.8).  The card's usable VRAM is **15.11 GiB**, not the 16 GB on
+the box (16 GB = 14.90 GiB; `sycl::info::device::global_mem_size` reports
+15.11 GiB, so the 15.11 figure is the one to budget against).  `lspci -vv` needs
+root there, so link width is inferred from measured bandwidth instead (below).
+
+Startup weight report, `--layer-map 0-31:gpu.0,32-63:gpu.1`:
+
+```
+[dev] device 0 weights: 59 u4, 43 k5, 69 codebook, 78 int8, 9072.1 MiB
+[dev] device 1 weights: 44 u4, 88 k5, 55 codebook, 61 int8, 7824.5 MiB
+```
+
+The 1248 MiB of imbalance **is** the int8 LM head (248320x5120 at 1.0625 B/w),
+pinned to backend 0 (`engine_graph.cpp` resets `cur_dev = 0` before the head
+because `gemv_at` reads `dnnl_for(cur_dev)`).
+
+Per-card VRAM budget, card 0 (card 1 has the same KV and 1248 MiB more room):
+
+| item | MiB | source |
+|---|---:|---|
+| usable VRAM | 15 541 | `global_mem_size` |
+| weights (incl. the int8 head) | 9 072 | startup report |
+| activations + recurrent state | 1 484 | `alloc_act_set`; **1 125 of it is `gdn_state`** |
+| oneDNN + attn_xmx scratch | 318 | `dnnl_gemm.cpp`, `attn_xmx.cpp` |
+| **left for KV** | **4 667** | |
+
+That is why a 256k context "does not fit" at `i8` and why `--max-slots` exists:
+the KV at 256k/`i8` is 4.36 GiB/card against 4.46 GiB of headroom - it fits by
+0.10 GiB, and **one extra allocation fails the whole load**
+(`dev_alloc_on` throws `device alloc failed`).  Both configs do allocate today
+(`--ctx 262144` exits 0 at `i8` and `i4:i8`; `kv_cap=8192 blocks` = 8192 MB /
+6144 MB model-wide).
+
+**`--max-slots` is the cheapest headroom there is.**  `gdn_state` is
+`kMaxB * n_gdn_local * (dt_rank*d_state*d_state)` f32 = 16 x 24 x 48*128*128 x 4
+= **1.125 GiB per card**, and a single-stream long-context run uses one slot.
+Every `[layer][slot]` stride is built from `state_slots_` (the clamped
+`max_slots`), *not* `kMaxB` - the two differ from this change onward and mixing
+them is a silent out-of-bounds write into a USM pool, not a slowdown.  What else
+keeps addressing rows by `kMaxB` (`step_info`, the block table, `d_logits`,
+`d_partials_dec`) is per-*sequence*, not per-state, and is small.
+
+| card 0 | KV budget | i8:i8 | i4:i8 | i4:i4 |
+|---|---:|---:|---:|---:|
+| as shipped (`kMaxB=16`) | 4.46 GiB | 275k | 360k | 519k |
+| `--max-slots 1` | 5.51 GiB | 339k | 443k | 640k |
+
+Measured A/B on the box, `--ctx 327680 --kv-type i8` (320k needs 5.45 GiB/card,
+i.e. above the 4.46 GiB budget and below the 5.51 GiB one):
+
+```
+$ sycl-infer --model ... --layer-map 0-31:gpu.0,32-63:gpu.1 --ctx 327680 --kv-type i8 gen ...
+error: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
+$ ... --ctx 327680 --kv-type i8 --max-slots 1 gen ...
+The capital of France is **Paris**.            exit=0
+```
+
+So `--max-slots 1` is not a projection: it converts a context that does not
+allocate into one that does.
+
+**1M is not reachable on 2x16 GB at >=4-bit KV, and the weights are why.**  1M
+tokens need, per card (8 of the 16 attention layers), 16.6 GiB at `i8:i8`,
+12.7 at `i4:i8`, **8.80 at `i4:i4`** - against 6.14 GiB of budget even after
+`--max-slots 1`.  Confirmed by running it: `--ctx 1048576 --kv-type i4:i4 --max-slots 1` on the
+2-card box prints `error: device alloc failed`.  It takes **four cards**
+(`--layer-map 0-15:gpu.0,16-31:gpu.1,32-47:gpu.2,48-63:gpu.3`): weights/card
+drop to ~5.7 GiB and the budget rises to ~8.9 GiB, so `i4:i4` fits with 0.09 GiB
+spare.
+Decode does not get slower with more cards - the weight pass is the same total
+bytes and each card reads at full speed - but the KV budget per card is what
+buys the context.  2-bit KV would fit 2 cards and is rejected on accuracy (the
+measured `i8:i4` mean|diff| is already 1.49 against i8's 0.035, and V is the
+sensitive side).
+
+**Prefill, not memory, is the wall for 1M.**  Per 512-token chunk the cost is
+`414 ms + 6.86 us * depth` (measured: 635 ms at pos 32k, 765 ms at pos 51k, so
+the fixed half - weights, GDN, head, handoff - is 54% of a chunk at 51k).  A
+51 499-token prompt prefilled in 62.3 s over 101 chunks (617 ms/chunk), and
+decode ran 89 ms/token (11.2 t/s).  Extrapolating the quadratic: **256k ~ 15-16
+min, 512k ~ 51 min, 1M ~ 3.1-3.4 h.**  So a 1M context is a *batch* capability,
+not a serving one, regardless of how the memory is arranged.
+
+#### PCIe, measured - and why streaming the KV cannot fix this
+
+Kernel-free probe (`/tmp/h2d{,2,3}.cpp` on the box, `icpx -fsycl`; no device
+code, so it also avoids that box's persistent-JIT-cache SIGSEGV).  2 GiB pinned
+transfers, best of 3, order-independent:
+
+| | H2D | D2H |
+|---|---:|---:|
+| dev0 (19:00.0) | **5.18 GB/s** | 5.68 GB/s |
+| dev1 (67:00.0) | **9.98 GB/s** | 10.78 GB/s |
+| pageable (dev0/dev1) | 3.70 / 5.30 | - |
+| dev1->dev0 peer D2D | 5.23 GB/s | |
+| **both H2D concurrently** | **10.37 GB/s aggregate** (5.19 each) | |
+
+The two cards are on **different PCIe generations** - dev1 exceeds the Gen3 x8
+line rate (7.877 GB/s), dev0 is 66% of it - so any plan that streams must assume
+**5.2 GB/s per card**, not 10.  The ratio is flat from 4 MiB to 2 GiB (1.8-1.93x)
+and chunking does not help (64 MiB -> 2 GiB chunks all measure 5.14-5.19 GB/s),
+so "stream in small pieces to improve overlap" does not exist.  Peer D2D equals
+host staging, so `handoff_x`'s host-staged path loses nothing; and at 9.4 MB the
+mode-2 handoff copy is 1.97 ms on dev0, i.e. the 37 ms of host blocking
+`PF_HOSTPROF` attributes to it is the `qf.wait()`, not the transfer.
+
+The consequence is arithmetic, and it differs between prefill and decode because
+their arithmetic intensities differ by 512x (one chunk is 512 query rows per KV
+byte read; one decode token is one):
+
+| | KV read : compute | best case from perfect overlap |
+|---|---:|---:|
+| decode (1 query/KV byte) | 15.8 : 1 | **5.8%** of the time saved |
+| prefill (512 queries/KV byte) | 0.98 : 1 | ~26% on an over-capacity context |
+
+So streaming a KV from host RAM is a **RAG-shaped** tool, not a serving one:
+its cost is `generated_tokens x bytes / 5.2 GB/s` per request (256k at `i4:i8`:
+0.57 s for 1 token, 18 s for 32, 73 s for 128), while the same context resident
+in VRAM decodes at 62 ms/token.  Anything that re-reads the whole KV every token
+- which is what decode is - divides by 67 against the 405 GB/s VRAM read ceiling,
+and no amount of overlap recovers more than the 5.8% above.
+
+#### Two changes deliberately **not** made
+
+* **Splitting the LM head across cards** (`--head-split`) would free 644 MiB on
+  card 0 (+14% context at `i4:i4`, and the difference between "1M on four cards
+  fits by 0.09 GiB" and "fits comfortably").  It needs the head's rows 0..N/2 and
+  N/2..N as **two** plan calls with two oneDNN keys, and a plan is a
+  device-pointer snapshot: the head call's `x`, `out` and oneDNN key are all
+  bound to backend 0 in `build_plan`/`gemv_at`.  Getting it wrong does not slow
+  anything down, it reads a buffer no kernel wrote for that step - the exact
+  class of bug the multi-device notes below describe.  Do it as its own change
+  with a test asserting split-vs-unsplit logits are bit-identical.
+* **Halving the KV scale plane is doable and the accuracy cost is now measured,
+  not estimated** - so what is left is only the payoff.  The plane is 1 f16 per
+  32-dim group (`kI8Q`), i.e. 12.5% of an i4 payload and 6.25% of an i8 one.
+  Measured on a real post-RoPE dump (`PF_DUMP_KV`, 0.8B, layers 3/7/11, 48
+  tokens) against the engine's own quantizer (`scale = amax/p`, p=127 / 7), as
+  relative RMS reconstruction error vs the current G=32/f16 format:
+
+  | variant | plane | i8 | i4 |
+  |---|---|---:|---:|
+  | per-64 groups, f16 scales | -50% | **1.182x** | **1.176x** |
+  | per-32 groups, uint8 code + f16 base per (32-token block, group) | -47% | **1.011x** | **1.000x** |
+
+  So the group-width variant costs **+18% RMS** and the uint8-scale variant is
+  **free** - and the reason is quantitative, not luck: a uint8 code resolves the
+  per-group scale to 1/255 = 0.4%, which is *below* the i8 step (1/254 of amax)
+  and ~17x below the i4 step, so it is hidden under the quantization it sits on.
+  The 18% is format-independent because the quantizer is scale-invariant: the
+  error goes as amax/p whatever p is, so widening the group hurts i4 and i8
+  equally - it is a *group* penalty, not a *bit-width* penalty.  Both numbers are
+  reconstruction RMS, not the end-to-end attention-output mean|diff| recorded
+  above, and both are from the 0.8B: the uint8 variant's cost depends on how
+  similar the per-group maxima are inside a 32-token block, which is a property
+  of the model and would want re-measuring on the 27B before shipping.
+
+  The reasons it is still skipped are therefore only: **+1.5% context at 256k,
+  +6% at 1M** (1M needs four cards regardless, at a 3.4 h prefill), against
+  `kI8Q` being a layout constant in 12 sites spanning the pool strides, the
+  prefix-cache blob, `kv_row_scales` and both attention readers plus the CPU
+  twins.  Note what is **not** a reason: the on-disk prefix-cache format does
+  **not** break - `pc_disk.cpp`'s header carries a `kVersion` and `read_header`
+  returns 1 for any mismatch, which the scan keeps on disk, counts in the budget
+  and never parses, so a layout change costs a cold cache and nothing else.
 
 ### Benchmarking on the 2x A770 box
 
@@ -1343,12 +1542,20 @@ kernel variants, so performance numbers must state the env used.
 
 **Model / memory**
 `PF_CTX`, `PF_KV_CAP_MB`, `PF_KV_GROW` (pool growth step, default 64 blocks),
+`PF_MAX_SLOTS` (concurrent sequences; sizes the recurrent state, default
+`kMaxB`=16 - 1.125 GiB per card on the 27B, so this is the cheapest context
+headroom there is),
 `PF_KV_TYPE` (`i4`|`int4`|`i8`|`bf16`|`f16`|`f32`, default `i8`; `--kv-type`
 overrides it; `K:V` sizes K and V independently, e.g. `i4:i8`), `PF_KV_F32`,
 `PF_KV_BF16`,
 `PF_SI4` (re-quantize weights to 4-bit SIn), `PF_META` (fp32 side scales).
 
 **Compute path**
+`PF_YARN` (YaRN context extension, **default off**; `--yarn`), `PF_YARN_FACTOR`
+(the extension factor; 0/absent derives `--ctx / <arch>.context_length`),
+`PF_YARN_ORIG_CTX` (override the trained context the factor is measured
+against), `PF_YARN_BETA_FAST`/`PF_YARN_BETA_SLOW` (ramp cutoffs in rotations,
+default 32/1), `PF_YARN_ATTN_FACTOR` (override the derived `1 + 0.1*log10(f)`),
 `PF_DEVICE` (`cpu`/`gpu`, default `gpu`), `PF_CPU_ISA`
 (`scalar`|`avx2`|`avx512`|`avxvnni`, forces a CPU kernel variant),
 `PF_CPU_THREADS` (CPU backend worker threads, default = physical cores, else hardware concurrency),
@@ -1636,6 +1843,32 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   must be read from the host-USM `step_info` *inside* the kernel body, never on
   the host.  `engine::record_forward`'s call order must stay in sync with
   `engine::build_plan` (the plan encodes the segment/call layout it replays).
+* **The recurrent state's slot axis is `state_slots_`, not `kMaxB`.**  Every
+  `[layer][slot][...]` stride into `d_gdn_state`/`d_conv_state` (device or host)
+  is built from `state_slots_`, the clamped `engine_config::max_slots`
+  (`--max-slots`, default `kMaxB`), and the allocation is
+  `state_slots_ * n_gdn_local * per_slot`.  The two differ as soon as anyone
+  passes `--max-slots`, and mixing them writes past the end of a USM pool rather
+  than slowing anything down - which is the failure mode this file keeps
+  repeating.  `zero_slot`, `pc_admit`, `pc_capture_begin` and `pc_commit` all
+  bound-check against `state_slots_`, and `scheduler::loop`'s slot search only
+  offers slots below `engine::max_slots`, so the index can never legitimately
+  reach past the arrays.  Everything else in the engine still addresses *rows* by
+  `kMaxB` (`step_info`, the block table, `d_logits`, `d_partials_dec`) because
+  those are per-sequence, not per-state, and are small.
+
+* **YaRN's two blends are written to be exact at their anchors, and that is not
+  cosmetic.**  `yarn_build` combines three sequences (`interp`, `extrap`, and a
+  ramp mask) and both blends are deliberately written in difference form
+  (`blended + (extrap - blended) * (1 - m)`) rather than the equivalent convex
+  form (`a*m + b*(1-m)`).  Each is exact at one anchor and carries an ulp of the
+  *larger* term at the other: the convex form makes the untouched high-frequency
+  head a 1-ulp ramp, and the wrong difference form makes the fully-stretched tail
+  wrong by an ulp of `extrap` - which, at factor 32, is ~2e-6 relative instead
+  of 0.  `test_yarn` asserts both anchors bit-exactly against the plain table, so
+  a "simplification" to the convex form fails there rather than in a 1M-token
+  generation.
+
 * **A plan is a device-pointer snapshot**.  `build_plan` writes the *then
   current* `d_x*` member pointers into each `gemv_seg`, and multi-device
   `bind_acts(dev)` only rebinds those members (it never rewrites a built plan).
@@ -1973,6 +2206,37 @@ M=/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref      # argmax SAME
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill "$M"  # OK
 ```
+
+`test_decode_vs_prefill` has three env hooks for exactly this kind of change, and
+they are the only coverage `--max-slots` and `--yarn` have on the decode path
+(it is the one test that exercises a per-*slot* stride and a rope table at the
+same time):
+
+```bash
+M=/path/to/Qwen3.5-0.8B-Q4_K_M.gguf
+TEST_MAX_SLOTS=1            ./build/test_decode_vs_prefill "$M"  # same argmaxs, less VRAM
+TEST_YARN_FACTOR=4.0        ./build/test_decode_vs_prefill "$M"  # table live, margins move
+TEST_LAYER_MAP=0-11:gpu.0,12-23:gpu.1 TEST_MAX_SLOTS=1 ./build/test_decode_vs_prefill "$M"
+```
+
+Run all four on the **A770** box rather than a laptop iGPU: a Debug build pays a
+one-time multi-minute JIT of the whole device image per process (no persistent
+cache, see *AOT builds*), so one 3-length case takes ~13 min on an Iris Xe and
+seconds on an A770.  Measured on the A770 (0.8B, `TEST_DVP_LENS=96,1056,2080`),
+all three lengths OK in every configuration:
+
+| config | result |
+|---|---|
+| single device, default | 3/3 OK |
+| single device, `TEST_MAX_SLOTS=1` | 3/3 OK, **argmaxs identical to default** |
+| single device, `TEST_YARN_FACTOR=4` | 3/3 OK, same argmaxs, margins differ |
+| `0-11:gpu.0,12-23:gpu.1`, default | 3/3 split OK |
+| the same + `TEST_MAX_SLOTS=1` | 3/3 split OK, **argmaxs identical** |
+| the same + `TEST_YARN_FACTOR=4` | 3/3 split OK, margins differ |
+
+That table is the reason to run it: `--max-slots` must be numerically invisible
+(it only changes an allocation) and `--yarn` must be numerically *visible* (its
+margins move) while leaving the greedy argmax alone at these lengths.
 
 The 0.8B is the **tied-embedding** (`output.weight` absent) reference, and the
 only model that exercises the tied multi-device LM head; check it with a split

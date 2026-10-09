@@ -153,11 +153,13 @@ struct cpu_backend : compute_backend {
     }
     void qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm,
                       void * kpool, void * vpool, const int32_t * tables, const step_info * info, int n_head,
-                      int n_head_kv, int head_dim, int n_rot, float rope_base, float eps, int max_blocks, int n_rows,
-                      int n_real, const void * kscales, const void * vscales) override {
+                      int n_head_kv, int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale,
+                      float eps, int max_blocks, int n_rows, int n_real, const void * kscales,
+                      const void * vscales) override {
         const cpu_step_info ci = to_cpu_info(info);
         cpu_qk_norm_rope(qbuf, kbuf, vbuf, q_norm, k_norm, kpool, vpool, tables, &ci, n_head, n_head_kv, head_dim,
-                         n_rot, rope_base, eps, max_blocks, n_rows, n_real, to_cpu_kv(), to_cpu_vkv(), kscales, vscales);
+                         n_rot, rope_base, rope_freqs, rope_mscale, eps, max_blocks, n_rows, n_real, to_cpu_kv(),
+                         to_cpu_vkv(), kscales, vscales);
     }
     void attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits, const step_info * info,

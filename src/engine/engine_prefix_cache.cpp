@@ -596,13 +596,13 @@ void engine::pc_restore_state(int slot, int st) {
             const int dev = layer_dev_[(size_t)il];
             const int gl = layer_gdn_local_[(size_t)il];
             sycl::queue & qd = dev_queue(dev);
-            qd.memcpy(as_[(size_t)dev].gdn_state + ((size_t)gl * kMaxB + slot) * gp, src + (size_t)gi * per, gp * 4);
-            qd.memcpy(as_[(size_t)dev].conv_state + ((size_t)gl * kMaxB + slot) * cp, src + (size_t)gi * per + gp,
+            qd.memcpy(as_[(size_t)dev].gdn_state + ((size_t)gl * state_slots_ + slot) * gp, src + (size_t)gi * per, gp * 4);
+            qd.memcpy(as_[(size_t)dev].conv_state + ((size_t)gl * state_slots_ + slot) * cp, src + (size_t)gi * per + gp,
                       cp * 4);
             continue;
         }
-        q.memcpy(d_gdn_state + ((size_t)gi * kMaxB + slot) * gp, src + (size_t)gi * per, gp * 4);
-        q.memcpy(d_conv_state + ((size_t)gi * kMaxB + slot) * cp, src + (size_t)gi * per + gp, cp * 4);
+        q.memcpy(d_gdn_state + ((size_t)gi * state_slots_ + slot) * gp, src + (size_t)gi * per, gp * 4);
+        q.memcpy(d_conv_state + ((size_t)gi * state_slots_ + slot) * cp, src + (size_t)gi * per + gp, cp * 4);
     }
     // `src` is the caller's temporary (a just-deserialized state buffer) and the
     // memcpys above read from it asynchronously, so this must wait on both paths -
@@ -759,7 +759,7 @@ int engine::pc_evict_lru() {
 
 int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int> & blocks) {
     static const bool pcdbg = si::env::flag("PF_PC_DEBUG");
-    if (slot >= 0 && slot < kMaxB) {
+    if (slot >= 0 && slot < state_slots_) {
         pc_slot_[slot] = {};
     }
     if (!pc_enabled) {
@@ -771,7 +771,7 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
     // and an out-of-range value lands in the heap next to them with no
     // diagnostic - the prefix cache's failure mode is a silently wrong answer, so
     // a silent heap overwrite here would be much worse than a missed cache.
-    if (slot < 0 || slot >= kMaxB) {
+    if (slot < 0 || slot >= state_slots_) {
         return 0;
     }
     pc_slot_[slot].tracking = true; // prefill of this slot captures checkpoints
@@ -1007,7 +1007,7 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     }
     pc_pending_.clear();
     inf->pc_active = 0;
-    if (!pc_enabled || slot < 0 || slot >= kMaxB) {
+    if (!pc_enabled || slot < 0 || slot >= state_slots_) {
         return;
     }
     pc_slot & ps = pc_slot_[slot];
@@ -1076,7 +1076,7 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
 
 void engine::pc_commit(int slot, const std::vector<int> & toks, const std::vector<int> & blocks, int done) {
     static const bool pcdbg = si::env::flag("PF_PC_DEBUG");
-    if (!pc_enabled || slot < 0 || slot >= kMaxB) {
+    if (!pc_enabled || slot < 0 || slot >= state_slots_) {
         for (auto & p : pc_pending_) {
             pc_state_release(p.second);
         }
@@ -1117,7 +1117,7 @@ void engine::pc_commit(int slot, const std::vector<int> & toks, const std::vecto
 }
 
 void engine::pc_retire(int slot, const std::vector<int> & blocks) {
-    if (slot >= 0 && slot < kMaxB) {
+    if (slot >= 0 && slot < state_slots_) {
         pc_slot_[slot] = {};
     }
     for (int b : blocks) {

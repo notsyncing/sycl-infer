@@ -28,8 +28,8 @@ void stage_attn(stage_env & env) {
     env.e.set_table(0, blocks);
     qk_norm_rope_launch(env.e.q, env.e.d_qbuf, env.e.d_kbuf, env.e.d_vbuf, env.e.m.dev_f32(L3.q_norm),
                         env.e.m.dev_f32(L3.k_norm), env.e.d_kpool, env.e.d_vpool, env.e.d_tables, env.e.d_info,
-                        hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps, env.e.max_blocks, 1,
-                        T, env.e.d_kscales, env.e.d_vscales);
+                        hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, /*rope_freqs=*/nullptr,
+                        /*rope_mscale=*/1.0f, hp.rms_eps, env.e.max_blocks, 1, T, env.e.d_kscales, env.e.d_vscales);
 
     // classic split attention + combine
     attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool, env.e.d_partials, env.e.d_tables,

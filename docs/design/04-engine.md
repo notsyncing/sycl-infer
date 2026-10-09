@@ -120,12 +120,22 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 
 * `kv_layer_stride = n_blocks * kv_block_bytes()`（`n_blocks` 是预留；单设备在
   `engine.cpp` 的 `kv_layer_stride = n_blocks * kv_block_bytes()`，多设备在 `engine_kvpool.cpp`）。
-* `d_gdn_state` / `d_conv_state` 按 **layer-major** 索引进分配（`[n_gdn][kMaxB][...]`），尽管头注释
-  写作 `[kMaxB][n_gdn][...]`；实际索引是
-  `state + layer_index*kMaxB*per`（`engine_graph.cpp:928-929`，单设备用
+* `d_gdn_state` / `d_conv_state` 按 **layer-major** 索引进分配（`[n_gdn][state_slots_][...]`），
+  尽管头注释写作 `[kMaxB][n_gdn][...]`；实际索引是
+  `state + layer_index*state_slots_*per`（`engine_graph.cpp:1023-1031`，单设备用
   `m.gdn_layer_index[il]`、多设备用 `layer_gdn_local_[il]`；`zero_slot` 里同样，
-  `engine.cpp:1924-1930`）。多设备下这两块不进单设备成员，而是每个分区在 `as_[dev]` 里各有一份，
+  `engine.cpp:2238-2245`）。多设备下这两块不进单设备成员，而是每个分区在 `as_[dev]` 里各有一份，
   状态**从不跨分区边界**，只交接隐状态（`engine.cpp` 里按分区分配递归状态那段）。
+* **slot 轴是 `state_slots_`，不是 `kMaxB`。** 它是 `--max-slots`（`PF_MAX_SLOTS`）clamp 到
+  `[1, kMaxB]` 后的值，分配量是 `state_slots_ * n_gdn_local * per`。27B 上这块是每卡最大的一笔
+  非权重分配（16 slot x 24 GDN 层 x 48*128*128 x 4B = **1.125 GiB/卡**），而单流长上下文只用一个
+  slot，所以 `--max-slots 1` 是最便宜的上下文余量：实测 `--ctx 327680 --kv-type i8` 在 2xA770 上
+  默认 `UR_RESULT_ERROR_OUT_OF_RESOURCES`，加 `--max-slots 1` 后正常出字。
+  两者一旦不同就混用，写出去的是 USM pool 之外——是静默越界，不是变慢。`zero_slot`、
+  `pc_admit` / `pc_capture_begin` / `pc_commit` 都按 `state_slots_` 做边界检查，
+  `scheduler::loop` 的 slot 搜索也只发 `engine::max_slots` 以下的 slot，所以下标合法。
+  engine 其余地方仍按 `kMaxB` 索引**行**（`step_info`、block 表、`d_logits`、`d_partials_dec`），
+  那些是按**序列**而不是按状态的缓冲，而且很小。
 * `d_info` 是 `sycl::malloc_host<step_info>`（host USM），清零；`d_info2_` 是多设备 prefill 流水线的
   第二份（同时在飞的 chunk）。
 * 段数组：`d_segs_dec`（1024，**已废弃**：只分配和释放，无任何读写点，engine.cpp:1736 / 587）、

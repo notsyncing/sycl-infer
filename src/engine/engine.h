@@ -155,6 +155,33 @@ struct engine_config {
     int n_splits = 16;  // decode attention splits per query head
     int n_blocks = 512; // KV pool blocks
 
+    // Max concurrent sequences.  kMaxB is the hard ceiling (step_info rows, the
+    // block table, d_logits), but the *recurrent* state is allocated per slot and
+    // dominates VRAM on a 27B: 16 slots x 24 GDN layers x 48*128*128 f32 is
+    // 1.125 GiB per card, of which a single-stream long-context run uses one
+    // slot.  Lowering this gives that memory back; the server never hands out a
+    // slot index >= max_slots.  Default kMaxB = the historical behaviour.
+    int max_slots = kMaxB;
+
+    // YaRN context extension (src/common/yarn.h).  `yarn` off by default: it is
+    // a scaling method whose gains in the paper come from long-context
+    // fine-tuning, so it is opt-in.  `yarn_factor` 0 = derive from the trained
+    // context and max_seq; `yarn_orig_ctx` 0 = read it from the GGUF.
+    bool yarn = false;
+    int yarn_orig_ctx = 0;
+    float yarn_factor = 0.0f;
+    float yarn_beta_fast = 32.0f;
+    float yarn_beta_slow = 1.0f;
+    float yarn_attn_factor = 0.0f;
+
+    // Split the LM head's output rows across every GPU partition instead of
+    // pinning the whole head to backend 0.  The head is int8 oneDNN and is the
+    // single largest tensor on card 0 (248320x5120 int8 = 1.26 GiB on the 27B,
+    // measured 1248 MiB of card 0's 9072 MiB total); halving it frees half of
+    // that on the card that has the least room.  Default off (measured neutral
+    // end to end, and it only pays when card 0 is the binding card).
+    bool head_split = false;
+
     // Three states, which the bare int never conveyed - the comment explaining
     // them used to live 430 lines away, at the pool sizing:
     //   > 0  explicit cap in MB
@@ -264,7 +291,30 @@ struct engine {
         return it != mp.end() ? it->second : host;
     }
     const float * wf32(int dev, const float * host) const;
+    // the YaRN table for `dev`, or null when YaRN is off (single-device reuses
+    // the one device copy, multi-device one per partition).
+    //
+    // The invariant is that a non-empty h_rope_freqs_ implies a non-null per-device
+    // pointer, because the kernels apply d_rope_mscale_ to cos/sin *unconditionally*.
+    // A null table with a non-unit mscale is the silent-wrong-answer case, so it is
+    // caught here rather than left to a text comparison to notice.
+    const float * rope_freqs_for(int dev) const {
+        if (h_rope_freqs_.empty()) {
+            return nullptr;
+        }
+        const float * p = as_.empty() ? d_rope_freqs : as_[(size_t)dev].rope_freqs;
+        if (!p) {
+            fprintf(stderr, "[yarn] internal error: no frequency table for device %d - disabling YaRN\n", dev);
+            const_cast<engine *>(this)->h_rope_freqs_.clear();
+            const_cast<engine *>(this)->d_rope_mscale_ = 1.0f;
+            return nullptr;
+        }
+        return p;
+    }
+    void build_rope_freqs(int n_rot, float base);
+    void free_rope_freqs();
     int max_seq;                 // max tokens per sequence (limited by the block pool)
+    int max_slots = kMaxB;       // max concurrent sequences (engine_config::max_slots)
     int n_splits;                // prefill K-split ceiling (PF_ATTN_SPLIT overrides)
     int dec_splits = kMaxSplits; // decode K-split (PF_DEC_SPLIT overrides)
     int ffn_stride;              // 2 * n_ff
@@ -310,7 +360,27 @@ struct engine {
     std::vector<int32_t> h_tables;
 
     // recurrent states, one slot per sequence
-    float * d_gdn_state = nullptr;  // [kMaxB][n_gdn][dt_rank][d_state][d_state]
+    // Slot axis of the recurrent state.  state_slots_ is max_slots clamped to
+    // kMaxB and is what every [layer][slot][...] stride below is built from;
+    // the rest of the engine keeps addressing rows by kMaxB (step_info, the
+    // block table, d_logits), which are per-sequence buffers, not per-state.
+    int state_slots_ = kMaxB;
+    // YaRN per-pair frequency table (src/common/yarn.h).  Null and 1.0 when the
+    // feature is off, which is what every default run passes; a table is
+    // n_rot/2 floats uploaded once per device.
+    std::vector<float> h_rope_freqs_;
+    float d_rope_mscale_ = 1.0f;
+    float * d_rope_freqs = nullptr; // single-device copy of h_rope_freqs_
+    // YaRN configuration, resolved in the constructor (build_rope_freqs derives
+    // the factor from max_seq when the config left it at 0 and may turn the
+    // feature off again, so the flags live here rather than in the config).
+    bool yarn_on_ = false;
+    int yarn_orig_ctx_ = 0;
+    float yarn_factor_ = 0.0f;
+    float yarn_beta_fast_ = 32.0f;
+    float yarn_beta_slow_ = 1.0f;
+    float yarn_attn_factor_ = 0.0f;
+    float * d_gdn_state = nullptr;  // [state_slots_][n_gdn][dt_rank][d_state][d_state]
     float * d_conv_state = nullptr; // [kMaxB][n_gdn][3][conv_dim]
 
     // ---------------- dynamic KV block pool ------------------------------
@@ -362,6 +432,8 @@ struct engine {
         // never crosses a partition boundary, only the hidden activation does)
         float * gdn_state = nullptr;
         float * conv_state = nullptr;
+        // this partition's copy of the YaRN frequency table (null when off)
+        float * rope_freqs = nullptr;
     };
     std::vector<act_set> as_;
     // global layer -> index of its GDN layer within its own partition

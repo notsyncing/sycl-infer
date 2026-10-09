@@ -457,8 +457,8 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     const int max_nkv = pos0 + n;
     const int nsp = std::min(std::max((max_nkv + 511) / 512, 1), mtp.mtp_splits);
     be.qk_norm_rope(mtp.d_mtp_qbuf, mtp.d_mtp_kbuf, mtp.d_mtp_vbuf, wf32(mtp.mtp_dev, M.q_norm), wf32(mtp.mtp_dev, M.k_norm), (void *)kp, (void *)vp,
-                    d_tables, inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
-                    max_blocks, 1, n, ksc, vsc);
+                    d_tables, inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base,
+                    rope_freqs_for(mtp.mtp_dev), d_rope_mscale_, hp.rms_eps, max_blocks, 1, n, ksc, vsc);
     const bool fused = (nsp == 1);
     be.attn(mtp.d_mtp_qbuf, mtp.d_mtp_qbuf, kp, vp, mtp.d_mtp_partials, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
             hp.attn_scale, max_blocks, 1, n, fused ? mtp.d_mtp_attn_out : nullptr, -1, ksc, vsc);

@@ -211,6 +211,20 @@ int main(int argc, char ** argv) {
         ec.max_seq = 4096;
         ec.n_blocks = 512;
         ec.layer_map = lm ? lm : "";
+        // TEST_MAX_SLOTS exercises --max-slots: the recurrent state is allocated
+        // per slot and every [layer][slot] stride is built from it, so a wrong
+        // stride shows up here as a decode-vs-prefill mismatch (or a crash) and
+        // nowhere else.  Unset keeps the kMaxB default.
+        if (const char * ms = si::env::str("TEST_MAX_SLOTS")) {
+            ec.max_slots = atoi(ms);
+        }
+        if (const char * yf = si::env::str("TEST_YARN_FACTOR")) {
+            // YaRN on, with an explicit factor so the test does not depend on the
+            // model's declared context length
+            ec.yarn = true;
+            ec.yarn_factor = (float)atof(yf);
+            ec.yarn_orig_ctx = 4096;
+        }
         engine e(ec);
         if (!explicit_toks.empty()) {
             return one_case(e, explicit_toks, split) ? 0 : 1;

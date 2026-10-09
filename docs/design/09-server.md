@@ -343,7 +343,7 @@ watchdog 线程每 100 ms 轮询 `g_term_requested` 与 `listen_done` 并调用 
 
 ### 3.1 `sequence`（`scheduler.h:16-89`）
 
-* 身份/位置：`id`、`slot`（引擎状态槽 `[0,kMaxB)`）、`prompt`、`prompt_pos`、`blocks`、`recent`。
+* 身份/位置：`id`、`slot`（引擎状态槽 `[0, e.max_slots)`，默认 `kMaxB`，由 `--max-slots` 收窄）、`prompt`、`prompt_pos`、`blocks`、`recent`。
 * 生成状态：`gp`、`ss`（`sampler_state`，每序列独立的 RNG）、`n_generated`、
   `finish_reason`（默认 `"stop"`）、`stops`。
 * 生命周期：`admitted`、`finished`。
@@ -373,7 +373,7 @@ submit/shutdown 时唤醒循环。
 在 `loop()` 内、**同时持有** `e.mtx` 与 `m` 时调用：
 
 1. 超长 prompt（`> e.max_seq`）→ `retire(s,"length")` 并返回 true（从 `waiting` 移除）。
-2. 找空闲 slot（标记 active 占用的槽，取第一个空闲 `[0,kMaxB)`）；无 → 返回 false（队头阻塞，本循环
+2. 找空闲 slot（标记 active 占用的槽，取第一个空闲 `[0, e.max_slots)`）；无 → 返回 false（队头阻塞，本循环
    停止准入）。
 3. 前缀缓存 `e.pc_admit(slot, prompt, blocks)`；`matched <= 0` 时 `e.zero_slot(slot)`（清 GDN/conv
    递归状态）；`s->reused = matched`。

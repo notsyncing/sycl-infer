@@ -27,6 +27,7 @@ void load_qwen35(model & m) {
     hp.n_head_kv = (int)f.get_u32(key("attention.head_count_kv"));
     hp.head_dim = (int)f.get_u32(key("attention.key_length"));
     hp.n_rot = (int)f.get_u32(key("rope.dimension_count"));
+    hp.n_ctx = (int)f.get_u32(key("context_length"), 0);
     hp.rope_base = f.get_f32(key("rope.freq_base"), 10000.f);
     hp.rms_eps = f.get_f32(key("attention.layer_norm_rms_epsilon"), 1e-6f);
     hp.d_state = (int)f.get_u32(key("ssm.state_size"));

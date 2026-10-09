@@ -8,7 +8,7 @@ namespace si {
 
 void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm, void * kpool,
                       void * vpool, const int32_t * tables, const cpu_step_info * info, int n_head, int n_head_kv,
-                      int head_dim, int n_rot, float rope_base, float eps, int max_blocks, int n_rows, int n_real,
+                      int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows, int n_real,
                       cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales) {
     (void)max_blocks;
     const int qstride = n_head * 2 * head_dim;
@@ -34,15 +34,17 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                     for (int i = 0; i < half; i++) {
                         const int sec = mrope_section(info, i);
                         const int rp = info->mrope[sec * n + ridx];
-                        const float ang = (float)rp * std::exp2(-2.0f * i / n_rot * std::log2(rope_base));
-                        const float c = std::cos(ang), s = std::sin(ang);
+                        // YaRN, as in rope_apply(): a null table is plain RoPE.
+                        const float ang = rope_freqs ? (float)rp * rope_freqs[i]
+                                                     : (float)rp * std::exp2(-2.0f * i / n_rot * std::log2(rope_base));
+                        const float c = std::cos(ang) * rope_mscale, s = std::sin(ang) * rope_mscale;
                         const float x0 = qh[i], x1 = qh[i + half];
                         qh[i] = x0 * c - x1 * s;
                         qh[i + half] = x0 * s + x1 * c;
                     }
                 }
             } else {
-                rope_apply(qh, n_rot, rope_base, (float)pos);
+                rope_apply(qh, n_rot, rope_base, (float)pos, rope_freqs, rope_mscale);
             }
         }
         for (int h = 0; h < n_head_kv; h++) {
@@ -56,15 +58,17 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                     for (int i = 0; i < half; i++) {
                         const int sec = mrope_section(info, i);
                         const int rp = info->mrope[sec * n + ridx];
-                        const float ang = (float)rp * std::exp2(-2.0f * i / n_rot * std::log2(rope_base));
-                        const float c = std::cos(ang), s = std::sin(ang);
+                        // YaRN, as in rope_apply(): a null table is plain RoPE.
+                        const float ang = rope_freqs ? (float)rp * rope_freqs[i]
+                                                     : (float)rp * std::exp2(-2.0f * i / n_rot * std::log2(rope_base));
+                        const float c = std::cos(ang) * rope_mscale, s = std::sin(ang) * rope_mscale;
                         const float x0 = khp[i], x1 = khp[i + half];
                         khp[i] = x0 * c - x1 * s;
                         khp[i + half] = x0 * s + x1 * c;
                     }
                 }
             } else {
-                rope_apply(khp, n_rot, rope_base, (float)pos);
+                rope_apply(khp, n_rot, rope_base, (float)pos, rope_freqs, rope_mscale);
             }
             const int kb = table[pos / kCpuBlk];
             const int ko = pos % kCpuBlk;

@@ -528,6 +528,25 @@ rpos = mrope[sec*(kMaxB*kMaxT) + r*kMaxT + t]
 * 仅 `lane < n_rot/2` 参与旋转：`ang = rpos * exp2(-2*lane/n_rot * log2(rope_base))`，对
   `(x[lane], x[lane+n_rot/2])` 做半分割旋转（GPT-J 风格）。`≥ n_rot` 的维度不动。
 
+#### YaRN（`--yarn`，默认关）
+
+`rope_freqs` 是**每对维度的频率表**（`src/common/yarn.h`，YaRN 的 NTK-by-parts），由 engine 在
+`m.load()` 之后建好并按设备上传（`act_set::rope_freqs`，单设备走 `d_rope_freqs`）；`rope_mscale`
+是它的注意力温度项。两者都从 `engine::rope_freqs_for(dev)` 来：
+
+* `rope_freqs == nullptr`（未开启）时走上面那条 `exp2` 原式，**逐位相同**——这是默认路径，
+  也是 `test_gpu_stages` / `test_gpu_vs_ref` 覆盖的那条。
+* 非空时 `ang = rpos * rope_freqs[lane]`，且 `cos/sin` 各乘一次 `rope_mscale`。乘法放在 `cos/sin`
+  上而不是折进角度：旋转仍是旋转，只补偿幅值，这正是论文里 attention scaling 的做法。
+
+YaRN 只改**每对维度的频率**，与 M-RoPE 正交——6.1 的 section 选择只用 `lane` 选位置，两者互不干扰，
+所以多模态路径不需要额外处理。
+
+`yarn_build` 里两处 blend 都写成差分形式（`blended + (extrap-blended)*(1-m)`）而不是凸组合，
+这样 ramp 的两个锚点都精确：未触及的高频头部逐位等于原频率，完全拉伸的尾部逐位等于 `extrap/factor`。
+凸组合形式在头部会带上 1 ulp 的 `m + 1 - m` 噪声，而在尾部带上 1 ulp 的 `extrap`——后者在
+factor 32 下就是 ~2e-6 的相对误差。`tests/common/test_yarn.cpp` 把这两个锚点都按位钉住。
+
 ### 6.3 KV 写入
 
 块内 token 偏移 `kb = table[pos/kBlockSize]`、`ko = pos%kBlockSize`。存储类型由**池指针类型**模板化

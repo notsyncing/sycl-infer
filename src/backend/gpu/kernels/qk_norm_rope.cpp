@@ -15,8 +15,8 @@ using namespace si::kd;
 void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, const float * q_norm,
                          const float * k_norm, void * kpool, void * vpool, const int32_t * tables,
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,
-                         float eps, int max_blocks, int n_rows, int n_real, const void * kscales,
-                         const void * vscales) {
+                         const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
+                         int n_real, const void * kscales, const void * vscales) {
     const int qstride = n_head * 2 * head_dim;
     const int n_sg = n_head + 2 * n_head_kv; // Q + K + V groups
     auto launch = [&](auto * kdst_base, auto * vdst_base, const sycl::half * ksc_base, const sycl::half * vsc_base) {
@@ -80,8 +80,13 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         qh[lane + 32 * i] *= inv * q_norm[lane + 32 * i];
                     }
                     if (lane < n_rot / 2) {
-                        const float ang = rope_theta(rpos, lane, n_rot, sycl::log2(rope_base));
-                        const float c = sycl::cos(ang), s = sycl::sin(ang);
+                        // YaRN: a non-null table carries the per-pair frequency
+                        // already stretched by 1/factor on the low-frequency pairs
+                        // (src/common/yarn.h).  A null table keeps the original
+                        // expression bit-for-bit, which is every default-off run.
+                        const float ang = rope_freqs ? rpos * rope_freqs[lane]
+                                                     : rope_theta(rpos, lane, n_rot, sycl::log2(rope_base));
+                        const float c = sycl::cos(ang) * rope_mscale, s = sycl::sin(ang) * rope_mscale;
                         const float x0 = qh[lane], x1 = qh[lane + n_rot / 2];
                         qh[lane] = x0 * c - x1 * s;
                         qh[lane + n_rot / 2] = x0 * s + x1 * c;
@@ -101,8 +106,9 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         khp[lane + 32 * i] *= inv * k_norm[lane + 32 * i];
                     }
                     if (lane < n_rot / 2) {
-                        const float ang = rope_theta(rpos, lane, n_rot, sycl::log2(rope_base));
-                        const float c = sycl::cos(ang), s = sycl::sin(ang);
+                        const float ang = rope_freqs ? rpos * rope_freqs[lane]
+                                                     : rope_theta(rpos, lane, n_rot, sycl::log2(rope_base));
+                        const float c = sycl::cos(ang) * rope_mscale, s = sycl::sin(ang) * rope_mscale;
                         const float x0 = khp[lane], x1 = khp[lane + n_rot / 2];
                         khp[lane] = x0 * c - x1 * s;
                         khp[lane + n_rot / 2] = x0 * s + x1 * c;

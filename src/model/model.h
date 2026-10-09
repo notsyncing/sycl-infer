@@ -21,6 +21,9 @@ struct hparams {
     int n_layer = 0, n_embd = 0, n_ff = 0;
     int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
     int n_vocab = 0;
+    // `<arch>.context_length`: the window the model was *trained* on.  YaRN's
+    // factor is target/trained, so it needs this (0 when the key is absent).
+    int n_ctx = 0;
     float rope_base = 0.f, rms_eps = 0.f, attn_scale = 0.f;
     int d_state = 0, n_group = 0, dt_rank = 0, d_inner = 0, conv_k = 0;
     int full_attn_interval = 4;

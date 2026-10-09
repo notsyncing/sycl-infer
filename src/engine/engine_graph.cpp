@@ -1027,8 +1027,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             // multi-device: each partition owns only its own GDN layers' state
             // (local index); the state never crosses the boundary, only d_x does
             const int gl = multi_dev ? layer_gdn_local_[(size_t)il] : gi;
-            float * cs = d_conv_state + (size_t)gl * kMaxB * conv_per; // [layer][slot][3][conv_dim]
-            float * gs = d_gdn_state + (size_t)gl * kMaxB * gdn_per;   // [layer][slot][rank][S][S]
+            float * cs = d_conv_state + (size_t)gl * state_slots_ * conv_per; // [layer][slot][3][conv_dim]
+            float * gs = d_gdn_state + (size_t)gl * state_slots_ * gdn_per;   // [layer][slot][rank][S][S]
             // prefix cache: per-layer slice of a checkpoint slot (see pc_snap)
             pc_snap snap{};
             if (d_pc_states && pc_enabled) {
@@ -1098,7 +1098,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     const auto t0 = tnow();
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
                                inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
-                               1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, 0, T, T, snap);
+                               1.0f / std::sqrt((float)hp.d_state), state_slots_, 1, 0, T, T, snap);
                     if (tdbg && !g_capturing) {
                         q.wait();
                         fprintf(stderr, "[t] layer %d gdn=%.2f ms\n", il, tms(t0, tnow()));
@@ -1107,7 +1107,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                     for (int r0 = 0; r0 < NCH; r0++) {
                         cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs,
                                    d_attn_pre, inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
-                                   1.0f / std::sqrt((float)hp.d_state), kMaxB, 1, r0, -1, -1, snap);
+                                   1.0f / std::sqrt((float)hp.d_state), state_slots_, 1, r0, -1, -1, snap);
                     }
                 }
                 stamp(prof_acc[13], a_sub);
@@ -1131,7 +1131,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                                              snap);
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
                                inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
-                               1.0f / std::sqrt((float)hp.d_state), kMaxB, rn, rr0, -1, -1, snap);
+                               1.0f / std::sqrt((float)hp.d_state), state_slots_, rn, rr0, -1, -1, snap);
                 }
                 stamp(prof_acc[13], a_sub);
                 a_sub = tnow();
@@ -1248,8 +1248,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const void * ksc = ksc0;
             const void * vsc = vsc0;
             cur_be->qk_norm_rope(d_qbuf, d_kbuf, d_vbuf, wf32(dev, L.q_norm), wf32(dev, L.k_norm), kp, vp, d_tables,
-                                inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, hp.rms_eps,
-                                max_blocks, nrows, nreal, ksc, vsc);
+                                inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base,
+                                rope_freqs_for(dev), d_rope_mscale_, hp.rms_eps, max_blocks, nrows, nreal, ksc, vsc);
             static const bool dbg_kv = si::env::flag("PF_DUMP_KV");
             if (dbg_kv && !g_capturing && mode != 0) {
                 dbg_dump_kv(dev_queue(cur_dev), d_kbuf, d_vbuf, mode, nrows, nreal, hp.n_head_kv, hp.head_dim, il);

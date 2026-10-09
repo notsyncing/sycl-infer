@@ -85,12 +85,15 @@ bool scheduler::admit(std::shared_ptr<sequence> & s) {
         return true;
     }
     // find a free state slot
+    // max_slots bounds the engine's recurrent state, so it bounds the slots we may
+    // hand out (engine_config::max_slots; kMaxB by default).
+    const int n_slots = e.max_slots;
     bool used[kMaxB] = {false};
     for (auto & a : active) {
         used[a->slot] = true;
     }
     int slot = -1;
-    for (int i = 0; i < kMaxB; i++) {
+    for (int i = 0; i < n_slots; i++) {
         if (!used[i]) {
             slot = i;
             break;

@@ -85,6 +85,8 @@ src/common/     量化格式与底层公共设施
                 w8.{h,cpp}    SIn int8 权重格式：重排、尺寸、Q6_K scale-only 优化
                 w4.{h,cpp}    原生位宽 u4 / k5 / cb4 / w2 权重的打包（per-32 f16 step+offset）
                 dp4a.h        可移植的 dp4a 辅助
+                rope.h        RoPE 角度（各 caller 共用）
+                yarn.h        YaRN 上下文扩展：每对维度的频率表（`--yarn`，默认关）
                 cpu_isa.{h,cpp}  主机 CPU 指令集检测与运行时变体选择
 
 src/device/     设备 profile：按 GPU 型号存放所有“在这张卡上量出来”的常量
@@ -339,10 +341,10 @@ prefill；prefill 走 oneDNN 的 `PF_GEMM_DNNL` 路径。见 §9 不变量 3 与
 |---|---|
 | `dev_weights` | 整个 GGUF 映射的副本（由 `model::upload` 分配） |
 | SIn 权重副本 | `PF_DP4A` 打开时约 700 MB（`model::build_w8`） |
-| 激活缓冲 | 行数 `R = kMaxB*kMaxT = 512`（`src/engine/engine.cpp:1683`），各阶段按需分配 |
+| 激活缓冲 | 行数 `R = kMaxB*kMaxT = 512`（`src/engine/engine.cpp:957` 的 `alloc_act_set`），各阶段按需分配 |
 | KV 池 | 虚拟 USM 预留 + 物理 extent 按需提交（`engine_kvpool.cpp`） |
-| 递归状态 | `d_gdn_state`、`d_conv_state`，每序列一个 slot（`src/engine/engine.h:235`） |
-| 前缀缓存检查点 | `d_pc_states[pc_max_states][pc_state_floats]`（`src/engine/engine.cpp:1900`） |
+| 递归状态 | `d_gdn_state`、`d_conv_state`，每序列一个 slot；slot 轴是 `state_slots_`（`--max-slots`，默认 `kMaxB`）而不是 `kMaxB`——27B 上每卡 1.125 GiB，单流长上下文只需一个 slot（`src/engine/engine.h`） |
+| 前缀缓存检查点 | `d_pc_states[pc_max_states][pc_state_floats]`（`src/engine/engine.cpp:2205`） |
 | MTP 缓冲 | `d_mtp_*`：草稿层的激活、per-token 递归状态快照（`d_mtp_hist_`）、候选集；MTP 开时才有（`src/engine/engine.h:459` 起） |
 | command graph | 单设备：decode 桶 `1/2/4/8/16` + prefill 变体；多设备：每个连续设备段一份 decode 图 + MTP verify 图 |
 
@@ -365,7 +367,7 @@ static——两个 `--layer-map` 设备各有自己的队列，共用一份 scra
 | 常量 | 值 | 含义 |
 |---|---|---|
 | `kMaxT` | 32 | 每行最大 prefill token 数 |
-| `kMaxB` | 16 | 最大并发序列数 |
+| `kMaxB` | 16 | 并发序列数的**硬上限**（`step_info` 行数、block 表、`d_logits`）；实际分配由 `--max-slots` 的 `state_slots_` 决定 |
 | `kMaxRows` | 32 | 每 token 缓冲的最大行数 |
 | `kBlockSize` | 32 | paged KV 块大小（token） |
 | `kI8Q` | 32 | int8/int4 KV 每多少 head dim 一个 scale |
