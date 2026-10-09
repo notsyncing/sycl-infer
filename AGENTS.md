@@ -96,6 +96,16 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSYCL_INFER_AOT=ON -DSYCL_INFER_
 cmake --build build --target sycl-infer -j$(nproc)   # only the binary, not every test
 ```
 
+* **The AOT flags and the library you link must agree.**  Linking the AOT
+  `libsycl_infer_core.a` (built with `-DSYCL_INFER_AOT=ON`, device images baked for
+  `acm-g10`) into a hand-built **JIT** binary compiled without them crashes inside
+  the SYCL runtime, not at link: `SIGSEGV` in
+  `DeviceKernelInfo::setCompileTimeInfoIfNeeded`, reached from
+  `dnnl_gemm::warmup` → `act_quant_launch` while JIT-compiling a kernel whose image
+  came from the AOT archive.  The engine is fine — the AOT `build/sycl-infer` runs
+  the same path to completion — so this reads as an engine bug and is not one.  Build
+  a JIT tool against `build-opencode-jit/libsycl_infer_core.a` (`-Lbuild-opencode-jit`).
+  See *Benchmarking* for the hand-built tools.
 * AOT lowering is the expensive step: `icpx` emits one device image per kernel,
   then `llvm-foreach` runs `ocloc` (IGC) on each.  It happens at the **final
   link of each executable**, so the ~20 test binaries each re-lower the device
@@ -486,952 +496,656 @@ mixable), `--audio-mmproj`, `--max-video-frames`, `--max-video-side`.  Server:
 OpenAI-style `image_url`/`video_url`/`input_audio`/`audio_url` parts in
 `/v1/chat/completions`, streaming and not.
 
-### Multi-token prediction (MTP / NextN) speculative decoding
+### Benchmarking on the 2x A770 box
 
-`--mtp N` drafts up to `N` tokens with the model's own NextN head and verifies
-them against the target in one batched forward, emitting exactly the tokens a
-plain greedy decode would.  Requires a GGUF that bundles the head: the 27B
-reference model has `qwen35.nextn_predict_layers == 1` with `blk.<n_layer>.nextn.*`
-(`eh_proj`, `enorm`, `hnorm`, `attn_norm`, q/k/v/wo/ffn, optional
-`shared_head_norm`/`shared_head_head`); the 0.8B has none, so `--mtp` there is a
-no-op.  **The second hard requirement is a multi-device oneDNN int8 partition**:
-`engine`'s constructor drops the path with `[mtp] MTP needs a multi-device oneDNN
-int8 partition (single device) - disabled` unless `multi_dev && md_xmx`
-(`src/engine/engine.cpp`), i.e. a `--layer-map` whose GPU partitions have
-`setup_md_dnnl()` weights (`PF_DP4A` on).  A single-device `--mtp 4` is
-therefore a silent no-op on the 0.8B *and* on a 27B that fits one card, and the
-draft length is clamped to 12 (`n = k+1 <= kMaxB`, the `d_logits` / `step_info`
-bound).  The MTP layer is a full-attention Qwen3.5 block, so it owns one extra
-attention KV slice (`attn_layers() - 1`) in the same paged pool and is counted in
-`--kv-cap-mb` and by all three prefix-cache tiers.
+Everything in the two drafter sections below, and the throughput table in
+[README.md](README.md), was measured on `bench-host` (two Arc A770 16 GB,
+`--layer-map 0-31:gpu.0,32-63:gpu.1`, i8 KV, AOT Release, ctx 131072,
+`PF_PREFIX_CACHE=0`).  Five things about that setup are not obvious and each one
+silently produces a wrong number rather than an error.
 
-Semantics, all required for the emitted stream to stay bit-equal to a plain
-greedy decode.  **Caveat (measured):** on the 27B it does not always stay
-bit-equal - a ~130-token generation on one prompt diverges from the plain
-decode from token 11 on, in both draft-head variants and with
-`PF_MTP_NOACCEPT=1`, `PF_MTP_NORB=1` and `k=1` (so it is the verify/rollback
-state, not the draft quality); other prompts are byte-identical.  Treat the
-stream as *greedy-equivalent in intent* but not byte-guaranteed until that is
-tracked down.  The pieces:
+* **Verify the remote is running the code you think it is.**  The box is a source
+  snapshot without git, synced file-by-file, so it drifts: a benchmark run against a
+  stale `server.cpp` measures the previous revision.  `md5sum -c` a manifest of
+  `src`/`tests`/`CMakeLists.txt` over ssh before trusting any number, and rebuild
+  after syncing (`find src tests -name '*.cpp' -o -name '*.h' | xargs touch`, because
+  rsync preserves mtimes and make will otherwise skip the recompile — which once
+  had me reading a stale binary's output as a result).
+* **`llama-benchy` needs `--tokenizer Qwen/Qwen3.8-27B`, and only `https_proxy`.**
+  The model *id* the server reports is `Qwen3.8-27B`, but that is not a Hub repo id;
+  asking for it 401s and then burns minutes in a retry loop with the GPU idle.  Set
+  `https_proxy=http://proxy.internal:8118` for the tokenizer fetch and **do not set
+  `http_proxy`** — the endpoint under test is `http://127.0.0.1:<port>` and a proxy
+  in front of a loopback request is how a local benchmark ends up measuring an
+  error page.  Also `PYTHONUNBUFFERED=1` and `--emit-progress <path.jsonl>`, because
+  with stdout redirected python block-buffers and a multi-depth run looks hung.
+* **`llama-benchy`'s own `pp512` column is wrong at depth > 0 and must not be
+  quoted.**  It reports 73 830 tok/s at 16k and 235 563 tok/s at 64k because it
+  divides the prompt length by `ttfr` — the time to the first streamed SSE chunk,
+  which the server sends *before* the prefill runs.  On one request `ttfr` (0.26 s)
+  and `e2e_ttft` (19.5 s) differ by 75x.  Its `est_ppt` column is not the answer
+  either: 234 ms at 16k and 281 ms at 64k, essentially flat, when a real 512-token
+  chunk over a 64k KV cannot cost less than one over a 16k KV.  **The only
+  prefill number that survives at depth > 0 is `prompt_tokens / e2e_ttft`**, and at
+  depth 0 the isolated prefill is the `est_ppt` cell (nothing else in flight).
+* **A plain-decode baseline measured as wall clock includes the model load.**  The
+  27B takes ~80 s to load, so timing a 128-token `gen` end to end gives ~690
+  ms/token — a 10x error that still "looks like a number".  Difference two runs
+  instead: `wall(N+128) - wall(N)` is exactly 128 decode tokens with the load, the
+  `madvise(MADV_DONTNEED)` page-out and the prefill shared.  (Differencing beats
+  subtracting a 1-token run: it keeps load-time jitter out instead of dividing it by
+  the token count.)  The baseline itself is prompt-independent within noise —
+  67.2 / 67.3 / 70.7 ms/token on three prompts.
+* **One process per cell, and run the heavy things serially.**  A prefix-cache hit
+  inside one process moves the acceptance enough to change the ranking (1.9 cold vs
+  2.8 warm), and stacking two GPU jobs on this box makes a card drop out with
+  `UR_RESULT_ERROR_DEVICE_LOST`, which looks exactly like a code regression.  Also
+  `set -u` / `set -e` must come **after** `source /opt/intel/oneapi/setvars.sh`,
+  which dereferences unset variables, and a backgrounded server needs `setsid` (not
+  just `nohup`) or the ssh session's process-group teardown SIGTERMs it — the log then
+  shows a clean `[srv] shutting down` and you lose a minute of model loading.
 
-* the head consumes the trunk hidden **before** `output_norm` (`t_h_pre_norm`)
-  and applies its own `enorm`/`hnorm`; a draft row pairs `emb(t_p)` with
-  `h_{p-1}`, matching llama.cpp's right-shift;
-* the verify is one batched forward of `[last_committed, draft0..draft_{k-1}]`
-  at consecutive positions, and acceptance is `target_argmax(row i) == draft[i]`
-  plus a bonus token from row `j`;
-* the verify is **dry** (`step_info::mtp_dry`): it computes the forward but does
-  not write the GDN/conv state, and it snapshots the per-token state into
-  `d_mtp_hist_` so the commit rewinds the recurrent state to the last accepted
-  row (llama.cpp's `n_rs_seq`); the conv window is rebuilt from the raw taps
-  saved in `d_mtp_qsave_`;
-* the prefix cache is supported: `generate_mtp` calls `pc_admit` for the prompt
-  (which restores the matched chain's KV *and* recurrent state), then commits
-  **after each completed prefill batch and its MTP-layer KV writes**.  The order
-  is load-bearing: `pc_commit` advances `pc_slot_[0].registered`, which the
-  next batch's `pc_capture_begin` checks against `pos0`; committing before a
-  batch captures nothing, whereas committing only after a multi-batch prompt
-  discards the earlier pending checkpoints.  Measured on the 27B / 2x A770
-  with `--mtp 4 gen --temp 0` (~90-token prompt): moving the commit after the
-  prefill moved the exit stats from `nodes=2 (with state 0) ... captured=0` to
-  `nodes=2 (with state 2) ... captured=2`.  A greedy CLI `gen` routed through
-  `generate_mtp` does reach this path, as does the server's `mtp_direct`
-  (`PF_MTP_SERVER=1`); ordinary `gen` does not use the prefix cache.
+Two measurement traps that cost real time and are worth stating once:
 
-The path is opt-in (`--mtp 0`/absent is the plain decode) and no longer
-experimental.  On the 27B (2x A770, `--layer-map 0-31:gpu.0,32-63:gpu.1`,
-ctx 4096, k=4) it measures ~37 ms/token internally in a 400-token generation
-(plain decode ~65-68 ms/token wall-clock marginal; the gap between the internal
-and wall MTP numbers is the loop's own host bookkeeping, dominated by the
-argmax over the verify's 7 x 248320-row logits on the host).  `--mtp N` takes
-its length optionally: a bare `--mtp` is k=4, the measured optimum (a sweep
-with the u4 draft head gives k=2/3/4/5/6/8 -> 40.2/38.1/38.1/39.0/40.6/47.6
-ms/token on a technical prompt and k=3/4/6/8 -> 41.1/40.8/43.1/52.7 on another;
-each extra draft costs ~5.4 ms and each extra verify row ~5.7 ms, while the
-marginal acceptance past k=4 is only 0.1-0.2).
-The per-cycle split is draft ~39 ms, verify ~108 ms, commit ~2.0 ms, rollback
-~1.5 ms for ~3.3 emitted tokens/cycle.
+* **Do not merge a diagnostic stream into the generated text.**  `2>&1` interleaves
+  `[dflash] time:` lines *into* the output mid-token, which made a byte-comparison
+  report a spurious DIFFERS.  Separate the streams when comparing streams.
+* **A speedup is a ratio, so both sides need the same shape.**  Measuring the
+  baseline through the server and the drafter through the CLI compares a graphed
+  decode against an ungraphed one.
 
-The verify is the whole cost.  `nat_gemm_launch` (`w4_gemv.cpp`) is a batched
-native-width GEMM (u4/k5/cb4/grouped int8) for M = 2..13 that stages the K-tile's
-activations in SLM once per workgroup, so the weight stream is read once for all
-M rows; it runs the whole scale/offset/residual epilogue in the same kernel and
-takes over `gemm_w4`/`gemm` for M <= 13.  That took the verify from 196 to 147 ms
-and let `--mtp N` keep the native q5/cb4 stores (it no longer forces
-`PF_CB4=0`/`PF_K5=0`).
-
-The largest single win was a loop-order change, and the reason is worth stating
-because it is invisible in the source: with the **c-outer / m-inner** order
-(loop over the C columns a sub-group owns, then over the M rows) IGC scalarises
-the whole inner loop - the IGC asm contains **zero `dp4a`** and the kernel runs
-at 106 GB/s.  Reordering to **m-outer / c-inner** (load one row's activation
-group once, then run the 8 `dp4a` for every column against it) makes IGC emit
-336 `dp4a` in the asm and the kernel jumps to **221 GB/s** (u4, M=7,
-K=5120, N=17408: 0.421 -> 0.200 ms, 2.08x; k5 0.342 -> 0.237, cb4 0.380 ->
-0.258, int8 0.370 -> 0.276).  The winning shape is `C=2, KT=32, SG=8, TX=128,
-TREE=1, VECST=1, VECA=1`, all bit-exact against the M=1 GEMVs.  Other things
-that were load-bearing: SIMD8 sub-groups (a SIMD16/SIMD32 float costs 2/4 GRFs,
-so the M*C accumulator set spilled 18-23 KB/thread to scratch); staging the
-activation and the scale/offset tiles with 16-byte copies rather than byte
-loops; and the SLM activation stride - 48 bytes pushes M >= 8 over the register
-cliff, so `APAD` is 32 except for u4 at M >= 12 (measured: M=8 u4 0.360 ->
-0.240, M=12 k5 0.685 -> 0.497, cb4 0.639 -> 0.426, int8 0.583 -> 0.398).  C=4/8
-in any order, a larger `TX` (a bigger workgroup is slower, and the extra RB does
-not help because the staged activation is L2-resident), and the c-outer order
-all lose.
-
-**Do not software-pipeline this kernel - both forms measured a loss, and the
-reason generalises.**  The K-tile loop is strictly load -> barrier -> compute ->
-barrier, and the weight dwords are read from global *inside* the compute phase, so
-there is a real exposed-latency story here.  Two pipelines were implemented and
-verified bit-exact (identical acceptance), both slower on the 27B / 2x A770
-verify at M=6:
-
-    form                          verify      draft     (vs 91.6 / 28.1 ms baseline)
-    none (shipped)                91.6 ms    28.1 ms
-    SLM double buffer             117.1      30.2      +28 % / +7 %
-    register prefetch, 1 group    107.6      31.4      +17 % / +12 %
-    no activation SLM (DIRECT=1)   96.3       31.7      +5 % / +13 %
-
-The SLM version doubles `act_s` (M=6: 6 -> 12 KB, ~21 KB per work-group with
-`sc_s`/`of_s`); the register version adds `pw[2][C]` (16 uint32) on top of
-`acc[M*C]` and the existing `wl`/`wh`.  **Both trade directly against occupancy,
-and this kernel is occupancy-bound - the same pressure documented above, where a
-SIMD16 sub-group spilled 18-23 KB/thread.**  Worse, the register form is
-redundant: the gt loop already carries `#pragma unroll 2`, so the compiler is
-already free to hoist iteration *i+1*'s loads across iteration *i*'s dp4a;
-hand-rolling it on top of what the compiler already extracted is pure loss.
-
-The third row is the interesting one, because it was the most promising idea of
-the three.  `nat_gemm` reaches 223 GB/s at M=7 where the M=1 GEMV reaches 294 on
-the *same weights*, and the M=1 path needs no activation staging at all - so the
-gap looked like `act_s`'s ~7 KB.  Setting `NAT_DIRECT=1` reads the quantized
-activation straight from global and shrinks `act_s` to 1 byte (the
-`local_accessor` *size* is what counts against the SLM budget whether or not it
-is touched), taking ~8.5 KB of SLM down to `sc_s`+`of_s`'s 4 KB for ~0.2 % more
-traffic.  It still loses: staging turns 24 dependent global loads per thread
-into 24 register reads, and putting them back on dp4a's dependency chain costs
-more than the occupancy buys.  **The activation staging is not overhead; it is
-earning its keep.**
-
-**So `nat_gemm` is at a local optimum at M ~ 7**: three changes touching SLM,
-registers and SLM footprint all lost, each one trading a resource the kernel had
-already balanced against another.  Do not attempt a fourth.  **The right mental
-model is that occupancy IS the latency hiding here** - many concurrent warps
-cover one warp's load latency - so spending SLM or registers on single-warp
-overlap buys much less than spending them on more concurrency, and the M=1
-GEMV's 294 GB/s belongs to a different blocking (no C dimension) that may simply
-not generalise to M > 1.  To make the verify faster, cut weight bytes (the u4
-per-32 offset plane is 20 % of them) or change the execution unit (DPAS,
-measured hopeless on this part), not the schedule.
-
-After the reorder the kernel is within ~1.3-1.5x of the M=1 GEMV's rate
-(measured M=7, K=5120, N=17408: u4 223 GB/s, k5 188, cb4 173, int8 323, against
-the M=1 GEMV's 294/249/261/364).  On *true* per-format traffic (weight plane +
-fifth-bit/index plane + the per-32 f16 scale/offset planes: u4 0.625, k5 0.75,
-cb4 0.5625 B/weight) k5 already matches u4's ~280 GB/s and only reads 20% more
-bytes; cb4 is at ~195 GB/s and is decode-issue bound - its codebook LUT decode
-(16 `lt16` lookups + shifts/ORs per operand set) is the whole excess, and a
-256-entry uint32 table, a pre-biased codebook and pre-shifted LUTs all measured
-worse.  The remaining bound is the combined weight + scale +
-offset stream and its latency, not raw issue throughput: the grouped per-32
-scale/offset planes are 11.2 MB of the ~66 MB moved per pass.  OneDNN's own
-grouped-scale int8 kernel measures 154-214 GB/s on this box, so the dp4a kernel
-is already at or above the best grouped-scale rate oneDNN achieves.
-
-**The dp4a ceiling, and why MTP tops out at ~2x.**  This is the number that
-bounds every speculative-decoding effort on this hardware, so record it before
-re-litigating the kernel.  Measured on one A770 (Iris Xe-LP-class DG2):
-
-* stream rate: **~376 GB/s** measured (`bw_probe`), i.e. the MIG ceiling for a
-  pure read stream.  The M=1 GEMVs reach 294 (u4), 249 (k5), 261 (cb4) and 364
-  GB/s (int8) of true per-format traffic; `nat_gemm_launch` reaches 323 GB/s on
-  int8 at M=7, and oneDNN's own grouped-scale int8 kernel only 154-214 GB/s.
-* dp4a throughput: ~4.9 T-MAC/s (oneDNN plain int8 M=8, 307 GB/s at 1 byte/weight
-  -> 307e9 dp4a/s, x16 MAC each).  The Xe-cores' int8 ALU peak is far above this,
-  but nothing here is ALU-limited.
-* **arithmetic intensity of the memory system**: 4.9e12 MAC/s / 376e9 B/s =
-  **~13 MAC/byte**.  Compare a tensor-core card at 20-30x that.
-
-The consequence is the batched-GEMM critical batch size.  A weight-streamed
-GEMM reads W bytes and does M*N*K MAC; at the M where the MAC rate stops hiding
-the stream, `M* = peak_MAC / BW_per_element`.  With the u4 store's 0.625 B/weight
-(4 bits + per-32 f16 step + offset) and the rate the *real* kernel achieves
-(**7.6 T-MAC/s** on the verify's marginal rows, which is 1.5-2.2x what
-`dev/bench_dp4a_peak.cpp` measures with register-resident operands - that
-microbenchmark is a lower bound, and any M\* taken from it is too small),
-`M* ~= 0.625 x 7.6e12 / 405e9 = ` **~12**, not the 6.4 the older 4.9 T-MAC/s figure
-gave.  Below M* the kernel is memory bound and extra rows are nearly free; above it
-each row costs real time.  For reference, the equivalent DPAS crossover is
-`0.625 x 78.8e12 / 405e9 = ` **~122**, so an XMX/DPAS unit only wins for
-**M in [12, 122]** - and `kMaxB = 16` caps every batched forward in the engine at
-M = 16, the first shape inside that window.  **Corrected after the whole-pass M
-sweep** (`dev/bench_wpass.cpp` over the real 497-call list): the pass is
-`53.93 ms of streaming + (M-1) x 3.67 ms of dp4a` (M=5 68.6, M=8 89.2, M=12 166.6),
-so the extra rows are *additive* pure compute at **7.1 T-MAC/s - the rate the real
-kernel achieves** - and DPAS's register-resident 78.8 is **11x** that.  The
-earlier "only ~3.5 ms of the marginal is dp4a" came from the *isolated* per-shape
-table and was low by ~4x; `dev/bench_dp4a_peak.cpp`'s 3.50/4.92 understate the
-kernel by 1.4-2x.  **A DPAS verify kernel is the right target in principle** (its
-arithmetic term is 14.7 ms at M=5 (u4/k5 is 52 % of the bytes, so ~8 ms of it),
-35.3 ms at M=8, 112 ms at M=12, and it grows with M) **but it is measured 37x
-slower than `nat_gemm` in a real GEMM**, so it needs another 37x on top of a
-register/occupancy redesign before it is worth anything.  The cb4 codebook LUT
-(30 % of the bytes) still cannot use a u4 DPAS operand and int8 (18 %) would need
-the s8 path (measured 1/16 the u4 rate).  Also note dp4a is *not* a hardware unit on
-Xe-LP: a measured fp32 FMA peak of ~5.0 T-FMA/s (`dev/alu_probe2.cpp`; the older
-`alu_probe.cpp` is dead - the compiler folds its loop and it reports 1.5 PFLOP/s)
-puts dp4a's 3.5-4.9 T-MAC/s at 70-98 % of the vector ALU, so DPAS is a genuinely
-separate ~16x unit.
-
-Both paths are memory bound and both read the same ~16.3 GB of weights per unit
-of work, so the only lever left is **tokens per weight pass**, and that is capped
-by the text's own information content, not by the kernel: 4 greedy draft tokens
-from a 27B model carry only ~3.1-3.3 tokens of accepted prefix (measured acc
-2.1-2.8 drafts + the bonus).  Hence
-
-    ceiling ~= 3.3 tokens/cycle x (weight-pass share of the cycle) ~= 2x
-
-and no amount of kernel work moves it; only a higher arithmetic-intensity
-execution unit (tensor cores / XMX) changes the constant.  That is why the GPU
-path stays dp4a and why the remaining work must go at XMX, below.
-
-**XMX / DPAS: re-examined and rejected on measured grounds.**  The earlier
-rejection rested on "DPAS K is fixed at 32 = our group width, so the accumulator
-must be drained per group", and on `joint_matrix`'s DG2 constraints (int8 only,
-M<=8, N==8, K==32, sub-group 8).  Both premises turned out to be narrower than
-stated - the *native* `esimd::dpas` intrinsic takes a **u4** weight operand with
-**K=64**, i.e. exactly two 32-wide quantisation groups chained without a drain -
-so the idea was re-implemented and re-measured end to end.  It still loses, by a
-wide margin, for a different and more fundamental reason.
-
-What is real (measured on the A770, `/tmp/kilo/dpas_*.cpp`, `xmx_*.cpp`):
-
-* `esimd::dpas<8,8,int32_t,int32_t,uint32_t,uint32_t,u4,s8,64,32,64>` exists and
-  is bit-exact for a per-32 u4 weight stream against a scalar reference
-  (0/64 and 0/200 mismatches on two probes).  The operand layouts were
-  calibrated: A (s8 activations) row m -> dwords [m*8,m*8+8) with 4 k per dword
-  (plain VNNI); B (u4 weights) pair (k,n) -> dword (k/8)*8+n, nibble k%8.  The
-  nibble *order* already matches the existing u4 plane, so adopting it is a
-  one-time dword reorder of the same 44.6 MB.
-* raw throughput, operands held in registers: **s8 (K=32) 16.2, u8 (K=32) 127.2,
-  u4 (K=64) 254.1 T-MAC/s**.  Note `s8` is 16x slower than `u4`/`u8` - the Xe
-  XMX presumably lacks a native signed-8 path.
-* the same DPAS loop measured **inside a real GEMM** (M=7, K=5120, N=17408,
-  operands streamed from memory, several accumulator/BIAS variants tried):
-  **0.06 T-MAC/s**, i.e. **255 ns per dpas against a 16 ns budget - 4527x below
-  the intuition, and 55x slower than the whole dp4a GEMM (11.1 vs 0.200 ms)**.
-
-The cause is the operand feed, not the memory system and not the dpas unit:
-the full B plane streams in 0.28 ms (158 GB/s) and re-reading A costs 0.39 ms,
-but the kernel's dpas issue slot is consumed by *building* the A and B SIMD
-vectors from memory for every single dpas (384 B per dpas, 16.7 MB total - which
-would take 0.056 ms at stream rate).  The microbenchmark hides this because its
-operands are loop-invariant registers; the real kernel rebuilds them, and the
-dependency/issue cost lands entirely on the 8x8x64 dpas.  Independent
-accumulator chains (4-way) made it *worse* (13-16 ms), so it is not accumulator
-latency either - it is the per-dpas operand assembly.  Getting around that needs
-operand reuse across many dpas (a much larger M or N tile held in registers),
-which is exactly what the M<=8 (one row tile at M=7) MTP verify shape cannot
-give: with M=7 there is a single 8-row tile, so every work-group must rebuild A.
-
-The older drain-per-group measurement (per-32 format ~2.3x slower than a plain
-int8 GEMM, 0.276 -> 0.640 ms at M=8) is consistent with this: widening the group
-to 128 to let four DPAS chain would help the drain cost, but the accuracy study
-measured per-128 u4 at 9.9-10.2% relative L2 weight error against 0.077% for the
-native per-32 store (131-524x worse), so it is not admissible anyway.
-
-**`nat_gemm_launch` cannot serve prefill, and it is a hard limit, not a missing
-instantiation.**  `nat_gemm_impl` stages the call's whole 32-group activation tile in
-SLM (`local_accessor<int8_t,1> act_s((size_t)M * KT * APAD, h)`, `KT=32`), i.e. `M x 1024`
-bytes: with `APAD=32` that caps it at M ~ 56 rows and with the `APAD=48` the u4 path
-prefers at M >= 12, M ~ 37 - against DG2's 64 KB of SLM per work-group.  **Prefill's GEMM
-M is the total token count** (`rows` in `record_forward`, `tbm = (mode == 2 && !single) ?
-rows : tb`), so a 512-token prompt is *one* mode-2 forward at M=512, and `batched_prefill_fit`
-takes the whole remainder up to `kMaxB*kMaxT`.  On the main configuration (oneDNN on,
-multi-device with a GPU partition) prefill is therefore always mode 2, mode 1's M=kMaxT=32
-chunks are never used, and no prefill call lands inside nat_gemm's M <= 13 window.  Turning
-on the even/odd activation split for prefill would only buy short prompts (< 13 tokens).
-
-**What prefill actually costs, measured on the 27B / 2x A770** (`llama-benchy 0.4.0`,
-`--pp 512 --tg 128 --depth 0 --runs 3 --exact-tg`, `PF_PREFIX_CACHE=0`): **pp512
-2870 t/s** (ttft 187 ms, e2e_ttft 1286 ms) and **tg128 14.63 t/s** - note the depth-0 pp
-number is ~3x the 911 t/s at depth 16k the attention work adds below.  512 tokens in
-178 ms against 24.5 GB of *int8* weight bytes is ~138 GB/s effective, i.e. **~35 % of the
-card's read ceiling**, so prefill is not purely weight-bound; oneDNN's grouped-scale int8
-matmul is doing real work here (its own ceiling on this box measures 154-323 GB/s).
-Replaying the same 497-call list with the production dp4a launchers instead would cost
-~1.93 s at M=512 (53.93 ms + 511 x 3.67 ms), i.e. **oneDNN is ~11x better than dp4a at
-this M**, which is why prefill needs a *blocked large-M* kernel and neither nat_gemm
-(M-capped) nor dp4a is the answer.  The one remaining prefill lever is a native-u4 large-M
-GEMM - 24.5 GB of int8 weight bytes against 17.5 GB native, so at most -29 % of the
-weight traffic, on top of whatever oneDNN's own efficiency leaves - and no env knob
-measures it today (`PF_W4`, `PF_CB4` and `PF_K5` all leave prefill on the int8 `wmem`,
-because the native stores only win where the activation's `split` form is set, i.e. decode and
-the MTP verify).
-
-**The dp4a path stays, and a DPAS verify kernel is now measured not to work.**  The
-operand-assembly problem was a *how*, not a *whether*: re-ordering the u4 plane once at
-load into the DPAS B layout and staging the A tile once per work-group turns ~260
-instructions of per-dpas assembly into ~5-6.  `dev/bench_dpas_gemm.cpp` does exactly that
-with **ESIMD `gather`** and the GEMM is now **numerically exact** - rel 5.26e-07 at the real
-verify shape (K=5120, N=17408, M=5) and **all 2560 dpas values exact across all 160 groups**
-- and it is still **7.44 ms against `nat_gemm`'s 0.200 ms, i.e. 37x slower**.  The old
-"groups >= 1 are wrong" was a byte/dword factor-4 error in the B base pointer (and the same
-bug in the probe's `ref_at`), now fixed; the register-resident 78.8 T-MAC/s simply does not
-survive a real GEMM here.  Where the time goes is measured, and it is *not* the epilogue
-(`NOEPI=1` is a no-op) and *not* the arithmetic: **K-split regresses exactly linearly**
-(KSPLIT 1/2/4/8/16/32 -> 7.69/14.80/28.92/57.10/112.82/231.73 ms), so the cost is
-proportional to the **work-group count** - ~6-14 us per work-group, growing with `NT`, i.e.
-building the two 64/32-element cross-lane **offset vectors** (a runtime element write or a
-union'd array write into a cross-lane simd is serialised through local memory) plus spilling
-the `NT x 8 x 8` accumulators.  `NT` sweep: 1/2/4/8 -> 13.27/9.16/**7.44**/8.93 ms.
-**Three ways to build the offsets that do not work, do not retry them:** an initialiser list
-(`esimd::simd<int,64>{0,4,8,...}`) has no matching constructor at either length; the
-`VS`-blocked `gather<VS>(p, simd<OffsetT, N/VS>)` overloads (which would need only 8 or 4
-offsets) require a **`simd_view`** pass-through argument; and there is no `(start, step)` /
-iota constructor and no identity-`offsets` helper (the `offsets` in `memory.hpp` are gather
-*masks*).  A working kernel needs a group-major activation tile plus one of those, and must
-stop holding 4 tiles of accumulators live - so it has to find another 37x, and the M=1
-decode it would nominally serve is 1/8 of the dpas work.
-**The plumbing works - the earlier "the toolchain blocks it" reading was an artefact
-of the test** (harnesses `dev/dpas_plumb.cpp` +
-`dev/dpas_data_probe.cpp` + `dev/bench_dpas_gemm.cpp`).  `esimd::gather` into a
-cross-lane operand, `block_store` out of one and per-element access with a *runtime*
-index all round-trip real memory data with 0/64 errors; the function they share
-(`simd_obj_impl::data()`, `__esimd_vload(&M_data)` on device) is fine here.  What is
-actually broken is **reading results back through SLM**: `copy_to(local_accessor)` plus
-a scalar SLM loop returns zero for even a plain scalar round trip in the 32-lane
-configuration, which is what made every earlier probe - including the previous
-session's 0.06 T-MAC/s one - look like it was never computing anything.  Use
-`block_store` to global (or per-lane scalar stores) to read results out, never SLM.
-Real constraints, each measured: `esimd::gather` needs **compile-time** offsets (runtime
-offsets return zero, so a GEMM must template on the activation row stride); cross-lane
-vectors assume a **32-thread block** (a 8-warp work-group produces zeros, `W=1` is
-required); `block_store` is block-cooperative so guarding it to one warp stores nothing.
-`src/common/dp4a.h` remains the pattern to imitate for anything esimd cannot express.
-(`dev/bench_wpass.cpp` also had a
-host-side out-of-bounds read in its activation pattern fill that glibc reported much
-later as `double free or corruption (out)`; fixed, and its M sweep is what corrected
-the XMX verdict.)
-
-**Refined later.**  Both halves of that
-conclusion were re-measured and one is wrong for a fixable reason.  (a) The
-*hardware* verdict holds and the number behind it is
-`dev/bench_dp4a_peak.cpp`: with register-resident operands dp4a reaches
-3.50 T-MAC/s, the real u4 decode inner loop 4.92, and `dpas<8,8,...,u4/s8,64>`
-**78.8** - so DPAS is 16-24x, and the verify's marginal rows (3.6 ms/row at
-~7.6 T-MAC/s) really are dp4a-bound.  (b) The 0.06 T-MAC/s in-GEMM number is a
-*kernel* artifact, not a shape limit: the probe rebuilt A from DRAM with 256
-scalar byte loads per dpas and B with 32 strided scalar dword loads
-(`/tmp/kilo/xmx_rate3.cpp`); a weight plane re-ordered once at load into the DPAS
-B layout plus an SLM-staged A tile is ~5-6 instructions per dpas, and `M=8`
-padding would give the dpas a full register-resident A tile without changing the
-verify's shape.  What *does* survive is the cost/benefit: on this model only
-~3.5 ms of the 14.25 ms marginal GEMM cost is u4/k5 dp4a issue - 3.84 ms is the
-96 tiny `ssm_alpha`/`ssm_beta` GEMVs (2 workgroups each, pure launch latency) and
-4.2 ms is the cb4 codebook LUT, which cannot be a u4 DPAS operand at all.  So a
-DPAS verify kernel is worth ~3 ms of a 116 ms cycle here, and would only become
-the dominant term on a model whose weights are mostly u4, or with a longer draft
-chain (where each extra verify row is another full weight pass's worth of
-compute).
-
-With the verify at a hypothetical one-decode-pass cost and free drafts the
-ceiling is ~2x (verify >= 1 weight pass + ~3.3 ms/row of attention/GDN/norm).
-
-**MTP is a short-context win only.**  Measured on the 27B / 2x A770 with
-`llama-benchy 0.4.0` (`--pp 512 --tg 128 --exact-tg --skip-coherence`, chat
-completions vs `serve`, `PF_PREFIX_CACHE=0`, i8 KV, merged into the server by
-routing greedy single requests to `engine::generate` - see `mtp_direct` in
-`server.cpp`), plain scheduler vs MTP (`temperature=1` vs `0`):
-
-| test | plain | MTP (before fixes) | MTP (now) |
-|---|---:|---:|---:|
-| pp512 (d0) | 2.49k t/s | 2325 | 2526 |
-| tg128 (d0) | 14.5-14.6 | 6.51 | 16.18 |
-| tg128 (d64k) | 8.0 | 0.94 | 2.26 |
-| tg128 (d128k) | 5.5 | 0.32 | 1.13 |
-| e2e_ttft (d64k) | 115 s | 697 | 169 |
-| e2e_ttft (d128k) | 312 s | 1472 | 420 |
-
-The 128k t/s is plain-equivalent *within measurement noise* because no token
-generation is involved (the request is a pure prompt load), but the prefill and
-short-context numbers are real: the MTP prompt prefill now batches up to
-`batched_prefill_fit` instead of flushing every 32 tokens, and the draft split
-(3) plus the adaptive k (4) cut the decode cost.
-
-Three separate causes, all measured in the server's `[mtp] time:` line:
-(1) *acceptance* - llama-benchy forces `ignore_eos`, so after the model's own
-EOS the 128 tokens are `<|im_end|>`-spam; the draft agrees with the target's
-greedy token only 0.15-0.85x/cycle there, against 1.8-2.6x on natural prompts
-(the same server measures acc 1.75-2.25 for a technical prompt, and the CLI
-1.88 for the llama-benchy corpus text as a raw continuation).  MTP still pays 6
-drafts + a 7-row verify for ~1.3 tokens.
-(2) *long context multiplies attention*: at 128k the verify (7 rows over 131k
-keys) costs 1390 ms/cycle against 181 ms for a plain decode, i.e. MTP buys a
-~3.5x weight amortization with ~8 decode-equivalents of attention.
-(3) the draft's attention used the *prefill* split ceiling `n_splits`, which
-the `--layer-map` path defaults to **1** (`PF_MD_SPLITS`); one warp per head
-looping over the whole KV made a 1-row draft pass cost 408 ms at 128k.  Fixed:
-`mtp_forward` now derives its own split count from the KV length (the same ~512
-keys per split the prefill uses, capped by `PF_MTP_SPLITS`, default
-`kMaxDecSplits`) instead of taking `n_splits`, and allocates the few hundred KB
-of partials it needs itself.  The draft phase went 2451 -> 35.7 ms/cycle at
-128k (68x, better than the 183 the blanket `PF_MD_SPLITS=1` gave) and is
-*identical* to the old single-split behaviour at short context (a fixed
-256-split grid there measurably degrades the draft: acceptance 1.27 vs 2.29 per
-cycle on a 320-token prompt - the plain decode, which does use the full cap,
-has no acceptance to lose).
-(4) the MTP prompt prefill used to walk the prompt in `kMaxT` chunks, paying a
-`prefill_flush()` plus a host-blocking `memcpy/wait` of `d_mtp_hprev` per 32
-tokens, which serialised the 3-phase multi-device pipeline (e2e_ttft at 131k
-1475 vs 311 s).  Fixed: one `prefill_text()` batch of up to
-`batched_prefill_fit()` tokens, then the MTP layer over its captured hidden in
-`kMaxT`-token pieces (`mtp_forward` also stopped taking the full-plan `n_splits`
-partials for this).  e2e_ttft went 697 -> 169 s at 64k and 1472 -> 420 s at
-128k, and the gradient is now prefill-dominated on both sides.
-`PF_MTP_HEAD_W4` (default on) gives the draft its own lossy u4 copy of the LM
-head, registered under a private key so the *target* keeps its exact int8 head:
-the draft reads the head once per drafted token, so 0.625 vs 1.0625 B/weight
-cuts the draft from 40.7 to 30.5 ms/cycle at k=6 and the acceptance is
-unchanged (acc 2.6 vs 2.6 per cycle over 400 tokens, and within +/-0.15 on four
-other prompts).  `PF_MTP_HEAD_W4=0` keeps the int8 head for the draft; the
-emitted stream is identical either way because the verify never uses it.
-
-`PF_MTP_ADAPT` (default on) shrinks the draft length by one whenever a whole
-cycle accepts nothing and grows it back on a full-acceptance cycle, keeping the
-ceiling at `--mtp` (buffers still cover it) and never changing the emitted
-stream (acceptance ignores k).  Measured: a low-acceptance prompt goes 42.0 ->
-38.7 ms/token, a high-acceptance one auto-raises k to the cap and runs
-27.5 ms/token.
-
-**MTP does not compose with batching, so the server defaults to the
-scheduler.**  A batched decode step measures `59.0 ms + 10.7 ms per row` (fitted
-over N=1/2/4/8 at 70.0/81.6/99.7/145.5 ms), and MTP spends `k+1 = 5` verify rows
-per `acc+1` emitted tokens - at the measured acc 1.49 that is **2.0 rows per
-token against the plain decode's 1.0**.  Both paths pay the same per-row cost,
-so for a fixed row budget plain batching wins as soon as the 59 ms weight pass is
-amortised: modelled `S=1/2/4/8 -> plain 69.7/40.2/25.5/18.1 ms/token vs MTP
-50.4/36.0/28.8/25.1`, i.e. MTP wins only at `S<=2` (1.38x at S=1) and loses from
-S=4 (0.89x) to S=8 (0.72x).  This is the same arithmetic-intensity ceiling from
-the other side: batching amortises the weight pass for free, so paying k+1 rows
-for ~2.5 tokens is strictly worse than paying 1 row per token.
-`server.cpp`'s `mtp_direct` therefore no longer routes greedy requests into the
-single-sequence MTP loop by default - doing so took the engine for the whole
-generation and serialised everything (measured: 8 concurrent greedy 128-token
-requests, 17.5 tok/s with MTP vs 55.0 through the scheduler).  `PF_MTP_SERVER=1`
-restores the old routing for a strictly single-request workload.
-MTP's remaining value is single-request latency: on the server, same prompt,
-same greedy settings, 68.6 -> **45.5 ms/token = 1.51x** (was 58.3 / 1.18x before
-the accept-argmax fix below), and it is strongly prompt-dependent (acc 1.49 on a
-structured "explain attention" prompt against 2.28 on a shorter one).  The lossy
-u4 draft head is not the cause: acc 1.49 (u4) vs 1.51 (exact int8 head), so
-`PF_MTP_HEAD_W4` stays on for the cheaper draft.
-
-**The accept argmax was 24% of the MTP cycle (fixed).**  `mtp_argmax_launch` was
-first written as `parallel_for(range<1>(M))` - one work-item per row - which on
-a 5-row verify means five GPU threads each scanning 248320 floats serially.  It
-measured **33.7 ms/cycle**, more than a third of the timed cycle, and since
-`mtp_verify` ends with `sync_all()` that cost is real GPU occupancy, not a
-hidden sync.  It is now one 256-lane work-group per row with a strided coalesced
-walk and an SLM tree reduction, and the reduction breaks ties to the *lowest*
-index (and so does the per-lane scan) to stay bit-identical to the host's
-`if (v[i] > best)`: **33.7 -> 1.2 ms/cycle (28x)**, verified by
-`PF_MTP_AMCHK` (device vs host argmax, 0 mismatches).  The whole cycle went from
-~138 to ~106 ms and single-request latency 58.3 -> 45.5 ms/token.
-The old host scan is **gone as a knob**: `compute_backend::mtp_argmax` is the only
-entry point (`mtp_argmax.cpp` on the GPU backend, a host loop in
-`cpu_backend.cpp` for an all-`cpu` run), so the device path is what the verify
-uses and `PF_MTP_ARGMAX_CPU` no longer exists.  The ~34 ms/cycle host scan is kept
-only as that dead-end measurement below.
-
-**Where MTP's remaining time is, and the one lever left (measured).**  After the
-argmax fix the cycle is ~104 ms for ~2.48 emitted tokens: draft **13.0**,
-verify **88.3**, commit 0.3, rollback 0.9, emit 1.2, and the loop body is now
-fully accounted for (`cycle-wall` prints a 0.0 ms gap against the phase sum).
-The verify decomposes as `72.2 ms + 4.0 ms per row` (M=1/3/5 -> 72.2/81.6/84.9),
-i.e. its fixed cost is *exactly one plain decode* (72.2 ms = 16.3 GB at the
-format limits) and the 4 extra rows cost 16 ms.  So:
-
-* the **weight stream (72 ms) is at the format limit** - 226 GB/s end to end and
-  ~272 GB/s once the non-GEMM work is removed, against the M=1 GEMV's 274-294 -
-  and XMX cannot beat it (it reads identical bytes);
-* the **draft (13 ms) is ~100% the draft LM head's u4 stream**: 4 steps x 794 MB
-  at the u4 M=1 rate (294 GB/s) = 10.8 ms, confirmed by the head-width A/B
-  (u4 13.0 vs int8 15.0 ms for +0.48 GB/step).  It is also at the format limit;
-* the rollback's device-wide barrier is **not** worth removing: dropping it takes
-  the phase from 3.9 to 0.9 ms/cycle but the wall does not move (8.74 -> 8.76 s
-  for 192 tokens) because the freed time reappears in the draft's first wait -
-  the same "the cost just moves" result as the commit/rollback merge below.  It
-  is kept (byte-identical output over 5 runs, one fewer barrier).
-
-The **only lever left is fewer bytes in the draft readout**.  The draft needs
-just the argmax of the head, but reads all 248320 rows (794 MB) per drafted
-token.  Restricting that to a candidate set - e.g. the previous step's top-N, or
-the verify's own top-N logits, which are already on the host - would read ~0.25 MB
-instead (64 rows), taking the cycle to ~92 ms and the single-request speedup
-from ~1.5x to ~1.9x.  It is a design change with an acceptance risk (the draft's
-argmax is then restricted to the candidate set) and is NOT implemented: it needs
-a gather-GEMV that reads selected u4 head rows, and the same
-"identical stream vs the unconstrained draft" harness to bound the loss.
-
-**Three speculative-decoding ideas that do not pay (all measured).**  The
-engine is memory bound in *both* paths, so the only lever is tokens per weight
-pass; the ceiling is the text's information content, ~3.1-3.3 accepted tokens
-per chain for a 27B model (measured acc 2.1-2.8 drafts + the bonus), which caps
-the speedup at ~2x on this hardware.  Verified dead ends:
-
-* **Taking the MTP layer's own linears to 4 bits** (`PF_MTP_LAYER_W4`).  As first
-  measured it was Q6_K/Q8_0 (338 MB) and the generic per-32 u4 pack cost 2.6%
-  relative L2 on Q6_K (cos 0.9949 on `blk.64.nextn.eh_proj` - 8x the error
-  `PF_W4_ALL` is documented at).  The draft got 3x cheaper (16.9 -> 5.4 ms) but
-  the acceptance collapsed to 0.11 and the net went 36.4 -> 83.4 ms/token.
-  A wrong draft costs the whole verify, so the bytes saved are never worth it.
-  **The 0.11 was a bug, not the precision**: `eh_proj`'s activation was
-  quantized without `do_split=true`, so the u4 GEMV read the *previous* call's
-  even/odd planes (`do_split` rule below).  Fixed, it is **default on** with an
-  unchanged acceptance (2.06 -> 0.875 B/w, -1.4 ms/cycle).
-* **Moving the verify's accept argmax onto the device** (`mtp_argmax.cpp` +
-  `compute_backend::mtp_argmax`).  This
-  removes a real 7 MB/cycle host copy, but it is *not* a speedup: 200.2/199.8 s
-  (host) against 199.8/200.1 s (device) for 2000 tokens, with identical user+sys
-  CPU time.  The transfer was never on the critical path - the verify's own sync
-  dominates and the copy overlaps the next draft.  Kept for the lower host work
-  and bit-identical output, not for t/s (and the device form became the only
-  path - see the accept-argmax fix above).
-* **Removing the commit/rollback syncs.**  `commit` measured 4.0 ms and looked
-  like pure overhead, but it is one device-wide barrier per cycle: merging it
-  into the rollback's just moves the cost (commit 4.0 -> 0.3, rb 1.5 -> 4.0, net
-  unchanged at 36.2 vs 36.4 ms/token).  The barrier itself is the cost.
-
-Diagnostics (all env-gated, `0`/unset = off unless noted): `PF_MTP` (draft
-length, `--mtp` overrides), `PF_MTP_LAYER_W4`, `PF_MTP_AMCHK`,
-`PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms), `PF_MTP_SUBMIT`,
-`PF_MTP_DEBUG`/`PF_MTP_DUMP`, `PF_MTP_VERIFY_PAD`/`PF_MTP_VERIFY_M32` (pad the
-verify's GEMM M), `PF_MTP_VERIFYN`, `PF_MTP_DECCHK` (verify row 0 vs a plain
-decode of the same token), `PF_MTP_LSTAT`, `PF_MTP_DECODE_H`, `PF_MTP_NOACCEPT`,
-`PF_MTP_NOMTPFWD`, `PF_MTP_NORB`, `PF_MTP_NORBSYNC`, `PF_MTP_FORCE_INT8` (restore
-the old int8-only verify stores).  Batch-GEMM knobs: `PF_NAT` (`0` disables
-`nat_gemm_launch` and falls back to the oneDNN grouped-scale matmul + epilogue),
-`PF_MTP_SPLITS` (the MTP draft's key-split cap, default `kMaxDecSplits`; `1`
-restores the old single-split draft),
-`PF_W4_GEMM_MAXM` (default 1 = the oneDNN matmul; 2..8 routes the u4 tensors to
-`w4_gemm_launch` for the legacy path), `PF_W4_GEMM_U` (accumulator sets),
-`PF_W4_GEMM_TN` (0 = row-expanded, 2/3/4 = the tiled experiments),
-`PF_DNNL_BLOCKED`.  `dev/bench_natgemm.cpp` benchmarks the batched GEMM against a
-scalar reference and the M=1 GEMVs.  Candidate-restricted draft head
-(`PF_MTP_CAND`=candidate cap, `PF_MTP_CANDM`=logit margin, `PF_MTP_CANDSRC`
-=1 seed the set from the draft's own first step, 0 from the verify's bonus row,
-`PF_MTP_CANDDBG`=1 print the per-step hit rate, `PF_MTP_CANDV`=1 also return the
-chosen logit): **default off, and it should stay off** - see below.  The narrow
-int8 call-group fusion is `PF_NOFUSE`=1 to turn it off, `PF_FUSEDBG`=1 to trace
-it (see the fused-GEMV note below).
-
-**The 3x question, measured (27B / 2x A770, single-request CLI, greedy).**  The
-speedup is
-`speedup = n * T_plain / (T_plain + X)` with `n = 1 + accepted drafts` and `X` the
-cycle-only cost, so it is **bounded by the acceptance**, and the acceptance is a
-property of the MTP layer rather than of the engine:
-
-| prompt | k | acc | cycle | ms/token | speedup | ceiling (=n) |
-|---|---:|---:|---:|---:|---:|---:|
-| technical explanation | 4 | 1.64 | 115.7 ms | 43.4 | 1.67x | 2.64x |
-| story opener | 4 | 1.35 | 115.0 | 48.4 | 1.50x | 2.35x |
-| code continuation | 6 | 2.81 | 136.6 | 35.5 | **2.04x** | 3.81x |
-
-against a non-graphed plain decode step of **72.5 ms** (13.8 t/s; the graphed
-scheduler decode is 68.6 ms).  **3x is not reachable here**: it needs acc >= 2.2
-*and* X <= 8 ms, while X is 43 ms and its floor is ~20 ms.  The three things that
-make the numbers what they are:
-
-* **One weight pass is 17.54 GB in 497 GEMV calls and costs 54 ms at 325 GB/s**
-  (80 % of the card's 405 GB/s read ceiling), measured by replaying the real
-  per-step list with the production launchers - `dev/bench_wpass.cpp` with
-  `dev/wpass_list.py` (its per-format counts match the engine's load-time weight
-  report exactly).  Per-call overhead is 7.1 us, so the ~500 launches are not the
-  problem.  `M=3/5/7` cost 60.98/68.29/78.64 ms, i.e. **3.6 ms per extra verify
-  row**, which at 27.5 G MAC/row is ~7.6 T-MAC/s - at the scalar dp4a issue rate,
-  so the marginal rows are compute bound, not bandwidth bound.
-* **XMX/DPAS is 16-24x the dp4a issue rate** (register-resident, measured by
-  `dev/bench_dp4a_peak.cpp`: dp4a 3.50 T-MAC/s, dp4a+u4-nibble-decode 4.92, DPAS
-  u4 K=64 **78.8**), so it *is* the right tool for the verify's marginal rows and
-  the earlier "XMX cannot help" conclusion stands only for this model's weight
-  mix: of the 14.25 ms marginal GEMM cost only ~3.5 ms is u4/k5 dp4a issue, 3.84
-  ms is the 96 tiny `ssm_alpha`/`ssm_beta` GEMVs (2 workgroups each - launch
-  latency, no arithmetic unit fixes that) and 4.2 ms is the cb4 codebook LUT,
-  which **cannot** be a DPAS u4 operand (16 arbitrary int8 values vs values 0-15).
-  The previous session's in-GEMM DPAS number (0.06 T-MAC/s) was a kernel artifact:
-  `/tmp/kilo/xmx_rate3.cpp` rebuilds A from DRAM with 256 scalar byte loads per
-  dpas and B with 32 strided scalar dword loads.  A pre-reordered B plane plus an
-  SLM-staged A tile is ~5-6 instructions per dpas.
-* **The candidate-restricted draft head works mechanically and loses on
-  acceptance.**  The draft needs one token per step and its head GEMV reads all
-  248320 rows (794 MB of u4) to keep one argmax, so `mtp_gather_launch` evaluates
-  the head on a few hundred gathered rows (`mtp_cand_launch` collects them from
-  the draft's own previous step, `mtp_gather_argmax_launch` reduces).  It is
-  numerically exact and takes the draft from 19.1 to 10.9 ms/cycle, but the
-  candidate set only contains the *next* step's argmax 25/17/7 % of the time at
-  margin 8 and 81/77/83 % even at 16384 rows (7 % of the vocab) - the
-  distribution moves too far in one token.  Net: 43.4 -> 42.9 ms/token on one
-  prompt, 48.4 -> 50.4 on another.  **Default off**; the machinery is what a
-  better candidate source (a low-rank prefilter, or a lossier draft head) needs.
-
-**The narrow GEMVs can be fused, and the cost was per launch, not bandwidth.**
-The GDN's `ssm_alpha` / `ssm_beta` are two 48-row int8 segments in one call
-group; each read 0.26 MB and each cost 12.9 us at M=1 and 42.5 us at M=5.  The
-launch floor is 5.8 us (500 calls of a 32x32 tensor), and over the *same* 25 MB,
-48 calls of N=96 take 2.14 ms at M=5 against 0.12 ms for one call of N=4608 -
-so the cost is ~8 us per group-iteration of K, exposed as latency.  Dropping the
-96 calls from the whole per-step list in `dev/bench_wpass.cpp` prices them
-honestly: 1.24 ms at M=1, 4.08 at M=5, i.e. a 2.84 ms *marginal* (the
-isolated per-shape table overstates it, since an isolated narrow call is
-submit-bound).  Two fusions, both implemented or measured:
-`i8_grp_gemv_rows_multi_launch` (one launch for up to four int8 segments, 12
-args / one local accessor, the M=1 GEMV's arithmetic - verified against a host
-reference by `dev/test_fused_i8.cpp`) takes the verify from **94.0 to 91.7 ms
-(-2.4 ms, three repeats each)**; and the weight-level version (concatenate the
-two Q8_0 blocks into one `[2*dt_rank, K]` tensor at load, so the existing
-`nat_gemm` sees N=96) measures 68.32 -> 66.52 ms in the replay with *no*
-numerical change.  The kernel-level fusion is on by default
-(`PF_NOFUSE=1` off, `PF_FUSEDBG=1` traces): the -2.4 ms is deterministic, but it
-uses the M=1 GEMV's accumulation order where `nat_gemm`'s was, which reshuffles
-the emitted stream's acceptance (1.64 -> 1.53 on one prompt, unchanged on two
-others), so the end-to-end effect is -1.1 to +0.9 ms/token depending on the
-prompt.  A *caveat worth knowing*: the first version of that kernel passed its
-`i8_grp_seg` descriptors as a host pointer and the device read zeros from it -
-a silently empty GEMV that looked 1.9 ms *faster*.  Copy them into the lambda
-closure (by value) or don't.
-
-One measured win kept: **the draft chain is device-resident**.  The head's argmax
-goes straight to `d_mtp_tok[step]` and the next step's `mtp_concat` reads it
-through its new `tok_dev` argument, so a cycle issues its k drafts back to back
-instead of doing k device syncs + k x 1 MB logits copies + k host scans of
-248320 floats: **-1.2 ms/cycle**, byte-identical output.  It needs the MTP layer
-on the primary device (`--mtp-device 0`, the default); a cross-device
-`--mtp-device` keeps the host round-trip.
-
-### MTP on 27B, re-measured 2026-10: what the cycle is made of, and the 2x question
-
-Re-measured 2026-10-02, because the numbers in §1-§8 above predate it:
-
-* **A 3.2 ms-per-launch regression was hiding in the verify path**, from the
-  device-profile refactor: `rmsnorm_launch` calls `si::dev::wg_clamped()`, which
-  was re-running `sycl::device::get_devices(gpu)` + a driver query on *every*
-  launch.  65 rmsnorms per verify = 210 ms of pure host time per cycle.  The
-  plain decode never saw it because it is a recorded command graph (the launch
-  is captured once at startup); the MTP verify is a direct replay.  Fixing it
-  took the verify 221 -> 85 ms and the cycle 255 -> 107 ms, i.e. **MTP went from
-  0.72x (slower than a plain decode) to 1.8-2.2x**.  **Never put a device query
-  in a kernel launcher** - see the `wg_clamped` cache in
-  `src/device/device_registry.cpp`.
-* **The verify is now a recorded command graph** (`build_md_verify_graphs`,
-  same phase split as the decode's `build_md_dec_graphs`): -3.7 ms/cycle at
-  k=6, byte-identical output.  Two guards earn their keep:
-  `dnnl_capture_guard()` throws from every oneDNN `prim.execute` while a
-  *declared-all-SYCL* capture is in progress (the verify's GEMMs all take
-  `nat_gemm_launch`, but an unservable shape would fall back to oneDNN and
-  silently record a pass that is missing work), and `vf_graph_usable()` declines
-  the graph once the context outgrows `xmx_min_keys`, where the recorded
-  attention split count would be stale.
-* **Where the 105 ms cycle goes** (k=4, p0): draft 19.0 (4 steps x 1.25 GB at
-  263-297 GB/s = its byte floor), verify 85.0 (70.7 for the M=1-equivalent pass
-  + 4.2 per extra row), commit/rollback/emit 1.2.  The plain decode is 69.1 ms
-  and is within 3 % of its structural floor (17.5 GB at 325 GB/s + ~13 ms
-  non-GEMV).  So `X = cycle - plain = 36 ms` is 53 % draft bytes and 47 % the
-  verify's extra rows, and the two big *fixed* costs cancel in the ratio.
-* **2x is acceptance-bound.**  `PF_MTP_STEPS=1` shows reach[j] = 75/53/37/28/15/6 %
-  at k=6 (p0): a clean geometric p ~ 0.70 with **no step-0 collapse**, so the
-  draft's hidden is right and the decay is the MTP layer's own accuracy.  Final
-  measured speedups (one process per cell; plain 69.10 ms/token): code
-  continuation **2.16x** (k=4), technical explanation **1.97x** (k=3), story
-  opener 1.35x (k=2).  The remaining engine-side headroom is ~10 % of X, worth
-  ~5 % of the speedup; the story prompt cannot be fixed by the engine at all,
-  because its ceiling is `n = 1 + acc = 2.23`.
-* **The draft's bytes cannot be cut.**  A 2-bit head store
-  (`w2_pack_any`/`w2_gemv_launch`, 0.375 B/w, exact to 1.9e-07 in
-  `dev/test_w2.cpp`) makes the draft 6 % cheaper and costs 2 % of the
-  acceptance - a wash - because the GEMV is not bandwidth-bound (270 vs the u4
-  path's 314 GB/s) so only 1.4x of the 1.6x byte cut is realised.  Its
-  quantization error on this Q6_K head is **39.8 % relative L2** (u4's is
-  0.077 %) and the argmax survives that, which is the useful result: the draft
-  head's *precision* is not the constraint, its bytes are.
-* **Draft precision is free, so the speedup is acceptance-bound (settled).
-  `PF_MTP_LAYER_EXACT=1` runs the MTP layer's GEMVs on the exact fp32 dequant
-  reference and the acceptance is *identical* to the int8 store (2.14 both), so
-  the layer's ~1 % weight error is orders of magnitude below the MTP head's
-  argmax sensitivity.  Every "fewer bits for the draft" attempt therefore has
-  nothing to gain on the acceptance side and can only lose the head's discrete
-  argmax decisions - which is what they all did.  n is bounded by the MTP
-  layer's own accuracy (reach[] geometric, p ~ 0.70).
-* Two measurement traps worth knowing: a **prefix-cache hit changes the
-  numerics enough to move the acceptance** (acc 1.9 cold vs 2.8 after the same
-  prompt ran at k=2..5 first in the same process), so an in-process k sweep
-  compares configs that did not start from the same state - `dev/bench_mtp.cpp`
-  is one process per config for that reason; and the two device partitions run
-  their layer ranges *sequentially* by necessity, so there is no cross-device
-  overlap to recover in the decode or the verify (a token's forward is a strict
-  chain, and token t+1 does not exist until t's forward ends).
-
-**The verify cannot be split across the two cards** (structural, measured): a
-token's forward is a strict chain through the layer split - card 0's layers 0-31
-must finish and hand over before card 1 starts, and `PF_HOSTPROF=1` measures that
-handoff at 37 ms of host-side blocking; the verify's 7 rows are also one forward,
-not 7 (row i+1 attends to row i's KV).  The one tensor-parallel opportunity in
-the MTP cycle is the draft's head readout, which is implemented and priced above.
-The `do_split` rule that came out of the u4 layer store is worth stating on its
-own: **any activation feeding a native-store GEMV must be quantized with
-`do_split=true`** - `eh_proj` was not, so the u4 path read the previous call's
-even/odd planes and gave acc 0.08 (garbage draft) until it was fixed.
-
-New diagnostics: `PF_HOSTPROF=1` (the `PF_PROF` buckets *without* the per-stamp
-device wait, i.e. submission cost - this is what found the regression),
-`PF_MTP_STEPS=1`, `PF_MTP_DSTEP=1` (per-stage draft-step time),
-`PF_MTP_LAYER_EXACT=1`, `PF_MTP_HEAD_W2=1`, `PF_W2_PAIR=1`, `PF_W2_INFO=1`,
-`PF_W2_DEBUG=1`.  `-DSI_DEV_BENCH=ON` builds exactly one of the `dev/` harnesses
-(`dev/bench_mtp.cpp`, the one-process-per-config MTP sweep); the rest are one-file
-tools compiled by hand against `sycl_infer_core` (e.g. `dev/test_w2.cpp`,
-`dev/test_fused_i8.cpp`, `dev/bench_wpass.cpp`, `dev/bench_dp4a_peak.cpp`,
-`dev/bench_natgemm.cpp`, `dev/bench_dpas_gemm.cpp`), because each one re-lowers the
-device image at link:
+The `dev/` harnesses are **gitignored**, so they rot silently and nothing fails until
+you run one.  `dev/bench_mtp.cpp` (the one-process-per-cell MTP sweep) had stopped
+compiling after the MTP state moved into `mspec_state` — and note the trap: the bare
+`engine::mtp_k` that remains is the *config* field the constructor takes, so
+`e.mtp_k = k` silently became a no-op that would have measured a plain decode and
+reported it as speculative.  They are one-file tools compiled by hand, each of which
+re-lowers its device image at link:
 
 ```bash
 icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
   -Isrc -Isrc/common -Isrc/backend -Isrc/backend/cpu -Isrc/backend/gpu/kernels \
   -Isrc/model -Isrc/mm -Isrc/engine -Isrc/server -Ithird_party \
-  -I/opt/intel/oneapi/dnnl/2026.0/include -Lbuild -lsycl_infer_core -ldnnl
+  -I/opt/intel/oneapi/dnnl/2026.0/include \
+  -Lbuild-opencode-jit -lsycl_infer_core -ldnnl      # -L must match the tool's flags
 ```
 
-(`build/libsycl_infer_core.a` has to be current or the link fails on whatever
-launcher the tool was last changed to call.)
+`-Lbuild-opencode-jit` because the command above has no AOT flags; link the AOT
+library instead and it dies in the runtime (see *AOT builds*).  The library must also
+be **current**, or the link fails on whatever launcher the tool was last changed to
+call.  `dev/bench_mtp.cpp` takes
+`<gguf> <layer-map> <tokens> <k,k,...> [nprompt] [do_plain]`, and its prompt array
+indexes 0 = technical explanation, 1 = story opener, 2 = code continuation.  Run it
+with `PF_MTP_TIME=1`, or you get ms/token with no acceptance column — which is the
+one number that explains the result.
+
+### Multi-token prediction (MTP / NextN) speculative decoding
+
+`--mtp N` drafts up to `N` tokens with the model's own NextN head and verifies them
+against the target in one batched forward, emitting the tokens a plain greedy decode
+would.  Two hard requirements, both of which downgrade silently to a plain decode:
+
+* the GGUF must bundle the head — the 27B reference has
+  `qwen35.nextn_predict_layers == 1` with `blk.<n_layer>.nextn.*` (`eh_proj`,
+  `enorm`, `hnorm`, `attn_norm`, q/k/v/wo/ffn, optional
+  `shared_head_norm`/`shared_head_head`); the 0.8B has none;
+* the run must be a **multi-device oneDNN int8 partition** (`multi_dev && md_xmx`),
+  i.e. a `--layer-map` whose GPU partitions have `setup_md_dnnl()` weights
+  (`PF_DP4A` on).  Otherwise `engine`'s constructor prints one `[mtp]` line and
+  disables it.  So a single-device `--mtp 4` is a no-op on the 0.8B *and* on a 27B
+  that fits one card.
+
+The draft length is clamped to 12 (`n = k+1 <= kMaxB`, the `d_logits` / `step_info`
+bound).  The MTP layer is a full-attention Qwen3.5 block, so it owns one extra
+attention KV slice (`attn_layers() - 1`) in the same paged pool and is counted in
+`--kv-cap-mb` and by all three prefix-cache tiers.
+
+**Semantics that keep the stream equivalent to a plain greedy decode:**
+
+* the head consumes the trunk hidden **before** `output_norm` (`t_h_pre_norm`) and
+  applies its own `enorm`/`hnorm`; a draft row pairs `emb(t_p)` with `h_{p-1}`,
+  matching llama.cpp's right-shift;
+* the verify is one batched forward of `[last_committed, draft0..draft_{k-1}]` at
+  consecutive positions; acceptance is `target_argmax(row i) == draft[i]` plus a
+  bonus token from row `j`;
+* the verify is **dry** (`step_info::mtp_dry`): it computes the forward but does not
+  write the GDN/conv state, and snapshots the per-token state into `d_mtp_hist_` so
+  the commit rewinds the recurrence to the last accepted row (llama.cpp's
+  `n_rs_seq`); the conv window is rebuilt from the raw taps in `d_mtp_qsave_`;
+* the prefix cache is supported: `generate_mtp` calls `pc_admit` for the prompt
+  (restoring the matched chain's KV *and* recurrent state), then commits **after
+  each completed prefill batch and its MTP-layer KV writes**.  The order is
+  load-bearing — `pc_commit` advances `pc_slot_[0].registered`, which the next
+  batch's `pc_capture_begin` checks against `pos0`, so committing before a batch
+  captures nothing and committing only after a multi-batch prompt discards the
+  earlier pending checkpoints.  Measured on the 27B / 2x A770 with
+  `--mtp 4 gen --temp 0` (~90-token prompt): moving the commit after the prefill
+  moved the exit stats from `nodes=2 (with state 0) ... captured=0` to
+  `nodes=2 (with state 2) ... captured=2`.  A greedy CLI `gen` routed through
+  `generate_mtp` reaches this path, as does the server's `mtp_direct`
+  (`PF_MTP_SERVER=1`); ordinary `gen` does not use the prefix cache.
+
+**Caveat (measured, unresolved):** the emitted stream is not *byte*-guaranteed
+against a plain decode.  A ~130-token 27B generation on one prompt diverges from
+token 11 on, in both draft-head variants and with `PF_MTP_NOACCEPT=1`,
+`PF_MTP_NORB=1` and `k=1` — so it is the verify/rollback state, not the draft
+quality.  Other prompts are byte-identical.  Treat it as greedy-equivalent in
+*intent*; `test_spec` is the oracle that would catch a change here.
+
+#### Measured cost model (27B / 2x A770, 2026-10-09)
+
+Single-request greedy decode, 128 tokens, **one process per cell** (a prefix-cache
+hit inside one process moves the acceptance — 1.9 cold vs 2.8 warm — so an
+in-process sweep compares states that did not start alike).  Plain decode on the
+same build and prompt: **67-70 ms/token**, measured by differencing two generation
+lengths so the 27B load cancels (see *Benchmarking* below).  `acc` is the engine's
+own number from `PF_MTP_TIME=1`, not inferred from ms/token.
+
+| prompt | `PF_MTP_ADAPT` | acc | cycle | ms/token | speedup |
+|---|---|---:|---:|---:|---:|
+| code continuation | on (default) | 2.08 | 99.0 | 36.4 | 1.84x |
+| technical explanation | on (default) | 1.84 | 100.5 | 39.2 | 1.72x |
+| story opener | on (default) | 0.84 | 88.8 | 52.5 | 1.35x |
+| code continuation | off | 2.50 | 106.0 | 34.3 | 1.96x |
+| technical explanation | off | 2.33 | 105.8 | 35.4 | 1.90x |
+| story opener | off | 1.18 | 105.7 | 53.2 | 1.33x |
+
+**The cycle is constant and the speedup is not.**  With adapt off, `draft` is
+17.5 ms, `verify` 87.0-87.2 ms and `commit`+`rollback` 1.2 ms on *all three*
+prompts — ~106 ms every time — while the speedup spans 1.33x-1.96x.  Nothing about
+the engine differs between those cells; only how many of the 4 drafted tokens the
+NextN head gets right.  So **acceptance is the entire story**, and it is a property
+of the prompt, not of the engine.
+
+`PF_MTP_ADAPT` (default on) shrinks the draft length by one on a cycle that accepts
+nothing and grows it back on a full-acceptance cycle, never changing the emitted
+stream (acceptance ignores `k`).  **Its sign is prompt-dependent, so measure both
+settings.**  It buys a cheaper cycle when acceptance collapses (the story prompt:
+88.8 ms instead of 105.7, because fewer rows are verified) but pays 5-6 ms/token on
+the two high-acceptance prompts (39.2 vs 35.4, 36.4 vs 34.3) and is a wash on the
+third (52.5 vs 53.2).  An earlier version of this file claimed it as an
+unconditional win from one prompt pair; that was over-generalised.
+
+**Acceptance is bounded by the text, so the ceiling is ~2-3x and no kernel work
+moves it.**  `speedup = n * T_plain / (T_plain + X)` with `n = 1 + acc` and `X` the
+cycle-only cost.  Both paths are memory bound and both read the same ~16.3 GB of
+weights per unit of work, so the only lever is tokens per weight pass, and 4 greedy
+drafts from a 27B carry ~3.1-3.3 accepted tokens.  `X` is ~38 ms here (106 - 67),
+of which the extra verify rows are ~4 ms each.
+
+**MTP does not compose with batching, so the server defaults to the scheduler.**
+A batched decode step measures `59.0 ms + 10.7 ms per row` (fitted over N=1/2/4/8 at
+70.0/81.6/99.7/145.5 ms), and MTP spends `k+1 = 5` verify rows per `acc+1` emitted
+tokens — at the measured acc 1.49 that is **2.0 rows per token against the plain
+decode's 1.0**.  Both pay the same per-row cost, so for a fixed row budget plain
+batching wins as soon as the 59 ms weight pass is amortised: modelled
+`S=1/2/4/8 -> plain 69.7/40.2/25.5/18.1 ms/token vs MTP 50.4/36.0/28.8/25.1`, i.e.
+MTP wins only at `S<=2` and loses 0.89x at S=4 to 0.72x at S=8.  `server.cpp`'s
+`mtp_direct` therefore does not route greedy requests into the single-sequence loop
+by default — doing so took the engine for the whole generation and serialised
+everything (8 concurrent greedy 128-token requests: 17.5 tok/s with MTP vs 55.0
+through the scheduler).  `PF_MTP_SERVER=1` restores it for a strictly
+single-request workload.  MTP's remaining value is single-request latency, and it
+is strongly prompt-dependent.
+
+**MTP is a short-context win only.**  At 128k depth the 7-row verify costs
+1390 ms/cycle against 181 ms for a plain decode: MTP buys a ~3.5x weight
+amortization with ~8 decode-equivalents of attention.  On the server the same
+prompt goes 68.6 → 45.5 ms/token (1.51x).  Two bugs made it far worse before and
+are worth not reintroducing:
+
+* the draft's attention used the *prefill* split ceiling `n_splits`, which the
+  `--layer-map` path pins to **1** (`PF_MD_SPLITS`); one warp per head over the
+  whole KV made a 1-row draft pass cost 408 ms at 128k.  `mtp_forward` now derives
+  its own split count from the KV length (~512 keys per split, capped by
+  `PF_MTP_SPLITS`, default `kMaxDecSplits`) and allocates its own partials.  The
+  draft phase went 2451 → 35.7 ms/cycle at 128k.  Note a *fixed* large split grid
+  degrades short-context acceptance (1.27 vs 2.29 per cycle on a 320-token prompt),
+  so derive it, do not hardcode it;
+* the prompt prefill used to walk in `kMaxT` chunks, paying a `prefill_flush()` plus
+  a host-blocking `memcpy`/`wait` of `d_mtp_hprev` per 32 tokens, which serialised
+  the 3-phase pipeline (e2e_ttft at 131k 1475 vs 311 s).  Fixed: one
+  `prefill_text()` batch of up to `batched_prefill_fit()` tokens, then the MTP layer
+  over its captured hidden in `kMaxT` pieces.
+
+#### The verify's kernel, and the ceiling that bounds it
+
+`nat_gemm_launch` (`w4_gemv.cpp`) is a batched native-width GEMM (u4/k5/cb4/grouped
+int8) for M = 2..13 that stages the K-tile's activations in SLM once per workgroup,
+so the weight stream is read once for all M rows; it runs the whole
+scale/offset/residual epilogue in the same kernel and takes over `gemm_w4`/`gemm`
+for M <= 13.  That took the verify from 196 to 147 ms and let `--mtp N` keep the
+native q5/cb4 stores (it no longer forces `PF_CB4=0`/`PF_K5=0`).
+
+**The largest single win was a loop-order change, and the reason is invisible in the
+source.**  With the **c-outer / m-inner** order (loop over the C columns a sub-group
+owns, then over the M rows) IGC scalarises the whole inner loop — the IGC asm
+contains **zero `dp4a`** and the kernel runs at 106 GB/s.  Reordering to **m-outer /
+c-inner** (load one row's activation group once, then run the 8 `dp4a` for every
+column against it) makes IGC emit 336 `dp4a` and the kernel jumps to **221 GB/s**
+(u4, M=7, K=5120, N=17408: 0.421 → 0.200 ms, 2.08x; k5 0.342 → 0.237, cb4 0.380 →
+0.258, int8 0.370 → 0.276).  The winning shape is `C=2, KT=32, SG=8, TX=128,
+TREE=1, VECST=1, VECA=1`, all bit-exact against the M=1 GEMVs.  Also load-bearing:
+SIMD8 sub-groups (a SIMD16/SIMD32 float costs 2/4 GRFs, so the M*C accumulator set
+spilled 18-23 KB/thread to scratch); staging the activation and the scale/offset
+tiles with 16-byte copies rather than byte loops; and the SLM activation stride —
+48 bytes pushes M >= 8 over the register cliff, so `APAD` is 32 except for u4 at
+M >= 12.  C=4/8 in any order, a larger `TX`, and the c-outer order all lose.
+
+**`nat_gemm` is at a local optimum at M ~ 7 — do not attempt a fourth
+restructure.**  Three changes touching SLM, registers and SLM footprint were
+implemented and verified bit-exact, and all three lost on the 27B / 2x A770 verify
+at M=6 (baseline 91.6 verify / 28.1 draft): SLM double buffer 117.1/30.2, register
+prefetch 107.6/31.4, `NAT_DIRECT=1` (read the activation from global, shrink
+`act_s` to 1 byte) 96.3/31.7.  **The kernel is occupancy-bound, and occupancy IS the
+latency hiding** — many concurrent warps cover one warp's load latency — so spending
+SLM or registers on single-warp overlap buys much less than spending them on more
+concurrency.  The register form is also redundant: the `gt` loop already carries
+`#pragma unroll 2`, so the compiler already hoists iteration *i+1*'s loads across
+iteration *i*'s dp4a.  And the activation staging is **not** overhead: `nat_gemm`
+reaches 223 GB/s at M=7 where the M=1 GEMV reaches 294 on the same weights, which
+looks like `act_s`'s ~7 KB, but staging turns 24 dependent global loads per thread
+into 24 register reads.  After the reorder the kernel is within ~1.3-1.5x of the M=1
+rate (u4 223 / k5 188 / cb4 173 / int8 323 GB/s against 294/249/261/364); on *true*
+per-format traffic k5 already matches u4's ~280 GB/s while reading 20 % more bytes,
+and cb4 is decode-issue bound on its codebook LUT (a 256-entry uint32 table, a
+pre-biased codebook and pre-shifted LUTs all measured worse).
+
+**The arithmetic-intensity ceiling.**  Measured on one A770: stream rate ~376 GB/s
+(`bw_probe`); dp4a ~4.9 T-MAC/s with register-resident operands
+(`dev/bench_dp4a_peak.cpp`: 3.50 plain, 4.92 with u4 nibble decode, **78.8** for
+DPAS u4 K=64); fp32 FMA peak ~5.0 T-FMA/s (`dev/alu_probe2.cpp` — the older
+`alu_probe.cpp` is dead, the compiler folds its loop and it reports 1.5 PFLOP/s).
+So the memory system's intensity is **~13 MAC/byte** against a tensor-core card's
+20-30x, and **dp4a is not a hardware unit on Xe-LP** — it sits at 70-98 % of the
+vector ALU, so DPAS really is a separate ~16x unit.
+
+The critical batch size follows: with the u4 store's 0.625 B/weight and the rate the
+*real* kernel achieves (**7.1-7.6 T-MAC/s**, from `dev/bench_wpass.cpp` replaying the
+real 497-call list: `53.93 ms` of streaming `+ (M-1) x 3.67 ms` of dp4a),
+`M* ~= 0.625 x 7.6e12 / 405e9 ~= 12`.  Below `M*` extra rows are nearly free; above
+it each costs real time.  The equivalent DPAS crossover is ~122, so an XMX/DPAS unit
+only wins for **M in [12, 122]** — and `kMaxB = 16` caps every batched forward at
+M = 16, the first shape inside that window.  **Take `M*` from `bench_wpass`, not from
+`bench_dp4a_peak`**: the latter understates the real kernel by 1.4-2x, and an `M*`
+derived from it is too small.  (The older 6.4 figure came from the 4.9 T-MAC/s
+number and is wrong.)
+
+**XMX / DPAS was re-implemented and rejected on measured grounds — do not re-derive.**
+The earlier rejection rested on "DPAS K is fixed at 32 = our group width", which is
+too narrow: the native `esimd::dpas<8,8,int32_t,int32_t,uint32_t,uint32_t,u4,s8,64,
+32,64>` takes a **u4** operand with **K=64**, i.e. two 32-wide groups chained without
+a drain, and it is bit-exact for a per-32 u4 stream (0/64 and 0/200 mismatches).
+Raw throughput with register-resident operands is **254 T-MAC/s** (u4), and `s8`
+(K=32) is 16x slower at 16.2 — the Xe XMX apparently lacks a native signed-8 path.
+It still loses by a wide margin in a real GEMM.  `dev/bench_dpas_gemm.cpp` does the
+right thing — a weight plane pre-reordered once at load into the DPAS B layout, an
+SLM-staged A tile, ESIMD `gather`, `block_store` out — and is **numerically exact**
+(rel 5.26e-07 at the verify shape, all 2560 dpas values exact across all 160 groups)
+and still **7.44 ms against `nat_gemm`'s 0.200 ms, 37x slower**.  Where it goes is
+measured: K-split regresses exactly linearly (1/2/4/8/16/32 → 7.69/14.80/28.92/57.10/
+112.82/231.73 ms), so the cost is proportional to the **work-group count** — building
+the two 64/32-element cross-lane **offset vectors** (a runtime element write or a
+union'd array write into a cross-lane simd is serialised through local memory) and
+spilling the `NT x 8 x 8` accumulators.  `NT` sweep 1/2/4/8 → 13.27/9.16/**7.44**/8.93.
+Three ways to build those offsets that **do not work**: an initialiser list
+(`esimd::simd<int,64>{0,4,8,...}`) has no matching constructor at either length; the
+`VS`-blocked `gather<VS>(p, simd<OffsetT, N/VS>)` overloads require a `simd_view`
+pass-through argument; and there is no `(start, step)` / iota constructor and no
+identity-`offsets` helper (the `offsets` in `memory.hpp` are gather *masks*).
+Other measured constraints: `esimd::gather` needs **compile-time** offsets;
+cross-lane vectors assume a **32-thread block** (an 8-warp workgroup produces zeros,
+`W=1` is required); `block_store` is block-cooperative so guarding it to one warp
+stores nothing; and **read results back with `block_store` to global, never through
+SLM** — a `copy_to(local_accessor)` plus a scalar SLM loop returns zero even for a
+plain scalar round trip in the 32-lane configuration, which is what made every
+earlier probe (including the previous session's 0.06 T-MAC/s) look like it was
+computing nothing.  `src/common/dp4a.h` remains the pattern to imitate.
+
+Cost/benefit, since the hardware verdict above is only half the story: on this
+model only ~3.5 ms of a 14.25 ms marginal GEMM cost is u4/k5 dp4a issue; 3.84 ms is
+the 96 tiny `ssm_alpha`/`ssm_beta` GEMVs (2 workgroups each — launch latency, which
+no arithmetic unit fixes) and 4.2 ms is the cb4 codebook LUT, which **cannot** be a
+DPAS u4 operand at all (16 arbitrary int8 values vs values 0-15).  So a DPAS verify
+kernel is worth ~3 ms of a ~106 ms cycle here.
+
+**`nat_gemm_launch` cannot serve prefill, and that is a hard limit, not a missing
+instantiation.**  `nat_gemm_impl` stages the call's whole 32-group activation tile
+in SLM (`M x 1024` bytes), which with `APAD=32` caps it at M ~ 56 rows and with the
+`APAD=48` u4 prefers at M >= 12, M ~ 37 — against DG2's 64 KB of SLM per workgroup.
+Prefill's GEMM M is the *total token count* (`tbm = (mode == 2 && !single) ? rows :
+tb`), so a 512-token prompt is **one** mode-2 forward at M=512 and no prefill call
+lands inside the M <= 13 window.  On the main configuration prefill is always mode 2
+and mode 1's M=kMaxT=32 chunks are never used.
+
+**What prefill actually costs** (27B / 2x A770, `llama-benchy 0.4.0 --pp 512 --tg
+128 --depth 0 --runs 3 --exact-tg`, `PF_PREFIX_CACHE=0`): **pp512 2 390 tok/s**,
+tg128 14.05 tok/s, cold full-prompt TTFT 1.44 s.  512 tokens in 214 ms against
+24.5 GB of *int8* weight bytes is ~114 GB/s effective, i.e. ~35 % of the card's read
+ceiling, so prefill is not purely weight-bound; oneDNN's grouped-scale int8 matmul
+is doing real work here.  Replaying the same 497-call list with the production dp4a
+launchers would cost ~1.93 s at M=512, i.e. **oneDNN is ~11x better than dp4a at
+this M** — which is why prefill needs a *blocked large-M* kernel and neither
+`nat_gemm` (M-capped) nor dp4a is the answer.  At depth 16k/64k the whole-prompt
+rates are 865 / 560 tok/s.  See *Benchmarking* below for why the harness's own
+`pp512` column cannot be quoted.
+
+**The verify's own floor.**  A `k` sweep prices it at ~one plain decode's weight
+pass plus ~4 ms per extra row (the verify is 83-87 ms at k=4 across all three
+prompts here), and it runs on `build_md_verify_graphs`' recorded command graphs, not
+the direct replay.  Two guards earn their keep: `dnnl_capture_guard()` throws from
+every oneDNN `prim.execute` while a declared-all-SYCL capture is in progress (the
+verify's GEMMs all take `nat_gemm_launch`, but an unservable shape would fall back
+to oneDNN and silently record a pass that is missing work), and `vf_graph_usable()`
+declines the graph once the context outgrows `xmx_min_keys`, where the recorded
+attention split count would be stale.
+
+**The accept argmax is on the device because the host version was 24 % of the
+cycle.**  `mtp_argmax_launch` was first written as `parallel_for(range<1>(M))` — one
+work-item per row — so a 5-row verify meant five GPU threads each scanning 248320
+floats serially: **33.7 ms/cycle**, and since `mtp_verify` ends with `sync_all()`
+that is real GPU occupancy, not a hidden sync.  It is now one 256-lane work-group per
+row with a strided coalesced walk and an SLM tree reduction, breaking ties to the
+*lowest* index (as does the per-lane scan) to stay bit-identical to the host's
+`if (v[i] > best)`: **33.7 → 1.2 ms/cycle (28x)**, verified by `PF_MTP_AMCHK`.
+`compute_backend::mtp_argmax` is now the only entry point (`mtp_argmax.cpp` on the
+GPU backend, a host loop in `cpu_backend.cpp` for an all-`cpu` run), so the device
+path is what the verify uses and **`PF_MTP_ARGMAX_CPU` no longer exists**.
+
+#### Dead ends (all measured — do not retry)
+
+* **Fewer bits in the draft.**  `PF_MTP_LAYER_EXACT=1` (exact fp32 dequant GEMVs)
+  gives an *identical* acceptance to int8, so draft precision is free — which means
+  every "fewer bits" attempt can only lose the head's discrete argmax decisions, and
+  all of them did.  `PF_MTP_LAYER_W4` (default on, u4 linears, 2.06 → 0.875 B/w,
+  -1.4 ms/cycle) is accuracy-neutral.  `PF_MTP_LAYER_W2` (acc 2.14 → 1.75 for
+  -0.5 ms) and `PF_MTP_HEAD_W2` (-2.6 ms/cycle for -2 % acceptance) are rejected:
+  lossy is free at the *readout* but compounds in the *recurrence*.  A 2-bit head
+  is also a wash because that GEMV is not bandwidth-bound (270 vs 314 GB/s), so only
+  1.4x of the 1.6x byte cut is realised.  Note the first `PF_MTP_LAYER_W4`
+  measurement showed acc collapsing to 0.11 — that was the `do_split` bug below, not
+  the precision.
+* **A candidate-restricted draft head** (`PF_MTP_CAND`, default off and it should
+  stay off).  `mtp_gather_launch` evaluates the head on a few hundred gathered rows
+  instead of all 248320 (0.25 MB vs 794 MB), is numerically exact, and took the
+  draft from 19.1 to 10.9 ms/cycle — but the candidate set contains the next step's
+  argmax only 25/17/7 % of the time at margin 8, and 81/77/83 % even at 16384 rows
+  (7 % of the vocab).  The distribution moves too far in one token.  Net 43.4 →
+  42.9 ms/token on one prompt, 48.4 → 50.4 on another.
+* **Splitting the draft head readout across both cards** (`PF_MTP_HEAD_SPLIT`,
+  default off): deterministically 17.2 → 13.1 ms/cycle and an end-to-end wash,
+  because halving N changes the u4 GEMV's decomposition and flips the draft's
+  argmax on a near-tie (p1 bit-identical over 128 tokens, p0 -6 %, p2 -8 %
+  acceptance).
+* **Merging the commit and rollback syncs.**  `commit` measured 4.0 ms and looked
+  like pure overhead, but it is one device-wide barrier per cycle: merging it into
+  the rollback's just moves the cost (commit 4.0 → 0.3, rb 1.5 → 4.0, net unchanged
+  at 36.2 vs 36.4 ms/token).  **The barrier itself is the cost.**  For the same
+  reason the rollback's own barrier is kept: removing it takes the phase from 3.9 to
+  0.9 ms/cycle and the wall does not move (8.74 → 8.76 s for 192 tokens), because
+  the freed time reappears in the draft's first wait.
+
+#### Two bugs that look like tuning
+
+* **Any activation feeding a native-store GEMV must be quantized with
+  `do_split=true`.**  `eh_proj`'s activation was not, so the u4 path read the
+  *previous* call's even/odd planes and gave acc 0.08 (garbage draft) until it was
+  fixed.  `quantize()` now returns an `si::act_view` (`{m, k, split, gen}`) and every
+  GEMM entry point *requires* it, so "forgot the gate" no longer compiles, and a
+  stale view returns `nullptr` from the `act_*` accessors instead of handing back
+  whatever is in the scratch.
+* **Never put a device query in a kernel launcher.**  The device-profile refactor
+  introduced `rmsnorm_launch` calling an uncached `sycl::device::get_devices()` per
+  launch — 3.2 ms each, 210 ms of host time in one verify pass (65 rmsnorm calls).
+  It was invisible in the plain decode because that is a *recorded* command graph
+  (captured once at startup) while the verify is a direct replay; fixing it took the
+  verify 221 → 85 ms.  See *Device profiles*.
+
+Diagnostics, all env-gated (`0`/unset = off unless noted): `PF_MTP` (draft length,
+`--mtp` overrides), `PF_MTP_LAYER_W4`, `PF_MTP_ADAPT` (`0` fixes `k`),
+`PF_MTP_AMCHK`, `PF_MTP_DEV`, `PF_MTP_TIME` (per-phase cycle ms **and `acc`** — the
+acceptance column any benchmark needs), `PF_MTP_SUBMIT`, `PF_MTP_DEBUG`/`PF_MTP_DUMP`,
+`PF_MTP_VERIFY_PAD`/`PF_MTP_VERIFY_M32`, `PF_MTP_VERIFYN`, `PF_MTP_DECCHK`,
+`PF_MTP_LSTAT`, `PF_MTP_DECODE_H`, `PF_MTP_NOACCEPT`, `PF_MTP_NOMTPFWD`,
+`PF_MTP_NORB`, `PF_MTP_NORBSYNC`, `PF_MTP_FORCE_INT8`, `PF_MTP_STEPS=1` (per-depth
+acceptance `reach[j]`, which distinguishes a geometric decay from a draft-state bug),
+`PF_MTP_DSTEP=1`, `PF_MTP_LAYER_EXACT=1`, `PF_MTP_LAYER_W2`/`_W2_CALL`,
+`PF_MTP_LAYER_W4_CALL=<ci>` (put only that call's tensors on the u4 grid — 0 qkv,
+1 wo, 2 ffn gate/up, 3 ffn down, -1 eh_proj; the bisection knob that localised the
+`do_split` bug), `PF_MTP_HEAD_SPLIT`(+`_DEBUG`), `PF_MTP_HEAD_W2`, `PF_MTP_CAND*`
+(`PF_MTP_CAND`/`_CANDM`/`_CANDSRC`/`_CANDDBG`/`_CANDV`).  Batch-GEMM knobs:
+`PF_MTP_SPLITS` (the draft's key-split cap, default `kMaxDecSplits`; `1` restores the
+old single-split draft), `PF_W4_GEMM_MAXM`/`_U`/`_TN`, `PF_DNNL_BLOCKED`,
+`PF_NOFUSE`, `PF_FUSEDBG`.
+`dev/bench_mtp.cpp` is the one-process-per-cell sweep; `dev/bench_natgemm.cpp`,
+`dev/bench_wpass.cpp` (+ `dev/wpass_list.py`) and `dev/bench_dpas_gemm.cpp` are the
+kernel probes — see *Benchmarking* for how to build and run them.
 
 ### DFlash2 block drafter (`--spec-type dflash2`)
 
 A second drafter, structurally different from MTP: the draft GGUF's own 5-layer
 NextN-style head runs **one non-causal forward over `[anchor, MASK x (n_max)]`**
-inside a private K/V ring, and a selector scores the top-K candidate sets per
-block position plus every ordered pair, so the host walks one coherent path
-through the lattice instead of re-drawing per token.  Model:
-`Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, 5 layers, `n_embd` 5120, 32/8 heads,
-`head_dim` 128, block 8, `swa` 2048, mask id 248070, selector rank 256 / top 16,
-target layers `[6,20,34,48,62]`.  Files: `src/model/dflash.{h,cpp}`,
-`src/backend/gpu/kernels/dflash.cpp`, `src/engine/engine_dflash.cpp`, plus the
-capture hook in `engine_graph.cpp`.
+inside a private K/V ring, and a selector scores the top-K candidate sets per block
+position plus every ordered pair, so the host walks one coherent path through the
+lattice instead of re-drawing per token.  Model `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`,
+5 layers, `n_embd` 5120, 32/8 heads, `head_dim` 128, block 8, `swa` 2048, mask id
+248070, selector rank 256 / top 16, target layers `[6,20,34,48,62]`.  Files:
+`src/model/dflash.{h,cpp}`, `src/backend/gpu/kernels/dflash.cpp`,
+`src/engine/engine_dflash.cpp`, plus the capture hook in `engine_graph.cpp`.
 
-Measured on the 27B / 2x A770, greedy, against llama.cpp at the same `n_max`
-(short prompt, mean accepted tokens per cycle):
+#### Acceptance is the whole story, and it is prompt-dependent
 
-    generated   llama.cpp   ours
-       32         4.43      4.75
-      116         3.96      3.90
-      227         4.13      3.92
+`n_max` is the draft tokens per cycle; `acc` is accepted drafts per cycle, so the
+ceiling on speedup is `1 + acc`.  Each cell is its own process.  Code-continuation
+prompt, plain decode **67.2 ms/token** (see *Benchmarking* for how the baseline is
+measured without the 27B load swamping it):
 
-    k      1     2     3     4     5     6
-    acc  0.98  1.44  2.18  2.54  2.90  2.90
-    ms/t 48.6  41.9  34.1  32.5  31.5  33.3
+| `n_max` | 1 | 2 | 3 | 4 | **5** | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| acc | 0.92 | 1.80 | 2.84 | 3.46 | **4.25** | 5.05 |
+| ms/token | 46.1 | 33.8 | 26.1 | 24.0 | **21.8** | 20.1 |
+| verify ms | 74.3 | 78.4 | 82.3 | 87.1 | **92.4** | 97.4 |
 
-**k=5 is the shipped default** (2.90 drafts/cycle, 31.5 ms/token against the~68
-ms/token plain decode, i.e. 2.17x).  On a 204-token prompt both engines drop
-(llama.cpp 0.239 / mean len 2.07, ours 0.81 / 1.81), so the long-context gap is
-~12 %, not the 5x an earlier broken state suggested.
+**But that is one prompt, and the spread across prompts is 8x.**  At `n_max=5`:
 
-Three bugs were load-bearing, and **none of them was findable from the inside** -
-every host check passed throughout, because each check restates the bug:
+| prompt | acc | ms/token | vs its own plain baseline |
+|---|---:|---:|---:|
+| code continuation | 4.25 | 21.8 | **3.08x** |
+| technical explanation | 2.19 | 35.8 | 1.88x |
+| story opener | 0.49 | 77.0 | **0.92x — slower than no drafter** |
 
-  - the block forward projected `wq` but **not `wk`/`wv`**, so the attention read
-    K and V out of whatever the injection path last left in the fused buffer.  The
-    injection writes the committed positions, so the ring held valid K/V for those
-    and an anchor row (which attends mostly to committed keys) still tracked
-    llama.cpp at cos 0.994, while the block's own rows attended to stale K/V.
-    **"Anchor close, mask rows off" is the signature.**  0.03 -> 0.48 acceptance.
-  - the conv composes two coefficient tensors with **mirrored axes**: base's side
-    slice is reshaped to `[group_size, n_groups, kernel_size]` (channel
-    innermost, so `(c,t)` is `c + width*t`) while the dynamic is
-    `[n_groups, kernel, 2, tokens]` (so `(g,t,side)` is
-    `g + n_groups*t + side*n_groups*kernel`).  Both were wrong; fixing base first
-    took the anchor row - which only ever uses tap 0 - to cos 0.999997, which is
-    what isolated the second error to the tap/side coefficients.
-  - the draft's rope **rotates the whole `head_dim`**.  `dimension_sections` is
-    `[64,0,0,0]` and reading `sections[0]` as the rotated width gives 64; the
-    reference rotates 128.  That is a fixed ~0.7 % on every attention score,
-    invisible in any aggregate, and it compounds to cos 0.79 by layer 4.
-    Measured against `DFLASH_REF_CUR` at pos0=204: n_rot 32/64/96/128 gives
-    0.9930 / 0.9932 / 0.9947 / **0.999991** on row 0.
+At acc 0.49 each cycle emits 1.49 tokens for a 114 ms cycle, which is strictly worse
+than the 70.7 ms plain step, and **no `n_max` rescues it** — the whole sweep above is
+worse in ms/token on the story prompt than 21.8, and raising `n_max` makes the cycle
+grow faster than acceptance improves.  So acceptance has to be checked per workload
+before enabling this, and a single speedup number is not a property of the drafter.
+This is the same lesson as MTP's, and it is the one most likely to be got wrong: both
+drafters' published speedups are single-prompt numbers.
 
-`attn_sinks` is wired up (ggml's `ggml_soft_max_add_sinks` semantics: one extra
-key per query head, score `sinks[h]`, value 0, so the whole effect is a factor
-`z / (z + exp(sink - max))`) but **this GGUF carries no such tensor** - 15
-`blk.N.*` tensors, `attn_sinks` not among them, and llama.cpp creates it
-`TENSOR_NOT_REQUIRED`.  So it is a no-op here; it is wired rather than assumed
-absent because a draft that *does* carry sinks would be wrong on every head.
+The emitted stream is **byte-identical to a plain greedy decode's** (verified: same
+md5 over 128 tokens with diagnostics on stderr), which is the correctness oracle —
+`test_spec` asserts it as stream equality against an explicitly non-speculative
+`generate_plain`, not acceptance, because a broken verify can accept at a perfectly
+healthy rate and still emit the wrong text.
 
-**How to compare against llama.cpp.**  Element-wise, never by fingerprint:
-`DFLASH_REF_{NOISE,CUR,FFNIN,FFNCONV,FFNOUT,XNORM,DYN,HIDDEN,LAYER}` publish a
-tensor at a layer chosen by `DFLASH_REF_IL=<il>` (default 0), and
-`DFLASH_REF_BIN=<path>` writes it raw; on this side `PF_DFLASH_BIN=<path>` does the
-same, with `PF_DFLASH_SIGALL` adding every layer and `PF_DFLASH_{SIG,GEMMCHK,
-PROJCHK,CONVCHK,CONVCHKALL,BASECHK,ROWRMS,EMBCHK,INJCHK}` selecting probes.
-`rms`/`max`/`first`/`top-6` say how big a divergence is but never where, and the
-anchor row carries an order of magnitude more energy than the mask rows, so a
-whole-batch aggregate is **not comparable with llama.cpp's per-position print at
-all** - an aggregate that said the `wo` output was 30 % low was comparing two
-different things.  llama.cpp's copy-out is fixed at `n_embd` wide, so a narrower
-tensor has to be padded on its side (`DFLASH_REF_DYN` does this).
+An earlier table in this file recorded acc 0.98/1.44/2.18/2.54/2.90/2.90 and
+31.5 ms/token at `n_max=5`, against the 0.92/1.80/2.84/3.46/4.25/5.05 and 21.8 ms
+measured now.  The **cycle cost is unchanged** (`verify` 92.4 vs 90.9 ms; both fit
+"one plain decode's weight pass plus ~4-5 ms per row"), so the difference is
+acceptance, not engine work, and the drafter path and the shared per-queue profile
+resolution under it have changed since.  The cause was not bisected; what is
+established is that the text is unchanged.
 
-**A diagnostic whose identity depends on when it fired needs that context in its
-name.**  Four confident wrong answers came from this, and they cost more time than
-the bugs did: reading the f16 ring as f32 (1e12 rms garbage and a 104/205
-"coverage gap"); reading the layer output from `d_df_h` instead of `d_df_c`,
-which fabricated a clean-looking error-accumulation curve; naming dumps by layer
-alone, so a later block overwrote an earlier one and two readings of one layer
-disagreed by exactly one layer (which produced a very convincing "layer 4 reads
-the wrong tensor" - the layer index was being set in a *different function*, by a
-`replace(...,1)` that matched the first of two identical `const dflash_layer_t &`
-declarations, the same mistake that segfaulted a probe); and `df_conv_check`
-keeping the pre-fix index derivation, so after the conv axes were corrected it
-reported the difference between two formulas while presenting itself as a
-verification of the conv, and reported host 0.805 vs dev 1.545 at layer 0.  **A
-broken verifier is worse than none - it suppresses exactly the signal the fix
-should be checked against.**
+#### Where the cycle goes, and its floor
 
-Open: the draft block forward is 21.2 ms, of which **20.5 ms is the five layers
-against a 4.67 ms bandwidth floor** (45 GEMM tensors, 1664.6 M params, 1040 MB at
-u4 0.625 B/w, vs `nat_gemm`'s measured 223 GB/s).  Ruled out: the weight format
-(all 49 draft tensors register as u4, `failed=0`), the dispatch (M=6 is
-`nat_gemm_pick`'s `case 6`, every draft GEMM has `K % 32 == 0`), and per-GEMM
-fixed cost - concatenating `ffn_gate`+`ffn_up` into one `[2*n_ff, n_embd]` GEMM
-(bit-identical, one launch instead of two) measured **28.0 -> 28.3 ms, i.e.
-nothing**, and switching to int8 stores (1.7x the bytes) only 28.0 -> 29.2.  So it
-is neither bytes, nor launches, nor arithmetic (10 GMAC is 1.3-2.8 ms at the
-measured 7.6 T-MAC/s).
+At `n_max=5`: `verify=92.4`, `draft=18.3`, `emit=1.5`, `inject=1.1`,
+`rollback=1.0` → 114.3 ms.  A least-squares fit of the verify column prices it at
+**69.1 ms fixed + 4.64 ms per extra draft row** (endpoints predict 73.7 / 96.9 ms
+against 74.3 / 97.4 measured).  The fixed part is one plain decode's weight pass,
+which is the structural floor; the two remaining levers are fewer weight bytes and a
+faster dp4a, and both are already priced and rejected (`PF_W4_K5` -5.7 % at 4.60 %
+mean weight error, `PF_W4_ALL` -29 % bytes at ~8x error, DPAS 16-24x the issue rate
+and 37x slower in a real GEMM).  **Do not re-derive either.**
 
-**`PF_DFLASH_OPTIME` (per-op, inserted by LINE NUMBER - every text-anchored
-insert landed in the injection path, which shares this code) must NOT be read as
-device time:**
+The verify runs on `mtp_verify`'s recorded command graphs, not the direct replay —
+the thing that cost 210 ms on the MTP path is not happening here, and
+`PF_DFLASH_VFCHK` prints `vf_dec_ok`, the row count and the graph count (1, 6, 378)
+so you can confirm it rather than assume it.
 
-    attn_norm 1.5 | attn_conv_proj 0.1 | attn conv0 2.7 | qkv 0.3 | attn 0.1
-    wo 5.0 | attn conv1 1.6 | ffn_conv_proj 0.1 | ffn conv0 1.6
-    gate+up 0.2 | ffn_down 5.5 | ffn conv1 1.7 | total 20.4 (wall 20.7)
+#### Three bugs that were load-bearing, and none was findable from the inside
 
-**`gate+up` reads 167 MB of weights in a reported 0.2 ms**, which is impossible on
-an in-order queue: it submits, and the device time is charged to whoever waits
-next.  Every number in that table is *host-blocking* attribution.  Pricing the two
-expensive-looking groups with no-op knobs (`PF_DFLASH_NOGEMM` /
-`PF_DFLASH_NOCONV`, both produce wrong results and exist only for this) shows the
-smear directly:
+Every host check passed throughout, because each check restates the bug:
 
-    everything               layers 20.8 ms
-    convs removed                    17.8    -> convs appear to be 3.0
-    GEMMs removed                    14.0    -> GEMMs appear to be 6.8
-    both removed                     12.1    -> "the rest" 12.1
+* the block forward projected `wq` but **not `wk`/`wv`**, so the attention read K and
+  V out of whatever the injection path last left in the fused buffer.  The injection
+  writes the committed positions, so the ring held valid K/V for those and an anchor
+  row (which attends mostly to committed keys) still tracked llama.cpp at cos 0.994,
+  while the block's own rows attended to stale K/V.  **"Anchor close, mask rows off"
+  is the signature.**  0.03 → 0.48 acceptance.
+* the conv composes two coefficient tensors with **mirrored axes**: base's side slice
+  is reshaped to `[group_size, n_groups, kernel_size]` (channel innermost, so
+  `(c,t)` is `c + width*t`) while the dynamic is `[n_groups, kernel, 2, tokens]`
+  (so `(g,t,side)` is `g + n_groups*t + side*n_groups*kernel`).  Both were wrong;
+  fixing base first took the anchor row — which only ever uses tap 0 — to cos
+  0.999997, which is what isolated the second error to the tap/side coefficients.
+* the draft's rope **rotates the whole `head_dim`**.  `dimension_sections` is
+  `[64,0,0,0]` and reading `sections[0]` as the rotated width gives 64; the
+  reference rotates 128.  That is a fixed ~0.7 % on every attention score, invisible
+  in any aggregate, and compounds to cos 0.79 by layer 4.  Measured against
+  `DFLASH_REF_CUR` at pos0=204: n_rot 32/64/96/128 → 0.9930 / 0.9932 / 0.9947 /
+  **0.999991**.
 
-and the removal does not land where the table says.  With both removed,
-`attn_norm`, `attn_conv_proj`, `wo` and `ffn_down` all report **0.0** - not because
-they are free, but because with the heavy kernels gone the queue drains faster
-than the host submits and nothing blocks.  **So the three numbers do not add up to
-20.8, and A/B subtraction is not a valid attribution on an in-order queue**; the
-only sound figure is the wall clock, 20.8 ms against a 4.67 ms weight-stream floor.
+`attn_sinks` is wired up (ggml's `ggml_soft_max_add_sinks` semantics: one extra key
+per query head, score `sinks[h]`, value 0, so the whole effect is a factor
+`z / (z + exp(sink - max))`) but **this GGUF carries no such tensor** — 15 `blk.N.*`
+tensors, `attn_sinks` not among them, and llama.cpp creates it `TENSOR_NOT_REQUIRED`.
+So it is a no-op here; it is wired rather than assumed absent because a draft that
+*does* carry sinks would be wrong on every head.
 
-**All three of those subtractions are invalid, and so was the device-side table that
-was supposed to replace them.**  The host numbers above attribute 16.8 of 20.8 ms to
-`norm + attn_conv_proj + attn conv0`, which is why the FFN looked free.  Both
-methods were wrong, in the same direction, and the second one was wrong *because* of
-three bugs in its own arithmetic rather than in the model:
+#### The one genuinely slow kernel is the draft's top-k, and it is 100x off the floor
 
-* the segment accumulation ran **once after the layer loop**, so it differenced the
-  **last** layer's markers - every number was one layer's, not five;
-* the markers are **not in index order** (program order is `0, 6, 5, 1, 3, 4`), so
-  `for (i = 3; i < 6; i++) df_seg[i] += seg_e[i+1] - seg_e[i]` differenced two
-  early markers against two late ones and printed **-3.60 ms**;
-* `seg_e[0]` sat **outside** the loop while every other marker was inside it, so
-  segment 0 measured "before layer 0 -> layer 4's norm", i.e. nearly the whole
-  forward.  That single line is what produced "the RMSNorm is 82%": five RMSNorms
-  moving 614 KB do **not** take 16.4 ms; they take **0.36 ms**, 0.07 ms per layer,
-  and no host-side cost in `rmsnorm_launch` explains a millisecond either (caching
-  the work-group width in a function-local static changes nothing: 16.3 ms before
-  and after, so it was never the device-registry lookup that `AGENTS.md` warns about
-  elsewhere).
+The readout does a top-16 over `[M=6][n_vocab=248320]` logits — 5.96 MB — and
+measured **2.06 ms**, about 2.8 GB/s where the floor is ~300 GB/s.  It is not the
+obvious suspect: transposing the per-lane top-K SLM lists from `[tid][k]` to `[k][tid]`
+removes a real 16-way bank conflict (stride-16 floats put all 256 lanes on two banks,
+hit on every one of ~970 element compares *and* 16x per reduction round) and changes
+nothing, 2.06 → 2.11 ms.  It was **six workgroups on a 512-EU GPU**: one workgroup
+per row is all the parallelism `M=6` allows.  `df_topk_launch` now reduces `S` slices
+per row into `[M][S][K]` partials and merges them with one more workgroup per row;
+`PF_DFLASH_SLICES` overrides `S`.
 
-Fixed, the device timeline accounts for itself and the profile is **flat**:
+Two things about that implementation are worth not re-deriving.  The slices must be
+**one launch** covering `M*S` workgroups with the bounds computed from the group
+index — the first version submitted one kernel per slice so the bounds could be
+literal, which serialized the work and measured **8.0 ms, 4x worse**.  And the
+optimum is **not** the occupancy-maximising value: `S=1/8/32/64/128/256` measures
+`2.09/1.39/1.52/1.69/1.70/1.67 ms`, so `S=8` ships.  Past 8 the merge and its `S*K`
+candidates cost more than the parallelism buys, which is the tell that the kernel is
+**latency-bound on its per-lane SLM insertion chain**, not bandwidth-bound — 1.39 ms
+for 5.96 MB is still ~4 GB/s.  A real rewrite would be a per-lane threshold in a
+register plus a warp-ballot merge, not more slices.  Net: topk 2.06 → 1.39 ms, draft
+28.0 → 26.9 ms, cycle 122.9 → 121.8 ms, output byte-identical.
+
+The draft's readout tail also looked like 5.7 ms of host work and is 1.8 ms of device
+work (`PF_DFLASH_TOPTIME` vs `PF_DFLASH_DTTAIL`); the lattice walk itself is free
+(0.001 ms), so the whole tail is the two kernels and the blocking wait.
+
+#### A lesson worth more than the numbers: A/B subtraction is not attribution here
+
+**`PF_DFLASH_OPTIME` (per-op, inserted by LINE NUMBER — every text-anchored insert
+landed in the injection path, which shares this code) must NOT be read as device
+time.**  It attributed 16.8 of 20.8 ms to `norm + attn_conv_proj + attn conv0`, which
+is why the FFN looked free; and `gate+up` was reported reading 167 MB of weights in
+0.2 ms, which is impossible on an in-order queue — it submits, and the device time is
+charged to whoever waits next.  Pricing the same phases with no-op knobs
+(`PF_DFLASH_NOGEMM` / `PF_DFLASH_NOCONV`, both produce wrong results and exist only
+for this) shows the smear directly: everything 20.8 ms, convs removed 17.8, GEMMs
+removed 14.0, both removed 12.1 — and the removal does not land where the table says.
+With both removed, `attn_norm`, `attn_conv_proj`, `wo` and `ffn_down` all report
+**0.0**, not because they are free but because the heavy kernels are gone and nothing
+blocks.  **So the three numbers do not add up, and A/B subtraction is not a valid
+attribution on an in-order queue**; the only sound figure is the wall clock.
+
+The device-side table meant to replace it had three bugs of its own: the segment
+accumulation ran **once after the layer loop**, so it differenced the *last* layer's
+markers; the markers are **not in index order** (program order is `0, 6, 5, 1, 3, 4`),
+so an index-order loop differenced two early markers against two late ones and
+printed **-3.60 ms**; and `seg_e[0]` sat **outside** the loop while every other marker
+was inside it, so segment 0 measured "before layer 0 → layer 4's norm" — that single
+line produced "the RMSNorm is 82 %".  Five RMSNorms moving 614 KB take **0.36 ms**,
+0.07 ms per layer.
+
+Fixed, the device timeline accounts for itself and the profile is flat:
 
     anorm=0.36  acproj=1.71  aconv0=2.27  attn=7.05          (qkv+rope+attn+wo+conv1)
     ffn: norm+cproj+cconv=1.89  gate_up=2.75  down+cconv=4.33
     sum=20.35   devspan=20.37   hostwall=20.70 ms
 
-`sum ≈ devspan` to 0.1% is the check that matters: `devspan` is the first layer's
+`sum ≈ devspan` to 0.1 % is the check that matters: `devspan` is the first layer's
 start barrier to the last layer's end barrier, so **the forward is device-bound**
-(20.37 of 20.70 ms), not submission-bound - which A/B subtraction could never have
-told you, and which is why the FFN's 8.97 ms is real and not "free".  There is no
-82% hotspot: the largest single item is the attention path at 35%, then
-`ffn_down + conv1` at 21%.  The FFN is *not* near its bandwidth floor after all -
-278 MB at 159 GB/s was measured on one layer's share of a mis-attributed total.
+(20.37 of 20.70 ms), not submission-bound — which A/B subtraction could never have
+told you.  There is no 82 % hotspot: the largest single item is the attention path
+at 35 %, then `ffn_down + conv1` at 21 %.
 
-**The lesson is the one this file already records elsewhere, and it is worth
-restating because it cost two sessions: a broken verifier is worse than none.**
-Here the verifier was self-consistent enough to look authoritative - it printed
-plausible positive numbers, one segment dominated, and the dominant segment had a
-ready-made physical story attached ("0.037 GB/s is impossible, so look at the host
-path").  Every one of those numbers was a mis-differenced timestamp.  **A timing
-breakdown must be checked against an independent total before it is believed**;
-`devspan` exists for exactly that, and `sum ≈ devspan` should have been the first
-thing printed rather than the last thing added.
+**The lesson is the one this file already records elsewhere: a broken verifier is
+worse than none.**  Here the verifier was self-consistent enough to look
+authoritative — plausible positive numbers, one segment dominating, and a
+ready-made physical story attached to it ("0.037 GB/s is impossible, so look at the
+host path").  Every one of those numbers was a mis-differenced timestamp.
+**A timing breakdown must be checked against an independent total before it is
+believed**; `devspan` exists for exactly that, and `sum ≈ devspan` should be the
+first thing printed rather than the last thing added.
 
-**The verify is at its structural floor - measured, not assumed.**  A `k` sweep
-prices it to 0.1 ms against the weight-stream model:
+#### Comparing against llama.cpp
 
-    k          1      2      3      5      7
-    verify   71.9   76.3   80.0   90.8  105.0 ms
+Acceptance against llama.cpp at the same `n_max` (short prompt, mean accepted tokens
+per cycle), from the pass that introduced the drafter — **not re-measured
+2026-10-09**, because it needs patched llama.cpp probes and this box's
+`~/llama.cpp/build/bin` has no DFlash tool:
 
-i.e. 72.2 ms fixed + ~5.5 ms per extra row, and `53.93 (streaming) + 3.67 x
-(k) + ~18.5 (non-GEMM) = 90.8` at k=5.  The fixed part is one plain decode's
-weight pass.  The one thing that had cost 210 ms on the MTP path - an ungraphed
-direct replay - is **not** happening here: DFlash's verify goes through
-`mtp_verify`'s recorded graphs and it is live (`PF_DFLASH_VFCHK` prints
-`vf_dec_ok`, the row count and the graph count: 1, 6, 378).  So the only two
-levers left are fewer weight bytes and a faster dp4a, and both are already
-priced and rejected above (`PF_W4_K5` -5.7% at 4.60% mean weight error,
-`PF_W4_ALL` -29% bytes at ~8x error; DPAS 16-24x the issue rate and 37x slower
-in a real GEMM).  **Do not re-derive either.**
+| generated | 32 | 116 | 227 |
+|---|---:|---:|---:|
+| llama.cpp | 4.43 | 3.96 | 4.13 |
+| this engine | 4.75 | 3.90 | 3.92 |
 
-**The one genuinely slow kernel is the draft's top-k, and it is 100x off the
-floor.**  The readout does a top-16 over `[M=6][n_vocab=248320]` logits - 5.96 MB -
-and measured **2.06 ms**, about 2.8 GB/s where the floor is ~300 GB/s.  It is not
-the obvious suspect: transposing the per-lane top-K SLM lists from `[tid][k]` to
-`[k][tid]` removes a real 16-way bank conflict (stride-16 floats put all 256
-lanes on two banks, hit on every one of ~970 element compares *and* 16x per
-reduction round) and changes nothing, 2.06 -> 2.11 ms.  It was **six workgroups on
-a 512-EU GPU**: one workgroup per row is all the parallelism `M=6` allows.
-`df_topk_launch` now reduces `S` slices per row into `[M][S][K]` partials and
-merges them with one more workgroup per row; `PF_DFLASH_SLICES` overrides `S`.
+On a 204-token prompt both engines drop (llama.cpp 0.239 / mean 2.07, this engine
+0.81 / 1.81), so the long-context gap is ~12 %, not the 5x an earlier broken state
+suggested.
 
-Two things about that implementation are worth not re-deriving.  The slices must
-be **one launch** covering `M*S` workgroups with the bounds computed from the
-group index - the first version submitted one kernel per slice so the bounds
-could be literal, which serialized the work (each submit still had only 6
-workgroups) and measured **8.0 ms, 4x worse** than the original.  And the
-optimum is **not** the occupancy-maximising value: `S=1/8/32/64/128/256` measures
-`2.09/1.39/1.52/1.69/1.70/1.67 ms`, so `S=8` ships.  Past 8 the merge and its
-`S*K` candidates cost more than the parallelism buys, which is the tell that the
-kernel is **latency-bound on its per-lane SLM insertion chain**, not
-bandwidth-bound - 1.39 ms for 5.96 MB is still ~4 GB/s.  A real rewrite would be
-a per-lane threshold in a register plus a warp-ballot merge, not more slices.
-Net: topk 2.06 -> 1.39 ms, draft 28.0 -> 26.9 ms, cycle 122.9 -> 121.8 ms, output
-byte-identical.
+**Compare element-wise, never by fingerprint.**  `DFLASH_REF_{NOISE,CUR,FFNIN,
+FFNCONV,FFNOUT,XNORM,DYN,HIDDEN,LAYER}` publish a tensor at a layer chosen by
+`DFLASH_REF_IL=<il>` (default 0), and `DFLASH_REF_BIN=<path>` writes it raw; on this
+side `PF_DFLASH_BIN=<path>` does the same, with `PF_DFLASH_SIGALL` adding every layer
+and `PF_DFLASH_{SIG,GEMMCHK,PROJCHK,CONVCHK,CONVCHKALL,BASECHK,ROWRMS,EMBCHK,INJCHK}`
+selecting probes.  `rms`/`max`/`first`/`top-6` say how big a divergence is but never
+where, and the anchor row carries an order of magnitude more energy than the mask
+rows, so a whole-batch aggregate is **not comparable with llama.cpp's per-position
+print at all** — an aggregate that said the `wo` output was 30 % low was comparing
+two different things.  llama.cpp's copy-out is fixed at `n_embd` wide, so a narrower
+tensor has to be padded on its side (`DFLASH_REF_DYN` does this).
 
-The draft's readout tail also looked like 5.7 ms of host work and is 1.8 ms of
-device work (`PF_DFLASH_TOPTIME` vs `PF_DFLASH_DTTAIL`); the lattice walk itself
-is free (0.001 ms), so the whole tail is the two kernels and the blocking wait.
+**A diagnostic whose identity depends on when it fired needs that context in its
+name.**  Four confident wrong answers came from this, and they cost more time than
+the bugs did: reading the f16 ring as f32 (1e12 rms garbage and a 104/205 "coverage
+gap"); reading the layer output from `d_df_h` instead of `d_df_c`, which fabricated a
+clean-looking error-accumulation curve; naming dumps by layer alone, so a later block
+overwrote an earlier one and two readings of one layer disagreed by exactly one layer
+(which produced a very convincing "layer 4 reads the wrong tensor" — the layer index
+was being set in a *different* function, by a `replace(...,1)` that matched the first
+of two identical `const dflash_layer_t &` declarations, the same mistake that
+segfaulted a probe); and `df_conv_check` keeping the pre-fix index derivation, so
+after the conv axes were corrected it reported the difference between two formulas
+while presenting itself as a verification of the conv, and reported host 0.805 vs dev
+1.545 at layer 0.
 
-The verify, by contrast, is unchanged and still done: 91.6 ms = 72.2 + 4.75 x (k-1),
-i.e. one plain decode's weight pass plus 4 ms per extra row, and see the
-DPAS/pipelining sections above for why neither is movable.
-
-### Three bugs the new DFlash2 tests found
+### What the new DFlash2 tests caught
 
 `tests/backend/gpu/kernels/test_dflash_kernels.cpp` (top-k + conv vs host
 references) and `tests/engine/test_spec.cpp` (both drafters vs the plain greedy
 decode) each found a real bug that nothing else could reach.  All three are the
 shape AGENTS.md keeps warning about: **a plausible-looking thing that is wrong,
-and that nothing in the product path happens to exercise.**
+and that nothing in the product path happens to exercise.**  (These are *not* the
+three forward bugs above — those were found by diffing against llama.cpp.)
 
 1. **`df_conv_launch` had a latent launch-geometry bug.**  It used a fixed
    256-thread local size, so SYCL rejected any `n_rows*width` that was not a
@@ -1464,26 +1178,18 @@ and that nothing in the product path happens to exercise.**
    test harness or a second-model server hits immediately and the CLI never does,
    because `main.cpp` builds one engine and routes by `--spec-type`.
 
-Two things `test_spec` does that are worth stating.  It asserts **stream
-equality against an explicitly non-speculative `generate_plain` decode**, not
-acceptance: a broken verify can
-accept at a perfectly healthy rate and still emit the wrong text, because
-acceptance only compares against the target's own argmax on the rows it kept.
-And it runs **one engine per process** (re-execing itself per configuration),
-because a second engine in the same process inherits state from the first - an
-MTP-enabled engine followed by a DFlash one fails at construction, while each
-alone and the reverse order both work.  The CLI never hits that because it builds
-one engine; the test would otherwise have encoded the limitation as a failure.
-
-Historical verification (before `test_spec` acquired an independent plain
-oracle): `test_dflash_kernels` 50 checks / 0 failures; `test_spec` four
-configurations returned OK, but their old `generate()` oracle routed through
-the same drafter and did not prove stream equivalence; `test_gpu_stages` all
-stages OK; `test_gpu_vs_ref` argmax SAME;
-`test_forward` reported input last_id=198 (not a prediction); `test_decode_vs_prefill` OK.  A 48-token greedy DFlash
-generation is byte-identical before and after all three fixes (stdout md5
-`19edba39...`) - note the earlier md5 comparison that "changed" was including
-stderr's variable KV/prefix-cache exit lines, not the generated text.
+Two things `test_spec` does that are worth stating.  It asserts **stream equality
+against an explicitly non-speculative `generate_plain` decode**, not acceptance: a
+broken verify can accept at a perfectly healthy rate and still emit the wrong text,
+because acceptance only compares against the target's own argmax on the rows it
+kept.  And it runs **one engine per process** (re-execing itself per
+configuration), because a second engine in the same process inherits state from the
+first - an MTP-enabled engine followed by a DFlash one fails at construction, while
+each alone and the reverse order both work.  The CLI never hits that because it
+builds one engine; the test would otherwise have encoded the limitation as a
+failure.  It now also covers the two-engines-in-one-process case explicitly
+(`TEST_SPEC_ONLY=two_engines`), because that is a real configuration and the
+limitation should be documented rather than dodged.
 
 ### OpenAI-compatible API
 
@@ -1686,9 +1392,11 @@ stream wait; default off, the in-order queue already orders them).
 `PF_GEMM_ROW`, `PF_GEMM_TILE`, `PF_GEMM_SPLIT`, `PF_GEMM_WG`, `PF_GEMM_SG`,
 `PF_GEMM_XSLM`, `PF_GEMM_ARCH`, `PF_MT_R`/`PF_MT_R2`, `PF_MT_TB`, `PF_MT_WG`,
 `PF_MT_WG2`, `PF_MT_PF`, `PF_MT_SLM`.
-`PF_NATPF` / `PF_NATPIPE` (both default on, and both measured **losses** - see the
-software-pipelining note above; `0` keeps the in-place weight load / the serial
-load->barrier->compute form).
+`PF_NAT` (`0` disables `nat_gemm_launch` and falls back to the oneDNN grouped-scale
+matmul + epilogue).  The two software-pipelining forms that used to sit in this list
+(`PF_NATPF` / `PF_NATPIPE`) were **removed**, not just defaulted off — the shipped
+schedule is the one that measured fastest, so a knob to re-enable a measured loss is
+a trap.  A real rewrite would have to beat the occupancy argument in *MTP* first.
 
 **GDN**
 `PF_GDN_COLS` (state columns/warp, default 2), `PF_GDN_WG` (warps/WG, default 8),
@@ -1838,7 +1546,7 @@ the note above), `PF_DFLASH_BTIME` (draft block phase split),
 `PF_DFLASH_CONVCHK` / `PF_DFLASH_CONVCHKALL`, `PF_DFLASH_PROJCHK` /
 `PF_DFLASH_PROJCHKALL`, `PF_DFLASH_BASECHK` (the conv base tensors are byte-identical
 device-side), `PF_DFLASH_GEMMCHK`, `PF_DFLASH_ROWRMS`, `PF_DFLASH_EMBCHK`,
-`PF_DFLASH_INJCHK`, `PF_DFLASH_INJTRACE` (ring V readback + coverage),
+`PF_DFLASH_INJP`, `PF_DFLASH_INJTRACE` (ring V readback + coverage),
 `PF_DFLASH_ATTNCHK`, `PF_DFLASH_LAYER_W4` (int8 instead of the native u4 store for
 the draft layers - an A/B, costs 2 %), `PF_DFLASH_ROWED` (one row at a time),
 `PF_DFLASH_SPLITQ` (split activation quantisation - **this one is load-bearing**,
@@ -1869,6 +1577,47 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
 `PF_SI4` (SIn 4-bit), `PF_META`.
 
 ## Invariants and gotchas
+
+* **`compute_backend::synchronize()` must actually wait, and the CPU backend's used
+  to be an empty override — which was a heap use-after-free, not a slow path.**
+  `cpu_backend.cpp` is compiled with `-fno-sycl` (it is in `SI_CPU_SOURCES`, outside
+  the device pass), so it has no queue to wait on and the override compiled fine
+  while doing nothing.  `engine::sync_all()` has ~24 call sites, so on a CPU
+  partition **every one of them was a no-op**.  The prefix cache then handed a
+  temporary `std::vector` to an asynchronous `queue::memcpy` and returned — the
+  vector was freed while the copy was still in flight.  It surfaced only as
+  `test_pc_cpu` failing, and the diagnostic trail is worth remembering: the KV
+  comparison passed (36/36 blocks identical) while the *logits* differed, because
+  the corruption was in a later host→device copy, not the KV one.  The fix is a
+  waiter handed in at construction — single device `[this]{ q.wait(); }`,
+  multi-device `[this, i]{ dev_queue(i).wait(); }`, and **`dev_queues_` cannot be
+  used directly for the CPU index because a CPU partition's entry is null and it
+  segfaults**.  **Generalisation: an override that exists only because the base
+  class declares it is a silent no-op waiting to happen — if a virtual has no effect
+  in one backend, assert it, do not leave it empty.**  A narrow test will not find
+  this class of bug: `test_pc_cpu` originally compared only three layer-0 K blocks,
+  and widening it to 36 units across all block-offset phases is what finally
+  localised the fault.  See `docs/design/06-prefix-cache.md`.
+
+* **A heterogeneous `--layer-map` is supported, not an error.**  A layer map may span
+  GPUs that resolve to different `si::dev::profile`s (e.g. A770 + Iris Xe).  Each
+  device gets its own profile resolved per queue, and the engine reports the mix at
+  startup under `PF_DEVICE_INFO=1` rather than refusing.  This matters because
+  launchers must use `si::dev::for_queue(q)` and `wg_clamped_for_queue(q, want)` — a
+  single process-wide `active()` would mis-tune the second card *and* could launch a
+  work-group it cannot accept (A770 accepts 1024 threads, Iris Xe only 512), which
+  is a launch failure, not a slowdown.  The lookup keys on `sycl::device` equality
+  and costs 0.039 us per launch.
+
+* **"The projector loaded" is not "the projector can run".**  `vision_model` (and the
+  audio tower) will happily load a GGUF whose geometry the kernels do not implement
+  — the remote mmproj files all have `head_dim 72` where only 64 is implemented, or a
+  `proj_dim` that does not match the text width — and then abort on the first
+  forward, *after* the model is loaded and after 23 checks have already passed.
+  `vision_model::runnable()` exists so a caller can ask that question up front and
+  report "loads but cannot run" instead.  **If you add a geometry constraint, add it
+  to `runnable()` as well as to the forward's check**, or the distinction is
+  invisible.
 
 * **The GGUF mmap is paged out of the host after the weights reach a device.**
   `model::page_out_host` does `madvise(MADV_DONTNEED)` + `posix_fadvise` on the

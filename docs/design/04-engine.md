@@ -49,7 +49,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 4. **MTP 第二个门控**（`engine.cpp:141-149`）：`mtp_on` 需要 `multi_dev && md_xmx`，否则打印
    `[mtp] MTP needs a multi-device oneDNN int8 partition (...) - disabled` 并回落普通 decode。
    再校验 `--mtp-device` 在范围内（越界退回 0）。
-5. **split 策略**（`engine.cpp:154-172`）：`cpu_mode` 强制 `n_splits = dec_splits = 1`；`multi_dev`
+5. **split 策略**（`engine.cpp` 里定 `n_splits`/`dec_splits` 的那段）：`cpu_mode` 强制 `n_splits = dec_splits = 1`；`multi_dev`
    默认也钉成 1，`PF_MD_SPLITS=1` 才选回 split 路径（MTP 草稿**不**受此门控，它有自己的
    `mtp_splits`）。
 6. **权重上传**：`m.upload(q, /*host=*/cpu_mode || multi_dev)`——GPU 单设备拷整文件；CPU 只把
@@ -57,7 +57,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 7. `PF_META` → `build_meta32`（默认关）；`PF_DP4A` → `pf8`、`pf8_dec`（默认都开，且 `pf8` 在
    `multi_dev` 下强制 false）。GPU 在 `pf8` 时 `m.build_w8(q)`（约 700 MB）；CPU 读 GGUF 整数
    block，**不建 w8**。
-8. **decode split + 前缀缓存配置**（`engine.cpp:203-361`，同一块里顺序执行）：`PF_DEC_SPLIT` 覆盖，
+8. **decode split + 前缀缓存配置**（`engine.cpp` 里解 `PF_DEC_SPLIT` 与前缀缓存预算的那段，同一块里顺序执行）：`PF_DEC_SPLIT` 覆盖，
    否则按设备 profile 推导 `dec_splits = max(8, ((warps_per_eu_x2*compute_units)/(2*n_head))/8*8)`，
    上限 `kMaxDecSplits`；`PF_PREFIX_CACHE`；算 `pc_state_floats`；由 `PF_PC_STATES` /
    `PF_PC_VRAM_MB` / `PF_PC_MEM_MB` 得 `pc_max_states`；RAM/磁盘预算；用 `kv_cap_mb` 收缩三层预算
@@ -70,7 +70,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
     `pool_initial = n_blocks_`；`PF_KV_GROW` → `pool_chunk`（默认 64）。
 11. **关键**：`n_blocks = pool_cap`（506，指向预留而非已提交），因此 `kv_layer_stride` 与录制进图的
     每层基址在池增长时保持稳定。
-12. `alloc_buffers()`（1678）→ `build_graphs()`（`engine_graph.cpp:1698`）→
+12. `alloc_buffers()`（1678）→ `build_graphs()`（`engine_graph.cpp`）→
     `release_host_weight_pages()`（`engine.cpp:1008-1073`，把 GGUF mmap 里 GPU 侧不再读的页丢掉；
     CPU 分区与其 tensor 保留，因为它们的 kernel 直接读 mmap）。
 
@@ -87,7 +87,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 
 * `zero_slot(slot)`（`engine.cpp:1911-1935`）：memset 一个序列的 GDN + conv 状态；多设备下状态在
   各自分区的 `as_[dev]` 里，索引用 `layer_gdn_local_[il]`，并走该设备的 queue。
-* `reset_state()`（`engine.cpp:1936-1970`）：清零所有 slot 递归状态、memset `d_info`、**从
+* `reset_state()`（`engine.cpp` 的 `engine::reset_state`）：清零所有 slot 递归状态、memset `d_info`、**从
   `hp.rope_sections` 恢复 `mrope_sections`**（memset 会清掉这个模型常量）、清空所有 `pc_slot_`、
   释放 pending 检查点预留。
 * `reset_single()`（`engine.cpp:1972-1984`）：先 `reset_state()`，再设 `n_rows=1, tpb=kMaxT,
@@ -119,13 +119,13 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 | `d_img_embd` | `kMaxImgTokens * n_embd` |
 
 * `kv_layer_stride = n_blocks * kv_block_bytes()`（`n_blocks` 是预留；单设备在
-  `engine.cpp:1717`，多设备在 `engine_kvpool.cpp:193`）。
+  `engine.cpp` 的 `kv_layer_stride = n_blocks * kv_block_bytes()`，多设备在 `engine_kvpool.cpp`）。
 * `d_gdn_state` / `d_conv_state` 按 **layer-major** 索引进分配（`[n_gdn][kMaxB][...]`），尽管头注释
   写作 `[kMaxB][n_gdn][...]`；实际索引是
   `state + layer_index*kMaxB*per`（`engine_graph.cpp:928-929`，单设备用
   `m.gdn_layer_index[il]`、多设备用 `layer_gdn_local_[il]`；`zero_slot` 里同样，
   `engine.cpp:1924-1930`）。多设备下这两块不进单设备成员，而是每个分区在 `as_[dev]` 里各有一份，
-  状态**从不跨分区边界**，只交接隐状态（`engine.cpp:759-764`）。
+  状态**从不跨分区边界**，只交接隐状态（`engine.cpp` 里按分区分配递归状态那段）。
 * `d_info` 是 `sycl::malloc_host<step_info>`（host USM），清零；`d_info2_` 是多设备 prefill 流水线的
   第二份（同时在飞的 chunk）。
 * 段数组：`d_segs_dec`（1024，**已废弃**：只分配和释放，无任何读写点，engine.cpp:1736 / 587）、
@@ -190,7 +190,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
   `c.i8` 只对 CPU 分区（单设备 CPU，或多设备的 CPU 后端）置位——它让 CPU 的整数 kernel 直接读
   GGUF block，不建 w8。
 * `mk` 构造 fp32 段：`w = wkey(dev, w.data)`、`meta32 = meta32_of(w.data)`。
-* `wkey`（lambda，`engine_graph.cpp:101-111`）与 `engine::wkey`（`engine.h:177-187`）同义：
+* `wkey`（lambda，`engine_graph.cpp` 的 `wkey` lambda）与 `engine::wkey`（`engine.h:255` 的 `wkey` lambda）同义：
   已上传到该分区的用设备指针，否则用 host 指针——**后者正是该张量的 oneDNN key**，因为转换器跳过
   了每个被转换张量的原始上传。
 
@@ -435,14 +435,14 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
 
 ### 7.1 批处理 API（调用者持有 `engine::mtx`）
 
-* `prefill_chunk(toks, start, n, slot, with_head=true)`（`engine.cpp:1986-2042`）：
+* `prefill_chunk(toks, start, n, slot, with_head=true)`（`engine.cpp` 的 `engine::prefill_chunk`）：
   先补完挂起的流水线 chunk（`prefill_flush` + `sync_all`）并清 `pf_info_`，再
   `pc_capture_begin` → 填 `d_info`（`n_rows=1, tpb=kMaxT, n_real=n, n_real_row[*]=n,
   pos[0]=start, slot, active, tokens`）→ 分三条路：`cpu_mode || multi_dev` 直接
   `record_forward(1, plan_pf8_ / plan_pf8_nh_ / plan_pf_slot[si], …)`（fp32 时按
   `round_up(n, kPfSlice=8)` 选最小的一份），`PF_NOGRAPH&&pf8` 直接 `record_forward`，否则重放
   `e_pf8`/`e_pf8_nh`/`e_pf` → `pc_active=0` → `sync_all()`。
-* `prefill_text(toks, slot, n)`（`engine.cpp:2050-2064`）：**文本 prompt 的首选入口**，循环取
+* `prefill_text(toks, slot, n)`（`engine.cpp` 的 `engine::prefill_text`）：**文本 prompt 的首选入口**，循环取
   `batched_prefill_fit(rem)`（CPU 恒为 0）喂 `prefill_batch`，只有 `< kMaxT` 的尾巴（或无可用
   批量变体时）落回 `prefill_chunk`。
 * `prefill_batch(toks, start, n, slot, pos0)`（`engine.cpp:2123-2196`）：mode 2 的 chunk-batched
@@ -584,7 +584,7 @@ head 已经不再上传它。`d_segs_aux` 的 fp32 回落仍然保留，但只�
 ## 10. 已知细节与注意点
 
 * `pf8_dec` 默认 on（单设备 GPU 与 CPU 都走 int8 decode，除非 `PF_DP4A_DEC=0`）。**多设备下
-  `pf8 == false`**（`engine.cpp:190`、`1547`），decode 的 int8 走分区机制（`w8_dev_` 或
+  `pf8 == false`**（`engine.cpp` 的 `use_dnnl` / `md_xmx` 选择），decode 的 int8 走分区机制（`w8_dev_` 或
   `dnnl_dev_`），不是这两个开关。
 * 无 head 的 prefill 变体（`plan_pf8_nh` / `plan_pf_nh_slot`）由 `seg_plan::has_head=false` 标记，
   `record_forward` 只在 `plan.has_head` 时重放最后一个 call，因此不会重跑 `ffn_down`。
@@ -595,7 +595,7 @@ head 已经不再上传它。`d_segs_aux` 的 fp32 回落仍然保留，但只�
   某个读 plan 期状态的地方。prefill 因此一次只跑一条序列（每条 ~300 ms）；多请求的收益全部来自
   decode batching。修好它需要"同一批 N 个请求必须逐字节相同"的对照 harness，并先把 decode batch
   钉成 1 以隔离变量。
-* 调度器 `loop` 在引擎调用期间**释放序列互斥量 `m`**（`scheduler.cpp:157`、`234`、`359` 的
+* 调度器 `loop` 在引擎调用期间**释放序列互斥量 `m`**（`scheduler.cpp` 的 `scheduler::loop`、`234`、`359` 的
   `lk2.unlock()`），否则 `submit()` 被饿死、请求只能一条接一条跑完。`e.mtx` 仍然串行化引擎本身。
 
 ---
@@ -688,7 +688,7 @@ MTP 需要 GGUF 里有一个额外的**全注意力块** `blk.<n_layer>.*`（由
 `nextn.shared_head_head`（没有就退回 `m.output`）。参考模型 `Qwen3.8-27B-UD-Q4_K_M.gguf` 有，
 0.8B 没有。因此：
 
-1. **没有 NextN 头**（`engine.cpp:108-111`）→ 打印
+1. **没有 NextN 头**（`engine.cpp` 的「无 NextN 头」门控）→ 打印
    `[mtp] model has no NextN (blk.%d.nextn.*) layer - MTP disabled`，`mtp_k = 0`。
 2. **没有 multi-device + oneDNN int8 分区**（`engine.cpp:141-149`，条件 `multi_dev && md_xmx`）
    → 打印 `[mtp] MTP needs a multi-device oneDNN int8 partition (...) - disabled`，
@@ -747,7 +747,7 @@ int 而不是 `(k+1)*n_vocab` 个 float（k=6 时约 7 MB/cycle）。旧的纯�
 （整个 cycle 的 24%，`mtp_argmax.cpp:1-12`），设备化后 **1.2 ms/cycle（28x）**。
 `PF_MTP_AMCHK` 打印设备/主机 argmax 的不一致行（实测 0 条）。注意：这一步**不带来整体加速**——
 2000 token 生成实测 200.2/199.8 s（主机扫描）对 199.8/200.1 s（设备），user+sys CPU 时间两路都是
-约 150 s（`engine_mtp.cpp:704-713`）：拷贝从来不在关键路径上（verify 自己的 sync 主导，拷贝与下一个
+约 150 s（`engine_mtp.cpp` 的 `mtp_rollback`）：拷贝从来不在关键路径上（verify 自己的 sync 主导，拷贝与下一个
 cycle 的 draft 重叠）。保留它是因为主机工作量严格更少且输出逐位相同。
 
 ### 12.3 权重存储与 `do_split` 规则
@@ -801,8 +801,24 @@ MTP 层的 plan 是手工构造的 5 个 call（`build_mtp_plan`，`engine_mtp.c
   往返。
 * **`PF_MTP_ADAPT`（默认开）**：一个 cycle 接受 ≤1 个草稿（`j <= 1`）就把 draft 长度减 1，全接受
   （`j == k`）再加回来，上限仍是 `--mtp`（缓冲覆盖得到），且**永不改变输出流**（acceptance 与 k
-  无关）。实测低 acceptance 的 prompt 42.0 → 38.7 ms/token，高 acceptance 的自动把 k 升到上限、
-  27.5 ms/token（`engine_mtp.cpp:1121-1132`、`1523-1530`）。
+  无关）。**但它的收益符号随 prompt 变，所以两种设置都要测**（2026-10-09，三个 prompt，
+  每格独立进程，`PF_PREFIX_CACHE=0`）：
+
+  | prompt | adapt | acc | cycle ms | ms/token |
+  |---|---|---:|---:|---:|
+  | code continuation | on | 2.08 | 99.0 | 36.4 |
+  | technical explanation | on | 1.84 | 100.5 | 39.2 |
+  | story opener | on | 0.84 | **88.8** | 52.5 |
+  | code continuation | off | 2.50 | 106.0 | 34.3 |
+  | technical explanation | off | 2.33 | 105.8 | 35.4 |
+  | story opener | off | 1.18 | 105.7 | 53.2 |
+
+  关掉时 cycle 在三个 prompt 上**恒定 ~106 ms**（`draft` 17.5、`verify` 87.0-87.2、
+  `commit`+`rollback` 1.2），而加速比横跨 1.33x-1.96x——**引擎没有任何差异，差的只是
+  NextN 头猜对几个 token**。开着时 acceptance 塌掉的 story prompt 得到更便宜的 cycle
+  （88.8 ms，因为要 verify 的行更少），但两个高 acceptance prompt 净亏 5-6 ms/token，
+  第三个打平。此前文档把它记成无条件获益（42.0 → 38.7 / 27.5 ms/token），那是**从一对
+  prompt 过度推广**的。
 * **`PF_MTP_LAYER_EXACT` 的一个陷阱**：`exact` 判定**不能**做成函数内 `static`，否则它会锁住第一次
   调用（MTP prefill 的 `n = 13`）的 `ci`/`M`，之后每次都错——这个探针就是这样一度读到 acc = 0
   而看不见任何 exact GEMV（`engine_mtp.cpp:212-228`）。另外 fp32 反量化 GEMV 只为 `TB ∈ {1,8,16,32}`
@@ -899,9 +915,24 @@ MTP 层的 plan 是手工构造的 5 个 call（`build_mtp_plan`，`engine_mtp.c
 **加速比由 acceptance 上限**：`speedup = n * T_plain / (T_plain + X)`，`n = 1 + 接受的草稿数`。
 `PF_MTP_STEPS=1` 给出的 `reach[j] = 75/53/37/28/15/6 %`（k=6）是一条干净的几何衰减
 **p ≈ 0.70**，**没有 step-0 崩塌**——说明草稿的隐状态是对的，衰减来自 MTP 层自身的精度，而精度又已
-被 `PF_MTP_LAYER_EXACT` 证明不是可动的杠杆。最终实测（每格一个进程，普通 decode 69.10 ms/token）：
-代码续写 **2.16x**（k=4）、技术解释 **1.97x**（k=3）、故事开头 1.35x（k=2；它的天花板就是
-`n = 1 + acc = 2.23`）。k 的扫面（`main.cpp:253-259`，带 u4 草稿头，两个 prompt）给出
+被 `PF_MTP_LAYER_EXACT` 证明不是可动的杠杆。
+
+**2026-10-09 重测**（每格独立进程，`PF_PREFIX_CACHE=0`，普通 decode **67-70 ms/token**，
+用两次生成长度相减抵消 27B 加载——直接计 wall clock 会把 ~80 s 加载摊进 128 token
+得到 690 ms/token 的 10 倍错误）：
+
+| prompt | acc | cycle ms | ms/token | 加速比 |
+|---|---:|---:|---:|---:|
+| code continuation | 2.50 | 106.0 | 34.3 | 1.96x |
+| technical explanation | 2.33 | 105.8 | 35.4 | 1.90x |
+| story opener | 1.18 | 105.7 | 53.2 | 1.33x |
+
+（`PF_MTP_ADAPT=0` 口径；默认开启时见 §12.4 的对照表。）**cycle 恒定而加速比不恒定**
+——见 `AGENTS.md` *MTP* 段。注意这批 acceptance **低于**本节此前记录的
+2.16x/1.97x/1.35x 那一组，因为那一组是 `PF_MTP_ADAPT=0` 下更早的一次运行，且 acc
+2.50/2.33/1.18 与当时记录的 2.78/2.25/1.18 同量级——**差异来自 prompt 与 k 的选择，
+不是回归**：cycle 成本（verify 87 ms、draft 17.5 ms）与历史记录一致。故事开头的天花板
+就是 `n = 1 + acc = 2.18`。k 的扫描（`main.cpp:253-259`，带 u4 草稿头，两个 prompt）给出
 k=2/3/4/5/6/8 → 40.2/38.1/38.1/39.0/40.6/47.6 与 k=3/4/6/8 → 41.1/40.8/43.1/52.7 ms/token，
 每个多一个草稿约 5.4 ms、每多一个 verify 行约 5.7 ms，而 k>4 的边际 acceptance 只有 0.1-0.2 ——
 所以裸 `--mtp` 的默认值是 k=4。
@@ -968,7 +999,7 @@ bonus 行播种，`PF_MTP_CANDDBG=1` 打印逐步命中率，`PF_MTP_CANDV=1` �
 
 1. **绝不要把设备查询放进 kernel launcher**。`rmsnorm_launch` 每次 launch 都调
    `si::dev::wg_clamped()`，所以那里的 `sycl::device::get_devices()` + `max_work_group_size`
-   查询**必须**缓存在函数内 `static` 里（`src/device/device_registry.cpp:134-142`，那里的注释记着
+   查询**必须**缓存在函数内 `static` 里（`device_registry.cpp` 的 `for_queue` 函数内 static，那里的注释记着
    实测值）。设备 profile 重构曾让它变成每次重跑：**3.2 ms/次**，一次 MTP verify 里的 65 次
    rmsnorm 就是 210 ms 纯主机时间，verify 221 → 85 ms、cycle 255 → 107 ms（修好后 MTP 从 0.72x
    变成 1.8-2.2x）。普通 decode 看不到它，因为 decode 是启动时录制一次的 command graph，而 verify

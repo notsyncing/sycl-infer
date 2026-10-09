@@ -43,7 +43,7 @@
 * `scheduler sched(e); sched.start();`（`server.cpp` 的 `serve`），栈上对象，`serve` 返回时析构。
 * `httplib::Server srv;`，读/写超时 3600 s，`set_payload_max_length(64 MiB)`（base64 图片需要）
   （`server.cpp` 的 `serve`）。
-* `server_config`（`server.h:8-20`）的 `n_threads`（`server.h:12`）**从未被读取**——全仓库唯一出现处是这行
+* `server_config`（`server.h:8-20`）的 `n_threads`（`server.h` 的 `server_config::n_threads`）**从未被读取**——全仓库唯一出现处是这行
   定义，`main.cpp` 的 `serve` 调用处也不填它；httplib 使用自己的默认线程池
   （`max(8, hardware_concurrency()-1)`，`third_party/httplib.h:183-190`，由
   `Server::Server()` 在 `httplib.h:12787-12788` 构造）。没有安装自定义 task queue。
@@ -291,14 +291,14 @@ reasoning/content/tool_calls 片段（stop 处截断，`tool_calls[].index` 从 
   并回退支持 `{"name":…,"arguments":…}`（或 `parameters`）的 JSON 形式；`arguments` 用
   `nlohmann::ordered_json::dump()` 序列化为字符串，`id` 由 `call_%08llx%04llx` 计数器生成
   （`response_parser.cpp:96-118`、`122-189`）。标记是**纯 ASCII** 的 `<tool_call>` /
-  `</tool_call>`，与模板/内置渲染器发出的字节一致（`chat.cpp:54`、`chat.cpp:65`）。
+  `</tool_call>`，与模板/内置渲染器发出的字节一致（`response_parser.cpp` 的 `kToolOpen`/`kToolClose`）。
 
 `feed(piece)` 只发射完整片段：piece 末尾可能是 `</think>`/`<tool_call>` 的前缀时会被暂存
 （`partial_marker_suffix`，`response_parser.cpp:82-90`），避免标记被拆到两个 chunk；推理末尾的空白
 同样会被回退，以便与模板的 rstrip 一致（`trailing_whitespace_run`）。`</think>` 之后与一个工具块
 之后的首个 content 片段会去掉前导换行（`strip_content_leading_`，`response_parser.cpp:222-228`）。
 `finish()` 冲刷剩余缓冲，并在“有工具调用且 content 只有空白”时清空 content（分隔符噪声，
-`response_parser.cpp:348-354`）；解析不出来的工具块会**原样退回成 content**
+`response_parser.cpp` 的 `else if (!buf_.empty())` 分支）；解析不出来的工具块会**原样退回成 content**
 （`response_parser.cpp:312-314`、`327-329`），不会静默吞掉。parse_tools 为假（completion 端点）时
 `<tool_call>` 直接当普通 content。以上行为由 `tests/server/test_response_parser.cpp` 覆盖
 （逐字符流式与整段解析必须给出同一结果）。
@@ -314,11 +314,11 @@ reasoning/content/tool_calls 片段（stop 处截断，`tool_calls[].index` 从 
 ### 2.9 线程模型
 
 * httplib 每个连接派一个工作线程执行 handler。
-* 非流式 handler 阻塞在 `seq->pop_token(t)`（`sequence::token_out`，`scheduler.h:76-85`）；流式 handler
+* 非流式 handler 阻塞在 `seq->pop_token(t)`（`sequence::token_out`，`scheduler.h` 的 `sequence::token_out`）；流式 handler
   为每个 choice 起一个生产者线程后立即返回，由 chunked provider 驱动。handler 返回时它捕获的一切
   （prompt 副本、`shared_ptr<sse_session>`、多模态的共享许可）都由线程自己的 lambda 持有。
 * `scheduler::submit` 多线程安全（锁 `scheduler::m`）；每个 `sequence` 的输出由自带 mutex+cv 保护。
-* 所有引擎工作由 `engine::mtx` 串行化——调度器的两个阶段各自持 `e.mtx`（`scheduler.cpp:150`、
+* 所有引擎工作由 `engine::mtx` 串行化——调度器的两个阶段各自持 `e.mtx`（`scheduler.cpp` 的阶段 1、
   `318`），`engine::generate` / `generate_mm` 也在入口加锁（`engine.cpp:2350`、`2356`）。
 * 多模态额外用 `serve()` 的共享 `media_gate` 许可串行化，因为请求共享
   `engine::d_img_embd`。许可由 handler 线程获取，可由最后持有它的 SSE 生产者线程释放；
@@ -353,7 +353,7 @@ watchdog 线程每 100 ms 轮询 `g_term_requested` 与 `listen_done` 并调用 
   prompt_tokens`。`push(string)` 造一个只有 `text` 的 `token_out`，`push_token` 追加并 `notify_all`；
   `pop_token` 阻塞到有数据或 `finished`，排空时返回 false；`pop`/`pop_wait` 是只取 `text` 的薄封装
   （服务器实际只用 `pop_token`，因为 logprobs/best_of 需要 id 与 logprob）。
-* `token_out`（`scheduler.h:43-48`）：`text`（UTF-8 安全片段，token 字节不完整时为空串）、
+* `token_out`（`scheduler.h` 的 `token_out` 结构）：`text`（UTF-8 安全片段，token 字节不完整时为空串）、
   `id`、`logprob`、`top`（`(token id, logprob)`，长度 = `top_logprobs`）。只有 `wants_logprobs()`
   为真时才填后三者。
 
@@ -390,7 +390,7 @@ submit/shutdown 时唤醒循环。
 ### 3.4 主循环（`scheduler.cpp:134-419`）
 
 两个阶段的锁顺序都是 **先 `e.mtx` 后 `m`**，但 **`m` 在每个 engine 调用前后显式 unlock/relock**
-（`std::unique_lock<std::mutex> lk2(m)` + `lk2.unlock()` / `lk2.lock()`，`scheduler.cpp:157`、`234-241`、
+（`std::unique_lock<std::mutex> lk2(m)` + `lk2.unlock()` / `lk2.lock()`，`scheduler.cpp` 的阶段 1、`234-241`、
 `319`、`360-362`）。这是有测量支撑的**必需**行为，不是风格选择：
 
 > 旧代码在 engine 调用期间一直持有 sequence mutex `m` 并立刻重锁，于是 `scheduler::submit()`
@@ -401,7 +401,7 @@ submit/shutdown 时唤醒循环。
 > N=1/2/4/8 → 14.3 / 24.5 / 40.1 / **55.0 tok/s**，即 N=8 时聚合 **3.85x**。
 > （条件与数字同样记录在 `AGENTS.md` 的 “Invariants and gotchas”。）
 
-**阶段 1 — 准入 + 一个 prefill chunk**（`scheduler.cpp:149-314`）：
+**阶段 1 — 准入 + 一个 prefill chunk**（`scheduler.cpp` 的 `scheduler::loop` 阶段 1）：
 
 * 从头到尾 drain `waiting` 直到 `admit` 失败，把准入的移入 `active`。
 * 轮询 `active`：跳过 `finished`；第一个 `prompt_pos < prompt.size()` 的序列执行**恰好一个 chunk** 后
@@ -412,7 +412,7 @@ submit/shutdown 时唤醒循环。
     `kMaxB*kMaxT`；DP4A/md_int8 只允许已录制的 `kMaxT` 倍数图尺寸，且**不允许**部分末行。
   * 尾部也走 mode 2（不是 `>= 2*kMaxT` 门槛）：mode-1 的 chunk 每 32 token 要付约 0.3 ms 的
     handoff/sync，一个 41 token 的尾巴曾花掉 553 token prefill 的约 0.7 s
-    （`scheduler.cpp:180-185` 的注释）。
+    （`scheduler.cpp` 的 `sample_and_emit` 注释 的注释）。
 * 饥饿守卫：`blocks.size()*32 < prompt_pos + n` 时无法写入 → `retire(s,"length")`。
 * `last_chunk = (prompt_pos + n >= prompt.size())`。forward：mode 2 用 `prefill_batch`（**不传**
   `last_chunk`，它总是跑 head），否则 `prefill_chunk(..., last_chunk)`。
@@ -494,14 +494,14 @@ on /* PF_MTP_SERVER */ && e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 
 
 `render_chat(tmpl, msgs, add_generation_prompt, enable_thinking, tools_json)`
 （`chat.cpp:37-44`）先试 `render_chat_template`，任何异常或空模板都回退 `render_chat_builtin`。
-`tmpl` 来自 GGUF 的 `tokenizer.chat_template`（`model.h:94`、`model.cpp:66-67`），服务器传的是
+`tmpl` 来自 GGUF 的 `tokenizer.chat_template`（`model.h` 的 `chat_template` 字段、`model.cpp:115-116`），服务器传的是
 `e.m.chat_template`。`chat_msg` 除 role/content/parts 外还带 `reasoning_content`、`tool_calls`
 （`{id,name,arguments(JSON 字符串)}`）、`tool_call_id`、`name`（`chat.h:30-49`）。
 
 ### 4.2 minja Jinja 封装（`chat_template.cpp`）
 
 * `tmpl` 为空立即返回 false（`chat_template.cpp:23-25`）。
-* `PF_CHAT_TMPL_DEBUG` 控制是否把异常写到 stderr（`chat_template.cpp:26`、`101-105`）；`tools_json`
+* `PF_CHAT_TMPL_DEBUG` 控制是否把异常写到 stderr（`chat_template.cpp` 的 `PF_CHAT_TMPL_DEBUG` 与其 stderr 写入）；`tools_json`
   解析失败也只在 debug 下打印并把 `tools` 留空（`chat_template.cpp:84-94`）。
 * 每次调用**新建** `minja::chat_template(tmpl, "", "")`（`chat_template.cpp:28`），模板无解析缓存。
 * 消息转 `nlohmann::ordered_json`：文本消息 `{role, content:<string>}`；含 part 的消息
@@ -521,14 +521,14 @@ on /* PF_MTP_SERVER */ && e.mtp_on && n == 1 && !logprobs && (gp.temperature <= 
   `<|vision_start|><|image_pad|><|vision_end|>`、视频 `<|vision_start|><|video_pad|><|vision_end|>`、
   音频 `<|audio_start|><|audio_pad|><|audio_end|>`（`chat.cpp:95-109`）。
 * 有 `tools_json` 时注入 Qwen 风格的 `# Tools` 说明块：首条是 system 就附在它后面，否则自己合成一条
-  `system` 消息（`chat.cpp:120-127`）。
+  `system` 消息（`chat.cpp` 的 `role == "system"` 分支）。
 * user/assistant/tool 各按 ChatML 渲染：user 是 `user\n<content>\n`；assistant 优先用
   `reasoning_content`，否则从 `content` 里找 `</think>`（再往前找 `<think>`）拆出 reasoning，且**只在
   “最后一个 user 之后的 assistant 轮”**保留 `<think>...</think>`（`chat.cpp:151-155`）；`tool_calls`
   渲染成 `<tool_call>\n<function=...>\n<parameter=...>\n...</parameter>\n</function>\n</tool_call>`
   块（`chat.cpp:64-83`）；`role:"tool"` 渲染成一条 `user\n<tool_response>\n...\n</tool_response>\n`
-  （`chat.cpp:166-168`）。
-* **其它 role（含旧式 `role:"function"`）不匹配任何分支，被静默丢弃**（`chat.cpp:129-168` 的 if/else
+  （`chat.cpp` 的 `role == "tool"` 分支）。
+* **其它 role（含旧式 `role:"function"`）不匹配任何分支，被静默丢弃**（`chat.cpp` 的 `role` if/else
   链没有 else）——不报错。
 * `add_generation_prompt` 时追加 `assistant\n`；`enable_thinking` 追加 `<think>\n`，否则
   追加一个空的 `<think>\n\n</think>\n\n`。
@@ -583,7 +583,7 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
 * 注意：mm 路径 `finish_reason` 只在 stop 命中时为 `"stop"`，其余情况（EOS、`max_tokens`、块耗尽）
   一律 `"length"`，有工具调用时为 `"tool_calls"`；`n>1` 顺序生成；绕过前缀缓存与连续批处理；
   `logprobs` 恒为 `null`（§2.6）。多模态请求也**不会**走 MTP——`handle_chat` 先判媒体分支再判
-  `mtp_direct`，引擎侧也显式排除（`engine.cpp:2365`）。
+  `mtp_direct`，引擎侧也显式排除（`engine::generate_impl` 的 `mm == nullptr` 条件）。
 
 ### 6.1 远程媒体抓取与 SSRF 边界（`src/server/url_fetch.{h,cpp}`）
 
@@ -640,11 +640,11 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 |---|---|
 | `PF_SRV_TIME` | 端点侧打印 `tokenize=.. ms chars=.. tokens=..`；调度器侧每 chunk 一行 `chunk pos=.. n=.. ms=..`，每个序列结束时一行 `prefill/fetch/sample/to_first_tok (wait/admit/prefill_total/chunks/reused/total)`（端点侧在 `server.cpp` 的 `handle_chat`，调度器侧在 `scheduler.cpp`、`1803-1814`、`scheduler.cpp:242-250`、`285-290`） |
 | `SCHED_DEBUG` | 准入/prefill/decode 决策日志，含每行 decode 的 `seq/slot/pos/tok`（`scheduler.cpp:129-132`、`252-255`、`363-369`、`378-380`） |
-| `PF_CHAT_TMPL_DEBUG` | 记录导致回退 ChatML 的模板异常（也记录 `tools_json` 解析失败，`chat_template.cpp:26`、`90-92`、`102-104`） |
+| `PF_CHAT_TMPL_DEBUG` | 记录导致回退 ChatML 的模板异常（也记录 `tools_json` 解析失败，见 `chat_template.cpp` 的 `PF_CHAT_TMPL_DEBUG` 各写入点） |
 | `PF_MTP_SERVER` | `1` 让 `mtp_direct` 把 greedy 单请求路由进单序列 MTP 循环，绕过调度器；**默认关**，理由与实测见 §3.6（`mtp_direct`，`server.cpp`） |
 | `PF_MM_URL_FETCH` | 允许下载远程 `http(s)://` 图片/视频/音频（base64 `data:` 不受影响），**默认关闭**；设 `1` 开启且只允许公网可达地址 |
 | `PF_MM_URL_ALLOW_PRIVATE` | 仅在 `PF_MM_URL_FETCH=1` 时有意义：`1` 放行 loopback/私有/link-local 目标（内网媒体服务器场景，等于重新暴露 SSRF） |
-| `PF_AV_FFMPEG` | 音频/视频解码的 ffmpeg 可执行路径（默认 `ffmpeg`，`video.cpp:340`、`audio.cpp:22`） |
+| `PF_AV_FFMPEG` | 音频/视频解码的 ffmpeg 可执行路径（默认 `ffmpeg`，`mm/av_common.h` 的 `PF_AV_FFMPEG` 读取） |
 | `PF_AV_FFPROBE` | 视频探测（时长/帧率）的 ffprobe 可执行路径（默认 `ffprobe`，`video.cpp:345`） |
 | `PF_GEMM_DNNL` | 不是服务端旋钮，但通过 `engine::batched_prefill_fit` 决定 prefill chunk 尺寸（见 §3.4） |
 

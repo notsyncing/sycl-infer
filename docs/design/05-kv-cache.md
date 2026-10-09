@@ -26,7 +26,7 @@
   （`engine_kvpool.cpp:33-35`）。只有 `--kv-type K:V` 混型时两者不同，否则相等。
 * `kv_layer_stride` / `kv_v_layer_stride`（`engine.h:195-196`）：每 attention 层 K / V 的字节数 =
   `n_blocks * kv_block_bytes()` / `n_blocks * kv_v_block_bytes()`。写入点不止一处：`alloc_buffers`
-  先按构造期算好的 `n_blocks`（= `pool_cap`）写一次 K stride（`engine.cpp:1717`），紧接着调用
+  先按构造期算好的 `n_blocks`（= `pool_cap`）写一次 K stride（`engine.cpp` 的 `kv_layer_stride = n_blocks * kv_block_bytes()`），紧接着调用
   `kv_setup`（`engine.cpp:1718`），而 `kv_setup` 的每个分支都会**重写两侧**：多设备分支
   `engine_kvpool.cpp:193-194`、CPU 分支 `:246-247`、虚拟/固定回退 `:324-329`。这里的 `n_blocks` 是
   **预留**大小，这正是池增长时图基址仍然有效的原因。
@@ -42,7 +42,7 @@
 ### 2.2 scale 平面
 
 `kv_scale_stride` / `kv_v_scale_stride`（`engine.h:229-230`）仅在任一侧带 scale 时存在
-（`has_scales = kv_dtype_has_scales(k) || kv_dtype_has_scales(v)`，`engine_kvpool.cpp:185`）：
+（`has_scales = kv_dtype_has_scales(k) || kv_dtype_has_scales(v)`，`engine_kvpool.cpp` 里解 `has_scales` 处）：
 `n_blocks * n_head_kv * kBlockSize * (head_dim/kI8Q) * sizeof(half)`（`kI8Q = 32`，
 `kernels.h:12`；写入点 `engine_kvpool.cpp:214-216`、`:249-251`、`:335-336`）。
 
@@ -70,17 +70,17 @@ K 与 V 各按自己的行宽计入。
 `sycl::malloc_host` 提交（K/V 与 scale 平面都是主机 USM），随后 `kv_grow` 只做空闲链表记账。没有
 虚拟内存与 map/shrink，因此 CPU 上 `kv_read_vec` / 前缀缓存的磁盘序列化都是主机拷贝。
 
-### 3.2 多设备（`multi_dev`，`engine_kvpool.cpp:186-238`）
+### 3.2 多设备（`multi_dev`，`engine_kvpool.cpp` 的 `kv_setup` 多设备分支）
 
 `kv_layer_stride = pool_cap * block_bytes` 全局一致，但每个设备只有一份包含**该设备注意力层**的池
-（`dev_kpool_[d]`/`dev_vpool_[d]` + scale 平面，`engine.h:166`），由 `layer_attn_local_[il]` 索引；
-block id 全局一致，所以 block table 只需一份。分配走 `dev_alloc_on(d, ...)`（`engine.cpp:721-731`）：
+（`dev_kpool_[d]`/`dev_vpool_[d]` + scale 平面，`engine.h` 的 `dev_kpool_`/`dev_vpool_`），由 `layer_attn_local_[il]` 索引；
+block id 全局一致，所以 block table 只需一份。分配走 `dev_alloc_on(d, ...)`（`engine.cpp` 的 `dev_alloc_on`）：
 GPU 分区给该设备队列上的 device USM，CPU 分区给主队列上的 host USM。没有注意力层的分区被跳过。
 `kv_release_pool`（`engine_kvpool.cpp:474-497`）按分区释放，GPU 池在各自队列上 `sycl::free`、
 CPU 池在主队列上。
 
 `kv_layer_ptrs(a, ...)`（`engine_kvpool.cpp:126-162`）与 `attn_dev(a)`（`:164-180`）把**全局**注意力
-层号解析到“设备 + 该设备的本地层号”，前缀缓存的序列化/反序列化就靠它们（`engine_prefix_cache.cpp:128`、
+层号解析到“设备 + 该设备的本地层号”，前缀缓存的序列化/反序列化就靠它们（`engine_prefix_cache.cpp` 的 `pc_serialize_block`、
 `:154`）。
 
 下面的流程针对单设备 GPU（虚拟 USM）。
@@ -171,7 +171,7 @@ CPU 池在主队列上。
 
 ## 5. 块分配器与块表
 
-* **空闲表**是 `std::priority_queue<int, vector<int>, greater<int>>` 最小堆（`engine.h:720`），因此分配
+* **空闲表**是 `std::priority_queue<int, vector<int>, greater<int>>` 最小堆（`engine.h` 的 `free_blocks_`），因此分配
   总是取最小块 id。这保证高地址 extent 容易完全空闲，从而可被收缩。
 * `alloc_block()`（`engine_kvpool.cpp:549-576`）：
   1. 弹出最小空闲块（防御性跳过 `block_used_` 已置位的块，保证不重复发放）；
@@ -235,7 +235,7 @@ i4 的 16）拿到接近 i8 的精度，并能装下 262144 上下文；`i8:i4` 
 位数（i4 每字节两元素）、`kv_dtype_row_bytes`（`:69-71`）给一行（一个 token 的一个 kv head）的字节数、
 `kv_dtype_has_scales`（`:74-76`）判断是否有独立 scale 平面、`kv_ld_host`（`:81-97`）是主机侧元素读取
 （i8/i4 返回反量化后的值）。pool 的 scale 处理在 `engine::kv_read_vec`
-（`engine_kvpool.cpp:37-100`）：它按 `[block][kv head]` 单元取数据区间与被触及单元的 scale 行，主机上
+（`engine_kvpool.cpp` 的 `engine::kv_block_elem_off`）：它按 `[block][kv head]` 单元取数据区间与被触及单元的 scale 行，主机上
 反量化成 fp32，供 stage test 与 CPU 侧读出。
 
 ---
@@ -270,7 +270,7 @@ i4 的 16）拿到接近 i8 的精度，并能装下 262144 上下文；`i8:i4` 
 
 `PF_CTX`、`PF_KV_CAP_MB`、`PF_KV_GROW`、`PF_KV_TYPE`、`PF_KV_F32`、`PF_KV_BF16`。总表以
 `AGENTS.md#environment-variables` 为准。前缀缓存的三层预算另见
-[06-prefix-cache.md](06-prefix-cache.md) §8。
+[06-prefix-cache.md](06-prefix-cache.md) §9。
 
 ---
 

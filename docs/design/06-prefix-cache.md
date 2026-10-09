@@ -16,15 +16,15 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 
 > **CPU 与多设备**：CPU 单设备完全支持该缓存（KV 都在主机 USM，`kv_setup` 的 CPU 分支把整个预留
 > 一次性 `malloc_host` 提交，检查点池 `d_pc_states` 也走 `alloc_bytes` 的 host USM 分支，
-> `engine.cpp:713`），序列化是主机拷贝，`test_pc_cpu` 覆盖磁盘 spill/promote 往返。
+> `engine_prefix_cache.cpp` 的 `pc_serialize_block`），序列化是主机拷贝，`test_pc_cpu` 覆盖磁盘 spill/promote 往返。
 >
 > 多设备（`--layer-map`）同样支持：block id 是全局的，`pc_block_node_` / `pc_map_` 也只有一份。
 > recr 状态检查点只有一个池 `d_pc_states`，全 GPU 的映射下它是**主设备 device USM**
-> （`alloc_bytes`，`engine.cpp:712-719`），混合 CPU/GPU 映射下 `host_act` 让它落在主机 USM；
+> （`alloc_bytes`，`engine.cpp` 的 `alloc_bytes`），混合 CPU/GPU 映射下 `host_act` 让它落在主机 USM；
 > `pc_restore_state` 逐分区用该设备自己的队列拷进 `as_[dev].gdn_state/conv_state` 再 `sync_all()`
 > （`engine_prefix_cache.cpp:485-501`）。块的序列化/恢复通过 `engine::kv_layer_ptrs` 把每个全局注意力
 > 层解析到所属设备的池（`dev_kpool_[d] + layer_attn_local_[il] * kv_layer_stride`）与该设备的队列
-> （`engine_prefix_cache.cpp:128`、`:154`），块内偏移与单设备布局一致。
+> （`engine_prefix_cache.cpp` 的 `pc_serialize_block`、`:154`），块内偏移与单设备布局一致。
 >
 > **MTP 路径**也支持：`generate_mtp` 对 prompt 调 `pc_admit`（`engine_mtp.cpp:736`，命中数还会打印
 > `[mtp] prefix cache: reused N prompt tokens`）、prefill 后调 `pc_commit`（`engine_mtp.cpp:847-849`），
@@ -46,7 +46,7 @@ struct pc_node {                    // engine.h:842-850
 };
 ```
 
-索引（`engine.h:851-853`）：`pc_nodes_`（vector，swap-remove）、`pc_map_`（hash → 节点 idx）、
+索引（`engine.h` 的 `pc_nodes_`/`pc_map_`）：`pc_nodes_`（vector，swap-remove）、`pc_map_`（hash → 节点 idx）、
 `pc_block_node_`（块 id → 节点 idx）。后两者必须与 `pc_nodes_` 同步维护，所以下面每处改动节点集合的
 地方都要一起改这三个容器。
 
@@ -125,7 +125,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 `pc_snap`（`kernels.h:125-131`）由 `record_forward` 逐层填好（`engine_graph.cpp:931-938`：
 `layer_off = gi * (gdn_per + conv_per)`，`gi` 是**全局** GDN 层号）。conv/GDN kernel 在 token 完成一个
 32 块边界时，通过 `step_info::pc_row_slot` 查目标槽并写入：GDN 在 token 索引 `(pbase + t + 1) % 32 == 0`
-处写（`gdn/kernels/gdn.cpp:122-135`），conv 在整行结束时若 `end_tok % 32 == 0` 写（`conv.cpp:92`、`:120`）。
+处写（`gpu/kernels/gdn.cpp:122-135`），conv 在整行结束时若 `end_tok % 32 == 0` 写（`gpu/kernels/conv.cpp:92`）。
 `pc_row_slot` 是 host USM 的 `step_info` 字段，`kPcMapLen = 1024`（`kernels.h:27`），因此捕获只覆盖
 `max_seq <= 32768` 的边界索引。
 
@@ -141,7 +141,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 
 ### 4.1 Admit（`pc_admit`，`engine_prefix_cache.cpp:619-779`）
 
-调度器在每个序列准入时调用（`scheduler.cpp:91`），返回命中的 token 数（0 表示需要 `zero_slot`，
+调度器在每个序列准入时调用（`scheduler.cpp` 的 `pc_admit` 调用点），返回命中的 token 数（0 表示需要 `zero_slot`，
 `scheduler.cpp:92-94`）。
 
 1. 重置 `pc_slot_[slot]`；缓存关闭返回 0。
@@ -178,7 +178,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 
 ### 4.2 捕获（`pc_capture_begin` + kernel 快照，`engine_prefix_cache.cpp:786-859`）
 
-在 `prefill_chunk`（`engine.cpp:1994`）与 `prefill_batch`（`:2144`、`:2156`）之前调用：
+在 `prefill_chunk` 与 `prefill_batch`（均在 `engine.cpp`）之前调用：
 
 * 目标 `step_info` 是 `pf_info_ ? pf_info_ : d_info`（`:787`）——多设备流水线里每个 chunk 有自己的
   `step_info`，快照表必须写进本次 chunk 用的那一份。
@@ -193,7 +193,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 * 写 `pc_row_slot[b] = st`，push `{hash, st}` 到 `pc_pending_`；最后发布 `pc_base/pc_stride` 并置
   `pc_active=1`。`pc_active` 与 `pc_row_slot` 都在 kernel 体内读，所以图回放也安全。
 
-### 4.3 提交（`pc_commit`，`engine_prefix_cache.cpp:861-902`）
+### 4.3 提交（`pc_commit`，`engine_prefix_cache.cpp` 的 `engine::pc_commit`）
 
 调度器在每个 prefill chunk 之后调用（`scheduler.cpp:257-259`），MTP 在 prompt prefill 之后调用：
 
@@ -207,7 +207,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 
 ### 4.4 退休（`pc_retire`，`engine_prefix_cache.cpp:904-919`）
 
-准入失败（`scheduler.cpp:102`）或序列退休（`scheduler.cpp:120`）时调用。重置 slot tracking；对每个
+准入失败（`scheduler.cpp:105`）或序列退休（`scheduler.cpp` 的 `pc_retire` 调用点）时调用。重置 slot tracking；对每个
 块：若被节点拥有且确属该节点则 `refcount--`，归零时 stamp `lru` 使其可驱逐；否则直接 `free_block`。
 
 ---
@@ -303,7 +303,7 @@ d_inner/conv_k/full_attn_interval`，`:60-63`）、`rope_sections`、`gguf.map_s
 
 ## 6. 三层预算与 `PF_KV_CAP_MB`
 
-全部在 `engine` 构造期一次定下（`engine.cpp:255-360`）：
+全部在 `engine` 构造期一次定下（`engine.cpp` 里解三个前缀缓存预算那段）：
 
 | 层 | 字段 | 环境变量 / flag | 默认 |
 |---|---|---|---|
@@ -334,7 +334,7 @@ d_inner/conv_k/full_attn_interval`，`:60-63`）、`rope_sections`、`gguf.map_s
 `pc_print_stats`（`engine_prefix_cache.cpp:921-952`）输出节点数、有状态节点数、总引用、命中率
 （`hits/(hits+misses)`）、复用 token、捕获状态数、驱逐节点/状态数、检查点尺寸×数量 = 总量，以及
 RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关计数器字段见 `engine.h:667-668`
-（命中/未命中/复用 token/捕获/驱逐）与 `engine.h:682-683`（磁盘与 RAM 的 spill/load/store）。
+（命中/未命中/复用 token/捕获/驱逐）与 `engine.h` 的 `pc_flush_to_disk`/`pc_store_ram`（磁盘与 RAM 的 spill/load/store）。
 每层还各有自己的 `print_stats`（`pc_ram.cpp:107-113`、`pc_disk.cpp:328-335`），由 `~engine` 在
 `pool_print("exit")` 之后逐层调用（`engine.cpp:625-632`）。
 
@@ -342,9 +342,31 @@ RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关�
 以及 `usage.prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` 返回（详见
 [09-server.md](09-server.md) §2.6/§8.2）。多模态路径绕过前缀缓存，故 `cached_tokens` 恒为 0。
 
+## 8. 不变量：`sync_all()` 必须在 CPU 后端上真的等待
+
+本文档在 §3.1/§4.1/§4.4/§5.4 多次依赖 `engine::sync_all()`。**在 CPU 分区上它曾经是
+一个空操作，而这个空操作是一条堆 use-after-free，不只是慢。**
+
+`cpu_backend.cpp` 在 `SI_CPU_SOURCES` 里、被 `-fno-sycl` 编译（在 device pass 之外），
+所以它拿不到队列，`compute_backend::synchronize()` 的 override 编译通过但什么也不做。
+`engine::sync_all()` 有约 24 个调用点，于是在 CPU 分区上**每一个都是 no-op**。前缀缓存
+随后把一个临时 `std::vector` 交给异步的 `queue::memcpy` 就返回——拷贝还在飞，vector 已经
+被释放。
+
+诊断轨迹值得记住，因为它说明了窄判据为什么危险：**KV 比对通过了（36/36 块逐字节相同）
+而 logits 不一致**，因为被破坏的是更靠后的一次主机→设备拷贝，不是 KV 那次。`test_pc_cpu`
+原本只比对三块 layer-0 的 K，扩到覆盖全部块偏移相位的 36 个单元后才定位到故障。
+
+修复是在构造时传入一个 waiter：单设备 `[this]{ q.wait(); }`，多设备
+`[this, i]{ dev_queue(i).wait(); }`。**CPU 分区的 `dev_queues_` 条目是 null，不能直接
+用它当下标——会段错误。**
+
+一般化的教训：**一个只因基类声明才存在的 override 是一个等着发作的静默 no-op**；若某个
+virtual 在某个后端上不起作用，就断言它，不要留空。
+
 ---
 
-## 8. 相关环境变量
+## 9. 相关环境变量
 
 `PF_PREFIX_CACHE`、`PF_PC_STATES`、`PF_PC_VRAM_MB`、`PF_PC_MEM_MB`、`PF_PC_RAM_MB`、`PF_PC_DIR`、
 `PF_PC_DISK_MB`、`PF_PC_DEBUG`、`PF_KV_CAP_MB`。KV 池本身的环境变量见
@@ -352,7 +374,7 @@ RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关�
 
 ---
 
-## 9. 进一步阅读
+## 10. 进一步阅读
 
 * `tests/backend/cpu/test_pc_disk.cpp`（磁盘格式/LRU/重开）、`test_pc_ram.cpp`（RAM 层）、
   `tests/backend/cpu/test_pc_cpu.cpp`（主机后端的 paged attention + 磁盘 tier 往返）、

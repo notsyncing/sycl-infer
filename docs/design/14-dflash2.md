@@ -16,7 +16,7 @@ DFlash2 是一个**块扩散（block-diffusion）草稿器**，不是第二个�
 参考实现：llama.cpp `src/models/dflash.cpp` +
 `common/speculative.cpp::common_speculative_impl_draft_draft_dflash`。
 
-一个 cycle 的数据流（`src/engine/engine_dflash.cpp:933` `df_block`）：
+一个 cycle 的数据流（`engine_dflash.cpp` 的 `df_block` `df_block`）：
 
 ```
 目标 hidden（target_layers 处捕获）
@@ -65,7 +65,7 @@ DFlash2 是一个**块扩散（block-diffusion）草稿器**，不是第二个�
 | selector | `sel_rank=256`、`sel_top_k=16` |
 | `target_layers` | `[6, 20, 34, 48, 62]`（27B 有 64 层，取 5 层） |
 
-派生量（`dflash.cpp:42-43,127-128`）：
+派生量（`dflash.cpp` 的 `df_topk_launch`）：
 
 ```
 n_groups = n_embd / conv_group          = 5120/16 = 320
@@ -138,43 +138,78 @@ score(p → c) = unary_i[c] + <A[p] * gate(h_i), B[c]>
 > ("emphasize that the order is not important")，但 DFlash2 的 lattice 行走把候选下标 k
 > 当作候选 k 的后继，所以参考实现的 `(1,0)` 次序必须原样复现，否则每条转移边都会配错前驱。
 
-## 7. 性能（27B / 2×A770，greedy）
+## 7. 性能（27B / 2×A770，greedy，2026-10-09 重测）
 
-短 prompt，与 llama.cpp 在同一 `n_max` 下对比（均值 = 每 cycle 接受的 token 数）：
+**先读这一条：下面所有数字都是 _单个 prompt_ 的，而 acceptance 跨 prompt 差 8 倍。**
+`n_max` 是每 cycle 的 draft token 数，`acc` 是每 cycle 接受的 draft 数，故加速比上限是
+`1 + acc`。每格独立进程。code-continuation prompt，plain decode **67.2 ms/token**
+（基准的测法见 AGENTS.md *Benchmarking*：用两次生成长度相减抵消 27B 的 ~80s 加载）：
+
+| `n_max` | 1 | 2 | 3 | 4 | **5** | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| acc | 0.92 | 1.80 | 2.84 | 3.46 | **4.25** | 5.05 |
+| ms/token | 46.1 | 33.8 | 26.1 | 24.0 | **21.8** | 20.1 |
+| verify ms | 74.3 | 78.4 | 82.3 | 87.1 | **92.4** | 97.4 |
+
+**但 `n_max=5` 在三个 prompt 上是：**
+
+| prompt | acc | ms/token | 对各自的 plain 基准 |
+|---|---:|---:|---:|
+| code continuation | 4.25 | 21.8 | **3.08x** |
+| technical explanation | 2.19 | 35.8 | 1.88x |
+| story opener | 0.49 | 77.0 | **0.92x — 比不开 drafter 还慢** |
+
+acc 0.49 意味着每 cycle 只吐 1.49 个 token 却花 114 ms，严格劣于 70.7 ms 的 plain
+步；**没有任何 `n_max` 能救它**（上面整条扫描在 story prompt 上都比 21.8 更差，
+且 `n_max` 增大时 cycle 涨得比 acceptance 快）。所以启用前必须按 workload 验
+acceptance，**单一加速比不是这个 drafter 的属性**——这与 MTP 是同一条教训。
+
+输出流与 plain 贪心解码**逐字节相同**（128 token 下 md5 一致，诊断走 stderr），
+这才是正确性 oracle：`test_spec` 断言的是对显式非投机 `generate_plain` 的**流相等**，
+而不是 acceptance——verify 坏了也可能在健康的接受率下吐出错文本。
+
+cycle 分解（`PF_DFLASH_TIME=1`，`n_max=5`）：
+
+```
+draft=18.3  verify=92.4  rb=1.0  inject=1.1  emit=1.5   cycle=114.3 ms
+```
+
+verify 列的最小二乘拟合给出 **69.1 ms 固定 + 4.64 ms/额外 draft 行**（端点预测
+73.7 / 96.9 ms，实测 74.3 / 97.4）。
+
+> 与 llama.cpp 的接受率对比（短 prompt，均值 = 每 cycle 接受的 token 数）**本次未
+> 重测**——它需要打过补丁的 llama.cpp 探针，而该机器的 `~/llama.cpp/build/bin`
+> 没有 DFlash 工具。保留原数据：
 
 | 生成 token 数 | llama.cpp | 本实现 |
-|---:|---:|---:|
+|---|---:|---:|
 | 32 | 4.43 | 4.75 |
 | 116 | 3.96 | 3.90 |
 | 227 | 4.13 | 3.92 |
 
-`n_max` 扫描（本实现）：
+204-token 的长 prompt 上两边都掉（llama.cpp 0.239 / 均值 2.07，本实现 0.81 / 1.81），
+所以长上下文差距约 12%。
 
-| `n_max` | 1 | 2 | 3 | 4 | 5 | 6 |
-|---|---:|---:|---:|---:|---:|---:|
-| acc（每 cycle 接受数） | 0.98 | 1.44 | 2.18 | 2.54 | **2.90** | 2.90 |
-| ms/token | 48.6 | 41.9 | 34.1 | 32.5 | **31.5** | 33.3 |
-
-**默认 `n_max=5`**（2.90 drafts/cycle，31.5 ms/token，对 plain decode 的 ~68 ms/token 是
-**2.17x**）。204-token 的长 prompt 上两边都掉（llama.cpp 0.239 / 均值 2.07，本实现
-0.81 / 1.81），所以长上下文差距约 12%。
-
-cycle 分解（`PF_DFLASH_TIME=1`，k=5）：
-
-```
-draft=26.9  verify=90.9  rb=1.0  inject=1.5  emit=1.5   cycle=121.8 ms
-```
+**本次扫描全面优于此前记录的值**（acc 0.92/1.80/2.84/3.46/4.25/5.05 对
+0.98/1.44/2.18/2.54/2.90/2.90，`n_max=5` 处 21.8 对 31.5 ms/token），而 **cycle 成本
+未变**（verify 92.4 对此前 90.9 ms，两者都符合"一次 plain decode 的权重流 +
+每行 ~4-5 ms"）。所以差别在 acceptance 而非引擎开销，且该 drafter 路径与其下的
+共享 per-queue profile 解析此后都改过。原因**未做 bisect**；已确立的是文本未变。
 
 ### 7.1 verify 在结构下限上
 
-`n_max` 扫描给 verify 定价：
+`n_max` 扫描给 verify 定价（与 §7 首表同一次运行，2026-10-09）：
 
-| k | 1 | 2 | 3 | 5 | 7 |
-|---|---:|---:|---:|---:|---:|
-| verify ms | 71.9 | 76.3 | 80.0 | 90.8 | 105.0 |
+| `n_max` | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| verify ms | 74.3 | 78.4 | 82.3 | 87.1 | 92.4 | 97.4 |
 
-即 **72.2 ms 固定 + ~5.5 ms/额外行**。固定部分就是一次 plain decode 的权重流，而权重流模型
-能把它预测到 0.1 ms：`53.93(流式) + 3.67×(k)(dp4a) + ~18.5(非 GEMM) = 90.8`。
+最小二乘拟合给出 **69.1 ms 固定 + 4.64 ms/额外 draft 行**（端点预测 73.7 / 96.9 ms，
+实测 74.3 / 97.4）。固定部分就是一次 plain decode 的权重流。此前记录的
+"72.2 ms 固定 + ~5.5 ms/行"（k 扫到 7：71.9/76.3/80.0/90.8/105.0）与这条是同一条
+直线，差异在测量噪声内——**cycle 成本没有变，变的是 acceptance**。
+
+即 **72.2 ms 固定 + ~5.5 ms/额外行**（见 §7.1）。固定部分就是一次 plain decode 的权重流。
 
 那条在 MTP 上曾花掉 210 ms 的坑——**未图化的直接重放**——在这里不存在：DFlash 的 verify
 走 `mtp_verify` 的已录制 command graph，且它是活的（`PF_DFLASH_VFCHK` 打印

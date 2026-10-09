@@ -71,7 +71,7 @@ flowchart LR
   绕开调度器，单序列串行执行。
 * **MTP 投机解码**（`--mtp N`，`src/engine/engine_mtp.cpp`）：贪心（`temperature <= 0` 或
   `top_k == 1`）且非多模态的请求在 `engine::generate_impl` 内部改走 draft/verify 循环
-  （`src/engine/engine.cpp:2365`）。服务端**默认**仍把贪心请求交给调度器，只有 `PF_MTP_SERVER=1`
+  （`engine::generate_impl` 的 MTP/DFlash 分派条件）。服务端**默认**仍把贪心请求交给调度器，只有 `PF_MTP_SERVER=1`
   时 `server.cpp` 的 `mtp_direct` 才绕过调度器直送单序列 MTP 循环（`src/server/server.cpp:901`）——
   因为 MTP 与 decode 批处理争同一份权重带宽。见 §12。
 
@@ -326,7 +326,7 @@ prefill；prefill 走 oneDNN 的 `PF_GEMM_DNNL` 路径。见 §9 不变量 3 与
   许可可以在另一个线程释放；底层 `std::mutex` 不跨线程转交。媒体设备编码另持
   `engine::mtx`，避免与调度器的前向执行交错。
 * 信号处理器只置原子标志（async-signal-safe）；watchdog 线程每 100 ms 轮询后正常停止服务器
-  （`src/server/server.cpp:1919`），从而保证 `~engine` 里 `pc_flush_to_disk()` 把前缀缓存
+  （`server.cpp` 的 `serve()` 内 watchdog 线程），从而保证 `~engine` 里 `pc_flush_to_disk()` 把前缀缓存
   VRAM/RAM 层落盘（`src/engine/engine.cpp:523`）。
 
 ---
@@ -351,8 +351,8 @@ KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射�
 
 **两条路径不走虚拟 USM**（都把 `kv_virtual` 置 false 并一次性提交 `pool_cap`）：
 
-* `cpu_mode`：`engine::kv_setup` 用 `sycl::malloc_host` 提交主机 USM（`src/engine/engine_kvpool.cpp:239`）。
-* `multi_dev`：每设备一个池，只含该设备计算的注意力层（`src/engine/engine_kvpool.cpp:186`）。
+* `cpu_mode`：`engine::kv_setup` 用 `sycl::malloc_host` 提交主机 USM（`engine::kv_setup` 的 `cpu_mode` 分支）。
+* `multi_dev`：每设备一个池，只含该设备计算的注意力层（`engine_kvpool.cpp` 的 `kv_setup` 多设备分支）。
 
 另外 `attn_xmx` 的 scratch（gather 后的连续 KV + query 堆叠区）按 **queue 地址** 索引而不是函数内
 static——两个 `--layer-map` 设备各有自己的队列，共用一份 scratch 会被跨设备 USM 访问拖慢
@@ -379,7 +379,7 @@ static——两个 `--layer-map` 设备各有自己的队列，共用一份 scra
 形状集合。
 
 **`kMaxDecSplits` 只是天花板**，真实的 `dec_splits` 由设备推导
-（`src/engine/engine.cpp:238`）：`(warps_per_eu_x2/2) * max_compute_units / n_head`，向下取整到 8 的
+（`engine.cpp` 里解 `dec_splits` 的那段）：`(warps_per_eu_x2/2) * max_compute_units / n_head`，向下取整到 8 的
 倍数、下限 8、上限 `kMaxDecSplits`。`warps_per_eu_x2` 来自设备 profile（`occ` 组），因为它是这张卡
 的子组晶格属性。解码注意力是**占用**受限而非带宽受限的：每层发 `n_head * dec_splits` 个 32 线程
 warp，一个 Xe-LP EU 装得下 8 个，超过就不共驻、时间上台阶。实测单层（27B 形状、i8 KV、64k 深度、
@@ -398,8 +398,8 @@ attn+combine ms）nsp = 64/128/**160**/168/176 → 3.05/2.18/1.70/1.74/2.68，17
    `call_tb`/`call_xq`/`call_group_*`，从 0 起步会让后面的分区读第一层的 call 元数据（`dnnl_call`
    转 false，组落回 fp32 `gemv_group`，层静默不写东西）。
 3. **oneDNN 不能录制进 SYCL 图**。`PF_GEMM_DNNL` 路径直接重放模式 2（`prefill_batch`）。多设备的
-   MTP verify 图声明自己必须是全 SYCL，并用 `dnnl_capture_guard`（`src/engine/engine_graph.cpp:1601`
-   布防，`src/backend/dnnl_gemm.cpp:287` 在每个 `prim.execute` 处检查并抛异常）——一个无法服务的
+   MTP verify 图声明自己必须是全 SYCL，并用 `dnnl_capture_guard`（`engine_graph.cpp` 的 `dnnl_capture_guard`
+   布防，`dnnl_gemm.cpp` 的 `dnnl_capture_guard` 检查点 在每个 `prim.execute` 处检查并抛异常）——一个无法服务的
    形状不会静默录出一份缺活的图。
 4. **不要多个 TU 包含 `sycl/ext/oneapi/dot_product.hpp`**（其函数在该工具链下不是 `inline`），统一用
    `src/common/dp4a.h`。
@@ -417,14 +417,14 @@ attn+combine ms）nsp = 64/128/**160**/168/176 → 3.05/2.18/1.70/1.74/2.68，17
     `test_decode_vs_prefill`）；任何只影响单 token 路径的改动都要用该测试验证——纯 prefill 的测试对
     解码路径是盲区。见 [design/12-build-and-testing.md](design/12-build-and-testing.md) §7。
 11. **kernel launcher 里绝不做设备查询**。`rmsnorm_launch` 每次启动都调 `si::dev::wg_clamped()`
-    （`src/backend/gpu/kernels/rmsnorm.cpp:71`），所以那里的
+    （`gpu/kernels/rmsnorm.cpp` 的 `rmsnorm_launch`（`wg_clamped` 调用点）），所以那里的
     `sycl::device::get_devices()` + `get_info<max_work_group_size>()` 必须缓存（它在
-    `src/device/device_registry.cpp:143` 的函数内 static 里，只查一次）。未缓存时实测**每次调用
+    `device_registry.cpp` 的 `for_queue` 函数内 static 的函数内 static 里，只查一次）。未缓存时实测**每次调用
     3.2 ms**，一次 MTP verify 的 65 次 rmsnorm 就是 **210 ms 纯 host 时间**；数字与理由记在
-    `src/device/device_registry.cpp:135` 的注释与 [AGENTS.md](../AGENTS.md)（测量条件：27B / 2x A770、
+    `device_registry.cpp` 里未知卡回退处的注释与 [AGENTS.md](../AGENTS.md)（测量条件：27B / 2x A770、
     `--layer-map 0-31:gpu.0,32-63:gpu.1` 的 MTP 配置）。这个 bug 在普通 decode 的数字里**看不见**，
     因为 decode 是启动时录一次、之后重放的 command graph，而当时的 verify 是直接重放 kernel 的。
-    同理 `si::dev::active()` 也只解析一次（`device_registry.cpp:86`）。
+    同理 `si::dev::active()` 也只解析一次（`device_registry.cpp` 的 `active()`）。
 12. **喂给原生权重 GEMV 的激活必须用 `do_split=true` 量化**。`nat_gemm_launch` 的四个格式入口
     （u4 / k5 / cb4 / int8）读的都是 even/odd 分组激活视图，`dnnl_gemm` 用 `p->split_valid` 把它们
     限制在 decode / `mtp_dry` verify 上（`src/backend/dnnl_gemm.cpp:1323`、`1375`、`1439`；
@@ -492,7 +492,7 @@ MTP 入口）。引擎的 `record_forward` 只调用 `compute_backend`，因此�
 在运行期选择 AVX2 / AVX-VNNI / AVX-512（int8 点积用 VNNI 的 `dpbusd`，否则 AVX2
 `maddubs+madd`；fp32 归约/点积同理）。`PF_CPU_ISA=scalar|avx2|avx512|avxvnni` 可强制变体；
 CPU worker 线程数由 `--cpu-threads N` 或 `PF_CPU_THREADS` 指定（默认 = 物理核数，探测失败时回退到硬件并发，
-见 `src/backend/cpu/kernels/common.cpp:68`）。
+见 `src/backend/cpu/kernels/common.cpp` 的 ISA dispatch）。
 
 CPU 后端默认跑 **从 GGUF block 直接提取的整数 int8 GEMV**（`kernels/i8.cpp`，
 Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgemv_sb_*`），
@@ -507,8 +507,12 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 `--layer-map 0-11:gpu,12-23:cpu` 把层区间映射到设备（`gpu` / `gpu.N` / `cpu` / `host` / `1`），
 每个区间是**闭区间**且必须无缝隙地覆盖 `[0, n_layer)`。多 GPU 区间共享**一个** SYCL context
 （host USM 是 context 作用域的，否则第二张卡上的激活会间歇性出错，
-`src/engine/engine.h:119`）。**多设备之间是 pipeline parallel（层区间流水）**：设备 `d` 计算自己的
-层区间，算完后把隐藏状态交给下一个设备。具体地：
+`src/engine/engine.h:119`）。**多个 GPU 可以解析到不同的调优 profile**（例如 A770 + Iris Xe）：
+这是**支持的配置而不是错误**，每张卡按自己的队列解析 profile（`si::dev::for_queue(q)` /
+`wg_clamped_for_queue(q, want)`，每次 launch 0.039 µs），并在 `PF_DEVICE_INFO=1` 下报告混合情况。
+这不只是调优问题——A770 接受 1024 线程的工作组而 Iris Xe 只接受 512，用进程级单一的
+`active()` 会让第二张卡**launch 失败**（不是变慢）。**多设备之间是 pipeline parallel（层区间流水）**：
+设备 `d` 计算自己的层区间，算完后把隐藏状态交给下一个设备。具体地：
 
 * `backends_` 每个设备一个后端；`layer_dev_[il]` 决定每层用哪个后端，`record_forward` 在**分区边界**
   调 `handoff_x(prev_dev, dev, nrows * nreal)`（`src/engine/engine_graph.cpp:903`），再
@@ -516,8 +520,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
   (1) `handoff_x`（`src/engine/engine.cpp:796`）先在**源设备的队列**上 `wait()`——command graph 只排序
   已录制的依赖，不排序这些手工提交的拷贝——再经一块 host USM 暂存缓冲拷到目标设备的
   `as_[to].x`（in-order 队列保证目标端自己的 kernel 在这次拷贝之后）；目标设备是 CPU 分区时
-  `as_[to].x` 本身就是主机 USM（`dev_alloc_on` 对 `dev_kind == cpu` 走 `sycl::malloc_host`，
-  `src/engine/engine.cpp:725`）。
+  `as_[to].x` 本身就是主机 USM（`dev_alloc_on` 对 `dev_kind == cpu` 走 `sycl::malloc_host`）。
   (2) 只拷**活着的那些行**：激活布局是 `[token][n_embd]`，所以单 token decode 拷 1 行而不是整个
   `kMaxB*kMaxT`——旧的全量拷贝每次交接搬 10.5 MB，一个 token 的 decode 要搬两次。
 * GPU 后端只上传它自己那部分层（加全局 tok_embd / output_norm）的权重张量，CPU 后端直接读 mmap；
@@ -527,7 +530,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
   `dev_kpool_` / `dev_vpool_` / `dev_kscales_` / `dev_vscales_` 只包含该设备的注意力层。
   block id 是全局的（同一张 block table），所以 paged attention 与 `set_table` 无需改动。
   这条路径不走虚拟 USM：`kv_setup` 把每设备的池一次性提交到 `pool_cap`
-  （`src/engine/engine_kvpool.cpp:186`）。
+  （`engine_kvpool.cpp` 的 `kv_setup` 多设备分支）。
 * **前缀缓存可用**——block id 全局，且多设备下 `host_act = true`（`src/engine/engine.cpp:1546`）让引擎
   scratch（含 `d_pc_states` 递归状态检查点池）整体走 `sycl::malloc_host`，所以三层缓存的记录在所有
   设备之间共享；`pc_serialize_block` / `pc_deserialize_block` 经 `kv_layer_ptrs` 按设备解析每层的池。
@@ -542,7 +545,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
     `PF_DP4A_DEC=0` 关掉，仍走 fp32 GEMV。批式 decode n>1 目前仍是 fp32，与单设备一致。
 * **prefill 的 mode-2 批处理**：`plan_pfb_` + 行偏移段副本 `d_segs_pfb`，一个长 prompt 的所有
   32-token 块合并进单个前向；有 oneDNN 分区时 `batched_prefill_fit` 直接返回 `min(rem, kMaxB*kMaxT)`
-  （`src/engine/engine.h:404`），即一次前向吃掉整个尾部。批内多段的窄 int8 调用组由
+  （`gpu/kernels/kernels.h` 声明的 `i8_grp_gemv_rows_multi_launch` 调用组），即一次前向吃掉整个尾部。批内多段的窄 int8 调用组由
   `i8_grp_gemv_rows_multi_launch` 一次分发（§5.3）。
 * **三层 prefill phase**：`md_pf_phases_` 把层循环切成连续的设备段（设备 0 带 embedding、
   设备 1、设备 0 带 output_norm + head）。当映射恰好是"两个 GPU 分区"这一形状且所有 phase 都在
@@ -587,12 +590,12 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 
 选择与回退：
 
-* `si::dev::active()` 在进程内只解析一次（`src/device/device_registry.cpp:86`）。
+* `si::dev::active()` 在进程内只解析一次（`device_registry.cpp` 的 `active()`）。
   `PF_DEVICE_PROFILE=<key>` 可以钉住某张卡的取值；CMake 的 `-DSYCL_INFER_AOT_PROFILE=<key>` 把它
   烘进 AOT 二进制的 `SI_FORCE_DEVICE_PROFILE`，运行期 env 仍然优先（这样烘好的二进制还能改指做 A/B）。
 * 没有 matcher 命中时回落到 `key = "unknown"` 的 profile：它是 `kDevices[0]` 的一份 struct 拷贝
   （构建期拷贝，不会随被拷贝的那一行漂移），硬件事实清零，并打印一条 WARNING 说明应该去
-  `src/device/profiles/` 加文件（`src/device/device_registry.cpp:30`、`77`）。`PF_DEVICE_INFO=1`
+  `src/device/profiles/` 加文件（`device_registry.cpp` 的 `kDevices[]` 与 `for_name()`）。`PF_DEVICE_INFO=1`
   在启动时把解析结果与 provenance 打出来。
 * **每个值都必须写指定初始化器**（`.key = ...`、`.shape = {.rmsnorm_wg = ...}`），构建用
   `-Wall -Wextra`，漏写会告警而不是静默取默认值。
@@ -618,10 +621,10 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 * **MTP 层是一个完整的 full-attention qwen35 block**，输入是
   `eh_proj(concat(enorm(emb(t_p)), hnorm(h_{p-1})))`（右移一位，与 llama.cpp 的 `graph_mtp` 和训练
   目标一致），所以它有自己的 `w{q,k,v,o}`、`ffn_*` 与可选的 `shared_head_norm`/`shared_head_head`
-  （`src/model/model.h:73`）。它跑在**主设备**上（`--mtp-device N`，默认 0），并拥有**自己的一段
+  （`model.h` 的 `lay_wts`）。它跑在**主设备**上（`--mtp-device N`，默认 0），并拥有**自己的一段
   paged KV**（该设备注意力层序号 `attn_layers()-1`，`src/engine/engine.h:448`）——因此它计入
   `--kv-cap-mb`，也被三个前缀缓存层一起管。
-* **三个门控**（`src/engine/engine.cpp:108`、`141`、`150`）：前两个不满足就打印一行 `[mtp]` 并
+* **三个门控**（`engine.cpp` 的三处 MTP 门控、`141`、`150`）：前两个不满足就打印一行 `[mtp]` 并
   **关闭** MTP 回落普通 decode，第三个只把越界的分区号重置为 0：
   1. GGUF 必须有 `blk.<n>.nextn.*`，否则打印 `model has no NextN (blk.N.nextn.*) layer - MTP disabled`；
   2. 必须是 `--layer-map` 的**多设备 oneDNN int8 分区**（`multi_dev && md_xmx`），否则打印
@@ -671,7 +674,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 | `--cpu-threads N` | CPU 后端 worker 线程数 | §11.1 |
 | `--layer-map L:dev,...` | pipeline-parallel 层放置，`dev` ∈ `gpu` / `gpu.N` / `cpu`（别名 `host`、`1`） | §11.2 |
 | `--mtp [N]` / `--mtp-device N` | MTP 草稿长度（省略数值 = 实测最优 k=4，上限 12）/ 草稿层所在分区 | §12 |
-| `--mmproj <gguf>` / `--audio-mmproj <gguf>` | 视觉投影 / 音频塔；CLI 的 `--image`/`--video` 需要前者、`--audio` 需要后者（`main.cpp:430-451`），但**服务端任何媒体 part 都先查 `mm.ready`**，所以纯音频请求实际要两个都加载（`server.cpp:1597-1611`） | §9 不变量 6/7/8 |
+| `--mmproj <gguf>` / `--audio-mmproj <gguf>` | 视觉投影 / 音频塔；CLI 的 `--image`/`--video` 需要前者、`--audio` 需要后者（`main.cpp` 的 `ensure_vm()`（CLI 惰性加载 `--mmproj`）），但**服务端任何媒体 part 都先查 `mm.ready`**，所以纯音频请求实际要两个都加载（`handle_chat` 的 `mm.ready`/`mm.audio_ready` 检查，`server.cpp`） | §9 不变量 6/7/8 |
 | `--host H` / `--port N` | `serve` 的绑定地址 / 端口 | §2 |
 | `--prompt "..."` / `--raw` / `--thinking`（别名 `--enable-thinking`） | `gen` 的提示与 chat template 选择 | §2 |
 | `--image/--video/--audio <file>` | 附加媒体（各自可重复、可混用） | §9 不变量 6 |
