@@ -33,8 +33,8 @@ model type is selected through the architecture registry.
   attention) is implemented today.
 * **Paged KV cache + continuous batching** — 32-token physical blocks with
   per-sequence block tables; chunked prefill and batched decode (up to 16
-  concurrent sequences).  Batched decode measures 14.3 → 24.5 → 40.1 → **55.0
-  tok/s aggregate** for 1/2/4/8 concurrent greedy requests on the 27B (3.85x at
+  concurrent sequences).  Batched decode measures 14.74 → 25.59 → 41.11 → **54.83
+  tok/s aggregate** for 1/2/4/8 concurrent greedy requests on the 27B (3.7x at
   8), because every extra row amortises the same weight pass.
 * **Cross-request prefix cache** — hashed 32-token blocks with recurrent-state
   checkpoints, so a shared prompt prefix is prefilled only once.  Three LRU
@@ -98,8 +98,11 @@ model type is selected through the architecture registry.
   **one non-causal forward** over `[anchor, MASK x (n_max)]` and a selector scores
   the top-K candidate sets per block position plus every ordered pair, so the host
   walks one coherent path through the lattice instead of re-drawing per token.
-  Measured **2.17x** single-request decode on the 27B (31.5 vs ~68 ms/token at
-  `n_max=5`), with acceptance matching llama.cpp at the same `n_max`.  Needs a
+  Measured **1.3x-3.1x** single-request decode on the 27B at `n_max=5` (21.8-77.0
+  vs 67-71 ms/token plain), the spread being *acceptance* and nothing else: 4.25
+  drafts/cycle on a code prompt, 2.19 on a technical one, and 0.49 on a story opener
+  where the drafter is **slower than no drafter at all** (0.92x).  Check acceptance
+  per workload before enabling it.  Needs a
   matching draft GGUF via `--spec-draft-model`.  See
   [Design 14](docs/design/14-dflash2.md).
 * **Per-GPU tuning profiles** — every launch constant that was measured on a
@@ -308,21 +311,37 @@ Notes:
 Measured configuration: `Qwen3.8-27B-UD-Q4_K_M` (64 layers, 16 full-attention,
 `n_head` 24 / `n_head_kv` 4, `head_dim` 256), two Arc A770 16 GB,
 `--layer-map 0-31:gpu.0,32-63:gpu.1`, i8 KV, AOT Release build, ctx 131072,
-`PF_PREFIX_CACHE=0`, driven by `llama-benchy` 0.4.0
-(`--pp 512 --tg 128 --depth {0,16384,65536} --exact-tg`, 2-3 runs) against
-the OpenAI server.
+`PF_PREFIX_CACHE=0` (verified in the server's `/proc/<pid>/environ`, because the
+whole prefill column is meaningless if it is on), driven by `llama-benchy` 0.4.0
+(`--pp 512 --tg 128 --depth {0,16384,65536} --exact-tg --runs 3`) against the
+OpenAI server.  Re-measured 2026-10-09.
 
-| context depth | prefill pp512 | decode tg128 |
-|---|---:|---:|
-| 0 | **2 870 tok/s** | **14.6 tok/s** |
-| 16 384 | **911 tok/s** | **13.4 tok/s** |
-| 65 536 | **540 tok/s** | **10.4 tok/s** |
+| context depth | 512-token prefill, alone | whole-prompt rate | decode tg128 |
+|---|---:|---:|---:|
+| 0 | 214 ms = **2 390 tok/s** | 513 tok in 1.44 s | **14.05 ± 0.16 tok/s** |
+| 16 384 | not measurable | **865 tok/s** | **12.86 ± 0.11 tok/s** |
+| 65 536 | not measurable | **560 tok/s** | **10.34 ± 0.09 tok/s** |
 
-* `pp512` is the rate of the *marginal* 512-token prefill chunk at that depth,
-  i.e. what a long prompt actually experiences (at depth 0 it is the 512-token
-  prompt itself, 178-187 ms).  The cold full-prompt time-to-first-token of those
-  runs was 1.38 s / 18.6 s / 87.3 s at depth 0 / 16k / 60k.
+* **Whole-prompt rate is `prompt_tokens / cold time-to-first-token`** — 513 in 1.44 s,
+  16 897 in 19.5 s, 66 049 in 117.9 s.  It is the only rate that means the same thing
+  at every depth, and at depth > 0 it is also the best available estimate of the
+  *marginal* 512-token chunk, since that chunk's cost is dominated by attention over
+  the whole KV (512 / 865 = 592 ms at 16k, 512 / 560 = 914 ms at 64k).
+* **A 512-token prefill cannot be timed in isolation at depth > 0, and the harness's
+  attempt to is wrong.**  `llama-benchy` reports `pp512` as 73 830 tok/s at 16k and
+  235 563 tok/s at 64k: it divides the prompt length by `ttfr`, the time to the first
+  streamed SSE chunk, which the server sends *before* the prefill runs.  Its `ttfr`
+  (0.19-0.29 s at every depth) and its `e2e_ttft` (19.5 s at 16k) differ by 75x on the
+  same request.  Its `est_ppt` column is not the answer either — 234 ms at 16k and
+  281 ms at 64k, essentially flat, when a real 512-token chunk over a 64k KV cannot
+  cost less than one over a 16k KV.  Only the depth-0 cell, where there is no
+  accumulated KV and nothing else in flight, is a real isolated prefill.
 * `tg128` is decode throughput over exactly 128 generated tokens for one request.
+* Against the previously recorded figures (2 870 / 911 / 540 and 14.6 / 13.4 / 10.4):
+  **decode reproduces to within 4 %** (14.05 / 12.86 / 10.34) and the deep prompt
+  rates to within 5 % (865 vs 911, 560 vs 540).  The isolated depth-0 prefill is
+  **17 % slower** than the 178-187 ms recorded before (214 ms) — the one cell that
+  moved materially, and it moved in the wrong direction.
 * The 16k and 64k prefill rates are above the OpenVINO reference numbers for this
   model on this hardware — 640 and 362 tok/s.  Two caveats on that comparison, both
   in OpenVINO's favour or against it, so read them with the numbers: they were
@@ -335,67 +354,115 @@ the OpenAI server.
   block-max reduction spread over 64 work-groups instead of one, and the per-row
   index arrays built by a device kernel instead of three host→device copies per
   kv head.
-* Where the remaining time goes: a decode step at 64k depth is 95 ms against an
+* Where the remaining time goes (from the previous pass, **not re-measured** — it needs
+  `PF_XMX_BREAKDOWN`, which this re-measurement did not run): a decode step at 64k
+  depth is 95 ms against an
   ~88 ms floor (27 ms attention + 62 ms of weight stream at the measured
   400 GB/s read ceiling), and a 512-token prefill chunk at 64k is 833 ms of which
-  ~230 ms is attention and ~373 ms dense GEMM.
+  ~230 ms is attention and ~373 ms dense GEMM.  The 833 ms is consistent with the
+  914 ms that this pass's whole-prompt rate implies (512 / 560 tok/s).
 
 ### MTP speculative decoding (`--mtp`)
 
 Single-request greedy decode, 128 tokens per cell, one process per cell, same
-box; plain decode on the same build is **69.0 ms/token**:
+box and model as above.  `acc` is accepted drafts per cycle as the engine reports it
+(`PF_MTP_TIME=1`), not inferred from ms/token — otherwise an acceptance change and a
+cycle-cost change are indistinguishable.  Plain decode on the same build, same prompt,
+same token count is **67-70 ms/token** (three prompts: 67.2 / 67.3 / 70.7).
 
-| prompt | draft `k` | acceptance | MTP ms/token | speedup | ceiling (1 + acc) |
-|---|---:|---:|---:|---:|---:|
-| code continuation | 4 | 2.78 | 27.8 | **2.49x** | 3.78x |
-| technical explanation | 4 | 2.25 | 32.3 | **2.14x** | 3.25x |
-| story opener | 4 | 1.18 | 48.3 | 1.43x | 2.18x |
+| prompt | `PF_MTP_ADAPT` | acceptance | cycle ms | MTP ms/token | speedup |
+|---|---|---:|---:|---:|---:|
+| code continuation | on (default) | 2.08 | 99.0 | 36.4 | 1.84x |
+| technical explanation | on (default) | 1.84 | 100.5 | 39.2 | 1.72x |
+| story opener | on (default) | 0.84 | 88.8 | 52.5 | 1.35x |
+| code continuation | off | 2.50 | 106.0 | 34.3 | 1.96x |
+| technical explanation | off | 2.33 | 105.8 | 35.4 | 1.90x |
+| story opener | off | 1.18 | 105.7 | 53.2 | 1.33x |
 
-Three things worth knowing before enabling it:
-
-* **the speedup is acceptance-bound, not engine-bound** — the cycle costs ~15 ms
-  over a plain decode on all three prompts, so what varies is how many drafted
-  tokens the model's own NextN head gets right (the per-depth acceptance decays
-  geometrically at ~0.7 with no step-0 collapse).  A prompt with `acc ≈ 1.2`
-  cannot be pushed past 1.4x by any engine change;
-* **it does not compose with batching** — MTP spends `k+1 = 5` verify rows per
-  `acc+1` emitted tokens (≈2.0 rows/token against the plain decode's 1.0) while
-  batching amortises the same weight pass for free, so MTP only wins at
-  concurrency ≤ 2.  The server therefore defaults to the scheduler: 8 concurrent
-  128-token greedy requests measure 55.0 tok/s through it against 17.5 tok/s with
-  the single-sequence MTP loop (`PF_MTP_SERVER=1` restores the MTP routing);
-* **it is a short-context win** — at 128k depth the 7-row verify costs 1390
-  ms/cycle against 181 ms for a plain decode, because the extra rows multiply the
-  attention over a 131k-key KV.
-
-The spread between the three prompts is entirely the acceptance, not the engine:
-`X` (the cycle-only cost over a plain decode) is ~15 ms on all of them, so the
-only thing that moves the speedup is how many drafted tokens the NextN head gets
-right — `reach[j]` (the fraction of cycles accepting at least `j` drafts) decays
-geometrically at p ≈ 0.7 with no step-0 collapse, i.e. the draft's hidden state
-is right and the decay is the model's own accuracy.
-
-Two knobs that look like levers and are not: the draft's precision is free
-(`PF_MTP_LAYER_EXACT=1` runs its GEMMs on the exact fp32 dequant reference and
-the acceptance is identical), and neither is its bytes (`PF_MTP_HEAD_W2=1`, a 2-bit
-head store at 0.375 B/weight, is a wash: -2.6 ms/cycle for -2 % acceptance,
-because that GEMV is not bandwidth-bound).
+* **Acceptance, not the engine, is what moves the speedup.**  With `PF_MTP_ADAPT=off`
+  the cycle is *constant* across all three prompts — `draft` 17.5 ms, `verify`
+  87.0-87.2 ms, `commit` + `rollback` 1.2 ms, **~106 ms every time** — while the
+  speedup ranges over 1.33x-1.96x.  Nothing about the engine changed between those
+  cells; only how many of the 4 drafted tokens the NextN head got right.
+* **`PF_MTP_ADAPT` (default on) trades cycle cost for acceptance, and which side wins
+  is prompt-dependent.**  It shrinks `k` by one on a cycle that accepts nothing, which
+  both lowers acceptance (`k=1` yields ~1.0 drafts/cycle, dragging a rejecting prompt
+  toward 1.0 — the story prompt goes 1.18 → 0.84) and makes the cycle cheaper
+  (88.8 ms instead of 105.7, because fewer rows are verified).  On the two
+  high-acceptance prompts the cheaper cycle does not pay for the lost drafts and it
+  costs 5-6 ms/token (39.2 vs 35.4, 36.4 vs 34.3); on the story prompt it is a wash
+  (52.5 vs 53.2).  `AGENTS.md` records it winning on a different prompt pair
+  (42.0 → 38.7 ms/token on a low-acceptance one, 27.5 ms/token on a high-acceptance
+  one), so measure both settings on your own prompts instead of assuming either.
+* **The acceptance figures previously recorded in this file were taken with
+  `PF_MTP_ADAPT` off**, which is now demonstrable rather than assumed: with adapt off
+  the story prompt measures `acc=1.18`, matching the previously recorded 1.18 to two
+  decimals, and 2.33 / 2.50 against the previously recorded 2.25 / 2.78.  If you are
+  comparing against an older copy of this table, that is the difference.
+* Reproducibility: acceptance is not noisy — prompt 0 measured `acc=1.84` at its final
+  cycle in all three separate processes, and 2.33 with adapt off.  This matters
+  because a prefix-cache hit inside one process moves the acceptance (1.9 cold vs 2.8
+  warm), so each cell needs its own process and `PF_PREFIX_CACHE=0`.
+* The accept-argmax moves no bytes and no time: `verify` here is 87 ms, in line with
+  the 88.3 ms recorded when the argmax was moved onto the device.
 
 ### DFlash2 block drafter (`--spec-type dflash2`)
 
-Single-request greedy decode on the same box and model.  `n_max` is the number of
-draft tokens per cycle (`acc` is accepted drafts per cycle, so the ceiling on
-speedup is `1 + acc`); each cell is one process per configuration, and the plain
-decode on the same build is **~68 ms/token**:
+Single-request greedy decode on the same box and model, draft GGUF
+`Qwen3.8-27B-DFlash2-Q4_K_M`.  `n_max` is the draft tokens per cycle; `acc` is
+accepted drafts per cycle, so the ceiling on speedup is `1 + acc`; each cell is its
+own process.  Plain decode is **67.2 / 67.3 / 70.7 ms/token** on the code /
+technical / story prompts (the baseline is prompt-independent within noise, measured
+by differencing two generation lengths so the 27B load cancels).  Code-continuation
+prompt:
 
 | `n_max` | 1 | 2 | 3 | 4 | **5** | 6 |
 |---|---:|---:|---:|---:|---:|---:|
-| acc | 0.98 | 1.44 | 2.18 | 2.54 | **2.90** | 2.90 |
-| ms/token | 48.6 | 41.9 | 34.1 | 32.5 | **31.5** | 33.3 |
+| acc | 0.92 | 1.80 | 2.84 | 3.46 | **4.25** | 5.05 |
+| ms/token | 46.1 | 33.8 | 26.1 | 24.0 | **21.8** | 20.1 |
+| verify ms | 74.3 | 78.4 | 82.3 | 87.1 | **92.4** | 97.4 |
 
-**`n_max=5` is the shipped default: 2.90 accepted drafts per cycle, 31.5 ms/token,
-2.17x over the plain decode.**  Acceptance against llama.cpp at the same `n_max`
-(short prompt, mean accepted tokens per cycle):
+**`n_max=5` is the shipped default: 4.25 accepted drafts per cycle, 21.8 ms/token,
+3.1x over the plain decode** — but that number is *this prompt*, and the prompt
+dependence is the headline finding here, not a footnote:
+
+| prompt at `n_max=5` | acc | ms/token | vs its own plain baseline |
+|---|---:|---:|---:|
+| code continuation | 4.25 | 21.8 | **3.08x** |
+| technical explanation | 2.19 | 35.8 | 1.88x |
+| story opener | 0.49 | 77.0 | **0.92x — slower than no drafter** |
+
+An acceptance of 0.49 means the block drafter is rejecting most of what it proposes,
+so each cycle emits 1.49 tokens for a 114 ms cycle: strictly worse than the 70.7 ms
+plain step.  Neither knob rescues it — raising `n_max` makes the cycle longer faster
+than it makes acceptance better (the sweep above: acc 4.25 at `n_max=5` but 0.92 at
+`n_max=1` on the *code* prompt, and every `n_max` is worse in ms/token than 21.8 on
+the story prompt) — so acceptance has to be checked per workload before enabling it,
+and a single speedup figure for this drafter is not a property of the drafter.
+
+**This sweep is uniformly better than the one previously recorded here** (acc
+0.92/1.80/2.84/3.46/4.25/5.05 against 0.98/1.44/2.18/2.54/2.90/2.90, and 21.8 vs
+31.5 ms/token at `n_max=5`) while the *cycle cost is unchanged* — `verify` 92.4 ms
+here against 90.9 ms recorded before, and the previous analysis' "72.2 ms fixed plus
+~5.5 ms per extra row" is the same line as the fit above.  So the difference is
+acceptance, not engine work, and the drafter path and the shared per-queue profile
+resolution under it have both changed since that table was taken.  The cause was not
+bisected for this re-measurement; what is established is that the emitted stream is
+byte-identical to a plain greedy decode's (same md5 over 128 tokens with the
+diagnostics on stderr), so the extra acceptance buys speed without changing the text.
+
+Where the 114 ms cycle goes at `n_max=5`: `verify=92.4`, `draft=18.3`, `emit=1.5`,
+`inject=1.1`, `rollback=1.0`.  A least-squares fit of the verify column above prices it
+at **69.1 ms fixed + 4.64 ms per extra draft row** (endpoints predict 73.7 / 96.9 ms
+against 74.3 / 97.4 measured) — one plain decode's weight pass plus the marginal
+rows, the same shape as MTP's verify, and it runs on the recorded command graphs
+rather than the direct replay that cost 210 ms on the MTP path.
+
+> **Not re-measured on 2026-10-09** (kept from the previous pass, which used patched
+> llama.cpp probes that this box's `~/llama.cpp` build does not contain — its
+> `build/bin` has no DFlash tool, so the comparison could not be reproduced here).
+> Treat it as the older claim: acceptance against llama.cpp at the same `n_max`
+> (short prompt, mean accepted tokens per cycle):
 
 | generated | 32 | 116 | 227 |
 |---|---:|---:|---:|
@@ -403,16 +470,10 @@ decode on the same build is **~68 ms/token**:
 | this engine | 4.75 | 3.90 | 3.92 |
 
 On a 204-token prompt both engines drop (llama.cpp 0.239 / mean 2.07, this engine
-0.81 / 1.81), so the long-context gap is ~12 %, not a structural difference.
-
-Where the 122 ms cycle goes at `n_max=5`: `verify=90.9`, `draft=26.9`,
-`inject=1.5`, `emit=1.5`, `rollback=1.0`.  **The verify is already at its
-structural floor** — a `n_max` sweep prices it at 72.2 ms fixed plus ~5.5 ms per
-extra row, which the weight-stream model predicts to 0.1 ms — and it runs on the
-recorded command graphs (378 of them), not the direct replay that cost 210 ms on
-the MTP path.  The remaining levers are fewer weight bytes and a faster dp4a, and
-both are already measured and rejected on accuracy grounds.  Details in
-[Design 14 §7](docs/design/14-dflash2.md).
+0.81 / 1.81), so the long-context gap is ~12 %, not a structural difference.  The
+rest of that section's analysis — the verify at its structural floor, the remaining
+levers being fewer weight bytes and a faster dp4a, both already measured and rejected
+on accuracy grounds — is in [Design 14 §7](docs/design/14-dflash2.md).
 
 ## Configuration
 
@@ -488,7 +549,7 @@ to the 27B instead.
 ## Notes
 
 * Batched decode is worth using: on the 27B, 1/2/4/8 concurrent greedy requests
-  measure 14.3 / 24.5 / 40.1 / 55.0 tok/s aggregate, because every extra row
+  measure 14.74 / 25.59 / 41.11 / 54.83 tok/s aggregate, because every extra row
   amortises the same weight pass.  On integrated GPUs both prefill and decode are
   memory-bandwidth bound, which is what the host backend is there for.
 * **Batching is not bit-exact against a single request.**  At temperature 0 a
