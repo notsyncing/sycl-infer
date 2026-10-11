@@ -24,6 +24,7 @@
 #include "multimodal.h"
 #include "tokenizer.h"
 #include "video.h"
+#include "env.h"
 #include "vision.h"
 
 using namespace si;
@@ -304,6 +305,11 @@ static void test_vision(const std::string & mmproj_path) {
     vision_model vm;
     try {
         vm.load(mmproj_path);
+
+        if (si::env::flag("PF_MM_DIAG")) {
+            fprintf(stderr, "[mm] %s: n_embd=%d n_head=%d head_dim=%d runnable=%d\n", mmproj_path.c_str(),
+                    vm.hp.n_embd, vm.hp.n_head, vm.hp.head_dim, (int) vm.runnable(nullptr));
+        }
     } catch (const std::exception & ex) {
         printf("  skip (cannot load %s: %s)\n", mmproj_path.c_str(), ex.what());
         return;

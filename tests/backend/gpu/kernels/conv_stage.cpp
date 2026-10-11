@@ -19,7 +19,7 @@ void stage_conv(stage_env & env) {
     env.set_info(T, 0, 1);
     env.e.q.memcpy(env.e.d_qkv, raw.data(), raw.size() * 4);
     env.e.q.memset(env.e.d_conv_state, 0, (size_t)kMaxB * (hp.conv_k - 1) * cd * 4);
-    conv_l2_launch(env.e.q, env.e.d_qkv, env.e.d_conv_state, env.e.m.dev_f32(L0.ssm_conv1d), env.e.d_conv_out,
+    conv_l2_launch(env.e.q, env.e.d_qkv, env.e.d_conv_state, env.wf32(L0.ssm_conv1d), env.e.d_conv_out,
                    env.e.d_info, cd, hp.conv_k, hp.d_state, hp.n_group, hp.rms_eps, 1, T);
     {
         auto qq = env.get("q_conv_predelta-0"), kk = env.get("k_conv_predelta-0"), vv = env.get("v_conv_predelta-0");

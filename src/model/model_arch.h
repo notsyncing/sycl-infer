@@ -24,6 +24,7 @@ const loader * find(const std::string & name);
 
 // per-architecture loaders
 void load_qwen35(model & m);
+void load_qwen35moe(model & m);
 
 // shared tensor-binding helpers (defined in model.cpp)
 wt bind_tensor(const gguf_file & f, const std::string & name, uint32_t expect_type = 0xFFFFFFFF);

@@ -13,6 +13,11 @@ void stage_attn(stage_env & env) {
     const hparams & hp = env.e.m.hp;
     const layer_t & L3 = env.e.m.layers[3];
     const int T = env.T;
+    // layer 3 is the first full-attention layer in both the dense and the
+    // MoE reference models, i.e. global attention index 0
+    void * kp, * vp;
+    const void * ksc, * vsc;
+    env.kvp(0, kp, vp, ksc, vsc);
 
     // set up the q/k/v projections and the paged KV cache
     std::vector<float> wq = env.get("raw_wq-3"), wk = env.get("raw_wk-3"), wv = env.get("raw_wv-3");
@@ -26,15 +31,15 @@ void stage_attn(stage_env & env) {
         blocks.push_back(env.e.alloc_block());
     }
     env.e.set_table(0, blocks);
-    qk_norm_rope_launch(env.e.q, env.e.d_qbuf, env.e.d_kbuf, env.e.d_vbuf, env.e.m.dev_f32(L3.q_norm),
-                        env.e.m.dev_f32(L3.k_norm), env.e.d_kpool, env.e.d_vpool, env.e.d_tables, env.e.d_info,
+    qk_norm_rope_launch(env.e.q, env.e.d_qbuf, env.e.d_kbuf, env.e.d_vbuf, env.wf32(L3.q_norm),
+                        env.wf32(L3.k_norm), kp, vp, env.e.d_tables, env.e.d_info,
                         hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, /*rope_freqs=*/nullptr,
-                        /*rope_mscale=*/1.0f, hp.rms_eps, env.e.max_blocks, 1, T, env.e.d_kscales, env.e.d_vscales);
+                        /*rope_mscale=*/1.0f, hp.rms_eps, env.e.max_blocks, 1, T, ksc, vsc);
 
     // classic split attention + combine
-    attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool, env.e.d_partials, env.e.d_tables,
+    attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, kp, vp, env.e.d_partials, env.e.d_tables,
                 hp.n_head, hp.n_head_kv, hp.head_dim, 16, env.e.d_info, hp.attn_scale, env.e.max_blocks, 1, T, nullptr,
-                -1, env.e.d_kscales, env.e.d_vscales);
+                -1, ksc, vsc);
     attn_combine_launch(env.e.q, env.e.d_partials, env.e.d_qbuf, env.e.d_attn_out, env.e.d_info, hp.n_head, hp.head_dim,
                         16, 1, T);
     std::vector<float> hb((size_t)T * hp.n_head * hp.head_dim);
@@ -56,7 +61,7 @@ void stage_attn(stage_env & env) {
         const size_t npart = (size_t)nreal * hp.n_head * nsp * (2 + hp.head_dim);
         std::vector<float> p_cls(npart), p_grp(npart);
         auto run = [&](int g) {
-            attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, env.e.d_kpool, env.e.d_vpool, env.e.d_partials,
+            attn_launch(env.e.q, env.e.d_qbuf, env.e.d_qbuf, kp, vp, env.e.d_partials,
                         env.e.d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, env.e.d_info, hp.attn_scale,
                         env.e.max_blocks, 1, nreal, nullptr, g);
             env.e.q.wait();

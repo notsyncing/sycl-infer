@@ -45,6 +45,7 @@ const float * bind_f32(const gguf_file & f, const std::string & name) {
 // their own translation units (e.g. qwen35.cpp).
 static const loader kLoaders[] = {
     {"qwen35", &load_qwen35},
+    {"qwen35moe", &load_qwen35moe},
 };
 
 const loader * find(const std::string & name) {
@@ -103,6 +104,27 @@ void validate_hparams(const hparams & hp, const std::string & arch) {
             throw std::runtime_error(p + "recurrent layers need d_state/n_group/dt_rank/conv_k > 0 (got " +
                                      std::to_string(hp.d_state) + "/" + std::to_string(hp.n_group) + "/" +
                                      std::to_string(hp.dt_rank) + "/" + std::to_string(hp.conv_k) + ")");
+        }
+    }
+    // MoE: the routed experts' K is n_embd and their N is n_ff_exp; the shared
+    // expert's width is n_ff (it is bound into the dense FFN slots, so the
+    // dense paths above already constrain it).  n_expert_used is bounded by
+    // kMaxT because the routed intermediate is materialised as
+    // [n_tokens][n_expert_used][2*n_ff_exp] and n_tokens is at most
+    // kMaxB*kMaxT wide with every slot live.
+    if (hp.is_moe()) {
+        if (hp.n_expert_used <= 0 || hp.n_expert_used > hp.n_expert) {
+            throw std::runtime_error(p + "n_expert_used " + std::to_string(hp.n_expert_used) +
+                                     " outside [1, n_expert=" + std::to_string(hp.n_expert) + "]");
+        }
+        if (hp.n_ff_exp <= 0) {
+            throw std::runtime_error(p + "MoE layers need expert_feed_forward_length > 0");
+        }
+        if (hp.n_expert > 4096) {
+            // the router's per-token top-k runs in one work-group over the
+            // expert logits, so the id/weight tables are bounded; beyond this a
+            // model would need a multi-block top-k.
+            throw std::runtime_error(p + "n_expert " + std::to_string(hp.n_expert) + " exceeds 4096");
         }
     }
 }

@@ -8,18 +8,19 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include "common/env.h"
 
 namespace si {
 
 // ---------------------------------------------------------------------------
-static bool g_capturing = false;
+bool engine::g_capturing_ = false;
 struct capture_guard {
     capture_guard() {
-        g_capturing = true;
+        engine::g_capturing_ = true;
     }
     ~capture_guard() {
-        g_capturing = false;
+        engine::g_capturing_ = false;
     }
 };
 // The oneDNN guard is *not* tied to capture_guard: the single-device prefill
@@ -39,7 +40,7 @@ static double prof_ci_t[256];
 static long prof_ci_n[256];
 static bool prof_on() {
     static bool p = si::env::flag("PF_PROF") && si::env::flag("PF_NOGRAPH");
-    return p && !g_capturing;
+    return p && !engine::g_capturing_;
 }
 static double prof_acc[16];
 static long prof_calls = 0;
@@ -66,10 +67,11 @@ static gemv_seg row_offset_seg(const gemv_seg & s, int r, int tpb) {
     return c;
 }
 // ---------------------------------------------------------------------------
-// The plan is a contract with record_forward: 4 calls per layer in build
-// order plus an optional device-0 head call, with layer_c0 marking each
-// layer's first call.  record_forward consumes it through an incrementing
-// cursor, so any skew miswires activations silently - validate both ends.
+// The plan is a contract with record_forward: one group of calls per layer in
+// build order (4 for a dense layer, 6 for a MoE one) plus an optional device-0
+// head call, with layer_c0 marking each layer's first call.  record_forward
+// consumes it through an incrementing cursor, so any skew miswires activations
+// silently - validate both ends.
 void seg_plan::validate(int n_layer, const char * what) const {
     auto fail = [&](const std::string & msg) {
         throw std::runtime_error(std::string("seg_plan::validate[") + what + "]: " + msg);
@@ -83,18 +85,21 @@ void seg_plan::validate(int n_layer, const char * what) const {
         if (layer_c0[0] != 0) {
             fail("layer_c0[0] != 0");
         }
+        // The span per layer used to be the literal 4.  A MoE layer spends six
+        // (two attention/GDN, the routed experts, the shared expert's gate/up and
+        // down, and the epilogue that gates and adds the shared expert), so the
+        // check is now that each layer's span is non-empty, the head index is
+        // the call count, and the two agree.  That is the invariant the replay
+        // actually depends on: the cursor consumes exactly the calls in order.
         for (int il = 0; il < nl; il++) {
             const int span = layer_c0[(size_t)il + 1] - layer_c0[(size_t)il];
-            if (span != 4) {
-                fail("layer " + std::to_string(il) + " spans " + std::to_string(span) + " calls, not 4");
+            if (span <= 0) {
+                fail("layer " + std::to_string(il) + " spans " + std::to_string(span) + " calls");
             }
         }
-        const int ncalls = 4 * nl + (has_head ? 1 : 0);
+        const int ncalls = layer_c0[(size_t)nl] + (has_head ? 1 : 0);
         if ((int)calls.size() != ncalls) {
             fail("plan has " + std::to_string(calls.size()) + " calls, expected " + std::to_string(ncalls));
-        }
-        if (layer_c0[(size_t)nl] != 4 * nl) {
-            fail("head index is not 4*n_layer");
         }
         if (has_head) {
             // the head call is last and pinned to the primary device: it reads
@@ -250,14 +255,21 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
                 add8(dev, L.wqkv, L.wqkv8, d_xnorm, hp.n_embd, d_qkv, hp.qkv_dim(), nullptr);
                 add8(dev, L.wgate, L.wgate8, d_xnorm, hp.n_embd, d_z, hp.d_inner, nullptr);
                 plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
-                add_sliced(mk(dev, L.ssm_beta, d_xnorm, hp.n_embd, d_beta, hp.dt_rank, nullptr));
-                add_sliced(mk(dev, L.ssm_alpha, d_xnorm, hp.n_embd, d_alpha, hp.dt_rank, nullptr));
             } else {
                 add_sliced(mk(dev, L.wqkv, d_xnorm, hp.n_embd, d_qkv, hp.qkv_dim(), nullptr));
                 add_sliced(mk(dev, L.wgate, d_xnorm, hp.n_embd, d_z, hp.d_inner, nullptr));
-                add_sliced(mk(dev, L.ssm_beta, d_xnorm, hp.n_embd, d_beta, hp.dt_rank, nullptr));
-                add_sliced(mk(dev, L.ssm_alpha, d_xnorm, hp.n_embd, d_alpha, hp.dt_rank, nullptr));
             }
+            // ssm_beta / ssm_alpha get their own call.  They are F32 (type 0),
+            // which oneDNN's int8 matmul cannot take, and the multi-device
+            // oneDNN eligibility test is all-or-nothing *per call* - so sharing a
+            // call with wqkv/wgate makes one unconvertible tensor drop the whole
+            // call, and on a mode-2 prefill the fp32 gemv_group it then lands on
+            // writes nothing: d_qkv stays zero, the GDN produces nothing, and the
+            // residual stream diverges at layer 0 with no error anywhere.  A
+            // 32-row call is cheap next to the qkv projection.
+            plan.begin_call(tb, hp.n_embd / 256);
+            add_sliced(mk(dev, L.ssm_beta, d_xnorm, hp.n_embd, d_beta, hp.dt_rank, nullptr));
+            add_sliced(mk(dev, L.ssm_alpha, d_xnorm, hp.n_embd, d_alpha, hp.dt_rank, nullptr));
             plan.begin_call(tb, hp.d_inner / 256);
             if (use_w8) {
                 add8(dev, L.ssm_out, L.ssm_out8, d_attn_merged, hp.d_inner, d_x, hp.n_embd, d_x);
@@ -287,6 +299,40 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
             }
         }
         plan.begin_call(tb, hp.n_embd / 256);
+        if (L.moe.ok()) {
+            // MoE FFN: the routed half is one call that dispatches the router +
+            // per-expert kernels (no segments - the expert choice is made on the
+            // device), then the *shared* expert runs as an ordinary dense FFN of
+            // width n_ff (= n_ff_shexp), and a final call gates it and adds both
+            // halves into the residual stream.  The order matters: the routed
+            // sum lands in d_x first and the shared expert's down reads
+            // d_moe_shout, so the residual is never read half-updated.
+            plan.begin_moe_call(seg_plan::call_t::moe_routed, tb, hp.n_embd / 256);
+            bind_moe_acts(dev);
+            // shared expert: gate/up, then down (no residual - the epilogue
+            // applies the sigmoid gate and then adds the residual)
+            plan.begin_call(tb, hp.n_embd / 256);
+            if (use_w8) {
+                add8(dev, L.ffn_gate, L.ffn_gate8, d_xnorm, hp.n_embd, d_moe_sh, ffn_stride, nullptr);
+                add8(dev, L.ffn_up, L.ffn_up8, d_xnorm, hp.n_embd, d_moe_sh + hp.n_ff, ffn_stride, nullptr);
+                plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+            } else {
+                add_sliced(mk(dev, L.ffn_gate, d_xnorm, hp.n_embd, d_moe_sh, ffn_stride, nullptr));
+                add_sliced(mk(dev, L.ffn_up, d_xnorm, hp.n_embd, d_moe_sh + hp.n_ff, ffn_stride, nullptr));
+            }
+            plan.begin_call(tb, hp.n_ff / 256);
+            if (use_w8) {
+                add8(dev, L.ffn_down, L.ffn_down8, d_moe_sh, ffn_stride, d_moe_shout, hp.n_embd, nullptr);
+                plan.set_xq(d_moe_sh, d_moe_sh + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
+                plan.set_act_up(d_moe_sh + hp.n_ff, d_moe_sh);
+            } else {
+                gemv_seg s = mk(dev, L.ffn_down, d_moe_sh, ffn_stride, d_moe_shout, hp.n_embd, nullptr);
+                s.act_up = d_moe_sh + hp.n_ff;
+                add_sliced(s);
+            }
+            plan.begin_moe_call(seg_plan::call_t::moe_epilogue, tb, hp.n_embd / 256);
+            continue;
+        }
         if (use_w8) {
             add8(dev, L.ffn_gate, L.ffn_gate8, d_xnorm, hp.n_embd, d_ffn, ffn_stride, nullptr);
             add8(dev, L.ffn_up, L.ffn_up8, d_xnorm, hp.n_embd, d_ffn + hp.n_ff, ffn_stride, nullptr);
@@ -527,6 +573,23 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // so the handoff (a host round trip) stays outside the graph.
     const bool phased = (ph != nullptr);
     int dbg_layer = -1; // current layer index for the PF_DUMP_SEGS diagnostic
+    // layer whose MoE calls the current call belongs to; the plan carries no
+    // layer index per call, and the MoE dispatch needs the layer's expert
+    // tensors, so the layer loop publishes it here (the same way dbg_layer does)
+    int moe_il = 0;
+    if (!phased && multi_dev) {
+        // A direct-replay pass can be *entered* with another device's bindings
+        // still installed: the MTP draft binds the draft device's MoE buffers
+        // and activations, and the verify that follows starts at layer 0 of the
+        // primary.  The layer loop only rebinds at a partition boundary, so
+        // without this the first partition silently reads and writes the other
+        // device's buffers (a graph-replayed pass is immune: its pointers are
+        // baked in, which is why this only ever showed up with ncmoe on).
+        bind_acts(0);
+        // and the MoE half has its own binding, because the speculative draft
+        // binds the draft device's (mtp_moe's bind_moe_acts)
+        bind_moe_acts(0);
+    }
     const bool prof = prof_on();
     auto tnow = [] { return std::chrono::high_resolution_clock::now(); };
     auto tms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -539,6 +602,13 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const char * e = si::env::str("PF_DUMP_LAYERS");
         return e && atoi(e) != 0;
     }();
+    // PF_MOE_REFDUMP: print the three mid-layer fingerprints tests/common/cpu_ref.h
+    // records, so the engine and the CPU reference can be compared textually.
+    static const bool dbg_refdump = si::env::flag("PF_MOE_REFDUMP");
+    static bool dbg_refdump_emb = dbg_refdump;
+    static bool dbg_refdump_xq = dbg_refdump;
+    static bool dbg_refdump_path = dbg_refdump;
+    static int dbg_refdump_dnnl = dbg_refdump ? 6 : 0;
     // PF_DUMP_SEGS=<layer>: dump that layer's per-segment fields + output
     // fingerprint (-1 = every layer, noisy).  Diagnostic only.
     static const int dbg_segs = [] {
@@ -571,7 +641,241 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             acc += tms(a, tnow());
         }
     };
+    // A MoE call carries no segments: it dispatches the router and the per-expert
+    // kernels instead.  The expert choice is made on the device every step, so
+    // this survives command-graph capture - which a host-side "which experts"
+    // decision could not, because reading the router's ids during a recording
+    // would both stall the queue and freeze the answer.
+    auto moe_call = [&](size_t idx) {
+        const moe_t & M = m.layers[(size_t)moe_il].moe;
+        const int il = moe_il;
+        const int dev = cur_dev;
+        sycl::queue & qq = dev_queue(dev);
+        const int k = hp.n_expert_used;
+        const int n_tok = rows; // flat live tokens in every mode
+        // PF_ABL_NOMOE / PF_ABL_NOSHEXP: drop one half of the MoE FFN, to tell
+        // which half a broken model is broken in.  Both are the same kind of
+        // "produce a plausible wrong answer" ablation as PF_ABL_NOATTN /
+        // PF_ABL_NOGDN, and both are non-causal on purpose.
+        static const bool abl_nomoe = si::env::flag("PF_ABL_NOMOE");
+        static const bool moe_dump = si::env::flag("PF_MOE_DUMP");
+        static int moe_dump_n = 0;
+        static const bool abl_noshexp = si::env::flag("PF_ABL_NOSHEXP");
+        if (plan.calls[idx].kind == seg_plan::call_t::moe_routed) {
+            const int n_pairs = n_tok * k;
+            if (dbg_refdump && il == 0 && !engine::g_capturing_ && mode == 0) {
+                std::vector<float> b((size_t)rows * hp.n_embd);
+                dev_queue(dev).memcpy(b.data(), d_x, b.size() * sizeof(float)).wait();
+                double sum = 0, sumsq = 0, mx = 0;
+                for (float v : b) { sum += v; sumsq += (double)v * v; mx = std::max(mx, std::fabs((double)v)); }
+                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_in-0", sum, sumsq, mx);
+            }
+            const int n_act = std::min(hp.n_expert, n_pairs);
+            const int32_t * sm = d_moe_slotmap + (size_t)moe_il * hp.n_expert;
+            // ncmoe / expert cache: pairs whose expert is not resident are skipped
+            // by the device kernels (slot == -1), so the host half computes them
+            // and the same weighted reduction folds them into the residual
+            const bool moe_cpu_enabled = moe_cache_.active() && !moe_cache_.all_resident();
+            const bool moe_calib_active = moe_cache_.active() && !moe_cache_.all_resident() && !moe_calib_done_;
+            std::vector<float> before_r;
+            if (!abl_nomoe) {
+            moe_router_launch(qq, wptr(dev, M.gate_inp), M.gate_inp_type, d_xnorm, hp.n_embd, n_tok, hp.n_embd,
+                              hp.n_expert, k, d_moe_logits, d_moe_ids, d_moe_wts);
+            if (moe_calib_active && !engine::g_capturing_) {
+                // one read-back per layer per calibration prefill: the resident
+                // set is measured from real traffic rather than a static table,
+                // and it is frozen afterwards so the bank cannot change under a
+                // recorded command graph
+                std::vector<int32_t> ids_h((size_t) n_pairs);
+                qq.memcpy(ids_h.data(), d_moe_ids, ids_h.size() * 4).wait();
+                if ((int) moe_calib_ids_.size() <= (int) moe_il) {
+                    moe_calib_ids_.resize(moe_il + 1);
+                }
+                moe_calib_ids_[moe_il] = ids_h;
+            }
+            moe_csr_clear_launch(qq, d_moe_off, d_moe_cur, d_moe_active, d_moe_nact, hp.n_expert);
+            moe_csr_count_launch(qq, d_moe_ids, n_pairs, d_moe_off);
+            moe_csr_prefix_launch(qq, d_moe_off, d_moe_active, d_moe_nact, hp.n_expert);
+            moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
+            moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
+                              moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, d_xnorm, hp.n_embd,
+                              d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type, M.up_exps.type);
+            moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
+                            d_moe_nact, n_act, d_moe_h, hp.n_ff_exp, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp,
+                            M.down_exps.type);
+            // accumulate into d_x, which still holds the residual: the routed
+            // half is added before the shared expert's down runs
+            // Every MoE layer by default now: the ncmoe host half has to be checked per
+            // layer (the per-layer quant types differ), not only at layer 0.
+            if (dbg_refdump && !engine::g_capturing_ &&
+                (si::env::flag("PF_MOE_REFDUMP_ALL") || si::env::i32("PF_MOE_REFDUMP_LAYER", 0) == (int) moe_il)) {
+                before_r.resize((size_t) n_tok * hp.n_embd);
+                qq.memcpy(before_r.data(), d_x, before_r.size() * 4).wait();
+            }
+            // ncmoe / expert cache: the device kernels skipped every pair whose
+            // expert is not resident (slot == -1), so those rows of d_moe_acc
+            // are still stale.  They must be filled *before* the reduction, not
+            // added afterwards: the reduce weights every row, so a stale row
+            // would be weighted in as if it were this layer's output (and the
+            // correct value added on top of it - the "routed energy is 2-4x too
+            // big from layer 1 on, exact at layer 0" signature).
+            if (moe_cpu_enabled && !engine::g_capturing_) {
+                moe_cpu_experts(moe_il, M, n_tok, k, n_pairs, dev, d_xnorm);
+            }
+            moe_reduce_launch(qq, d_moe_acc, d_moe_wts, k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
+            }
+            // d_x right after the reduce *is* the routed contribution (the
+            // reduce accumulates into the residual), which is what cpu_ref's
+            // moe_routed-0 snapshots; d_moe_acc is the per-expert partial and
+            // holds n_tok*top_k pairs, so folding it is a different quantity.
+            if (dbg_refdump && !engine::g_capturing_ &&
+                (si::env::flag("PF_MOE_REFDUMP_ALL") || si::env::i32("PF_MOE_REFDUMP_LAYER", 0) == (int) moe_il)) {
+                auto fpr = [&](const char * nm, const float * p, size_t n) {
+                    double sum = 0, sumsq = 0, mx = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        sum += p[i];
+                        sumsq += (double) p[i] * p[i];
+                        mx = std::max(mx, std::fabs((double) p[i]));
+                    }
+                    fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+                };
+                std::vector<float> rr((size_t)n_tok * hp.n_embd);
+                qq.memcpy(rr.data(), d_x, rr.size() * 4).wait();
+                fpr(moe_il == 0 ? "routed-0" : "routed", rr.data(), rr.size());
+                // the exact contribution: after minus before, elementwise.
+                // Differences of *sums of squares* are not additive, so this is
+                // the only honest per-token number.
+                if (!before_r.empty()) {
+                    std::vector<float> dr(rr.size());
+                    for (size_t i = 0; i < dr.size(); i++) {
+                        dr[i] = rr[i] - before_r[i];
+                    }
+                    {
+                        char n3[48];
+                        snprintf(n3, sizeof(n3), "routed_exact-L%d", (int) moe_il);
+                        fpr(n3, dr.data(), dr.size());
+                    }
+                    for (int t : {0, n_tok - 1}) {
+                        char n2[40];
+                        snprintf(n2, sizeof(n2), "routed_exact%s/t%d", moe_il == 0 ? "-0" : "", t);
+                        fpr(n2, dr.data() + (size_t) t * hp.n_embd, hp.n_embd);
+                    }
+                }
+            }
+            g_lc.seg++;
+            // PF_MOE_DUMP: the routed half's own diagnostics, one line per MoE
+            // layer.  The expert choice is a *device* decision, so on a broken
+            // model this is the only thing that says whether the router read a
+            // sane hidden state and whether the experts amplified it.  Decode
+            // only, and never while a command graph is being recorded: the
+            // multi-device prefill pipeline has two chunks in flight and a
+            // blocking device-to-host read here deadlocks it.
+            if (moe_dump && mode == 0 && !engine::g_capturing_ && moe_dump_n < hp.n_layer) {
+                moe_dump_n++;
+                std::vector<int32_t> hi(8);
+                qq.memcpy(hi.data(), d_moe_ids, 8 * sizeof(int32_t)).wait();
+                // full scan of the routed buffers, not just pair 0: one NaN in
+                // one (token, expert) pair is enough to poison the layer, and a
+                // partial read cannot tell "this pair is bad" from "the whole
+                // buffer is bad"
+                {
+                    const size_t npr = (size_t)n_tok * k;
+                    std::vector<float> hb(npr * (size_t)hp.n_ff_exp), ab(npr * (size_t)hp.n_embd);
+                    qq.memcpy(hb.data(), d_moe_h, hb.size() * sizeof(float)).wait();
+                    qq.memcpy(ab.data(), d_moe_acc, ab.size() * sizeof(float)).wait();
+                    size_t bh = 0, ba = 0;
+                    int hpair = -1, apair = -1;
+                    double hmax = 0, amax = 0;
+                    for (size_t i = 0; i < hb.size(); i++) {
+                        if (!std::isfinite(hb[i])) { if (!bh) hpair = (int)(i / hp.n_ff_exp); bh++; }
+                        else hmax = std::max(hmax, std::fabs((double)hb[i]));
+                    }
+                    for (size_t i = 0; i < ab.size(); i++) {
+                        if (!std::isfinite(ab[i])) { if (!ba) apair = (int)(i / hp.n_embd); ba++; }
+                        else amax = std::max(amax, std::fabs((double)ab[i]));
+                    }
+                    if (bh || ba) {
+                        fprintf(stderr, "[moe] il=%2d NONFINITE h=%zu (first pair %d, id %d) acc=%zu (first pair %d, id %d)"
+                                        " |max h=%.4g acc=%.4g\n", moe_il, bh, hpair,
+                                hpair >= 0 ? hi[hpair % k] : -1, ba, apair, apair >= 0 ? hi[apair % k] : -1, hmax, amax);
+                        // which rows, and does the address the kernel derives for
+                        // this expert actually hold this layer's bytes?
+                        int rlo = 1 << 30, rhi = -1;
+                        for (int pr = 0; pr < n_tok * k; pr++) {
+                            for (int n = 0; n < hp.n_embd; n++) {
+                                if (!std::isfinite(ab[(size_t)pr * hp.n_embd + n])) {
+                                    rlo = std::min(rlo, n);
+                                    rhi = std::max(rhi, n);
+                                }
+                            }
+                        }
+                        fprintf(stderr, "[moe]   bad acc rows %d..%d of %d\n", rlo, rhi, hp.n_embd);
+                        const moe_t & M = m.layers[(size_t)moe_il].moe;
+                        std::vector<int32_t> smh((size_t)hp.n_expert);
+                        qq.memcpy(smh.data(), d_moe_slotmap + (size_t)moe_il * hp.n_expert,
+                                  (size_t)hp.n_expert * sizeof(int32_t)).wait();
+                        for (int j = 0; j < k && j < 8; j++) {
+                            const int e = hi[j], sl = smh[e];
+                            const char * db = (const char *)wptr(dev, M.down_exps.data);
+                            const size_t off = (size_t)sl * moe_slot_db[(size_t)moe_il];
+                            fprintf(stderr, "[moe]   expert %d slot %d off %zu (plane %zu, tensor %zu)\n", e, sl, off,
+                                    M.down_exps.plane_bytes, M.down_exps.total_bytes());
+                            if (sl < 0) continue;
+                            for (int row : {0, hp.n_embd / 2, hp.n_embd - 1}) {
+                                const size_t roff = off + (size_t)row * (hp.n_ff_exp / 256) * 176;
+                                std::vector<char> got(176);
+                                qq.memcpy(got.data(), db + roff, 176).wait();
+                                const char * hb = (const char *)M.down_exps.data + roff;
+                                fprintf(stderr, "[moe]     row %4d @%zu %s (host d=%.4g dev d=%.4g)\n", row, roff,
+                                        memcmp(got.data(), hb, 176) == 0 ? "matches host" : "DIFFERS",
+                                        (float)*(const uint16_t *)hb,
+                                        (float)*(const uint16_t *)got.data());
+                            }
+                        }
+                    }
+                }
+                std::vector<float> hw(8), ha(hp.n_embd), hx0(hp.n_embd), hxn(hp.n_embd), hh(hp.n_ff_exp), wv(hp.n_embd);
+                qq.memcpy(hw.data(), d_moe_wts, 8 * sizeof(float)).wait();
+                qq.memcpy(ha.data(), d_moe_acc, (size_t)hp.n_embd * sizeof(float)).wait();
+                qq.memcpy(hx0.data(), d_x, (size_t)hp.n_embd * sizeof(float)).wait();
+                qq.memcpy(hxn.data(), d_xnorm, (size_t)hp.n_embd * sizeof(float)).wait();
+                qq.memcpy(hh.data(), d_moe_h, (size_t)hp.n_ff_exp * sizeof(float)).wait();
+                double sa = 0, sx = 0, sn = 0, sh = 0, sw = 0;
+                for (int i = 0; i < hp.n_embd; i++) {
+                    sa += (double)ha[i] * ha[i];
+                    sx += (double)hx0[i] * hx0[i];
+                    sn += (double)hxn[i] * hxn[i];
+                    sw += (double)wv[i] * wv[i];
+                }
+                for (int i = 0; i < hp.n_ff_exp; i++) sh += (double)hh[i] * hh[i];
+                // the norm weight's rms is the *floor* on |xnorm|: RMSNorm
+                // returns x/rms(x) * w, so a correct layer gives |xnorm| ~ |w|
+                const double wref = std::sqrt(sw / hp.n_embd);
+                fprintf(stderr, "[moe] il=%2d ids", moe_il);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " %d/%.4g", hi[i], hw[i]);
+                fprintf(stderr, " |rms xnorm=%.4g (w=%.4g) h=%.4g acc=%.4g d_x=%.4g\n", std::sqrt(sn / hp.n_embd),
+                        wref, std::sqrt(sh / hp.n_ff_exp), std::sqrt(sa / hp.n_embd), std::sqrt(sx / hp.n_embd));
+            }
+            return;            return;
+        }
+        // moe_epilogue: d_x += sigmoid(gate_inp_shexp . d_xnorm) * shared_out
+        if (dbg_refdump && il == 0 && !engine::g_capturing_ && mode == 0) {
+            std::vector<float> b((size_t)rows * hp.n_embd);
+            dev_queue(dev).memcpy(b.data(), d_x, b.size() * sizeof(float)).wait();
+            double sum = 0, sumsq = 0, mx = 0;
+            for (float v : b) { sum += v; sumsq += (double)v * v; mx = std::max(mx, std::fabs((double)v)); }
+            fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_out-0", sum, sumsq, mx);
+        }
+        if (!abl_noshexp) {
+            moe_gate_add_launch(qq, M.gate_inp_shexp ? wptr(dev, M.gate_inp_shexp) : nullptr, M.gate_inp_shexp_type,
+                                d_xnorm, hp.n_embd, n_tok, hp.n_embd, d_moe_shout, hp.n_embd, d_x, hp.n_embd);
+        }
+    };
     auto gemv_at = [&](size_t idx) {
+        if (plan.calls[idx].kind != seg_plan::call_t::dense) {
+            moe_call(idx);
+            return;
+        }
         const int gb = plan.calls[idx].group_begin;
         const int gc = plan.calls[idx].group_count;
         if (dbg_pfb2) {
@@ -642,6 +946,19 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                         && (!(D->has_weight(key) || D->has_weight_w4(key) || D->has_weight_k5(key)
                               || D->has_weight_cb4(key))
                             || kk != plan.calls[idx].xq.K)) {
+                        // a whole call is dropped from the oneDNN path because of
+                        // one segment, and the fp32 fallback it lands on writes
+                        // nothing in mode 2 - so name the segment instead of
+                        // letting it surface as an all-zero activation
+                        if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_dnnl > 0) {
+                            dbg_refdump_dnnl--;
+                            fprintf(stderr,
+                                    "[dump] dnnl_call=false idx=%d seg=%d type=%d K=%d w8=%d need=%d has_w=%d w4=%d k5=%d "
+                                    "cb4=%d kk=%d xqK=%d\n",
+                                    (int)idx, j, (int)sj.type, (int)sj.K, sj.w8.vals ? 1 : 0, (int)need,
+                                    (int)D->has_weight(key), (int)D->has_weight_w4(key), (int)D->has_weight_k5(key),
+                                    (int)D->has_weight_cb4(key), (int)kk, (int)plan.calls[idx].xq.K);
+                        }
                         return false;
                     }
                 }
@@ -662,6 +979,26 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             // which the MTP speculative verify (a mode-2 batch) uses.
             av = D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K,
                              /*do_split=*/mode == 0 || inf->mtp_dry != 0);
+            // one-shot: the first quantise of the layer-0 prefill is where a
+            // zeroed d_qkv originates (an all-zero int8 activation makes the
+            // GEMM write exact zeros, which is indistinguishable from "the GEMM
+            // never ran" downstream)
+            if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_xq) {
+                dbg_refdump_xq = false;
+                // view fields only: act_data()/act_scales() dereference the
+                // view and fault on a degenerate one, which is itself the thing
+                // being diagnosed here
+                double xn = 0;
+                {
+                    std::vector<float> t(256);
+                    dev_queue(cur_dev).memcpy(t.data(), xq.x, t.size() * 4).wait();
+                    for (float v : t) {
+                        xn += std::fabs((double)v);
+                    }
+                }
+                fprintf(stderr, "[dump] xq0 M=%d K=%d |x[..256]|=%.6f view{m=%d k=%d split=%d gen=%u valid=%d}\n", tbm, xq.K,
+                        xn, av.m, av.k, (int)av.split, av.gen, (int)av.valid());
+            }
             g_lc.calls++;
             g_lc.xq++;
             g_lc.xq_merge += (g_lc.xq_prev == xq.x) ? 1 : 0;
@@ -694,6 +1031,13 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         for (int g = 0; g < gc; g++) {
             const seg_plan::group_t & gr = plan.groups[gb + g];
             const gemv_seg & s0 = plan.segs[gr.off];
+            if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_path && idx == 0) {
+                dbg_refdump_path = false;
+                fprintf(stderr,
+                        "[dump] grp0 idx=%d mode=%d tbm=%d K=%d n_rows=%d out_stride=%d w8=%d i8=%d dnnl_call=%d\n",
+                        (int)idx, mode, (int) tbm, (int) s0.K, (int) s0.n_rows, (int) s0.out_stride, s0.w8.vals ? 1 : 0,
+                        s0.i8 ? 1 : 0, (int)dnnl_call);
+            }
             const auto a_g2 = tnow();
             if (s0.i8) {
                 // CPU integer path: compute straight from the GGUF blocks
@@ -985,6 +1329,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const int dev = multi_dev ? layer_dev_[il] : 0;
         cur_dev = dev;
         dbg_layer = il;
+        moe_il = il;
         if (!phased && multi_dev && dev != prev_dev) {
             const auto a_ho = tnow();
             handoff_x(prev_dev, dev, (size_t)nrows * (size_t)nreal);
@@ -1020,7 +1365,8 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         g_lc.norm++;
         stamp(c_norm, a_n);
         if (L.recurrent) {
-            gemv();
+            gemv(); // wqkv + wgate
+            gemv(); // ssm_beta + ssm_alpha (own call: F32, not oneDNN-convertible)
             const size_t conv_per = (size_t)(hp.conv_k - 1) * hp.qkv_dim();      // per slot
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state; // per slot
             const int gi = m.gdn_layer_index[il];
@@ -1092,14 +1438,14 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 a_sub = tnow();
                 static const bool tdbg = si::env::flag("PF_TIME");
                 if (fuse_gdn >= 2) {
-                    if (tdbg && !g_capturing) {
+                    if (tdbg && !engine::g_capturing_) {
                         q.wait();
                     }
                     const auto t0 = tnow();
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
                                inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
                                1.0f / std::sqrt((float)hp.d_state), state_slots_, 1, 0, T, T, snap);
-                    if (tdbg && !g_capturing) {
+                    if (tdbg && !engine::g_capturing_) {
                         q.wait();
                         fprintf(stderr, "[t] layer %d gdn=%.2f ms\n", il, tms(t0, tnow()));
                     }
@@ -1251,7 +1597,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                                 inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base,
                                 rope_freqs_for(dev), d_rope_mscale_, hp.rms_eps, max_blocks, nrows, nreal, ksc, vsc);
             static const bool dbg_kv = si::env::flag("PF_DUMP_KV");
-            if (dbg_kv && !g_capturing && mode != 0) {
+            if (dbg_kv && !engine::g_capturing_ && mode != 0) {
                 dbg_dump_kv(dev_queue(cur_dev), d_kbuf, d_vbuf, mode, nrows, nreal, hp.n_head_kv, hp.head_dim, il);
             }
             const bool at_fused = (nsp == 1 && at_fuse);
@@ -1272,6 +1618,83 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const auto a_n2 = tnow();
         cur_be->rmsnorm(d_x, wf32(dev, L.post_attn_norm), d_xnorm, T, hp.n_embd, hp.rms_eps);
         stamp(c_norm, a_n2);
+        // PF_MOE_REFDUMP: the embedding, before layer 0 touches anything.
+        // rmsnorm hides the residual's *scale*, so this is the only place a
+        // uniformly-too-small residual stream is visible.
+        if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_emb) {
+            dbg_refdump_emb = false;
+            auto fp0 = [&](const char * nm, const float * p, size_t n) {
+                double sum = 0, sumsq = 0, mx = 0;
+                for (size_t i = 0; i < n; i++) {
+                    sum += p[i];
+                    sumsq += (double)p[i] * p[i];
+                    mx = std::max(mx, std::fabs((double)p[i]));
+                }
+                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+            };
+            // `rows` is the flat live-token count; in mode 2 `nrows` is the
+            // chunk-row count and `T` is kMaxT, so either of those reads past
+            // (or short of) the real data.
+            std::vector<float> h((size_t)rows * hp.n_embd);
+            dev_queue(dev).memcpy(h.data(), d_x, h.size() * sizeof(float)).wait();
+            fp0("embd", h.data(), h.size());
+        }
+        // PF_MOE_REFDUMP: the same three fingerprints tests/common/cpu_ref.h
+        // records (`attn_post_norm-0`, `ffn_out-0`, `l_out-0`), so the engine and
+        // the CPU reference can be diffed textually and the divergence localised
+        // to "attention/GDN output" vs "FFN output" rather than to a layer index.
+        if (dbg_refdump && il == 0 && !engine::g_capturing_) {
+            auto fp = [&](const char * nm, const float * p, size_t n) {
+                double sum = 0, sumsq = 0, mx = 0;
+                for (size_t i = 0; i < n; i++) {
+                    sum += p[i];
+                    sumsq += (double)p[i] * p[i];
+                    mx = std::max(mx, std::fabs((double)p[i]));
+                }
+                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+            };
+            std::vector<float> h((size_t)rows * hp.n_embd);
+            dev_queue(dev).memcpy(h.data(), d_xnorm, h.size() * sizeof(float)).wait();
+            fp("attn_post_norm-0", h.data(), h.size());
+            // d_x here is the residual after attention (the norm has not
+            // touched it yet): RMSNorm is scale-invariant, so a per-token
+            // scale error in the attention contribution survives every folded
+            // fingerprint above and only shows up here.
+            {
+                std::vector<float> ar(h.size());
+                dev_queue(dev).memcpy(ar.data(), d_x, ar.size() * sizeof(float)).wait();
+                fp("attn_residual-0", ar.data(), ar.size());
+                for (int t : {0, (int) rows - 1}) {
+                    char n2[40];
+                    snprintf(n2, sizeof(n2), "attn_residual-0/t%d", t);
+                    fp(n2, ar.data() + (size_t) t * hp.n_embd, hp.n_embd);
+                }
+            }
+            {
+                char nm[40];
+                snprintf(nm, sizeof(nm), "attn_post_norm-0/t%zu", (size_t)rows - 1);
+                fp(nm, h.data() + (size_t)(rows - 1) * hp.n_embd, hp.n_embd);
+            }
+            // the GDN chain behind that residual (layer 0 is recurrent), against
+            // cpu_ref's final_output_pre-0 / final_output-0 / z-0: rmsnorm hides
+            // the residual's scale, so these are what localise a wrong magnitude
+            const size_t RD = (size_t)rows * hp.d_inner;
+            std::vector<float> hg(RD);
+            dev_queue(dev).memcpy(hg.data(), d_attn_pre, RD * sizeof(float)).wait();
+            fp("final_output_pre-0", hg.data(), RD);
+            dev_queue(dev).memcpy(hg.data(), d_attn_merged, RD * sizeof(float)).wait();
+            fp("final_output-0", hg.data(), RD);
+            dev_queue(dev).memcpy(hg.data(), d_z, RD * sizeof(float)).wait();
+            fp("z-0", hg.data(), RD);
+            {
+                const size_t RQ = (size_t)rows * hp.qkv_dim();
+                std::vector<float> hq(RQ);
+                dev_queue(dev).memcpy(hq.data(), d_qkv, RQ * sizeof(float)).wait();
+                fp("linear_attn_qkv_mixed-0", hq.data(), RQ);
+                dev_queue(dev).memcpy(hq.data(), d_conv_out, RQ * sizeof(float)).wait();
+                fp("conv_l2-0", hq.data(), RQ);
+            }
+        }
         if (dbg_mid == 2) {
             break;
         }
@@ -1279,7 +1702,118 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         if (dbg_mid == 3) {
             break;
         }
-        gemv();
+        if (L.moe.ok()) {
+            // routed experts (call 3), shared expert gate/up + down (4, 5) and
+            // the gated epilogue (6) - all consumed by the calls the plan
+            // recorded for this layer, in the order it recorded them
+            gemv(); // moe_routed
+            gemv(); // shared expert gate/up
+            gemv(); // shared expert down
+            gemv(); // moe_epilogue
+        } else {
+            gemv();
+        }
+        if (dbg_refdump && il == 0 && !engine::g_capturing_) {
+            auto fp = [&](const char * nm, const float * p, size_t n) {
+                double sum = 0, sumsq = 0, mx = 0;
+                for (size_t i = 0; i < n; i++) {
+                    sum += p[i];
+                    sumsq += (double)p[i] * p[i];
+                    mx = std::max(mx, std::fabs((double)p[i]));
+                }
+                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+            };
+            const size_t R = (size_t)rows * hp.n_embd;
+            std::vector<float> h(R), fo(R);
+            dev_queue(dev).memcpy(h.data(), d_x, R * sizeof(float)).wait();
+            fp("l_out-0", h.data(), R);
+            if (L.moe.ok()) {
+                // d_x *after* the reduce is the routed contribution (the
+                // reduce accumulates into the residual), so this is what has to
+                // match cpu_ref's moe_routed-0 - not d_moe_acc, which is the
+                // per-expert partial and only holds rows*top_k pairs.
+                {
+                    std::vector<float> rx(R);
+                    dev_queue(dev).memcpy(rx.data(), d_x, R * sizeof(float)).wait();
+                    fp("post_routed-0", rx.data(), R);
+                    for (int t : {0, (int) rows - 1}) {
+                        char n2[40];
+                        snprintf(n2, sizeof(n2), "post_routed-0/t%d", t);
+                        fp(n2, rx.data() + (size_t) t * hp.n_embd, hp.n_embd);
+                    }
+                }
+                dev_queue(dev).memcpy(fo.data(), d_moe_acc, R * sizeof(float)).wait();
+                fp("acc_packed-0", fo.data(), R);
+                for (int t : {0, (int)rows - 1}) {
+                    if (t < 0 || t >= (int) rows) {
+                        continue;
+                    }
+                    char nm[40];
+                    snprintf(nm, sizeof(nm), "moe_routed-0/t%d", t);
+                    fp(nm, fo.data() + (size_t) t * hp.n_embd, hp.n_embd);
+                }
+                {
+                    // CSR total: sum(off[e+1]-off[e]) must be rows*top_k, and
+                    // n_active*top_k must be the pair budget the expert kernels
+                    // launch with.  A stale ids buffer inflates both and shows up
+                    // as a position-dependent over-count in the routed output.
+                    std::vector<int32_t> off((size_t)hp.n_expert + 1), na(2);
+                    dev_queue(dev).memcpy(off.data(), d_moe_off, off.size() * 4).wait();
+                    dev_queue(dev).memcpy(na.data(), d_moe_nact, 2 * 4).wait();
+                    int64_t tot = 0;
+                    for (int e = 0; e < hp.n_expert; e++) {
+                        tot += (int64_t) off[(size_t) e + 1] - off[(size_t) e];
+                    }
+                    fprintf(stderr, "[dump] csr off[0]=%d off[n]=%d total=%lld (want %lld) n_active=%d\n", off[0],
+                            off[hp.n_expert], (long long) tot, (long long) rows * hp.n_expert_used, na[0]);
+                }
+                dev_queue(dev).memcpy(fo.data(), d_moe_shout, R * sizeof(float)).wait();
+                fp("moe_sh-0", fo.data(), R);
+                {
+                    std::vector<float> g1((size_t) rows);
+                    dev_queue(dev).memcpy(g1.data(), d_moe_sg, g1.size() * 4).wait();
+                    fprintf(stderr, "[dump] moe_gate-0/t0=%.8f  tL=%.8f\n", g1[0], g1[rows - 1]);
+                }
+                {
+                    std::vector<int32_t> ii((size_t)rows * hp.n_expert_used);
+                    dev_queue(dev).memcpy(ii.data(), d_moe_ids, ii.size() * 4).wait();
+                    fprintf(stderr, "[dump] moe_ids-0   ");
+                    for (int j = 0; j < hp.n_expert_used; j++) {
+                        fprintf(stderr, " %d", ii[(size_t)(rows - 1) * hp.n_expert_used + j]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                {
+                    // silu(gate)*up for the top-ranked expert of two tokens: the
+                    // bisection point between the expert gate/up half and the
+                    // down half of the routed contribution
+                    std::vector<float> hh((size_t)hp.n_ff_exp);
+                    dev_queue(dev).memcpy(hh.data(), d_moe_h, hh.size() * 4).wait();
+                    fp("moe_h0-0", hh.data(), hp.n_ff_exp);
+                    dev_queue(dev).memcpy(hh.data(), d_moe_h + (size_t)(rows - 1) * hp.n_expert_used * hp.n_ff_exp,
+                                           hh.size() * 4).wait();
+                    fp("moe_hL-0", hh.data(), hp.n_ff_exp);
+                    std::vector<float> yy((size_t)hp.n_embd);
+                    for (int t : {0, (int) rows - 1}) {
+                        for (int j = 0; j < hp.n_expert_used; j++) {
+                            dev_queue(dev).memcpy(yy.data(),
+                                                   d_moe_acc + ((size_t) t * hp.n_expert_used + j) * hp.n_embd,
+                                                   yy.size() * 4).wait();
+                            char n2[40];
+                            snprintf(n2, sizeof(n2), "acc t%d j%d", t, j);
+                            fp(n2, yy.data(), hp.n_embd);
+                        }
+                    }
+                }
+                {
+                    std::vector<float> ww((size_t)rows * hp.n_expert_used);
+                    dev_queue(dev).memcpy(ww.data(), d_moe_wts, ww.size() * sizeof(float)).wait();
+                    // the last token's row only: the weights are per token and the
+                    // reference snapshotted them per token too
+                    fp("moe_wts-0", ww.data() + (size_t)(rows - 1) * hp.n_expert_used, hp.n_expert_used);
+                }
+            }
+        }
         // PF_DUMP_LAYERS: per-layer hidden-state fingerprint, to check that the
         // u4 and int8 paths diverge smoothly across layers (amplification)
         // rather than jumping at one layer (a wiring bug).
@@ -1366,7 +1900,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     g_lc.flush(mode);
     if (prof || hostprof) {
         const double c_host = tms(pt0, tnow());
-        if (prof && !g_capturing) {
+        if (prof && !engine::g_capturing_) {
             dev_queue(0).wait();
         }
         const double c_total = tms(pt0, tnow());

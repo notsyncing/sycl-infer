@@ -106,6 +106,13 @@ engine::engine(const engine_config & cfg)
       md_ctx_(make_md_context(cfg.layer_map)),
       q(make_queue(device_req, md_ctx_.get())),
       max_seq(cfg.max_seq), max_slots(cfg.max_slots), n_splits(cfg.n_splits), n_blocks(cfg.n_blocks) {
+    {
+        moe_cache_cfg mc = moe_cache_cfg::from_env(cfg.moe_resident);
+        mc.vram_mb = cfg.moe_vram_mb ? cfg.moe_vram_mb : mc.vram_mb;
+        mc.ram_mb = cfg.moe_ram_mb ? cfg.moe_ram_mb : mc.ram_mb;
+        mc.ram_tier = mc.ram_tier || mc.ram_mb > 0;
+        moe_cfg_ = mc;
+    }
     // clamp before anything sizes an array: every per-slot stride is built from this
     state_slots_ = std::max(1, std::min(max_slots, kMaxB));
     // YaRN config, resolved now and consumed by build_rope_freqs() once the
@@ -146,6 +153,20 @@ engine::engine(const engine_config & cfg)
         mtp.mtp_k = 12; // d_logits / step_info bounds: n = mtp.mtp_k+1 <= kMaxB
     }
     mtp.mtp_on = mtp.mtp_k > 0;
+    // The expert split is verified bit-exact against the CPU reference on the
+    // prefill/decode path, and the verify's *anchor row* (the only row a
+    // PF_MTP_NOACCEPT run needs) is exact too.  The later verify rows - the ones
+    // that decide whether a drafted token is accepted - are not: at k >= 2 they
+    // accept tokens a fully-resident run would not.  Rather than emit a stream
+    // that is wrong in a way only a reference can see, the split holds MTP at the
+    // depth it is measured correct at.
+    if (mtp.mtp_on && moe_cfg_.resident_per_layer > 0 && mtp.mtp_k > 1) {
+        fprintf(stderr,
+                "[mtp] note: the expert split is verified at k=1 only, so --mtp %d is held at 1 while "
+                "--moe-resident/--moe-vram-mb is set (use --mtp with a fully-resident expert bank for k>1)\n",
+                mtp.mtp_k);
+        mtp.mtp_k = 1;
+    }
     {
         const char * e = si::env::str("PF_MTP_SPLITS");
         if (e) {
@@ -578,11 +599,32 @@ engine::engine(const engine_config & cfg)
     alloc_buffers();
     build_graphs();
     // all weights are on their devices now: release the host pages of the GGUF
-    // so the process does not carry the whole file in its RSS
-    release_host_weight_pages();
+    // so the process does not carry the whole file in its RSS.  This cannot run
+    // earlier: the release's keep-set includes the expert tensors whenever the
+    // ncmoe host half is live, and that decision is made in setup_moe_slots(),
+    // which runs from alloc_buffers() above.
+    if (!moe_host_weights_deferred_) {
+        release_host_weight_pages();
+    }
 }
 
 engine::~engine() {
+    if (moe_cache_.active()) {
+    if (moe_cache_.active()) {
+        // The three tiers in one line, so a run says what it used rather than
+        // only what it was configured with: the VRAM bank's size is a *measured*
+        // residency set (calibrated from this request's own routing), and the RAM
+        // tier's hit rate is what tells you whether the disk tier is still being
+        // touched.
+        const size_t ram_h = moe_cache_.ram_hits(), ram_m = moe_cache_.ram_misses();
+        fprintf(stderr,
+                "[moe] expert cache: bank %d/%d resident per layer (calibrated %zu pairs), RAM tier %.1f MB "
+                "hits=%zu misses=%zu (%.1f%%)\n",
+                moe_cache_.resident(), moe_cache_.n_expert(), moe_cache_.resident_pairs(),
+                (double) moe_cache_.ram_bytes() / (1024.0 * 1024.0), ram_h, ram_m,
+                (ram_h + ram_m) ? 100.0 * (double) ram_h / (double) (ram_h + ram_m) : 0.0);
+    }
+    }
     // complete a pending pipelined prefill chunk and drain the device queues
     // before freeing their buffers
     if (multi_dev) {
@@ -994,6 +1036,132 @@ engine::act_set engine::alloc_act_set(int dev) {
     return a;
 }
 
+void engine::moe_acts_alloc(int dev) {
+    const hparams & hp = m.hp;
+    if (!hp.is_moe()) {
+        return;
+    }
+    const size_t R = (size_t)kMaxB * kMaxT;
+    const int k = hp.n_expert_used;
+    const size_t P = R * (size_t)k; // (token, expert-slot) pairs
+    auto I = [&](size_t n) { return (int32_t *)dev_alloc_on(dev, n * sizeof(int32_t)); };
+    auto F = [&](size_t n) { return (float *)dev_alloc_on(dev, n * sizeof(float)); };
+    moe_act & a = moe_as_[(size_t)dev];
+    a.logits = F(R * (size_t)hp.n_expert);
+    a.ids = I(P);
+    a.wts = F(P);
+    a.h = F(P * (size_t)hp.n_ff_exp);
+    a.acc = F(P * (size_t)hp.n_embd);
+    a.sh = F(R * (size_t)ffn_stride);
+    a.shout = F(R * (size_t)hp.n_embd);
+    a.sg = F(R);
+    a.off = I((size_t)hp.n_expert + 1);
+    a.cur = I((size_t)hp.n_expert);
+    a.pair = I(P);
+    a.active = I((size_t)hp.n_expert + 1);
+    a.nact = I(1);
+    // +1 row for the NextN block: the MTP layer is a full MoE layer, so the
+    // expert slot table has to cover it too (and it is the row the expert
+    // cache will evict into, alongside the trunk layers)
+    a.slotmap = I(R > 0 ? ((size_t)hp.n_layer + 1) * (size_t)hp.n_expert : 0);
+    if (!a.ids || !a.h || !a.acc || !a.slotmap) {
+        throw std::runtime_error("MoE scratch allocation failed");
+    }
+}
+
+// Fill the expert slot tables.  In the default "resident" configuration every
+// expert sits in its device's copy of the GGUF expert tensor, so a slot is the
+// expert's own index and the MoE kernels address them with one extra indirection
+// they would not otherwise need.  With a cache budget the tables are -1 (nothing
+// resident) and the host refills them per step - see moe_cache.cpp.
+void engine::setup_moe_slots() {
+    const hparams & hp = m.hp;
+    moe_banks_.resize(moe_as_.size());
+    // the cache owns which experts are resident and in which device slot; with
+    // no policy configured it hands back the identity map, which is the mode the
+    // engine has always run in.
+    moe_all_.clear();
+    moe_all_.reserve((size_t) hp.n_layer + 1);
+    for (int il = 0; il < hp.n_layer; il++) {
+        moe_all_.push_back(m.layers[(size_t) il].moe);
+    }
+    if (m.mtp.moe.ok()) {
+        moe_all_.push_back(m.mtp.moe);
+    }
+    std::vector<int32_t> host;
+    moe_cache_.slotmap(moe_all_, host);
+    moe_slotmap_host_ = host;
+    for (size_t d = 0; d < moe_as_.size(); d++) {
+        dev_queue((int)d).memcpy(moe_as_[d].slotmap, host.data(), host.size() * sizeof(int32_t)).wait();
+    }
+    // Per-layer strides, and a note when they differ: a shared slot bank has to
+    // reserve the largest of each (that is what moe_slot_*_max is for), so the
+    // difference is worth saying out loud at startup rather than discovering as
+    // silently-wrong weights three dozen layers in.
+    const size_t nL = (size_t)hp.n_layer;
+    const size_t nRows = m.mtp.moe.ok() ? nL + 1 : nL;
+    moe_slot_gb.assign(nRows, 0);
+    moe_slot_ub.assign(nRows, 0);
+    moe_slot_db.assign(nRows, 0);
+    for (size_t il = 0; il < nL; il++) {
+        const moe_t & M = m.layers[il].moe;
+        moe_slot_gb[il] = M.gate_exps.plane_bytes;
+        moe_slot_ub[il] = M.up_exps.plane_bytes;
+        moe_slot_db[il] = M.down_exps.plane_bytes;
+    }
+    if (nRows > nL) {
+        moe_slot_gb[nL] = m.mtp.moe.gate_exps.plane_bytes;
+        moe_slot_ub[nL] = m.mtp.moe.up_exps.plane_bytes;
+        moe_slot_db[nL] = m.mtp.moe.down_exps.plane_bytes;
+    }
+    moe_slot_gb_max = *std::max_element(moe_slot_gb.begin(), moe_slot_gb.end());
+    moe_slot_ub_max = *std::max_element(moe_slot_ub.begin(), moe_slot_ub.end());
+    moe_slot_db_max = *std::max_element(moe_slot_db.begin(), moe_slot_db.end());
+    // false when the expert cache splits experts between the device and the host
+    moe_resident = moe_cache_.all_resident();
+    size_t mixed = 0;
+    for (size_t il = 0; il < nL; il++) {
+        const moe_t & M = m.layers[il].moe;
+        if (M.gate_exps.type != m.layers[0].moe.gate_exps.type || M.up_exps.type != m.layers[0].moe.up_exps.type ||
+            M.down_exps.type != m.layers[0].moe.down_exps.type) {
+            mixed++;
+        }
+    }
+    if (mixed) {
+        fprintf(stderr, "[moe] %zu of %zu layers use a different expert quant type than layer 0 "
+                        "(down plane %zu vs %zu bytes) - strides are per-layer\n", mixed, nL, moe_slot_db_max,
+                moe_slot_db[0]);
+    }
+    size_t per_layer = 0;
+    for (int il = 0; il < hp.n_layer; il++) {
+        per_layer += m.layers[(size_t)il].moe.bytes();
+    }
+    fprintf(stderr, "[moe] %d experts, top-%d, expert_ff %d, shared_ff %d: %.2f GiB of routed experts (%.1f MiB/layer)\n",
+            hp.n_expert, hp.n_expert_used, hp.n_ff_exp, hp.n_ff_shexp, (double)per_layer / (1024.0 * 1024.0 * 1024.0),
+            (double)(per_layer / (size_t)std::max(1, hp.n_layer)) / (1024.0 * 1024.0));
+}
+
+void engine::bind_moe_acts(int dev) {
+    if (moe_as_.empty() || (size_t)dev >= moe_as_.size()) {
+        return;
+    }
+    const moe_act & a = moe_as_[(size_t)dev];
+    d_moe_logits = a.logits;
+    d_moe_ids = a.ids;
+    d_moe_wts = a.wts;
+    d_moe_h = a.h;
+    d_moe_acc = a.acc;
+    d_moe_sh = a.sh;
+    d_moe_shout = a.shout;
+    d_moe_sg = a.sg;
+    d_moe_off = a.off;
+    d_moe_cur = a.cur;
+    d_moe_pair = a.pair;
+    d_moe_active = a.active;
+    d_moe_nact = a.nact;
+    d_moe_slotmap = a.slotmap;
+}
+
 void engine::bind_acts(int dev) {
     if (as_.empty()) {
         return;
@@ -1020,6 +1188,7 @@ void engine::bind_acts(int dev) {
     d_xsumq = a.xsumq;
     d_gdn_state = a.gdn_state;
     d_conv_state = a.conv_state;
+    bind_moe_acts(dev);
 }
 
 void engine::handoff_x(int from, int to, size_t rows, void * staging) {
@@ -1114,6 +1283,15 @@ void engine::upload_device_weights(int dev) {
         addp(M.enorm);
         addp(M.hnorm);
         addp(M.shared_head_norm);
+        // the NextN block is a full MoE layer, so its routed experts must be on
+        // the draft's device too: mtp_layer_t is not layer_t, so the per-layer
+        // upload loop cannot reach them, and without them the draft computes the
+        // shared expert only
+        addp(M.moe.gate_exps.data);
+        addp(M.moe.up_exps.data);
+        addp(M.moe.down_exps.data);
+        addp(M.moe.gate_inp);
+        addp(M.moe.gate_inp_shexp);
     }
     if (dev == 0) {
         addp(m.tok_embd.data);
@@ -1169,6 +1347,17 @@ void engine::upload_device_weights(int dev) {
             addp(L.q_norm);
             addp(L.k_norm);
         }
+        if (L.moe.ok()) {
+            // the routed experts.  They are the bulk of a MoE model's file, so
+            // they ride the same per-device upload as the dense tensors: a
+            // `--layer-map` partition then holds exactly its own layers'
+            // experts, which is what makes the model fit on two 16 GB cards.
+            addp(L.moe.gate_exps.data);
+            addp(L.moe.up_exps.data);
+            addp(L.moe.down_exps.data);
+            addp(L.moe.gate_inp);
+            addp(L.moe.gate_inp_shexp);
+        }
     }
     size_t bytes = 0;
     size_t n = 0;
@@ -1206,6 +1395,31 @@ void engine::upload_device_weights(int dev) {
             throw std::runtime_error("multi-device weight upload failed (out of device memory)");
         }
         qd.memcpy(g, t.data, t.nbytes()).wait();
+        // PF_MOE_VERIFY: byte-compare the freshly uploaded copy against the host
+        // mmap for the routed expert tensors.  A partial or clobbered expert
+        // plane shows up as a 1e9-scale activation (a Q5_K scale read from
+        // garbage is ~65504), which is indistinguishable from a kernel bug once
+        // it reaches the hidden state.
+        if (si::env::flag("PF_MOE_VERIFY") && t.nbytes() > (1u << 20) &&
+            (t.name.find(".ffn_down_exps.") != std::string::npos || t.name.find(".ffn_gate_exps.") != std::string::npos)) {
+            std::vector<char> back(t.nbytes());
+            qd.memcpy(back.data(), g, t.nbytes()).wait();
+            size_t bad = 0, first = 0;
+            bool have_first = false;
+            const char * h0 = (const char *)t.data;
+            for (size_t i = 0; i < back.size(); i++) {
+                if (back[i] != h0[i]) {
+                    if (!have_first) { first = i; have_first = true; }
+                    bad++;
+                }
+            }
+            fprintf(stderr, "[moe] verify dev=%d %-34s bytes=%zu mismatched=%zu%s\n", dev, t.name.c_str(),
+                    t.nbytes(), bad, bad ? "" : "  OK");
+            if (bad && have_first) {
+                fprintf(stderr, "[moe]   first mismatch at %zu (%.4f%% into the tensor)\n", first,
+                        100.0 * (double)first / (double)back.size());
+            }
+        }
         mp[t.data] = g;
         bytes += t.nbytes();
         n++;
@@ -1395,6 +1609,30 @@ void engine::release_host_weight_pages() {
                 kp(L.q_norm);
                 kp(L.k_norm);
             }
+        }
+    }
+    if (!moe_resident) {
+        // The ncmoe host half evaluates the non-resident experts straight out of
+        // the mmap, so every expert tensor has to stay resident.  Keyed on the
+        // config rather than moe_host_split(): release_host_weight_pages() runs
+        // before setup_moe_slots(), so the cache is not active yet here and
+        // testing it would always say "fully resident".  Without this the
+        // MTP/NextN experts in particular are uploaded, released, and then read
+        // back as zeros - which is not a slow path but a wrong one, and only
+        // shows up as "fine with one expert spilled, garbage with fifty".
+        for (int il = 0; il < m.hp.n_layer; il++) {
+            const moe_t & M = m.layers[(size_t) il].moe;
+            keep.insert(M.gate_exps.data);
+            keep.insert(M.up_exps.data);
+            keep.insert(M.down_exps.data);
+            keep.insert(M.gate_inp);
+        }
+        if (m.mtp.moe.ok()) {
+            const moe_t & M = m.mtp.moe;
+            keep.insert(M.gate_exps.data);
+            keep.insert(M.up_exps.data);
+            keep.insert(M.down_exps.data);
+            keep.insert(M.gate_inp);
         }
     }
     size_t dropped = 0;
@@ -1959,6 +2197,63 @@ void engine::setup_multi_device(const std::string & layer_map) {
     for (size_t i = 0; i < gpu_indices.size(); i++) {
         upload_device_weights((int)i);
     }
+    // PF_MOE_DIAG: why a call can miss every GEMM path.  The plan keys a segment
+    // on wkey(dev, host) - the *host* pointer for a tensor the upload skipped
+    // because oneDNN holds a converted copy, the *device* pointer otherwise -
+    // while has_weight() only ever knows the host pointer.  So a converted
+    // weight that also got uploaded resolves to a device pointer that no
+    // registry has, the call falls off the oneDNN path, and on the mode-2
+    // prefill the fp32 gemv_group it lands on writes nothing: an all-zero
+    // activation that is indistinguishable from a kernel bug.
+    if (si::env::flag("PF_MOE_DIAG") && multi_dev) {
+        const layer_t & L0 = m.layers[0];
+        for (size_t d = 0; d < dnnl_dev_.size(); d++) {
+            if (dev_kind_[d] != 0 || !dnnl_dev_[d]) {
+                continue;
+            }
+            const bool in_map = weight_maps_[d].count(L0.wqkv.data) != 0;
+            fprintf(stderr, "[diag] dev=%zu wqkv host=%p in_map=%d has_w=%d w4=%d k5=%d cb4=%d w8=%d\n", d,
+                    L0.wqkv.data, (int)in_map, (int)dnnl_dev_[d]->has_weight(L0.wqkv.data),
+                    (int)dnnl_dev_[d]->has_weight_w4(L0.wqkv.data), (int)dnnl_dev_[d]->has_weight_k5(L0.wqkv.data),
+                    (int)dnnl_dev_[d]->has_weight_cb4(L0.wqkv.data),
+                    (int)(d < w8_dev_.size() && w8_dev_[d].count(L0.wqkv.data)));
+        }
+        {
+            const moe_t & M = m.layers[0].moe;
+            const struct {
+                const char * nm;
+                const moe_wt * w;
+            } ts[] = {{"gate", &M.gate_exps}, {"up", &M.up_exps}, {"down", &M.down_exps}};
+            for (const auto & e : ts) {
+                fprintf(stderr, "[diag] %-5s type=%2d K=%5d N=%5d E=%d plane_bytes=%9zu rows*N=%9zu total=%9zu\n", e.nm,
+                        (int) e.w->type, e.w->K, e.w->N, e.w->E, e.w->plane_bytes,
+                        quant_row_bytes(e.w->type, e.w->K) * (size_t) e.w->N, e.w->total_bytes());
+            }
+        }
+        fprintf(stderr, "[diag] weight_maps sizes:");
+        for (size_t d = 0; d < weight_maps_.size(); d++) {
+            fprintf(stderr, " dev%zu=%zu", d, weight_maps_[d].size());
+        }
+        fprintf(stderr, "\n");
+        // the group that carries wqkv also carries ssm_beta/ssm_alpha (K=n_embd,
+        // N=dt_rank = 32 rows), and dnnl_call is all-or-nothing per call - so if
+        // oneDNN cannot take those two, the qkv GEMV loses the fast path with them
+        for (size_t d = 0; d < dnnl_dev_.size(); d++) {
+            if (dev_kind_[d] != 0 || !dnnl_dev_[d]) {
+                continue;
+            }
+            const struct {
+                const char * nm;
+                const wt * t;
+            } ts[] = {{"wqkv", &L0.wqkv}, {"wgate", &L0.wgate}, {"ssm_out", &L0.ssm_out},
+                      {"ssm_beta", &L0.ssm_beta}, {"ssm_alpha", &L0.ssm_alpha}};
+            for (const auto & e : ts) {
+                fprintf(stderr, "[diag] dev=%zu %-10s type=%d K=%d N=%d has_w=%d\n", d, e.nm, (int)e.t->type, e.t->K,
+                        e.t->N, (int)dnnl_dev_[d]->has_weight(e.t->data));
+            }
+            break;
+        }
+    }
     // A tied LM head shares token_embd's storage, so the raw embedding had to be
     // uploaded for the embed kernel and cannot be replaced by the int8 head
     // copy.  Build the head's oneDNN conversion here and key it by the *uploaded
@@ -2061,6 +2356,27 @@ void engine::alloc_buffers() {
         }
     }
     d_segs_aux = alloc_elems<gemv_seg>(8);
+    // MoE scratch: per-device like the activation sets, because the expert
+    // weights a partition uses live in that partition's device USM.  Sized from
+    // kMaxB*kMaxT tokens x n_expert_used pairs, which is the widest batch the
+    // engine can present.
+    if (m.hp.is_moe()) {
+        moe_topk = m.hp.n_expert_used;
+        moe_as_.resize(multi_dev ? backends_.size() : 1);
+        for (size_t d = 0; d < moe_as_.size(); d++) {
+            moe_acts_alloc((int)d);
+        }
+        moe_cache_.init(m, moe_cfg_, (int) m.hp.n_expert);
+        if (!moe_cache_.all_resident() && moe_cache_.active()) {
+            fprintf(stderr, "[moe] expert cache: host expert split active, the decode graph is disabled\n");
+        }
+        setup_moe_slots();
+        bind_moe_acts(0);
+        moe_host_weights_deferred_ = true;
+        // unconditional: with a fully-resident expert set the keep-set is empty
+        // and this is exactly the sweep the constructor used to do
+        release_host_weight_pages();
+    }
     // The DFlash drafter runs on the *target's* speculative machinery (the same
     // dry verify, per-token recurrent-state snapshots and rollback the MTP uses),
     // so it needs the same buffers even though it has no MTP layer of its own.
@@ -2316,8 +2632,12 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
     for (int i = 0; i < n; i++) {
         d_info->tokens[i] = toks[start + i];
     }
-    // PF_NOGRAPH=1: run the recorded sequence directly (diagnostics/PF_PROF)
-    static const bool nog = si::env::flag("PF_NOGRAPH");
+    // PF_NOGRAPH=1: run the recorded sequence directly (diagnostics/PF_PROF).
+    // The ncmoe host half is also a reason to skip the graph: it is a host pass
+    // with blocking transfers, and a recorded command graph cannot contain one -
+    // and if it were recorded *around*, every decode step would silently drop
+    // the experts the device kernels skipped for lack of a slot.
+    static const bool nog = si::env::flag("PF_NOGRAPH") || moe_host_split();
     if (cpu_mode || multi_dev) {
         if (pf8 || multi_dev) {
             // full-chunk path: SI8 on single-device CPU, per-device oneDNN/w8
@@ -2488,6 +2808,12 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
             q.wait();
         }
         d_info->pc_active = 0;
+        // The expert cache measures its residency from real traffic, and this is
+        // the first place the traffic exists: one prefill has every layer's
+        // router output in moe_calib_ids_.  Freezing the bank here, rather than
+        // picking an index range, makes the VRAM tier a cache of *measured* hot
+        // experts (and the set then cannot change under a command graph).
+        moe_calibrate(0);
         return;
     }
     const pfb_variant * v = nullptr;
@@ -2509,6 +2835,12 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
 }
 
 void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows) {
+    // One-shot freeze of the expert bank.  By now every layer's router output of
+    // the prefill is in moe_calib_ids_ and the forward that produced it has ended,
+    // so the bank is being decided between steps rather than under one.  (The
+    // multi-device prefill runs pipelined and returns before its own tail, which
+    // is why this cannot live only there.)
+    moe_calibrate(0);
     // any pending pipelined prefill chunk must be finished before decode
     prefill_flush();
     pf_info_ = nullptr;
@@ -2538,7 +2870,11 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
         // run dp4a_gemv (SIn) or the oneDNN int8 GEMM (XMX).  With the
         // per-partition command graphs each partition's ~350 kernels go out in
         // one submission instead of one per kernel.
-        if (md_dec_ok) {
+        // A recorded decode graph cannot contain the ncmoe host pass (blocking
+        // transfers, and its expert choice is made per step), so replaying one
+        // would silently drop every expert without a device slot.  Fall back to
+        // the direct replay whenever the split is live.
+        if (md_dec_ok && !moe_host_split()) {
             replay_md_dec_graphs();
         } else {
             record_forward(0, plan_dec8_, d_segs_dec8, 1);

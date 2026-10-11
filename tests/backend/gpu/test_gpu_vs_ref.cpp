@@ -20,10 +20,17 @@ int main(int argc, char ** argv) {
         toks = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
     }
 
-    engine_config ec;
+engine_config ec;
         ec.model_path = model_path;
         ec.max_seq = 512;
-        engine e(ec);
+        // Same hook the stage harness takes: a model that only fits on a layer
+        // split (the 35B A3B MoE is ~21 GB) has to be runnable by every GPU test,
+        // and without this the engine tries to upload it to one card and dies
+        // with "device allocation failed" before it prints anything.
+        if (const char * lm = getenv("TEST_LAYER_MAP")) {
+            ec.layer_map = lm;
+        }
+    engine e(ec);
     auto gpu = e.eval(toks);
 
     cpu_ref ref(e.m, 512);

@@ -51,10 +51,19 @@ size_t engine::kv_block_elem_off(int which, int layer, int block) const {
                                                              : 0);
 }
 
-void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
+void engine::kv_read_vec(int layer, int which, size_t elem_off, float * dst, int n) {
     const kv_dtype_t dt = which ? kv_v_dtype() : kv_k_dtype();
     const int esz = kv_dtype_bytes(dt);
-    const void * base = which ? d_vpool : d_kpool;
+    // The pool base is per *device*, not per engine: in multi-device mode only
+    // dev_kpool_ is allocated and the d_kpool member stays null, so reading
+    // through it left the caller's buffer untouched and reported a perfect
+    // match against zeros.  Resolve the layer's slice the way every producer
+    // does (kv_layer_ptrs), and read it with that device's queue.
+    const char * bk = nullptr, * bv = nullptr, * bks = nullptr, * bvs = nullptr;
+    kv_layer_ptrs(layer, bk, bv, bks, bvs);
+    const void * base = which ? (const void *)bv : (const void *)bk;
+    const void * sbase_all = which ? (const void *)bvs : (const void *)bks;
+    sycl::queue & rq = dev_queue(attn_dev(layer));
     if (!base || !dst || n <= 0) {
         return;
     }
@@ -67,12 +76,12 @@ void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
         const int hd = m.hp.head_dim;
         const int nq = hd / kI8Q;
         std::vector<uint8_t> tmp((size_t)n);
-        q.memcpy(tmp.data(), (const int8_t *)base + elem_off, (size_t)n).wait();
+        rq.memcpy(tmp.data(), (const int8_t *)base + elem_off, (size_t)n).wait();
         const size_t r0 = elem_off / hd, r1 = (elem_off + (size_t)n - 1) / hd;
         std::vector<sycl::half> sc((r1 - r0 + 1) * (size_t)nq);
-        const void * sbase = which ? d_vscales : d_kscales;
+        const void * sbase = sbase_all;
         for (size_t r = r0; r <= r1; r++) {
-            q.memcpy(&sc[(r - r0) * nq], (const sycl::half *)sbase + r * nq, (size_t)nq * 2).wait();
+            rq.memcpy(&sc[(r - r0) * nq], (const sycl::half *)sbase + r * nq, (size_t)nq * 2).wait();
         }
         for (int i = 0; i < n; i++) {
             const size_t e = elem_off + (size_t)i;
@@ -89,12 +98,12 @@ void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
         const size_t b0 = elem_off / 2;
         const size_t b1 = (elem_off + (size_t)n + 1) / 2;
         std::vector<uint8_t> tmp(b1 - b0);
-        q.memcpy(tmp.data(), (const uint8_t *)base + b0, tmp.size()).wait();
+        rq.memcpy(tmp.data(), (const uint8_t *)base + b0, tmp.size()).wait();
         const size_t r0 = elem_off / hd, r1 = (elem_off + (size_t)n - 1) / hd;
         std::vector<sycl::half> sc((r1 - r0 + 1) * (size_t)nq);
-        const void * sbase = which ? d_vscales : d_kscales;
+        const void * sbase = sbase_all;
         for (size_t r = r0; r <= r1; r++) {
-            q.memcpy(&sc[(r - r0) * nq], (const sycl::half *)sbase + r * nq, (size_t)nq * 2).wait();
+            rq.memcpy(&sc[(r - r0) * nq], (const sycl::half *)sbase + r * nq, (size_t)nq * 2).wait();
         }
         for (int i = 0; i < n; i++) {
             const size_t e = elem_off + (size_t)i;
@@ -106,11 +115,11 @@ void engine::kv_read_vec(int which, size_t elem_off, float * dst, int n) {
         return;
     }
     if (esz == 4) {
-        q.memcpy((char *)dst, (const char *)base + elem_off * 4, (size_t)n * 4).wait();
+        rq.memcpy((char *)dst, (const char *)base + elem_off * 4, (size_t)n * 4).wait();
         return;
     }
     std::vector<uint8_t> tmp((size_t)n * esz);
-    q.memcpy((char *)tmp.data(), (const char *)base + elem_off * esz, tmp.size()).wait();
+    rq.memcpy((char *)tmp.data(), (const char *)base + elem_off * esz, tmp.size()).wait();
     for (int i = 0; i < n; i++) {
         dst[i] = kv_ld_host(dt, tmp.data(), (size_t)i);
     }

@@ -438,4 +438,42 @@ void df_sel_launch(sycl::queue & q, const int32_t * ids, const float * vals, con
                    const uint8_t * next_vals, const uint16_t * next_scales, const uint16_t * next_offs,
                    float * lattice, int32_t anchor, int n_blk, int n_vocab, int rank, int K);
 
+// ---------------------------------------------------------------------------
+// Mixture of Experts.  The expert a token uses is a runtime value read from
+// device memory, so the weight address comes from a slot table rather than from
+// the launcher:  slot = slot_map[expert] (-1 = not resident here), and the
+// weight is bank + slot*slot_stride.  With every expert resident slot_map is the
+// identity, so one kernel serves both the resident and the ncmoe case.
+// `x` is the post-attention-norm hidden state, `h` the [n_pairs][n_ff_exp]
+// silu(gate)*up intermediate and `acc` the [n_pairs][n_embd] down partials,
+// where n_pairs = n_tok*top_k and a pair's token is pair_index/top_k.
+// `logits` is caller-owned scratch of n_tok*n_expert floats (8 KB for the 35B).
+// It is passed in rather than allocated because the engine records command
+// graphs, and a malloc inside a capture is illegal.
+void moe_router_launch(sycl::queue & q, const void * gate_inp, uint32_t gp_type, const float * x, int x_stride,
+                       int n_tok, int n_embd, int n_expert, int top_k, float * logits, int32_t * ids, float * wts);
+// token -> expert CSR (`off[n_expert+1]`, `pair[n_pairs]`) plus the list of
+// experts that at least one token selected (`active`, `n_active`).
+void moe_csr_clear_launch(sycl::queue & q, int32_t * off, int32_t * cur, int32_t * active, int32_t * n_active,
+                          int n_expert);
+void moe_csr_count_launch(sycl::queue & q, const int32_t * ids, int n_pairs, int32_t * off);
+void moe_csr_prefix_launch(sycl::queue & q, int32_t * off, int32_t * active, int32_t * n_active, int n_expert);
+void moe_csr_scatter_launch(sycl::queue & q, const int32_t * ids, int32_t * off, int32_t * cur, int32_t * pair,
+                            int n_pairs);
+void moe_gate_up_launch(sycl::queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
+                        size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
+                        const int32_t * active, const int32_t * n_active, int n_act_max, const float * x, int x_stride,
+                        float * h, int h_stride, int n_embd, int n_ff_exp, int top_k, uint32_t gtype,
+                        uint32_t utype);
+void moe_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db, const int32_t * off,
+                     const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
+                     const float * h, int h_stride, float * acc, int acc_stride, int n_embd, int n_ff_exp,
+                     uint32_t dtype);
+void moe_reduce_launch(sycl::queue & q, const float * acc, const float * wts, int top_k, int n_tok, int n_embd,
+                       int acc_stride, float * out, int out_stride);
+// MoE epilogue: out[t] += sigmoid(gate . x[t]) * shared[t].  A null `gate`
+// skips the factor (a model whose shared expert is ungated).
+void moe_gate_add_launch(sycl::queue & q, const void * gate, uint32_t gtype, const float * x, int x_stride, int n_tok,
+                         int n_embd, const float * shared, int sh_stride, float * out, int out_stride);
+
 } // namespace si

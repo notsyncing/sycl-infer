@@ -17,6 +17,32 @@ struct wt { // weight tensor view
     int32_t N = 0; // output rows (product of dims[1:])
 };
 
+// One Mixture-of-Experts weight: the GGUF stores the routed experts as a 3-D
+// tensor [K][N][E], so a single expert is exactly a 2-D weight of the same
+// (K, N) as any other linear - `plane(e)` is `data + e*plane_bytes`, which is
+// why every existing GEMV path takes an expert unchanged.  Keeping the expert
+// count and the plane stride here (rather than a std::vector of `wt`) is what
+// lets one expert be handed to the GPU as an ordinary base pointer while the
+// expert *index* stays a runtime value the kernels read from device memory.
+struct moe_wt {
+    const void * data = nullptr;
+    uint32_t type = 0;
+    int32_t K = 0;
+    int32_t N = 0;
+    int32_t E = 0;
+    size_t plane_bytes = 0;
+
+    bool ok() const {
+        return data != nullptr && E > 0;
+    }
+    const void * plane(int e) const {
+        return (const char *)data + (size_t)e * plane_bytes;
+    }
+    size_t total_bytes() const {
+        return plane_bytes * (size_t)E;
+    }
+};
+
 struct hparams {
     int n_layer = 0, n_embd = 0, n_ff = 0;
     int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
@@ -33,6 +59,21 @@ struct hparams {
     // M-RoPE pair counts per section (t, h, w, e); all-zero = plain RoPE
     int rope_sections[4] = {0, 0, 0, 0};
 
+    // ---- Mixture of Experts (`qwen35moe` and friends) ----------------------
+    // n_expert == 0 means the FFN is dense and n_ff is its width.  When it is
+    // not, n_ff holds the *shared* expert's width (n_ff_shexp), because the
+    // shared expert is the dense half of the FFN and reuses every dense path;
+    // the routed half runs through the MoE kernels with n_ff_exp per expert.
+    int n_expert = 0;
+    int n_expert_used = 0;
+    int n_ff_exp = 0;
+    int n_ff_shexp = 0;
+    float expert_weights_scale = 1.0f;
+
+    bool is_moe() const {
+        return n_expert > 0;
+    }
+
     bool is_recr(int il) const {
         return (il + 1) % full_attn_interval != 0;
     }
@@ -44,6 +85,27 @@ struct hparams {
     // separate the key and value head counts.
     int qkv_dim() const {
         return 2 * n_group * d_state + dt_rank * d_state;
+    }
+};
+
+// The routed half of a Mixture-of-Experts FFN.  Empty (`ok()` false) for a
+// dense layer.  `gate_exps`/`up_exps`/`down_exps` are the GGUF's [K][N][E]
+// tensors; `gate_inp` is the router and `gate_inp_shexp` the shared expert's
+// per-token sigmoid gate.  The router's element type is the GGUF's (the trunk
+// layers ship f32 and the NextN block bf16), so it travels with the pointer
+// rather than being assumed.
+struct moe_t {
+    moe_wt gate_exps, up_exps, down_exps;
+    const void * gate_inp = nullptr;
+    uint32_t gate_inp_type = 0;
+    const void * gate_inp_shexp = nullptr;
+    uint32_t gate_inp_shexp_type = 0;
+
+    bool ok() const {
+        return gate_exps.ok();
+    }
+    size_t bytes() const {
+        return gate_exps.total_bytes() + up_exps.total_bytes() + down_exps.total_bytes();
     }
 };
 
@@ -80,6 +142,10 @@ struct layer_t {
     const float * attn_norm = nullptr;
     const float * post_attn_norm = nullptr;
     wt ffn_gate, ffn_up, ffn_down;
+    // Mixture-of-Experts half of the FFN.  Empty for a dense layer; when set,
+    // `ffn_gate/ffn_up/ffn_down` above hold the *shared* expert (a plain dense
+    // FFN of width n_ff_shexp) and `moe` holds the routed experts.
+    moe_t moe;
     // attention layers
     wt wq, wk, wv, wo;
     const float * q_norm = nullptr;
@@ -108,6 +174,7 @@ struct mtp_layer_t {
     const float * q_norm = nullptr;
     const float * k_norm = nullptr;
     wt ffn_gate, ffn_up, ffn_down;
+    moe_t moe;
     // NextN extras
     wt eh_proj;                  // [2*n_embd][K=2*n_embd] -> n_embd
     const float * enorm = nullptr;

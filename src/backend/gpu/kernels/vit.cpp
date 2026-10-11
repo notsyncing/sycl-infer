@@ -326,22 +326,26 @@ void vit_rope_launch(queue & q, float * qkv, int qkv_stride, int n_tok, int n_he
 // tiles stream through SLM and the softmax is online (running max/sum), so the
 // score matrix never leaves the workgroup.
 // ---------------------------------------------------------------------------
-void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok, int n_head,
-                     int head_dim, float scale) {
+// BQ and BK are both part of the instantiation because the work-group's local
+// memory is: s_q + s_acc = 2*BQ*HDP floats, s_k + s_v = 2*BK*HDP,
+// s_s = BQ*(BK+4), with HDP = HD + 4.  At HD=72 with BQ=BK=64 that is 65.5 KB,
+// over the 64 KB per-work-group limit every Xe-LP part has - and Level Zero
+// reports a refused local allocation as UR_RESULT_ERROR_OUT_OF_RESOURCES,
+// which reads like a full card when it is a 1.5 KB overshoot on a work-group.
+// The query tile is the one to halve: BK is woven through the online softmax
+// (the four-lanes-per-row reduction, the P/V inner loop), while BQ only
+// selects how many query rows share the staged K/V.
+template <int HD, int BQ, int BK>
+static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok,
+                          int n_head, float scale) {
     if (n_tok <= 0 || n_head <= 0) {
         return;
-    }
-    constexpr int BQ = 32;
-    constexpr int BK = 64;
-    constexpr int HD = 64; // vision head dim is fixed at 64
-    if (head_dim != HD) {
-        return; // callers guarantee this
     }
     constexpr int HDP = HD + 4;
     constexpr int SDP = BK + 4;
     constexpr int WG = 128;
     const int n_qb = (n_tok + BQ - 1) / BQ;
-    const int embd = n_head * head_dim;
+    const int embd = n_head * HD;
     const int total_qb = n_head * n_qb;
 
     q.submit([&](handler & h) {
@@ -441,9 +445,17 @@ void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, 
                     if (r < n_q) {
                         const float corr = s_rc[r];
                         if (corr != 1.f) {
-                            float * ar = &s_acc[r * HDP + j * 16];
+                            // four lanes per query row, so each owns HD/4 of the
+                            // accumulator.  This was `j * 16` with a fixed trip
+                            // count of 16, which only covers 64 dims: at HD=72
+                            // the last 8 dims were never rescaled when the
+                            // running max rose, so they kept the previous
+                            // tile's magnitude and the attention output came out
+                            // with visibly more energy than the reference.
+                            constexpr int DQ = HD / 4;
+                            float * ar = &s_acc[r * HDP + j * DQ];
 #pragma unroll
-                            for (int d = 0; d < 16; d++) {
+                            for (int d = 0; d < DQ; d++) {
                                 ar[d] *= corr;
                             }
                         }
@@ -505,5 +517,21 @@ void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, 
         });
     });
 }
+
+// The vision head dim is a property of the projector, not of the kernel: 64 for
+// the Qwen-VL towers this was written against, 72 for the Qwen3.6/3.5 mmproj
+// files.  The workgroup layout is indexed by (query row, key) and never by
+// head_dim, and the inner products are float4 over an HDP = HD + 4 SLM stride,
+// so any multiple of 4 works unchanged - the only requirement is that it be
+// instantiated here, which keeps the loop trip counts compile-time.
+void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok, int n_head,
+                     int head_dim, float scale) {
+    switch (head_dim) {
+    case 64: vit_attn_impl<64, 32, 64>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+    case 72: vit_attn_impl<72, 16, 64>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+    default: break; // vision_model::runnable() rejects anything else up front
+    }
+}
+
 
 } // namespace si

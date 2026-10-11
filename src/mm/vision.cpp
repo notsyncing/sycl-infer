@@ -1,5 +1,6 @@
 #include "vision.h"
 
+#include "env.h"
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -303,9 +304,12 @@ void vision_model::build_patch_input(const vision_input & in, std::vector<float>
 }
 
 bool vision_model::runnable(std::string * why) const {
-    if (hp.head_dim != 64) {
+    // the kernel is instantiated for these two; anything else has no
+    // implementation, so say so up front rather than aborting on the first
+    // forward with the model already loaded
+    if (hp.head_dim != 64 && hp.head_dim != 72) {
         if (why) {
-            *why = "vision: unsupported head_dim " + std::to_string(hp.head_dim) + " (the encoder implements 64)";
+            *why = "vision: unsupported head_dim " + std::to_string(hp.head_dim) + " (the encoder implements 64 and 72)";
         }
         return false;
     }
@@ -335,14 +339,33 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
     std::vector<float> downbuf((size_t)np * E);
     std::vector<float> scores((size_t)np);
 
+    const bool dbg_mm = si::env::flag("PF_MM_DIAG");
+    auto fph = [&](const char * tag, const std::vector<float> & v, size_t n) {
+        if (!dbg_mm) {
+            return;
+        }
+        double sm = 0, sq = 0, mx = 0;
+        for (size_t i = 0; i < n; i++) {
+            sm += v[i];
+            sq += (double) v[i] * v[i];
+            mx = std::max(mx, std::fabs((double) v[i]));
+        }
+        fprintf(stderr, "[mm] host %-12s sum=%.5f sumsq=%.5f max=%.5f\n", tag, sm, sq, mx);
+    };
     for (int il = 0; il < hp.n_layer; il++) {
         const vision_layer & L = layers[il];
         // ln1
         for (int t = 0; t < np; t++) {
             layer_norm(x.data() + (size_t)t * E, L.ln1, L.ln1_b, tmp.data() + (size_t)t * E, E, hp.eps);
         }
+        if (il == 0) {
+            fph("ln1", tmp, (size_t) np * E);
+        }
         // fused qkv + rope on Q/K
         matmul_all(L.qkv, L.qkv_b, tmp.data(), qkv.data(), np);
+        if (il == 0) {
+            fph("qkv", qkv, (size_t) np * 3 * E);
+        }
         // token -> patch coordinates in the original grid (merged order)
         auto patch_xy = [&](int t, int & px, int & py) {
             const int m = t / (M * M);
@@ -359,8 +382,14 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
                 float * q = qt + h * HD;
                 float * k = qt + E + h * HD;
                 for (int ic = 0; ic < HD / 2; ic++) {
-                    const int sec = ic / 16; // sections {16,16,16,16}, exponent resets
-                    const int p = ic % 16;
+                    // four sections of HD/4 pairs each (so {16,16,16,16} at
+                    // HD=64): the exponent restarts at each section boundary.
+                    // Hardcoding 16 made this agree with vit_rope_launch only at
+                    // HD=64 - every projector with a different head dim put the
+                    // section split in a different place on the two sides, and
+                    // the device looked wrong instead.
+                    const int sec = ic / (HD / 4);
+                    const int p = ic % (HD / 4);
                     const int pos = sec == 0 ? py : px;
                     const float theta = pos * std::pow(rope_scale, (float)p);
                     const float c = std::cos(theta), s = std::sin(theta);
@@ -372,6 +401,9 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
                     k[ic + HD / 2] = k0 * s + k1 * c;
                 }
             }
+        }
+        if (il == 0) {
+            fph("qkv_rope", qkv, (size_t) np * 3 * E);
         }
         // bidirectional attention per head
         const float scale = 1.0f / std::sqrt((float)HD);
@@ -410,22 +442,37 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
                 }
             }
         }
+        if (il == 0) {
+            fph("attn", attn, (size_t) np * E);
+        }
         // attn_out projection + residual
         matmul_all(L.out, L.out_b, attn.data(), tmp.data(), np);
         for (size_t i = 0; i < x.size(); i++) {
             x[i] += tmp[i];
         }
+        if (il == 0) {
+            fph("x_after_attn", x, (size_t) np * E);
+        }
         // ln2 + ffn (up -> gelu -> down) + residual
         for (int t = 0; t < np; t++) {
             layer_norm(x.data() + (size_t)t * E, L.ln2, L.ln2_b, tmp.data() + (size_t)t * E, E, hp.eps);
+        }
+        if (il == 0) {
+            fph("ln2", tmp, (size_t) np * E);
         }
         matmul_all(L.up, L.up_b, tmp.data(), upbuf.data(), np);
         for (int t = 0; t < np; t++) {
             gelu_tanh(upbuf.data() + (size_t)t * ff, ff);
         }
+        if (il == 0) {
+            fph("ffn_up", upbuf, (size_t) np * ff);
+        }
         matmul_all(L.down, L.down_b, upbuf.data(), downbuf.data(), np);
         for (size_t i = 0; i < x.size(); i++) {
             x[i] += downbuf[i];
+        }
+        if (il == 0) {
+            fph("x_after_ffn", x, (size_t) np * E);
         }
     }
 
@@ -521,6 +568,14 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         d_attn = (float *)sycl::malloc_device((size_t)np * E * 4, q);
         d_ffn = (float *)sycl::malloc_device((size_t)np * ff * 4, q);
         d_mm0 = (float *)sycl::malloc_device((size_t)n_out * hidden * 4, q);
+        if (si::env::flag("PF_MM_DIAG")) {
+            fprintf(stderr,
+                    "[mm] scratch np=%d E=%d ff=%d hidden=%d n_out=%d patch_elems=%d -> patch_in %.1f qkv %.1f "
+                    "ffn %.1f mm0 %.1f MiB\n",
+                    np, E, ff, hidden, n_out, patch_elems, np * (double) patch_elems * 4 / 1048576.0,
+                    np * 3.0 * E * 4 / 1048576.0, np * (double) ff * 4 / 1048576.0,
+                    n_out * (double) hidden * 4 / 1048576.0);
+        }
         if (!d_patch_in || !d_pos || !d_x || !d_ln || !d_qkv || !d_attn || !d_ffn || !d_mm0) {
             throw std::runtime_error("vision: device scratch allocation failed");
         }
@@ -543,22 +598,61 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
     vit_add_launch(q, d_x, E, d_pos, E, np, E);
 
     const float scale = 1.0f / std::sqrt((float)HD);
+    const bool dbg_mm = si::env::flag("PF_MM_DIAG");
+    auto fpd = [&](const char * tag, const void * p, size_t n) {
+        if (!dbg_mm) {
+            return;
+        }
+        std::vector<float> h(n);
+        q.memcpy(h.data(), p, n * 4).wait();
+        double sm = 0, sq = 0, mx = 0;
+        for (float v : h) {
+            sm += v;
+            sq += (double) v * v;
+            mx = std::max(mx, std::fabs((double) v));
+        }
+        fprintf(stderr, "[mm] dev %-12s sum=%.5f sumsq=%.5f max=%.5f\n", tag, sm, sq, mx);
+    };
     for (int il = 0; il < hp.n_layer; il++) {
         const vision_layer & L = layers[il];
         vit_layernorm_launch(q, d_x, E, devf(L.ln1), devf(L.ln1_b), d_ln, E, np, E, hp.eps);
+        if (il == 0) {
+            fpd("ln1", d_ln, (size_t) np * E);
+        }
         vit_gemm_launch(q, dev_ptr(L.qkv.data), L.qkv.type, 3 * E, E, d_ln, E, d_qkv, 3 * E, np, 1.f, nullptr);
         vit_add_bias_launch(q, d_qkv, 3 * E, devf(L.qkv_b), np, 3 * E);
+        if (il == 0) {
+            fpd("qkv", d_qkv, (size_t) np * 3 * E);
+        }
         vit_rope_launch(q, d_qkv, 3 * E, np, NH, HD, in.out_w, M, hp.rope_base);
+        if (il == 0) {
+            fpd("qkv_rope", d_qkv, (size_t) np * 3 * E);
+        }
         vit_attn_launch(q, d_qkv, 3 * E, d_attn, E, np, NH, HD, scale);
+        if (il == 0) {
+            fpd("attn", d_attn, (size_t) np * E);
+        }
         // x += out_b, then x += attn_out_proj (residual through the GEMM)
         vit_add_bias_launch(q, d_x, E, devf(L.out_b), np, E);
         vit_gemm_launch(q, dev_ptr(L.out.data), L.out.type, E, E, d_attn, E, d_x, E, np, 1.f, d_x);
+        if (il == 0) {
+            fpd("x_after_attn", d_x, (size_t) np * E);
+        }
         vit_layernorm_launch(q, d_x, E, devf(L.ln2), devf(L.ln2_b), d_ln, E, np, E, hp.eps);
+        if (il == 0) {
+            fpd("ln2", d_ln, (size_t) np * E);
+        }
         vit_gemm_launch(q, dev_ptr(L.up.data), L.up.type, ff, E, d_ln, E, d_ffn, ff, np, 1.f, nullptr);
         vit_add_bias_launch(q, d_ffn, ff, devf(L.up_b), np, ff);
         vit_gelu_launch(q, d_ffn, np * ff);
+        if (il == 0) {
+            fpd("ffn_up", d_ffn, (size_t) np * ff);
+        }
         vit_add_bias_launch(q, d_x, E, devf(L.down_b), np, E);
         vit_gemm_launch(q, dev_ptr(L.down.data), L.down.type, E, ff, d_ffn, ff, d_x, E, np, 1.f, d_x);
+        if (il == 0) {
+            fpd("x_after_ffn", d_x, (size_t) np * E);
+        }
     }
 
     vit_layernorm_launch(q, d_x, E, devf(post_ln), devf(post_ln_b), d_ln, E, np, E, hp.eps);

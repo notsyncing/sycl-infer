@@ -116,16 +116,43 @@ void engine::build_mtp_plan() {
     p.begin_call(kMaxT, hp.n_head * hp.head_dim / 256);
     p.add(seg(M.wo, mtp.d_mtp_attn_out, hp.n_head * hp.head_dim, mtp.d_mtp_x, hp.n_embd, mtp.d_mtp_x, 3));
     p.set_xq(mtp.d_mtp_attn_out, nullptr, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim, hp.n_head * hp.head_dim);
-    // call 2: ffn_gate + ffn_up
-    p.begin_call(kMaxT, hp.n_embd / 256);
-    p.add(seg(M.ffn_gate, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_ffn, ffn_stride, nullptr, 4));
-    p.add(seg(M.ffn_up, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_ffn + hp.n_ff, ffn_stride, nullptr, 5));
-    p.set_xq(mtp.d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
-    // call 3: ffn_down (silu gate) (+ residual)
-    p.begin_call(kMaxT, hp.n_ff / 256);
-    p.add(seg(M.ffn_down, mtp.d_mtp_ffn, ffn_stride, mtp.d_mtp_x, hp.n_embd, mtp.d_mtp_x, 6));
-    p.set_xq(mtp.d_mtp_ffn, mtp.d_mtp_ffn + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
-    p.set_act_up(mtp.d_mtp_ffn + hp.n_ff, mtp.d_mtp_ffn);
+    const bool mtp_moe_ok = M.moe.ok() && M.moe.gate_exps.data != nullptr;
+    if (mtp_moe_ok) {
+        // The NextN block is a full MoE layer, so the draft's FFN is the same
+        // four-call shape a trunk layer uses: routed experts (no segments - the
+        // expert choice is a device decision), the shared expert's gate/up and
+        // down as ordinary dense calls, then the sigmoid-gated epilogue that
+        // adds both halves.  Building only the shared half - which is what this
+        // used to do - makes the draft a different model than the target, and
+        // the symptom is a plausible-looking stream with a wrong token in it.
+        p.begin_moe_call(seg_plan::call_t::moe_routed, kMaxT, hp.n_embd / 256);
+        // shared expert: gate/up, then down (no residual - the epilogue applies
+        // the sigmoid gate and then adds the residual)
+        p.begin_call(kMaxT, hp.n_embd / 256);
+        p.add(seg(M.ffn_gate, mtp.d_mtp_xnorm, hp.n_embd, d_moe_sh, ffn_stride, nullptr, 4));
+        p.add(seg(M.ffn_up, mtp.d_mtp_xnorm, hp.n_embd, d_moe_sh + hp.n_ff, ffn_stride, nullptr, 5));
+        p.set_xq(mtp.d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+        p.begin_call(kMaxT, hp.n_ff / 256);
+        p.add(seg(M.ffn_down, d_moe_sh, ffn_stride, d_moe_shout, hp.n_embd, nullptr, 6));
+        p.set_xq(d_moe_sh, d_moe_sh + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
+        p.set_act_up(d_moe_sh + hp.n_ff, d_moe_sh);
+        p.begin_moe_call(seg_plan::call_t::moe_epilogue, kMaxT, hp.n_embd / 256);
+        mtp.head_call = 6;
+    } else {
+        mtp.head_call = 4;
+    }
+    // call: ffn_gate + ffn_up (dense draft layer)
+    if (!mtp_moe_ok) {
+        p.begin_call(kMaxT, hp.n_embd / 256);
+        p.add(seg(M.ffn_gate, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_ffn, ffn_stride, nullptr, 4));
+        p.add(seg(M.ffn_up, mtp.d_mtp_xnorm, hp.n_embd, mtp.d_mtp_ffn + hp.n_ff, ffn_stride, nullptr, 5));
+        p.set_xq(mtp.d_mtp_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
+        // call 3: ffn_down (silu gate) (+ residual)
+        p.begin_call(kMaxT, hp.n_ff / 256);
+        p.add(seg(M.ffn_down, mtp.d_mtp_ffn, ffn_stride, mtp.d_mtp_x, hp.n_embd, mtp.d_mtp_x, 6));
+        p.set_xq(mtp.d_mtp_ffn, mtp.d_mtp_ffn + hp.n_ff, ffn_stride, ffn_stride, hp.n_ff);
+        p.set_act_up(mtp.d_mtp_ffn + hp.n_ff, mtp.d_mtp_ffn);
+    }
     // call 4: shared LM head over the MTP hidden
     p.begin_call(kMaxT, hp.n_embd / 256);
     {
@@ -162,13 +189,70 @@ void engine::build_mtp_plan() {
     }
 }
 
+// The NextN block's MoE FFN: the two segment-less calls of its plan.  Same five
+// kernels and the same slot table a trunk layer uses - the draft layer is just
+// row `n_layer` of that table - but on the draft's device and over the MTP
+// plan's own activation buffer.
+void engine::mtp_moe(int ci, int M, int step) {
+    (void) step;
+    const hparams & hp = m.hp;
+    const mtp_layer_t & MM = m.mtp;
+    const seg_plan & p = mtp.plan_mtp_;
+    if (!MM.moe.ok() || ci >= (int) p.calls.size()) {
+        return;
+    }
+    const seg_plan::call_t & c = p.calls[(size_t) ci];
+    const int dev = mtp.mtp_dev;
+    sycl::queue & qq = dev_queue(dev);
+    const int k = hp.n_expert_used;
+    const int n_tok = M;
+    const int n_pairs = n_tok * k;
+    const size_t il = (size_t) hp.n_layer;
+    bind_moe_acts(dev);
+    const int32_t * sm = d_moe_slotmap + il * (size_t) hp.n_expert;
+    const int n_act = std::min(hp.n_expert, n_pairs);
+
+    if (c.kind == seg_plan::call_t::moe_routed) {
+        // the draft's residual lives in d_mtp_x and its norm output in
+        // d_mtp_xnorm, so both are passed explicitly rather than reusing d_x
+        moe_router_launch(qq, wptr(dev, MM.moe.gate_inp), MM.moe.gate_inp_type, mtp.d_mtp_xnorm, hp.n_embd, n_tok,
+                          hp.n_embd, hp.n_expert, k, d_moe_logits, d_moe_ids, d_moe_wts);
+        moe_csr_clear_launch(qq, d_moe_off, d_moe_cur, d_moe_active, d_moe_nact, hp.n_expert);
+        moe_csr_count_launch(qq, d_moe_ids, n_pairs, d_moe_off);
+        moe_csr_prefix_launch(qq, d_moe_off, d_moe_active, d_moe_nact, hp.n_expert);
+        moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
+        moe_gate_up_launch(qq, wptr(dev, MM.moe.gate_exps.data), wptr(dev, MM.moe.up_exps.data), sm,
+                          moe_slot_gb[il], moe_slot_ub[il], d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act,
+                          mtp.d_mtp_xnorm, hp.n_embd, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
+                          MM.moe.gate_exps.type, MM.moe.up_exps.type);
+        moe_down_launch(qq, wptr(dev, MM.moe.down_exps.data), sm, moe_slot_db[il], d_moe_off, d_moe_pair, d_moe_active,
+                        d_moe_nact, n_act, d_moe_h, hp.n_ff_exp, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp,
+                        MM.moe.down_exps.type);
+        // ncmoe / expert cache: the draft's own experts are resident, so this is
+        // normally a no-op - but the host half has to be called here too, with
+        // the draft's activation buffer, or a spilled expert would be dropped
+        // from the draft (and the verify would then accept against a draft that
+        // never saw it).
+        if (moe_host_split() && !g_capturing_) {
+            moe_cpu_experts(il, MM.moe, n_tok, k, n_pairs, dev, mtp.d_mtp_xnorm);
+        }
+        moe_reduce_launch(qq, d_moe_acc, d_moe_wts, k, n_tok, hp.n_embd, hp.n_embd, mtp.d_mtp_x, hp.n_embd);
+    } else if (c.kind == seg_plan::call_t::moe_epilogue) {
+        moe_gate_add_launch(qq, MM.moe.gate_inp_shexp ? wptr(dev, MM.moe.gate_inp_shexp) : nullptr,
+                            MM.moe.gate_inp_shexp_type, mtp.d_mtp_xnorm, hp.n_embd, n_tok, hp.n_embd, d_moe_shout,
+                            hp.n_embd, mtp.d_mtp_x, hp.n_embd);
+    }
+}
+
 // One call of the MTP plan: quantize its activations once, then run the GEMMs.
 // OneDNN cannot be recorded and its M==1 path is the grouped GEMV the
 // multi-device decode already uses per segment, so this mirrors that dispatch.
 void engine::mtp_gemv(int ci, int M, int step) {
     const seg_plan & p = mtp.plan_mtp_;
     compute_backend & be = multi_dev ? *backends_[(size_t)mtp.mtp_dev] : backend();
-    dnnl_gemm * D = dnnl_for(ci == 4 ? 0 : mtp.mtp_dev);
+    // the shared LM head lives on the primary device; every other call is on
+    // the draft's device
+    dnnl_gemm * D = dnnl_for(ci == mtp.head_call ? 0 : mtp.mtp_dev);
     const seg_plan::xq_t & xq = p.calls[(size_t)ci].xq;
     if (D == nullptr || xq.x == nullptr) {
         throw std::runtime_error("mtp: the oneDNN int8 weight path is required");
@@ -180,7 +264,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
     // head is evaluated on the candidate rows instead of all n_vocab - the same
     // quantized activation and the same int8 grouped dot product the decode GEMV
     // computes (mtp_gather_launch).
-    if (ci == 4 && step >= 0) {
+    if (ci == mtp.head_call && step >= 0) {
         const bool gather = (mtp.mtp_cand_cap_ > 0 && mtp.mtp_cand_ok_);
         compute_backend & hb = *backends_[0];
         if (gather) {
@@ -252,7 +336,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
     // rejected by the generation check instead of being silently believed.
     const act_view av = D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, M, xq.K, /*do_split=*/w4_draft);
     static const bool head_split_dbg = si::env::flag("PF_MTP_HEAD_SPLIT_DEBUG");
-    if (ci == 4 && M == 1 && step >= 0 && mtp.mtp_head_split_) {
+    if (ci == mtp.head_call && M == 1 && step >= 0 && mtp.mtp_head_split_) {
         // The head readout split across both cards (opt-in, default off - it
         // measures as a wash: -4.1 ms/cycle of draft, no end-to-end gain).
         // out[n] = w[n].h is
@@ -315,12 +399,12 @@ void engine::mtp_gemv(int ci, int M, int step) {
         const seg_plan::group_t & gr = p.groups[(size_t)(gb + g)];
         for (int j = 0; j < gr.n; j++) {
             const gemv_seg & s = mtp.d_segs_mtp[gr.off + j];
-            const void * wk = (ci == 4 && mtp.mtp_head_w4_) ? (const void *)mtp.mtp_head_w4_key_ : s.w;
+            const void * wk = (ci == mtp.head_call && mtp.mtp_head_w4_) ? (const void *)mtp.mtp_head_w4_key_ : s.w;
             // the draft's head readout on the 2-bit store: 0.375 B/weight
             // against the u4 copy's 0.625, so ~0.5 ms of the cycle per drafted
             // token.  It is the one place a lossy store is free of consequence
             // beyond the draft's own argmax accuracy (see PF_MTP_HEAD_W2).
-            if (ci == 4 && M == 1 && mtp.mtp_head_w2_ && D->gemm_w2(av, mtp.mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
+            if (ci == mtp.head_call && M == 1 && mtp.mtp_head_w2_ && D->gemm_w2(av, mtp.mtp_head_w2_key_, s.residual, s.alpha, M, s.K, s.out, s.out_stride)) {
                 continue;
             }
             if (ci < 4 && M == 1 && mtp.mtp_layer_w2_ && s.w_raw
@@ -339,7 +423,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
             throw std::runtime_error("mtp: oneDNN GEMM failed for a layer tensor");
         }
     }
-    if (ci == 4 && step >= 0) {
+    if (ci == mtp.head_call && step >= 0) {
         // The full head readout's argmax stays on the device.  It has to go on
         // the *primary partition's* queue (backends_[0] = dev_queues_[0]), which
         // is where the head GEMV was submitted - `backend()` is the single-device
@@ -471,8 +555,15 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     dmark("wo");
     // 4. FFN
     be.rmsnorm(mtp.d_mtp_x, wf32(mtp.mtp_dev, M.post_attn_norm), mtp.d_mtp_xnorm, n, hp.n_embd, hp.rms_eps);
-    mtp_gemv(2, n);
-    mtp_gemv(3, n);
+    if (M.moe.ok() && M.moe.gate_exps.data != nullptr) {
+        mtp_moe(2, n, step);        // routed experts
+        mtp_gemv(3, n);             // shared expert gate/up
+        mtp_gemv(4, n);             // shared expert down
+        mtp_moe(5, n, step);        // sigmoid gate + residual
+    } else {
+        mtp_gemv(2, n);
+        mtp_gemv(3, n);
+    }
     dmark("ffn");
     // 5. the AR draft chain seeds the next step with the MTP hidden *before*
     // the shared head norm (llama.cpp: the draft context's pre-norm hidden)
@@ -498,7 +589,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
             // the shared LM head lives on the primary device
             dev_queue(0).memcpy(mtp.d_mtp_hnorm0, mtp.d_mtp_hnorm, (size_t)n * hp.n_embd * 4).wait();
         }
-        mtp_gemv(4, n, step);
+        mtp_gemv(mtp.head_call, n, step);
     }
     dmark("head");
     MTPDBG("forward done\n");
@@ -597,7 +688,10 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     // ~810.  Everything that varies per cycle (tokens, positions, slots,
     // n_real, the KV page table, the recurrent-state snapshot slot map) is read
     // from USM inside the kernels, so the graph is shape-fixed, not state-fixed.
-    const bool use_graph = v_pad == 0 && vf_graph_usable(rows_vf, pos0);
+    // A recorded verify graph cannot contain the ncmoe host half: it is a host
+    // pass whose expert set is chosen per cycle, so replaying one would drop
+    // every expert without a device slot.
+    const bool use_graph = v_pad == 0 && !moe_host_split() && vf_graph_usable(rows_vf, pos0);
     if (use_graph) {
         replay_md_verify_graphs();
     } else {
@@ -1234,7 +1328,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 }
                 int32_t hid = -1, hf = -1;
                 dev_queue(0).memcpy(&hid, mtp.d_mtp_tok_ + i, 4);
-                mtp_gemv(4, 1, -1); // full readout of the same hidden
+                mtp_gemv(mtp.head_call, 1, -1); // full readout of the same hidden
                 backends_[0]->mtp_argmax(d_logits, hp.n_vocab, mtp.d_am2_, nullptr, 1);
                 dev_queue(0).memcpy(&hf, mtp.d_am2_, 4).wait();
                 h_cand += (hid == hf);

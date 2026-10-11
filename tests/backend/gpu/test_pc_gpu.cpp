@@ -168,7 +168,7 @@ int main(int argc, char ** argv) {
         const size_t per_block = (size_t)e.m.hp.n_head_kv * kBlockSize * e.m.hp.head_dim;
         auto read_block = [&](int b) {
             std::vector<float> v(per_block);
-            e.kv_read_vec(0, (size_t)b * per_block, v.data(), (int)per_block);
+            e.kv_read_vec(0, 0, (size_t)b * per_block, v.data(), (int)per_block);
             return v;
         };
         std::vector<std::vector<float>> cold_kv;

@@ -119,6 +119,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/mtp.cpp
     src/backend/gpu/kernels/mtp_argmax.cpp
     src/backend/gpu/kernels/dflash.cpp
+    src/backend/gpu/kernels/moe.cpp
     src/backend/gpu/kernels/dp4a_common.cpp
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp
@@ -129,6 +130,7 @@ add_library(sycl_infer_core STATIC
     src/model/model.cpp
     src/model/model_w8.cpp
     src/model/qwen35.cpp
+    src/model/qwen35moe.cpp
     src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
@@ -144,6 +146,7 @@ add_library(sycl_infer_core STATIC
     src/engine/engine_mtp.cpp
     src/engine/engine_dflash.cpp
     src/engine/engine_kvpool.cpp
+    src/engine/moe_cache.cpp
     src/engine/engine_prefix_cache.cpp
     src/engine/pc_disk.cpp
     src/engine/pc_ram.cpp
@@ -285,6 +288,8 @@ si_add_test(test_w4_vs_cpuref tests/engine/test_w4_vs_cpuref.cpp)
 si_add_test(test_w4_topk     tests/engine/test_w4_topk.cpp)
 si_add_test(test_decode_vs_prefill tests/engine/test_decode_vs_prefill.cpp)
 si_add_test(test_dp4a        tests/backend/gpu/kernels/test_dp4a_gemm.cpp)
+si_add_test(test_moe_kernels tests/backend/gpu/kernels/test_moe_kernels.cpp)
+si_add_test(test_moe_ref tests/model/test_moe_ref.cpp)
 si_add_test(test_dflash_kernels tests/backend/gpu/kernels/test_dflash_kernels.cpp)
 si_add_test(test_spec        tests/engine/test_spec.cpp)
 

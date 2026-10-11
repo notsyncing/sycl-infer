@@ -25,6 +25,10 @@ struct cpu_ref {
     int n_tokens = 0;
     bool record = false;
     bool dbg_attn = false;
+    // TEST_ABL / PF_ABL_*: drop one half of a MoE FFN, mirroring the engine's
+    // PF_ABL_NOMOE / PF_ABL_NOSHEXP, so the two can be compared like-for-like.
+    bool abl_nomoe = false;
+    bool abl_noshexp = false;
     struct snap_t {
         std::string name;
         std::vector<float> data;
@@ -87,6 +91,110 @@ struct cpu_ref {
     }
 
     // out[r] = dot(row_r(W), x)
+    // ---- Mixture-of-Experts (qwen35moe).  The routed half is the sum of the
+    // top-k experts' dense FFNs, weighted by the renormalised router softmax;
+    // the shared expert is added by the caller.  Scalar and deliberately
+    // literal: this is the oracle the GPU path is compared against, so it
+    // mirrors the reference (llama.cpp build_moe_ffn) rather than the kernels.
+    static float sigmoid_f32(float x) {
+        return 1.f / (1.f + std::exp(-x));
+    }
+
+    // dot of an f32 GGUF tensor (router / shared-expert gate) with x
+    float dot_f32(const void * p, const float * x, int n) const {
+        const float * v = (const float *)p;
+        double acc = 0;
+        for (int i = 0; i < n; i++) acc += (double)v[i] * x[i];
+        return (float)acc;
+    }
+
+    // one expert plane: the same matvec against `W` with expert e's bytes
+    void matvec_plane(const moe_wt & W, int e, const float * x, float * out) const {
+        std::vector<float> row((size_t)W.K);
+        const size_t rb = quant_row_bytes(W.type, W.K);
+        const char * base = (const char *)W.data + (size_t)e * W.plane_bytes;
+        for (int r = 0; r < W.N; r++) {
+            dequantize_row(W.type, base + (size_t)r * rb, row.data(), W.K);
+            double acc = 0;
+            for (int k = 0; k < W.K; k++) acc += (double)row[k] * x[k];
+            out[r] = (float)acc;
+        }
+    }
+
+
+    // the routed half: sum_j (w_j * expert_weights_scale) / max(sum_j w_j, 6.103515625e-5)
+    //                 * FFN_{e_j}(x), with w_j the renormalised router softmax.
+    // Scalar and deliberately literal - this is the oracle the GPU path is
+    // compared against, so it mirrors the reference (llama.cpp build_moe_ffn)
+    // rather than the kernels.
+    // wts_out (optional, k floats) receives the *normalised* router weights in
+    // descending-probability order, so the engine's d_moe_wts can be diffed
+    // against it: a wrong normalisation shows up here rather than as a 7x
+    // mystery factor in the routed output.
+    // h_out (optional, n_ff_exp floats) receives silu(gate)*up for the *top-ranked*
+    // expert of this token - the intermediate the down projection consumes.  It is
+    // the bisection point between the expert gate/up half and the down half.
+    void moe_ffn_routed(const moe_t & M, const float * x, float * out, float * wts_out = nullptr,
+                         int32_t * ids_out = nullptr, float * h_out = nullptr, float * y_out = nullptr) const {
+        const int E = M.gate_exps.E;
+        const int k = hp.n_expert_used;
+        const int F = hp.n_ff_exp;
+        std::fill(out, out + hp.n_embd, 0.f);
+        std::vector<float> lg((size_t)E), p((size_t)E);
+        const float * rw = (const float *)M.gate_inp;
+        float mx = -1e30f;
+        for (int e = 0; e < E; e++) {
+            lg[e] = dot_f32(rw + (size_t)e * hp.n_embd, x, hp.n_embd);
+            mx = std::max(mx, lg[e]);
+        }
+        float sum = 0;
+        for (int e = 0; e < E; e++) {
+            p[e] = std::exp(lg[e] - mx);
+            sum += p[e];
+        }
+        for (int e = 0; e < E; e++) {
+            p[e] /= sum;
+        }
+        std::vector<int> idx(E);
+        for (int e = 0; e < E; e++) {
+            idx[e] = e;
+        }
+        std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return p[a] > p[b]; });
+        idx.resize(k);
+        float wsum = 0;
+        for (int e : idx) {
+            wsum += p[e];
+        }
+        const float den = std::max(wsum, 6.103515625e-5f);
+        std::vector<float> g((size_t)F), u((size_t)F), h((size_t)F), y((size_t)hp.n_embd);
+        for (int j = 0; j < k; j++) {
+            const int e = idx[j];
+            matvec_plane(M.gate_exps, e, x, g.data());
+            matvec_plane(M.up_exps, e, x, u.data());
+            for (int i = 0; i < F; i++) {
+                h[i] = silu(g[i]) * u[i];
+            }
+            matvec_plane(M.down_exps, e, h.data(), y.data());
+            const float w = p[e] / den * hp.expert_weights_scale;
+            if (wts_out) {
+                wts_out[j] = w;
+            }
+            if (ids_out) {
+                ids_out[j] = e;
+            }
+            if (j == 0 && h_out) {
+                std::memcpy(h_out, h.data(), (size_t) F * sizeof(float));
+            }
+            if (y_out) {
+                // all k experts, so the caller can see which slot goes wrong
+                std::memcpy(y_out + (size_t) j * hp.n_embd, y.data(), (size_t) hp.n_embd * sizeof(float));
+            }
+            for (int i = 0; i < hp.n_embd; i++) {
+                out[i] += w * y[i];
+            }
+        }
+    }
+
     void matvec(const wt & W, const float * xx, float * out) const {
         std::vector<float> row(W.K);
         const size_t rb = quant_row_bytes(W.type, W.K);
@@ -178,6 +286,11 @@ struct cpu_ref {
                         snap("q_conv_predelta-0", co, hp.n_group * hp.d_state);
                         snap("k_conv_predelta-0", co + hp.n_group * hp.d_state, hp.n_group * hp.d_state);
                         snap("v_conv_predelta-0", co + 2 * hp.n_group * hp.d_state, hp.dt_rank * hp.d_state);
+                        // the full post-l2 conv output, which is what
+                        // conv_l2_launch writes (it folds silu + the l2 norm into
+                        // one pass, so the three per-part snapshots above cannot
+                        // be reassembled without it)
+                        snap("conv_l2-0", co, cd);
                     }
                     // state shift: st[0]=x[t-3], st[1]=x[t-2], st[2]=x[t-1]
                     float *st0 = st, *st1 = st + cd, *st2 = st + 2 * cd;
@@ -355,13 +468,55 @@ struct cpu_ref {
                     snap("attn_post_norm-0", xnt, hp.n_embd);
                 }
                 float * ft = ffn.data() + (size_t)t * 2 * hp.n_ff;
-                matvec(L.ffn_gate, xnt, ft);
-                matvec(L.ffn_up, xnt, ft + hp.n_ff);
-                for (int i = 0; i < hp.n_ff; i++) {
-                    ft[i] = silu(ft[i]) * ft[hp.n_ff + i];
-                }
                 std::vector<float> tmp(hp.n_embd);
-                matvec(L.ffn_down, ft, tmp.data());
+                if (L.moe.ok()) {
+                    // routed experts: d_x += sum_j w_j * FFN_{e_j}(xnt)
+                    std::vector<float> mwts((size_t)hp.n_expert_used);
+                    std::vector<int32_t> mids((size_t)hp.n_expert_used, -1);
+                    const bool h_tok = (t == 0 || t == n - 1);
+                    std::vector<float> mh(hp.n_ff_exp, 0.f), my((size_t) hp.n_expert_used * hp.n_embd, 0.f);
+                    if (!abl_nomoe) {
+                        moe_ffn_routed(L.moe, xnt, tmp.data(), mwts.data(), mids.data(), h_tok ? mh.data() : nullptr,
+                                       h_tok ? my.data() : nullptr);
+                    }
+                    if (il == 0) {
+                        snap("moe_routed-0", tmp.data(), hp.n_embd);
+                        snap("moe_wts-0", mwts.data(), hp.n_expert_used);
+                        snap("moe_ids-0", (const float *) mids.data(), hp.n_expert_used);
+                        if (h_tok) {
+                            snap(t == 0 ? "moe_h0-0" : "moe_hL-0", mh.data(), hp.n_ff_exp);
+                            snap(t == 0 ? "moe_y0-0" : "moe_yL-0", my.data(), (size_t) hp.n_expert_used * hp.n_embd);
+                        }
+                    }
+                    // shared expert: a plain dense FFN of width n_ff (= n_ff_shexp),
+                    // scaled by sigmoid(gate_inp_shexp . xnt)
+                    matvec(L.ffn_gate, xnt, ft);
+                    matvec(L.ffn_up, xnt, ft + hp.n_ff);
+                    for (int i = 0; i < hp.n_ff; i++) {
+                        ft[i] = silu(ft[i]) * ft[hp.n_ff + i];
+                    }
+                    std::vector<float> sh(hp.n_embd);
+                    matvec(L.ffn_down, ft, sh.data());
+                    if (il == 0) {
+                        snap("moe_sh-0", sh.data(), hp.n_embd);
+                    }
+                    if (!abl_noshexp) {
+                        const float g = sigmoid_f32(dot_f32(L.moe.gate_inp_shexp, xnt, hp.n_embd));
+                        if (il == 0 && (t == 0 || t == n - 1)) {
+                            snap(t == 0 ? "moe_gate-0/t0" : "moe_gate-0/tL", &g, 1);
+                        }
+                        for (int i = 0; i < hp.n_embd; i++) {
+                            tmp[i] += sh[i] * g;
+                        }
+                    }
+                } else {
+                    matvec(L.ffn_gate, xnt, ft);
+                    matvec(L.ffn_up, xnt, ft + hp.n_ff);
+                    for (int i = 0; i < hp.n_ff; i++) {
+                        ft[i] = silu(ft[i]) * ft[hp.n_ff + i];
+                    }
+                    matvec(L.ffn_down, ft, tmp.data());
+                }
                 if (il == 0) {
                     snap("ffn_out-0", tmp.data(), hp.n_embd);
                 }

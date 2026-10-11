@@ -1533,6 +1533,19 @@ name.
   include dir and drops `-fsycl` so upstream clangd parses as host.  Lint policy:
   `Diagnostics.UnusedIncludes: Strict` must stay clean — check with
   `clang-tidy -p build -checks='-*,misc-include-cleaner' <file>`.
+* **Never write a real IP address, host name, SSH/host account, or private home
+  path into a doc, a comment, a source file, or a commit message.**  This repo is
+  pushed to a public remote, so anything committed is public.  Use neutral
+  placeholders instead: `bench-host` for a machine, `proxy.internal:8118` for a
+  proxy, `/path/to/<file>.gguf` for a model path.  A measurement is still
+  reportable without its location — "the 2x A770 box, i9-10940X" carries all the
+  hardware detail, and the address carries none of the value.  This includes the
+  obvious ones: an RFC1918 literal in a benchmark note, a `ssh user@host` line, and
+  a `$HOME`-derived path baked into a test's default argument.  Note the trap in
+  both directions: RFC1918 / IANA special-use *ranges* (`192.0.0.0/24`,
+  `192.168.1.1` as an RFC1918 test vector) are constants the
+  `url_fetch` SSRF classifier is built on and must stay; the rule is about *this
+  infrastructure's* addresses, not about the protocol.
 * Do not commit unless explicitly asked.
 
 ## Environment variables

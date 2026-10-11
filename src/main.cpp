@@ -182,6 +182,9 @@ int main(int argc, char ** argv) {
         kv_cap_mb = atoi(e);
     }
     int max_slots = kMaxB;      // --max-slots: concurrent sequences (recurrent state)
+    int moe_resident = 0;      // --moe-resident: experts kept on the device per layer
+    size_t moe_vram_mb = 0;     // --moe-vram-mb: device budget for the expert bank
+    size_t moe_ram_mb = 0;      // --moe-ram-mb: host budget for the decoded-expert tier
     bool yarn = false;          // --yarn: YaRN context extension
     int yarn_orig_ctx = 0;      // 0 = the GGUF's declared context_length
     float yarn_factor = 0.0f;   // 0 = derive from --ctx / trained context
@@ -335,6 +338,15 @@ int main(int argc, char ** argv) {
             }
         } else if (a == "--mtp-device") {
             spec_dev = std::atoi(next().c_str());
+        } else if (a == "--moe-resident") {
+            // ncmoe-style split: keep only N experts per layer on the device and
+            // compute the rest on the host.  0 (the default) keeps every expert
+            // resident, which is what a model that fits does anyway.
+            moe_resident = std::atoi(next().c_str());
+        } else if (a == "--moe-vram-mb") {
+            moe_vram_mb = (size_t) std::atoi(next().c_str());
+        } else if (a == "--moe-ram-mb") {
+            moe_ram_mb = (size_t) std::atoi(next().c_str());
         } else if (a == "--max-slots") {
             // Bounds the engine's per-slot recurrent state.  That state is the
             // largest non-weight allocation on a 27B (1.125 GiB per card at 16
@@ -465,6 +477,9 @@ int main(int argc, char ** argv) {
         ec.model_path = model_path;
         ec.max_seq = ctx;
         ec.max_slots = max_slots;
+        ec.moe_resident = moe_resident;
+        ec.moe_vram_mb = moe_vram_mb;
+        ec.moe_ram_mb = moe_ram_mb;
         ec.n_splits = 16;
         ec.n_blocks = n_blocks;
         ec.yarn = yarn;
@@ -575,8 +590,33 @@ int main(int argc, char ** argv) {
                             throw std::runtime_error("--image/--video requires --mmproj <mmproj.gguf>");
                         }
                         vm_owned.load(mmproj_path);
+                        // "loaded" is not "can run": ask before anything else is
+                        // allocated, so an unsupported projector geometry is a
+                        // message instead of a device fault inside the first
+                        // forward with the whole model resident
+                        std::string vm_why;
+                        if (!vm_owned.runnable(&vm_why)) {
+                            throw std::runtime_error("mmproj loaded but cannot run: " + vm_why);
+                        }
                         if (vm.hp.proj_dim != e.m.hp.n_embd) {
                             throw std::runtime_error("vision projector output width != text n_embd");
+                        }
+                        // Upload here rather than letting encode_device do it on
+                        // the first image: by then the KV pool has already
+                        // claimed its cap, and a 0.9 GB projector on a card that
+                        // is already at its ceiling fails as
+                        // UR_RESULT_ERROR_OUT_OF_RESOURCES with no hint which
+                        // allocation was refused.
+                        vm_owned.upload(e.q);
+                        if (si::env::flag("PF_MM_DIAG")) {
+                            for (const sycl::device & d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
+                                fprintf(stderr, "[mm] %-28s total %.0f MiB, allocatable %.0f MiB\n",
+                                        d.get_info<sycl::info::device::name>().c_str(),
+                                        d.get_info<sycl::info::device::global_mem_size>() / 1048576.0,
+                                        d.get_info<sycl::info::device::max_mem_alloc_size>() / 1048576.0);
+                            }
+                            fprintf(stderr, "[mm] vision weights %.0f MiB on %s\n", vm_owned.dev_weights_size / 1048576.0,
+                                    e.q.get_device().get_info<sycl::info::device::name>().c_str());
                         }
                         img_cfg.patch_size = vm.hp.patch_size;
                         img_cfg.merge = vm.hp.merge;

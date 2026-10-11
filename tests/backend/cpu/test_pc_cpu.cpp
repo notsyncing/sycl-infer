@@ -220,7 +220,7 @@ int main(int argc, char ** argv) {
         const size_t per_block = (size_t)e.m.hp.n_head_kv * kBlockSize * e.m.hp.head_dim;
         auto read_block = [&](int b, int layer, int which) {
             std::vector<float> v(per_block);
-            e.kv_read_vec(which, e.kv_block_elem_off(which, layer, b), v.data(), (int)per_block);
+            e.kv_read_vec(layer, which, (size_t)b * per_block, v.data(), (int)per_block);
             return v;
         };
         // [block][K|V][layer] -> that unit's values

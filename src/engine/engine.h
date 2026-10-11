@@ -16,6 +16,7 @@
 #include "dnnl_gemm.h"
 #include "backend.h"
 #include "kernels.h"
+#include "moe_cache.h"
 #include "model.h"
 #include "multimodal.h"
 #include "pc_disk.h"
@@ -73,6 +74,12 @@ struct seg_plan {
         int nsb = 0;         // segments before the batch base
         int group_begin = 0; // first index into `groups`
         int group_count = 0; // groups in this call
+        // What the call *is*.  A dense call replays its segments; a MoE call
+        // has none and dispatches the MoE kernels instead, so the router's
+        // output - which no host code has seen at record time - still lives in
+        // the same recorded command graph.
+        enum kind_t { dense = 0, moe_routed = 1, moe_epilogue = 2 };
+        kind_t kind = dense;
         xq_t xq;
     };
     std::vector<call_t> calls;
@@ -88,6 +95,13 @@ struct seg_plan {
         c.tb = tb;
         c.nsb = nsb;
         calls.push_back(c);
+    }
+    // open a MoE call: it advances the call cursor exactly like begin_call (so
+    // the replay stays a straight walk over `calls`) but carries no segments.
+    call_t & begin_moe_call(call_t::kind_t kind, int tb, int nsb) {
+        begin_call(tb, nsb);
+        calls.back().kind = kind;
+        return calls.back();
     }
     void add(const gemv_seg & s) {
         segs.push_back(s);
@@ -162,6 +176,12 @@ struct engine_config {
     // slot.  Lowering this gives that memory back; the server never hands out a
     // slot index >= max_slots.  Default kMaxB = the historical behaviour.
     int max_slots = kMaxB;
+    // ncmoe-style split: experts kept on the device per layer (0 = all of them).
+    // Everything outside the resident set is computed on the host, which is
+    // also what makes the VRAM/RAM/disk expert cache tiers meaningful.
+    int moe_resident = 0;
+    size_t moe_vram_mb = 0;
+    size_t moe_ram_mb = 0;
 
     // YaRN context extension (src/common/yarn.h).  `yarn` off by default: it is
     // a scaling method whose gains in the paper come from long-context
@@ -273,8 +293,27 @@ struct engine {
     compute_backend & be_of(int layer) {
         return multi_dev ? *backends_[(size_t)layer_dev_[layer]] : *be;
     }
-    void sync_all();
+    // queue whose device owns backend `d` (falls back to the primary queue for
+    // CPU partitions and the single-device path).  Public so a test that drives
+    // one layer's kernels standalone runs them on that layer's device instead of
+    // whichever device the pointers happen to be bound to.
+    sycl::queue & dev_queue(int d) {
+        return const_cast<sycl::queue &>(std::as_const(*this).dev_queue(d));
+    }
+    const sycl::queue & dev_queue(int d) const {
+        if (multi_dev && d >= 0 && d < (int)dev_queues_.size() && dev_queues_[(size_t)d] && dev_kind_[(size_t)d] == 0) {
+            return *dev_queues_[(size_t)d];
+        }
+        return q;
+    }
+    // Device pointer of a weight tensor as uploaded on backend `dev` (the host
+    // mmap for a CPU partition).  Public because a test that drives one layer's
+    // kernels standalone needs it, and model::dev_f32 is not a substitute:
+    // multi-device has no whole-blob upload, so dev_ptr hands back the *host*
+    // pointer and the kernel dereferences host memory on the device.
     const void * wptr(int dev, const void * host) const;
+    void kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const;
+    void sync_all();
     // Resolve a weight key the way build_plan's wkey does: the uploaded device
     // pointer when the tensor was copied to that partition, otherwise the host
     // pointer - which is the tensor's oneDNN key when it was converted (the
@@ -344,6 +383,98 @@ struct engine {
     float * d_logits = nullptr;       // [kMaxB][vocab]
     float * d_last_hidden = nullptr;
     float * d_img_embd = nullptr; // [kMaxImgTokens][n_embd] vision embeddings
+
+    // ---- Mixture of Experts ------------------------------------------------
+    // Per-device scratch for the routed half of a MoE FFN.  `ids`/`wts` are the
+    // router's top-k output, `h` the [n_pairs][n_ff_exp] silu(gate)*up and `acc`
+    // the [n_pairs][n_embd] down partials; a pair's token index is pair/top_k.
+    // The CSR arrays group the pairs by expert so each expert's weights are
+    // streamed once for all the tokens that selected it.  `sh`/`shout` hold the
+    // *shared* expert's gate/up and down output, and `sg` its per-token sigmoid
+    // gate.  `slotmap` is [n_layer][n_expert]: the slot each expert occupies in
+    // this device's expert bank, -1 when it is not resident here.
+    struct moe_act {
+        float * logits = nullptr;    // [R][n_expert] router logits (softmax'd in place)
+        int32_t * ids = nullptr;    // [R*k] expert id per (token, slot)
+        float * wts = nullptr;      // [R*k] normalized router weight
+        float * h = nullptr;        // [R*k][n_ff_exp]
+        float * acc = nullptr;      // [R*k][n_embd]
+        float * sh = nullptr;       // [R][2*n_ff_shexp] shared-expert gate/up
+        float * shout = nullptr;    // [R][n_embd] shared-expert down output
+        float * sg = nullptr;       // [R] shared-expert gate
+        int32_t * off = nullptr;    // [n_expert+1] CSR offsets
+        int32_t * cur = nullptr;    // [n_expert] scatter cursor
+        int32_t * pair = nullptr;   // [R*k] pair indices grouped by expert
+        int32_t * active = nullptr; // [n_expert+1] experts with >= 1 token
+        int32_t * nact = nullptr;   // [1] count of the above
+        int32_t * slotmap = nullptr;// [n_layer][n_expert]
+    };
+    std::vector<moe_act> moe_as_;
+    // residency + the disk/RAM/VRAM expert cache tiers
+    // the host half of the expert split needs this; engine_graph reaches it
+    // through the engine, so the cache keeps its own API instead of being
+    // a friend
+    moe_cache moe_cache_;
+    moe_cache_cfg moe_cfg_{};   // set from engine_config in the constructor
+    std::vector<int32_t> moe_slotmap_host_;   // the slot table, mirrored for the host expert path
+    std::vector<std::vector<int32_t>> moe_calib_ids_;   // per-layer router output of the calibration prefill
+    int moe_calib_tok_ = 0;
+    bool moe_calib_done_ = false;
+    // the ncmoe host half: every (token, expert) pair whose expert is not
+    // resident on the device, computed from the GGUF blocks on the host
+    void moe_cpu_experts(size_t moe_il, const moe_t & M, int n_tok, int top_k, int n_pairs, int dev,
+                           const float * xbuf);
+    // true when some experts live on the host, which rules out a recorded graph
+    // True while a command graph is being recorded.  The MTP verify path
+    // needs it because the ncmoe host half cannot live inside a graph.
+    static bool g_capturing_;
+    bool moe_host_split() const {
+        return moe_cache_.active() && !moe_cache_.all_resident();
+    }
+    void moe_calibrate(int dev);
+    std::vector<moe_t> moe_all_;   // trunk layers + the NextN block, indexed like the slot map
+    // Bound by bind_moe_acts(dev); null on a dense model.
+    float * d_moe_logits = nullptr;
+    int32_t * d_moe_ids = nullptr;
+    float * d_moe_wts = nullptr;
+    float * d_moe_h = nullptr;
+    float * d_moe_acc = nullptr;
+    float * d_moe_sh = nullptr;
+    float * d_moe_shout = nullptr;
+    float * d_moe_sg = nullptr;
+    int32_t * d_moe_off = nullptr, *d_moe_cur = nullptr, *d_moe_pair = nullptr, *d_moe_active = nullptr,
+            *d_moe_nact = nullptr;
+    const int32_t * d_moe_slotmap = nullptr; // [n_layer][n_expert] of this device
+
+    // Where a device's expert weights live.  `resident` (the default) is the
+    // device copy of the GGUF expert tensors, addressed by the expert id itself;
+    // `cached` is an LRU slot bank the host refills per step, addressed by
+    // slot_map.  Both are the same kernel - see the slot table in moe.cpp.
+    struct moe_bank {
+        void * g = nullptr, *u = nullptr, *d = nullptr;
+        size_t sg = 0, su = 0, sd = 0; // bytes between consecutive slots
+    };
+    std::vector<moe_bank> moe_banks_;
+    // false when the expert cache splits experts between the device and the host,
+    // which is a *construction-time* fact: release_host_weight_pages() runs
+    // before setup_moe_slots(), so it cannot ask the cache
+    bool moe_resident = true;
+    // set once the expert cache has decided its residency, so the constructor's
+    // page release can hand the decision to the post-setup one
+    bool moe_host_weights_deferred_ = false;
+    // Slot stride per LAYER (bytes between consecutive expert planes).  This
+    // cannot be one value per device: the expert quant type is a per-layer
+    // property of the *file*, not of the architecture, and a mixed-quantization
+    // model (this one has Q5_K ffn_down_exps for 38 layers and Q6_K for three)
+    // gives Q6_K planes 860,160 bytes against Q5_K's 720,896.  Taking the
+    // stride from layer 0 silently addresses the wrong plane for the minority
+    // layers - still valid bytes, so nothing faults, just the wrong weights.
+    std::vector<size_t> moe_slot_gb, moe_slot_ub, moe_slot_db;
+    // the largest of each, which is what a shared slot bank must reserve per
+    // slot (see moe_cache); 0 when every layer agrees.
+    size_t moe_slot_gb_max = 0, moe_slot_ub_max = 0, moe_slot_db_max = 0;
+    int moe_topk = 0;
+    void bind_moe_acts(int dev);
 
     // paged KV cache + tables.  The pools are raw byte storage whose element
     // type is kv_dtype() (f32/bf16/f16/i8/i4, see kernels.h); sizes are in
@@ -440,6 +571,10 @@ struct engine {
     std::vector<int> layer_gdn_local_;
     std::vector<int> n_gdn_dev_;
     act_set alloc_act_set(int dev);
+    // MoE scratch for one device; a no-op when the model is dense
+    void moe_acts_alloc(int dev);
+    // fill the expert slot tables (identity when every expert is resident)
+    void setup_moe_slots();
     // point the d_* members at backend `dev`'s buffers (no-op single-device)
     void bind_acts(int dev);
     // hand the hidden state from backend `from` to `to` (device-to-device via a
@@ -655,6 +790,10 @@ struct engine {
       gemv_seg * d_segs_vf = nullptr;
       seg_plan plan_mtp_;                // the MTP layer's own calls
       gemv_seg * d_segs_mtp = nullptr;
+      // which plan call holds the shared LM head.  It is 4 for a dense
+      // draft layer and 6 once the NextN block's own MoE takes four calls,
+      // so the verify and the readout ask the plan instead of hardcoding it.
+      int head_call = 4;
       // PF_MTP_LAYER_EXACT: same segments with `w` pointing at the raw GGUF bytes
       gemv_seg * d_segs_mtp_exact = nullptr;
       // PF_MTP_HEAD_W4: a draft-only u4 copy of the LM head, registered under a
@@ -726,6 +865,10 @@ struct engine {
     const wt & draft_head() const { return m.mtp.shared_head.data ? m.mtp.shared_head : m.output; }
     void build_mtp_plan();
     void mtp_gemv(int ci, int M, int step = -1);
+    // the NextN block's routed experts + shared-expert epilogue.  Called
+    // for the plan's moe_routed / moe_epilogue calls; a no-op when the
+    // draft layer is dense.
+    void mtp_moe(int ci, int M, int step = -1);
     // run the MTP layer over `n` tokens at positions pos0.. (mode 1 layout:
     // row 0, n <= kMaxT).  `h` is the main model's hidden [token][n_embd] for the
     // same tokens (h_{-1} comes from hprev), extra_writes the KV and the head.
@@ -915,7 +1058,10 @@ struct engine {
     }
     // copy `n` elements of one KV vector out of the pool into fp32 (converts
     // the storage type; used by the stage tests)
-    void kv_read_vec(int which, size_t elem_off, float * dst, int n);
+    // `elem_off` is relative to the layer's slice (i.e. block * per_block);
+    // the layer selects both the device and the slice, because the pool base
+    // is per-device and the d_kpool member is null on a layer map.
+    void kv_read_vec(int layer, int which, size_t elem_off, float * dst, int n);
     // Element offset of one block's K (which=0) or V (which=1) inside the paged
     // pool, i.e. the `elem_off` to hand kv_read_vec to read that block.
     //
@@ -1110,22 +1256,8 @@ private:
     // planes, null when the kv type has none): the single pool on the normal
     // path, the owning device's pool in multi-device mode (block ids are global,
     // so `block` offsets within each device's local layer stride are the same)
-    void kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const;
     // backend index that owns global attention layer `a` (0 when single-device)
     int attn_dev(int a) const;
-    // queue whose device owns backend `d` (falls back to the primary queue for
-    // CPU partitions and the single-device path)
-    sycl::queue & dev_queue(int d) {
-        return const_cast<sycl::queue &>(std::as_const(*this).dev_queue(d));
-    }
-    // Same lookup, const: the decision functions only *read* it (e.g. which
-    // device profile applies), and a const_cast here would be papering over that.
-    const sycl::queue & dev_queue(int d) const {
-        if (multi_dev && d >= 0 && d < (int)dev_queues_.size() && dev_queues_[(size_t)d] && dev_kind_[(size_t)d] == 0) {
-            return *dev_queues_[(size_t)d];
-        }
-        return q;
-    }
 
     // prefix cache internals
     struct pc_node {
