@@ -116,7 +116,8 @@ model type is selected through the architecture registry.
 |---|---|
 | file format | GGUF (memory-mapped, single file) |
 | weight quantization | Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, IQ3_S, Q8_0, F32; Q4_K uses the native 4-bit (u4) path by default |
-| architecture registry | selected via `general.architecture`; `qwen35` implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry |
+| architecture registry | selected via `general.architecture`; `qwen35` and `qwen35moe` (routed MoE) implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry |
+| expert placement | routed-MoE models can keep part of the experts on the GPU and compute the rest on the host per step (llama.cpp's ncmoe), with a disk → host-RAM → VRAM three-tier expert cache (`--moe-resident` / `--moe-vram-mb` / `--moe-ram-mb`) |
 | KV cache dtype | `i8` (default), `i4`, `bf16`, `f16`, `f32`; `--kv-type K:V` sizes K and V independently (`i4:i8`) |
 | tokenizer | GPT-2 byte-level BPE from the GGUF vocabulary + special tokens / chat template |
 
@@ -243,6 +244,39 @@ given, the sum of the three tiers is clamped to it (shrinking disk first, then
 RAM, then the VRAM checkpoint count).  When it is not given, the configured three
 tiers define the budget themselves.  The device KV pool reservation is always
 made large enough to hold the VRAM tier.
+
+### Expert cache and the ncmoe split (routed-MoE models)
+
+A MoE model's routed experts dominate its weight bytes (18.2 GiB of the 35B A3B),
+and a token only ever activates `n_expert_used` of `n_expert`.  The engine can keep
+part of them on the GPU and compute the rest on the host each step, the way
+llama.cpp's ncmoe does, and keep them cached across three tiers:
+
+```bash
+# keep ~55 experts/layer on the GPU (a 100 MB bank), cache 150 MB of expert
+# blocks on the host, and leave the rest on disk
+./build/sycl-infer --model Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+    --layer-map 0-19:gpu.0,20-39:gpu.1 \
+    --moe-vram-mb 100 --moe-ram-mb 150 gen --prompt "Q: What is 2+2? A:" --max-tokens 8
+
+[moe] expert cache: 55 of 256 experts resident per layer, RAM tier 150 MB
+[moe] expert cache: calibration done, 2255 of 10496 (layer, expert) pairs resident on the device
+[moe] expert cache: bank 55/256 resident per layer (calibrated 2255 pairs), RAM tier 149.8 MB hits=2559 misses=2738 (48.3%)
+```
+
+* The resident set is **measured, not indexed**: one request's own routing fills a
+  frequency table and the bank is frozen from it, so `--moe-vram-mb` is a byte
+  budget rather than a count.
+* The host tier holds the selected experts' GGUF blocks, keyed by (layer, expert)
+  with an LRU, so the host half stops re-faulting pages that
+  `release_host_weight_pages()` deliberately dropped.
+* Correctness is oracle-checked, not eyeballed: with the split armed the logits are
+  **bit-identical** to a fully-resident run (`max|diff|=0.125359`, argmax SAME), and
+  `test_decode_vs_prefill` is 8/8.  Arming the split disables the decode command
+  graph in all three places one is replayed - a recorded graph cannot hold a host
+  pass whose expert set is chosen per step.
+* Limit: with the split armed MTP is held at `k=1` (the verify's later rows are
+  verified at that depth only).  Use a fully-resident expert bank for `--mtp 4`.
 
 ### Multi-GPU (pipeline parallel)
 
@@ -497,6 +531,9 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_ATTN_XMX` | on | prefill attention through oneDNN int8 matmuls; `0` restores the classic kernel (faster below ~2048 keys) |
 | `PF_DP4A` | on | `0` forces the fp32 path |
 | `PF_DP4A_DEC` | on | `0` forces fp32 decode |
+| `PF_MOE_RESIDENT` | 0 | experts kept on the GPU per layer (`--moe-resident`); `0` = all resident |
+| `PF_MOE_VRAM_MB` | – | device budget for the expert bank (`--moe-vram-mb`); the bank holds the measured hot set |
+| `PF_MOE_RAM_MB` | – | host budget for the expert-block tier (`--moe-ram-mb`); `0` = off |
 | `PF_W4` | on | native 4-bit (u4) weights for Q4_K; `0` falls back to pure int8 |
 | `PF_CB4` | on | store IQ4_XS/IQ4_NL as native codebook 4-bit; `0` keeps int8 |
 | `PF_K5` | on | store Q5_K as the native 5-bit (nibble + bit) planes; `0` keeps int8 |

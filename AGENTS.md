@@ -1796,6 +1796,22 @@ other type onto the same 4-bit grid: 16.0 vs 24.5 GB read per 27B decode token,
 measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
 `PF_SI4` (SIn 4-bit), `PF_META`.
 
+**Expert split / ncmoe / three-tier expert cache** (`--moe-resident N`,
+`--moe-vram-mb MB`, `--moe-ram-mb MB`; routed-MoE models only, see
+[`docs/design/15-moe-ncmoe.md`](docs/design/15-moe-ncmoe.md))
+`PF_MOE_RESIDENT` (experts kept on the device per layer, 0 = every expert
+resident, the default and what a model that fits does anyway),
+`PF_MOE_VRAM_MB` (device budget for the expert bank - authoritative over the
+count, and the bank's *content* is the measured hot set from `moe_calibrate()`,
+not an index range), `PF_MOE_RAM_MB` (host budget for the RAM tier of expert
+blocks, an LRU keyed by (layer, expert); 0 = off. Measured 48-66 % hit rate at
+150 MB on the 35B A3B). Diagnostics: `PF_MOE_CPUDBG` (per-layer
+`spilled of n_pairs`), `PF_MOE_REFDUMP` (per-layer routed fingerprint
+sum/sumsq/max), `PF_MOE_REFDUMP_ALL` (every layer instead of layer 0 -
+**the only switch worth trusting**: a layer-0-only dump cannot see the layers
+whose quantization type differs), `PF_MOE_REFDUMP_LAYER=<L>`. `TEST_MOE_RESIDENT`
+runs the stage tests through the split.
+
 ## Invariants and gotchas
 
 * **`compute_backend::synchronize()` must actually wait, and the CPU backend's used
@@ -2200,6 +2216,77 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
   KV slot index (token count) and the RoPE position diverge: decode keeps
   `info->pos` = token count and carries the running RoPE position in
   `step_info::mrope` with `mrope_on` set.
+
+* **A MoE model's expert strides are per *layer*, not per tensor, and the file
+  decides.**  The 35B A3B has Q4_K gate/up everywhere but Q5_K down for 37 layers
+  and **Q6_K down for 34/38/39**.  One `plane_bytes` per tensor family reads the
+  wrong weights on exactly those layers - it loads, it answers, and it is wrong in
+  a place no aggregate catches.  `moe_slot_{g,u,d}b[]` are indexed by layer for
+  this reason; say the layer count and the distinct values out loud at startup so
+  the mixed case cannot be silent.
+
+* **oneDNN eligibility is per *call* and all-or-nothing - one f32 tensor takes
+  the whole plan call down with it.**  GDN's `ssm_beta`/`ssm_alpha` are f32; sharing
+  a plan call with the convertible `wqkv`/`wgate` made the entire call fall back to
+  the fp32 dequant GEMV.  That is 12.3 vs 3.4 ms/token disappearing for a shape
+  reason, not a numerics one, and it looks exactly like "the kernels got slower".
+
+* **A host pass that fills a sparse buffer has to run *before* its consumer, not
+  after.**  `moe_down_launch` returns on `slot < 0`, so `d_moe_acc`'s non-resident
+  rows still hold the previous layer's output, and `moe_reduce_launch` weights
+  **every** row.  Adding the host contribution after the reduction therefore
+  double-counts a stale row and then adds the right answer on top.  The signature
+  is unmistakable and was read as a dequant bug for hours: **layer 0 exact because
+  the buffer is still zero, 2-4x too much routed energy from layer 1 on**, worst
+  relative sumsq 3.29 -> 0.0088 once the order is right.  Per-layer fingerprints,
+  not a layer-0-only dump, are what showed it - see the next entry.
+
+* **A per-layer diagnostic that reports one layer is a verifier that agrees with
+  the bug.**  `PF_MOE_REFDUMP` dumped layer 0 only, so the mixed-quantization
+  defect above and the stale-accumulator defect here both looked "fine" at layer 0
+  while every later layer was wrong.  It now dumps all 40 with
+  `PF_MOE_REFDUMP_ALL`, and each layer's name carries its index because two dumps
+  of the same name are indistinguishable.  **A timing or fingerprint breakdown has
+  to be checkable against an independent total before it is believed** - this is
+  the third time that rule has paid for itself in this repo.
+
+* **The GGUF's expert tensors are three *separate* tensors, so a packed cache
+  entry changes where `up` starts.**  `gate_exps.data + e*plane_bytes + plane_bytes`
+  is expert e+1's gate plane, not expert e's up plane.  A RAM tier that packs
+  `[gate][up][down]` per expert therefore needs different base pointers from the
+  mmap path; giving the mmap path the packed ones evaluated every expert against
+  expert 0's weights.  Symptom: the split runs fine with the RAM tier off and
+  emits garbage with it on.
+
+* **A command graph cannot contain a host pass, and every replay site has to know
+  it.**  The ncmoe host half has blocking transfers and an expert set chosen per
+  step.  There are **three** places a forward is replayed from a graph (plain
+  decode, multi-device decode, MTP verify) and each one was missed in turn; a
+  recorded graph does not merely skip the pass, it silently drops every expert
+  without a device slot.  Grep for `moe_host_split()` - it is the whole rule.
+
+* **A page-release sweep that asks a component about itself has to run *after*
+  that component has decided.**  `release_host_weight_pages()` sweeps from
+  `alloc_buffers()`, which is where `setup_moe_slots()` also runs - **earlier**.
+  The keep-set asked `moe_host_split()` and got `false` because the cache had not
+  been initialised, so the expert pages were `MADV_DONTNEED`d and then re-faulted
+  one row at a time by the host half.  It is not incorrect, so nothing failed; it
+  is unobservable without measuring the RSS release.  `release 21603 -> 2396 MB`
+  is the number that says the keep-set actually applied.
+
+* **MTP's draft layer does not share the trunk's activation buffers.**  The draft
+  runs out of `d_mtp_xnorm` (and writes `d_mtp_x`), so a host pass that hardcodes
+  `d_xnorm` evaluates its experts against *another layer's* activation.  Every
+  kernel-launcher boundary that takes "the activation" needs the caller to say
+  which one - `moe_cpu_experts` now takes the buffer as an argument for this.
+
+* **A recorded decode graph has the previous pass's device bindings baked into
+  nothing - the host side must rebind on entry.**  `record_forward` only rebinds at
+  a partition boundary (`dev != prev_dev`), so a direct-replay pass entered with
+  the MTP draft's bindings still installed silently read and wrote the *draft
+  device's* buffers for the first partition.  Graph-replayed passes are immune
+  (their pointers are baked in), which is why this only ever showed up with
+  ncmoe disabling them.
 
 ## Quick verification before finishing a change
 
