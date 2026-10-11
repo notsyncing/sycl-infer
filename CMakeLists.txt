@@ -102,6 +102,7 @@ add_library(sycl_infer_core STATIC
     src/backend/cpu/kernels/xq.cpp
     src/backend/cpu/kernels/dp4a.cpp
     src/backend/cpu/kernels/i8.cpp
+    src/backend/cpu/kernels/moe.cpp
     # gpu kernels: one translation unit per device kernel
     src/backend/gpu/kernels/kv_type.cpp
     src/backend/gpu/kernels/rmsnorm.cpp
@@ -193,6 +194,7 @@ set(SI_CPU_SOURCES
     src/backend/cpu/kernels/xq.cpp
     src/backend/cpu/kernels/dp4a.cpp
     src/backend/cpu/kernels/i8.cpp
+    src/backend/cpu/kernels/moe.cpp
 )
 if(NOT SYCL_INFER_AOT)
     set_source_files_properties(${SI_CPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-sycl")

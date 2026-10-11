@@ -16,7 +16,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "quant.h"
 #include "w8.h"
+#include "model/gguf.h" // the ggml_type enum (SYCL-free)
 
 namespace si {
 
@@ -138,5 +140,35 @@ int cpu_thread_count();
 // override the CPU worker thread count; 0 restores auto (PF_CPU_THREADS, else
 // the hardware concurrency).  Must be called before the first CPU kernel runs.
 void cpu_set_thread_count(int n);
+
+// ---- routed-MoE mirror (see src/backend/cpu/kernels/moe.cpp) -------------------
+// Raw host pointers only: this header is SYCL-free, so it cannot carry `moe_t`.
+// engine_graph's MoE branch fills one of these per layer and dispatches to the
+// CPU kernels when the layer's partition is a cpu device.
+struct cpu_moe_wt {
+    const char * data = nullptr;
+    uint32_t type = 0;
+    int K = 0;         // input width of one row
+    int N = 0;         // rows
+    size_t plane_bytes = 0;
+};
+
+struct cpu_moe {
+    cpu_moe_wt gate_exps, up_exps, down_exps;
+    const void * gate_inp = nullptr;            // router
+    uint32_t gate_inp_type = GGML_TYPE_F32;
+    const void * gate_inp_shexp = nullptr;      // shared expert's gate
+    uint32_t gate_inp_shexp_type = GGML_TYPE_F32;
+    int n_expert = 0, top_k = 0, n_ff_exp = 0, n_embd = 0;
+};
+
+void cpu_moe_route(const float * x, int x_stride, const void * gate_inp, uint32_t gp_type, int n_tok, int n_embd,
+                   int n_expert, int top_k, float * logits, int32_t * ids, float * wts);
+void cpu_moe_experts(const cpu_moe & M, const float * x, int x_stride, int n_tok, int top_k, const int32_t * ids,
+                     const int * slots, float * acc, int acc_stride);
+void cpu_moe_reduce(const float * acc, const float * wts, int top_k, int n_tok, int n_embd, int acc_stride, float * out,
+                    int out_stride);
+void cpu_moe_epilogue(const float * x, int x_stride, const void * gate, uint32_t gtype, int n_tok, int n_embd,
+                      const float * shared, int sh_stride, float * out, int out_stride);
 
 } // namespace si

@@ -1,7 +1,9 @@
 #include "engine.h"
 #include "device/device_profile.h"
+#include "backend/cpu/cpu_types.h" // the cpu-partition MoE mirror
 
 #include <algorithm>
+#include <numeric>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -650,6 +652,12 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const moe_t & M = m.layers[(size_t)moe_il].moe;
         const int il = moe_il;
         const int dev = cur_dev;
+        // A routed MoE has to run on a cpu partition as well as a gpu one, and
+        // the SYCL launchers below cannot: they name a device kernel that does
+        // not exist on the host device ("No kernel named moe_router_logits").
+        const bool cpu_dev = (dev >= 0 && (size_t) dev < dev_kind_.size() && dev_kind_[(size_t) dev] == 1);
+        const bool cpu_dev_host = !multi_dev && cpu_mode;
+        const bool on_cpu = cpu_dev_host || cpu_dev;
         sycl::queue & qq = dev_queue(dev);
         const int k = hp.n_expert_used;
         const int n_tok = rows; // flat live tokens in every mode
@@ -679,6 +687,76 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             const bool moe_calib_active = moe_cache_.active() && !moe_cache_.all_resident() && !moe_calib_done_;
             std::vector<float> before_r;
             if (!abl_nomoe) {
+            // d_x still holds the residual here; capture it before the routed half
+            // lands in it, so the refdump below can report the difference.
+            if (dbg_refdump && !engine::g_capturing_ &&
+                (si::env::flag("PF_MOE_REFDUMP_ALL") || si::env::i32("PF_MOE_REFDUMP_LAYER", 0) == (int) moe_il)) {
+                before_r.resize((size_t) n_tok * hp.n_embd);
+                qq.memcpy(before_r.data(), d_x, before_r.size() * 4).wait();
+            }
+            if (on_cpu) {
+                // The routed half entirely on the host.  A routed-MoE model has to
+                // run on a cpu partition (the all-`cpu` backend and a --layer-map
+                // whose tail is `cpu`), and the SYCL launchers below cannot: they
+                // name a device kernel that has no host counterpart, which is a
+                // startup failure ("No kernel named moe_router_logits"), not a
+                // slow path.  d_xnorm/d_x are the engine's device pointers, and on
+                // a cpu partition those *are* host pointers, so the host kernels
+                // read and write them in place.
+                cpu_moe CM;
+                auto cw = [&](const moe_wt & t) {
+                    // the mmap pointer: a cpu partition keeps its weights on the host
+                    return cpu_moe_wt{(const char *) t.data, t.type, t.K, t.N, t.plane_bytes};
+                };
+                CM.gate_exps = cw(M.gate_exps);
+                CM.up_exps = cw(M.up_exps);
+                CM.down_exps = cw(M.down_exps);
+                CM.gate_inp = wptr(dev, M.gate_inp);
+                CM.gate_inp_type = M.gate_inp_type;
+                CM.n_expert = hp.n_expert;
+                CM.top_k = k;
+                CM.n_ff_exp = hp.n_ff_exp;
+                CM.n_embd = hp.n_embd;
+                std::vector<float> logits_h((size_t) n_tok * hp.n_expert);
+                std::vector<int32_t> ids_h((size_t) n_pairs);
+                std::vector<float> wts_h((size_t) n_pairs);
+                std::vector<float> acc_h((size_t) n_pairs * (size_t) hp.n_embd);
+                cpu_moe_route(d_xnorm, hp.n_embd, CM.gate_inp, M.gate_inp_type, n_tok, hp.n_embd, hp.n_expert, k,
+                              logits_h.data(), ids_h.data(), wts_h.data());
+                if (moe_calib_active && !engine::g_capturing_) {
+                    if ((int) moe_calib_ids_.size() <= (int) moe_il) {
+                        moe_calib_ids_.resize(moe_il + 1);
+                    }
+                    moe_calib_ids_[moe_il] = ids_h;
+                }
+                // slots = nullptr: a cpu partition computes every routed expert on
+                // the host anyway, so the resident set is not a split here - there
+                // is no second half for it to hand the remainder to.  The tiers
+                // still apply to where the *bytes* come from.
+                cpu_moe_experts(CM, d_xnorm, hp.n_embd, n_tok, k, ids_h.data(), nullptr, acc_h.data(), hp.n_embd);
+                if (si::env::flag("PF_MOE_CPUDBG")) {
+                    double sx = 0, sa = 0;
+                    long bad = 0;
+                    for (int i = 0; i < n_tok * hp.n_embd; i++) {
+                        const float v = d_xnorm[i];
+                        if (!std::isfinite(v)) {
+                            bad++;
+                        }
+                        sx += (double) v * v;
+                    }
+                    for (size_t i = 0; i < acc_h.size(); i++) {
+                        if (!std::isfinite(acc_h[i])) {
+                            bad++;
+                        }
+                        sa += (double) acc_h[i] * acc_h[i];
+                    }
+                    fprintf(stderr, "[moe] cpu-branch dev=%d il=%d n_tok=%d ids0=%d sum_w=%.4g rms_x=%.5g rms_acc=%.5g nan=%ld\n",
+                            dev, moe_il, n_tok, n_tok > 0 ? ids_h[0] : -1,
+                            (double) std::accumulate(wts_h.begin(), wts_h.begin() + std::min<size_t>(wts_h.size(), (size_t) k), 0.0),
+                            std::sqrt(sx / (n_tok * hp.n_embd)), std::sqrt(sa / (double) acc_h.size()), bad);
+                }
+                cpu_moe_reduce(acc_h.data(), wts_h.data(), k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
+            } else {
             moe_router_launch(qq, wptr(dev, M.gate_inp), M.gate_inp_type, d_xnorm, hp.n_embd, n_tok, hp.n_embd,
                               hp.n_expert, k, d_moe_logits, d_moe_ids, d_moe_wts);
             if (moe_calib_active && !engine::g_capturing_) {
@@ -703,26 +781,18 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
                             d_moe_nact, n_act, d_moe_h, hp.n_ff_exp, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp,
                             M.down_exps.type);
-            // accumulate into d_x, which still holds the residual: the routed
-            // half is added before the shared expert's down runs
-            // Every MoE layer by default now: the ncmoe host half has to be checked per
-            // layer (the per-layer quant types differ), not only at layer 0.
-            if (dbg_refdump && !engine::g_capturing_ &&
-                (si::env::flag("PF_MOE_REFDUMP_ALL") || si::env::i32("PF_MOE_REFDUMP_LAYER", 0) == (int) moe_il)) {
-                before_r.resize((size_t) n_tok * hp.n_embd);
-                qq.memcpy(before_r.data(), d_x, before_r.size() * 4).wait();
-            }
             // ncmoe / expert cache: the device kernels skipped every pair whose
-            // expert is not resident (slot == -1), so those rows of d_moe_acc
-            // are still stale.  They must be filled *before* the reduction, not
-            // added afterwards: the reduce weights every row, so a stale row
-            // would be weighted in as if it were this layer's output (and the
-            // correct value added on top of it - the "routed energy is 2-4x too
-            // big from layer 1 on, exact at layer 0" signature).
+            // expert is not resident (slot == -1), so those rows of d_moe_acc are
+            // still stale.  They must be filled *before* the reduction, not added
+            // afterwards: the reduce weights every row, so a stale row would be
+            // weighted in as if it were this layer's output (and the correct value
+            // added on top of it - the "routed energy 2-4x too big from layer 1
+            // on, exact at layer 0" signature).
             if (moe_cpu_enabled && !engine::g_capturing_) {
                 moe_cpu_experts(moe_il, M, n_tok, k, n_pairs, dev, d_xnorm);
             }
             moe_reduce_launch(qq, d_moe_acc, d_moe_wts, k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
+            }
             }
             // d_x right after the reduce *is* the routed contribution (the
             // reduce accumulates into the residual), which is what cpu_ref's
@@ -856,7 +926,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 fprintf(stderr, " |rms xnorm=%.4g (w=%.4g) h=%.4g acc=%.4g d_x=%.4g\n", std::sqrt(sn / hp.n_embd),
                         wref, std::sqrt(sh / hp.n_ff_exp), std::sqrt(sa / hp.n_embd), std::sqrt(sx / hp.n_embd));
             }
-            return;            return;
+            return;
         }
         // moe_epilogue: d_x += sigmoid(gate_inp_shexp . d_xnorm) * shared_out
         if (dbg_refdump && il == 0 && !engine::g_capturing_ && mode == 0) {
@@ -867,8 +937,17 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_out-0", sum, sumsq, mx);
         }
         if (!abl_noshexp) {
+            if (on_cpu) {
+                // d_x += sigmoid(gate_inp_shexp . xnorm) * shared.  Same formula as
+                // moe_gate_add_launch, one sub-group per token there and one
+                // worker per token here.
+                cpu_moe_epilogue(d_xnorm, hp.n_embd,
+                                 M.gate_inp_shexp ? wptr(dev, M.gate_inp_shexp) : nullptr, M.gate_inp_shexp_type,
+                                 n_tok, hp.n_embd, d_moe_shout, hp.n_embd, d_x, hp.n_embd);
+            } else {
             moe_gate_add_launch(qq, M.gate_inp_shexp ? wptr(dev, M.gate_inp_shexp) : nullptr, M.gate_inp_shexp_type,
                                 d_xnorm, hp.n_embd, n_tok, hp.n_embd, d_moe_shout, hp.n_embd, d_x, hp.n_embd);
+            }
         }
     };
     auto gemv_at = [&](size_t idx) {
