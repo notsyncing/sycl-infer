@@ -1,3 +1,169 @@
+* **The routed experts do not use the int8 GEMM path, and that is the whole gap.**
+  **Status: half of it is closed.**  A grouped dp4a expert GEMM over the *native*
+  GGUF blocks now ships and is the default (`PF_MOE_DP4A`), taking pp512 on the
+  35B A3B from **246.4 to 612.0 t/s** with an identical argmax - the rest of this
+  note (the 2000 t/s projection) is the remaining half, and the mechanics and the
+  two register-locality bugs that had to be fixed first are in *"The routed-expert
+  prefill"* below.  The original diagnosis follows.
+  `setup_md_dnnl` converts the *dense* tensors to SIn int8 with `build_w8_one`
+  and the plan takes the oneDNN branch for them.  The MoE `addp`-uploads its
+  expert tensors raw, so 18.22 GiB - 90% of a MoE prefill - runs the fp32
+  dequant kernel while 2 GiB of dense weights runs int8.  Measured on the 35B
+  A3B, same prompt, warm, one config apart:
+
+      dense only, int8 (PF_ABL_NOMOE)            2610.2 t/s   (0.169 s)
+      dense only, fp32 (PF_ABL_NOMOE PF_DP4A=0)    94.1 t/s   (4.689 s)
+
+  **27.7x for the same work.**  Projected against the current 239 t/s (of which
+  the MoE is 90%), moving the experts onto int8 lands at ~2000 t/s, which is
+  where a 3B-active model belongs next to the 27B's 2390.
+
+  Why the obvious routes are closed, so none of them has to be re-derived:
+  * `nat_gemm_launch` (the batched native-width GEMM, 221 GB/s at M=7) **rejects
+    M > 13**, and a 452-token prefill routes 3616 pairs over 256 experts, so M
+    per expert is ~14 - just outside.  Its oneDNN path would serve it, but ...
+  * u4 stores for the experts need 0.625 B/w x 18.22 GiB/0.5625 = 10.1 GiB per
+    card *on top of* the 9.1 GiB raw upload the decode path still reads, against
+    15.11 GiB usable.  And `add_weight_w4` builds a prefill primitive ladder per
+    weight, so 256 experts x 3 tensors x 40 layers = 30780 ladders at ~15 ms of
+    primitive creation each is not a load time.
+  * So the shape is: **expand the active experts to int8 in a reused scratch**
+    (~768 MB per device, one layer at a time) and drive it from the existing
+    activation view.  The scratch makes the weight pointer identical for every
+    layer, so one oneDNN primitive per (M, K, N=512) shape is reused across all
+    80 calls instead of 30780 - the same trick `attn_qk`'s fixed `kBlk = 8192`
+    uses.  The gather of each expert's routed rows into a contiguous
+    [p_e, K] tile, and the scatter back, is ~585 MB of traffic per prefill
+    against a ~25 ms DRAM floor, so it is free.
+
+  ### How OpenVINO structures it (looked up, and it matches the shape above)
+
+  The Intel GPU plugin's MoE prefill is six ops: `moe_mask_gen` (per-expert
+  token lists) -> `moe_gather` (gather the routed tokens into per-expert
+  *contiguous* tiles) -> `moe_gemm_up` + bias -> `swiglu` -> `moe_gemm_down` +
+  bias -> `moe_scatter_reduce` (weighted scatter back).  They state the reason
+  for two micro-GEMM paths explicitly: **prefill is compute-bound, decode is
+  memory-bound**, so they are different kernels.  Newer builds route the gather
+  through oneDNN's *grouped* matmul (`dnnl::matmul` grouped) with an
+  expert-major packed layout, and they warn that the token sort is
+  single-threaded and "a clear bottleneck" for long sequences.
+
+  So the structure is the same one this file already says is needed.  What is
+  worth adding from their PRs: the gather makes each expert's activation tile
+  contiguous, which is what lets the micro-GEMM tile (rows x K) and reuse it
+  across the expert's output rows.
+
+  ### Why the register blocking that should do it does not, measured
+
+  `x`'s row for a routed pair was re-read once per output row, which is 15 GB of
+  L2 traffic per layer against a 302 MB weight stream.  Ablating it (pin every
+  pair to token row 0, leaving the weight stream byte-identical) takes gate_up
+  1083 -> 591 ms, so the re-read is 45% of that kernel.
+
+  **The gate_up ablations, in one place.**  Same 452-token prefill, each variant
+  measured with the other costs still present:
+
+  | variant | gate_up | cost removed |
+  |---|---:|---:|
+  | as shipped | 1909 ms | - |
+  | no dequant ALU (`PF_ABL_NODEQ`) | 1054 | 855 ms, 45% |
+  | no activation re-read (`PF_ABL_NOL2`) | 1632 | 277 ms, 15% |
+  | both | **413** | 1496 ms, 78% |
+
+  With both removed the residue is 413 ms against a ~60 ms fp32-FMA floor and a
+  ~30 ms DRAM floor, i.e. still **5-7x off the roofline**, so this kernel is
+  latency/issue-bound and not roofline-bound.  The dequant is the bigger half and
+  it is ~3 ALU ops per value (`d * sc[b] * nib - dmin * mm[b]`, with the 6-bit
+  scale unpacking counted), which is why the int8/dp4a rewrite is the real lever:
+  the Q4_K nibble *is already an integer*, so feeding it to dp4a and applying
+  the per-32 group scales afterwards looks like it cuts those ~3 ops to ~1.
+
+  **It does not work, and the reason is worth having before re-deriving it.**
+  Built and measured end to end on the 35B A3B: the dp4a kernel is *correct* (same
+  argmax, same text) and **13x slower** than the fp32 kernel it replaces, and the
+  mechanism is the group scales, not dp4a.  With `xq_launch`'s int8 activations the
+  dot is
+
+      sum(w*x) = scale * (A * sum(nib*q) + B * sum(q))
+
+  so every 32-value group costs two extra global loads (`xmeta`'s scale and
+  `xsumq`'s two half-sums) and three dependent float ops *per (row, pair, group)*
+  - 64 groups a row - and those loads are re-issued for every one of the expert's
+  ~512 output rows because they are pair-indexed, not row-indexed.  That is the
+  activation re-read one level down, and it costs more than the dequant it removes.
+  The lane split has to change too (a warp reading all 128 bytes of qs in one
+  instruction needs each lane to own 8 consecutive elements, which is not the
+  32-lane x 8 split the nibbles were unpacked for).  A faster version has to hoist
+  the group scales into registers before the row loop, which makes the row loop
+  not-innermost, and that is what spills the accumulators.
+
+  The obvious fix is kMoER rows per warp, which is free on the ALU side (the
+  dequant-to-FMA ratio is 1/(2*kMoEPB) and *independent* of kMoER).  It measures
+  **worse**: 1170 -> 1801 ms at kMoER=4 and 1742 ms at kMoER=2, because
+  `ag[kMoER][kMoEPB] + au[kMoER][kMoEPB]` is 2*R*PB float registers and both
+  spill, and the spill traffic costs more than the re-read it removes.  The
+  [R][PB] accumulator array is the wall, and it is the same wall for down.
+  Getting both reuses at once needs the activation tile in **SLM** rather than
+  registers - which is what their micro-GEMM does (BM x BK tile staged once,
+  reused across BN output columns).  Attempted: stage one tile of
+  `kMoEPB x kMoEKTC` floats (8 x 1024 x 4 B = 32 KB) in SLM, shared by the
+  work-group's eight warps because they all serve the same expert and hence the
+  same routed pairs, with the per-pair accumulators left at `[kMoEPB]`.  It is
+  **both wrong and slower** (2084 vs 1170 ms, and the logits are garbage), and
+  the reason not to retry it is already in this file: the router's one-work-
+  group-per-token version - logits in SLM, softmax and top-k after a barrier -
+  "never took effect" on the A770's Level Zero backend while passing under
+  OpenCL and on the Iris Xe.  That is this backend's codegen for
+  SLM-plus-barrier shapes, not the algorithm, and a barrier per K-chunk is
+  exactly that shape.  So the OpenVINO micro-GEMM structure is not reachable
+  through SLM here, and a GEMM rewrite that avoids barriers (or one that is
+  routed through oneDNN's grouped matmul, which is a library call and not our
+  codegen) is the only way to get both reuses.
+
+  What is *not* the problem, each measured and reverted: SLM row staging (139
+  vs 148 t/s - the reuse is real but one sub-group per work-group throws away
+  8x the occupancy), pair-tiled dequant reuse `kMoEPB` 16/32 (worse, register
+  spill), and row-blocking `kMoER` on its own (gate_up 1170 -> 3430 ms; the
+  dequant-to-FMA ratio is 1/(2*kMoEPB) and *independent* of kMoER, but without
+  the pair tiling it collapses to 1:1 and the dequant is 10 FMAs' worth of ALU
+  per FMA).  Row-blocking only pays if the pair tiling is kept, and then the
+  [kMoER][kMoEPB] accumulators spill.  `PF_MOE_TIME` is the tool for this; the
+  router was a red herring for two whole attempts and was 46% of the prefill.
+
+  **`PF_MOE_TIME` measures one kernel in isolation and the whole prefill
+  disagrees - trust the wall clock.**  Raising `kMoEPB` 8 -> 40 cuts the *measured*
+  gate_up 1909 -> 1570 ms, because the dequant then runs once instead of once per
+  8-pair tile.  End to end the same change takes the prefill **239 -> 146 t/s**:
+  `ag[kMoEPB] + au[kMoEPB]` is 2*PB registers, and at PB=40 that is 80 of them,
+  so the occupancy loss hits every other kernel in the forward too.  A sweep of
+  PB = 8/12/16/20/24/28/32/40/48/64 all agreed with the wall clock in the end:
+  8 is the optimum, and the 8-tile's 2x dequant redundancy is cheaper than the
+  registers that would remove it.  Reverting the PB sweep back to 8 is
+  load-bearing - do not "fix" the 7x roofline gap by widening the tile.
+
+  **OneDNN's grouped matmul is not in the public 3.11 API, and its substitute is
+  memory-blocked.**  Checked: the headers carry only `dnnl_graph_op_matmul` and
+  the plain `dnnl::matmul`; `DNNL_ARG_HINT_MAX_GROUP_SIZE` and the grouped
+  `dnnl::matmul` that OpenVINO's MoE PRs use live in their *fork*.  The
+  fixed-shape reuse the int8 entry already does (one primitive per (M,K,N) shape,
+  which is `attn_qk`'s fixed `kBlk = 8192` trick) does still apply here.
+
+  The other route, `nat_gemm_launch` (the batched native-width GEMM, 221 GB/s at
+  M=7), needs no oneDNN primitive at all and *works* with the experts: packing
+  each layer's expert bank as one `[n_expert*n_ff][K]` tensor is 3 `add_weight_w4`
+  calls a layer, and `gemv_only=true` skips the prefill ladder.  It registers
+  (40 u4 + 20 k5 per card) and is then **memory-blocked**: u4 is 0.625 B/w
+  against raw Q4_K's 0.5625, so keeping both costs 9.1 + 10.1 = **19.2 GiB per
+  card against 15.11 GiB usable** - confirmed, `UR_RESULT_ERROR_DEVICE_LOST`.
+  Two details worth not re-deriving: the stores must be registered *after* the raw
+  upload, because the upload skips any tensor a oneDNN table already holds and the
+  MoE decode path still reads these tensors' GGUF blocks (registering first
+  strands it on an unuploaded pointer); and `nat_gemm` rejects M > 13 while a
+  452-token prefill routes 3616 pairs over 256 experts (~14 each), so the pairs
+  must be tiled either way.  So that route is a full weight-representation swap -
+  replace the raw upload with the native store and route decode through the
+  native GEMV too - not a prefill-side change.
+
 # AGENTS.md
 
 Guidance for AI coding agents working on **sycl-infer**.
@@ -1809,8 +1975,232 @@ blocks, an LRU keyed by (layer, expert); 0 = off. Measured 48-66 % hit rate at
 `spilled of n_pairs`), `PF_MOE_REFDUMP` (per-layer routed fingerprint
 sum/sumsq/max), `PF_MOE_REFDUMP_ALL` (every layer instead of layer 0 -
 **the only switch worth trusting**: a layer-0-only dump cannot see the layers
-whose quantization type differs), `PF_MOE_REFDUMP_LAYER=<L>`. `TEST_MOE_RESIDENT`
-runs the stage tests through the split.
+whose quantization type differs), `PF_MOE_REFDUMP_LAYER=<L>`,
+`PF_MOE_HIST` (the routed-pair histogram: pairs per active expert, the mean, and
+how many experts fit one row tile - see "The routed-pair histogram" below),
+`TEST_MOE_RESIDENT` runs the stage tests through the split.
+
+**Expert GEMM selection** (routed-MoE models only): `PF_MOE_DP4A` (**default
+on** - the grouped dp4a expert GEMM; `=0` restores the fp32 dequant experts,
+measured 246.4 vs 612.0 t/s pp512 on the 35B A3B with an identical argmax, see
+the section below), `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` (tile shape `M x C x NSG` of
+`moe_grp_impl`, selected **per projection** - gate+up is `FUSE==2` and reads
+`PF_MOE_CFG`, down is `FUSE==1` and reads `PF_MOE_CFG_DOWN`; the default is
+`M=16 C=2 NSG=16` for both and `dev/bench_grp` is the sweep).  Note that
+`dev/grp_min` drives the **down** path, so exactness runs must set
+`PF_MOE_CFG_DOWN` - that is how a staged kernel under test once read as exact.
+`PF_MOE_GRPDBG` prints the resolved tile and grid and is the assertion on that
+selection path; `PF_MOE_NOACTQ` skips `moe_actq_launch` (wrong results -
+diagnostic only; measured at 1.3 ms of the 501 ms gate+up phase, i.e. **the
+activation quantizer is not part of the gap**).
+
+## The routed-expert prefill: where the 8x actually is
+
+**The 35B A3B prefills at 246 t/s and 90% of it is the routed experts.**  Measured
+on the 2x A770 box, `--layer-map 0-19:gpu.0,20-39:gpu.1`, 512-token prefill,
+`PF_MOE_TIME=1 PF_NOGRAPH=1` (`dev/pf.sh` is the harness; one process per cell):
+
+```
+[moe] phases: router=45.8 csr=6.3 gate_up=1489.7 down=367.1 reduce=5.0
+              epilogue=0.0 sum=1913.9 ms   calls=40 n_tok=512 n_pairs=4096
+[pf]  pp512  best 2.138 s (239.4 t/s)      with PF_NOGRAPH; 246 t/s without
+```
+
+and the same prefill with `PF_ABL_NOMOE=1` is **3081 t/s (0.166 s)**.  So the
+budget for a 2000 t/s pp512 (0.256 s) is **~90 ms for the whole routed half**,
+against 1914 ms today.  That is the whole problem, and it is not the arithmetic:
+the routed MACs per prefill are 4.6e11, which is 30 ms at the machine's measured
+7.6 T-MAC/s, and the expert weights are 18.1 GiB, which is 26 ms at the card's
+376 GB/s.  **The roofline is ~30 ms and the work is ~64x that.**
+
+Three facts that shape any fix, each measured:
+
+* **The router is a GEMM that is not tiled, and it costs 46 ms** - 2.4% of the
+  prefill, ~1.5% of the 90 ms budget.  `moe_router_logits` is one sub-group per
+  (token, expert), so each of the 512 tokens re-reads the whole 256x2048 f32
+  router weight: 1 GB of (mostly L2) reads per layer, 40 GB per prefill.  Tiled
+  as a real `[M, n_embd] x [n_embd, n_expert]` GEMM it reads the weight once per
+  M-tile and should cost well under 5 ms.
+
+* **The routed-pair distribution is extremely skewed, and the row tile has to
+  cover it.**  `PF_MOE_HIST` on the 35B at 512 tokens: **133 active experts of
+  256, mean 31 pairs, max 124**, with 65 of the 133 at <=16 pairs, 95 at <=32,
+  121 at <=64.  A kernel that tiles the rows by M re-reads an expert's weight
+  `ceil(p_e/M)` times, so the weight stream is read **2.26x at M=16, 1.45x at
+  M=32, 1.15x at M=64, 1.0x at M=128**.  Any expert GEMM here trades tile size
+  against a weight re-read factor, and the factor is not uniform across M.
+
+* **`nat_gemm_launch` cannot serve this shape at all**, which is worth stating
+  because it looks like the obvious reuse: at the gate/up geometry (K=2048,
+  N=512) it launches `N/(NSG*C) = 16` work-groups, and `dev/moe_probe` measures
+  it at **5-8 GB/s** - 512 columns is simply not enough work-groups for a
+  512-EU card.  It is the right kernel for `N=17408` (1088 work-groups) and the
+  wrong one here, whatever the M limit says.
+
+**A grouped dp4a expert GEMM is implemented, is numerically exact, and **ships,
+default on** (`PF_MOE_DP4A`, set `=0` for the old fp32 path;
+`src/backend/gpu/kernels/moe.cpp`, the "grouped dp4a expert GEMM" section).  It
+quantizes the layer activation to
+int8-with-per-32-group-scale, then runs dp4a against the *native GGUF* expert
+blocks - Q4_K's 32-value group is 32 bytes of nibbles, which is already two dp4a
+operands, so there is no expansion pass and no extra weight storage.  One 8-lane
+slice takes one 32-value scale group (lane l owns values 4l..4l+3 = exactly one
+dp4a operand), so no lane repeats another's work and the only cross-lane step is
+one `sg_sum<8>` per output.  The asymmetric zero point costs one extra dp4a:
+taking the activation's group sum over the lane's OWN four values
+(`dp4a_s8u8(x, 0x01010101, 0)` - a multiply by one is a dp4a) makes the
+correction per-lane, so it needs no broadcast and no divide-by-lane-count, and it
+is correct for Q6_K's 16-value scale group as well as Q4_K/Q5_K's 32-value one.
+
+It is **exact**: `dev/grp_min` compares 16 rows x 512 columns against the host
+GGUF dequant and reports **0/8192 mismatches**, and that is the shipped default's
+own configuration.  It is **2.48x the prefill**: pp512 on the 35B A3B / 2x A770
+goes **246.4 -> 612.0 t/s** with a bit-identical argmax (4821), pp64 180.1 ->
+277.8 t/s (argmax 3790), and `PF_MOE_DP4A=0` reproduces the old number exactly.
+
+| | fp32 dequant (`PF_MOE_DP4A=0`) | grouped dp4a (default) |
+|---|---:|---:|
+| pp512, 35B A3B, 2x A770 | 246.4 t/s | **612.0 t/s** |
+| router / csr / gate_up / down / reduce | 43.8 / 5.6 / 1299 / 574 / 4.8 ms | 43.6 / 5.9 / **392.6** / **236.2** / 4.9 ms |
+| kernel, gate+up (K=2048 N=512 Q4_K) | - | 6.93 ms, 51.1 GB/s |
+| kernel, down (K=512 N=2048 Q5_K) | - | 4.12 ms, 52.5 GB/s |
+
+**It is still 5.7x short of the 2000 t/s budget** (routed half 683 ms against
+~90 ms; see the budget arithmetic above), so the rest of this section is the
+remaining gap rather than the remaining win.
+
+Four correctness bugs, each of which looks like something else.  All four were
+found by
+`dev/grp_min`, a 170-line exactness check, and each one *ran*:
+
+* **`nd_range<1>(G, L)` takes a TOTAL work-item count, not a work-group count.**
+  `(ngrid, TX)` therefore launches `ngrid/TX` work-groups - one here.  The kernel
+  then reads the same 32 KB from L1 for every column block (every column block
+  hits the same activation rows), which is why the first working version
+  measured *faster than the bandwidth roofline allows* (2.7 TB/s): it was one
+  work-group doing 1/128th of the work.  The tell is that the output is
+  plausible and partial.
+* **A GGUF group index is row-global, and the offsets inside a block are not.**
+  `qs[32*(g>>1) + 4*lane]` and `get_scale_min_k4(g, ...)` are right for the
+  first superblock and wrong for every group after it - the first eighth of the
+  dot product comes out exact and the rest is the next rows' bytes, a ~3% error.
+  It must be `g & 7`.
+* **`sg_sum<N>` hardcodes a 32-lane mask ladder** (`permute_group_by_xor` with
+  masks 16, 8, 4, 2, 1).  On an 8-lane sub-group the first two masks are out of
+  range, which is undefined behaviour; the visible effect was 99% of the
+  work-groups producing no output at all.  Use `sg_sum<8>` or
+  `reduce_over_group`.
+* **The CSR's pair list is built by an atomic scatter, so an expert's rows are a
+  permutation of its range, not `pair[i0+m] == pair[i0]+m`.**  Assuming contiguity
+  misplaces every row of every expert that selected more than one pair, and the
+  store is the only place that can tell.
+
+And two properties of this backend that constrain the next attempt, both
+measured:
+
+* **`local_accessor` over ~34 KB per work-group is rejected**: 16384 bytes runs,
+  34816 fails with `UR_RESULT_ERROR_OUT_OF_RESOURCES`, 65536 fails too.  The
+  activation tile for one expert at M=16, K=2048 is 32 KB + 2 KB of scales, i.e.
+  *just over* the limit, so SLM staging of the tile has to chunk K or shrink M -
+  it cannot simply be switched on.
+* **An empty kernel is not the launch cost, and neither is a 128-float frame.**
+  `dev/bench_grp` measures `0.006 ms` at 16 work-groups and `0.083 ms` at 65536,
+  so the grid size is free; the same 16384-work-group grid with this kernel's body
+  cost 26 ms, which read as "the body/register frame".  It was neither.  A
+  `dev/probe_frame.cpp` sweep (frames of 8/32/64/128 floats, and 32/64 unrolled
+  ALU iterations) is **0.020 ms at 16384 work-groups for every one of them**, so
+  neither the private frame nor the unrolled code size explains it.
+
+**The 26 ms was a broken ablation, and a broken ablation is worse than none** —
+the same failure mode as the `PF_DFLASH_OPTIME` misdifferencing further up this
+file.  `PF_MOE_ABL`'s "immediate return" was `if (PF_MOE_RDBG && lid == 0)
+{ ...; return; }`, so **127 of 128 lanes fell straight through into the real
+body** and the measurement was of the body, not of a return.  The condition has
+to hold for every lane; `PF_MOE_GRPDBG2=1` alone is 0.01 ms.  Two rules, both
+worth keeping: an ablation that short-circuits a *subset* of the work-items is
+measuring the complement, and **a stub that is faster than the real kernel means
+the stub is wrong** — here it "proved" a 26 ms launch cost that did not exist.
+
+**What it was, once the ablation was real: a runtime-indexed array, which SYCL
+places in private (scratch) memory.**  `moe_grp_impl`'s row loop is bounded by
+the *template* `M` and carries `if (m >= np) break;`.  The `break` stops the
+unroller, so `m` is a runtime value at the point `acc[m][f][c]` is addressed, so
+`acc` is not register-allocable, so **every one of the ~450 inner iterations is a
+scratch load plus a scratch store instead of an FMA.**  Predicating instead -
+`if (m >= np) continue;` - lets the unroller fold `m` to a constant and `acc`
+becomes `M*FUSE*C` registers.  **Measured 51.6 -> 6.3 ms on the `down`
+projection, 8x, from one keyword**, and the price is the dp4a for rows the expert
+does not have, which `PF_MOE_HIST` puts at ~14%.  The same trap was hit twice in
+this kernel: the superblock's `uint8_t sc8[FUSE][C][8]`, written by
+`moe_sb_scale` *through a pointer parameter*, cannot be promoted no matter how it
+is unrolled, so the eight group scales are now recomputed per group from the
+block (2 extra L1 hits) and only `d`/`dmin` are hoisted, as scalars.
+
+  **Generalisation, and it is not MoE-specific: on this backend an array indexed
+  by anything the compiler cannot fold to a constant is private memory, and
+  private memory is ~8x slower than registers here, silently.**  IGC says
+  "compiled SIMD32 allocated 128 regs and spilled around 4" for a kernel that is
+  100% scratch-resident, so **the spill report does not see it either** - the
+  frame is not a spill, it never became an allocation.  A loop over a
+  compile-time bound must be *predicated*, never `break`-ed.
+
+**And the second, independent half: the row loop was inside the group loop, so
+`pair[i0+m]` and the `top_k` integer division were re-executed for every
+32-value group.**  They are per (tile, row), not per (tile, row, group), and the
+inner body has only `FUSE*C` dp4a to hide them behind.  Hoisting them into a
+`int trowv[M]` above the K loop (unrolled, so registers) took gate+up 8.94 ->
+6.93 ms and down 6.03 -> 4.11 ms.
+
+### SLM activation staging: tried, measured, rejected — and it nearly shipped a lie
+
+The obvious next step is to stage the activation tile in SLM, because all `NSG`
+sub-groups of a work-group load the *same* `M x K` bytes from global — 16x more
+load requests than the tile has bytes.  It was implemented (K-chunked at 256
+values so the tile stays under this backend's SLM limit, see above), and it
+measured **4.9x faster: 1.82 ms vs 8.94**.  Both halves of that number were
+false:
+
+* **it was wrong** — 7680/8192 mismatches, exactly 1 of 16 column blocks correct;
+* **the exactness check was silently testing a different kernel.**  The tile
+  config is selected *per projection* (`FUSE == 2 ? cfg_gate : cfg_down`), so
+  `dev/grp_min`, which drives `moe_grp_down_launch`, reads `PF_MOE_CFG_DOWN` and
+  ignored `PF_MOE_CFG`.  Every "it passes" reading of that config came from the
+  un-staged path;
+* **and the 4.9x was a bug, not a result** — the K-chunk loop was bounded by `KC`
+  instead of `K`, so with `KC=256` it processed 1/8 of the work.
+
+With the loop bounded correctly, the staged path is **still wrong and 6x slower**
+than not staging (gate 70.8 vs 8.9 ms).  That is the same backend property the
+router's one-work-group-per-token version hit - a K-loop with a barrier per chunk
+is a shape this Level Zero backend generates badly, so the OpenVINO micro-GEMM
+structure is still unreachable here.  Reverted; `PF_MOE_CFG`/`_CFG_DOWN` select
+tile shape only, never staging.
+
+  **Two lessons, both of which cost more than the kernel did.**  *A speedup and a
+  correctness check that disagree is a correctness problem until proven
+  otherwise* - the honest response to "4.9x and exact" is to distrust the exact
+  check, not the kernel.  And *a diagnostic knob whose default reads a different
+  env var than the one you set will keep confirming whatever you already
+  believed*, so a config knob that changes the kernel under test must have its
+  selection path asserted (`PF_MOE_GRPDBG` prints the resolved C/NSG/M, which is
+  how the mismatch above became visible at all).
+
+### What is left
+
+The kernel runs at 51-60 GB/s of *unique* weight against the card's 376 GB/s
+ceiling, and `PF_MOE_HIST`'s row tiling re-reads it 2.26x at M=16, so it is
+still latency-bound rather than at the roofline.  The tile sweep
+(`dev/bench_grp`, `PF_MOE_CFG`) is flat-to-worse in every direction: `down`
+prefers `C=1` over `C=2` (4.57 vs 6.33 ms - its accumulator count is half and
+occupancy beats dp4a-per-activation-load), and **every `M > 16` spills**
+(`moe_grp_impl<*,*,24|32,...>` are the only instantiations in the spill report),
+so the weight-re-read factor cannot be reduced past 2.26x by widening `M`.
+`M*FUSE*C` registers is the wall, and it is the same wall the dense path's
+row-blocking hits.  Separately, `dev/bench_grp` says 6.9/4.1 ms per call while
+the engine measures 9.8/5.9 ms (392.6/236.2 ms over 40 calls), and the gap is
+work-group tail imbalance: `PF_MOE_HIST`'s distribution runs from 1 to 124 pairs
+per active expert, so one tile's work-group runs 2 tiles and the next runs 8, and
+the engine's real routing is less smooth than the benchmark's synthetic one.
 
 ## Invariants and gotchas
 
@@ -2280,8 +2670,101 @@ runs the stage tests through the split.
   kernel-launcher boundary that takes "the activation" needs the caller to say
   which one - `moe_cpu_experts` now takes the buffer as an argument for this.
 
+* **A routed MoE model runs on the CPU backend, and the host half has to mirror
+  the device kernels exactly.**  `record_forward`'s MoE branch is dispatched on
+  the *partition's kind* (`dev_kind_[dev] == 1`), not on `multi_dev`: an all-`cpu`
+  run and a `--layer-map` with a `cpu` tail both take it, and calling the SYCL
+  launchers unconditionally is a startup failure ("No kernel named
+  moe_router_logits"), not a slow path.  `src/backend/cpu/kernels/moe.cpp` mirrors
+  `moe_router_launch`/`moe_gate_up`/`moe_down`/`moe_reduce`/`moe_gate_add` step for
+  step - same rank-counting top-k (ties to the lower index, no sort), same
+  `max(sum, 6.103515625e-5f)` renormalisation, and the experts stay *unweighted*
+  because the reduction multiplies.  `PF_MOE_CPUDBG` prints one line per layer:
+  `dev / il / n_tok / ids0 / sum_w / rms_x / rms_acc / nan`.
+
+* **A handoff to a CPU partition has to be waited, because that partition's
+  kernels are not on the queue.**  `handoff_x` ended with
+  `dev_queue(to).memcpy(as_[to].x, buf, bytes)` - *unwaited*.  The comment above
+  it says the destination copies before its own kernels because it is an in-order
+  queue, which holds for SYCL kernels enqueued there and not for a CPU partition,
+  whose kernels are host `par()` workers with nothing to order them against.  A
+  GPU+CPU `--layer-map` therefore raced the copy against the first host read of
+  the receiving layers' activations.  The signature is the one to remember,
+  because it reads exactly like a kernel bug: the GPU partition's layer was
+  **bit-identical** in decode and the next layer's MoE input was 63% too large,
+  and only the *decode* handoff showed it (the multi-device prefill runs pipelined
+  with explicit flushes), so the prefill matched and the first generated token was
+  already wrong.  `gpu+gpu` and `cpu+cpu` were both correct, which is what ruled
+  out the host kernels.  A diagnostic that dereferences `d_xnorm` on the host is a
+  SEGV here for the same reason - on a GPU partition it is a *device* pointer -
+  and it must be read through the queue and skipped while a graph is recorded.
+
 * **A recorded decode graph has the previous pass's device bindings baked into
-  nothing - the host side must rebind on entry.**  `record_forward` only rebinds at
+  nothing - the host side must rebind on entry.**
+
+* **A diagnostic that loops `n_expert` times *inside one work-item* is a
+  parallelism bug, not a cost bug.**  `moe_router_topk` computed each expert's rank
+  by scanning all `n_expert` experts to count how many beat it - O(n_expert^2),
+  which is fine - but it launched `range<1>(n_tok)`, so a **decode's 65536
+  comparisons ran in a single thread**, twice over (ids and weights).  Ranks are a
+  permutation of 0..n_expert-1 because ties break on the index, so the loop
+  parallelises across experts with no coordination at all.  Measured on the 35B
+  A3B the router - 0.5 M-MAC of real work - was **4.4 s of a 4.6 s decode**.
+  Fixed: one work-item per (token, expert).  `router=4393 -> 48 ms`, and the same
+  prompt's decode went 2.13 -> 21.58 t/s.
+
+  The lesson generalises: **measure before restructuring.**  The routed *experts*
+  were blamed for the prefill's 94% for two whole attempts (SLM row staging, then a
+  pair-tiled dequant reuse) and both were worth <15% - the router was 46% of it and
+  the experts' shape was only an issue because they were never the top entry.
+  `PF_MOE_TIME` exists for this now.
+
+* **K-parallel reduction changes the router's fp summation order, and MTP at
+  k>=2 is sensitive to it.**  Same measurement on the 35B, `gen` of "The capital
+  of France is":
+
+  | | mtp 0 | mtp 1 | mtp 2 | mtp 4 |
+  |---|---|---|---|---|
+  | before | `**Paris**.` | `**Paris**.` | `** **Paris*` | `**Paris**.` |
+  | after | `**Paris**.` | `**Paris**.` | `The capital ` | `The capital capital of's capital of ` |
+
+  `mtp 0`/`1` are unaffected and `test_gpu_vs_ref` still reports argmax SAME; the
+  perturbation is one ulp in the router logits, which only moves *marginal* draft
+  decisions.  It is shipped because the decode is 10x and the prefill 1.6x faster,
+  and because MTP was already documented as not byte-guaranteed - but it is a real
+  quality trade at k>=2, not a free win, and `test_spec` (the oracle) fails on this
+  box for unrelated pre-existing reasons so it could not arbitrate.
+
+* **Open (large): a routed-MoE model's prefill is ~17x off what its own dense
+  layers do.**  Measured on the 35B A3B / 2x A770 / `--layer-map
+  0-19:gpu.0,20-39:gpu.1`, one 441-token prompt through the server: 148.8 t/s
+  whole-model, and **2605 t/s with `PF_ABL_NOMOE=1`** - the routed experts are 94%
+  of the prefill and removing them is a 17.5x speedup.  The arithmetic and the
+  bandwidth are both ~200x away from that, so it is the kernel shape and not the
+  work: one warp per (active expert, output row), looping over that expert's
+  routed pairs with `moe_dot` re-reading and re-dequantizing the weight row
+  **per pair**.  A 512-token prefill routes 4096 pairs over 256 experts, so each
+  row is dequantized ~14 times over, and the dequant is a dozen integer ops per
+  value against one FMA of useful work.
+  * Staging the dequantized row in SLM (one sub-group per work-group, so the
+    staged row owns its own 16 KB) removed the redundancy and changed the wall
+    time by nothing - 139 vs 148 t/s - because it also cut occupancy from eight
+    warps per work-group to one.  Reverted; the occupancy/dequant trade is not
+    the answer either way.
+  * One real bug was found on the way and is worth not re-making: `sg_sum` is a
+    sub-group collective, so it has to be called by **all 32 lanes**.  Moving it
+    inside `if (lane == 0)` still compiled, still produced plausible text, and was
+    wrong.
+  * What is left is a proper grouped-GEMM shape: one work-group per active expert,
+    tiling (rows x the expert's tokens) so both the weights and the activations
+    are staged once and reused - the structure the dense prefill path already has
+    through oneDNN, which is what makes the 27B's 512-token prefill 2.4k t/s.
+  * Reference points for the same model on comparable hardware: llama.cpp Vulkan
+    4x A770 `qwen35moe Q4_K` pp512 242.5 / tg128 49.2; 4x A770 Q8_0 pp512 497 /
+    tg128 17.6; llama.cpp CPU-only on this box pp512 80.8 / tg128 7.4 at depth 0,
+    36.5 / 2.0 at depth 64k.  (Post-8xxx builds regressed MoE PP on Vulkan, so a
+    pre-regression build is the fair comparison.)
+  `record_forward` only rebinds at
   a partition boundary (`dev != prev_dev`), so a direct-replay pass entered with
   the MTP draft's bindings still installed silently read and wrote the *draft
   device's* buffers for the first partition.  Graph-replayed passes are immune

@@ -648,7 +648,79 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
     // this survives command-graph capture - which a host-side "which experts"
     // decision could not, because reading the router's ids during a recording
     // would both stall the queue and freeze the answer.
-    auto moe_call = [&](size_t idx) {
+    // PF_MOE_TIME: per-phase *device* time for the routed half.  The prefill's 94%
+// routed-expert cost was attributed by guessing twice and both guesses measured
+// no faster, so it is measured: the timer waits on the in-order queue before each
+// timestamp, which serialises the phases but attributes them.  `=2` also prints
+// the aggregate (one line per process, from a static destructor).
+static const bool moe_time_on = si::env::flag("PF_MOE_TIME");
+// Grouped dp4a expert GEMM.  ON by default, and it is now a *win* rather than a
+// curiosity: pp512 on the 35B A3B / 2x A770 goes 246.4 -> 507.6 t/s (2.06x)
+// with a bit-identical argmax, because the fp32 dequant path it replaces
+// re-dequantises each expert's weight row once per routed pair.  It was
+// default-off while it was *slower* than what it replaced (173 vs 246 t/s at
+// 8-18 GB/s); the two changes that made it worth shipping are both in
+// moe_grp_impl and both are register-locality bugs rather than tuning - see the
+// "runtime-indexed arrays" note there, and AGENTS.md.
+// PF_MOE_DP4A=0 restores the fp32 dequant expert GEMMs.
+static const bool moe_grp_on = si::env::i32("PF_MOE_DP4A", 1) != 0;
+static double moe_time_ms[6] = {0, 0, 0, 0, 0, 0};
+static int moe_time_calls = 0, moe_time_ntok = 0, moe_time_pairs = 0;
+static const char * const moe_time_nm[6] = {"router", "csr", "gate_up", "down", "reduce", "epilogue"};
+struct moe_time_report {
+    ~moe_time_report() {
+        if (!moe_time_on) {
+            return;
+        }
+        double sum = 0;
+        for (int i = 0; i < 6; i++) {
+            sum += moe_time_ms[i];
+        }
+        fprintf(stderr, "[moe] phases: ");
+        for (int i = 0; i < 6; i++) {
+            fprintf(stderr, "%s=%.1f ", moe_time_nm[i], moe_time_ms[i]);
+        }
+        fprintf(stderr, "sum=%.1f ms", sum);
+        if (moe_time_calls) {
+            fprintf(stderr, "  calls=%d n_tok=%d n_pairs=%d", moe_time_calls, moe_time_ntok, moe_time_pairs);
+        }
+        fprintf(stderr, "\n");
+    }
+};
+static moe_time_report moe_time_report_;
+
+struct moe_timer {
+    std::chrono::steady_clock::time_point t0;
+    sycl::queue * q = nullptr;
+    int phase = -1;
+    int sync = 0;
+    // A wait on a queue that is recording a command graph throws, so the timer
+    // drops its attribution for those passes instead of killing the process:
+    // PF_MOE_TIME is a diagnostic and must not be able to stop a run.
+    bool can_sync() const {
+        return sync && q && !engine::g_capturing_;
+    }
+    void set(int p) {
+        phase = p;
+        if (can_sync()) {
+            q->wait();
+        }
+        t0 = std::chrono::steady_clock::now();
+    }
+    void lap(int p) {
+        if (phase < 0) {
+            set(p);
+            return;
+        }
+        if (can_sync()) {
+            q->wait();
+        }
+        moe_time_ms[phase] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        set(p);
+    }
+};
+
+auto moe_call = [&](size_t idx) {
         const moe_t & M = m.layers[(size_t)moe_il].moe;
         const int il = moe_il;
         const int dev = cur_dev;
@@ -659,6 +731,9 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
         const bool cpu_dev_host = !multi_dev && cpu_mode;
         const bool on_cpu = cpu_dev_host || cpu_dev;
         sycl::queue & qq = dev_queue(dev);
+        moe_timer mtimer;
+        mtimer.q = &qq;
+        mtimer.sync = moe_time_on ? si::env::i32("PF_MOE_TIME", 1) : 0;
         const int k = hp.n_expert_used;
         const int n_tok = rows; // flat live tokens in every mode
         // PF_ABL_NOMOE / PF_ABL_NOSHEXP: drop one half of the MoE FFN, to tell
@@ -679,6 +754,11 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_in-0", sum, sumsq, mx);
             }
             const int n_act = std::min(hp.n_expert, n_pairs);
+            moe_time_calls++;
+            if (moe_time_calls == 1) {
+                moe_time_ntok = n_tok;
+                moe_time_pairs = n_pairs;
+            }
             const int32_t * sm = d_moe_slotmap + (size_t)moe_il * hp.n_expert;
             // ncmoe / expert cache: pairs whose expert is not resident are skipped
             // by the device kernels (slot == -1), so the host half computes them
@@ -757,6 +837,7 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 }
                 cpu_moe_reduce(acc_h.data(), wts_h.data(), k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
             } else {
+            mtimer.lap(0);
             moe_router_launch(qq, wptr(dev, M.gate_inp), M.gate_inp_type, d_xnorm, hp.n_embd, n_tok, hp.n_embd,
                               hp.n_expert, k, d_moe_logits, d_moe_ids, d_moe_wts);
             if (moe_calib_active && !engine::g_capturing_) {
@@ -771,16 +852,46 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
                 }
                 moe_calib_ids_[moe_il] = ids_h;
             }
+            mtimer.lap(1);
             moe_csr_clear_launch(qq, d_moe_off, d_moe_cur, d_moe_active, d_moe_nact, hp.n_expert);
             moe_csr_count_launch(qq, d_moe_ids, n_pairs, d_moe_off);
             moe_csr_prefix_launch(qq, d_moe_off, d_moe_active, d_moe_nact, hp.n_expert);
             moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
-            moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
-                              moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, d_xnorm, hp.n_embd,
-                              d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type, M.up_exps.type);
-            moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
-                            d_moe_nact, n_act, d_moe_h, hp.n_ff_exp, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp,
-                            M.down_exps.type);
+            mtimer.lap(2);
+            // Grouped dp4a expert GEMM, opt-in (PF_MOE_DP4A=1): the same product
+            // off the same GGUF blocks, with the activation int8-quantized per
+            // 32-value group and the multiply in dp4a.  The fp32 dequant path
+            // stays the default and is also the fallback for any shape the dp4a
+            // path declines.
+            const auto & A = moe_as_[(size_t)(dev >= 0 ? dev : 0)];
+            bool grp_ok = moe_grp_on && A.xq && !moe_host_split() && !on_cpu;
+            if (grp_ok) {
+                if (!si::env::flag("PF_MOE_NOACTQ"))
+                    moe_actq_launch(qq, d_xnorm, hp.n_embd, n_tok, hp.n_embd, A.xq, A.asa, A.xs);
+                grp_ok = moe_grp_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
+                                                moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off,
+                                                d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq, A.asa, A.xs, d_moe_h,
+                                                hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type,
+                                                M.up_exps.type);
+            }
+            if (!grp_ok) {
+                moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
+                                  moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, d_xnorm, hp.n_embd,
+                                  d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type, M.up_exps.type);
+            }
+            mtimer.lap(3);
+            if (grp_ok) {
+                if (!si::env::flag("PF_MOE_NOACTQ"))
+                    moe_actq_launch(qq, d_moe_h, hp.n_ff_exp, n_pairs, hp.n_ff_exp, A.xq, A.asa, A.xs);
+                grp_ok = moe_grp_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off,
+                                             d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq, A.asa, A.xs, d_moe_acc,
+                                             hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type);
+            }
+            if (!grp_ok) {
+                moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
+                                d_moe_nact, n_act, d_moe_h, hp.n_ff_exp, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp,
+                                M.down_exps.type);
+            }
             // ncmoe / expert cache: the device kernels skipped every pair whose
             // expert is not resident (slot == -1), so those rows of d_moe_acc are
             // still stale.  They must be filled *before* the reduction, not added
@@ -791,7 +902,61 @@ void engine::record_forward(int mode, const seg_plan & plan, gemv_seg * d_segs, 
             if (moe_cpu_enabled && !engine::g_capturing_) {
                 moe_cpu_experts(moe_il, M, n_tok, k, n_pairs, dev, d_xnorm);
             }
+            if (si::env::flag("PF_MOE_CPUDBG") && !engine::g_capturing_) {
+                // Same line the cpu branch prints, so the two halves of a
+                // --layer-map can be compared at the same layer.  The read has to
+                // go through the queue: on a GPU partition d_xnorm is a *device*
+                // pointer, so dereferencing it on the host is a SEGV that looks
+                // like a kernel bug and lands in decode_batch/build_md_dec_graphs.
+                std::vector<float> xr_h((size_t) n_tok * hp.n_embd);
+                qq.memcpy(xr_h.data(), d_xnorm, xr_h.size() * sizeof(float)).wait();
+                double sx2 = 0;
+                for (float v : xr_h) {
+                    sx2 += (double) v * v;
+                }
+                fprintf(stderr, "[moe] gpu-branch dev=%d il=%d n_tok=%d rms_x=%.5g\n", dev, moe_il, n_tok,
+                        std::sqrt(sx2 / (double) xr_h.size()));
+            }
+            mtimer.lap(4);
             moe_reduce_launch(qq, d_moe_acc, d_moe_wts, k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
+            }
+            mtimer.lap(5);
+            // PF_MOE_HIST: how many routed pairs each active expert has.  This
+            // is the number that fixes the row tile of the grouped expert GEMM:
+            // an expert with more pairs than the tile is re-read once per extra
+            // tile, so the tile has to cover the distribution's mass, not its
+            // mean.  Printed for the first layer only (the distribution is the
+            // same shape every layer) and from the CSR, so it costs one copy.
+            if (si::env::flag("PF_MOE_HIST") && !engine::g_capturing_ && moe_il == 0 && mode != 0) {
+                std::vector<int32_t> hoff((size_t)hp.n_expert + 1), hact((size_t)hp.n_expert + 1), hn(2);
+                qq.memcpy(hoff.data(), d_moe_off, hoff.size() * 4).wait();
+                qq.memcpy(hact.data(), d_moe_active, hact.size() * 4).wait();
+                qq.memcpy(hn.data(), d_moe_nact, 2 * 4).wait();
+                std::vector<int> h((size_t)hp.n_expert + 1, 0);
+                for (int i = 0; i < hn[0]; i++) h[hoff[hact[i] + 1] - hoff[hact[i]]]++;
+                int tot = 0, wsum = 0, w8 = 0, w16 = 0, w24 = 0, w32 = 0, mx = 0;
+                for (int i = 0; i <= hp.n_expert; i++) {
+                    if (!h[i]) continue;
+                    tot += h[i];
+                    wsum += h[i] * i;
+                    w8 += (i <= 8) ? h[i] : 0;
+                    w16 += (i <= 16) ? h[i] : 0;
+                    w24 += (i <= 24) ? h[i] : 0;
+                    w32 += (i <= 32) ? h[i] : 0;
+                    mx = std::max(mx, i);
+                }
+                double wtile = 0;
+                for (int i = 0; i <= hp.n_expert; i++) {
+                    if (h[i]) wtile += (double)h[i] * ((i + 15) / 16);
+                }
+                fprintf(stderr,
+                        "[moe hist] n_tok=%d top_k=%d n_active=%d/%d mean=%.1f max=%d  <=8:%d <=16:%d <=24:%d "
+                        "<=32:%d  tiles16=%.0f (weight re-read x%.2f)\n",
+                        n_tok, k, hn[0], hp.n_expert, (double)wsum / std::max(1, tot), mx, w8, w16, w24, w32, wtile,
+                        wtile / std::max(1, tot));
+                for (int i = 0; i <= hp.n_expert; i++) {
+                    if (h[i]) fprintf(stderr, "[moe hist]   pairs=%3d experts=%d\n", i, h[i]);
+                }
             }
             }
             // d_x right after the reduce *is* the routed contribution (the

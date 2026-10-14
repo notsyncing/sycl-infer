@@ -408,6 +408,14 @@ struct engine {
         int32_t * active = nullptr; // [n_expert+1] experts with >= 1 token
         int32_t * nact = nullptr;   // [1] count of the above
         int32_t * slotmap = nullptr;// [n_layer][n_expert]
+        // Grouped dp4a expert GEMM activation tile: the int8 values plus the
+        // per-32-group f16 scale and f32 sum.  Two shapes use it and they are
+        // not live at once - gate/up quantize the token rows (R x n_embd), then
+        // down quantizes the pair rows (R*k x n_ff_exp) over the `h` they
+        // produced - so one buffer sized for both is enough (moe_acts_alloc).
+        int8_t * xq = nullptr;    // [rows][K]
+        uint16_t * asa = nullptr; // [rows][K/32]
+        float * xs = nullptr;     // [rows][K/32]
     };
     std::vector<moe_act> moe_as_;
     // residency + the disk/RAM/VRAM expert cache tiers

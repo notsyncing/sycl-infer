@@ -469,6 +469,30 @@ void moe_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_m
                      const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
                      const float * h, int h_stride, float * acc, int acc_stride, int n_embd, int n_ff_exp,
                      uint32_t dtype);
+// ---------------------------------------------------------------------------
+// Grouped dp4a expert GEMM (the prefill path; see docs/design/15-moe-ncmoe.md).
+//
+// Quantize a MoE activation tile to the form the dense int8 path already uses
+// - per-row-group int8 plus an f16 scale and an f32 sum per 32-wide group -
+// so `moe_grp_*` below can drive dp4a straight off the GGUF expert blocks.
+// One 32-lane group per (row, group), i.e. the same shape as
+// `act_quant_grp_launch`, so the two paths agree on what an activation is.
+void moe_actq_launch(sycl::queue & q, const float * x, int x_stride, int n_rows, int K, int8_t * xq,
+                     uint16_t * asa, float * xs);
+// silu(gate) * up for every routed pair: one launch, both banks read in the
+// same pass so the activation row is fetched once.  Returns false when the
+// geometry or a quant type is outside what the dp4a path implements, and the
+// caller must then use moe_gate_up_launch.
+bool moe_grp_gate_up_launch(sycl::queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
+                            size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
+                            const int32_t * active, const int32_t * n_active, int n_act_max, const int8_t * xq,
+                            const uint16_t * asa, const float * xs, float * h, int h_stride, int n_embd, int n_ff_exp,
+                            int top_k, uint32_t gtype, uint32_t utype);
+// down: [p_e, n_ff_exp] x [n_ff_exp, n_embd] per active expert.  Same contract.
+bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                         const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
+                         int n_act_max, const int8_t * xq, const uint16_t * asa, const float * xs, float * acc,
+                         int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype);
 void moe_reduce_launch(sycl::queue & q, const float * acc, const float * wts, int top_k, int n_tok, int n_embd,
                        int acc_stride, float * out, int out_stride);
 // MoE epilogue: out[t] += sigmoid(gate . x[t]) * shared[t].  A null `gate`

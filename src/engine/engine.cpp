@@ -1064,6 +1064,17 @@ void engine::moe_acts_alloc(int dev) {
     // expert slot table has to cover it too (and it is the row the expert
     // cache will evict into, alongside the trunk layers)
     a.slotmap = I(R > 0 ? ((size_t)hp.n_layer + 1) * (size_t)hp.n_expert : 0);
+    // Grouped dp4a activation tile.  Two shapes use it and they are not live at
+    // once: gate/up quantize the token rows (R x n_embd), then down quantizes
+    // the pair rows (R*k x n_ff_exp) over the `h` they produced.  One buffer
+    // sized for the larger of the two is therefore enough, and both are
+    // multiples of 32 so the quantizer's 32-lane groups are uniform.
+    {
+        const size_t bytes = R * (size_t)hp.n_embd + P * (size_t)hp.n_ff_exp;
+        a.xq = (int8_t *)dev_alloc_on(dev, bytes);
+        a.asa = (uint16_t *)dev_alloc_on(dev, bytes / 32 * 2);
+        a.xs = F(bytes / 32);
+    }
     if (!a.ids || !a.h || !a.acc || !a.slotmap) {
         throw std::runtime_error("MoE scratch allocation failed");
     }
@@ -1224,7 +1235,17 @@ void engine::handoff_x(int from, int to, size_t rows, void * staging) {
     qf.wait();
     qf.memcpy(buf, as_[(size_t)from].x, bytes).wait();
     // the destination copies before its own kernels (in-order queue)
-    dev_queue(to).memcpy(as_[(size_t)to].x, buf, bytes);
+    auto dst = dev_queue(to).memcpy(as_[(size_t)to].x, buf, bytes);
+    // ... unless the destination partition is the CPU one, whose kernels are host
+    // `par()` workers rather than submissions on that queue.  There is nothing
+    // to order them against, so an unwaited copy here races the first host read
+    // of as_[to].x: the handoff itself is right, and the receiving layers see a
+    // stale or half-written row.  It only shows up on a *decode* handoff (the
+    // prefill's phases are pipelined with explicit flushes), which is why the
+    // prompt prefill matches and the first generated token is already wrong.
+    if (to >= 0 && (size_t) to < dev_kind_.size() && dev_kind_[(size_t) to] == 1) {
+        dst.wait();
+    }
 }
 
 void engine::sync_all() {
