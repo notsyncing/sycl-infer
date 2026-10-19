@@ -30,6 +30,14 @@ static const profile arc_a770 = {
         .compute_units = 512,
         .max_work_group_size = 1024, // rmsnorm uses the whole group
         .local_mem_size = 65536,     // 64 KB SLM per work-group
+
+        // Xe-HPG (DG2): HAS the XMX / DPAS unit.  QUERIED at run time from the
+        // driver's advertised extensions (cl_intel_subgroup_matrix_multiply_
+        // accumulate); this is only the fallback.  Measured: dpas<8,8,float> and
+        // dpas<8,8,int32_t,...,u4,s8,64,32,64> both JIT here, and a
+        // register-resident already-packed-operand DPAS reaches 14.5 T-MAC/s
+        // (dev/dpas_slm arm C).
+        .has_dpas = 1,
     },
 
     // MEASURED: 7.5 of the 8 warps/EU a Xe-LP EU holds.  The cliff itself is

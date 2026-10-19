@@ -1,7 +1,7 @@
 * **The routed experts do not use the int8 GEMM path, and that is the whole gap.**
   **Status: half of it is closed.**  A grouped dp4a expert GEMM over the *native*
   GGUF blocks now ships and is the default (`PF_MOE_DP4A`), taking pp512 on the
-  35B A3B from **246.4 to 612.0 t/s** with an identical argmax - the rest of this
+  35B A3B from **248.2 to 851.8 t/s** with an identical argmax - the rest of this
   note (the 2000 t/s projection) is the remaining half, and the mechanics and the
   two register-locality bugs that had to be fixed first are in *"The routed-expert
   prefill"* below.  The original diagnosis follows.
@@ -1141,8 +1141,13 @@ The earlier rejection rested on "DPAS K is fixed at 32 = our group width", which
 too narrow: the native `esimd::dpas<8,8,int32_t,int32_t,uint32_t,uint32_t,u4,s8,64,
 32,64>` takes a **u4** operand with **K=64**, i.e. two 32-wide groups chained without
 a drain, and it is bit-exact for a per-32 u4 stream (0/64 and 0/200 mismatches).
-Raw throughput with register-resident operands is **254 T-MAC/s** (u4), and `s8`
-(K=32) is 16x slower at 16.2 — the Xe XMX apparently lacks a native signed-8 path.
+Raw throughput with register-resident operands (`dev/probe_dpas_occ`): the XMX has
+**no K=64 int8 form**, only K=32, so the int8 path delivers half the MACs per
+instruction at the same instruction rate - `u4 x s8` (K=64) measures 7.7 T-MAC/s and
+`s8 x s8` (K=32) **3.8**, both at 1.9 G-dpas/s.  That is **2x, not 16x**, and it is the
+*K ratio*, not a missing capability.  (An earlier revision of this file recorded 254
+T-MAC/s for u4 and a 16x ratio; both came from a probe whose u4 arm and dp4a's measured
+instruction rate disagree by 10x, and are superseded.)
 It still loses by a wide margin in a real GEMM.  `dev/bench_dpas_gemm.cpp` does the
 right thing — a weight plane pre-reordered once at load into the DPAS B layout, an
 SLM-staged A tile, ESIMD `gather`, `block_store` out — and is **numerically exact**
@@ -1770,8 +1775,10 @@ more warps),
 `PF_DEC_GROUP` (grouped decode attention, default off), `PF_ATTN_XMX` (oneDNN
 int8 *matmul* prefill attention, **default on**; `0` restores the classic kernel),
 `PF_ATTN_XMX_MIN` (minimum key count for the oneDNN matmul path, default 2048 - below it the
-classic kernel is faster), `PF_ATTN_WAIT` (force a per-attention-matmul oneDNN
-stream wait; default off, the in-order queue already orders them).
+classic kernel is faster), `PF_ATTN_STREAM=1` (put the attention matmuls back on
+the separate oneDNN stream `st_a`, which is a **data race** - see the note on
+`st_a` in `dnnl_gemm::impl`; unset/0 keeps them on `st` with everything else),
+`PF_ATTN_WAIT` (force a blocking per-attention-matmul stream wait; default off).
 
 **GEMV / GEMM tuning**
 `PF_GEMV_SPLIT`, `GEMV_DEC_VEC`, `GEMV_VEC12`, `GEMV_VEC13`,
@@ -1873,7 +1880,10 @@ the mode-1 32-token path; every stage is measured with a `q.wait()`, so the
 absolute values are inflated by the serialisation and only the shares are
 meaningful), `PF_XMX_TIME` (whole-call wall clock, same caveat),
 `PF_XMX_DBG` (print `M`, `max_nkv` and the per-block widths of one call),
-`PF_XMX_GRED=N` (gather stage-1 work-group count, default 64), `PF_XMX_TAILBLK=0`
+`PF_XMX_GRED=N` (gather stage-1 work-group count, default 64), `PF_XMX_GQ=N`
+(gather stage-2 lanes per key row inside a fixed 64-thread work-group;
+1 is the old one-thread-per-row shape with the 16-byte accesses kept, so the
+sweep separates the stripe width from the access width), `PF_XMX_TAILBLK=0`
 (keep the last block at the full `kBlk`), `PF_DUMP_KV=<dir>` (append the
 live tokens' post-norm+RoPE f32 K and V of every full-attention layer to
 `<dir>/{k,v}_LL.bin`, for offline KV-quantization studies; skipped while a
@@ -1982,15 +1992,29 @@ how many experts fit one row tile - see "The routed-pair histogram" below),
 
 **Expert GEMM selection** (routed-MoE models only): `PF_MOE_DP4A` (**default
 on** - the grouped dp4a expert GEMM; `=0` restores the fp32 dequant experts,
-measured 246.4 vs 612.0 t/s pp512 on the 35B A3B with an identical argmax, see
+measured 248.2 vs 851.8 t/s pp512 on the 35B A3B with an identical argmax, see
 the section below), `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` (tile shape `M x C x NSG` of
-`moe_grp_impl`, selected **per projection** - gate+up is `FUSE==2` and reads
-`PF_MOE_CFG`, down is `FUSE==1` and reads `PF_MOE_CFG_DOWN`; the default is
-`M=16 C=2 NSG=16` for both and `dev/bench_grp` is the sweep).  Note that
+`moe_grp_impl`, plus the `HOIST` A/B in cases 16-21, selected **per projection** -
+gate+up is `FUSE==2` and reads `PF_MOE_CFG`, down is `FUSE==1` and reads
+`PF_MOE_CFG_DOWN`; the defaults are `M=8 C=2 NSG=16` for both, and
+`dev/bench_grp` is the sweep - cases 40-57 are the register-budget sweep).  Note that
 `dev/grp_min` drives the **down** path, so exactness runs must set
 `PF_MOE_CFG_DOWN` - that is how a staged kernel under test once read as exact.
-`PF_MOE_GRPDBG` prints the resolved tile and grid and is the assertion on that
-selection path; `PF_MOE_NOACTQ` skips `moe_actq_launch` (wrong results -
+`PF_MOE_FLAT` / `PF_MOE_FLAT_DOWN` (put the row tile in the grid - one
+work-group = one tile - instead of looping it inside an (expert, column block)
+work-group; the trade is not uniform, see the section below),
+`PF_MOE_PERSIST` (replace the grid with `2 * compute_units` work-groups that
+work-steal `(expert, row tile, column block)` triples off an atomic cursor, with the
+item total summed on the device; **exact at every configuration, and 3% SLOWER -
+refuted, see the section below, so leave it off**), `PF_MOE_PERSIST_WG` (its grid,
+default `2 * compute_units`), `PF_MOE_GRPDBG` prints the resolved tile and grid and is the assertion on the
+tile selection path; `PF_DNNL_FPMATH` (widen the oneDNN int8/u4 matmul's accumulation to `fpmath_mode::any,true`; a guard against the K >= 5376 NaN the A770 library records, **default off** because no model here reaches it and it measures neutral), `PF_MOE_DP4A_DEC=1` (run the grouped dp4a expert GEMM on a DECODE step too;
+default off because decode is the wrong shape for it and the fp32 dequant path
+is 1.29-1.38x faster at all three depths - see *Decode: the grouped expert GEMM
+is prefill-shaped*), `PF_MOE_GRP_MIN_TOK` (prefill chunk size below which the
+grouped kernel declines, default 8), `PF_MOE_DQ2` (halves the dequant
+arithmetic with every load unchanged - **wrong results by design**, and the
+experiment that bounds the f16 idea at 18%), `PF_MOE_NOACTQ` skips `moe_actq_launch` (wrong results -
 diagnostic only; measured at 1.3 ms of the 501 ms gate+up phase, i.e. **the
 activation quantizer is not part of the gap**).
 
@@ -2054,18 +2078,19 @@ is correct for Q6_K's 16-value scale group as well as Q4_K/Q5_K's 32-value one.
 
 It is **exact**: `dev/grp_min` compares 16 rows x 512 columns against the host
 GGUF dequant and reports **0/8192 mismatches**, and that is the shipped default's
-own configuration.  It is **2.48x the prefill**: pp512 on the 35B A3B / 2x A770
-goes **246.4 -> 612.0 t/s** with a bit-identical argmax (4821), pp64 180.1 ->
-277.8 t/s (argmax 3790), and `PF_MOE_DP4A=0` reproduces the old number exactly.
+own configuration.  It is **3.4x the prefill**: pp512 on the 35B A3B / 2x A770
+goes **248.2 -> 851.8 t/s** with a bit-identical argmax (11171; 4821 in the same
+table below is pre-router-fix and the two are different quantities), pp64 188.7 ->
+334.8 t/s (argmax 3790), and `PF_MOE_DP4A=0` reproduces the old number exactly.
 
 | | fp32 dequant (`PF_MOE_DP4A=0`) | grouped dp4a (default) |
 |---|---:|---:|
-| pp512, 35B A3B, 2x A770 | 246.4 t/s | **612.0 t/s** |
-| router / csr / gate_up / down / reduce | 43.8 / 5.6 / 1299 / 574 / 4.8 ms | 43.6 / 5.9 / **392.6** / **236.2** / 4.9 ms |
-| kernel, gate+up (K=2048 N=512 Q4_K) | - | 6.93 ms, 51.1 GB/s |
-| kernel, down (K=512 N=2048 Q5_K) | - | 4.12 ms, 52.5 GB/s |
+| pp512, 35B A3B, 2x A770 | 248.2 t/s | **851.8 t/s** |
+| router / csr / gate_up / down / reduce | 43.8 / 5.6 / 1299 / 574 / 4.8 ms | 21.3 / 6.1 / **272.8** / **147.4** / 5.1 ms |
+| kernel, gate+up (K=2048 N=512 Q4_K) | - | 6.03 ms, 58.7 GB/s |
+| kernel, down (K=512 N=2048 Q5_K) | - | 3.39 ms, 63.7 GB/s |
 
-**It is still 5.7x short of the 2000 t/s budget** (routed half 683 ms against
+**It is still ~3x short of the 2000 t/s budget** (routed half 449 ms against
 ~90 ms; see the budget arithmetic above), so the rest of this section is the
 remaining gap rather than the remaining win.
 
@@ -2151,56 +2176,2036 @@ inner body has only `FUSE*C` dp4a to hide them behind.  Hoisting them into a
 `int trowv[M]` above the K loop (unrolled, so registers) took gate+up 8.94 ->
 6.93 ms and down 6.03 -> 4.11 ms.
 
-### SLM activation staging: tried, measured, rejected — and it nearly shipped a lie
+### SLM activation staging: tried twice.  Both times the "fast" version was wrong
 
 The obvious next step is to stage the activation tile in SLM, because all `NSG`
-sub-groups of a work-group load the *same* `M x K` bytes from global — 16x more
-load requests than the tile has bytes.  It was implemented (K-chunked at 256
-values so the tile stays under this backend's SLM limit, see above), and it
-measured **4.9x faster: 1.82 ms vs 8.94**.  Both halves of that number were
-false:
+sub-groups of a work-group load the *same* `M x K` bytes from global - 16x more
+load requests than the tile has bytes.  It was implemented, and it measured
+**4.9x faster: 1.82 ms vs 8.94**.  Both halves of that were false, and so was a
+second reading of it, and the shape of the mistake is the part worth keeping:
 
-* **it was wrong** — 7680/8192 mismatches, exactly 1 of 16 column blocks correct;
+* **it was wrong** - 7680/8192 mismatches, exactly one column block in sixteen;
 * **the exactness check was silently testing a different kernel.**  The tile
   config is selected *per projection* (`FUSE == 2 ? cfg_gate : cfg_down`), so
   `dev/grp_min`, which drives `moe_grp_down_launch`, reads `PF_MOE_CFG_DOWN` and
-  ignored `PF_MOE_CFG`.  Every "it passes" reading of that config came from the
-  un-staged path;
-* **and the 4.9x was a bug, not a result** — the K-chunk loop was bounded by `KC`
-  instead of `K`, so with `KC=256` it processed 1/8 of the work.
+  ignored `PF_MOE_CFG`.  Every "it passes" reading came from the un-staged path;
+* **the 4.9x was a bug** - the K-chunk loop was bounded by `KC` instead of `K`,
+  so at `KC=256` it processed 1/8 of the work.
 
-With the loop bounded correctly, the staged path is **still wrong and 6x slower**
-than not staging (gate 70.8 vs 8.9 ms).  That is the same backend property the
-router's one-work-group-per-token version hit - a K-loop with a barrier per chunk
-is a shape this Level Zero backend generates badly, so the OpenVINO micro-GEMM
-structure is still unreachable here.  Reverted; `PF_MOE_CFG`/`_CFG_DOWN` select
-tile shape only, never staging.
+Redone with exactness as the *gate* rather than a footnote, the picture is
+cleaner and the negative is real (`PF_MOE_CFG`/`_CFG_DOWN` 30 and 32, both
+0/8192):
 
-  **Two lessons, both of which cost more than the kernel did.**  *A speedup and a
-  correctness check that disagree is a correctness problem until proven
-  otherwise* - the honest response to "4.9x and exact" is to distrust the exact
-  check, not the kernel.  And *a diagnostic knob whose default reads a different
-  env var than the one you set will keep confirming whatever you already
-  believed*, so a config knob that changes the kernel under test must have its
-  selection path asserted (`PF_MOE_GRPDBG` prints the resolved C/NSG/M, which is
-  how the mismatch above became visible at all).
+| cfg | tile | exact? | gate ms | down ms |
+|---|---|---|---:|---:|
+| 0 | `M=16 C=2 NSG=16 KC=0` (shipped) | **yes** | **7.07** | **4.12** |
+| 30 | `M=32 C=1 NSG=32 KC=512` | yes | 9.00 | 4.89 |
+| 32 | `M=32 C=1 NSG=16 KC=256` | yes | 9.50 | 5.43 |
+| 31 | `M=32 C=1 NSG=32 KC=128` | **8192/8192 wrong** | 1.15 | 1.08 |
+| 34 | `M=64 C=1 NSG=32 KC=128` | **8192/8192 wrong** | 1.29 | 1.33 |
+
+**The exact staged forms are 1.3-1.4x slower than reading global**, and `KC=128`
+is the same "6x faster" artifact all over again - it computes almost nothing.
+The `M=16` staged forms are wrong in exactly one row (512/8192 is one row of 512
+columns) and `M=8` in two, so correctness at all requires `M=32`, which spills.
+Cases 31/34 and the `M=16` ones are **deleted, not left as switches**: a knob
+that returns wrong results 6x faster is the trap this file keeps warning about,
+and it is indistinguishable from a win unless someone runs the exactness check.
+
+Two things that had been believed on the strength of the broken version are now
+corrected.  *SLM + a barrier per K-chunk is not pathological on this backend* -
+`dev/slm_probe` isolates it and puts **stage+barrier at 0.012 ms of a 0.779 ms
+pipeline (1.5%)**, with `full` (0.779) even ahead of `compute-only` (0.889), so
+the earlier "a barrier per K-chunk is a shape this backend generates badly" is
+false for the GEMM case.  *The activation re-read was never the bottleneck* -
+`PF_MOE_ABL=8` (no weight reads, no activation reads, no dp4a) was within 1% of
+the full kernel, which said so before this experiment and was ignored.  The
+real cost of staging here is the `M=32` it forces, not the barrier.
+
+### DPAS/XMX for the expert GEMM: re-measured at the MoE's M, and it still loses
+
+Worth re-measuring because **the earlier rejection does not transfer**:
+`dev/bench_dpas_gemm.cpp` rejected DPAS at **M=8** (the MTP verify shape), which
+is *below* the arithmetic-intensity crossover - the memory system delivers
+~13 MAC/byte and dp4a reaches ~18 there, so at M=8 neither path is
+instruction-bound and a faster instruction cannot pay for itself.  The routed
+experts are 1..124 pairs with a mean of 31, squarely inside the window where the
+handover note says an XMX/DPAS unit should win.
+
+`dev/probe_dpas_moe.cpp` reuses that probe's proven dpas form and operand layouts
+and sweeps the MoE shapes with the expert in the grid (so the 128 MiB weight
+stream comes from DRAM rather than L2 - one expert's 590 KB plane is L2-resident
+and measuring it measures cache bandwidth, which is how the first attempt at this
+got a nonsense 1 TB/s).  Reported per call, i.e. scaled by `sum_e ceil(p_e/M)`
+over the measured histogram, so it is directly comparable with `dev/bench_grp`:
+
+| projection | dp4a (shipped) | best DPAS |
+|---|---:|---:|
+| gate/up, K=2048 N=512 | **6.93** | 7.52 (NT=2, R=4, M=32) |
+| down, K=512 N=2048 | **3.80** | 7.74 |
+
+**1.08x and 2.0x slower.**  And the full `NT x R` sweep kills the idea that M
+could be grown to pay for it:
+
+```
+NT=1: R=1 18.5  R=2 18.2  R=4 13.5  R=8 21.5
+NT=2: R=1 13.9  R=2 10.4  R=4  7.5  R=8 29.6
+NT=4: R=1 10.6  R=2  7.9  R=4 16.0  R=8 79.6
+NT=8: R=1 10.8  R=2 20.3  R=4 53.0  R=8 111.8
+```
+
+M rises from 8 to 64 and gets better up to ~32 and then collapses.  The
+tempting argument was that a DPAS 8x8 result is `simd<int32_t,64>` = **2 GRF per
+lane** for 64 outputs while dp4a's `acc[16][FUSE][C]` is **64 GRF per lane** for
+the same 64 - a 32x denser accumulator, so M would grow for free and take the
+weight re-read factor from 2.26 to 1.05.  **The density claim is right and the
+conclusion is wrong**: the sweep's cliff tracks `NT*R` (the accumulator in GRF/lane)
+exactly as tightly as it tracks R, and the practical ceiling lands at 16-32
+GRF/lane either way.  There is one register file, and DPAS does not get more of
+it - it just packs it differently, which does not raise the ceiling.
+
+Two structural notes that make the comparison bound rather than exact, both in
+DPAS's favour, so the loss is not overstated: the probe's epilogue uses the same
+`dsc` for the scale and the zero point, where the real Q4_K path needs both
+(so the real one loads more), and it is a performance probe with no exactness
+check.  The `u4` weight plane is also assumed pre-reordered into
+`[group][n-tile][32 dwords]`, which is a one-time load-time cost - the 18 GiB wall
+AGENTS.md already records for every other expert-store change.
+
+### "Transpose the matrix to raise M": measured, and it is the wrong trade
+
+`M` is the routed-pairs-per-tile and it is the one knob that reduces the weight
+re-read factor (`ceil(p_e/M)`: 2.26 at M=16, 1.45 at M=32).  The register wall is
+`M*FUSE*C` floats, so the obvious fix is to transpose the expert weights from
+`[n][k]` to `[k][n]`, which lets one lane own one output column: `acc[M][FUSE][1]`
+instead of `acc[M][FUSE][C]`, half the registers, no cross-lane reduction at the
+end, and therefore room for `M=32`.  **It is not worth it, for two independent
+reasons, both measured.**
+
+*The weight read gets much worse.*  Row-major in k is exactly what makes the
+current read coalesced: lane `l` takes k-values `[4l, 4l+3)` of **one** column, so
+8 lanes read 32 *contiguous* bytes.  Transposing puts the 8 lanes on 8 different
+rows, `row_bytes` (1152 B) apart.  `dev/probe_coalesce.cpp` holds the byte count,
+the instruction count and the grid fixed and changes only that mapping:
+
+| lane mapping | C=1 | C=2 | C=4 |
+|---|---:|---:|---:|
+| KAXIS (today: 32 contiguous B per lane-group) | **194.8 GB/s** | **157.4** | **126.1** |
+| NAXIS (transposed: 8 strided loads) | 74.7 GB/s | 109.9 | 113.4 |
+
+**2.6x worse at C=1** - which is precisely the configuration the transpose needs,
+since C=1 is how it halves the accumulator.  The transpose buys a 1.56x smaller
+weight-re-read factor (M=32 vs M=16) and pays 2.6x on the read: **net ~1.7x
+worse**, before any cost of materialising the layout.
+
+*And it cannot be materialised anyway.*  A transposed copy of the same bits is
+the same 18 GiB, and the decode GEMV still needs the row-major original, so both
+would have to be resident - the identical wall that already rejected the int8
+expansion scratch and the u4 store.  A per-layer transposed scratch (486 MB) would
+itself cost ~104 ms per card to build, more than the entire 90 ms MoE budget.
+
+**But the deeper answer is that a transpose could not have raised M anyway.**
+`M` loses on a different axis, and the formula says which:
+
+    memory ops per (superblock, group) = M (activation) + FUSE*C (weight)
+    dp4a per (superblock, group)        = M * FUSE * C
+    dp4a per memory op                  = M*FUSE*C / (M + FUSE*C)
+
+At `M=16, FUSE=1, C=1` that is **0.94**; at `M=32` it is **0.97**.  **Once
+`M >= FUSE*C` the ratio is saturated** - the weight side is already fed (one
+weight load feeds `M` dp4a) and the whole cost sits on the activation side (one
+load feeds `FUSE*C` dp4a).  So widening `M` buys less weight traffic and *no*
+extra dp4a density, which is the only thing that would pay for the registers.
+The transpose's whole appeal was that it frees registers to widen the one knob
+that is already saturated.
+
+Measured, on `down` (FUSE=1, so the accumulator is `M*C` and M has its best
+chance), all numerically exact at 0/8192:
+
+| M | C | NSG | down (ms) | weight traffic | spills? |
+|---|---|---|---:|---:|---|
+| **16** | 1 | 32 | **3.80** | 1.00 | no |
+| 24 | 1 | 32 | 5.49 | 0.70 | yes |
+| 32 | 1 | 32 | 5.92 | 0.64 | yes |
+| 16 | 1 | 16 | 3.80 | 1.00 | no |
+
+**M=32 moves 1.56x less weight and is 1.55x slower.**  And "spills?" is not the
+reason - that was the obvious guess and it is wrong.  `PF_MOE_CFG_DOWN` cases
+16-21 re-run the same M values with the hoisted row dropped (`HOIST=0`, which
+frees `M` integer registers and *does* remove `M=32`/`M=24` from the IGC spill
+report, leaving only M=48/64):
+
+| M | HOIST | down (ms) | spills? |
+|---|---|---:|---|
+| 16 | 1 | **3.80** | no |
+| 16 | 0 | 4.02 | no |
+| 24 | 0 | 4.18 | **no** (spill gone, still slower) |
+| 32 | 0 | 6.37 | **no** (spill gone, still 1.68x slower) |
+| 48 | 0 | 6.44 | yes |
+| 64 | 0 | 12.04 | yes |
+
+So the register pressure is real but it is not what caps M: **with the spill
+eliminated M=32 is still 1.68x slower than M=16.**  What M buys is weight
+bandwidth, and the kernel is not weight-bandwidth-bound - it is bound by the
+dp4a-per-load ratio, which M cannot move.  **The lever that would move it is
+`FUSE*C` (more columns/banks per activation load), not M** - which is exactly why
+gate+up ships at `FUSE=2, C=2` and is the faster of the two projections.
+
+`down` shipped at `M=16, C=1, NSG=32` on the reasoning that its accumulator
+count is half and occupancy beats dp4a-per-activation-load there.  **Both
+projections later turned out to want `M=8, C=2, NSG=16`**, and the reason is
+register budget rather than any of the ratios argued for in this section - see
+*What is left*.  The isolated measurements that motivated `C=1` were right about
+that tile and wrong about the neighbourhood: 3.80 vs 4.13 ms for `C=2` at `M=16`,
+against 3.38 ms for `C=2` at `M=8`.
+
+### The bench harness silently served a stale binary for several rounds
+
+Worth its own entry because it produced a wrong headline number twice in this
+pass.  `dev/build_*.sh` did `set -euo pipefail` and then
+`source /opt/intel/oneapi/setvars.sh`.  **`setvars.sh` dereferences unset
+variables and returns non-zero**, so the script died *inside the source*, the
+tool was never relinked, and the script's `|| echo "LINK FAIL"` fired - but the
+**old binary still ran and measured the previous `libsycl_infer_core.a`**.
+Nothing about the output looks wrong; `bench_pf` printed a plausible t/s.
+
+`dev/build_tool.sh` now sources with `-e` *and* `-u` both off and asserts the
+binary's mtime is newer than the library, so a failed relink is a hard error.
+The general rule is the one AGENTS.md already states twice (for `rsync -a`
+mtimes and for AOT/JIT flag agreement): **in a harness whose whole job is to
+measure the current code, "the tool still runs" is not evidence that it is
+current** - assert it.
+
+**Context depth: the routed experts do not get less important, and the 2000 t/s
+target was defined on the worst cell.**  Measured on the 35B A3B / 2x A770 with
+`dev/pf.sh`, one process per cell (`NT` is the *total* prefill length, so
+`NT=16384` is 32 mode-2 chunks at an average depth of 8k):
+
+| cell | t/s | | routed experts removed |
+|---|---:|---|---:|
+| pp512 (depth ~0) | 851.8 | | - |
+| pp4096 | 1376.7 | | - |
+| **pp16384** | **1548.8** | | 4483.0 |
+| **pp65536** | **1389.2** | | 3308.2 |
+
+**Depth makes the *rate* worse than 16k, and both are far better than depth 0**
+- the depth-0 cell carries the pipeline fill and the lowest arithmetic intensity,
+  so pp512's 851.8 t/s is the floor of this model, not its typical number.  Anyone
+  quoting "the 35B A3B prefills at N t/s" has to say which cell.
+
+The routed half is **depth-independent**: `PF_MOE_TIME` measures 465.6 ms for a
+512-token prefill and 455 ms per 512-token chunk at 16k and 448 ms at 64k, so it
+scales with tokens and not with context.  Attention does scale, but from a much
+smaller base.  `PF_XMX_BREAKDOWN` (the only attribution of the mode-2 chunk that
+`PF_PROF` cannot do, because `PF_PROF` needs `PF_NOGRAPH` and that forces the
+32-token path):
+
+| cell | attention total | of the whole prefill |
+|---|---:|---:|
+| 16k | 1711 ms of 10860 | **15.8%** |
+| 64k | 11094 ms of 48069 | **23.1%** |
+
+So at 64k the routed experts are ~55%, attention ~23%, GDN ~10%
+(`PF_ABL_NOGDN` 1518.5 vs 1363.5).  **Two things follow that are worth more than
+any kernel work.**  *A DPAS attention targets at most 23% of the 64k prefill* -
+the MoE's M is set by the 512 tokens in a chunk and does not move with depth, so
+depth does not open the expert-GEMM window DPAS needs.  And *`PF_MOE_TIME` is an
+upper bound, not a share*: at 64k its serialised total is 57.4 s against a
+48.1 s wall clock, because its per-phase waits serialise a run that is otherwise
+pipelined across the two cards.  **A measurement that sums to more than the wall
+clock is measuring the instrumentation** - attribute by ablation
+(`PF_ABL_NOMOE`, `PF_ABL_NOGDN`) or not at all.  (`PF_ABL_NOATTN` fails outright
+at both depths.)
+
+There *is* a real opportunity in that 23%, and it is not the DPAS unit's fault:
+`attn_xmx`'s QK/PV are oneDNN int8 matmuls, and AGENTS.md records that this
+oneDNN 3.11.4 resolves every one of them to `jit:gemm:any` with **no XMX kernel
+compiled in at all** (all 498 `dpas` hits are `DUMMY_DPAS_*` JIT placeholders).
+So the generic SIMD path is doing the attention, which is the one thing DPAS is
+actually good at.  The obstacle is the same one that made
+`dev/bench_dpas_gemm` 37x slower than `nat_gemm`: the cross-lane offset vectors,
+not the arithmetic.  At depth the shapes are friendlier than that probe's
+(M = 512 x HPG against a 64k-long K), so it is worth a re-measurement before it
+is worth writing - but it is ~23%, against the routed experts' ~55%.
+
+### DPAS at the attention shape: the s8 path does not exist on this part
+
+The decision above rested on a previously-recorded number, so it was re-measured
+directly: `dev/probe_dpas_rate.cpp` is a register-resident issue-throughput probe
+(loop-constant operands, no gather, no memory, no offset vectors).  It is
+deliberately *not* `dev/bench_dpas_gemm`, whose 37x loss is the offset vectors
+and says nothing about the unit.
+
+**The first version of that probe was wrong twice, and both errors produced a
+plausible-looking number.**  It used the two-argument `dpas(B, A)` overload for
+s8, which the header documents as `Result = A x B` — it does **not** accumulate
+into C — so the loop body was a function of constants and the compiler hoisted
+it: **2166 T-MAC/s**, eight times the u4 peak it was supposed to be compared
+against.  And with only four chains it measured the dpas *latency* (one issue per
+~6 cycles per warp), not its throughput.  Fixed to eight independent chains
+through the three-argument accumulating form, with both arms measured the same
+way on the same build:
+
+| form | ms | G-instr/s | T-MAC/s |
+|---|---:|---:|---:|
+| `u4 x s8` (K=64) | 32.855 | 2.0 | **8.2** |
+| `s8 x s8` (K=32) | 32.858 | 2.0 | **4.1** |
+
+**The occupancy sweep rules out occupancy as the missing factor.**  `dev/probe_dpas_occ`
+sweeps 4096 / 16384 / 65536 sub-groups at a fixed total instruction count and the `u4`
+arm takes 34.886 / 34.886 / 41.894 ms - exactly proportional, so the unit is already
+saturated at 8 warps/EU; 16 accumulator chains are *slower* than 8 (1.7 vs 1.9 G-instr/s).
+And IGC is not scalarising: the `u4 K=64` arm does **2x the MACs of the `s8 K=32` arm in
+bit-identical time**, which a scalarised version could not (it is the same signature that
+exposed the zero-`dp4a` codegen in `nat_gemm`).  The absolute rate is still only ~1/10 of
+dp4a's instruction rate (19.1 G-warp-instr/s at 8 MACs/lane against 1.9 G/s at 4096), so
+3.8 T-MAC/s is a **lower bound** and not the unit's best case; resolving that needs
+`ocloc disasm` on a device `.bin`, which this toolchain does not expose (`icpx` hides
+`--emit-spirv` and `-fsycl-dump-device-code`).
+
+**That lower bound is not the argument, because the argument is already built.**
+`dev/bench_dpas_gemm` is a real GEMM on this unit: 7.44 ms against `nat_gemm`'s 0.200,
+with the cost in cross-lane offset vectors and accumulator spills - neither of which
+more peak would remove.  The unit's best case therefore does not decide the attention
+question; the real GEMM already did.  What survives is that on this backend DPAS's int8
+form delivers **3.8 T-MAC/s**, against
+
+| | T-MAC/s |
+|---|---|
+| oneDNN int8 attention, QK (estimated from `PF_XMX_BREAKDOWN`) | ~8 |
+| dp4a, the real kernel's rate | 7.1-7.6 |
+| fp32 FMA peak | 5.0 |
+| **DPAS s8 (K=32)** | **3.8** |
+
+**So DPAS's int8 path is 2x slower than the oneDNN path already in use and 2x slower
+than dp4a**, and dequantising the KV to f16 does not rescue it either - fp32 FMA peaks
+at 5.0 and f16 buys about 2x for a conversion pass, against dp4a's 7.1-7.6 with no pass
+at all.  **DPAS for attention is closed.**  It was only ever aimed at 10% of the 64k
+prefill anyway, and AGENTS.md's own accounting says the routed experts are 55% of that
+prefill and depth-independent - so the depth question is not an XMX question.
+
+**What the attention actually runs at, and why there is no XMX headroom there.**
+`PF_XMX_BREAKDOWN` at 64k, deepest call (1216 calls, 68158 cols/call): its absolute ms
+are inflated ~2x because every stage is bracketed by a `q.wait()`, so only the
+shares are meaningful - but the *rates* derived from them are ratios of work to
+time inside one call and survive that:
+
+| stage | ms/call | share of attention | share of the 64k prefill | rate |
+|---|---:|---:|---:|---:|
+| routed experts | - | - | **55%** | depth-independent |
+| qk (oneDNN int8) | 4.324 | 27.9% | 6.4% | **8.3 T-MAC/s** |
+| softmax | 3.876 | 25.0% | 5.8% | **180 GB/s** (48% of 376) |
+| **gather** | **3.472** | **22.4%** | **5.2%** | **10.9 GB/s** |
+| pv (oneDNN int8) | 2.494 | 16.1% | 3.7% | **14.4 T-MAC/s** |
+| GDN | - | - | 10% | - |
+
+(QK is `M x cols x head_dim` = 35.8 G-MAC at 2048 stacked query rows; PV is the
+same MAC count reading a u8 operand instead of int32, which is why it is the
+faster of the two.)
+
+**So the matmuls are already the fastest thing in the prefill** - 8.3 and 14.4
+T-MAC/s against dp4a's real-kernel 7.1-7.6, fp32 FMA's 5.0 and DPAS s8's 3.8.
+There is no unused XMX capacity to reclaim: a DPAS attention would replace a
+**14.4 T-MAC/s** PV with a **3.8 T-MAC/s** one, and even an infinitely fast DPAS
+caps out at the 44% of attention that is matmul, i.e. **10% of the 64k prefill**.
+
+**The softmax is already near its own floor, and it is a structural one.** It
+reads the int32 score block and writes the u8 P operand: `M x cols x 5` bytes =
+698 MB per call at 64k, which at 3.876 ms is 180 GB/s - 48% of the card.  The
+only way below it is fusing softmax into PV (flash attention), and that trade is
+*worse*, not better: it would save the 1-of-5 write of P but hand PV a **fp32**
+operand instead of a u8 one, raising its read traffic 4x against the stage that
+is currently the cheapest thing in the call.  **That is the whole reason the
+path is split in two**, and it is a bandwidth fact, not a scheduling choice.
+
+**The gather is the outlier, and by a factor of 16 to 35.**  At 10.9 GB/s it runs
+at 1/35 of the bandwidth roofline while the softmax beside it runs at 48% of it,
+and the reason is structural rather than arithmetic - see *The gather's second
+stage* below.
+
+### Decode: the grouped expert GEMM is prefill-shaped, and decode takes fp32
+
+`tg128` on the 35B A3B / 2x A770 (`--layer-map 0-19:gpu.0,20-39:gpu.1`), measured
+with `dev/bench_tg`, which prefills `depth` tokens and then times ONLY the decode
+loop - so the depth is the variable and the prefill is not in the number.  It also
+prints the generated token ids and a hash of them, which is a far better oracle
+than one argmax.
+
+| depth | before | after (decode on fp32) | |
+|---|---:|---:|---:|
+| 512 | 56.7 ms (17.6 t/s) | **41.2 ms (24.3 t/s)** | **1.38x** |
+| 16384 | 59.6 (16.8) | **44.2 (22.6)** | **1.35x** |
+| 65536 | 68.5 (14.6) | **53.0 (18.9)** | **1.29x** |
+
+A decode step is `n_tok = 1` with `top_k = 8`, so every selected expert
+contributes exactly **one** row and the kernel's `M = 8` tile is 7/8 empty.  The
+grouped dp4a kernel is therefore 1.38x SLOWER on decode than the fp32 dequant
+path it replaced, and `PF_MOE_DP4A_DEC` (default 0) now chooses per mode instead
+of per process.  **Prefill is untouched**: pp512 / pp16384 / pp65536 stay at
+860.8 / 1565.4 / 1437.0 t/s with argmax 11171 / 1204 / 4779, and the MoE exactness
+oracle stays 0/8192.
+
+**The decode budget, by ablation** (`PF_ABL_*`, one process per cell).  Note that
+`PF_ABL_NOATTN` crashes at both depths, so attention is the difference between the
+two "no experts" rows:
+
+| | depth 512 | depth 65536 |
+|---|---:|---:|
+| routed experts | 39.6 ms | 39.5 ms |
+| attention | ~0 | 12.1 ms |
+| GDN | 1.7 | 1.7 |
+| dense GEMVs + head + norms | 15.4 | 15.4 |
+
+**The routed experts are 70% of a depth-0 decode step and 58% of a 64k one, and
+they are depth-independent.**  They read `8/256` of an 18.22 GiB bank = 630 MB per
+token, which at 376 GB/s is a **1.68 ms** floor, so they run ~15x off their own
+bandwidth roofline.
+
+**Two hypotheses about why, both measured, and the second killed a planned
+rewrite.**
+
+*The obvious one - a starved grid - is wrong.*  The grid is `n_act x N/RB` =
+`8 x 16` = 128 work-groups on 512 EUs, which reads like half the machine idle.
+Halving RB through the existing cfg cases doubles the work-group count and changes
+**nothing** (56.8 -> 56.6 ms), while RB = 8 (512 work-groups) is 81.1.  The reason
+is that `RB = NSG * C`, so the **total thread count `n_act * N * 8 / C` is
+invariant under NSG** - the sweep traded work-group size for count and netted zero.
+M is not in that formula either (each thread holds all M rows in registers), so no
+tile shape changes the occupancy at all.
+
+*And the occupancy curve then runs backwards.*  C is the only tile parameter that
+does change the thread count, and it is anti-correlated with speed:
+
+| cfg | C | warps/EU | ms/tok |
+|---|---:|---:|---:|
+| 45 | 4 | 0.5 | **44.7** |
+| 43 (was shipped) | 2 | 1 | 56.7 |
+| 44 | 1 | 2 | **81.4** |
+
+**Fewer warps is 1.82x faster across a 4x swing in warp count**, i.e. steeper than
+linear.  What the shape actually rewards is arithmetic per load -
+`M*FUSE*C / (M + FUSE*C)` is 4.0 / 2.67 / 1.6 at C = 4 / 2 / 1 - so **a split-K
+rewrite, whose entire mechanism is more warps, was pointed the wrong way and was
+never written.**  The same ratio explains why the grouped kernel loses to the
+fp32 one in decode while winning 3.4x in prefill: the two read very different
+amounts of weight per lane (128 values per superblock against 16).
+
+**And the decode stream was not reproducible — cause found, it was not in this
+kernel at all.**  Five runs of one binary at depth 512 gave five different token
+hashes at bit-identical timings.  It was **not** the `kv_cap_mb` harness bug
+(`bench_tg` sets it), not the uninitialised-partial path, and not the MoE CSR's
+atomic scatter.  It took a separate investigation and the answer was
+**`moe_router_logits_tiled`'s missing `reqd_sub_group_size(32)`** — see the
+router section below for the full account.  Two things about the hunt are worth
+keeping, because both are instrument faults rather than engine faults:
+
+* **The hash was not an oracle until the filler was made varied.**  `bench_tg`
+  originally cycled ONE sentence, and the model fell into a fixed periodic
+  continuation: `PF_ABL_NOMOE=1` — which removes the entire MoE FFN — produced
+  **the same hash as the unmodified default**.  A bisection built on that would
+  have "found" nothing and looked rigorous doing it.  27 distinct passages fixed
+  it, after which every ablation moved the hash and the default varied 13 times
+  out of 13.
+* **The per-rep hashes are not a determinism oracle either, for a subtler
+  reason.**  The prefill runs ONCE before the rep loop and each rep decodes 128
+  further tokens, so rep 1's first token is read at position `depth` against
+  rep 0's 128 tokens of KV.  Two reps of one process differ **by construction**;
+  treating that as engine-state nondeterminism was wrong.  Only cross-process
+  comparison of the *first* rep means anything.
+
+The measurement that actually localized it was the cheapest one in the whole
+hunt: print the prefill argmax **and its top1/top2 margin**, from three
+processes.  The argmax alone reads as "flipped a near-tie"; the margin read
+**0.04 to 1.28 across runs**, which says the whole logit vector is moving, and
+that is a different bug class than a tie-break.  `PF_ABL_NOMOE=1` then pinned it
+to the MoE path, and full-precision top-1/top-2 **values** separated "upstream
+noise amplified by discrete routing" from "something reads memory it never
+wrote".  After the fix, three processes give one hash.
+
+**`PF_MOE_DQ2` answers "would dequantising to f16 be faster", and the answer is
+bounded at 18%.**  A Q4_K/Q5_K value is `d * sc[b] * nib - dmin * mm[b]` - two
+multiplies and a subtract per value - and f16's entire contribution is doing those
+in half precision, with no precision question at all because `d` and `dmin` are
+already f16 in the block.  `PF_MOE_DQ2=1` removes the two multiplies and changes
+no load, which is an upper bound on the f16 gain:
+
+| depth | real | DQ2 | |
+|---|---:|---:|---:|
+| 512 | 46.5 ms | **38.1** | **-18%** |
+| 65536 | 58.2 | **49.8** | -14% |
+
+So the dequant arithmetic is a real 18% and **fp16 can take no more than that,
+and less** (the f32<->f16 conversions cost instructions of their own).  The other
+82% is still unattributed, and it is not bandwidth (the reads are coalesced: a
+warp reads 8 contiguous 128-byte runs per superblock) and not occupancy (the fp32
+kernel runs 4096 warps = 8 per EU, the measured ceiling).  `PF_MOE_DQ2` is
+wrong-answering by design and must never be combined with a correctness cell.
+
+**Where the decode time actually goes: a four-point decomposition.**
+`PF_MOE_DQ2` (drop the weight arithmetic, keep every load) and `PF_MOE_NOACT` (drop
+the activation load and FMA operand, keep the weight loads and their arithmetic)
+are single-variable, so the four combinations account for the kernel's time:
+
+| cell | weight loads | weight ALU | activation loads | FMA | depth 512 | depth 65536 |
+|---|:-:|:-:|:-:|:-:|---:|---:|
+| real | yes | yes | yes | yes | 46.5 ms | 58.2 ms |
+| `PF_MOE_DQ2` | yes | no | yes | yes | 40.8 | 52.4 |
+| `PF_MOE_NOACT` | yes | yes | no | yes | 45.8 | 57.5 |
+| both | yes | no | no | yes | **38.6** | **50.4** |
+
+So the weight arithmetic is **5.7 ms (12%)**, the activation loads **0.7 ms
+(1.5%)**, and **83% of the decode step is reading the 630 MB of expert weights and
+nothing else.**  (The activation re-read looked like the suspect - a lane reads 32
+bytes of activation against 4 bytes of weight per superblock, and 512 warps share
+one 2 KB row - but it is 1.5%, so the L2 absorbs it completely.)
+
+**And the reason is bytes per load instruction, which two independent negatives
+both point at.**
+
+*The occupancy curve runs backwards for the experts too.*  Already above: C = 4 /
+2 / 1 gives 0.5 / 1 / 2 warps per EU and 44.7 / 56.7 / 81.4 ms.
+
+*The decode attention's split count has an interior optimum for the same reason.*
+This model has **8 query heads**, not the 27B's 24, so `n_head * n_splits` is the
+whole grid and the profile's `(warps_per_eu/2) * CUs / n_head` resolves to 256
+rather than the 160 that AGENTS.md records for the 27B.  Swept properly (the
+earlier sweep stopped at 240, which is why it looked monotonic):
+
+| `PF_DEC_SPLIT` | 160 | **240** | 256 | 320 | 384 | 512 |
+|---|---:|---:|---:|---:|---:|---:|
+| 64k ms/tok | 59.6 | **58.4** | 59.6 | 64.1 | 62.7 | 62.5 |
+
+**More warps is worse**, exactly as for the experts, and flat-to-worse at 16k and
+depth 0.  So the 11.7 ms of 64k attention is not an occupancy problem either.
+
+*What the two paths share is the width of one load.*  Measured, per warp per load
+instruction:
+
+| path | access | bytes | measured |
+|---|---|---:|---:|
+| dense int8 GEMV | `w[n*K + k]`, 4 consecutive bytes per lane | **128 B** | **132 GB/s** |
+| raw GGUF expert, fp32 decode | `qs[32*(b>>1) + lane]`, **one byte per lane** | **32 B** | **26 GB/s** |
+
+**The GGUF K-quant layout interleaves by value, so a lane's 4 values of a 32-value
+group are 4 nibbles inside ONE byte - there is nothing contiguous for it to load,
+and the warp gets 32 bytes per instruction where the int8 path gets 128.**  That
+is the 4x, and the measured gap is 5x.  It is a property of the on-disk format, not
+of the kernel, which is why no tile shape and no split count touches it.
+
+**And the obvious narrowing of that is wrong too, which is worth as much as the
+right answer.**  `qs[32 * (b >> 1) + lane]` is the same address for `b = 0` and
+`b = 1` - the loop takes the low nibble of a byte and then the high nibble of the
+same byte - so the source issues eight load instructions for the four bytes a lane
+owns, half of them redundant.  Reading the four bytes into registers first and
+taking both nibbles from each is bit-exact (`dev/grp_min` 0/8192 either way, and
+pp512/16k/64k argmax 11171/1204/4779 unchanged) and **measures no change at all**:
+the load-only floor is 38.8 ms against 38.6.  **The compiler was already CSE-ing
+it.**  So "instructions per byte" is not the lever either, and the decomposition
+above stands with that removed.
+
+**That hypothesis, tested: partly right, and it is worth 6-7%.**  `PF_MOE_NPB`
+makes one warp walk NPB *adjacent* output rows sequentially, reusing a single
+accumulator set (holding NPB rows of `ag[]`/`au[]` at once would be NPB*kMoEPB*2
+floats and blow the register budget).  Each warp's NPB separate 1152-byte runs
+become one sequential run, and the grid drops from `n_act x rows` to
+`n_act x ceil(rows/NPB)`, so the stream count falls by NPB and the occupancy falls
+with it.  All cells in ONE run, since the box drifts:
+
+| `PF_MOE_NPB` | 1 | 2 | **4** | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| depth 512 | 41.0 | **37.9** | 38.1 | 40.9 | 52.2 |
+| depth 16384 | 43.8 | **40.8** | 41.2 | 43.9 | 55.1 |
+| depth 65536 | 52.7 | **49.6** | 50.0 | 52.8 | 64.1 |
+
+**Re-swept after the router fix**, all fifteen cells in ONE run because the box
+drifts ~13%.  The first sweep was taken with the broken router, so its absolute
+values are superseded - the shape was identical, which is all this knob needed.
+
+**Dividing the stream count buys 6-7% and then the occupancy loss takes over,
+hard** - 16 is 22-26% worse than 1.  So the stream count is real and it is not
+the 5.5x: something else still accounts for most of the gap to the dense path.
+`dev/grp_min` is **0/8192 at every NPB**, so the row-boundary handling is right.
+**NPB=2 is nominally ahead of the shipped NPB=4 by 0.5-1% at all three depths**,
+which is inside this box's run-to-run spread; the default stays at 4 because that
+is the value that was swept for exactness and shipped, and a sub-noise difference
+is not a reason to move a default.  Anyone re-sweeping should say which they
+measured.
+
+**Cumulative plain decode, all three changes together** - the fp32 decode expert
+path, NPB=4, and the correct router, which is itself worth something because
+every number quoted above it was measured with a router that was selecting a
+wrong expert set:
+
+| depth | start of this work | now | |
+|---|---:|---:|---:|
+| 512 | 56.7 ms (17.6 t/s) | **38.2 ms (26.2 t/s)** | **1.48x** |
+| 16384 | 59.6 (16.8) | **41.2 (24.3)** | **1.45x** |
+| 65536 | 68.5 (14.6) | **50.0 (20.0)** | **1.37x** |
+
+**What is left, stated as a hypothesis and not as a measurement.**  The fp32 expert
+kernel's grid is `n_act x n_ff_exp` = **4096 warps, each reading a DIFFERENT output
+row**, i.e. a different superblock `8 * 144 = 1152` bytes further along.  That is
+**4096 concurrent read streams on a 1152-byte stride** - the shape that thrashes
+DRAM row buffers, and it is exactly what the dense int8 GEMV does not do (each warp
+sweeps its own row sequentially).  It is consistent with the 5.5x gap to the dense
+path on the same device memory.  **Testing it means giving each warp a block of
+consecutive output rows instead of one, which cuts the stream count by the same
+factor - a real kernel change, not a knob, and not attempted here.**
+
+**The box drifts.**  The same binary and the same cell measured 41.2 ms and then
+46.5 ms for tg128 at depth 512, ~13%, hours apart.  **Only compare cells measured
+in the same run**, which is why the DQ2 and occupancy numbers above are each
+paired against a baseline from their own run.
+
+### The gather's second stage: one thread per key, 256 scalar bytes at a time
+
+`xmx_gather`'s pass 2 requantizes the paged K/V into the contiguous scratch the
+oneDNN matmuls read.  It was `parallel_for(range<1>(blk))` - **one work-item per
+key** - and each work-item walked `kD = 256` elements one byte at a time.  Its
+sibling in the same function, pass 1 (the block-max reduction), had already been
+fixed for the same class of reason (1 work-group -> 64, 18.1 -> 9.1 ms per layer
+at 64k); pass 2 had not.
+
+Per key the stage moves 256 (K) + 256 (V) + 32 (two f16 scale planes, 8 groups
+each) in and 512 out, so a full 8192-key iteration is ~8.7 MB - **~23 us at the
+card's 376 GB/s**.  It measured **~386 us per iteration** (3472 us per call at
+64k, 9 iterations), i.e. **17x its own bandwidth floor**, while the softmax
+beside it sat at 48% of that same floor and the two matmuls at 8.3 and
+14.4 T-MAC/s.  **It was the only stage in the whole prefill not already at a
+machine limit.**  The fix is `PF_XMX_GQ` lanes per key row,
+each lane owning whole 32-value scale groups so the int8 accesses are 16-byte
+vectors:
+
+| `PF_XMX_GQ` | gather, deepest 64k call | vs before |
+|---|---:|---:|
+| 1 (old shape, **16-byte accesses added**) | **0.902** | **3.85x** |
+| 2 | 0.818 | 4.25x |
+| 4 | 0.776 | 4.47x |
+| **8** | **0.801 -> 0.771** | **4.50x** |
+
+(measured in two builds: the first let the work-group width be `qg` itself,
+which reached 1.158 / 0.963 / 0.853 / 0.801, and the shipped one holds it at 64
+and reaches 0.902 / 0.818 / 0.776 / **0.771**.  End to end the two are
+indistinguishable - 848.6 / 1568.9 / 1437.4 against 848.9 / 1565.0 / 1436.8 - so
+the constant width is taken for the structure, not the 4%.)
+
+**Vectorising the accesses was 2/3 of the win and the parallelism was the other
+1/3**, which is the opposite of the hypothesis the shape invited.  The reasoning
+that pointed at parallelism - "8192 work-items is 256 warps on a 512-EU card, so
+half the machine idles" - was arithmetically right and practically beside the
+point: what each of those threads did was ~1000 *scalar* memory operations for
+one key row (256 elements x 4 loads/stores), and widening them is what the
+hardware was actually waiting on.  **The generalisable half: count the memory
+*operations* before blaming the memory *system*.**  `probe_coalesce` reached the
+same verdict from the other end for the expert GEMM.
+
+`PF_XMX_GRED` (pass 1's slice count) is already at its optimum: 32 is 4% faster
+than the default 64 but 128 / 256 / 512 / 1024 all lose monotonically, so 64
+stays.
+
+End to end, and the gain is **depth-local as it should be** - the gather runs
+once per (kv head, block chunk), so its share grows with the key count:
+
+| cell | before | after |
+|---|---:|---:|
+| pp512 | 851.8 | 848.6 (flat: mean 834.0 vs 837.2) |
+| pp16384 | 1548.8 | **1568.9** |
+| pp65536 | 1389.2 | **1437.4** |
+
+**The 64k cell's spread is large and only best-of is meaningful**: one
+65536-token prefill is ~47 s, and four reps of the shipped build measured a best
+of 1437.4 against a mean of 1156.1.  Quote best-of with that caveat, never the
+mean, and never a single rep.
+
+**After this, the attention is at its floor.**  The per-call split at the deepest
+64k chunk is now qk 4.346 (37%), softmax 3.873 (33%), pv 2.501 (21%), gather 0.771
+(6%) - so **58% of it is two oneDNN int8 matmuls already running at 8-14 T-MAC/s**,
+which is faster than dp4a's real kernel and 3.8x faster than DPAS.  There is
+nothing left to reclaim there short of changing the two-pass structure, and the
+softmax analysis above says that trade is negative.
+
+For scale, `PF_ATTN_XMX=0` (the classic kernel) measures **242.4 t/s at 64k
+against the oneDNN path's 1437.4 - 5.9x** - which is also the size of the
+`--kv-type i4:i8` cliff below, since any KV type other than i8 falls out of this
+path.  (That cell's argmax is 32288, not 4779: a different attention kernel is a
+different summation order, so it is a timing cell only and not a correctness
+gate.)
+
+**Two bugs this change introduced and fixed, both in the pad-row cold path.**
+The zero-fill must stride by the *row-local* lane (`gl`), not by the work-group's
+linear id: one work-group spans `QG_WG/qg` rows, so `lr` would give each row only
+the bytes its own lane slot landed on - with qg=8 that is 4 of 256, leaving 252
+bytes of the pad row holding whatever the previous chunk wrote.  And the scale
+must stay inside the multiply: `k[c] * ksc[g] / ksr` is the original fp32
+association, and hoisting `ksc[g]/ksr` out is a *different* expression and a
+different bit pattern, so the requantized block would stop being bit-identical.
+
+**`PF_XMX_BREAKDOWN`'s argmax is not a usable correctness oracle.**  Across
+configurations that differ only in a work-group shape it reported 4779, 279, 3069,
+44896, 304 and 32288, while **every uninstrumented run is 4779 at 64k** (and 1204
+at 16k, 4821 at pp512), including before and after this change.  So inserting the
+instrumentation's `q.wait()` calls changes the answer - most likely a
+stream-ordering interaction between the gather/softmax (main stream) and the
+matmuls (`st_a`), which this file already flags as delicate.  **The gate for
+anything in this area has to be the uninstrumented end-to-end argmax.**  The
+breakdown's *timing* is still sound, because the hazard changes which bytes are
+read, not how long the stage takes.
+
+**The 64k argmax is not an oracle at any depth, and that is a property of the
+model, not of this change.**  Five prefills of one binary in five processes gave
+13775 / 13775 / 264 / 44896 / 4779, and the classic kernel (`PF_ATTN_XMX=0`)
+produced 264 too.  Use **pp512 (11171; 4821 before the router fix) and 16k (1204)**,
+which are stable, as the
+correctness gate for anything here.
+
+### The depth cells were run against a 512-block KV pool
+
+**Every depth cell above 16384 was measured against a truncated block table, and
+the argmax those runs reported was reading device memory at a negative offset.**
+`dev/bench_pf` never set `cfg.kv_cap_mb`, whose default of 0 the engine reads as
+"unbounded, fall back to `n_blocks`" - and `n_blocks` is the *initial committed*
+count, which that tool sets to 512.  So the pool was **512 blocks = 16384 tokens of
+KV no matter what `ntok` was**.  The CLI sets `-1` ("auto: reserve what `max_seq`
+needs") when `--kv-cap-mb` is absent; the tool did not, and nobody noticed because
+the pool printed itself in every run:
+
+    [kv] exit: pool=512 blocks (160 MB), cap=512 (160 MB), in_use=512, peak=512, grows=32 shrinks=0 (fixed)
+
+Above 16384 `alloc_block()` returns **-1**, the -1 went into the block table
+unchecked, and `attn_xmx`'s `kv_row_data(kp_base, kb * n_head_kv + kvh, ...)`
+indexed the pool at block -1.  32768 needs 1028 blocks and 65536 needs 2052, so
+**more than half the keys read garbage**, and which garbage depends on the
+allocator's state - hence the argmax churn.  16384 needs **516** and was short by
+**4**, so its apparent stability was luck: the corruption was confined to the last
+128 tokens and happened not to move the argmax.  Even 16384 was being measured on
+a broken table.
+
+With `cfg.kv_cap_mb = -1` and a loud check on `alloc_block()`'s return, **every
+depth is now bit-reproducible** (three separate processes each):
+
+| NT | before (truncated pool) | after |
+|---|---|---|
+| 16384 | 1204 / 1204 / 1204 (4 blocks short) | **1204 / 1204 / 1204** |
+| 32768 | 4821 / 4821 / **13775** | **4821 / 4821 / 4821** |
+| 49152 | 8427 / 10993 / 44896 | **44896 / 44896 / 44896** |
+| 65536 | 13775 / 264 / 44896 / 4779 / 11 | **4779 / 4779 / 4779** |
+
+44896 and 4779 were already appearing in the churn: they were the *correct* answers,
+and everything else was the out-of-bounds read.
+
+**The throughput numbers were never affected, and that is the only reason the
+performance work stands.**  The gather and both matmuls process the same number of
+keys whether the block index behind a key is valid or not, and the region read was
+mapped device memory (an unmapped one would have faulted), so the traffic and the
+latency are the same.  Re-measured on the correctly sized pool: pp512 848.3
+(was 852.0), pp16384 1566.7 (was 1574.1), pp65536 1437.0 (was 1438.7) - all flat.
+**So a correctness gate can be void across a whole measurement campaign while the
+performance conclusions are all still correct, and nothing but a check would have
+told the two apart.**
+
+Three things generalise, and all three cost more than they should have:
+
+* **Diff the whole output, not the number you are watching.**  The argmax moved and
+  `[kv] exit: pool=512` had been printed in every single run.  Four targeted
+  ablations (`PF_NOGRAPH=1`, `PF_PF_PIPE=0`, `PF_ABL_NOMOE=1`, `PF_ATTN_XMX=0`) all
+  came back "still churns" and none of them was pointed at the pool; the unfiltered
+  diff would have.
+* **"The harness is correct" is an assumption, not a default.**  `bench_pf`
+  duplicated the engine's construction by hand and missed one field that `main.cpp`
+  sets from the CLI's own defaults.  **Anything a CLI derives from a user-visible
+  default has to be re-derived in every non-CLI entry point**, and the check that
+  catches it is the cheapest one available: *does this call return a value I am not
+  checking?*  `alloc_block()` returning -1 is an ordinary, documented failure - it
+  is the caller's job to handle it, and `bench_pf` did not.
+* **A negative index that reaches a kernel is an engine bug too.**  Every current
+  caller handles it, but nothing in the attention's pool lookup rejects one, so a
+  single missed check anywhere becomes a silent multi-minute corruption instead of
+  an error.  Worth a guard at `kv_row_data`; not done here, and recorded here so it
+  is not rediscovered as "the 64k argmax is flaky".
+
+**`--kv-type i4:i8` is 5x slower at 64k, and the reason is not that i4 is bad.**
+Measured: `i8` 1509.9/1363.1 t/s at 16k/64k, `i4:i8` 744.6/261.9, `i4:i4`
+796.8/287.4 - and `PF_ATTN_XMX=0` (the oneDNN attention off) measures 780.8/256.9.
+**The i4 numbers *are* the classic-kernel numbers**: `attn_xmx`'s documented
+scope is i8 KV only, and any other KV type falls back.  So i4 is not a knob, it
+is a port - one that halves the KV bytes the gather and both matmuls stream at
+depth, which is the one branch of the three with a plausible payoff.  It is
+"write it", not "measure it".
+
+### The row tile in the grid: measured, worth 2% on gate and nothing on down
+
+`moe_grp_impl` loops an expert's `ceil(p/M)` row tiles INSIDE a work-group, so a
+work-group's cost is proportional to that expert's pair count - 1..32 tiles on the
+real routing.  Lifting the tile into the grid (one work-group = one tile) is the
+only thing that moves the critical path, and a host simulation of greedy
+list-scheduling over 512 slots (`PF_MOE_HIST`, which now prints it) puts the bound
+at **in-order 34 tile-units, LPT 34, perfect 17** - i.e. up to 2x on the expert
+GEMMs.  **LPT ordering is worth 0%** (34 -> 34): the single 32-tile work-group *is*
+the critical path and it is the same work-group in every order, so "sort the
+experts" is a non-starter and only the grid shape can help.  That negative is why
+no sort was written.
+
+What the grid shape actually delivers, all four combinations exact at 0/8192:
+
+| `PF_MOE_FLAT` (gate) | `PF_MOE_FLAT_DOWN` | pp512 | pp64 |
+|---|---|---:|---:|
+| 1 | 1 | 777.3 | 266.4 |
+| **1** | **0** (shipped) | **862.4** | **334.4** |
+| 0 | 0 | 844.8 | - |
+
+**Gate +2%, down -11%.**  The 2x the simulation promised does not arrive, and
+the reason is what the flattening adds: the grid is sized by the upper bound
+`sum_e ceil(p_e/M) <= n_pairs/M + n_expert` (the exact count lives on the device
+and the grid must be a host constant), so about a third of the work-groups scan
+off the end of the CSR and return, every work-group now pays a `n_expert`-entry
+scan to find its expert, and `down`'s grid is `N/RB = 64` column blocks against
+gate's 16, so its surplus is 4x larger in absolute work-groups against a kernel
+that is only half as long.  Net: a small win where the per-tile work dominates
+and a loss where the fixed cost per work-group does.
+
+The flat form locates its expert with a **linear scan of `off[]`**, not a
+prebuilt tile list: `n_expert` is a few hundred, the array is 1 KB and
+L1-resident, and it means no scratch to allocate, no extra kernel to launch, and
+no way for `dev/grp_min` to exercise a different path from the engine.
+
+**`dev/bench_grp`'s synthetic histogram was wrong and the whole M sweep was tuned
+against it.**  It carried 133 experts with mean 31 and max 124 pairs; the measured
+routing is **71 active, mean 54.6, max 256, with four experts at 256**, which
+puts the weight re-read factor at **3.90** at M=16 rather than the 2.26 the old
+array implied.  That is a much heavier tail, and it is why the shape the
+benchmark picked and the shape the engine sees disagreed by 15% for so long.  The
+array is now the measured one, which is also why the kernel numbers in the table
+above are not comparable with the ones recorded before this change.
 
 ### What is left
 
-The kernel runs at 51-60 GB/s of *unique* weight against the card's 376 GB/s
-ceiling, and `PF_MOE_HIST`'s row tiling re-reads it 2.26x at M=16, so it is
-still latency-bound rather than at the roofline.  The tile sweep
-(`dev/bench_grp`, `PF_MOE_CFG`) is flat-to-worse in every direction: `down`
-prefers `C=1` over `C=2` (4.57 vs 6.33 ms - its accumulator count is half and
-occupancy beats dp4a-per-activation-load), and **every `M > 16` spills**
-(`moe_grp_impl<*,*,24|32,...>` are the only instantiations in the spill report),
-so the weight-re-read factor cannot be reduced past 2.26x by widening `M`.
-`M*FUSE*C` registers is the wall, and it is the same wall the dense path's
-row-blocking hits.  Separately, `dev/bench_grp` says 6.9/4.1 ms per call while
-the engine measures 9.8/5.9 ms (392.6/236.2 ms over 40 calls), and the gap is
-work-group tail imbalance: `PF_MOE_HIST`'s distribution runs from 1 to 124 pairs
-per active expert, so one tile's work-group runs 2 tiles and the next runs 8, and
-the engine's real routing is less smooth than the benchmark's synthetic one.
+**First, a correction: the shipped tile was simply the wrong shape, and finding
+that out was worth more than any of the four restructurings below.**  An earlier
+version of this section argued that the kernel's binding constraint was the
+dp4a-per-load ratio `M*FUSE*C/(M + FUSE*C)` and therefore that `M` had to go up.
+**The sweep refutes it.**  What binds is the register budget `P = M*FUSE*C`, and
+at a given `P` the optimum sits where `M` is *small*, not large:
+
+| cfg | M | C | NSG | P(gate) | gate ms | P(down) | down ms |
+|---|---|---|---|---:|---:|---:|---:|
+| 0 (shipped before) | 16 | 2 | 16 | 64 | 7.05 | 32 | 4.12 |
+| 4 | 16 | 1 | 32 | 32 | 7.29 | 16 | 3.76 |
+| **43 (shipped now)** | **8** | **2** | **16** | **32** | **6.01** | **16** | **3.38** |
+| 52 | 12 | 2 | 16 | 48 | 6.78 | 24 | 3.61 |
+| 55 | 16 | 2 | 8 | 64 | 6.96 | 32 | 4.15 |
+| 56 | 24 | 2 | 16 | 96 | 11.43 | 48 | 4.72 |
+
+All exact at 0/8192.  Every `P=32` config lands at 6.0-6.1 ms, `P=64` at
+7.0-7.3, `P=128` at 20-51 - **P is monotone and it is the whole story.**  At
+equal `P`, `M=8/C=2` (6.01 ms) beats `M=4/C=4` (10.0) because `M=4` doubles the
+weight re-read - **and that is affordable**, because the kernel sustains only
+50-68 GB/s of unique weight against a 376 GB/s card.  **Bandwidth is not the
+scarce resource here; occupancy is.**  `M=8` reads the weight 1.87x more than
+`M=16` and is 17% faster, which is the cleanest single demonstration in this
+file that the "reduce the weight traffic" framing was backwards here.
+
+The four restructurings all failed, and the sweep says they should have:
+a weight transpose (2.6x worse reads, `dev/probe_coalesce`), DPAS (1.08-2.0x
+slower, and its 32x denser accumulator does not raise the register ceiling),
+SLM activation staging (1.3-1.4x slower, and it forces the M=32 that spills),
+and a wider `M` (P grows with it).  What is genuinely left is to raise `FUSE*C`
+without raising `P`, which no tile shape can do - it means keeping the
+accumulator narrow in *time* rather than in space: a persistent kernel that walks
+the column blocks with the activation already in registers.
+
+**And the router WAS a GEMM tiled as a GEMV - which turned out to be 2.1x faster
+and wrong, and is now deleted.**  `moe_router_logits_tiled` tiled one 32-lane
+sub-group over an `MT tokens x EB experts` block instead of one per (token,
+expert), reading the activation `n_expert/EB` times and the router weight
+`n_tok/MT` times; measured **45.5 -> 20.5 ms**.  It is **deleted, not left behind
+`PF_MOE_ROUTER`**, and the GEMV form is again the only router.  Two independent
+defects, and the second is the one that makes this worth writing down:
+
+* **It raced, so the engine's output varied between processes.**  **13 runs of one
+  binary produced 13 different prefill argmaxes**, with the top1-top2 margin
+  ranging **0.04 to 1.28** - not a tie-break flip, the whole logit vector moving.
+  The expert GEMMs were proved innocent first: `dev/grp_min` now relaunches the
+  same kernel into the same output six times and reports **0 of 65536 outputs
+  differ**, at every tile config and at both decode shapes (`P=1`).
+* **The cause is pinned, the mechanism is NOT, and the obvious mechanism is
+  wrong.**  Adding `[[sycl::reqd_sub_group_size(32)]]` to that one lambda makes it
+  4/4 bit-reproducible.  A three-point isolation in a single tree - HEAD (GEMV)
+  3/3 identical, tiled **with** the attribute 4/4 identical, tiled **without** it
+  4/4 all different with `l1` spanning 14.38 to 15.51 - attributes the
+  nondeterminism to that one line beyond reasonable doubt.
+
+  **But the explanation that first seemed obvious is refuted by direct
+  measurement.**  The hypothesis was "a 32-thread work-group is not necessarily
+  one 32-lane sub-group, so several lane-0s raced on the same `logits[t][e]`".
+  `dev/sgprobe.cpp` measures it, and on **both** the A770 and the Iris Xe:
+
+      sub_group_sizes: 8 16 32
+      wg=32  no attribute : sub_group_range=32  n_sub_groups=1
+      wg=32  reqd(32)      : sub_group_range=32  n_sub_groups=1
+
+  A 32-thread work-group is one 32-lane sub-group either way, and the attribute
+  does not change it (on a 16-thread group `reqd_sub_group_size(32)` is silently
+  ignored).  **So the attribute is doing something to the lowering, not to the
+  work-group partition, and what exactly is not established.**  The plausible
+  remaining story is the one this file already documents elsewhere - `acc[MT][EB]`
+  is 64 floats plus 16 temporaries, which is where IGC stops allocating registers,
+  and a `sg_sum` over a scratch-resident value may be lowered through a shared
+  buffer that the collective does not order.  **That is a guess**; it predicts
+  that `MT=EB=4` (16 accumulators, comfortably in registers) should be
+  deterministic without the attribute, and nobody has run that.  Do not record
+  either the refuted hypothesis or the guess as the mechanism - the attribution is
+  solid, the mechanism is open.
+
+* **Pinning the attribute fixed the race and NOT the answer.**  With it the tiled
+  form is 4/4 bit-reproducible, and still computes a different logit vector:
+  pp512's argmax is **11171** against the established **4821**, and it is
+  **slower** - 751.0 vs 772.7 t/s prefill and **49.1 vs 38.1 ms/token** on a
+  depth-0 decode (1.29x).  The 2.1x was real; it was buying a wrong answer.  The
+  MoE's discrete top-8 selection is what turns one ulp into a different logit
+  vector rather than a smaller error, which is also why the top1/top2 margin is
+  the useful signal and the argmax alone is not.  **So restoring the attribute
+  would not have been a fix** - only deleting the kernel was.
+
+**How it survived a round that was explicitly looking for it.**  `dev/grp_rout`
+reported that all five tiled shapes gave "bit-identical logits and 0/4096 ids
+different" against the GEMV formulation.  **That check passed while the engine
+produced a different answer on every single run**, so it was testing the wrong
+thing - the shapes were compared in one process, where a race tends to resolve
+the same way, and the GEMV-vs-host disagreement it *did* report was filed as
+"probably a pre-existing defect in the reference" and not acted on.  The
+generalisation is the one this file already states twice, in a new place: **a
+verifier that cannot fail is worse than none**, and the specific shape here is
+that **correctness was checked against another device kernel, never against the
+one number the product is judged on.**  The check that found it in one run was
+`dev/bench_tg` printing the prefill argmax and its top1/top2 margin, once per
+step, from three processes - and the check that localized it was the margin
+being 25x different between runs, which says "the logits moved" rather than
+"an argmax flipped".
+
+**Still open, and not settled by any of this:** `dev/grp_rout` also compares the
+GEMV path against a host f32 softmax+top-k on random input, and they disagree
+(`max|dp| = 1.0`, expert sets differ for 512 of 512 tokens).  The GEMV form is
+the one that reproduces the long-established, bit-reproducible oracles
+(4821 / 1204 / 4779) that every prefill measurement in this file rests on, so the
+weight of evidence is that it is the trusted path - but that is an inference,
+not a proof, and settling it needs a reference the model was actually trained
+against (llama.cpp's `ffn_gate_inp` selection on the same activations) rather
+than a host reimplementation.  `MT=8 EB=4`'s `wts` differing from the GEMV by
+exactly 1.0 with identical ids went with the deleted code and is no longer
+reproducible.
+
+**The persistent work-stealing expert GEMM was implemented and is 3% SLOWER, and
+the reason is that the imbalance it was built to remove does not exist.**
+`PF_MOE_PERSIST=1` (default off, exact at every configuration - `dev/grp_min`
+0/8192 up to 0/262144) replaces the grid with `2 * compute_units` work-groups that
+pull `(expert, row tile, column block)` triples off an atomic cursor, where the
+item total `sum_e ceil(p_e/M) * ncb` is summed **on the device** because the host
+cannot know it.  A/B, one run, argmax as the gate:
+
+| | static (`PF_MOE_FLAT=1`) | persistent |
+|---|---:|---:|
+| pp512 | **778.3** t/s, argmax 4821 | 749.9, argmax 4821 |
+| NT=16384 | **1417.6**, argmax 1204 | 1381.1, argmax 1204 |
+| NT=65536 | **1315.9**, argmax 4779 | 1288.8, argmax 4779 |
+| tg128 512 / 16k / 64k | 38.1 / 41.1 / 50.0 ms | 38.2 / 41.2 / 50.0 ms |
+
+`PF_MOE_PERSIST_WG` = 256 / 512 / 1024 / 2048 / 4096 gives 615.5 / 748.4 / 741.7 /
+749.4 / 740.6 t/s - flat above 512 and worse below, so there is no configuration
+that wins.  **Do not pursue this further.**  The premise was that 71 active experts
+with 1..256 pairs each (mean 54.6) means a 32x tail imbalance, because one
+work-group walks 32 row tiles for a 256-pair expert while another walks 1.  That
+premise is wrong in the shipped configuration: **`PF_MOE_FLAT=1` already puts one
+work-group per (row tile, column block)**, so the imbalance is ACROSS work-groups,
+which the hardware scheduler balances by running 12288 of them - there is no
+serialisation left to remove.  This file's own host simulation predicted "in-order
+34 tile-units, perfect 17, i.e. up to 2x" and that prediction is wrong for the same
+reason: it assumed in-order scheduling.  (It is not wrong about `PF_MOE_FLAT`
+itself, which measured +2% on gate and -11% on down for a different reason - a
+host-sized grid that over-provisions.)
+
+**And the measurement that nearly shipped it was fake, which is the part worth
+having.**  The first version drew ONCE per work-group and returned, measured
+**2.85x on the prefill, with all three argmax oracles unchanged**, and I did not
+believe it.  It should not have: a real prefill has ~9000 work items against a
+grid of ~1024, so that version **silently dropped ~90% of the work and still
+produced the right argmax**.  The argmax is a weak oracle for precisely this class
+of change - this file records the prefill argmax sitting at 4821 while the router
+was selecting a completely wrong expert set - and the standing rule is that a stub
+which beats the real kernel means the stub is wrong.  What caught it was arithmetic
+(item total vs grid size), and what then caught the *real* bug in the same kernel
+was that raising `PF_MOE_PERSIST_WG` from 64 to 4096 changed nothing: the cursor
+was being drawn **per lane**, so the 128 lanes of a work-group each took a
+different item and `sg_sum` summed eight unrelated computations.  A work item must
+be drawn by `lid == 0` and broadcast through SLM, with the early-out placed AFTER
+the barrier so every lane reaches it - the same shape as this file's recorded
+"sg_sum is a sub-group collective, so it has to be called by ALL 32 lanes".
+
+**OPEN, and NOT the block allocator after all: a >16k PREFILL is not
+reproducible, low-rate, and the cause is not found.**  Diffing the WHOLE output of
+six runs at depth 16384 (not just the hash - that is the method that found the
+router bug) put the divergence in the prefill itself: the prefill argmax **agrees**
+at 1056 in every run while its **margin does not**, 8.51988 vs 7.68071 and l1
+23.2787991 vs 22.1598723 - a ~5% difference in the logits, not a tie-break.  Six
+runs give three distinct token-stream hashes; another six give three again.  Depth
+512 is 3/3 identical, depth 65536 gave the same hash twice.
+
+Ruled out, each by measurement:
+
+* **The block allocator.**  The `[kv] exit:` line is **identical in all six runs**
+  (`pool=528 blocks (165 MB), cap=644, in_use=524, peak=524, grows=33`), so the
+  growth itself is deterministic.
+* **The 3-phase multi-device pipeline.**  It is the one structural thing that only
+  activates with more than one chunk (16k is 32 chunks, 512 is 1, so every earlier
+  probe of it was a no-op), and it makes things worse - default 4 runs give **4
+  distinct hashes**.  But `PF_PF_PIPE=0` gives 3 of 4 equal and `PF_NOGRAPH=1`
+  gives 3 of 4 equal, so it is not the sole cause.
+* **Pre-reserving the KV cap.**  `PF_KV_CAP_MB=2048` gave 4/4 identical and
+  `=512` gave three distinct, but plain auto also gave 4/4 in that batch while
+  being 3-distinct in the previous one.  **Underpowered**: the deviation rate is
+  low enough that 4 samples per cell cannot separate the arms.
+* **The heap overflow below.**  Fixing it changed nothing, which is why it is
+  recorded as a separate bug rather than as this one's cause.
+
+The shape - a dominant mode plus occasional outliers, prefill-local, and needing
+more than one chunk - is a race, and it is not any of the above.
+
+**Both per-layer diagnostics were aborting the whole run, and the cause is worth
+having: `q.memcpy(...).wait()` on a queue whose next work is a RECORDED COMMAND
+GRAPH throws "wait method cannot be used for an event associated with a command
+graph".**  The existing `!g_capturing_` guard does not cover it, because the
+multi-device decode graph is recorded once at startup and *replayed* afterwards, so
+only the recording pass is skipped and every later forward still hits it.  The
+result was `terminate called` / core dump - the worst failure mode for a
+diagnostic, since it reads as a code fault.  Both now go through `dev_read_back()`,
+which reports once and skips, and **both work with `PF_NOGRAPH=1`**, which is the
+whole point: the per-layer fingerprints are the sensitive oracle and the token hash
+is not (next paragraph).
+
+**With the fingerprints working, the picture changed: the threshold is between
+depth 512 and 2048, not at 16k, and the token hash was hiding almost all of it.**
+`PF_NOGRAPH=1 PF_DUMP_LAYERS=1`, three runs per depth, counting differing
+`[dump]` lines:
+
+| depth | dump lines | differing | distinct token hashes |
+|---|---:|---:|---:|
+| 128 | 124 | **0** | 1 |
+| 512 | 124 | **0** | 1 |
+| 2048 | 370 | 64 | 1 |
+| 8192 | 1354 | 937 | 1 |
+| 16384 | 2666 | 2142 | 1 |
+
+**2666 fingerprint lines with 2142 differing, and one token hash.**  So the engine's
+hidden state is wrong in the large majority of layers on most runs while the sampled
+argmax usually survives it - which is exactly the "dominant mode plus rare
+outliers" shape that made this look like a flaky decode.  **A token-stream hash is
+not a correctness oracle for a forward pass; a per-layer fingerprint is.**  Any
+conclusion in this file that rests on "the hash was the same" is weaker than it
+looks, and the earlier "depth 512 is 3/3 identical" was a statement about the
+oracle, not about the engine.
+
+What the fingerprints add, beyond the threshold:
+
+* **It needs more than one chunk.**  512 tokens is ONE `prefill_batch` and is
+  bit-identical; 2048 is four and diverges.  So the trigger is "a second chunk",
+  not "a big context" - which is why every earlier probe of the multi-chunk
+  machinery looked innocent when it was run at depth 512.
+* **First divergence is `layerlast il=4 dev=0`** - layer 4, device 0, and only the
+  LAST-REAL-TOKEN row, while that same layer's main `layer` row is still identical.
+  It then amplifies down the stack (sum 1.3906 -> 2.2100 by layer 11).
+* **It survives everything thrown at it**, each by measurement, on the sensitive
+  oracle: `PF_PF_PIPE=0` (2136/2132 differing), `PF_NO_PFB_PARTIAL=1` (2140/2124),
+  `PF_MOE_DP4A=0` - the fp32 expert path, which does not use the CSR pair order at
+  all - (2151/2147), `PF_MOE_NPB=1` (2118/2128), and with the MoE host pass forced
+  off (2141/2140).  **Not the pipeline, not the partial-batch path, not the MoE.**
+
+**The threshold is NOT "more than one chunk" - it is `attn_xmx` engaging at all.
+The locus is the oneDNN int8 prefill attention, and nothing else.**  The attention is
+the one stage the first sweep never touched (it had covered the pipeline, the
+partial-batch path and the MoE), and separating it on the fingerprint oracle is
+decisive.  Depth 2048, three runs each, differing `[dump]` lines:
+
+| configuration | differing |
+|---|---:|
+| **`PF_ATTN_XMX=0`** (classic kernel) | **0, 0** |
+| baseline (`attn_xmx`) | 72, 72 |
+| `PF_ATTN_FLASH=1` | 72, 64 |
+| `PF_ATTN_SPLIT=1` | 64, 64 |
+| `PF_ATTN_SPLIT_KEYS=1` | 56, 56 |
+| `PF_XMX_GQ=1` (gather lane count) | 72, 72 |
+| `PF_XMX_GRED=8` (block-max slices) | 93, 85 |
+| `PF_ATTN_WAIT=1` (force a blocking wait per matmul) | 72, 97 |
+| `PF_ATTN_STREAM=1` (restore the second stream `st_a`) | 64, 64 |
+| `PF_GDN_VEC=0` / `PF_GDN_FUSE=1` / `PF_GDN_COLS=1` | 64, 72 / 72, 56 / 72, 72 |
+
+**Only turning `attn_xmx` off makes it bit-reproducible.**  That also corrects the
+chunk story: depth 512 has fewer than `PF_ATTN_XMX_MIN = 2048` keys, so `attn_xmx`
+never engages there and the cell is deterministic for a reason that has nothing to
+do with chunking.  512 being one `prefill_batch` was a coincidence.
+
+**Ruled out inside `attn_xmx`, each by measurement:**
+
+* **Not a stream-ordering race.**  This is the one this file already suspected -
+  "`PF_XMX_BREAKDOWN`'s argmax is not a usable correctness oracle ... inserting the
+  instrumentation's `q.wait()` calls changes the answer - most likely a
+  stream-ordering interaction between the gather/softmax (main stream) and the
+  matmuls".  The suspicion was right about the signature and **wrong about the
+  cause**: `PF_ATTN_WAIT=1` forces a blocking per-matmul wait and does not fix it,
+  and restoring the split stream does not either.
+* **Not oneDNN picking a different implementation.**  `ONEDNN_VERBOSE=1` gives
+  `jit:gemm:any` with 1203 instances on every run, and the sorted impl set is
+  md5-identical across four runs; `ONEDNN_PRIMITIVE_CACHE_CAPACITY=1` changes
+  nothing.
+* **Not the gather's tiling or the block-max reduction's slice count**
+  (`PF_XMX_GQ`, `PF_XMX_GRED`), and not the split heuristics.
+
+So inside `attn_xmx` the implementation, the shapes, the tiling and the ordering are
+all deterministic and the result is not.  **Read the file and eliminated the
+history-dependent-stread candidates by inspection** - each of these is the obvious
+place for a reused `malloc_device` scratch to leak the previous call's bytes, and
+each is in fact sound:
+
+* **The pad-row zero-fill.**  `gather` pass 2 does `if (row >= nk) { for (c = gl;
+  c < kD; c += qg) gkr[c] = gvr[c] = 0; }` - strided by the ROW-LOCAL lane `gl`
+  and covering all of `kD`, which is the fix this file already records ("must stride
+  by the row-local lane, not the work-group's linear id ... leaving 252 bytes of
+  the pad row holding whatever the previous chunk wrote").  Full coverage, and the
+  comment at line 271 states the reasoning: "a zero V row contributes nothing to
+  PV".
+* **The stale `P` beyond `nk`.**  The softmax only masks `[lim, nk)`
+  (`for (int k = lim + tid; k < nk; k += T)`), so `b.p[nk .. blk)` is NOT rewritten
+  this call - and `b.p` is `uint8_t`, so `0 * anything = 0` exactly, and the `V`
+  rows there ARE zeroed by the gather.  Harmless.
+* **`[blk, kBlk)` at all.**  `attn_pv(M, blk, b.p, b.v, b.pv)` uses **`blk`**, not
+  `kBlk`, so PV never reads past the gathered width even though QK's shape is the
+  fixed one.  The tail-block width (`xmx_tail_blk`) shrinking `blk` therefore cannot
+  leak in through PV.
+* **The block-max partials.**  Pass 1 writes `part[0 .. nslice)` and
+  `part[nslice .. 2*nslice)`; the fold reads exactly those ranges
+  (`for (s = 0; s < nslice; s++)`), so a smaller `nslice` never reads a stale slot.
+  `PF_XMX_GRED` changing the slice count measures neutral anyway.
+
+**And the ORDERING hypothesis is now disproven, which is the most useful thing in
+this entry - it was this file's standing explanation.**  `PF_ATTN_QWAIT=1` (new,
+default off) waits on `p->q`, the **SYCL queue every surrounding kernel is
+submitted to**, immediately before `prim.execute`; `PF_ATTN_WAIT=1` waits on the
+interop stream the primitive goes to.  Depth 2048, three runs each, differing
+`[dump]` lines:
+
+| | differing |
+|---|---:|
+| baseline | 48, 48 |
+| `PF_ATTN_WAIT=1` (wait on the interop **stream**) | 72, 97 |
+| **`PF_ATTN_QWAIT=1` (wait on the SYCL **queue**)** | **72, 48** |
+| `PF_ATTN_XMX=0` | 0, 0 |
+
+**Neither wait helps.**  A wait on the queue is ordered against every SYCL
+submission that precedes it, so if the matmul were racing the gather this would
+have to fix it.  **So `attn_xmx`'s nondeterminism is not a submission-order race**,
+and the long-standing note here - "inserting the instrumentation's `q.wait()` calls
+changes the answer - most likely a stream-ordering interaction between the
+gather/softmax and the matmuls" - is **wrong about the cause** even though it was
+right about the signature.  What made that note look like an ordering problem is
+still unexplained, and that is the loose end worth having: something in this path
+makes the result depend on whether a wait was inserted, and a wait is not what is
+varying between processes.
+
+Incidentally the queue wait is **free** - 772.4 vs 772.5 t/s at pp512, identical
+argmax - so `PF_ATTN_QWAIT` is kept as a diagnostic rather than removed, but it is
+not a fix and the default stays off.
+
+**Two real defects found in `attn_xmx` by reading it, one of which is fixed.  Neither
+is this bug, and that is worth knowing because both were high-confidence guesses.**
+
+* **A negative `lim` in the softmax was an out-of-bounds write, on both sides.**
+  `lim = min(nk, olim[i] - k0)` goes **negative** for any query row that sits before
+  the current key block's first key - which is every row of every earlier chunk
+  once there is more than one block, so from `max_nkv > 8192` up.  It then reaches
+  the masked loop `for (k = lim + tid; k < nk; k += T) prow[k] = 0;` as a negative
+  start, `k < nk` is true, and the store lands **before the row**: row 0 writes in
+  front of the `p8` allocation and row `i` writes into row `i-1`'s live `P` values,
+  which the row `i-1` work-group is filling concurrently.  So it is undefined
+  behaviour *and* a cross-row race.  **Fixed** by clamping `lim` to `[0, nk]`, which
+  is also the semantically correct value: a row that sees no key in this block has
+  no visible key in it, so the whole block is masked.  **It is provably a no-op on
+  the arithmetic** - pass 1 and pass 2 already skipped a negative `lim` - and the
+  argmax oracles are unchanged (4821 / 1204 / 4779), which is what confirms it.
+* **The capacity check was never needed, and the arithmetic that suggested it was
+  wrong.**  `M = HPG * sum(row_nr)` against `m_cap = HPG * kMaxT * kMaxB` looked like
+  a 2x overflow at depth 2048, and it is the only way `M` can overflow.  Measured
+  (`PF_XMX_DBG` now prints `HPG`, `n_rows`, `sum_row_nr`, `cap`, `M`):
+  **`HPG = 8`, `n_rows = 16 = kMaxB`, `sum_row_nr = 512 = kMaxT*kMaxB`, `cap = 4096`,
+  `M = 4096`** - a full batch, filling the scratch exactly, with `n_rows` inside
+  `kMaxB` so `step_info`'s own `[kMaxB]` row arrays are safe.  Note this **corrects
+  the model note's `8 heads / 2 kv (HPG 4)`**: it is `HPG = 8`, so `n_head_kv` is 1.
+* **The remaining three functions in the file are sound.**  `xmx_quant_q` (one
+  work-item per row, row-local `amax`, resets `acc`/`m`/`l` in the same launch),
+  `xmx_pv_acc` (one work-item per `(row, dim)`, reads `b.pv` and writes `b.acc`) and
+  `xmx_output` (`pstride = 2 + head_dim`, split 0 real and every other split
+  explicitly zeroed, which is why `n_splits > 1` is redundant rather than wrong).
+  At the call site `n_wg` is computed but unused for this path, and `n_splits` only
+  reaches `xmx_output`.
+
+**The ordering hypothesis is now disproven in BOTH directions, and padding is
+innocent.**  `PF_ATTN_QWAIT=1` was extended to wait on `p->q` after `prim.execute`
+as well as before - before, because the gather -> matmul edge was the one the old
+`st_a` note blamed, and after, because `xmx_softmax` reads `b.qk` and
+`xmx_pv_acc` reads `b.pv` on the queue immediately after the primitives wrote
+them on the interop stream, and nothing covers that edge.  Depth 2048 and 16384,
+three runs each, differing `[dump]` lines:
+
+| | 2048 | 16384 |
+|---|---:|---:|
+| baseline | 72, 64 | 2136, 2142 |
+| `PF_ATTN_QWAIT=1` (queue wait on **both** edges) | 72, 64 | 2134, 2136 |
+| `PF_XMX_TAILBLK=0` (6144 padded columns at 2048) | 64, 40 | - |
+| `PF_ATTN_XMX=0` | 0, 0 | 0, 0 |
+
+**No wait on either edge changes anything, and 6144 extra padded columns changes
+nothing.**  `TAILBLK` is the arm that isolates the padded region - it holds `nk`
+fixed and changes only `blk`, at the one depth where there is no padding to begin
+with - and it moves the count within the same run's noise.  So: not a submission
+race on either ordering domain, and not the padded columns.
+
+**And the argmax is stable in every single arm** (628 at depth 2048, 1056 at 16384,
+including the `PF_ATTN_XMX=0` control at 16384) while the per-layer fingerprints
+move.  That asymmetry is the sharpest remaining clue and it cuts against the
+byte-corruption reading this whole section assumes: a genuine race usually takes the
+argmax with it, as the deleted `moe_router_logits_tiled` did.  Either the
+divergence is confined to rows the argmax cannot see (the dumps' first divergence
+is `layerlast il=4 dev=0`, the last-real-token row only), or what moves is not the
+engine's data but the **fingerprint readback itself**.  The second has not been
+tested at all, and it is where the next look should be: `dbg_dump_fp` /
+`dev_read_back` issue a host -> device -> host round trip per layer inside a
+multi-device forward, and a diagnostic that races the forward it is measuring
+produces exactly this signature - a stable argmax with unstable per-layer
+fingerprints, sensitive to whether a wait was inserted.
+
+### THE MEASUREMENT WAS WRONG.  `PF_DUMP_LAYERS` is not a valid arbiter, and it invented the whole `attn_xmx` locus
+
+**Everything above this line rests on an oracle that cannot arbitrate, and the
+conclusion it produced - "the locus is `attn_xmx`" - is WRONG.**  It is retracted
+here rather than left to be re-derived.
+
+`PF_DUMP_LAYERS` and `PF_DUMP_RAW` round-trip host -> device -> host **inside** the
+forward, once or eight times per layer.  `dev_read_back` is `q.memcpy(...).wait()`
+on the owning device's in-order queue, so it is correctly ordered *as a read* - and
+that is exactly the problem: **it inserts an ordering edge between consecutive
+layers that the forward itself does not have.**  A diagnostic that supplies the
+missing synchronisation will reliably "fix" a missing-synchronisation bug.  That is
+the whole explanation for this file's oldest unsolved note, the one that has sat
+here for months: *"inserting the instrumentation's `q.wait()` calls changes the
+answer - most likely a stream-ordering interaction"*.  It was not a stream
+interaction.  **The instrumentation was the ordering edge.**
+
+**A valid oracle, and it is free.**  `dev/bench_tg.cpp` now takes the full post-prefill
+logit vector with `PF_DUMP_PF_LOGITS=<prefix>` (and already printed post-prefill `l1`,
+which costs one host scan of an already-fetched buffer).  `bench_tg` reads it at
+`e.fetch_logits(0, ...)` - **after `prefill_flush()` and `sync_all()`** - so every
+device wait is behind the prefill and **nothing inside the forward is perturbed**.
+Spread of `l1` over N processes is the nondeterminism measure; full-vector diff is
+the detail.
+
+**With that oracle the prefill is genuinely, badly nondeterministic** (depth 16384,
+`--layer-map 0-19:gpu.0,20-39:gpu.1`, prompt hash and KV pool state identical across
+runs, and the *only* differing lines in the whole output are the two `[trace]` lines):
+
+| depth | post-prefill `l1` over 3 processes | full logit vector |
+|---|---|---|
+| 2048 | 25.4147797 / 25.4286461 / 25.5590782 | - |
+| 16384 | 22.3595371 / 22.9385338 / 23.4675236 | **all 248320 elements differ**, max abs 1.86 / 2.08, rel 8.3e-2 / 9.3e-2 |
+
+and the **argmax is stable throughout** (1056 prefill, 440 first decode, in every
+run).  A whole logit vector shifting a few percent while its argmax survives is not
+what a corrupted read looks like - it is a systematic numerical difference, and it is
+**amplified by the MoE** (whose discrete top-8 turns a small difference into a
+different expert set) rather than caused by it.
+
+**And `PF_ATTN_XMX=0` is NOT reproducible.**  Under the valid oracle it still spreads
+**0.37%**.  The earlier "depth 16384 `PF_ATTN_XMX=0` -> 0 differing" was the
+perturbing oracle lying.  Measured spread of post-prefill `l1` over 3 processes,
+depth 16384:
+
+| arm | spread | |
+|---|---:|---|
+| **`PF_GEMM_DNNL=0` (no oneDNN at all)** | **0** | **REPRODUCIBLE, twice** |
+| `PF_ABL_NOMOE=1` | 0.0655937 | 0.24% - the MoE amplifies ~12x |
+| `PF_ATTN_XMX=0` | 0.0832653 | 0.37% - attn_xmx amplifies ~8x |
+| default | 0.668642 | 2.91% |
+| `PF_XMX_POISON=1` | 0.563503 | 2.48% |
+| `PF_ABL_NOGDN=1` | 0.36235 | 4.24% |
+| `PF_MOE_DP4A=0` | 0.486687 | 1.76% |
+| `PF_W4=0` | 0.645958 | 2.82% |
+| `ONEDNN_MAX_CPU_ISA=1` | - | 2.64% |
+| `ONEDNN_MAX_CPU_ISA=0` (**no threading at all**) | - | **5.38%, worse** |
+| `PF_DNNL_QWAIT=1` (queue **and** stream wait after every oneDNN execute) | - | 1.46% vs 1.38% default |
+
+**So: oneDNN is NECESSARY and the mechanism is still not found.**  Not its host
+threading (disabling it is worse), not submission ordering (every edge, both
+domains), not uninitialised scratch (poison), not padding, not the negative `lim`
+(found and fixed above, demonstrably not it).  `PF_DNNL_QWAIT` (renamed from
+`PF_ATTN_QWAIT`, and now covering all seven executes) is the general form of the
+ordering test and it is the one that finally covered the dense GEMM -> SYCL kernel
+edge; it does not help.
+
+**What the element-wise dumps add, now that they can be trusted at all.**  Holding
+the diagnostic configuration FIXED (the divergence point moves when the dump arity
+changes - 2 waits/layer gave `il04`, 8 waits/layer gave `il12`, same binary
+otherwise), the first differing layer is born from **bit-identical** inputs: every
+one of the 2048 elements of the layer's output differs, at a relative 2.5e-4,
+growing to ~1e-1 by the end.  Both the first token row (`w0`, position 0, which sees
+exactly one key) and the last real token (`w1`) start diverging at the *same* layer,
+so it is not row-local, and it is born inside a layer rather than accumulated into
+one.  Only chunks with `max_nkv >= 2048` ever differ - which is the `attn_xmx`
+threshold, but that is where the *amplification* is, not where the difference is
+born.
+
+**The methodological rule this earns, and it is the generalisation of three separate
+mistakes in this file:** *an oracle that synchronises is not an oracle for a
+missing-synchronisation bug.*  The token hash was rejected earlier as too weak; the
+per-layer fingerprint is rejected now as actively misleading.  What is left is an
+oracle read strictly after the region under test has completed and been waited on.
+
+### The oneDNN axis is now an exhaustive negative result, and that is the finding
+
+`PF_GEMM_DNNL=0` is still the ONLY arm that reproduces (spread 0, three separate
+times), so **oneDNN's presence is necessary**.  It does not follow that oneDNN's
+GEMM is at fault, and by now everything reachable from the descriptor has been
+measured.  Spread of the post-prefill `l1`, depth 16384, non-perturbing oracle:
+
+| hypothesis | arm | result |
+|---|---|---|
+| oneDNN host threading | `ONEDNN_MAX_CPU_ISA=1` / `=0` | 2.64% / **5.38%, worse** |
+| uninitialised memory, `attn_xmx` | `PF_XMX_POISON=1` (all 15 buffers, 0x7F) | 2.48% |
+| uninitialised memory, the whole oneDNN path | `PF_DNNL_POISON=1` (**every** `dev_alloc` buffer) | 2.22% |
+| ordering, attention edges | `PF_ATTN_QWAIT` before and after both primitives | no effect |
+| ordering, dense GEMM -> next SYCL kernel | `p->q.wait()` + `p->st.wait()` after all 7 executes | 1.46% vs 1.38% |
+| ordering, quantizer -> dense GEMM | `p->q.wait()` **before** all 7 executes | 5.26% vs 2.49% |
+| accumulation precision | `PF_DNNL_FPMATH=2` = `fpmath_mode::strict`, exact s32 | 1.44% |
+| accumulation precision, the other way | `PF_DNNL_FPMATH=1` = `any,true` (fp32) | 3.75% |
+| warmup's leftover work | `PF_DNNL_NOWARM=1` | 6.75%, worse |
+| stale descriptor pointers | read the code: every long-lived buffer is allocated in `dnnl_gemm`'s ctor and **never reallocated** (`dev_erase` has no caller) | dead |
+| the MoE's GEMM | `PF_MOE_DP4A=0` (fp32 dequant, no oneDNN) | 1.76% |
+| the native weight stores | `PF_W4=0` | 2.82% |
+
+**So the difference is inside oneDNN's own GPU kernel at run time, past everything
+the descriptor exposes.**  Three specific things are worth writing down because they
+are wrong in this file now:
+
+* **`ONEDNN_MAX_CPU_ISA` is an ISA knob, not a threading knob.**  The rows above
+  therefore do **not** refute host threading - nothing here ever disabled it.  For a
+  SYCL-interop stream the thread count comes from the queue, and this engine never
+  sets it.  **The one mechanism in the whole table that has not actually been tested
+  is multi-threaded oneDNN**, and it remains the single most plausible explanation
+  left: an int8 GEMM split across threads whose partial sums are combined in a
+  runtime-dependent order is exactly a "consistent 1-5% spread with a stable argmax".
+  Settling it needs the queue's oneDNN stream configured for one thread, not an env
+  var on the library.
+* **`fpmath_mode::strict` not reproducing it is informative.**  AGENTS.md's note that
+  an A770 u4 matmul "overflows to NaN at K >= 5376 under narrow fp16-class
+  accumulation" was being read as evidence the accumulation was inexact, and it was
+  used to motivate this test.  Forcing strict changes the value (l1 mean 23.20 vs
+  22.97) and does not remove the spread, so that note is about the *library's*
+  default, not about where the nondeterminism comes from.
+* **`PF_GEMM_DNNL=0` does not isolate the matmul.**  It also swaps the activation
+  quantizer, the grouped-scale layout and the epilogue for the dp4a branch, and it
+  makes `attn_xmx` decline (`dnnl_for_queue` returns null).  So "oneDNN is
+  necessary" is a statement about a whole branch, not about `prim.execute`, and the
+  four env knobs that exist to separate those pieces do not cover the dense GEMM's
+  *input* side.  **The untested seam is the activation quantizer
+  (`act_quant_grp_launch`), which is pure SYCL and is the only computation in that
+  branch that is not oneDNN's** - it is a per-32-group amax reduction feeding the
+  GEMM's source operand, and the engine's `act_view` staleness check (`gen`, `M`,
+  `K`) is host-side, so it cannot see the device scratch being overwritten by a
+  different call with the same shape.
+
+### Host threading is closed too, and for a better reason than a knob
+
+The table above needed a correction and then a real answer.  `ONEDNN_MAX_CPU_ISA`
+reports `onednn_verbose,v1,info,cpu,runtime:DPC++,nthr:28`, i.e. oneDNN *is* using
+28 host threads - so the ISA rows never disabled threading and did not refute it.
+But threading cannot be the mechanism here, for a reason that needs no knob at all:
+
+**every one of these is an int8 x int8 -> s32 matmul, so the accumulation is exact
+integer addition.**  `fpmath_mode` only applies to bf16/fp16 *input* data types and
+does not apply to an int8 source with an s32 destination at all - which is also why
+`PF_DNNL_FPMATH=2` (`strict`) changing the value but not the spread is uninformative
+rather than evidence.  Splitting K across threads and combining **exact integer**
+partials in a runtime-dependent order is bit-for-bit identical.  No thread count can
+produce a 2% difference in a sum that cannot round.
+
+**And oneDNN's own decisions are identical run to run.**  Two runs at depth 2048 with
+`ONEDNN_VERBOSE=2`, timings stripped, diffed line by line: **1572 verbose lines, 0
+differing** - the same implementation selection, the same descriptors, the same
+kernel and nested-primitive cache hits - while the engine's own post-prefill `l1` in
+those same two runs was **25.2284012 vs 25.6039982**.  So the nondeterminism is not
+inside oneDNN's execution.
+
+What that does *not* exclude is that oneDNN is **handed different data**: verbose logs
+descriptors, not contents.  That leaves the activation quantizer
+(`act_quant_grp_launch`) as the untested seam - it is pure SYCL, the only computation
+in the oneDNN branch that is not oneDNN's, and it feeds the GEMM's source operand.
+Read, it is deterministic in itself: one 32-lane work-group per (row, group), the
+value never leaves its register between the max pass and the store, the scale is
+`fmax/127` (exact and associative) and the group sum is `plus<int>` (exact).  Its
+*inputs* are the activation and `up`, the gate projection, and `up` is written by a
+oneDNN GEMM on `p->st` - which makes the GEMM -> quantizer edge the one to look at,
+and `PF_DNNL_QWAIT` already waits on it without effect.  **The engine's
+`act_view` staleness check is host-side (`gen`, `M`, `K`) and cannot see the device
+scratch being overwritten by a different call with the same shape** - that remains
+the structural weakness on this seam.
+
+**One latent defect found while reading it, not the cause.**  The kernel writes the
+group scale from `lane == 0` only:
+`if (lane == 0) sasc[...] = bits;` - while **every** lane quantized its own value
+with `mx` from `reduce_over_group(it.get_sub_group(), ...)`.  Those agree only if the
+sub-group size equals `kW4Group`.  On this part a 32-thread work-group is one
+32-lane sub-group (`dev/sgprobe.cpp` measures `n_sub_groups=1` at `wg=32`), so it is
+correct today - but it is an unstated precondition, and the same shape silently
+produces a wrong-but-plausible scale on any part whose sub-group is 16.  AGENTS.md's
+own rule applies: an `sg_sum`/collective's width is a hardware fact, so the store
+should be from the lane whose reduction it recorded, or the two should be tied
+together explicitly.
+
+### A non-perturbing per-call checksum retires oneDNN as the locus
+
+Every attempt above measured the nondeterminism from outside the branch, and every
+one of them said "somewhere in oneDNN".  The instrument that settles it is
+`PF_ACTQ_SUM`, and the design constraint is the whole point: **the checksum is
+accumulated on the device and read exactly once, in `~dnnl_gemm`.**  A host read-back
+inside the forward is precisely what made the per-layer fingerprint oracle useless
+(this entry's own first half), so `act_quant_grp_launch` takes `int64_t * sumq,
+sums, int slot` and, inside its existing `if (lane == 0)` block, adds
+`reduce_over_group(q8, plus<int>)` and the scale bits through 64-bit relaxed atomics.
+Both are exact and order-independent, so **the checksum is itself deterministic given
+the data** - it can only move if the data moves.
+
+It moves.  Three processes, depth 16384, 2643 quantizer calls each (identical count,
+so the schedule is the same):
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| post-prefill `l1` | 22.5222721 | 23.1787815 | 22.6040802 |
+| activation checksum | `37b52703ed68e724` | `0621ba1658433ad4` | `d14e6d02d94590e3` |
+
+**So oneDNN is being handed different bytes.**  The quantizer is deterministic in
+itself, so its *input* - the fp32 activation, and `up`, the gate projection - already
+differs.  **oneDNN computes faithfully from whatever it is given, and is not the
+locus.**  `ONEDNN_VERBOSE` could never have shown this: it logs descriptors, not
+contents.
+
+**Per-slot diffing then localises it precisely.**  `PF_ACTQ_SHAPE` adds each call's
+`M`/`K`, and with two `dnnl_gemm` instances (one per `--layer-map` device) each
+printing its own slot block, depth 2048 gives:
+
+| device block | calls | `M==1` | `M>1` | differing | first differing `M>1` call |
+|---|---:|---:|---:|---:|---|
+| 0 (layers 0-19) | 402 | 161 | 241 | 100 (48 / 52) | **slot 350**, `qsum` -422904 -> -422947 |
+| 1 (layers 20-39) | 400 | 161 | 239 | 160 (80 / 80) | **slot 320**, `qsum` -117931 -> -117492 |
+
+`M == 1` is the **multi-device decode command graph being recorded at startup** (40
+layers x 2 calls) plus the decode step at the end; `M > 1` is the prefill.  And
+**48 of the 161 startup `M == 1` calls already differ**, so the divergence exists
+*before the prefill runs* - which is consistent with the earlier element-wise finding
+that chunks with `max_nkv < 2048` are bit-identical while later ones are not, and
+inconsistent with a story where the prefill's own arithmetic invents it.
+
+The size is what makes this tractable.  Slot 350 is `M=512, K=2048`: **1,048,576
+values, of which 43 differ, each by exactly one int8 step** (`dqsum = -43` against a
+population of 1,048,576; the scale plane's `dssum` moves by 27,462 out of 225
+million).  **That is a handful of activation values sitting within an ulp of a
+quantisation boundary** - the smallest difference this whole investigation has ever
+produced, and the first one that is localisable to a call index.
+
+**What this is not.**  It is not a near-tie in the MoE router: flipping one of the
+top-8 experts changes the layer's output by far more than 43 values in a million.
+It is not `attn_xmx` either - that only amplifies, and `PF_ATTN_XMX=0` still spreads
+0.37%.  The instrument is what matters for the next step: **a per-call,
+non-perturbing, order-independent checksum of the quantized activation is a
+bisection instrument that needs no further instrumentation** - diff the per-slot
+lines between two processes and the first differing slot is the call whose *input*
+already differed.  Mapping that slot index to (chunk, layer, call) is the one cheap
+step left, and it is the step that turns "189 calls into the prefill" into a layer
+number.
+
+#### Where the first differing call actually is
+
+`PF_ACTQ_SHAPE` prints each call's `M`/`K`, and under `0-19:gpu.0,20-39:gpu.1` there
+are **20 layers per device and exactly 3 quantized calls per layer**, so the `M > 1`
+(prefill) calls are `4 chunks x 60 per chunk` and a slot index divides into
+`(chunk, layer, position)`.  Depth 2048, three processes, `PF_DNNL_NOWARM=1` so the
+startup decode-graph recording is out of the slot range:
+
+| device block | first differing `M > 1` call | chunk | global layer | that call's `(M,K)` |
+|---|---|---:|---:|---|
+| 0 (layers 0-19) | `#173` (slot 334) | **3** | **17** | `(512, 4096)` |
+| 1 (layers 20-39) | `#159` (slot 320) | **3** | **33** | `(512, 512)` |
+
+**Both devices first differ in chunk 3**, and chunk 3 is exactly the chunk where
+`max_nkv` reaches 2048 and `attn_xmx` engages (chunk 0/1/2 have `max_nkv` 512/1024/
+1536, below `PF_ATTN_XMX_MIN`).  That is independent confirmation, from a
+non-perturbing instrument, of what the element-wise dumps showed - the first three
+chunks are bit-identical and the fourth is not.  It is *not* confirmation that
+`attn_xmx` causes it: `PF_ATTN_XMX=0` still spreads 0.37%, so this is where the
+difference is **visible**, and the honest reading is that whatever amplifies there
+is downstream of a difference that is already present upstream.
+
+**How far this can be trusted.**  The layer index rests on all 20 layers making
+exactly 3 quantized calls, which the 100%-matching `(M,K)` periodicity supports.  The
+position *within* a layer does not: the best `(M,K)` period found is 4 against 3 calls
+per layer, i.e. the `K` sequence is degenerate and two of a layer's three calls share a
+`K`.  **So read "chunk 3, layer ~17 / ~33" and not "position 2 of 3".**  Disambiguating
+needs a per-call identifier the engine supplies, and `dnnl_gemm::quantize()` has no
+weight `key` to carry one - threading it would touch every caller in the engine,
+`engine_mtp.cpp` and `engine_dflash.cpp`.
+
+#### The arm bisection, and it reverses the "amplifier only" reading
+
+With the per-slot checksum the arms can finally be compared on *where* they first
+differ rather than on a downstream logit norm, and the result reverses the reading
+above.  Depth 2048, three processes each, `PF_DNNL_NOWARM=1 PF_ACTQ_SUM PF_ACTQ_SHAPE`:
+
+| arm | first differing `M > 1` quantized activation |
+|---|---|
+| default | chunk 3, layer 17 (dev 0) / layer 13 (dev 1) |
+| **`PF_ATTN_XMX=0`** | **REPRODUCIBLE - 0 of 241 and 0 of 239 calls differ** |
+| `PF_ABL_NOGDN=1` | chunk 3, layer 17 / 13 |
+| `PF_ABL_NOMOE=1` | chunk 3, layer 17 / 13 |
+| `PF_MOE_DP4A=0` | chunk 3, layer 17 / 13 |
+| `PF_W4=0` | chunk 4, layer 2 / chunk 3, layer 13 |
+
+**`PF_ATTN_XMX=0` makes the quantized activation bit-reproducible.**  The earlier
+"it still spreads 0.37% of `l1`" was measured on the logit norm, which sums every
+chunk and every downstream amplification; at the quantized-activation level the
+classic attention is exactly reproducible.  **`attn_xmx` creates the difference, it
+is not only an amplifier** - and every other arm lands on the *same* (chunk, layer),
+which says the MoE, the GDN, the expert GEMM and the weight stores are all innocent of
+creating it.
+
+The position is the mechanism.  Chunk 3 layers 0-16 are clean and layer 17 is not, so
+this is not "one layer goes wrong" but **a per-layer difference small enough to stay
+invisible for sixteen layers and then cross a rounding boundary**.  That fits the
+measured size exactly: **43 of 1,048,576 int8 values, each off by exactly one step.**
+One step is `round()` in `xmx_softmax`'s requantization -
+`prow[k] = round(fmin(255, e * 255))` where `e = exp(qk*sc - blo)` and
+`sc = qsc[i] * bs[0] * attn_scale`.  `qk` is an exact int32 matmul result, so the only
+inputs to that `exp` that can move are `qsc[i]` (from `xmx_quant_q`'s row amax),
+`bs[0]`/`bs[1]` (one scale per 8192-key block, from the gather's two-stage `fmax`),
+and `attn_scale` - and a one-ulp move in any of them flips a `round()` for only the
+handful of keys whose `e * 255` sits near an integer.  **A uniform scale difference
+would move every element; a ulp difference in the exponent moves a few `round()`
+results.  The measurement says the latter.**
+
+**So the next single measurement is small and it splits the remaining space in two:**
+device-side checksums, per gather call, of the **gathered K/V bytes** and of
+**`bs[0]`/`bs[1]` separately**.  If the K/V bytes move, the paged pool's contents are
+changing; if only the scales move, the gather read identical bytes and the block-max
+reduction is what differs.  `PF_ACTQ_SUM` is the template - same rule (accumulate on
+the device, read once), same reason (a host read-back inside the forward is what broke
+the fingerprint oracle).  It is *not* implemented: threading a per-call slot through
+`xmx_gather` into the `fold` and `pass 2` is a mechanical change that was started and
+then reverted rather than left half-applied.
+
+#### The K/V bytes change and the block-max reduction does not
+
+`PF_XMX_SUM` is the same device-accumulate / read-once-at-exit instrument applied to
+the gather, and it splits the two remaining candidates by construction: `kv` hashes
+the gathered K/V **bytes**, `bs` hashes `bs[0]`/`bs[1]` **separately**.  Depth 2048,
+three processes:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| gathered K/V bytes | `645ac384178c6ed6` | `7ef16a9ea40406a4` | `f8f29d6a0e7fddd4` |
+| block scales `bs[0]`/`bs[1]` | `3f21ef1ab7506363` | `3f21ef1ab7506363` | `3f21ef1ab7506363` |
+
+**18 of the 20 gather calls have different K/V bytes, and ZERO have a different block
+scale** - `bs0`/`bs1` are bit-identical at every call in every run (slot 2's values are
+literally `1033011200` / `1015226368` in all three).
+
+**So the paged pool's contents change between processes, and the two-stage `fmax`
+reduction over those contents is exactly deterministic.**  The reduction is exonerated
+along with oneDNN, and the difference is on the **write** side of the KV pool, not the
+read side and not the scale derivation.  That is also consistent with everything above:
+a K/V byte differing by one quantization step is exactly a "few values off by one
+step" signature, and it explains the ulp-in-the-exponent mechanism without needing the
+scale to move at all - `qk` is an int32 dot of two int8 blocks, so one changed byte
+moves one score by a whole step.
+
+`calls=20` is chunk 3's ten full-attention layers (`full_attn_interval=4`, so il03,
+07, ... 39 - and chunk 3 is the only prefill chunk where `attn_xmx` engages) followed
+by the decode step's ten.  **The first differing gather is slot 2, i.e. il11.**
+
+**And the writer is now identified.**  `attn_xmx` only ever *reads* the pool - all ten
+of its `kv_row_data` uses are `const int8_t *`.  The writer is
+**`qk_norm_rope.cpp`**: it takes `kpool`/`vpool`/`kscales`/`vscales` and dispatches on
+`kv_dtype_t`, and for `i8` it launches with both scale planes, i.e. it does the q/k
+norm, the RoPE, **and** the per-32-group i8 quantization of the KV it stores.
+
+**The next single measurement is therefore the same instrument one level down**:
+per-call device-side checksums of the K/V bytes and the two scale planes *as
+`qk_norm_rope` stores them*.  If they already differ on the chunk-0 store then the
+divergence is born in the store and the read path was never involved; if they match
+until chunk 3, then something between the chunks changes them.  Note the tension to
+resolve: the store runs on **both** the xmx and the classic path, and
+`PF_ATTN_XMX=0` is bit-reproducible, so the store cannot be unconditionally the
+source - which means either its input (the activation) already differs in the default
+arm, or the xmx path perturbs something the later store reads.
+
+#### The store's input already differs in the FIRST prefill chunk - and the tension resolves
+
+`PF_KVSTORE_SUM` folds the post-norm, post-RoPE K and V into a per-call device checksum
+**inside the existing kernel** (no extra launch, so no new ordering edge - both of
+which this investigation has shown can move the answer).  It prints each call's extents
+so the slot index is decodable, which immediately paid for itself: the earlier reading
+of the `PF_XMX_SUM` result assumed slots 0-19 were the startup decode-graph recording,
+and that had never been checked.
+
+Depth 2048, three processes, `PF_KVSTORE_SUM=1`:
+
+| arm | calls | differing | first differing |
+|---|---:|---:|---|
+| default | 100 | 9 | slots 2,4,6,8 (`nrows=1 nreal=1`) then **10,12,14,16,18** (`nrows=16 nreal=32`) |
+| `PF_ATTN_XMX=0` | 100 | **0** | REPRODUCIBLE |
+
+`100 = 20 + 4 chunks x 20 layers`: twenty `M == 1` calls are the startup decode-graph
+recording plus its replays, and the rest are the prefill.  **The `M == 1` slots are
+downstream and prove nothing** - a replayed graph re-reads the buffers at replay time,
+so those slots inherit the prefill's difference.  **The signal is slots 10+.**  Those
+are the `M == 512` prefill calls, and **the very first one already differs.**
+
+**And that is the narrowest this has been.**  `PF_ACTQ_SUM` established that the
+prefill's *quantized GEMM inputs* are bit-identical in chunks 0, 1 and 2.  This
+establishes that the *K/V actually stored* are not.  So the difference is created
+**between the quantized GEMM's input and the stored K/V** - i.e. in the qkv GEMM's
+output path or in the norm + RoPE that `qk_norm_rope` applies in place before
+quantizing.  An int32 accumulator converted to fp32 by a per-group-scaled epilogue is
+the obvious place for an order-dependent fp32 accumulation, and it is downstream of
+every GEMM *input* this investigation has been able to see.
+
+**This also resolves the tension recorded above.**  The store runs on both the xmx and
+the classic path, and `PF_ATTN_XMX=0` is bit-reproducible, so the store could not be
+unconditionally the source.  It is not: the store's *input* is what differs, and it
+differs only when `attn_xmx` is enabled - so `attn_xmx` changes what the qkv path is
+fed, not what the store does.
+
+#### The norm + RoPE is exonerated, the refutations survive a sharper oracle, and the
+#### prefill's dense GEMM does not go through oneDNN at all
+
+`PF_KVSTORE_SUM` was split into a **pre** hash (the qkv GEMM's fp32 output, taken at
+the top of the kernel before its in-place norm and RoPE touch anything) and a **post**
+hash, in the same slot pair, so one measurement separates the GEMM's epilogue from the
+norm + RoPE.  Depth 2048, three processes:
+
+| arm | pre differs | post differs |
+|---|---:|---:|
+| default | 9 | 9 |
+| `PF_ATTN_XMX=0` | **0** | **0** |
+
+**Pre and post differ at exactly the same slots.**  The norm + RoPE are exonerated: the
+K/V already differ when `qk_norm_rope` receives them, i.e. in the qkv GEMM's fp32
+output.
+
+**The refutations were re-run with this oracle rather than `l1`**, because every one of
+them was originally measured with an oracle this entry has since shown cannot arbitrate.
+They all hold: `PF_DNNL_QWAIT=1`, `PF_DNNL_FPMATH=2`, `PF_XMX_POISON=1`,
+`PF_DNNL_NOWARM=1` and `PF_W4=0` all leave pre/post differing at 9 slots.  Only
+`PF_ATTN_XMX=0` is reproducible.
+
+**And then the accumulator probe answered a question this entry has had open for
+several rounds, by coming back empty.**  `PF_DNNL_ACC_SUM` hashes `p->acc` right after
+oneDNN's `prim.execute` at all three dense sites (the k5 prefill site and both
+`w.wmem` sites).  It reports **`calls=0`** - at depth 2048, **not one of them fires.**
+
+**So the prefill's dense GEMM does not use oneDNN's matmul at all.**  It is a SYCL
+kernel (`w4_gemm_launch` or `nat_gemm_launch`, both pure SYCL, both reached before the
+oneDNN branch).  Two consequences:
+
+* **`PF_GEMM_DNNL=0` is fully explained by `attn_xmx` declining.**  It returns false from
+  `dnnl_for_queue(q) == nullptr`, so the classic attention is used - and that is the
+  whole of its reproducibility.  Every "oneDNN is necessary" reading built on that arm
+  was wrong in the same way as the earlier `PF_ATTN_XMX=0` reading: the arm changes more
+  than the thing it names.
+* **The remaining site is the prefill's SYCL GEMM or its epilogue**, writing `kbuf`.
+  Given the prefill's chunk-0 qkv already differs while `attn_xmx` has not yet run
+  even once (it first engages in chunk 3), the coupling is not a side effect of
+  `attn_xmx`'s execution - it is that `attn_xmx_enabled` changes which branch the plan
+  takes.
+
+#### The wall: a schedule-sensitive bug cannot be attributed with an instrument that
+#### perturbs the schedule
+
+The previous commit's attribution - "the prefill's first qkv GEMM" - is **not stable**,
+and the way it failed is the most useful thing in this whole entry.
+
+Adding a `pos` field to `PF_KVSTORE_SUM` (a third int64 per slot, written by the
+device, purely so a slot index could be decoded into a chunk) changed nothing about what
+the probe does - two sub-group reductions and two atomics inside `qk_norm_rope` - and
+the answer moved completely:
+
+| build | the calls that differ |
+|---|---|
+| previous | the prefill's first M == 512 calls, `nrows=16 nreal=32` |
+| with the `pos` field | **only `nrows=1 nreal=1` at `pos=2048`** - the decode step |
+
+Both are true.  `l1` (the non-perturbing oracle) still reports the prefill's output
+differing, and the prefill's stored K/V are now bit-identical, so the two statements
+are only consistent if **the instrument moved the divergence**.
+
+**So: an instrument that perturbs the schedule cannot attribute a schedule-sensitive
+bug to a call site.**  Every per-call reading in this entry is a statement about the
+*instrumented* build, not the shipped one - including, in principle, every refutation,
+because an arm that reduces the perturbation makes the symptom disappear, which is
+observationally identical to fixing it.  This is the same lesson as the fingerprint
+oracle, one level deeper: that oracle *supplied a missing synchronisation*, this class
+*changes a schedule*, and both produce confident, plausible, wrong answers.
+
+What survives, because it holds in every build and under both oracles:
+
+* **`PF_ATTN_XMX=0` is bit-reproducible; the default is not.**  Every arm, every
+  oracle, every build.
+* **`pre` and `post` agree** on which calls differ, in every build: the norm + RoPE
+  add nothing.
+* **The prefill's dense GEMM does not use oneDNN's `prim.execute`** - `calls=0` at all
+  three dense sites.  That is a structural fact, not a timing-sensitive one, and it is
+  what makes `PF_GEMM_DNNL=0`'s reproducibility entirely a story about
+  `attn_xmx` declining.
+* **oneDNN's own decisions are identical run to run** (1572 verbose lines, 0 differing),
+  and its arithmetic is exact integer, so it cannot be the source on its own.
+
+**What it would take to go further.**  Not another probe inside the forward - every one
+of those is now known to move the thing it measures.  Either (a) an instrument that
+provably cannot change the schedule, which for a kernel means *not touching it*, and
+the only such thing left is a checksum computed by an **already-existing** kernel on
+data it already touches, or (b) accept the symptom and characterise it externally: it
+is stable in argmax, it is 1-5% on the logit vector, and it only appears once
+`attn_xmx` engages at 2048 keys.
+
+#### The profile on this build, and the router is the tractable target
+
+Re-profiled after every change this entry describes (NT=16384, 35B A3B / 2x A770):
+
+| | t/s | wall | share of the prefill |
+|---|---:|---:|---:|
+| baseline | 1420.1 | 11.537 s | - |
+| `PF_ABL_NOMOE=1` | 5056.6 | 3.240 s | **routed experts = 71.9%** |
+| `PF_ABL_NOGDN=1` | 1548.0 | 10.584 s | GDN = 8.3% |
+| `PF_ATTN_XMX=0` | 750.7 | 21.825 s | attention ~15%; `attn_xmx` is worth 1.89x |
+
+`PF_MOE_TIME`'s phase split (absolute values inflated ~1.4x by its own serialisation,
+shares usable): `router=1358.7 csr=119.2 gate_up=9223.4 down=5314.6 reduce=140.2`
+over `calls=1280` - so `gate_up` is 57% of the MoE and `down` 33%, and **the router is
+1.06 ms per call**.
+
+**The router is ~6% of the prefill and runs ~30x off its own roofline**: 512 tokens x
+256 experts x 2048 = 268 M-MAC, and the engine's measured dp4a rate is 7.6 T-MAC/s, so
+it should be ~35 us against a measured 1.06 ms.  It is also the only sizeable item in
+the MoE that has **not** already resisted four restructurings.  So it is the tractable
+target, and this entry's next line of work.
+
+**A working version of the tiling was built, measured, and then deleted** - and the
+deletion is the finding.  One expert per work-group with `MT` tokens, lanes keeping the
+same `k = 32*b + lane` mapping and the same `sg_sum`, so it is arithmetically identical
+to the GEMV form by construction:
+
+| MT | router phase | pp16384 |
+|---|---:|---:|
+| 1 (shipped) | 1711.2 ms | 1391.8 t/s |
+| **8** | **1159.1 ms** | **1422.7 t/s (+2.2%)** |
+| 16 | 1331.3 ms | 1413.3 t/s |
+
+**and it was not exact.**  `PF_MOE_ROUTER_AB` - a device-side A/B against the GEMV form,
+because "bit-identical" is a claim a benchmark cannot check - reported **131072 of
+131072 logits differing, max abs 9.77, and `max|tiled| = 11` where the GEMV form's max is
+6.204**.  The cause is the shape this file warns about twice: the token loop was bounded
+by a **runtime** `nm` (the tail-tile count), so `acc[m]` was indexed by a
+non-constant, which on this backend places `acc` in **private/scratch memory** instead of
+registers.  The fix is the prescribed one - **predicate** the store rather than bound the
+loop with a runtime value, keeping `m` a compile-time constant - and that was not done
+here.
+
+**Two of this file's own lessons fired in the making of that probe, both worth
+recording:**
+
+* **The A/B's control was not the same source.**  It reported 131072-of-131072 differing
+  *for every MT including MT=1*, with identical magnitudes - which is impossible for four
+  different computations and was the tell.  MT=1 had been routed to `moe_router_logits_tiled<GP,1>`
+  rather than to `moe_router_logits<GP>` itself.  With MT=1 routed to the GEMV form the
+  control reports **0 of 131072, max|d| = 0**, and the tiled form is then genuinely
+  broken rather than the harness.  **A control that is not the same code path as the thing
+  it controls cannot fail.**
+* **A count of "differ" without the magnitude is uninformative.**  The first version
+  printed only a count, which cannot distinguish a 1-ulp difference from a structurally
+  wrong logit - and only the second is capable of moving the MoE's discrete top-8.  The
+  count alone would have been filed as "a rounding difference".
+
+**The prescribed fix did NOT work, and the diagnosis behind it was wrong.**  The runtime
+`nm` bound is real and is the documented private-memory shape, but it is **not** the
+correctness cause: rewriting the tiled form to unroll the full compile-time `MT` and
+predicate the tail's store - clamping the tail's activation address so every load stays
+in bounds, and leaving `sg_sum` in the unrolled loop so the collective stays uniform -
+produced a **byte-identical wrong answer**: `max|d| = 9.77069`, `max|tiled| = 11`, the
+same for MT=4, 8 and 16 and the same as the runtime-bound version.  Two independent
+implementations of the tiling converge on the same wrong value, so the cause is
+systematic and **still unidentified**.  Deleted again; the +2.2% is real but its
+correctness is not established, and this file's rule is explicit that a switch returning
+wrong results faster is worse than no switch.
+
+**THE ROUTER WAS DROPPING HALF OF EVERY DOT PRODUCT, AND THE "STILL OPEN" ENTRY ABOVE WAS THIS BUG.**  Found by building two closed-form probes into `dev/grp_rout` and then chasing them properly.  `moe_router_logits` launches `nd_range<1>(..., 32)` - a work-group of **exactly 32 threads** - with **no `[[sycl::reqd_sub_group_size(32)]]`** on the lambda, and then reduces with `sg_sum<32>`, whose mask ladder is `permute_group_by_xor` with masks 16, 8, 4, 2, 1.  On this backend that first mask-16 step reads only lanes 0-15, so **lane 0 stored a sum over half the K range**: every router logit lost the contribution of the upper 16 lanes.  Adding the attribute makes `dev/grp_rout` exact at **0 of 131072**.
+
+| probe | what it pins | before | after |
+|---|---|---|---|
+| `ones` (hx = hw = 1) | logit == n_embd exactly | 0 of 131072 off | 0 of 131072 off |
+| `eye` (hw[e][k] = (k==e), hx[t][k] = 1+0.25k) | logit == 1+0.25e, no accumulation at all | **32768 of 131072 wrong** | **0 of 131072** |
+| random, exact within-token logit differences over the top-8 | magnitude | **64.895** | **2.3e-05** |
+| random, expert sets | selection | **512 of 512 tokens differ** | **0** |
+
+**`ones` mode was blind and that is the lesson.**  With every logit equal, any error that hits all experts equally leaves the softmax uniform, so a coverage bug of *any* size is invisible.  The probe that found it is the one whose correct answer is a **distinctive per-expert constant with no accumulation**, so the wrong ones cannot cancel: the failure was exactly the experts with `e mod 32 >= 16`, each reading logit **0** instead of `1+0.25e`, which is the signature of lane 0 not seeing lanes 16-31.  **A reference whose every answer is identical cannot find a bug whose every answer is identical.**
+
+**This corrects a recorded conclusion in this file, in the device-profile section.**  `dev/sgprobe.cpp` measured `wg=32, no attribute -> sub_group_range=32, n_sub_groups=1` on both the A770 and the Iris Xe, and the tiled-router entry below used that to reject "a 32-thread work-group is two 16-lane sub-groups" as the cause of *its* nondeterminism.  The measurement did not transfer to this kernel.  **The rule that does hold is narrower and is about the work-group width, not the device:** a work-group of **exactly 32 threads** is the ambiguous case for the sub-group partition, while a multi-warp one is not - which is why `moe_grp_impl`, 71.9% of the prefill, gets away with the same omission.  Its `kMoEWG = kMoERG * 32` is 512 or 1024 threads, so its 32-lane sub-groups are unambiguous and `dev/grp_min`'s 0/8192 is real.  A sweep of the whole kernel tree for "32-thread work-group + hardcoded `sg_sum<32>` + no declaration" now finds exactly one site, the router, which is fixed.  `reduce_over_group` queries its sub-group at run time and is not affected.
+
+**And it moves an oracle, which is the part that matters for everything above.**  pp512's argmax goes **4821 -> 11171** (4 of 4 separate processes), while pp16384 (1204), pp65536 (4779), `test_decode_vs_prefill` (3/3) and `test_w4_vs_cpuref` (SAME) are unchanged.  So **4821 was an artefact of the broken router**, and **11171 - the value this file twice called "the tiled router's known-bad signature" - is the correct one.**  It was the correct answer all along and the bug was what prevented it from being produced.  Every number in this entry that cites 4821 as an oracle is measuring the broken kernel; the throughput figures are unaffected (a systematically halved logit is still a deterministic function of the same inputs, and the sweep, not the argmax, is the statistic).  **The stable oracles are now pp512 11171, pp16384 1204, pp65536 4779.**
+
+**And a correction to something this entry did twice.**  `dev/bench_tg` and
+`dev/bench_pf` build **different prompts**, so their prefill argmaxes are different
+quantities and must never be compared: at depth 512 `bench_tg` reports 8307 and
+`bench_pf` reports 4821, and at 16384 they report 1056 and 1204.  Recognising the tiled
+router's "known-bad signature" as 11171 was a **cross-harness comparison**, and the
+"stale binary" story below was built on the same conflation.  The stale binary itself
+was real - `bench_pf` reported 11171 before it was rebuilt and 4821 after - but the two
+harnesses have never agreed on the number, and neither is the other's oracle.
+
+**And a stale-binary scare that turned out to be exactly this file's own rule, one level
+deeper.**  The gates immediately after the revert reported **pp512 argmax 11171** - the
+tiled router's known-bad signature - twice, on runs that "passed" every other cell.  It
+was not a regression: `dev/final.sh` **only ran, never built**, and `dev/pf.sh` executes
+`dev/bench_pf`, which is a *different binary* from `build/sycl-infer`.  Rebuilding only
+the latter left the prefill gate verifying a router that was no longer in the tree.  The
+script now rebuilds both and **asserts each binary's mtime against
+`libsycl_infer_core.a`**, because a gate that cannot tell a stale binary from a current
+one is not a gate - which is what this file already says about `dev/build_*.sh`, and the
+same failure one layer up.
+
+**The tiling is not left behind as a switch.**  A knob that returns wrong results 2.2%
+faster is exactly the trap this file keeps warning about, and it is indistinguishable
+from a win unless someone runs the exactness check.  Reverted; the profile above and the
+prescribed fix are what is worth keeping.
+
+#### What it actually costs, measured against the approximation already being made
+
+This is the number that matters for deciding whether to keep working on it.  Depth
+16384, 35B A3B / 2x A770, post-prefill logits at the non-perturbing read point - four
+processes with `attn_xmx` on and two with it off:
+
+| | max abs diff | rms diff |
+|---|---:|---:|
+| run to run, `attn_xmx` ON (worst of 6 pairs) | **1.9016** | **0.3712** |
+| run to run, `attn_xmx` OFF (the control) | 0.2580 | 0.0448 |
+| **`attn_xmx` vs classic, i.e. the approximation the engine already makes** | **1.6813** | **0.3416** |
+
+**The run-to-run jitter is 113% of the approximation on max and 109% on rms - the same
+order of magnitude, not an order less.**  So the honest characterisation is not "int8
+prefill attention is a few percent less reproducible": it is **that the run-to-run
+spread is indistinguishable from the difference between the int8 attention path and the
+classic one.**  Enabling `attn_xmx` multiplies a smaller, always-present
+nondeterminism by about 7-8x (0.0448 rms -> 0.3712); `attn_xmx` itself is what raises it
+to the scale of the approximation it replaces.
+
+What it does **not** cost, all measured:
+
+* **The sampled output: nothing.**  argmax 1056 in every one of the six runs at depth
+  16384 and 628 in every run at depth 2048, and the generated token hash was identical
+  across processes at both depths.
+* **Performance: nothing.**  1313.9 t/s pp65536 and 1419.7 t/s pp16384, unchanged by
+  every probe, and no arm has ever crashed a real run.
+
+What it **does** cost is **reproducibility, and therefore the ability to see a real
+regression**: the noise floor on the post-prefill logits is ~1.7 max / ~0.37 rms at depth
+16384, so nothing smaller than that can be distinguished from run-to-run variation -
+which is exactly why this bug survived a long search.  Depth matters: at 2048 the
+spread is ~0.57% of `l1` against ~5% at 16384, roughly 10x.
+
+`PF_ATTN_XMX=0` is a usable *reproducibility mode* (7x less noise) but it is **not a
+fix**: the control's own two runs differ by max 0.258 / rms 0.0448, so there is a
+smaller nondeterminism underneath that this investigation has not attributed either.
+
+**Honest position: the divergence needs `attn_xmx` enabled, is invisible to the argmax
+and to the token stream, and its run-to-run spread is the same size as the int8
+approximation it replaces.**  It is not fixed; the remaining work is not more
+instrumentation, and the cost/benefit of continuing should be judged against the table
+above rather than against "the prefill is nondeterministic".  Ruled out by
+measurement:
+the perturbing oracle itself, `attn_xmx`-specificity, uninitialised memory in both
+`attn_xmx` and the whole oneDNN path, submission ordering on every edge and both
+domains, accumulation precision, warmup, the padded columns, and the negative `lim`.
+Ruled out by reading the code: `attn_xmx`'s pad fill, stale `P` beyond `nk`,
+`[blk, kBlk)`, the block-max partials, the scratch capacity (`HPG = 8`,
+`n_rows = 16 = kMaxB`, `sum_row_nr = 512 = kMaxT*kMaxB`, `cap = M = 4096` - a full
+batch, filling the scratch exactly), `xmx_quant_q` / `xmx_pv_acc` /
+`xmx_output`, and every stale-descriptor-pointer route.
+
+**Fixed on the way, and a real bug in its own right: the KV pool's host bookkeeping
+was sized by `n_blocks` instead of `pool_cap`, which is a heap out-of-bounds read
+AND write the moment the virtual pool grows.**  A block index legitimately reaches
+`pool_cap - 1` - `kv_grow()` hands out indices up to `pool_blocks - 1` - while
+`n_blocks` is only the initial committed count.  All three setup sites now size
+`block_used_` / `block_extent_` / `pc_block_node_` to `pool_cap`.  The vulnerable
+site is the virtual pool with an automatic cap, which is the default path for any
+long-context run (`kv_cap_mb = -1`).  Two symptoms of the same oversight:  `alloc_block()`
+indexed both arrays with no bound check and wrote past the end, and `free_block()`
+*did* have a bound check - so a grown block was **never returned to the pool**, which
+is why `in_use=524` of `pool=528` looked plausible rather than alarming.
+`alloc_block()` now throws on an out-of-range index instead of `continue`-ing past
+it, because the silent skip is what let this read as "decode is flaky at 16k".
+
+Separately, `dev/bench_grp` says 6.0/3.4 ms per call while the engine measures
+6.9/3.6 ms (274.9/143.9 ms over 40 calls), and **that gap is work-group tail
+imbalance, not the kernel**: `PF_MOE_HIST`'s distribution runs from 1 to 124 pairs
+per active expert, so one tile's work-group runs 1 tile and the next runs 8, and
+the engine's real routing is less smooth than the benchmark's synthetic one.  With
+`M=8` there are ~560 tiles instead of 300 and the imbalance is worse, which is the
+price paid for the 17%; a grouped-M formulation (16 rows for the 95 experts with
+p<=32, 8 for the rest) is what would recover it.
+
+### What an external A770 kernel library did and did not settle
+
+Reviewed the A770/DG2 fork of Intel's `omni_xpu_kernel` (the PyTorch/XRT kernel
+collection) against this engine.  Most of it does not transfer, and the parts that
+do are narrower than they look.  The one substantive result replaces a recorded
+blocker, and it is below.
+
+**DPAS operand delivery: the recorded blocker is real, and there is a 6x better
+way to pay it.**  This file closes DPAS partly because `dev/bench_dpas_gemm`
+measured 7.44 ms against `nat_gemm`'s 0.200 and attributed the cost to "building
+the two 64/32-element cross-lane offset vectors ... serialised through local
+memory".  That fork's DPAS flash attention never builds an offset vector: it does
+`block_load` (lane-contiguous, 16-byte aligned) -> `slm_block_store` ->
+`barrier` -> `slm_block_load` **at a permuted address**, i.e. it moves the
+cross-lane permutation into the SLM *address*, which each lane computes for
+itself.  `dev/dpas_slm` measures the three delivery paths with identical DPAS
+count and identical accumulator, on the A770, oneAPI 2026.1:
+
+| B-operand delivery | 512 WG | 2048 WG | 8192 WG |
+|---|---:|---:|---:|
+| A  `sv::gather` + runtime offset vector | 0.71 | 0.76 | 0.77 T-MAC/s |
+| B  `slm_block_store` / `slm_block_load` | 4.60 | 4.85 | 4.92 |
+| C  already in DPAS order (no transform) | 13.29 | 14.26 | **14.46** |
+
+Three things follow. **The recorded 18x penalty reproduces** (A vs C, constant
+across grid sizes - consistent with "proportional to the WORK-GROUP COUNT").
+**The fork's recipe is worth 6x** (0.77 -> 4.9). **And it is still not free**:
+B sits ~2.9x above C.  So the honest statement is that DPAS on this part is not
+closed because the unit is slow - at 14.5 T-MAC/s arm C matches oneDNN's PV rate
+and beats dp4a - but because getting operands into DPAS order costs 3x through
+SLM or 18x through offset vectors, and only a **load-time pre-pack** reaches the
+rate, which the 18 GiB weight wall blocks for weights and does not for
+activations.  `slm_block_store` / `slm_block_load` are ESIMD built-ins
+(`sycl/ext/intel/esimd/memory.hpp`) and the SLM comes from `sv::slm_init<N>()`, not
+`local_accessor` - which is also the escape from this file's recorded
+`copy_to(local_accessor)`-returns-zero trap.
+
+**DPAS availability is PER MICROARCHITECTURE, and it is now a device-profile
+field.**  **The A770 is Xe-HPG (DG2) and HAS the XMX/DPAS unit; the Iris Xe is
+Xe-LP and does not.**  `dev/dpas_compat`: on the A770 `dpas<8,8,float>` (fp16 x
+fp16, fp32 accumulate, i.e. the fork's form) **and**
+`dpas<8,8,int32_t,...,u4,s8,64,32,64>` (the form this file's own probes used) both
+JIT fine; on the Iris Xe **both fail**, the second with
+
+    llvm.genx.dpas2.v64f32.v64f32.v64i32.v64i32(...):
+        Intrinsic is not supported by the <XeLP> platform
+
+(`block_load<uint32_t,64>(p, overaligned_tag<16>)` fails the same way, its
+`lsc.load.ugm.v16i32` lowering).  **So a DPAS kernel here does not run slowly on
+an Iris Xe - it does not BUILD**, and since the reference model runs on an Iris Xe
+while the AOT target is `acm-g10`, an ungated DPAS kernel is a portability
+landmine.  `dev/devinfo` shows the split is ADVERTISED, which is what makes this a
+query rather than a name match:
+
+| | `cl_intel_subgroup_matrix_multiply_accumulate` | `..._split_matrix_multiply_accumulate` |
+|---|:-:|:-:|
+| A770 (Xe-HPG) | yes | yes |
+| Iris Xe (Xe-LP) | no | no |
+
+**`si::dev::has_dpas_for_queue(q)` reads it from `info::device::extensions`** and
+`profile::hw.has_dpas` is only the fallback, which is the order this file's device
+profile section asks for (hardware facts are queried).  It is per-queue, not
+per-process, because a `--layer-map` may span the two architectures.
+`PF_DEVICE_INFO=1` prints `xmx(dpas)=1` on the A770.  `extensions` is deprecated in
+SYCL 2020 in favour of `aspects`, but aspects describes memory/scalar/vector
+capabilities and does **not** carry the matrix unit, so the deprecation is
+suppressed locally with that reason.
+
+**This file's own first inference on this was wrong, and the error is worth
+recording**: the JIT message says `<XeLP>` and I read it as "both cards are
+Xe-LP".  They are not - Xe-LP is the Iris Xe.  When a compiler message names a
+platform, read it as naming *the device that produced it*, which here was the
+only device I had run the probe on locally.
+
+**Does not transfer, each for a stated reason.**  ESIMD int8 quantization (nothing
+in the library computes a per-32 group amax; `xq.cpp`'s group-major layout plus
+its f32 scale plane is strictly more expressive - and they record that replacing a
+scalar sub-group design with an ESIMD SLM kernel **lost 3.7x** to an IGC
+register-spill penalty).  GDN / gated delta (strictly worse: global state
+read-modify-written twice per token, a 7-barrier ladder instead of `sg_sum`,
+16x less parallelism - it is a *corroboration* of this file's
+"sub-group-reduction-latency bound" diagnosis, not a source).  GGUF dequant (**no
+Q5_K at all** - it has Q4_0/Q4_1/Q8_0/Q4_K/Q6_K only, so half this model's expert
+bank has no counterpart; and it always materialises to float, i.e. exactly the
+3.56x expansion the scratch/weight-store work here rejected).  Its K-quant
+intermediates are computed **in fp16** (`gguf_dequant.cpp:298-311`), which is a
+precision regression against `quant.h`'s fp32 and must not be copied.  Head-blocked
+RoPE and fused rms+rope are **BMG-gated**, so A770 runs a weaker 6-barrier version
+that re-reads the row from global.
+
+**Measured, not assumed: the fpmath guard is free, and the other two are not worth
+building.**  (1) It records that an A770 **u4 oneDNN matmul overflows to NaN when
+K >= 5376** with narrow fp16-class accumulation, fixed by
+`attr.set_fpmath_mode(fpmath_mode::any, true)`, and `dnnl_gemm.cpp` set **no**
+fpmath_mode at all.  `PF_DNNL_FPMATH` now wraps both attr sites, **default off**.
+Measured A/B, same run, argmax as the gate:
+
+| | default | fpmath=1 |
+|---|---:|---:|
+| pp512 | 775.0 t/s, argmax 4821 | 774.5, argmax **4821** |
+| NT=16384 | 1414.5, argmax 1204 | 1410.8, argmax **1204** |
+| NT=65536 | 1312.8, argmax 4779 | 1306.2, argmax **4779** |
+| tg128 depth 512 | 38.1 ms, hash 8787d83 | 38.3 ms, **same hash** |
+| tg128 depth 64k | 49.9 ms, hash 82df23a | 50.2 ms, **same hash** |
+
+**Neutral everywhere and bit-identical**, which is what a guard should cost.  (The
+64k *means* were 52.0 vs 74.9 ms - that is four reps of drift on this box, not an
+effect; `best` is the statistic, per the benchmarking rules in this file.)  **The
+NaN itself is still the library's claim and has NOT been reproduced here** - no
+model in reach reaches K >= 5376, since this engine's largest oneDNN int8 matmul K
+is the 27B's 5120 and the 35B A3B's 2048.  So the knob is shipped OFF and is a
+guard for the next model up, not a fix for an observed bug.
+
+(2) Its RoPE carries a **precomputed 2x2 rotation matrix per pair** instead of
+computing `exp2` per lane per call, and (3) its reduction is **one barrier, then
+every work-item reloads all partials as a vector and reduces redundantly**
+(`norm.cpp:1134`) instead of a tree.  **Neither is worth building, and the price is
+measured rather than argued.**  `PF_PROF`'s norm aggregate - `rmsnorm` plus
+`qk_norm_rope` together - is **1.07 ms of a 48.65 ms prefill step (2.2%)**, 1.09 of
+49.59 on a decode step (2.2%), and 1.85 of 75.71 in the per-step decode accounting
+(2.4%).  Both ideas attack a fraction of 2.2%, and the rotation table is not free
+in memory: a `[pos][pair][2][2]` f16 table is **134 MB at ctx 131072 and n_rot
+128**, i.e. it would spend 4% of a card's VRAM to remove an `exp2` from 2.2% of a
+step.  Build the persistent-tile expert GEMM instead; that is where the 55% is.
+
+**Two of my own suspicions were raised, tested with a control, and refuted - the
+control is the part worth keeping.**  I thought `dequant_sb_lane_impl` applied the
+wrong per-32 group to half of every lane's values.  A host-only replay said
+240 of 256 differed - and the CONTROL arm, the grouped mapping that `dev/grp_min`
+verifies at 0/8192 on device, also said 219/256 differed, which made the test, not
+the kernel, the suspect.  Redone with the correct 8-lane grouped convention and a
+random scale plane, the control came out 0/256 and so did the consumer convention
+that `moe_dot`/`gemv.cpp` actually use: **`w[b]` is group `b`'s value `lane`, and
+`sc[b]` is right.**  Two lessons, both already in this file in other forms: a
+failing control invalidates the whole probe, and *do not build an arm from your own
+algebra when the codebase has a convention you have not read* - I constructed a
+placement (`64*(b>>1)+2*lane+(b&1)`) that no caller uses.  Separately, the
+suggestion to hoist `d*sc[b]` out of that loop does not apply: a lane's 8 values
+are in 8 **different** groups, each used once, so there is no reuse to exploit and
+the 3-multiply form is already minimal.  `PF_MOE_DQ2`'s 12% is irreducible
+arithmetic, not missed CSE.
 
 ## Invariants and gotchas
 
@@ -2383,10 +4388,9 @@ the engine's real routing is less smooth than the benchmark's synthetic one.
   (0/0 is NaN); both are reverted, since a KV-format change is not worth 0.3 %.
   The attention scratch is per-queue (`xmx_get` keys on the queue address): a
   function-local static was shared across the two `--layer-map` devices and the
-  cross-device USM access cost another ~12x.  The matmuls use a dedicated
-  oneDNN stream (`st_a`) on the same in-order queue so waiting on attention
-  does not drain the dense GEMMs queued on the main stream (a queue-wide wait
-  serialised the whole prefill).  The softmax is one work-group per query row
+  cross-device USM access cost another ~12x.  The matmuls run on `p->st` with the
+  rest of the forward (see the `st_a` entry below - they used to be on their own
+  stream and that was a race).  The softmax is one work-group per query row
   with a single vectorized `exp` pass.  The per-row index arrays (`orow` /
   `oh` / `olim`) are built by a device kernel from `info`, **not** by host
   `q.memcpy`: three host->device copies per kv head kept the host pinned to the
@@ -2396,9 +4400,55 @@ the engine's real routing is less smooth than the benchmark's synthetic one.
   540 t/s (both above the OpenVINO targets of 640 / 362).  Below the key
   threshold the classic kernel still wins (4k: 718 vs 649 t/s), hence the gate.
   Scope: i8 KV, head_dim 256, `n_real > 1`; other cases fall back.
-* **`st_a` is the oneDNN-int8-matmul-only stream.**  The dense `PF_GEMM_DNNL` GEMMs still use
-  `p->st`; `attn_qk`/`attn_pv` submit to `p->st_a` and wait only that stream.
-  Do not move the dense path onto `st_a`.
+* **A SYCL stream built from an in-order queue is NOT ordered against that queue's
+  own submissions, and the attention matmuls were on the wrong side of that.**
+  `attn_qk`/`attn_pv` used to execute on a second oneDNN stream `st_a`, created by
+  the same `sycl_interop::make_stream(p->eng, q)` call as `p->st`, on the stated
+  theory that "it wraps the same in-order queue, so the matmul is ordered after the
+  Q-quantize / K-gather kernels without an explicit wait".  **That inference is a
+  category error: a stream is its own ordering domain.**  SYCL orders work *within*
+  a stream; two streams are unordered regardless of how the queue was created.  So
+  in `attn_xmx`'s per-block-chunk loop the next iteration's `xmx_gather` (main
+  stream) overwrote the `b.k`/`b.v` rows the current iteration's `attn_pv` (`st_a`)
+  was still reading, and `attn_qk` could read K before the gather wrote it.
+  **This is NOT the cause of the 64k argmax churn, and getting that wrong burned
+  three wrong hypotheses in a row.**  Five 65536-token prefills of one binary in
+  five separate processes gave argmax **13775, 13775, 264, 44896, 4779** with timing
+  stable to 0.2%, and `PF_NOGRAPH=1`, `PF_PF_PIPE=0` and `PF_ABL_NOMOE=1` all
+  still churned - which rules out the recorded graph, the 3-phase pipeline and the
+  routed experts - while `PF_ATTN_XMX=0`, a path that never touches `st_a`,
+  produced 264 as well, which rules out this.  **The real cause is `dev/bench_pf`,
+  and it was printed in every single run**: see *The depth cells were run against a
+  512-block KV pool* below.
+  In order the three guesses were: (a) this race, killed by `PF_ATTN_XMX=0`;
+  (b) the MoE CSR's atomic scatter, killed by reasoning rather than by a run - the
+  grouped GEMM accumulates over k for each row independently, so a permutation of
+  an expert's rows changes no output; (c) a near-tie amplified by exposure (128
+  chunks against 16k's 32), killed by a *third* run at 32768 giving 13775 when the
+  first two had both given 4821 - so there was no threshold either.  **What found
+  it was not an ablation at all: it was diffing the engine's entire printed output
+  between two runs of the same depth.**  The argmax moved, and the only line with
+  anything to say was `[kv] exit: pool=512 ... cap=512`, which had been there the
+  whole time.
+
+  * The fix is one line anyway - run the attention matmuls on `p->st`, where every
+  dense GEMM and every SYCL kernel already lives and where ordering is known to
+  work.  Nothing inside `attn_xmx` waits in the shipped path, so the split's
+  original motive - an attention sync draining the dense GEMMs - never arose.  It
+  removes an unsound assumption; it is **not** claimed to fix the argmax churn,
+  which is not its symptom.  The general primitive would have been
+  `ext_oneapi_submit_barrier()` events in both directions; that is unavailable
+  here because `sycl_interop::stream` exposes only a blocking `wait()` and cannot
+  produce a barrier event, and this SYCL's `sycl::stream` has no `(queue)`
+  constructor at all.  `PF_ATTN_STREAM=1` reproduces the split for A/B.
+  * `PF_XMX_BREAKDOWN` is still unusable as an oracle at any depth (4779 / 279 /
+  3069 / 44896 / 304 / 32288 across work-group shapes), for the separate and
+  sufficient reason that its `q.wait()` calls change the ordering.
+  **Generalisation: "same queue" is not an ordering guarantee, and a comment
+  asserting one is worse than no comment** - this one had been read as settled for
+  the lifetime of the feature.  **And the meta-lesson: I reached for the most
+  recently touched subsystem to explain a nondeterminism, and the control that
+  killed it was one env var on a different path.**
 * **`ggml_float_to_half` used to flush the whole f16 subnormal range to zero,
   which silently destroyed weight-store scales (`src/common/quant.h`).**  The
   f16 subnormals represent `[2^-24, 2^-14)` with ten mantissa bits; the old code

@@ -96,7 +96,8 @@ void act_quant_launch(sycl::queue & q, const float * x, const float * up, int x_
 // scale per row.  This is what removes the dominant quantization error: with a
 // per-row scale the activation error (~0.9%) swamped the 4-bit weight error.
 void act_quant_grp_launch(sycl::queue & q, const float * x, const float * up, int x_stride, int up_stride, int8_t * xq,
-                          uint16_t * sasc, float * xs, int8_t * axe, int8_t * axo, bool do_split, int M, int K) {
+                          uint16_t * sasc, float * xs, int8_t * axe, int8_t * axo, bool do_split, int M, int K,
+                          int64_t * sumq, int64_t * sums, int slot) {
     const int ng = K / kW4Group;
     const size_t kh = (size_t)K / 2;
     // One 32-lane workgroup per (row, group): each lane owns exactly one value,
@@ -141,6 +142,29 @@ void act_quant_grp_launch(sycl::queue & q, const float * x, const float * up, in
             uint16_t bits;
             __builtin_memcpy((void *)&bits, &h, sizeof(h));
             sasc[(size_t)m * ng + g] = bits;
+            // PF_ACTQ_SUM: an order-independent INTEGER checksum of what this
+            // kernel just wrote, so two processes can be compared WITHOUT a host
+            // read-back inside the forward - a read-back is precisely what broke
+            // the per-layer fingerprint oracle for this investigation, so the
+            // checksum is accumulated on the device and read exactly once at
+            // teardown.  `plus<int>` over the sub-group and a 64-bit atomic add are
+            // both exact and order-independent, so the checksum is itself
+            // deterministic given the data: it can only move if the DATA moves.
+            // That is the whole point - it separates "oneDNN was handed different
+            // bytes" from "oneDNN computed differently from the same bytes", which
+            // oneDNN_VERBOSE cannot answer because verbose logs descriptors, not
+            // contents.
+            if (sumq) {
+                const int gsum = sycl::reduce_over_group(it.get_sub_group(), (int)q8, sycl::plus<int>());
+                sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+                    aq(sumq[slot]);
+                aq.fetch_add((int64_t)gsum);
+                sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+                    as(sums[slot]);
+                as.fetch_add((int64_t)bits);
+            }
         }
         if (xs) {
             // a sub-group collective, so every lane must execute it (a divergent
@@ -321,16 +345,166 @@ bool dnnl_gemm_enabled(const sycl::queue & q) {
     return forced != 0 || si::dev::for_queue(q).wt.gemm_dnnl;
 }
 
+// PF_DNNL_QWAIT: wait on the SYCL QUEUE after EVERY oneDNN execute in this file.
+//
+// Every primitive here runs on an interop stream (`p->st` / `p->st_a`) while every
+// consumer of its output - the next SYCL kernel, the epilogue, the quantizer - is
+// submitted to `p->q`.  PF_ATTN_QWAIT only ever covered `attn_qk`/`attn_pv`, so the
+// dense mode-2 GEMM -> next-SYCL-kernel edge was never ordered by anything the
+// engine controls.  That edge is what the prefill's nondeterminism hangs on: the
+// symptom is a consistent 1-5% spread with a STABLE argmax, which is what a kernel
+// reading the PREVIOUS layer's value looks like (consecutive layers differ by a few
+// percent, so a stale read is a few percent rather than garbage).  It also explains
+// why every per-layer diagnostic seemed to stabilise the run - PF_DUMP_LAYERS
+// inserts a q.wait() after each layer, which inserts exactly the missing edge.
+//
+// The oneDNN host-threading hypothesis is refuted by measurement: forcing
+// ONEDNN_MAX_CPU_ISA=0 makes it WORSE (5.38% vs 3.04% default).  Nor is it
+// attn_xmx-specific - with a non-perturbing oracle PF_ATTN_XMX=0 still spreads
+// 0.37%, so "only PF_ATTN_XMX=0 is reproducible" was an artifact of the
+// per-layer fingerprint oracle, which perturbs the very schedule it measures.
+//
+// DIAGNOSTIC ONLY, default off.  If this collapses the spread, the fix is to submit
+// the primitive on the queue's own ordering domain (or ext_oneapi_submit_barrier
+// between the stream and the queue), not to pay a host wait per GEMM.
+//
+// PF_ATTN_WAIT=1 calls `ast.wait()` on the interop stream the primitive is
+// submitted to.  Every SYCL kernel around the matmul - the Q quantize, the K/V
+// gather, the softmax - is submitted to the SYCL queue, not to that stream, so a
+// wait on the stream is only ordered against work submitted to the same stream.  If
+// the two are distinct ordering domains then PF_ATTN_WAIT cannot make the matmul
+// see the gather, and the symptom is exactly the one this file already records for
+// the old `st_a`: results that change when a `q.wait()` is inserted, i.e. when the
+// instrumentation adds an ordering edge.  This waits on `p->q` itself, which orders
+// against the SYCL submissions, and is the honest test of whether there is an
+// ordering problem at all.  DIAGNOSTIC ONLY, default off: if this does turn out to
+// be the fix, the real fix is to submit the primitive on the queue's own ordering
+// domain rather than to pay a host wait per matmul.
+// PF_DNNL_ACC_SUM: per-call device-side checksum of the int32 accumulator oneDNN
+// just wrote, i.e. the GEMM's own output BEFORE the epilogue scales it.  Together
+// with PF_ACTQ_SUM (the GEMM's input) and PF_KVSTORE_SUM's `pre` (the fp32 qkv
+// output) this closes the last gap: input identical AND accumulator identical would
+// leave the epilogue as the only possible site.
+static bool acc_sum_env() {
+    static const bool on = si::env::flag("PF_DNNL_ACC_SUM");
+    return on;
+}
+
+static void acc_sum_launch(sycl::queue & q, const int32_t * acc, size_t n, int64_t * sum, int slot) {
+    constexpr int W = 256;
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<int64_t, 1> red(W, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)n, W), [=](sycl::nd_item<1> it) {
+            red[it.get_local_id(0)] = (int64_t)acc[it.get_global_id(0)];
+            it.barrier();
+            if (it.get_local_id(0) == 0) {
+                int64_t t = 0;
+                for (int k = 0; k < W; k++) {
+                    t = t * 1000003 + red[k];
+                }
+                sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+                    a(sum[slot]);
+                a.fetch_add(t);
+            }
+        });
+    });
+}
+
+static bool actq_sum_env() {
+    static const bool on = si::env::flag("PF_ACTQ_SUM");
+    return on;
+}
+
+static bool dnnl_poison_env() {
+    static const bool on = si::env::flag("PF_DNNL_POISON");
+    return on;
+}
+
+static bool dnnl_qwait_env() {
+    static const bool on = si::env::flag("PF_ATTN_QWAIT");
+    return on;
+}
+
 // ---------------------------------------------------------------------------
+// PF_ATTN_STREAM=1 puts the attention matmuls back on the separate `st_a`, which
+// is the racy arrangement; it exists only to re-measure the race.  Unset/0 runs
+// them on `st` with everything else.  See the note on `st_a` in impl.
+
+// PF_DNNL_FPMATH: widen the matmul's accumulation class.
+//
+// The A770 fork of intel/omni_xpu_kernel records (onednn_s8u4_gemm.cpp:113-116):
+// "A770 u4 matmul: narrow (fp16-class) accumulation overflows to NaN when
+// K >= 5376 (Qwen-style K=12288). fpmath_mode::any with the second arg true
+// allows the bf16 accumulation the jit:gemm DPAS path needs - wide exponent, no
+// overflow (recorded A770 fix)".  This engine sets NO fpmath_mode at all.
+//
+// It has never bitten here: the largest K in a oneDNN int8 matmul is the 27B's
+// n_embd = 5120, and the 35B A3B's is 2048, both under 5376.  So this is a guard
+// for the next model up, not a fix for a bug that has been observed - and the
+// claim is the LIBRARY's, not a measurement in this file.  Hence the switch:
+// off by default so nothing changes until it is measured both ways on real shapes.
+static inline void dnnl_fpmath(primitive_attr & attr) {
+    static const int on = si::env::i32("PF_DNNL_FPMATH", 0);
+    // PF_DNNL_FPMATH=2 forces `strict`, i.e. exact s32 accumulation.
+    //
+    // This is the test of the last surviving hypothesis on the oneDNN axis.
+    // PF_GEMM_DNNL=0 is the ONLY arm that makes the prefill reproducible, and it is
+    // reproducible because the dp4a path accumulates in int32 EXACTLY - which says
+    // oneDNN's own accumulation is where the run-to-run difference comes from.  If
+    // so, the accumulation is not plain s32: this file sets no fpmath_mode at all,
+    // so oneDNN picks its own, and its default on this library is a reduced-precision
+    // class (which is also why the A770 "K >= 5376 overflows to NaN" note exists -
+    // that note is evidence the accumulation is NOT exact, not a curiosity).
+    //
+    // Reduced precision plus a runtime-variable accumulation order is exactly the
+    // observed signature: a consistent 1-5% spread with a STABLE argmax, which is
+    // not what a race looks like and not what garbage looks like.  And it is why
+    // nothing else moved the needle - not threads (ONEDNN_MAX_CPU_ISA is an ISA
+    // knob, not a threading knob, so threading was never actually disabled),
+    // not ordering (both domains, every edge), not uninitialised memory (every
+    // dev_alloc'd buffer poisoned with 0x7F), not warmup.
+    //
+    // DIAGNOSTIC.  `strict` is the right answer for an int8 GEMM whose output is
+    // s32, so if this collapses the spread the fix is to set it unconditionally
+    // rather than to leave oneDNN's default in charge.
+    if (on == 2) {
+        attr.set_fpmath_mode(fpmath_mode::strict);
+    } else if (on) {
+        attr.set_fpmath_mode(fpmath_mode::any, true);
+    }
+}
+static bool attn_stream_env() {
+    static const bool v = [] {
+        const char * e = si::env::str("PF_ATTN_STREAM");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 struct dnnl_gemm::impl {
     sycl::queue q;
     engine eng;
     stream st;
-    // Separate stream for the XMX attention matmuls.  Both streams wrap the
-    // same in-order SYCL queue, so submissions stay ordered, but waiting on
-    // this stream no longer drains the dense GEMMs queued on `st` (which is
-    // what made attention syncs cost tens of ms and serialised prefill).
+    // The XMX attention matmuls USED to get a second stream (`st_a`) so that a
+    // wait on attention would not drain the dense GEMMs queued on `st`.  That
+    // reasoning was wrong about SYCL: a stream is its own ordering domain, so two
+    // streams built from the same queue are NOT ordered with respect to each
+    // other, however "in-order" the queue is.  The consequence was a real data
+    // race in `attn_xmx`'s per-block loop - iteration i+1's K/V gather (main
+    // stream) overwrites the `b.k`/`b.v` rows that iteration i's `attn_pv`
+    // (st_a) is still reading, and `attn_qk` can read K before the gather wrote
+    // it.  It shows up as a prefill argmax that is not reproducible: 4779 on most
+    // 64k runs and 9966 on one, while 16k (2 block chunks per call against 8)
+    // was stable across four runs - the window scales with the chunk count.
+    //
+    // `st_a` is kept only so PF_ATTN_STREAM=1 can re-measure the split; the
+    // attention matmuls run on `st` by default, which is where the rest of the
+    // engine already lives and where ordering is known to work.  Nothing waits
+    // inside `attn_xmx` in the shipped path, so the original motive for the
+    // split (attention syncs draining the dense GEMMs) does not arise there.
     stream st_a;
+    bool attn_sep = false; // run the attention matmuls on `st_a`; see attn_stream_env()
     // activation scratch: row-major [M][K] int8 + one scale per row
     int8_t * ax = nullptr;
     float * axs = nullptr;
@@ -358,6 +532,16 @@ struct dnnl_gemm::impl {
     uint16_t * asa = nullptr;  // their per-(m,g) f16 scales, [M][K/32]
     int8_t * axe = nullptr;    // even/odd k split of axg, for the u4 decode GEMV
     int8_t * axo = nullptr;
+    // PF_ACTQ_SUM: per-call device checksums of the quantized activation and its
+    // scale plane, written by act_quant_grp_launch and read once in the destructor.
+    static constexpr int kActSumSlots = 4096;
+    int64_t * actsum_q = nullptr;
+    int64_t * actsum_s = nullptr;
+    int actsum_n = 0;
+    static constexpr int kAccSlots = 8192;
+    int64_t * accsum = nullptr;
+    int accsum_n = 0;
+    bool actsum_shape = si::env::flag("PF_ACTQ_SHAPE");
     bool has_w4 = false;       // any u4 weight registered -> produce axg/asa
 
     // int8 weight with a PER-32-GROUP scale (was per-row).  Every native quant
@@ -435,8 +619,52 @@ struct dnnl_gemm::impl {
         T * ptr = sycl::malloc_device<T>(n, q);
         if (ptr) {
             owned_.push_back(ptr);
+            // PF_DNNL_POISON=1: fill every long-lived device buffer at creation
+            // with 0x7F instead of leaving malloc_device's uninitialised bytes.
+            // This is the oneDNN path's analogue of PF_XMX_POISON, and it is the
+            // right next probe because PF_GEMM_DNNL=0 is the ONLY arm that makes
+            // the prefill reproducible - but that arm does not merely disable the
+            // matmul, it swaps the whole branch (activation quantizer, grouped
+            // scale layout, epilogue) for the dp4a one.  So "oneDNN is necessary"
+            // does not yet mean "oneDNN's GEMM is at fault", and uninitialised
+            // memory anywhere in that branch is still untested.
+            //
+            // 0x7F bytes are ~1.7e38 as float and a large positive int32, so a
+            // read of a poisoned buffer is loud rather than quietly plausible.
+            // Poisoning at creation is safe: every one of these buffers is meant
+            // to be written before it is read.
+            if (dnnl_poison_env()) {
+                q.memset(ptr, 0x7F, (size_t)n * sizeof(T)).wait();
+            }
         }
         return ptr;
+    }
+    int actq_slot() {
+        if (!actsum_q || actsum_n >= kActSumSlots) {
+            return -1;
+        }
+        return actsum_n++;
+    }
+    // PF_ACTQ_SHAPE: what M/K each quantized call actually had.  Without it a
+    // checksum whose base is a few hundred cannot be read - a difference of 334
+    // out of M*K int8 values means something quite different at M=1 than at
+    // M=512, and the slot dump alone does not say which.
+    void actq_note(int M, int K, const void * key) {
+        if (actsum_shape) {
+            // N identifies WHICH tensor, so the per-call M/K/N sequence is
+            // periodic with the layer, and the first differing slot maps to a
+            // (layer, position-in-layer) pair by arithmetic on the period - no
+            // cross-process-stable identifier needed, which matters because the
+            // weight KEY is a pointer and pointer values are not stable across
+            // processes (ASLR).
+            int N = -1;
+            auto it = weights.find(key);
+            if (it != weights.end()) {
+                N = it->second.N;
+            }
+            fprintf(stderr, "[actqshape] %d M=%d K=%d N=%d groups=%d values=%d\n", actsum_n, M, K, N,
+                    (M * (K / kW4Group)), M * K);
+        }
     }
     void dev_erase(void * ptr) {
         if (!ptr) {
@@ -531,6 +759,7 @@ struct dnnl_gemm::impl {
         auto wmd = memory::desc({K, N}, memory::data_type::u4, memory::format_tag::ba);
         auto dmd = memory::desc({M, N}, memory::data_type::f32, memory::format_tag::ab);
         primitive_attr attr;
+        dnnl_fpmath(attr);
         // mask = dim 0 (K) zoomed by the 32-value group; layouts validated on
         // this GPU (dims {1, NG*N} f16, exact against the integer reference)
         attr.set_scales(DNNL_ARG_WEIGHTS, 1, {kW4Group, 1}, memory::data_type::f16);
@@ -579,6 +808,7 @@ struct dnnl_gemm::impl {
         // so the accumulator can no longer stay int32
         auto dmd = memory::desc({M, N}, memory::data_type::f32, memory::format_tag::ab);
         primitive_attr attr;
+        dnnl_fpmath(attr);
         attr.set_scales(DNNL_ARG_WEIGHTS, 1, {kW4Group, 1}, memory::data_type::f16);
         attr.set_scales(DNNL_ARG_SRC, 2, {1, kW4Group}, memory::data_type::f16);
         prim_entry e;
@@ -600,6 +830,7 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     p->eng = sycl_interop::make_engine(q.get_device(), q.get_context());
     p->st = sycl_interop::make_stream(p->eng, q);
     p->st_a = sycl_interop::make_stream(p->eng, q);
+    p->attn_sep = attn_stream_env();
     p->cap_M = kMaxB * kMaxT; // max rows of one chunk-batched prefill
     p->cap_K = kActMaxK;
     p->ax = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K);
@@ -618,12 +849,53 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     p->asa = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group));
     p->axe = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K / 2);
     p->axo = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K / 2);
+    if (actq_sum_env()) {
+        p->actsum_q = p->dev_alloc<int64_t>(impl::kActSumSlots);
+        p->actsum_s = p->dev_alloc<int64_t>(impl::kActSumSlots);
+    }
+    if (acc_sum_env()) {
+        p->accsum = p->dev_alloc<int64_t>(impl::kAccSlots);
+    }
     if (!p->ax || !p->axs || !p->acc || !p->accf || !p->xs || !p->axg || !p->asa || !p->axe || !p->axo) {
         throw std::runtime_error("dnnl scratch alloc failed");
     }
 }
 
 dnnl_gemm::~dnnl_gemm() {
+    // One read-back, here, after everything has been submitted and waited on by the
+    // engine - never inside the forward.  Two processes printing the same sequence
+    // here have handed oneDNN bit-identical bytes; a differing sequence means the
+    // difference entered at or before this kernel.
+    if (p->actsum_q) {
+        std::vector<int64_t> hq((size_t)p->actsum_n), hs((size_t)p->actsum_n);
+        if (p->actsum_n > 0) {
+            p->q.memcpy(hq.data(), p->actsum_q, (size_t)p->actsum_n * 8).wait();
+            p->q.memcpy(hs.data(), p->actsum_s, (size_t)p->actsum_n * 8).wait();
+        }
+        uint64_t h = 1469598103934665603ULL;
+        for (int i = 0; i < p->actsum_n; i++) {
+            for (int k = 0; k < 8; k++) {
+                h = (h ^ (uint64_t)((hq[i] >> (k * 8)) & 0xFF)) * 1099511628211ULL;
+                h = (h ^ (uint64_t)((hs[i] >> (k * 8)) & 0xFF)) * 1099511628211ULL;
+            }
+        }
+        fprintf(stderr, "[actq] calls=%d checksum=%016llx\n", p->actsum_n, (unsigned long long)h);
+        if (p->accsum && p->accsum_n > 0) {
+            std::vector<int64_t> ha((size_t)p->accsum_n);
+            p->q.memcpy(ha.data(), p->accsum, (size_t)p->accsum_n * 8).wait();
+            fprintf(stderr, "[accsum] calls=%d\n", p->accsum_n);
+            for (int i = 0; i < p->accsum_n; i++) {
+                fprintf(stderr, "[accsumslot] %d %lld\n", i, (long long)ha[i]);
+            }
+        }
+        // Per-slot values, so two runs can be diffed to find the FIRST call whose
+        // input already differed.  That is a bisection needing no new
+        // instrumentation: slot 0 differing means the divergence is born at the
+        // very first quantized GEMM of the run.
+        for (int i = 0; i < p->actsum_n; i++) {
+            fprintf(stderr, "[actqslot] %d %lld %lld\n", i, (long long)hq[i], (long long)hs[i]);
+        }
+    }
     // Every long-lived allocation was registered in owned_ at creation;
     // freeing the registry (not a per-field list) is what keeps a newly
     // added store from leaking by forgetting this function.
@@ -1189,11 +1461,26 @@ int dnnl_gemm::warmup() {
                 p->eng,
                 sycl_interop::memory_kind::usm, (void *)dsc.get());
             dnnl_capture_guard();
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
             pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                                     {DNNL_ARG_WEIGHTS, *wmem},
                                     {DNNL_ARG_DST, pe.dst},
                                     {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scmem},
                                     {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe.sscales}});
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
             if (tdbg) {
                 p->q.wait();
                 fprintf(
@@ -1217,7 +1504,9 @@ int dnnl_gemm::warmup() {
     float * dout = sycl::malloc_device<float>((size_t)WM * WN, p->q);
     if (dx && dsw && dout) {
         act_quant_launch(p->q, dx, nullptr, WK, WK, p->ax, p->axs, p->axsum, WM, WK);
-        act_quant_grp_launch(p->q, dx, nullptr, WK, WK, p->axg, p->asa, p->xs, p->axe, p->axo, true, WM, WK);
+        p->actq_note(WM, WK, nullptr);
+    act_quant_grp_launch(p->q, dx, nullptr, WK, WK, p->axg, p->asa, p->xs, p->axe, p->axo, true, WM, WK, p->actsum_q,
+                         p->actsum_s, p->actq_slot());
         epilogue_f32_launch(p->q, p->accf, dout, WN, nullptr, 1.f, WM, WN);
         p->q.wait();
     }
@@ -1261,7 +1550,9 @@ act_view dnnl_gemm::quantize(const float * x, const float * up, int x_stride, in
     // same launch produces the group sums (needed by the u4 GEMV and the u4
     // prefill epilogue) and, for decode, the even/odd k split the u4 GEMV
     // reads, so no separate view kernels are needed.
-    act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, p->xs, p->axe, p->axo, do_split, M, K);
+    p->actq_note(M, K, nullptr); // quantize() has no weight key; (M,K) is periodic per layer
+    act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, p->xs, p->axe, p->axo, do_split, M, K,
+                         p->actsum_q, p->actsum_s, p->actq_slot());
     p->cur_M = M;
     p->cur_K = K;
     p->acts_valid = true;
@@ -1322,11 +1613,33 @@ bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residua
             memory::desc({1, e.ng * e.N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
             sycl_interop::memory_kind::usm, (void *)e.scales);
         dnnl_capture_guard();
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
         pe->prim.execute(p->st, {{DNNL_ARG_SRC, pe->src},
                                  {DNNL_ARG_WEIGHTS, wmem},
                                  {DNNL_ARG_DST, pe->dst},
                                  {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scmem},
                                  {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe->sscales}});
+        // PF_DNNL_ACC_SUM.  This is the k5 prefill path - the one the 35B A3B's qkv
+        // actually takes.  The two `w.wmem` sites are the plain int8 and u4
+        // variants and neither fires here, which is why the first run of this probe
+        // reported calls=0.
+        if (acc_sum_env() && p->accsum && p->accsum_n < impl::kAccSlots) {
+            acc_sum_launch(p->q, p->acc, (size_t)M * e.N, p->accsum, p->accsum_n++);
+        }
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
         // PF_K5_NOCORR (diagnostic): drop the offset correction, keeping only the
         // step-scaled matmul - tells whether the prefill cost is the expansion
         // kernel or the u4-style correction epilogue.
@@ -1379,11 +1692,26 @@ bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residua
             memory::desc({1, e.ng * e.N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
             sycl_interop::memory_kind::usm, (void *)e.scales);
         dnnl_capture_guard();
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
         pe->prim.execute(p->st, {{DNNL_ARG_SRC, pe->src},
                                  {DNNL_ARG_WEIGHTS, wmem},
                                  {DNNL_ARG_DST, pe->dst},
                                  {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scmem},
                                  {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe->sscales}});
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
         epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, e.N);
         return true;
     }
@@ -1436,11 +1764,29 @@ bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residua
     }
     impl::prim_entry & pe = pit->second;
     dnnl_capture_guard();
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
     pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                             {DNNL_ARG_WEIGHTS, w.wmem},
                             {DNNL_ARG_DST, pe.dst},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe.sscales}});
+    if (acc_sum_env() && p->accsum && p->accsum_n < impl::kAccSlots) {
+        acc_sum_launch(p->q, p->acc, (size_t)M * w.N, p->accsum, p->accsum_n++);
+    }
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
     // both the weight and the activation scales are applied by the matmul now
     epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, w.N);
     return true;
@@ -1543,11 +1889,29 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
     }
     impl::prim4_entry & pe = pit->second;
     dnnl_capture_guard();
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
     pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                             {DNNL_ARG_WEIGHTS, w.wmem},
                             {DNNL_ARG_DST, pe.dst},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe.sscales}});
+    if (acc_sum_env() && p->accsum && p->accsum_n < impl::kAccSlots) {
+        acc_sum_launch(p->q, p->acc, (size_t)M * w.N, p->accsum, p->accsum_n++);
+    }
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
     const int N = w.N;
     const int ng = K / kW4Group;
     // PF_W4_NOCORR: bisection knob - drop the offset (zero-point) correction and
@@ -1648,10 +2012,13 @@ const int32_t * dnnl_gemm::act_sum(const act_view & v) const {
 // ---------------------------------------------------------------------------
 // XMX attention GEMMs.  Operands and dst are the caller's USM buffers; only
 // the primitive is cached.
-// The attention matmuls are submitted to `st_a`, which wraps the same in-order
-// queue as the softmax/accumulate kernels, so the following SYCL kernel is
-// ordered after the matmul without an explicit wait.  PF_ATTN_WAIT=1 restores
-// a per-matmul stream wait for A/B.
+// The attention matmuls run on `st`, the same oneDNN stream every dense GEMM and
+// every SYCL kernel of the forward uses, so the following softmax is ordered after
+// the matmul with no explicit wait and no queue drain.  They used to run on a
+// second stream on the theory that a stream built from the same in-order queue is
+// ordered against it; it is not, and that was a live data race - see the note on
+// `st_a` in impl.  PF_ATTN_STREAM=1 reproduces it; PF_ATTN_WAIT=1 adds a blocking
+// per-matmul wait for A/B.
 static bool attn_wait_env() {
     static const bool v = [] {
         const char * e = si::env::str("PF_ATTN_WAIT");
@@ -1660,15 +2027,19 @@ static bool attn_wait_env() {
     return v;
 }
 
+
+
 bool dnnl_gemm::attn_qk(int M, int blk, const int8_t * q_kmajor, const int8_t * k_keymajor, int32_t * dst) {
     const auto * e = p->attn_qk_prim(M, /*K=*/256, blk);
     if (!e->ok) {
         return false;
     }
-    // `st_a` wraps the same in-order queue as the engine's SYCL work, so the
-    // matmul is ordered after the Q-quantize / K-gather kernels without a
-    // queue drain; waiting only `st_a` avoids draining the dense GEMMs queued
-    // on the main stream (a queue-wide wait here serialised the whole prefill).
+    // On `st` - the same stream every dense GEMM and every SYCL kernel uses - so
+    // the matmul is ordered after the Q-quantize / K-gather that produced `k` and
+    // before the softmax that reads `dst`, with no host-side wait and no queue
+    // drain.  The separate `st_a` this used was NOT ordered against the main
+    // stream despite wrapping the same queue; see the note on `st_a` in impl.
+    stream & ast = p->attn_sep ? p->st_a : p->st;
     auto xm = sycl_interop::make_memory(memory::desc({M, 256}, memory::data_type::s8, memory::format_tag::ab), p->eng,
                                         sycl_interop::memory_kind::usm, (void *)q_kmajor);
     auto wm = sycl_interop::make_memory(memory::desc({256, blk}, memory::data_type::s8, memory::format_tag::ba), p->eng,
@@ -1676,9 +2047,34 @@ bool dnnl_gemm::attn_qk(int M, int blk, const int8_t * q_kmajor, const int8_t * 
     auto dm = sycl_interop::make_memory(memory::desc({M, blk}, memory::data_type::s32, memory::format_tag::ab), p->eng,
                                         sycl_interop::memory_kind::usm, (void *)dst);
     dnnl_capture_guard();
-    e->prim.execute(p->st_a, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
+    e->prim.execute(ast, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
+    if (dnnl_qwait_env()) {
+        // The OTHER direction.  The wait above orders the gather -> matmul edge;
+        // this one orders the matmul -> consumer edge, which is the one nothing
+        // covers: `xmx_softmax` reads b.qk and `xmx_pv_acc` reads b.pv, both
+        // submitted to `p->q`, right after these two primitives ran.  If the
+        // interop stream and the queue are distinct ordering domains then a wait
+        // in front of the matmul fixes nothing, because it is the consumer that
+        // can run early.  Cheap to ask.
+        p->q.wait();
+    }
     if (attn_wait_env()) {
-        p->st_a.wait();
+        ast.wait();
     }
     return true;
 }
@@ -1694,10 +2090,39 @@ bool dnnl_gemm::attn_pv(int M, int blk, const uint8_t * p_major, const int8_t * 
                                         sycl_interop::memory_kind::usm, (void *)v_keymajor);
     auto dm = sycl_interop::make_memory(memory::desc({M, 256}, memory::data_type::s32, memory::format_tag::ab), p->eng,
                                         sycl_interop::memory_kind::usm, (void *)dst);
+    // same stream choice as attn_qk, and for the same reason - see impl's note on
+    // `st_a`.  PV reads the `b.v` the gather wrote, and the next block chunk's
+    // gather overwrites it, so an unordered stream here is a live hazard.
+    stream & ast = p->attn_sep ? p->st_a : p->st;
     dnnl_capture_guard();
-    e->prim.execute(p->st_a, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+    }
+    e->prim.execute(ast, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+    if (dnnl_qwait_env()) {
+        p->q.wait();
+        // ALSO the stream's own wait.  A queue wait only orders against work
+        // submitted to the queue, so if `p->st` is a distinct ordering domain
+        // (it is an interop stream built from the queue) then waiting on `p->q`
+        // does not wait for the primitive at all, and the whole ordering
+        // hypothesis would have been tested against the wrong domain.  PF_ATTN_WAIT
+        // did use the stream's wait, but only on the two attention primitives and
+        // only under the perturbing fingerprint oracle, which this whole entry
+        // shows is not a valid arbiter.  Both domains, one arm.
+        p->st.wait();
+    }
+    if (dnnl_qwait_env()) {
+        // The OTHER direction.  The wait above orders the gather -> matmul edge;
+        // this one orders the matmul -> consumer edge, which is the one nothing
+        // covers: `xmx_softmax` reads b.qk and `xmx_pv_acc` reads b.pv, both
+        // submitted to `p->q`, right after these two primitives ran.  If the
+        // interop stream and the queue are distinct ordering domains then a wait
+        // in front of the matmul fixes nothing, because it is the consumer that
+        // can run early.  Cheap to ask.
+        p->q.wait();
+    }
     if (attn_wait_env()) {
-        p->st_a.wait();
+        ast.wait();
     }
     return true;
 }

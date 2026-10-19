@@ -254,9 +254,14 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
                 dev_vscales_[(size_t)d] = dev_alloc_on(d, kv_v_scale_stride * (size_t)na);
             }
         }
-        block_used_.assign(n_blocks, 0);
-        block_extent_.assign(n_blocks, -1);
-        pc_block_node_.assign(n_blocks, -1);
+        // SIZED BY pool_cap, NOT BY n_blocks.  A block index legitimately reaches
+        // pool_cap - 1: kv_grow() hands out indices up to pool_blocks - 1 and
+        // pool_blocks grows toward pool_cap at run time, while n_blocks is only the
+        // INITIAL committed count.  Sizing to n_blocks is an out-of-bounds read AND
+        // write the moment the pool grows, which is what this is.
+        block_used_.assign((size_t)pool_cap, 0);
+        block_extent_.assign((size_t)pool_cap, -1);
+        pc_block_node_.assign((size_t)pool_cap, -1);
         pool_initial = pool_cap;
         pool_blocks = 0;
         kv_grow(pool_cap);
@@ -281,9 +286,21 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
                 throw std::runtime_error("int8 KV scale planes failed");
             }
         }
-        block_used_.assign(n_blocks, 0);
-        block_extent_.assign(n_blocks, -1);
-        pc_block_node_.assign(n_blocks, -1);
+        // pool_cap, not n_blocks - see the note at the other assign() above.  THIS
+        // IS THE SITE THAT WAS BROKEN: n_blocks is initial_blocks here, and with an
+        // automatic cap (kv_cap_mb = -1) pool_cap exceeds it, so every block past
+        // the initial count indexed off the end of three host vectors.  Symptom, on
+        // the 35B A3B / 2x A770 at 16384-token depth: the pool grew from 512 to 528
+        // blocks and the decode stream stopped being reproducible, three distinct
+        // token-stream hashes out of six runs, with the PREFILL logits already
+        // differing by ~5% (prefill argmax margin 8.52 vs 7.68, l1 23.28 vs 22.16)
+        // while the argmax itself agreed - which is why it survived as "decode is
+        // flaky" and is really a host-side heap overflow corrupting block state.
+        // `initial_blocks` is clamped to pool_cap just above (line ~313), so pool_cap
+        // is the safe and sufficient size here.
+        block_used_.assign((size_t)pool_cap, 0);
+        block_extent_.assign((size_t)pool_cap, -1);
+        pc_block_node_.assign((size_t)pool_cap, -1);
         pool_initial = initial_blocks;
         pool_blocks = 0;
         d_kpool = dalloc_bytes(q, (size_t)initial_blocks * block_bytes * n_attn, true);
@@ -366,9 +383,11 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
             throw std::runtime_error("int8 KV scale planes failed");
         }
     }
-    block_used_.assign(n_blocks, 0);
-    block_extent_.assign(n_blocks, -1);
-    pc_block_node_.assign(n_blocks, -1);
+    // pool_cap, not n_blocks - see above.  Equal here (pool_cap = initial_blocks on
+    // the fixed-pool path) but written once so the three sites cannot disagree.
+    block_used_.assign((size_t)pool_cap, 0);
+    block_extent_.assign((size_t)pool_cap, -1);
+    pc_block_node_.assign((size_t)pool_cap, -1);
     pool_initial = initial_blocks;
     pool_blocks = 0;
     if (!kv_virtual) {
@@ -577,6 +596,14 @@ int engine::alloc_block() {
         if (!free_blocks_.empty()) {
             const int b = free_blocks_.top();
             free_blocks_.pop();
+            // A block index outside the bookkeeping arrays is a bug in whoever
+            // grew the pool, and `continue` would turn it into a silently dropped
+            // block - which is how a heap overflow stayed invisible here for long
+            // enough to read as "decode is flaky at 16k".  Fail loudly instead.
+            if (b < 0 || b >= (int)block_used_.size()) {
+                throw std::runtime_error("kv pool: block " + std::to_string(b) + " is outside the " +
+                                         std::to_string(block_used_.size()) + "-entry bookkeeping arrays");
+            }
             if (block_used_[b]) {
                 continue; // defensive: never hand out a block twice
             }
@@ -623,8 +650,31 @@ void engine::set_table(int slot, const std::vector<int> & blocks) {
     if (slot < 0 || slot >= kMaxB) {
         return;
     }
-    for (size_t i = 0; i < blocks.size() && i < (size_t)max_blocks; i++) {
+    // A negative index is not a value the pool can produce, so a caller holding one
+    // failed to handle `alloc_block()`'s exhaustion return.  Passing it through puts
+    // -1 in the table, and `kv_row_data(kp_base, kb * n_head_kv + kvh, ...)` then
+    // indexes the pool at a negative offset - a silent out-of-bounds device read
+    // whose result depends on the allocator's state, not an error.  That is not
+    // hypothetical: dev/bench_pf did exactly this for every depth cell above 16384
+    // (it sized the pool from `n_blocks` instead of `max_seq`), and the symptom was
+    // a prefill argmax that was not reproducible rather than anything that pointed
+    // at the pool.  Refuse it here so the next caller that forgets is an exception.
+    for (size_t i = 0; i < blocks.size(); i++) {
+        if (blocks[i] < 0) {
+            throw std::runtime_error("engine::set_table: negative KV block index " + std::to_string(blocks[i]) +
+                                     " at entry " + std::to_string(i) + " of " + std::to_string(blocks.size()) +
+                                     " - the caller did not handle alloc_block() returning -1");
+        }
+    }
+    const size_t n = std::min(blocks.size(), (size_t)max_blocks);
+    for (size_t i = 0; i < n; i++) {
         h_tables[(size_t)slot * max_blocks + i] = blocks[i];
+    }
+    // Zero past `n` as well: re-arming a slot with a SHORTER list than last time
+    // otherwise leaves the previous run's block indices behind, which is the same
+    // class of silent corruption - a valid-looking index into a freed block.
+    for (size_t i = n; i < (size_t)max_blocks; i++) {
+        h_tables[(size_t)slot * max_blocks + i] = 0;
     }
     // multi-device: the block table is host USM read by every queue, so write
     // it on the host instead of enqueuing a copy on the primary queue (which

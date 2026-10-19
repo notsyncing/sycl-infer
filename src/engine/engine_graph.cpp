@@ -456,12 +456,47 @@ static void dbg_dump_seg(sycl::queue & q, const gemv_seg & sg, int call, int tb,
 // PF_DUMP_LAYERS: fingerprint of one device activation buffer, printed so two
 // weight paths (int8 / u4 / fp32) can be compared layer by layer to see where
 // they start to differ.  Diagnostic only, off unless PF_DUMP_LAYERS is set.
+// A device->host read-back that degrades to a MESSAGE instead of terminating the
+// process.  Every fingerprint diagnostic wants a blocking wait, and SYCL forbids
+// waiting on an event that belongs to a recorded command graph:
+//
+//   "wait method cannot be used for an event associated with a command graph"
+//
+// which is what PF_DUMP_LAYERS and PF_MOE_REFDUMP_ALL both hit, because the
+// multi-device decode graph is recorded once at startup and REPLAYED afterwards -
+// so the existing `!g_capturing_` guard (which only covers the recording pass) does
+// not help, and both diagnostics aborted the whole run with a core dump instead of
+// printing nothing.  That is the worst possible failure for a diagnostic: it looks
+// like a code fault and it silently cost a wrong conclusion once already.
+//
+// Returns false and says so ONCE per process when the read-back is impossible.
+static bool dev_read_back(sycl::queue & q, void * dst, const void * src, size_t bytes, const char * who) {
+    try {
+        q.memcpy(dst, src, bytes).wait();
+        return true;
+    } catch (sycl::exception & e) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr,
+                    "[dump] %s DISABLED: %s\n"
+                    "       A recorded command graph is replayed on this queue and SYCL will not\n"
+                    "       wait on its events.  This diagnostic needs a direct replay - run the\n"
+                    "       same command with PF_NOGRAPH=1.\n",
+                    who, e.what());
+        }
+        return false;
+    }
+}
+
 static void dbg_dump_fp(sycl::queue & q, const float * d, int n, const char * tag, int il, int dev) {
     static std::vector<float> h;
     if ((int)h.size() < n) {
         h.resize((size_t)n);
     }
-    q.memcpy(h.data(), d, (size_t)n * 4).wait();
+    if (!dev_read_back(q, h.data(), d, (size_t)n * 4, "PF_DUMP_LAYERS")) {
+        return;
+    }
     double s0 = 0, s1 = 0;
     float mx = 0;
     int am = 0;
@@ -664,6 +699,27 @@ static const bool moe_time_on = si::env::flag("PF_MOE_TIME");
 // "runtime-indexed arrays" note there, and AGENTS.md.
 // PF_MOE_DP4A=0 restores the fp32 dequant expert GEMMs.
 static const bool moe_grp_on = si::env::i32("PF_MOE_DP4A", 1) != 0;
+// Decode takes the fp32 dequant expert path by default.  The grouped dp4a kernel
+// is built for prefill's shape and decode is the wrong shape for it: a decode
+// step is n_tok = 1 with top_k = 8, so each selected expert contributes exactly
+// ONE row and the M = 8 tile is 7/8 empty.  Measured on the 35B A3B: 56.7 ms/token
+// grouped against 41.2 with PF_MOE_DP4A=0 at depth 0 (1.38x) and 68.5 against 55.1
+// at 64k (1.24x), the routed experts being 39.6 ms of the 56.7 - 70% of the whole
+// decode step.
+//
+// Note what the diagnosis is NOT.  The obvious reading of the shape is "the grid
+// is starved": n_act x N/RB = 8 x 16 = 128 work-groups on 512 EUs.  That is wrong,
+// and it was measured rather than assumed - halving RB through the existing cfg
+// cases doubles the work-group count and changes nothing (56.8 -> 56.6 ms), while
+// RB = 8 (512 work-groups) is 81.1.  The reason is that RB = NSG * C, so the TOTAL
+// thread count n_act * N * 8 / C is invariant under NSG: the sweep traded work-group
+// size for work-group count and net zero.  What limits this shape is 16384 threads =
+// 512 warps = one warp per EU, and no tile shape reaches past it - which is also
+// why a split-K rewrite is not obviously the answer either.
+static const bool moe_grp_dec = si::env::i32("PF_MOE_DP4A_DEC", 0) != 0;
+// Prefill side: the kernel needs enough row tiles to fill the machine, which is a
+// function of the chunk's token count, not of the model.
+static const int moe_grp_min_tok = si::env::i32("PF_MOE_GRP_MIN_TOK", 8);
 static double moe_time_ms[6] = {0, 0, 0, 0, 0, 0};
 static int moe_time_calls = 0, moe_time_ntok = 0, moe_time_pairs = 0;
 static const char * const moe_time_nm[6] = {"router", "csr", "gate_up", "down", "reduce", "epilogue"};
@@ -772,7 +828,7 @@ auto moe_call = [&](size_t idx) {
             if (dbg_refdump && !engine::g_capturing_ &&
                 (si::env::flag("PF_MOE_REFDUMP_ALL") || si::env::i32("PF_MOE_REFDUMP_LAYER", 0) == (int) moe_il)) {
                 before_r.resize((size_t) n_tok * hp.n_embd);
-                qq.memcpy(before_r.data(), d_x, before_r.size() * 4).wait();
+                dev_read_back(qq, before_r.data(), d_x, before_r.size() * 4, "PF_MOE_REFDUMP");
             }
             if (on_cpu) {
                 // The routed half entirely on the host.  A routed-MoE model has to
@@ -864,15 +920,20 @@ auto moe_call = [&](size_t idx) {
             // stays the default and is also the fallback for any shape the dp4a
             // path declines.
             const auto & A = moe_as_[(size_t)(dev >= 0 ? dev : 0)];
-            bool grp_ok = moe_grp_on && A.xq && !moe_host_split() && !on_cpu;
+            // The grouped dp4a kernel is PREFILL-shaped and decode is not (see the
+            // `n_tok > 1` note below), so PF_MOE_DP4A_DEC chooses between them per
+            // mode rather than per process.
+            const bool dec_step = (n_tok <= 1);
+            const bool grp_want = dec_step ? moe_grp_dec : moe_grp_on;
+            bool grp_ok = grp_want && A.xq && !moe_host_split() && !on_cpu && (dec_step || n_tok >= moe_grp_min_tok);
             if (grp_ok) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
                     moe_actq_launch(qq, d_xnorm, hp.n_embd, n_tok, hp.n_embd, A.xq, A.asa, A.xs);
                 grp_ok = moe_grp_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
                                                 moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off,
-                                                d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq, A.asa, A.xs, d_moe_h,
-                                                hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type,
-                                                M.up_exps.type);
+                                                d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq,
+                                                A.asa, A.xs, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
+                                                M.gate_exps.type, M.up_exps.type);
             }
             if (!grp_ok) {
                 moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
@@ -884,8 +945,8 @@ auto moe_call = [&](size_t idx) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
                     moe_actq_launch(qq, d_moe_h, hp.n_ff_exp, n_pairs, hp.n_ff_exp, A.xq, A.asa, A.xs);
                 grp_ok = moe_grp_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off,
-                                             d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq, A.asa, A.xs, d_moe_acc,
-                                             hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type);
+                                             d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq, A.asa,
+                                             A.xs, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type);
             }
             if (!grp_ok) {
                 moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
@@ -949,11 +1010,58 @@ auto moe_call = [&](size_t idx) {
                 for (int i = 0; i <= hp.n_expert; i++) {
                     if (h[i]) wtile += (double)h[i] * ((i + 15) / 16);
                 }
+                // What the dispatched ORDER costs.  moe_grp_impl's grid is one
+                // work-group per (expert, column block) in the order `active[]`
+                // lists them, and each takes ceil(p/M) row tiles, so the list is
+                // a schedule and the makespan depends entirely on the order it is
+                // in.  `active[]` is built in ascending expert index, i.e. random
+                // with respect to cost, so the 16-tile expert is as likely to go
+                // last as first.  Greedy list-schedule both orders over 512 slots
+                // (one per EU) and report the two makespans: that is the ceiling
+                // on fixing this, measured before writing the fix.
+                const int tiles_m8 = si::dev::profile_int(qq, "PF_MOE_CFG", 43) == 43 ? 8 : 16;
+                // NB: one work-group per (expert, COLUMN BLOCK), not per expert -
+                // nwg = N/RB, and every column block of an expert walks the same
+                // ceil(p/M) row tiles.  Getting that wrong makes the schedule look
+                // 71 items on 512 slots (max 34 vs an ideal 1.05) and hides the
+                // question entirely.
+                const int nwg = (hp.n_ff_exp + 31) / 32; // gate/up: N = 512, RB = 32
+                auto makespan = [&](bool lpt) {
+                    std::vector<int> cost;
+                    for (int i = 0; i < hn[0]; i++) {
+                        const int p = hoff[hact[i] + 1] - hoff[hact[i]];
+                        const int t = (p + tiles_m8 - 1) / tiles_m8;
+                        for (int b = 0; b < nwg; b++) cost.push_back(t);
+                    }
+                    if (lpt) std::sort(cost.begin(), cost.end(), std::greater<int>());
+                    std::vector<long> slot(512, 0);
+                    for (int c : cost) {
+                        size_t best = 0;
+                        for (size_t s = 1; s < slot.size(); s++) {
+                            if (slot[s] < slot[best]) best = s;
+                        }
+                        slot[best] += c;
+                    }
+                    long mx = 0, sum = 0;
+                    for (long v : slot) {
+                        mx = std::max(mx, v);
+                        sum += v;
+                    }
+                    return std::make_pair(mx, sum);
+                };
+                const auto in_order = makespan(false);
+                const auto lpt = makespan(true);
+                const long perfect = (in_order.second + 511) / 512;
                 fprintf(stderr,
                         "[moe hist] n_tok=%d top_k=%d n_active=%d/%d mean=%.1f max=%d  <=8:%d <=16:%d <=24:%d "
                         "<=32:%d  tiles16=%.0f (weight re-read x%.2f)\n",
                         n_tok, k, hn[0], hp.n_expert, (double)wsum / std::max(1, tot), mx, w8, w16, w24, w32, wtile,
                         wtile / std::max(1, tot));
+                fprintf(stderr,
+                        "[moe sched] M=%d nwg=%d  in-order makespan %ld tile-units, LPT %ld, perfect %ld  ->  LPT is "
+                        "worth %.0f%% of the expert-GEMM time\n",
+                        tiles_m8, nwg, in_order.first, lpt.first, perfect,
+                        100.0 * (in_order.first - lpt.first) / std::max(1L, in_order.first));
                 for (int i = 0; i <= hp.n_expert; i++) {
                     if (h[i]) fprintf(stderr, "[moe hist]   pairs=%3d experts=%d\n", i, h[i]);
                 }
@@ -975,7 +1083,7 @@ auto moe_call = [&](size_t idx) {
                     fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
                 };
                 std::vector<float> rr((size_t)n_tok * hp.n_embd);
-                qq.memcpy(rr.data(), d_x, rr.size() * 4).wait();
+                if (dev_read_back(qq, rr.data(), d_x, rr.size() * 4, "PF_MOE_REFDUMP")) {
                 fpr(moe_il == 0 ? "routed-0" : "routed", rr.data(), rr.size());
                 // the exact contribution: after minus before, elementwise.
                 // Differences of *sums of squares* are not additive, so this is
@@ -995,6 +1103,7 @@ auto moe_call = [&](size_t idx) {
                         snprintf(n2, sizeof(n2), "routed_exact%s/t%d", moe_il == 0 ? "-0" : "", t);
                         fpr(n2, dr.data() + (size_t) t * hp.n_embd, hp.n_embd);
                     }
+                }
                 }
             }
             g_lc.seg++;
@@ -2083,6 +2192,22 @@ auto moe_call = [&](size_t idx) {
                 if (last_slot > 0) {
                     dbg_dump_raw(dev_queue(cur_dev), d_x + (size_t)last_slot * hp.n_embd, hp.n_embd, rp, dbg_call_no, il,
                                  1);
+                    // How MANY tokens diverge, not just whether one does.  `w1` is
+                    // the last real token and it was the only one of the two
+                    // fingerprinted rows that ever differed, which leaves three
+                    // readings open - that single token, its whole chunk, or every
+                    // chunk's last row - and they imply different mechanisms.  The
+                    // offsets walk backwards from `last_slot` by tokens (1, 2) and
+                    // by chunk rows (1, 2, 8, 16), so one run separates them.
+                    static const int kBack[] = {1, 2, kMaxT, 2 * kMaxT, 8 * kMaxT, 16 * kMaxT};
+                    for (int bi = 0; bi < 6; bi++) {
+                        const int off = kBack[bi];
+                        if (last_slot < off) {
+                            break;
+                        }
+                        dbg_dump_raw(dev_queue(cur_dev), d_x + (size_t)(last_slot - off) * hp.n_embd, hp.n_embd, rp,
+                                     dbg_call_no, il, 2 + bi);
+                    }
                 }
             }
         }

@@ -86,6 +86,25 @@ static int gather_red_max(const sycl::queue & q) {
 static int gather_red(const sycl::queue & q) {
     return si::dev::profile_int(q, "PF_XMX_GRED", si::dev::for_queue(q).attn.xmx_gather_red);
 }
+// Work-group width for the gather's requantize stage (`xmx_gather` pass 2).
+// Held constant at 64 across every `PF_XMX_GQ` setting so the sweep varies only
+// the lanes-per-key-row stripe and not the work-group width - see the note there.
+static constexpr int QG_WG = 64;
+// Threads per key row in the gather's requantize stage (`xmx_gather` pass 2).
+// One is the old `range<1>` shape; kD/32 = 8 is the point where every lane owns
+// exactly one f16 scale group.  Above 8 lanes idle, so the range stops there, and
+// only powers of two are accepted so `QG_WG/qg` rows per work-group is exact.
+static int gather_q(const sycl::queue & q) {
+    const int want = si::dev::profile_int(q, "PF_XMX_GQ", 8);
+    if (want < 1) {
+        return 1;
+    }
+    int v = 1;
+    while (v * 2 <= want && v * 2 <= kD / 32 && v * 2 <= QG_WG) {
+        v *= 2;
+    }
+    return v;
+}
 
 // Width used for the *last* key block of a call.  The oneDNN matmuls always run
 // at a fixed width (primitive creation is ~15 ms per new shape, so a width that
@@ -209,6 +228,43 @@ static xmx_bufs & xmx_get(queue & q, int m_cap, int key_cap) {
         b.acc = sycl::malloc_device<float>((size_t)m_cap * kD, q);
         b.m = sycl::malloc_device<float>(m_cap, q);
         b.l = sycl::malloc_device<float>(m_cap, q);
+        // PF_XMX_POISON=1: fill every freshly allocated scratch buffer with a
+        // recognisable garbage pattern instead of leaving malloc_device's
+        // uninitialised bytes in place.  This is the direct test of "a reused
+        // scratch leaks the previous call's bytes or reads never-written bytes",
+        // and it is the only hypothesis that fits the observed SHAPE: the whole
+        // logit vector shifts by a small amount uniformly rather than a few
+        // elements going wrong, and `bs[0]`/`bs[1]` - one scale per 8192-key
+        // block - is the only place in this file where an entire block's data
+        // collapses into a single number.  A different block max requantizes the
+        // whole block slightly differently and every query row moves.
+        //
+        // 0x7F7F7F7F as float is ~1.7e38 and as int is a large positive int32, so
+        // a read of poisoned memory is loud rather than quietly plausible.  If the
+        // divergence is unaffected, uninitialised scratch is refuted outright.
+        if (si::env::flag("PF_XMX_POISON")) {
+            constexpr uint8_t kP = 0x7F;
+            auto poison = [&](void * ptr, size_t bytes) {
+                if (ptr) {
+                    q.memset(ptr, kP, bytes).wait();
+                }
+            };
+            poison(b.k, (size_t)kBlk * kD);
+            poison(b.v, (size_t)kBlk * kD);
+            poison(b.bs, (2 + 2 * gather_red_max(q)) * sizeof(float));
+            poison(b.q8, (size_t)m_cap * kD);
+            poison(b.qsc, (size_t)m_cap * sizeof(float));
+            poison(b.orow, (size_t)m_cap * sizeof(int32_t));
+            poison(b.oh, (size_t)m_cap * sizeof(int32_t));
+            poison(b.olim, (size_t)m_cap * sizeof(int32_t));
+            poison(b.qk, (size_t)m_cap * kBlk * sizeof(int32_t));
+            poison(b.p, (size_t)m_cap * kBlk);
+            poison(b.ps, (size_t)m_cap * sizeof(float));
+            poison(b.pv, (size_t)m_cap * kD * sizeof(int32_t));
+            poison(b.acc, (size_t)m_cap * kD * sizeof(float));
+            poison(b.m, (size_t)m_cap * sizeof(float));
+            poison(b.l, (size_t)m_cap * sizeof(float));
+        }
     }
     return b;
 }
@@ -244,9 +300,80 @@ static void xmx_quant_q(queue & q, const float * qbuf, int qstride, const int32_
 // Gather the key block [k0, k0+nk) of kv head kvh into contiguous [nk][256]
 // with ONE scale for the whole block.  bs[0] = K block scale, bs[1] = V block
 // scale.
+// PF_XMX_SUM: per-gather-call device-side integer checksums, read exactly ONCE at
+// process exit.
+//
+// Same design rule and the same reason as PF_ACTQ_SUM: a host read-back inside the
+// forward is precisely what made the per-layer fingerprint oracle useless, so these
+// accumulate on the device and nothing is read back until the process is done.
+//
+// The point is the SPLIT.  `sumkv` hashes the gathered K/V bytes and `sumbs` the two
+// block scales, separately.  If `sumkv` moves, the paged pool's contents are changing;
+// if only `sumbs` moves, the gather read identical bytes and the two-stage fmax
+// reduction is what differs.  That is the one measurement left after the arm
+// bisection showed `attn_xmx` creates the difference and the size said "a ulp in the
+// exponent of the score requantization", which leaves exactly these two candidates.
+//
+// The queue is held BY VALUE so the holder can read back safely at exit even if the
+// engine has already gone; a SYCL queue keeps its context and device alive.
+struct xmx_sum_holder {
+    static constexpr int kSlots = 8192;
+    sycl::queue q;
+    int64_t * sumkv = nullptr;
+    int64_t * sumbs = nullptr;
+    int n = 0;
+    ~xmx_sum_holder() {
+        if (!sumkv || n == 0) {
+            return;
+        }
+        try {
+            std::vector<int64_t> hkv((size_t)n), hbs((size_t)n * 2);
+            q.memcpy(hkv.data(), sumkv, (size_t)n * 8).wait();
+            q.memcpy(hbs.data(), sumbs, (size_t)n * 16).wait();
+            uint64_t hkv_h = 1469598103934665603ULL, hbs_h = 1469598103934665603ULL;
+            for (int i = 0; i < n; i++) {
+                hkv_h = (hkv_h ^ (uint64_t)hkv[i]) * 1099511628211ULL;
+                for (int k = 0; k < 2; k++) {
+                    hbs_h = (hbs_h ^ (uint64_t)hbs[2 * i + k]) * 1099511628211ULL;
+                }
+            }
+            fprintf(stderr, "[xmxsum] calls=%d kv=%016llx bs=%016llx\n", n, (unsigned long long)hkv_h,
+                    (unsigned long long)hbs_h);
+            for (int i = 0; i < n; i++) {
+                fprintf(stderr, "[xmxsumslot] %d %lld %lld %lld\n", i, (long long)hkv[i], (long long)hbs[2 * i],
+                        (long long)hbs[2 * i + 1]);
+            }
+        } catch (sycl::exception & e) {
+            fprintf(stderr, "[xmxsum] readback failed: %s\n", e.what());
+        }
+    }
+    int slot(queue & qq) {
+        if (!si::env::flag("PF_XMX_SUM")) {
+            return -1;
+        }
+        if (!sumkv) {
+            q = qq;
+            sumkv = sycl::malloc_device<int64_t>(kSlots, q);
+            sumbs = sycl::malloc_device<int64_t>(kSlots * 2, q);
+            if (!sumkv || !sumbs) {
+                sumkv = sumbs = nullptr;
+                return -1;
+            }
+            // No .wait(): the multi-device decode command graph is recorded at
+            // startup and replayed, and a host wait on an event belonging to a
+            // recorded graph throws.  The in-order queue already orders the memset
+            // before every kernel submitted after it.
+            q.memset(sumkv, 0, (size_t)kSlots * 8);
+            q.memset(sumbs, 0, (size_t)kSlots * 16);
+        }
+        return n < kSlots ? n++ : -1;
+    }
+};
+static xmx_sum_holder g_xmx_sum;
+
 static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base, const sycl::half * ksc_base,
                        const sycl::half * vsc_base, const int32_t * table, int n_head_kv, int kvh, int k0, int nk, int blk,
-                       int8_t * gk, int8_t * gv, float * bs) {
+                       int8_t * gk, int8_t * gv, float * bs, int slot, int64_t * sumkv, int64_t * sumbs) {
     // The oneDNN matmul runs at the fixed block width `blk` (primitive creation
     // is ~15 ms per new shape, so the shape must not follow the chunk size).
     // Keys beyond nk are zero-filled; the softmax's causal limit (<= nk for the
@@ -332,19 +459,68 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
                 m = sycl::fmax(m, p[s]);
             }
             bs[id[0]] = m > 0 ? m / 127.f : 1.f;
+            if (sumbs) {
+                sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                  sycl::access::address_space::global_space>
+                    ab(sumbs[2 * slot + (int)id[0]]);
+                ab.fetch_add((int64_t)*(const uint32_t *)&bs[id[0]]);
+            }
         });
     });
-    // pass 2: quantize every key row with the block scales, zero-fill the pad
+    // pass 2: quantize every key row with the block scales, zero-fill the pad.
+    //
+    // This is the fix pass 1 already got, applied to the stage that never had
+    // it.  `range<1>(blk)` is ONE work-item per key: at the fixed matmul width
+    // blk = kBlk = 8192 that is 8192 work-items = 256 warps on a 512-EU card -
+    // half the machine with nothing to schedule - and each of those threads then
+    // walked kD = 256 elements one byte at a time, behind a dependent
+    // `table[kk / kBlockSize]` load.
+    //
+    // Per key the stage moves 256 (K) + 256 (V) + 32 (two f16 scale planes,
+    // 8 groups each) in and 512 out, so 1056 B, and a full 8192-key iteration is
+    // ~8.7 MB - ~23 us at the card's 376 GB/s.  It measured ~386 us per
+    // iteration (3472 us per call at 64k, 9 iterations), i.e. **17x the
+    // bandwidth floor**, while the softmax beside it sat at 48% of that floor.
+    //
+    // `qg` lanes per key row inside a QG_WG-thread work-group, so `QG_WG/qg` rows are
+    // in flight per work-group and each lane owns whole 32-value scale groups.
+    // The work-group width is held CONSTANT across the whole sweep on purpose:
+    // letting it vary with `qg` would confound "how many lanes per row" with
+    // "how many lanes a warp keeps busy", and on a SIMD32 part an 8-thread
+    // work-group is the worst possible width for the second question.
+    // `PF_XMX_GQ` sweeps `qg` alone; 1 is the old one-thread-per-row shape with
+    // the 16-byte accesses kept, so the sweep separates the two effects.
+    //
+    // The scale stays inside the multiply: `(float)k[c] * (float)ksc[g] / ksr`
+    // is the *original* association, and hoisting it to `(k[c] * (ksc[g]/ksr))`
+    // would be a different fp32 expression and a different bit pattern.  Only
+    // the loop-invariant `ksc[g]` is hoisted.
+    const int qg = gather_q(q);
+    const int rpw = QG_WG / qg; // rows per work-group
     q.submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::range<1>((size_t)blk), [=](sycl::id<1> id) {
-            if (id[0] >= (size_t)nk) {
-                for (int c = 0; c < kD; c++) {
-                    gk[(size_t)id[0] * kD + c] = 0;
-                    gv[(size_t)id[0] * kD + c] = 0;
+        h.parallel_for(nd_range<1>((size_t)((blk + rpw - 1) / rpw) * QG_WG, QG_WG), [=](nd_item<1> it) {
+            const int lr = (int)it.get_local_linear_id();
+            const int row = (int)it.get_group(0) * rpw + lr / qg;
+            const int gl = lr % qg;
+            if (row >= blk) {
+                return;
+            }
+            int8_t * gkr = gk + (size_t)row * kD;
+            int8_t * gvr = gv + (size_t)row * kD;
+            if (row >= nk) {
+                // cold path (only the last chunk's tail).  Scalar, so it needs no
+                // vec construction and cannot fail the 16-byte alignment the live
+                // path relies on.  Strided by `gl`, NOT by `lr`: a work-group spans
+                // QG_WG/qg different rows, so `lr` would give each row only the
+                // bytes its own lane slot happens to land on and leave the rest of
+                // the pad row holding whatever the previous chunk left there.
+                for (int c = gl; c < kD; c += qg) {
+                    gkr[c] = 0;
+                    gvr[c] = 0;
                 }
                 return;
             }
-            const int kk = k0 + id[0];
+            const int kk = k0 + row;
             const int kb = table[kk / kBlockSize];
             const int ko = kk % kBlockSize;
             const size_t unit = (size_t)kb * n_head_kv + kvh;
@@ -353,14 +529,61 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
             const sycl::half * ksc = kv_row_scales(ksc_base, unit, ko, kD);
             const sycl::half * vsc = kv_row_scales(vsc_base, unit, ko, kD);
             const float ksr = bs[0], vsr = bs[1];
-            for (int c = 0; c < kD; c++) {
-                const float kv = (float)krow[c] * (float)ksc[c / 32] / ksr;
-                const float vv = (float)vrow[c] * (float)vsc[c / 32] / vsr;
-                gk[(size_t)id[0] * kD + c] = (int8_t)sycl::round(sycl::fmin(127.f, sycl::fmax(-127.f, kv)));
-                gv[(size_t)id[0] * kD + c] = (int8_t)sycl::round(sycl::fmin(127.f, sycl::fmax(-127.f, vv)));
+            for (int g = gl; g < kD / 32; g += qg) { // one f16 scale per 32 dims
+                const float ksg = (float)ksc[g];
+                const float vsg = (float)vsc[g];
+                for (int u = 0; u < 2; u++) { // two 16-byte vectors per group
+                    const int c = g * 32 + u * 16;
+                    const sycl::vec<int8_t, 16> a = vload<sycl::vec<int8_t, 16>, int8_t>(krow + c);
+                    const sycl::vec<int8_t, 16> b = vload<sycl::vec<int8_t, 16>, int8_t>(vrow + c);
+                    sycl::vec<int8_t, 16> oa, ob;
+#pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        const float kv = (float)a[j] * ksg / ksr;
+                        const float vv = (float)b[j] * vsg / vsr;
+                        oa[j] = (int8_t)sycl::round(sycl::fmin(127.f, sycl::fmax(-127.f, kv)));
+                        ob[j] = (int8_t)sycl::round(sycl::fmin(127.f, sycl::fmax(-127.f, vv)));
+                    }
+                    vstore<sycl::vec<int8_t, 16>, int8_t>(gkr + c, oa);
+                    vstore<sycl::vec<int8_t, 16>, int8_t>(gvr + c, ob);
+                }
             }
         });
     });
+    // PF_XMX_SUM: hash what pass 2 just wrote.  A separate launch rather than an
+    // extra accumulation inside pass 2, deliberately: pass 1's four fmax
+    // accumulators plus two more 64-bit values would change register pressure and
+    // therefore the timing of the stage this investigation is measuring.  One extra
+    // launch on the same in-order queue is ordered after pass 2 by construction.
+    if (sumkv) {
+        constexpr int CW = 256;
+        q.submit([&](sycl::handler & h) {
+            local_accessor<int64_t, 1> red(CW, h);
+            h.parallel_for(nd_range<1>((size_t)((blk + 7) / 8) * CW, CW), [=](nd_item<1> it) {
+                const int row = it.get_group(0) * 8;
+                const int gl = (int)it.get_local_id(0);
+                int64_t v = 0;
+                for (int r = row; r < row + 8 && r < blk; r++) {
+                    for (int c = gl; c < kD; c += CW) {
+                        v = v * 31 + (int64_t)gk[(size_t)r * kD + c];
+                        v = v * 31 + (int64_t)gv[(size_t)r * kD + c];
+                    }
+                }
+                red[gl] = v;
+                it.barrier();
+                if (gl == 0) {
+                    int64_t t = 0;
+                    for (int i = 0; i < CW; i++) {
+                        t = t * 1000003 + red[i];
+                    }
+                    sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::global_space>
+                        ak(sumkv[slot]);
+                    ak.fetch_add(t);
+                }
+            });
+        });
+    }
 }
 
 // Online softmax over one key block with a per-row causal mask, requantize
@@ -385,7 +608,25 @@ static void xmx_softmax(queue & q, const int32_t * qk, const float * qsc, const 
             const int i = it.get_group(0);
             const int tid = it.get_local_linear_id();
             const float sc = qsc[i] * bs[0] * attn_scale;
-            const int lim = sycl::min(nk, olim[i] - k0); // visible keys in this block
+            // Visible keys in this block, clamped to [0, nk].
+            //
+            // The clamp to 0 is load-bearing and was missing.  `olim[i] - k0` goes
+            // NEGATIVE for any query row that sits before this block's first key,
+            // which happens as soon as there is more than one key block: chunk
+            // N's rows all carry positions < the start of chunk N+1's blocks, so
+            // every later block re-masks them.  `lim` then reaches the masked
+            // loop below as a negative start, `k < nk` is true, and `prow[k] = 0`
+            // indexes before the row - row 0 writes in front of the `p8`
+            // allocation, and row i writes into row i-1's live P values, which the
+            // row i-1 work-group is filling at the same time.  So it is a real
+            // out-of-bounds write AND a cross-row race whose winner is not
+            // scheduled, which is why it only shows up as history-dependent
+            // divergence rather than as a crash.
+            //
+            // Semantically 0 is also the right value, not just the safe one: a row
+            // that sees no key in this block has no visible key in it, so the
+            // whole block is masked and pass 1/pass 2 are skipped.
+            const int lim = sycl::max(0, sycl::min(nk, olim[i] - k0));
             const int vlim = lim - (lim % 4);            // vector part of the visible range
             const int32_t * qrow = qk + (size_t)i * ld;
             uint8_t * prow = p8 + (size_t)i * ld;
@@ -586,7 +827,23 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
     for (int kvh = 0; kvh < n_head_kv; kvh++) {
         const int M = Mtot;
         if (si::env::flag("PF_XMX_DBG") && kvh == 0) {
-            fprintf(stderr, "[xmx] M=%d max_nkv=%d nblk@%d=", M, max_nkv, kBlk);
+            // HPG / n_rows / sum(row_nr) are printed because they decide whether
+            // `M` can exceed the scratch capacity: m_cap = HPG * kMaxT * kMaxB and
+            // Mtot = HPG * sum(row_nr), so the ONLY way M overflows is
+            // sum(row_nr) > kMaxT*kMaxB, which is either a batch bigger than the
+            // documented bound or n_rows past kMaxB (and then step_info's own
+            // [kMaxB] row arrays overflow too).  Cheap to make visible.
+            {
+                int srow = 0;
+                for (int r = 0; r < n_rows; r++) {
+                    if (info->active[r]) {
+                        srow += row_nr(info, r);
+                    }
+                }
+                fprintf(stderr, "[xmx] HPG=%d n_rows=%d sum_row_nr=%d cap=%d M=%d ", HPG, n_rows, srow,
+                        HPG * kMaxQ, M);
+            }
+            fprintf(stderr, "max_nkv=%d nblk@%d=", max_nkv, kBlk);
             for (int k0 = 0; k0 < max_nkv;) {
                 const int blk = (max_nkv - k0 > kBlk) ? kBlk : xmx_tail_blk(max_nkv - k0);
                 fprintf(stderr, "%d", blk);
@@ -641,7 +898,9 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
                 q.wait();
                 t_gather = std::chrono::steady_clock::now();
             }
-            xmx_gather(q, kp_base, vp_base, ksc, vsc, table, n_head_kv, kvh, k0, nk, blk, b.k, b.v, b.bs);
+            const int xsum_slot = g_xmx_sum.slot(q);
+            xmx_gather(q, kp_base, vp_base, ksc, vsc, table, n_head_kv, kvh, k0, nk, blk, b.k, b.v, b.bs, xsum_slot,
+                       xsum_slot >= 0 ? g_xmx_sum.sumkv : nullptr, xsum_slot >= 0 ? g_xmx_sum.sumbs : nullptr);
             if (bd) {
                 q.wait();
                 t_qk = std::chrono::steady_clock::now();

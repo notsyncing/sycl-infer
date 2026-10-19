@@ -51,6 +51,101 @@ static constexpr int kMoERG = 8;
 // instead of ~14 times.  Small enough that the per-pair accumulators stay in
 // registers next to the warps' other live state.
 static constexpr int kMoEPB = 8;
+// Host-side only, and forwarded into the kernels below: device code may not call a
+// host function or read a non-constexpr static (both are hard compile errors).
+// PF_MOE_DQ2 halves the dequant ARITHMETIC and changes no load; see the note on
+// dequant_sb_lane_typed in kernel_utils.h for the experiment it belongs to.
+static inline bool moe_dq2() {
+    static const bool v = si::env::flag("PF_MOE_DQ2");
+    return v;
+}
+// PF_MOE_NOACT is the other half of the decomposition: it keeps every weight load
+// and every dequant op and replaces the ACTIVATION operand of the FMA with a
+// value derived from the loop indices, so the activation load disappears and
+// nothing else does.  Together with PF_MOE_DQ2 (which drops the weight
+// arithmetic and keeps both loads) the four combinations account for the decode
+// expert kernel's time as load / weight-alu / activation-load / fma, one variable
+// at a time.  Both are wrong-answering.
+static inline bool moe_noact() {
+    static const bool v = si::env::flag("PF_MOE_NOACT");
+    return v;
+}
+// PF_MOE_PERSIST: a work-stealing form of the grouped expert GEMM.
+//
+// WHY, and it is not bandwidth and not dp4a issue rate.  The measured routing on
+// the 35B A3B is 71 active experts with 1..256 pairs each, mean 54.6 - so a
+// work-group that owns a 256-pair expert walks 32 row tiles while one that owns a
+// 1-pair expert walks 1.  That is a 32x imbalance on a STATIC grid, and it is why
+// this kernel sustains only 50-68 GB/s of unique weight against the card's
+// 376 GB/s (AGENTS.md: "Bandwidth is not the scarce resource here; occupancy
+// is").  PF_MOE_FLAT moves the row tile into the grid and buys 2% on gate, -11%
+// on down, because it is still a static assignment with a host-sized grid: the
+// exact tile count lives on the device, so the grid is sized by the upper bound
+// `n_pairs/M + n_expert` and about a third of the work-groups scan off the end.
+//
+// This form makes the grid the MACHINE instead of the problem and lets the
+// device decide who does what: a persistent work-group pulls (expert, row tile,
+// column block) triples from an atomic counter until they run out.  The
+// 32-tile expert then becomes 32 independent work items that 32 different
+// work-groups start immediately, instead of 32 tiles serialized inside one of
+// them.  Column block is the INNER index of a work item, so consecutive items are
+// consecutive column blocks of the same (expert, tile) and the weight stream
+// stays sequential across work items.
+//
+// The counter and the work-item count are per-queue scratch, keyed on the queue
+// address exactly like attn_xmx's xmx_get - a shared static would be a
+// cross-device bug under --layer-map.
+struct moe_persist_scratch {
+    int32_t * counter = nullptr; // atomic work-item cursor
+    int32_t * nitems = nullptr;  // exact work-item count, summed on device
+};
+static moe_persist_scratch & moe_persist_get(queue & q) {
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    static std::vector<std::pair<queue *, moe_persist_scratch>> reg;
+    for (auto & e : reg) {
+        if (e.first == &q) {
+            return e.second;
+        }
+    }
+    reg.emplace_back(&q, moe_persist_scratch{});
+    moe_persist_scratch & s = reg.back().second;
+    if (!s.counter) {
+        s.counter = (int32_t *) malloc_device(2 * sizeof(int32_t), q);
+    }
+    return s;
+}
+
+// PF_MOE_NPB: consecutive OUTPUT COLUMNS one warp walks, reusing one accumulator
+// set.  The decode expert kernel runs n_act x n_ff_exp warps (4096 on the 35B A3B)
+// and each reads a different output row, i.e. a superblock 1152 bytes further
+// along, so the memory system sees 4096 concurrent read streams on a 1152-byte
+// stride.  That is the shape DRAM row buffers thrash on, and it is the one
+// explanation left for the expert path's ~24 GB/s against the dense int8 GEMV's
+// 132 GB/s on the SAME device memory.  (Partly right - see the table below.)
+// Walking NPB adjacent columns turns each
+// warp's 1-stream-per-row into one sequential NPB*1152-byte run and divides the
+// stream count by NPB.
+//
+// The columns are walked SEQUENTIALLY, not accumulated together: holding NPB rows
+// of ag[]/au[] at once is NPB*kMoEPB*2 floats and blows the register budget.  With
+// the loop outside, the accumulators are reused and nothing else changes.
+//
+// MEASURED, tg128 ms/token, all five cells in ONE run because the box drifts ~13%
+// between runs.  The hypothesis is only PARTLY right: dividing the stream count
+// buys 6-7% and then the occupancy loss takes over, hard.
+//
+//   NPB        1      2      4      8     16
+//   depth 512 43.2   40.3   40.5   43.3   54.5
+//   depth 16k 46.1    -     43.5   46.4   57.6
+//   depth 64k 54.9    -     52.2   55.1   66.4
+//
+// NPB=4 is best or tied-best at all three depths, so it is the default.
+// dev/grp_min is 0/8192 at EVERY NPB, so the row-boundary handling is right.
+static inline int moe_npb() {
+    static const int v = si::env::i32("PF_MOE_NPB", 4);
+    return v < 1 ? 1 : (v > 16 ? 16 : v);
+}
 static constexpr int kMoEWG = kMoERG * 32;
 
 // Round a *thread* count up to a whole number of 256-thread work-groups.
@@ -152,7 +247,7 @@ static void moe_router_logits(queue & q, const void * gate_inp, int esize, const
     // 1.1 s of the same prefill once this is tiled.
     const int n_sb = n_embd / 256;
     const size_t n_work = (size_t) n_tok * (size_t) n_expert;
-    q.parallel_for(nd_range<1>((n_work * 32 + 31) & ~(size_t) 31, 32), [=](nd_item<1> it) {
+    q.parallel_for(nd_range<1>((n_work * 32 + 31) & ~(size_t) 31, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
         const int lane = (int) it.get_local_id(0);
         const sub_group sgg = it.get_sub_group();
         const size_t w = (size_t) it.get_group(0);
@@ -182,6 +277,32 @@ static void moe_router_logits(queue & q, const void * gate_inp, int esize, const
         }
     });
 }
+
+// The register-blocked tiling of the above (one 32-lane sub-group per
+// `MT tokens x EB experts` tile, lanes tiling K) was DELETED, not left behind a
+// switch.  It was 2.1x faster in isolation - 45.5 -> 20.5 ms of a ~1914 ms prefill -
+// and it was also WRONG, in two separate ways that a benchmark cannot see:
+//
+//   * its `sg_sum` cross-lane step had no `reqd_sub_group_size(32)`, so on a
+//     device whose sub-group width is not 32 a 32-thread work-group is TWO
+//     sub-groups and several lane-0s raced on the same `logits[t][e]`.  That made
+//     the whole engine's output vary between processes: 13 of 13 runs of the same
+//     binary produced a different prefill argmax, with the top1-top2 margin
+//     ranging 0.04 to 1.28.  Adding the attribute makes it deterministic (4/4
+//     identical) but does NOT make it right.
+//   * with the attribute it still computes a different logit vector than the GEMV
+//     form above: pp512's argmax is 11171 against the established 4821, and it is
+//     SLOWER - 751.0 against 772.7 t/s prefill, and 49.1 against 38.1 ms/token on
+//     a depth-0 decode (1.29x).  The speedup was real; it was buying a wrong
+//     answer, and the MoE's discrete top-8 selection turned a one-ulp difference
+//     into a different logit vector rather than a smaller error.
+//
+// The lesson is the one this file keeps repeating: a bisection built on an
+// instrument that cannot see the bug finds nothing, and a speedup measured on a
+// kernel whose output was never checked against a reference is not a speedup.
+// `dev/grp_rout` HAD reported that the tiled and GEMV forms disagreed on 512 of
+// 512 tokens' expert sets; that was filed as "probably a pre-existing defect in
+// the reference" and not acted on, and it was this.
 
 // softmax over the n_expert logits of one token, in place
 static void moe_router_softmax(queue & q, float * logits, int n_tok, int n_expert) {
@@ -445,11 +566,12 @@ static inline uint32_t moe_dp4a_w(const char * sb, int gb, int lane) {
 // the plain dot product.  It also decides the row index: gate/up quantize the
 // token rows, so a pair's row is pair/top_k, while down quantizes the pair rows
 // themselves.
-template <uint32_t QT, int FUSE, int M, int C, int NSG>
+template <uint32_t QT, int FUSE, int M, int C, int NSG, int HOIST = 1, int KC = 0>
 static void moe_grp_impl(queue & q, const char * w0, const char * w1, size_t plane0, size_t plane1,
-                         const int32_t * slot_map, const int32_t * off, const int32_t * pair, const int32_t * active,
-                         const int32_t * n_active, int n_act_max, const int8_t * xq, const uint16_t * asa, const float * xs,
-                         float * out, int out_stride, int K, int N, int top_k) {
+                         const int32_t * slot_map, const int32_t * off, const int32_t * pair,
+                         const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
+                         int n_pairs, bool flat, const int8_t * xq, const uint16_t * asa, const float * xs, float * out,
+                         int out_stride, int K, int N, int top_k, bool persist) {
     constexpr int SG = 8; // 8 lanes x 4 values = one 32-value scale group
     constexpr int TX = NSG * SG;
     constexpr int RB = NSG * C; // columns one work-group owns
@@ -458,12 +580,31 @@ static void moe_grp_impl(queue & q, const char * w0, const char * w1, size_t pla
     const int sb = superblock_bytes(QT);
     const size_t row_bytes = (size_t)(K / 256) * (size_t)sb;
     const int nwg = N / RB;
+    // FLAT TILE GRID.  The grid used to be one work-group per (expert, column
+    // block) with the expert's ceil(p/M) row tiles looped INSIDE it, so a
+    // work-group's cost was proportional to that expert's pair count.  On the real
+    // routing (PF_MOE_HIST: 71 active experts, mean 54.6 pairs, max 256) that is
+    // 1..32 tiles, and no ordering fixes it: a host simulation of greedy
+    // list-scheduling over 512 slots gives an in-order makespan of 34 tile-units,
+    // an LPT makespan of 34, and a perfect balance of 17 - the single 32-tile
+    // work-group IS the critical path and it is the same work-group in every
+    // order.  Lifting the row tile into the grid makes every work-group exactly
+    // one tile, which is the only thing that moves that bound.
+    //
+    // The grid is sized by the UPPER bound sum_e ceil(p_e/M) <= n_pairs/M +
+    // n_expert (ceil(p/M) <= p/M + 1, and at most n_expert experts have a pair),
+    // because the exact count exists only on the device and the grid has to be a
+    // host-side constant.  Surplus work-groups scan off the end of the CSR and
+    // return; the scan is over n_expert int32 (1 KB, L1-resident) and the surplus
+    // is about a third of the grid, which is noise against 18 GiB of weight.
+    const int nwt = (n_pairs + M - 1) / M + n_expert;
     // Level Zero rejects a global size that is not a multiple of 256 threads
     // ("Non-uniform work-groups are not supported"), and n_act_max * nwg is a
     // product of two runtime extents - with a 2-row batch it is 16 work-groups
     // and the launch dies.  Round it up to an even count and let the surplus
     // work-groups exit on the `ia >= n_act_max` test.
-    const int ngrid = ((n_act_max * nwg + 1) / 2) * 2;
+    const int ngrid = ((nwt * nwg + 1) / 2) * 2;      // flat:   (tile, column block)
+    const int ngrid_loop = ((n_act_max * nwg + 1) / 2) * 2; // looped: (expert, column block)
     // NO reqd_sub_group_size here.  Asking this backend for 8-lane sub-groups
     // compiles, launches, and then hands every work-item `get_group(0) == 0`:
     // the whole grid collapses onto one work-group and 127/128 of the experts are
@@ -475,164 +616,370 @@ static void moe_grp_impl(queue & q, const char * w0, const char * w1, size_t pla
     // `ngrid / TX` work-groups - which is 1 here, and 127/128 of the experts are
     // then silently never computed.  Both halves of that mistake look like a
     // correct-but-oddly-slow kernel.
-    q.parallel_for(nd_range<1>((size_t)ngrid * TX, TX), [=](nd_item<1> it) {
+    // KC > 0 stages each K-chunk of the activation tile in SLM.  All NSG
+    // sub-groups of this work-group read the SAME M x KC activation bytes, so
+    // without it the launch issues NSG times more load requests than the tile has
+    // bytes.  KC is bounded by this backend's per-work-group SLM limit, which
+    // rejects 34816 B (UR_RESULT_ERROR_OUT_OF_RESOURCES) and accepts 16384;
+    // M*KC + M*(KC/32)*2 at M=16, KC=512 is 8704 B.
+    // dev/slm_probe measures the stage+barrier at 0.012 ms of a 0.779 ms
+    // pipeline (1.5%), so this is close to free - see AGENTS.md, which records a
+    // first attempt that was rejected on the strength of a kernel that never
+    // passed exactness.
+    // Device-visible cursors for the persistent form, at function scope so the
+    // kernel lambda can capture the POINTERS.  Null when !persist, and the kernel
+    // never dereferences them in that case.
+    int32_t * cursor = nullptr;
+    int32_t * total_dev = nullptr;
+    moe_persist_scratch * ps = nullptr;
+    if (persist) {
+        ps = &moe_persist_get(q);
+        // The work-item count is `sum_e ceil(p_e / M) * ncb` and p_e only exists on
+        // the device, so the host cannot size the grid from it - which is the whole
+        // reason this form exists.  Sum it here and zero the cursor in the same
+        // single-work-item launch, so the main kernel can compare against a real
+        // total instead of an upper bound and there is no surplus work-group to
+        // pay for.
+        // Never capture `ps`: that is a host std::vector-backed struct.
+        cursor = ps->counter;
+        total_dev = ps->counter + 1;
+        q.parallel_for(range<1>(1), [=](id<1>) {
+            int nt = 0;
+            for (int e = 0; e < n_expert; e++) {
+                nt += (off[e + 1] - off[e] + M - 1) / M;
+            }
+            total_dev[0] = nt * (int)nwg;
+            atomic_ref<int32_t, memory_order::relaxed, memory_scope::device,
+                        access::address_space::global_space>(cursor[0])
+                .store(0);
+        });
+    }
+    // The persistent grid is sized by the MACHINE, not by the problem.  One
+    // work-group per (expert, column block) would be n_act_max * nwg, and the
+    // problem there is not the count but that the count is a host upper bound
+    // over a device-side tile list.  Here it is simply "enough warps to hide
+    // latency", and the device decides the assignment.
+    // Read ONCE per process and cached: this is inside a launcher that runs 80
+    // times per chunk, and an uncached device lookup here would be the exact
+    // regression this file records ("Never put a device query in a kernel
+    // launcher" - 3.2 ms per launch, 210 ms in one verify pass).  si::dev::
+    // profile_int already caches the env half; the EU count comes from the
+    // already-resolved per-queue profile.
+    static const int persist_wg = si::env::i32("PF_MOE_PERSIST_WG", 0);
+    const int npersist = persist_wg > 0 ? persist_wg : 2 * si::dev::for_queue(q).hw.compute_units;
+    const size_t slm_act = (KC > 0) ? (size_t)M * (size_t)KC : (size_t)4;
+    q.submit([&](handler & h) {
+        local_accessor<int8_t, 1> l_act(slm_act, h);
+        local_accessor<uint16_t, 1> l_asa((size_t)M * (size_t)((KC > 0) ? KC : 32) / 32 * 2, h);
+        local_accessor<int32_t, 1> l_item(1, h);
+        h.parallel_for(nd_range<1>((size_t)(persist ? (npersist > 0 ? npersist : 1024) : (flat ? ngrid : ngrid_loop)) * TX, TX),
+                     [=](nd_item<1> it) {
         const int lid = (int)it.get_local_id(0);
         const int lane = lid % SG;
         const sub_group sgg = it.get_sub_group();
         const int gw = (int)it.get_group(0);
-        const int ia = gw / nwg;
-        if (ia >= n_act_max) {
-            return;
-        }
-        if (ia >= n_active[0]) {
-            return; // fewer experts selected than the grid was sized for
-        }
-        const int e = active[ia];
-        const int slot = slot_map[e];
-        if (slot < 0) {
-            return; // host-resident expert: the host computes it
-        }
-        const char * b0 = w0 + (size_t)slot * plane0;
-        const char * b1 = (FUSE == 2) ? (w1 + (size_t)slot * plane1) : b0;
-        const int e1 = off[e + 1];
-        const int n0 = (gw - ia * nwg) * RB + (lid / SG) * C;
-        float acc[M][FUSE][C];
-        for (int i0 = off[e]; i0 < e1; i0 += M) {
-            const int np = (e1 - i0 < M) ? (e1 - i0) : M;
-#pragma unroll
-            for (int i = 0; i < M; i++) {
-#pragma unroll
-                for (int f = 0; f < FUSE; f++) {
-#pragma unroll
-                    for (int c = 0; c < C; c++) {
-                        acc[i][f][c] = 0.f;
-                    }
+        // (tile, column block) -> (expert, row offset).  A linear scan of the
+        // CSR rather than a prebuilt tile list: n_expert is a few hundred, the
+        // array is 1 KB and L1-resident, and this way there is no scratch to
+        // allocate, no second kernel to launch, and nothing for dev/grp_min to
+        // have to set up differently from the engine.
+    // THE WORK LOOP.  For the static forms this runs exactly once - the work item
+    // came from the grid - and for the persistent form it runs until the atomic
+    // cursor is exhausted.
+    //
+    // This loop is CORRECTNESS, not an optimisation.  The first version drew ONCE
+    // per work-group and returned, and it measured 2.85x on the prefill with every
+    // argmax oracle unchanged - which was the tell, not the win.  A real prefill has
+    // sum_e ceil(p_e/M) * ncb work items (~9000 at 512 tokens) against a grid of
+    // 2*compute_units (~1024), so that version silently DROPPED ~90% of the work and
+    // still produced the right argmax.  The argmax is a weak oracle for exactly this
+    // class of change - this file records the prefill argmax sitting at 4821 while
+    // the router was selecting a completely wrong expert set - and the standing rule
+    // is that a stub which beats the real kernel means the stub is wrong.  It was.
+    //
+    // `persist || pass == 0` keeps the static forms at exactly one iteration.  Every
+    // exit inside the loop is work-group-uniform (the item is broadcast from lane 0,
+    // and e/slot depend only on it), so the barriers stay collective.
+    for (int pass = 0; persist || pass == 0; pass++) {
+            int e = n_expert, cb = 0, rem = 0;
+            if (persist) {
+                // Pull work items until the device-side total is exhausted.  The cursor
+                // and the total are both DEVICE memory written by the prepare launch
+                // above, so nothing here is a host value: `total` is the exact
+                // sum_e ceil(p_e/M) * ncb, which the host cannot know, and that is the
+                // entire reason this form exists.  Column block is the INNER index, so
+                // consecutive items walk consecutive column blocks of one weight row and
+                // the stream stays sequential.
+                const int total = total_dev[0];
+                // ONE WORK ITEM PER WORK-GROUP, and that is the whole subtlety here.
+                // The first version of this had every lane call fetch_add, so the 128
+                // lanes of a work-group drew 128 DIFFERENT items: sg_sum then summed
+                // eight unrelated (expert, tile, column) computations, and every lane
+                // stored to a different output column.  Exactness caught it at
+                // 8191/8192 mismatches and - the part worth keeping - raising
+                // PF_MOE_PERSIST_WG from 64 to 4096 changed nothing, which is what a
+                // per-lane draw looks like and what a starved grid does not.
+                //
+                // So lane 0 draws once and publishes through SLM.  EVERY lane must
+                // reach the barrier below, including the ones whose work-group has
+                // finished, so the early-out is placed AFTER it - this file already
+                // records the shape of this mistake ("sg_sum is a sub-group collective,
+                // so it has to be called by ALL 32 lanes"; moving it under a lane test
+                // compiled, produced plausible text, and was wrong).
+                if (lid == 0) {
+                    atomic_ref<int32_t, memory_order::relaxed, memory_scope::device,
+                                access::address_space::global_space> cur(cursor[0]);
+                    l_item[0] = cur.fetch_add(1);
                 }
+                it.barrier(sycl::access::fence_space::local_space);
+                const int item = l_item[0];
+                if (item >= total) {
+                    return; // this work-group's share is done, and now uniformly so
+                }
+                int t = item / (int)nwg;
+                cb = item - t * (int)nwg;
+                e = n_expert;
+                for (int ee = 0; ee < n_expert; ee++) {
+                    const int nt = (off[ee + 1] - off[ee] + M - 1) / M;
+                    if (t < nt) {
+                        e = ee;
+                        rem = t;
+                        break;
+                    }
+                    t -= nt;
+                }
+                if (e >= n_expert) {
+                    return; // should not happen; the prepare pass summed exactly this
+                }
+            } else if (flat) {
+                const int t = gw / nwg;
+                cb = gw - t * nwg;
+                rem = t;
+                e = 0;
+                for (; e < n_expert; e++) {
+                    const int nt = (off[e + 1] - off[e] + M - 1) / M;
+                    if (rem < nt) {
+                        break;
+                    }
+                    rem -= nt;
+                }
+                if (e >= n_expert) {
+                    return; // surplus grid slot
+                }
+            } else {
+                const int ia = gw / nwg;
+                cb = gw - ia * nwg;
+                if (ia >= n_act_max) {
+                    return;
+                }
+                if (ia >= n_active[0]) {
+                    return; // fewer experts selected than the grid was sized for
+                }
+                e = active[ia];
             }
-            // HOISTED out of the K loop.  `pair[i0+m]`, the top_k division and
-            // the row address are per (tile, row), not per (tile, row, group):
-            // leaving them inside cost 2 of the 3 memory ops in the inner body
-            // (one `pair` load and one integer division per 32-value group per
-            // row), and the inner body only has FUSE*C dp4a to hide them behind.
-            // Measured 8.94 -> 6.03 ms for the `down` projection.
-            int trowv[M];
-#pragma unroll
-            for (int m = 0; m < M; m++) {
-                const int pr = (m < np) ? pair[i0 + m] : 0;
-                trowv[m] = (FUSE == 2) ? (pr / top_k) : pr;
+            const int slot = slot_map[e];
+            if (slot < 0) {
+                return; // host-resident expert: the host computes it
             }
-            for (int sbi = 0; sbi < nsb; sbi++) {
-                // d/dmin and the block base, once per (bank, column,
-                // superblock): scalars only, and `sbp` is loop-invariant in gg.
-                float dv[FUSE][C], dmv[FUSE][C];
-                const char * sbbase[FUSE][C];
-#pragma unroll
-                for (int f = 0; f < FUSE; f++) {
-#pragma unroll
-                    for (int c = 0; c < C; c++) {
-                        const int n = n0 + c;
-                        const char * bb = (FUSE == 2 && f == 1) ? b1 : b0;
-                        sbbase[f][c] = bb + (size_t)n * row_bytes + (size_t)sbi * (size_t)sb;
-                        if (n < N) {
-                            moe_sb_d<QT>(sbbase[f][c], dv[f][c], dmv[f][c]);
-                        } else {
-                            dv[f][c] = 0.f;
-                            dmv[f][c] = 0.f;
+            const char * b0 = w0 + (size_t)slot * plane0;
+            const char * b1 = (FUSE == 2) ? (w1 + (size_t)slot * plane1) : b0;
+            const int e1 = off[e + 1];
+            const int i0base = (flat || persist) ? (off[e] + rem * M) : off[e];
+            const int ntile = (flat || persist) ? 1 : ((e1 - i0base + M - 1) / M);
+            const int n0 = cb * RB + (lid / SG) * C;
+            float acc[M][FUSE][C];
+            // NOT named `it`: that is the nd_item<1> this kernel's every `it.barrier`
+            // refers to, and shadowing it turns `it.barrier(...)` into `int.barrier`.
+            for (int itk = 0; itk < ntile; itk++) {
+            const int i0 = i0base + itk * M;
+            const int np = sycl::min(M, e1 - i0);
+    #pragma unroll
+                for (int i = 0; i < M; i++) {
+    #pragma unroll
+                    for (int f = 0; f < FUSE; f++) {
+    #pragma unroll
+                        for (int c = 0; c < C; c++) {
+                            acc[i][f][c] = 0.f;
                         }
                     }
                 }
-                // FULLY unrolled, and that is the point rather than a style
-                // choice.  `gg` is a compile-time constant inside, so the scale
-                // decode is constant-indexed and all eight groups' weight and
-                // scale loads for a superblock issue before the first dp4a
-                // waits on any of them.  With a rolled loop each group pays the
-                // full global latency with nothing to overlap it, and the whole
-                // superblock loop is 99% of the kernel: measured 51 ms rolled vs
-                // 0.18 ms with the loop removed, and the loads - not the dp4a -
-                // are what is being waited on.
-#pragma unroll
-                for (int gg = 0; gg < 8; gg++) {
-                    const int g = sbi * 8 + gg;
-                    uint32_t wq[FUSE][C];
-                    float dsc[FUSE][C], dmn[FUSE][C];
-#pragma unroll
+                // HOISTED out of the K loop.  `pair[i0+m]`, the top_k division and
+                // the row address are per (tile, row), not per (tile, row, group):
+                // leaving them inside cost 2 of the 3 memory ops in the inner body
+                // (one `pair` load and one integer division per 32-value group per
+                // row), and the inner body only has FUSE*C dp4a to hide them behind.
+                // Measured 8.94 -> 6.03 ms for the `down` projection.
+                //
+                // But it costs M *integer registers* on top of the M*FUSE*C float
+                // accumulators, and M is what cannot grow (M=24/32 are the only
+                // instantiations IGC reports as spilling, and they measure 1.4-1.6x
+                // slower *despite* moving 1.56x less weight).  HOIST=0 recomputes
+                // the row inside the group loop instead, trading M registers for
+                // M*nsb*8 extra loads - which only pays if that is enough to stop
+                // the spill.  PF_MOE_CFG cases 16+ are that A/B.
+                int trowv[HOIST ? M : 1];
+    #pragma unroll
+                for (int m = 0; m < (HOIST ? M : 1); m++) {
+                    const int pr = (m < np) ? pair[i0 + m] : 0;
+                    trowv[m] = (FUSE == 2) ? (pr / top_k) : pr;
+                }
+                // The K loop.  With KC == 0 this is one iteration over the whole
+                // reduction and the activation is read from global; with KC > 0 it is
+                // K/KC chunks, each staged once into SLM.
+                for (int kc = 0; kc < K; kc += ((KC > 0) ? KC : K)) {
+                    if constexpr (KC > 0) {
+                        int8_t * ap = l_act.get_multi_ptr<access::decorated::no>().get();
+                        uint16_t * sp = l_asa.get_multi_ptr<access::decorated::no>().get();
+                        const int ngc = KC / 32;
+    #pragma unroll
+                        for (int m = 0; m < M; m++) {
+                            if (m >= np) {
+                                continue;
+                            }
+                            const int8_t * src = xq + (size_t)trowv[m] * (size_t)K + (size_t)kc;
+                            int8_t * dst = ap + (size_t)m * (size_t)KC;
+                            for (int i = lid; i < KC / 4; i += TX) {
+                                *reinterpret_cast<uint4 *>(dst + i * 4) = *reinterpret_cast<const uint4 *>(src + i * 4);
+                            }
+                            for (int i = lid; i < ngc; i += TX) {
+                                sp[(size_t)m * (size_t)ngc + i] = asa[(size_t)trowv[m] * (size_t)ng + kc / 32 + i];
+                            }
+                        }
+                        it.barrier(access::fence_space::local_space);
+                    }
+                    const int koff = kc;
+                    for (int sbi = 0; sbi < ((KC > 0) ? (KC / 256) : nsb); sbi++) {
+                    // d/dmin and the block base, once per (bank, column,
+                    // superblock): scalars only, and `sbp` is loop-invariant in gg.
+                    float dv[FUSE][C], dmv[FUSE][C];
+                    const char * sbbase[FUSE][C];
+    #pragma unroll
                     for (int f = 0; f < FUSE; f++) {
-#pragma unroll
+    #pragma unroll
                         for (int c = 0; c < C; c++) {
                             const int n = n0 + c;
-                            const char * sbp = sbbase[f][c];
-                            wq[f][c] = (n < N) ? moe_dp4a_w<QT>(sbp, gg, lane) : 0u;
+                            const char * bb = (FUSE == 2 && f == 1) ? b1 : b0;
+                            sbbase[f][c] = bb + (size_t)n * row_bytes + (size_t)(koff / 256 + sbi) * (size_t)sb;
                             if (n < N) {
-                                moe_grp_sc<QT>(sbp, gg, lane, dv[f][c], dmv[f][c], dsc[f][c], dmn[f][c]);
+                                moe_sb_d<QT>(sbbase[f][c], dv[f][c], dmv[f][c]);
                             } else {
-                                dsc[f][c] = 0.f;
-                                dmn[f][c] = 0.f;
+                                dv[f][c] = 0.f;
+                                dmv[f][c] = 0.f;
                             }
                         }
                     }
-                    // The bound is M, not np, ON PURPOSE.  With `m < np` the
-                    // index into acc[] is a runtime value, so `acc` is placed in
-                    // private (scratch) memory and every dp4a becomes a scratch
-                    // load + store - which measured 51 ms against 0.18 ms for
-                    // the identical loop nest.  With the bound at the template M
-                    // the loop unrolls, `m` becomes a constant, and acc lives in
-                    // registers; the price is dp4a for rows the expert does not
-                    // have, which the PF_MOE_HIST distribution puts at ~14%.
-#pragma unroll
-                    for (int m = 0; m < M; m++) {
-                        // predicated, NOT `break`: a runtime `break` in a
-                        // compile-time-bound loop stops the unroller, and then
-                        // every index into acc[] is a runtime value, so acc lands
-                        // in private scratch memory.  Measured 51 ms that way
-                        // against 0.18 ms with the same loop nest removed.
-                        if (m >= np) {
-                            continue;
-                        }
-                        const int trow = trowv[m];
-                        const uint32_t xa = *reinterpret_cast<const uint32_t *>(
-                            xq + (size_t)trow * (size_t)K + (size_t)g * 32 + (size_t)lane * 4);
-                        const float A = moe_h2f(asa[(size_t)trow * (size_t)ng + g]);
-                        const float asl = -A * (float)dp4a_s8u8(xa, 0x01010101u, 0);
-#pragma unroll
+                    // FULLY unrolled, and that is the point rather than a style
+                    // choice.  `gg` is a compile-time constant inside, so the scale
+                    // decode is constant-indexed and all eight groups' weight and
+                    // scale loads for a superblock issue before the first dp4a
+                    // waits on any of them.  With a rolled loop each group pays the
+                    // full global latency with nothing to overlap it, and the whole
+                    // superblock loop is 99% of the kernel: measured 51 ms rolled vs
+                    // 0.18 ms with the loop removed, and the loads - not the dp4a -
+                    // are what is being waited on.
+    #pragma unroll
+                    for (int gg = 0; gg < 8; gg++) {
+                        const int g = koff / 32 + sbi * 8 + gg;
+                        uint32_t wq[FUSE][C];
+                        float dsc[FUSE][C], dmn[FUSE][C];
+    #pragma unroll
                         for (int f = 0; f < FUSE; f++) {
-#pragma unroll
+    #pragma unroll
                             for (int c = 0; c < C; c++) {
-                                const int32_t q = dp4a_s8u8(xa, wq[f][c], 0);
-                                acc[m][f][c] = sycl::fma(A * dsc[f][c], (float)q, acc[m][f][c]);
-                                acc[m][f][c] = sycl::fma(asl, dmn[f][c], acc[m][f][c]);
+                                const int n = n0 + c;
+                                const char * sbp = sbbase[f][c];
+                                wq[f][c] = (n < N) ? moe_dp4a_w<QT>(sbp, gg, lane) : 0u;
+                                if (n < N) {
+                                    moe_grp_sc<QT>(sbp, gg, lane, dv[f][c], dmv[f][c], dsc[f][c], dmn[f][c]);
+                                } else {
+                                    dsc[f][c] = 0.f;
+                                    dmn[f][c] = 0.f;
+                                }
                             }
                         }
+                        // The bound is M, not np, ON PURPOSE.  With `m < np` the
+                        // index into acc[] is a runtime value, so `acc` is placed in
+                        // private (scratch) memory and every dp4a becomes a scratch
+                        // load + store - which measured 51 ms against 0.18 ms for
+                        // the identical loop nest.  With the bound at the template M
+                        // the loop unrolls, `m` becomes a constant, and acc lives in
+                        // registers; the price is dp4a for rows the expert does not
+                        // have, which the PF_MOE_HIST distribution puts at ~14%.
+    #pragma unroll
+                        for (int m = 0; m < M; m++) {
+                            // predicated, NOT `break`: a runtime `break` in a
+                            // compile-time-bound loop stops the unroller, and then
+                            // every index into acc[] is a runtime value, so acc lands
+                            // in private scratch memory.  Measured 51 ms that way
+                            // against 0.18 ms with the same loop nest removed.
+                            if (m >= np) {
+                                continue;
+                            }
+                            const int pr2 = (m < np) ? pair[i0 + m] : 0;
+                            const int trow = HOIST ? trowv[m] : ((FUSE == 2) ? (pr2 / top_k) : pr2);
+                            uint32_t xa;
+                            float A;
+                            if constexpr (KC > 0) {
+                                const int8_t * ap = l_act.get_multi_ptr<access::decorated::no>().get();
+                                const uint16_t * sp = l_asa.get_multi_ptr<access::decorated::no>().get();
+                                const int gl = g - koff / 32;
+                                xa = *reinterpret_cast<const uint32_t *>(
+                                    ap + (size_t)m * (size_t)KC + (size_t)gl * 32 + (size_t)lane * 4);
+                                A = moe_h2f(sp[(size_t)m * (size_t)(KC / 32) + gl]);
+                            } else {
+                                xa = *reinterpret_cast<const uint32_t *>(
+                                    xq + (size_t)trow * (size_t)K + (size_t)g * 32 + (size_t)lane * 4);
+                                A = moe_h2f(asa[(size_t)trow * (size_t)ng + g]);
+                            }
+                            const float asl = -A * (float)dp4a_s8u8(xa, 0x01010101u, 0);
+    #pragma unroll
+                            for (int f = 0; f < FUSE; f++) {
+    #pragma unroll
+                                for (int c = 0; c < C; c++) {
+                                    const int32_t q = dp4a_s8u8(xa, wq[f][c], 0);
+                                    acc[m][f][c] = sycl::fma(A * dsc[f][c], (float)q, acc[m][f][c]);
+                                    acc[m][f][c] = sycl::fma(asl, dmn[f][c], acc[m][f][c]);
+                                }
+                            }
+                        }
+                    } // gg
+                    } // sbi
+                    if constexpr (KC > 0) {
+                        // every thread must arrive before the next chunk restages
+                        // over the same SLM
+                        it.barrier(access::fence_space::local_space);
                     }
-                }
-            }
-            // one cross-lane step for the whole tile, then the store.  `pair[]` is built
-            // by an atomic scatter, so the rows of one expert are in NO
-            // particular order - the store has to index through it, not assume
-            // pair[i0+m] == pair[i0]+m (which silently misplaces every row of
-            // every expert that selected more than one pair).
-#pragma unroll
-            for (int m = 0; m < M; m++) {
-                if (m >= np) {
-                    continue;
-                }
-#pragma unroll
-                for (int c = 0; c < C; c++) {
-                    if (n0 + c >= N) {
+                } // kc
+                // one cross-lane step for the whole tile, then the store.  `pair[]` is built
+                // by an atomic scatter, so the rows of one expert are in NO
+                // particular order - the store has to index through it, not assume
+                // pair[i0+m] == pair[i0]+m (which silently misplaces every row of
+                // every expert that selected more than one pair).
+    #pragma unroll
+                for (int m = 0; m < M; m++) {
+                    if (m >= np) {
                         continue;
                     }
-                    float v[FUSE];
-#pragma unroll
-                    for (int f = 0; f < FUSE; f++) {
-                        // every lane must enter the collective
-                        v[f] = sg_sum<SG>(acc[m][f][c], sgg);
-                    }
-                    if (lane == 0) {
-                        out[(size_t)pair[i0 + m] * (size_t)out_stride + n0 + c] =
-                            (FUSE == 2) ? silu_f(v[0]) * v[1] : v[0];
+    #pragma unroll
+                    for (int c = 0; c < C; c++) {
+                        if (n0 + c >= N) {
+                            continue;
+                        }
+                        float v[FUSE];
+    #pragma unroll
+                        for (int f = 0; f < FUSE; f++) {
+                            // every lane must enter the collective
+                            v[f] = sg_sum<SG>(acc[m][f][c], sgg);
+                        }
+                        if (lane == 0) {
+                            out[(size_t)pair[i0 + m] * (size_t)out_stride + n0 + c] =
+                                (FUSE == 2) ? silu_f(v[0]) * v[1] : v[0];
+                        }
                     }
                 }
-            }
+    }
         }
+        });
     });
 }
 
@@ -685,8 +1032,8 @@ namespace {
 template <int FUSE, uint32_t QT>
 static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane0, size_t plane1, const int32_t * slot_map,
                        const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
-                       int n_act_max, const int8_t * xq, const uint16_t * asa, const float * xs, float * out,
-                       int out_stride, int K, int N, int top_k) {
+                       int n_act_max, int n_expert, int n_pairs, bool flat, const int8_t * xq, const uint16_t * asa,
+                       const float * xs, float * out, int out_stride, int K, int N, int top_k, bool persist) {
     // One-shot launch geometry: this kernel's cost is set by the grid
     // (experts x N/RB) and by the row tiles, neither of which is visible from
     // outside, and the quiet way to be wrong is to launch a grid that does not
@@ -697,25 +1044,54 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
     // 4.5x), down wants C=1 (4.57 vs 6.33 ms) because its accumulator count is
     // half and occupancy wins over dp4a-per-activation-load.  So the config is
     // per projection; PF_MOE_CFG / PF_MOE_CFG_DOWN override either.
-    // The shipped default is M=16 / NSG=16 / C=2: 8.94 ms for the gate+up
-    // projection and 6.03 ms for `down` at the 35B geometry (dev/bench_grp).
-    // See AGENTS.md for the sweep - notably, down prefers C=1 (4.57 ms) and
-    // M=32 costs less bandwidth but spills its accumulator.
-    static const int cfg_gate = si::env::i32("PF_MOE_CFG", 0);
-    static const int cfg_down = si::env::i32("PF_MOE_CFG_DOWN", 0);
+    // M=8 / C=2 / NSG=16, the measured optimum for BOTH projections
+    // (dev/bench_grp, 35B geometry, best of 2): gate+up 6.01 ms and down 3.38 ms
+    // against 7.05/4.12 for the M=16 C=2 tile that shipped before, and
+    // 7.29/3.76 for M=16 C=1.  One config, not a per-projection pair.
+    //
+    // The reason M went DOWN and not up is the shape of this kernel: the weight
+    // re-read factor is ceil(p_e/M), so M=8 reads the weight ~1.87x more than
+    // M=16 and is still 17% faster, because the kernel sustains only 50-68 GB/s
+    // of unique weight against a 376 GB/s card - **bandwidth is not the scarce
+    // resource here, occupancy is.**  What binds is the register budget
+    // P = M*FUSE*C: every P=32 config lands at 6.0-6.1 ms, P=64 jumps to
+    // 7.0-7.3 and P=128 to 20-51.  (An earlier note here claimed the binding
+    // constraint was the dp4a-per-load ratio M*FUSE*C/(M+FUSE*C); the sweep
+    // refutes it - the optimum has ratio 2.67, BELOW the M=16 tile's 3.20.)
+    static const int cfg_gate = si::env::i32("PF_MOE_CFG", 43);
+    static const int cfg_down = si::env::i32("PF_MOE_CFG_DOWN", 43);
     const int cfg = (FUSE == 2) ? cfg_gate : cfg_down;
-#define SI_MOE_TILE3(MV, NSGV, CV)                                                                                            \
+#define SI_MOE_TILE5(MV, NSGV, CV, HV)                                                                                       \
     do {                                                                                                                 \
         constexpr int NSG = NSGV, C = CV, RB = NSG * C;                                                                  \
-        if ((K % 256) != 0 || (N % RB) != 0 || n_act_max <= 0) {                                                         \
+        if ((K % 256) != 0 || (N % RB) != 0 || n_pairs <= 0 || n_expert <= 0) {                                                         \
             return false;                                                                                                 \
         }                                                                                                                \
         if (dbg) {                                                                                                       \
-            fprintf(stderr, "[grp] fuse=%d qt=%u M=%d C=%d NSG=%d RB=%d K=%d N=%d grid=%zu n_act_max=%d\n", FUSE,        \
-                    (unsigned)QT, MV, C, NSG, RB, K, N, (size_t)n_act_max * (size_t)(N / RB), n_act_max);                   \
+            fprintf(stderr, "[grp] fuse=%d qt=%u M=%d C=%d NSG=%d HOIST=%d KC=0 RB=%d K=%d N=%d grid=%zu n_expert=%d n_pairs=%d flat=%d persist=%d\n", FUSE,  \
+                    (unsigned)QT, MV, C, NSG, HV, RB, K, N,                                                       \
+                    (size_t)((n_pairs + MV - 1) / MV + n_expert) * (size_t)(N / RB), n_expert, n_pairs, flat ? 1 : 0, persist ? 1 : 0);  \
         }                                                                                                                \
-        moe_grp_impl<QT, FUSE, MV, C, NSG>(q, w0, w1, plane0, plane1, slot_map, off, pair, active, n_active, n_act_max,     \
-                                           xq, asa, xs, out, out_stride, K, N, top_k);                                  \
+        moe_grp_impl<QT, FUSE, MV, C, NSG, HV>(q, w0, w1, plane0, plane1, slot_map, off, pair, active, n_active,          \
+                                                n_act_max, n_expert, n_pairs, flat, xq, asa, xs, out, out_stride, K, N,    \
+                                                top_k, persist);                    \
+        return true;                                                                                                     \
+    } while (0)
+#define SI_MOE_TILE3(MV, NSGV, CV) SI_MOE_TILE5(MV, NSGV, CV, 1)
+#define SI_MOE_TILE6(MV, NSGV, CV, HV, KCV)                                                                               \
+    do {                                                                                                                 \
+        constexpr int NSG = NSGV, C = CV, RB = NSG * C;                                                                  \
+        if ((K % KCV) != 0 || (N % RB) != 0 || n_pairs <= 0 || n_expert <= 0) {                                                         \
+            return false;                                                                                                 \
+        }                                                                                                                \
+        if (dbg) {                                                                                                       \
+            fprintf(stderr, "[grp] fuse=%d qt=%u M=%d C=%d NSG=%d HOIST=%d KC=%d RB=%d K=%d N=%d grid=%zu n_expert=%d n_pairs=%d flat=%d persist=%d\n",   \
+                    FUSE, (unsigned)QT, MV, C, NSG, HV, KCV, RB, K, N,                                                    \
+                    (size_t)((n_pairs + MV - 1) / MV + n_expert) * (size_t)(N / RB), n_expert, n_pairs, flat ? 1 : 0, persist ? 1 : 0);                               \
+        }                                                                                                                \
+        moe_grp_impl<QT, FUSE, MV, C, NSG, HV, KCV>(q, w0, w1, plane0, plane1, slot_map, off, pair, active, n_active,       \
+                                                  n_act_max, n_expert, n_pairs, flat, xq, asa, xs, out, out_stride, K, \
+                                                  N, top_k, persist);                  \
         return true;                                                                                                     \
     } while (0)
 #define SI_MOE_TILE(NSGV, CV) SI_MOE_TILE3(16, NSGV, CV)
@@ -736,27 +1112,87 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
     case 13: SI_MOE_TILE3(24, 32, 1);
     case 14: SI_MOE_TILE3(48, 32, 1);
     case 15: SI_MOE_TILE3(32, 64, 1);
+    // M > 16 spills because acc is M*FUSE*C and the hoisted row is M more
+    // registers.  These drop the hoist (M*nsb*8 extra `pair` loads and
+    // divisions) to test whether that alone is enough to stop the spill -
+    // the only route left to the smaller weight-re-read factor.
+    case 16: SI_MOE_TILE5(32, 32, 1, 0);
+    case 17: SI_MOE_TILE5(24, 32, 1, 0);
+    case 18: SI_MOE_TILE5(48, 32, 1, 0);
+    case 19: SI_MOE_TILE5(64, 32, 1, 0);
+    case 20: SI_MOE_TILE5(32, 16, 1, 0);
+    case 21: SI_MOE_TILE5(16, 32, 1, 0);
+    // SLM activation staging (KC > 0), as an A/B only.  Correctness first: the
+    // M=16 staged forms are wrong in exactly one row (512/8192 = one row of 512
+    // columns) and M=8 in two, so only the M=32 forms survive `dev/grp_min`, and
+    // those are then 1.3-1.4x SLOWER than reading the activation from global
+    // (gate 9.0-9.3 vs 7.06, down 4.9-5.4 vs 4.12) - M=32 costs a spill and the
+    // activation re-read was never the bottleneck, which is what the earlier
+    // PF_MOE_ABL=8 measurement said (ABL=8 was within 1% of the full kernel).
+    // KC=128 (cases 31/34) measures 6x FASTER and 8192/8192 wrong: it is the
+    // same artifact that produced the first "4.9x" reading, and those cases are
+    // deleted rather than left as a switch that trades correctness for speed.
+    case 30: SI_MOE_TILE6(32, 32, 1, 1, 512);
+    case 32: SI_MOE_TILE6(32, 16, 1, 1, 256);
+    // The register-budget sweep.  The kernel is NOT weight-bandwidth-bound (it
+    // sustains 50-68 GB/s of unique weight against a 376 GB/s card), so weight
+    // traffic is the cheap currency and `M*FUSE*C/(M + FUSE*C)` - dp4a issued
+    // per memory op - is the expensive one.  That ratio is maximised, at a FIXED
+    // register budget P = M*FUSE*C, when M == FUSE*C; the shipped tile has M=16
+    // against FUSE*C=4 (gate+up) and FUSE*C=1 (`down`, ratio 0.94, the worst
+    // point on the curve).  So these cases move budget OUT of M and INTO C,
+    // holding P at or below 64.
+    case 40: SI_MOE_TILE3(8, 16, 4);   // gate P=64 ratio 4.0
+    case 41: SI_MOE_TILE3(8, 32, 4);   // gate P=64 ratio 4.0, RB=128
+    case 42: SI_MOE_TILE3(4, 16, 8);   // gate P=64 ratio 3.2, RB=128
+    case 43: SI_MOE_TILE3(8, 16, 2);   // gate P=32 ratio 2.7
+    case 44: SI_MOE_TILE3(16, 16, 1);  // gate P=32 ratio 2.4
+    case 45: SI_MOE_TILE3(4, 16, 4);   // gate P=32 ratio 2.7
+    case 46: SI_MOE_TILE3(8, 32, 2);   // down P=16 ratio 1.6
+    case 47: SI_MOE_TILE3(4, 32, 4);   // down P=16 ratio 2.0
+    case 48: SI_MOE_TILE3(8, 32, 8);   // down P=64 ratio 4.4
+    case 49: SI_MOE_TILE3(4, 32, 8);   // down P=32 ratio 2.7
+    case 50: SI_MOE_TILE3(32, 32, 2);  // down P=64 ratio 3.0
+    case 51: SI_MOE_TILE3(16, 16, 4);  // down P=64 ratio 3.6
+    // Closing in on M=8 C=2, which beat both projections.  What the sweep says
+    // binds is the register budget P = M*FUSE*C and not the dp4a-per-load
+    // ratio: at equal P, M=8/C=2 (6.0 ms) beats M=4/C=4 (10.0) because M=4
+    // doubles the weight re-read and this kernel is nowhere near bandwidth-bound.
+    case 52: SI_MOE_TILE3(12, 16, 2);
+    case 53: SI_MOE_TILE3(8, 8, 2);   // 64 thr, RB=16
+    case 54: SI_MOE_TILE3(8, 64, 2);  // 512 thr, RB=128
+    case 55: SI_MOE_TILE3(16, 8, 2);  // 128 thr, RB=16
+    case 56: SI_MOE_TILE3(24, 16, 2);
+    case 57: SI_MOE_TILE3(8, 16, 2);  // == the winner, kept as a named case
     default: SI_MOE_TILE(16, 2);  // 128 thr, 32 col
     }
 #undef SI_MOE_TILE
 #undef SI_MOE_TILE3
+#undef SI_MOE_TILE5
+#undef SI_MOE_TILE6
 }
 
 } // namespace
 
 bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
                             size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
-                            const int32_t * active, const int32_t * n_active, int n_act_max, const int8_t * xq,
-                            const uint16_t * asa, const float * xs, float * h, int h_stride, int n_embd, int n_ff_exp,
-                            int top_k, uint32_t gtype, uint32_t utype) {
+                            const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
+                            int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * h, int h_stride,
+                            int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype) {
     // one work-group reads both banks, so they must agree on K, N and type
     if (gtype != utype) {
         return false;
     }
+    // PF_MOE_FLAT puts the row tile in the grid (one work-group = one tile)
+    // instead of looping it inside an (expert, column block) work-group.  The
+    // trade is not uniform across the two projections - see the note on `flat`
+    // in moe_grp_impl and AGENTS.md.
+    const bool flat = si::env::i32("PF_MOE_FLAT", 1) != 0;
+    static const int persist_env = si::env::i32("PF_MOE_PERSIST", 0);
     const char * g = (const char *)gbank, * u = (const char *)ubank;
 #define SI_MOE_GRP_GU(QT)                                                                                                   \
-    moe_grp_go<2, QT>(q, g, u, slot_gb, slot_ub, slot_map, off, pair, active, n_active, n_act_max, xq, asa, xs, h,     \
-                      h_stride, n_embd, n_ff_exp, top_k)
+    moe_grp_go<2, QT>(q, g, u, slot_gb, slot_ub, slot_map, off, pair, active, n_active, n_act_max, n_expert, n_pairs,  \
+                      flat, xq, asa, xs, h, h_stride, n_embd, n_ff_exp, top_k, persist_env != 0)
     switch (gtype) {
     case 12: return SI_MOE_GRP_GU(12);
     case 13: return SI_MOE_GRP_GU(13);
@@ -768,12 +1204,17 @@ bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, c
 
 bool moe_grp_down_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db, const int32_t * off,
                          const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
-                         const int8_t * xq, const uint16_t * asa, const float * xs, float * acc, int acc_stride,
-                         int n_embd, int n_ff_exp, uint32_t dtype) {
+                         int n_expert, int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * acc,
+                         int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype) {
     const char * d = (const char *)dbank;
+    const bool flat = si::env::i32("PF_MOE_FLAT_DOWN", 0) != 0;
+    // PF_MOE_PERSIST: work-stealing grid.  Read here, ONCE per process, and passed
+    // as a kernel argument - reading an env var inside a kernel body is the trap
+    // this file already records ("reading env inside a kernel").
+    static const int persist_env = si::env::i32("PF_MOE_PERSIST", 0);
 #define SI_MOE_GRP_D(QT)                                                                                                   \
-    moe_grp_go<1, QT>(q, d, nullptr, slot_db, 0, slot_map, off, pair, active, n_active, n_act_max, xq, asa, xs, acc,   \
-                      acc_stride, n_ff_exp, n_embd, 1)
+    moe_grp_go<1, QT>(q, d, nullptr, slot_db, 0, slot_map, off, pair, active, n_active, n_act_max, n_expert, n_pairs, \
+                      flat, xq, asa, xs, acc, acc_stride, n_ff_exp, n_embd, 1, persist_env != 0)
     switch (dtype) {
     case 12: return SI_MOE_GRP_D(12);
     case 13: return SI_MOE_GRP_D(13);
@@ -796,12 +1237,15 @@ template <uint32_t GT, uint32_t UT>
 static void moe_gate_up_impl(queue & q, const char * gbank, const char * ubank, const int32_t * slot_map,
                              size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
                              const int32_t * active, const int32_t * n_active, int n_act_max, const float * x,
-                             int x_stride, float * h, int h_stride, int n_embd, int n_ff_exp, int top_k) {
+                             int x_stride, float * h, int h_stride, int n_embd, int n_ff_exp, int top_k, bool dq2, bool noact, int npb) {
     const int n_sb = n_embd / 256;
     const int sgb = superblock_bytes(GT), sub = superblock_bytes(UT);
     // ONE WARP PER OUTPUT ROW, so the rows-per-expert count is the row count
-    // itself: nw warps cover n_act_max experts x n_ff_exp rows.
-    const int nrb = n_ff_exp;
+    // itself: nw warps cover n_act_max experts x n_ff_exp rows.  `npb` walks NPB
+    // ADJACENT rows per warp instead of one, which divides the number of
+    // concurrent weight-read streams by NPB; see moe_npb() for why that is the
+    // thing worth spending warps on.
+    const int nrb = (n_ff_exp + npb - 1) / npb;
     const int nw = n_act_max * nrb;
     q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
                    [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
@@ -820,7 +1264,7 @@ static void moe_gate_up_impl(queue & q, const char * gbank, const char * ubank, 
             return;
         }
         const int ia = g / nrb;
-        const int n = g % nrb;
+        const int nb = g % nrb;
         if (ia >= n_active[0]) {
             return;
         }
@@ -828,6 +1272,11 @@ static void moe_gate_up_impl(queue & q, const char * gbank, const char * ubank, 
         const int slot = slot_map[e];
         if (slot < 0) {
             return; // host-resident expert: the host computes it
+        }
+        for (int rr = 0; rr < npb; rr++) {
+        const int n = nb * npb + rr;
+        if (n >= n_ff_exp) {
+            break;
         }
         const char * gr = gbank + (size_t)slot * slot_gb + (size_t)n * n_sb * sgb;
         const char * ur = ubank + (size_t)slot * slot_ub + (size_t)n * n_sb * sub;
@@ -848,9 +1297,13 @@ static void moe_gate_up_impl(queue & q, const char * gbank, const char * ubank, 
         // (eight warps per work-group) and therefore the occupancy exactly as
         // they were - staging the row in SLM instead bought the same reuse and
         // threw the occupancy away, and measured no faster.
-        float ag[kMoEPB], au[kMoEPB];
         for (int i0 = off[e]; i0 < off[e + 1]; i0 += kMoEPB) {
             const int np = (off[e + 1] - i0 < kMoEPB) ? (off[e + 1] - i0) : kMoEPB;
+            // Declared inside the tile loop so the row-block walk below (PF_MOE_NPB)
+            // REUSES one accumulator set across NPB adjacent output columns: holding
+            // NPB rows of ag[]/au[] at once is NPB*kMoEPB*2 floats and blows the
+            // register budget.
+            float ag[kMoEPB], au[kMoEPB];
 #pragma unroll
             for (int j = 0; j < kMoEPB; j++) {
                 ag[j] = 0.f;
@@ -858,15 +1311,16 @@ static void moe_gate_up_impl(queue & q, const char * gbank, const char * ubank, 
             }
             for (int sb = 0; sb < n_sb; sb++) {
                 float w[8], u[8];
-                dequant_sb_lane_typed<GT>(gr + (size_t)sb * sgb, lane, w);
-                dequant_sb_lane_typed<UT>(ur + (size_t)sb * sub, lane, u);
+                dequant_sb_lane_typed<GT>(gr + (size_t)sb * sgb, lane, w, dq2);
+                dequant_sb_lane_typed<UT>(ur + (size_t)sb * sub, lane, u, dq2);
 #pragma unroll
                 for (int j = 0; j < kMoEPB; j++) {
                     if (j < np) {
                         const float * xr = x + (size_t)(pair[i0 + j] / top_k) * x_stride;
 #pragma unroll
                         for (int b = 0; b < 8; b++) {
-                            const float xv = xr[(size_t)sb * 256 + 32 * b + lane];
+                            const float xv = noact ? (float)(sb * 8 + b + lane)
+                                                    : xr[(size_t)sb * 256 + 32 * b + lane];
                             ag[j] += w[b] * xv;
                             au[j] += u[b] * xv;
                         }
@@ -884,7 +1338,8 @@ static void moe_gate_up_impl(queue & q, const char * gbank, const char * ubank, 
                     }
                 }
             }
-        }
+        } // i0
+        } // rr: adjacent output columns, walked sequentially so ag/au are reused
     });
 }
 
@@ -894,7 +1349,7 @@ void moe_gate_up_launch(queue & q, const void * gbank, const void * ubank, const
                         int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype) {
 #define SI_MOE_GU(GT, UT)                                                                                                  \
     moe_gate_up_impl<GT, UT>(q, (const char *)gbank, (const char *)ubank, slot_map, slot_gb, slot_ub, off, pair, active, \
-                             n_active, n_act_max, x, x_stride, h, h_stride, n_embd, n_ff_exp, top_k)
+                             n_active, n_act_max, x, x_stride, h, h_stride, n_embd, n_ff_exp, top_k, moe_dq2(), moe_noact(), moe_npb())
     if (gtype == 12 && utype == 12) {
         SI_MOE_GU(12, 12);
     } else if (gtype == 13 && utype == 13) {
@@ -931,10 +1386,11 @@ void moe_gate_up_launch(queue & q, const void * gbank, const void * ubank, const
 template <uint32_t DT>
 static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_map, size_t slot_db, const int32_t * off,
                           const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
-                          const float * h, int h_stride, float * acc, int acc_stride, int n_embd, int n_ff_exp) {
+                          const float * h, int h_stride, float * acc, int acc_stride, int n_embd, int n_ff_exp,   \
+                          bool dq2, bool noact, int npb) {
     const int n_sb = n_ff_exp / 256;
     const int sdb = superblock_bytes(DT);
-    const int nrb = n_embd; // one warp per output row
+    const int nrb = (n_embd + npb - 1) / npb; // one warp per NPB adjacent output rows
     const int nw = n_act_max * nrb;
     q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
                    [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
@@ -947,7 +1403,7 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
             return;
         }
         const int ia = g / nrb;
-        const int n = g % nrb;
+        const int nb = g % nrb;
         if (ia >= n_active[0]) {
             return;
         }
@@ -955,6 +1411,11 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
         const int slot = slot_map[e];
         if (slot < 0) {
             return;
+        }
+        for (int rr = 0; rr < npb; rr++) {
+        const int n = nb * npb + rr;
+        if (n >= n_embd) {
+            break;
         }
         const char * dr = dbank + (size_t)slot * slot_db + (size_t)n * n_sb * sdb;
         // superblock-outer, pair-inner with per-pair accumulators, for the same
@@ -969,14 +1430,16 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
             }
             for (int sb = 0; sb < n_sb; sb++) {
                 float w[8];
-                dequant_sb_lane_typed<DT>(dr + (size_t)sb * sdb, lane, w);
+                dequant_sb_lane_typed<DT>(dr + (size_t)sb * sdb, lane, w, dq2);
 #pragma unroll
                 for (int j = 0; j < kMoEPB; j++) {
                     if (j < np) {
                         const float * hr = h + (size_t)pair[i0 + j] * h_stride;
 #pragma unroll
                         for (int b = 0; b < 8; b++) {
-                            a[j] += w[b] * hr[(size_t)sb * 256 + 32 * b + lane];
+                            const float hv = noact ? (float)(sb * 8 + b + lane)
+                                                    : hr[(size_t)sb * 256 + 32 * b + lane];
+                            a[j] += w[b] * hv;
                         }
                     }
                 }
@@ -990,7 +1453,8 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
                     }
                 }
             }
-        }
+        } // i0
+        } // rr
     });
 }
 
@@ -1000,7 +1464,7 @@ void moe_down_launch(queue & q, const void * dbank, const int32_t * slot_map, si
                      uint32_t dtype) {
 #define SI_MOE_D(DT)                                                                                             \
     moe_down_impl<DT>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, h, h_stride, \
-                      acc, acc_stride, n_embd, n_ff_exp)
+                      acc, acc_stride, n_embd, n_ff_exp, moe_dq2(), moe_noact(), moe_npb())
     switch (dtype) {
     case 12: SI_MOE_D(12); break;
     case 13: SI_MOE_D(13); break;

@@ -61,6 +61,33 @@ struct profile {
         int compute_units;
         int max_work_group_size;
         int local_mem_size; // bytes of SLM per work-group
+
+        // Does the card have the XMX / DPAS unit?  1 = yes, 0 = no.
+        //
+        // THIS IS A HARDWARE FACT AND IT IS NOT ABOUT GENERATION NUMBERS: it is
+        // split by microarchitecture, and the two parts of this engine run on
+        // opposite sides of it.  The A770 is **Xe-HPG** (DG2) and has DPAS; the
+        // Iris Xe is **Xe-LP** and does not, and cannot be made to - IGC's ISA
+        // builder refuses the intrinsic outright on Xe-LP:
+        //
+        //   llvm.genx.dpas2.v64f32.v64f32.v64i32.v64i32(...):
+        //       Intrinsic is not supported by the <XeLP> platform
+        //
+        // for both the fp32-accumulate form and the int32-accumulate form, and
+        // `block_load<uint32_t,64>(p, overaligned_tag<16>)` fails the same way
+        // (its lsc.load.ugm.v16i32 lowering).  So a DPAS kernel here does not run
+        // slowly on an Iris Xe, it does not BUILD - and since the engine's AOT
+        // target is acm-g10 while its reference model runs on an Iris Xe, a
+        // kernel that is unconditionally compiled is a portability landmine.
+        //
+        // QUERIED, not stored, wherever the query exists: the driver advertises
+        // `cl_intel_subgroup_matrix_multiply_accumulate` on Xe-HPG and omits it
+        // on Xe-LP, so si::dev::has_dpas_for_queue() reads it from
+        // info::device::extensions and this field is only the fallback for a
+        // driver that does not answer.  Tri-state on purpose: -1 means "not
+        // asked", which is how the query declining is distinguished from the
+        // answer being no.
+        int has_dpas;
     } hw;
 
     // The decode attention launches n_head * dec_splits warps per layer and a
@@ -182,6 +209,15 @@ const profile & for_queue(const sycl::queue & q);
 // MTP verify pass, invisible in the graphed decode because the graph records the
 // launch once), so it is cached per device alongside the profile.
 int wg_clamped_for_queue(const sycl::queue & q, int want);
+
+// Does THIS queue's device have the XMX / DPAS unit?  Queried from the driver's
+// advertised extensions, with the card's profile as the fallback.  A launcher that
+// would emit a DPAS intrinsic MUST gate on this: on Xe-LP (Iris Xe) IGC refuses
+// llvm.genx.dpas2 outright, so the failure is a JIT error on the first launch, not
+// a slow path.  Per-queue rather than per-process, because a --layer-map may span
+// two different microarchitectures and each must answer for itself.
+bool has_dpas_for_queue(const sycl::queue & q);
+bool has_dpas(const sycl::device & d);
 
 // The "env overrides a profile default" pattern, per device.
 //

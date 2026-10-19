@@ -37,6 +37,15 @@ static const profile iris_xe = {
         .compute_units = 96,
         .max_work_group_size = 512,
         .local_mem_size = 65536,
+
+        // Xe-LP: NO DPAS.  QUERIED at run time; this is only the fallback.
+        // MEASURED, not assumed - the driver does not advertise
+        // cl_intel_subgroup_matrix_multiply_accumulate, and IGC refuses
+        // llvm.genx.dpas2.v64f32 AND .v64i32 with "Intrinsic is not supported by
+        // the <XeLP> platform".  A DPAS kernel here therefore fails to BUILD, and
+        // this is the card the reference model runs on, so anything XMX has to be
+        // gated on si::dev::has_dpas_for_queue().
+        .has_dpas = 0,
     },
 
     // INHERITED: same Xe-LP lattice, so 7.5 is the expected shape.  With 96 EUs

@@ -3,6 +3,7 @@
 // the backend abstraction existed).  All allocations and command-graph handling
 // stay in the engine; this layer is intentionally stateless beyond the queue.
 #include "backend.h"
+#include "env.h"
 
 #include <memory>
 
@@ -66,7 +67,16 @@ struct gpu_backend : compute_backend {
                       const void * vscales) override {
         qk_norm_rope_launch(q, qbuf, kbuf, vbuf, q_norm, k_norm, kpool, vpool, tables, info, n_head, n_head_kv,
                             head_dim, n_rot, rope_base, rope_freqs, rope_mscale, eps, max_blocks, n_rows, n_real,
-                            kscales, vscales);
+                            kscales, vscales, qk_sum_slot(), qk_sum_ptr());
+    }
+    // PF_KVSTORE_SUM: hand the per-call slot and the device checksum buffer to the
+    // kernel, which folds the post-norm/post-RoPE K and V into it.  Diagnostic only;
+    // the accessors return -1/nullptr so every other configuration is untouched.
+    int qk_sum_slot() {
+        return si::env::flag("PF_KVSTORE_SUM") ? kv_store_sum_slot(q) : -1;
+    }
+    int64_t * qk_sum_ptr() {
+        return si::env::flag("PF_KVSTORE_SUM") ? kv_store_sum_ptr(q) : nullptr;
     }
     void attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits, const step_info * info,

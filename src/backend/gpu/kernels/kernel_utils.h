@@ -225,7 +225,62 @@ inline float dequant_elem_iq(uint32_t type, const char * sb, int e) {
 }
 
 // typed variant (compile-time dispatch)
-template <uint32_t TYPE> inline void dequant_sb_lane_typed(const char * sb, int lane, float w[8]) {
+// PF_MOE_DQ2=1 halves the dequant ARITHMETIC while touching every load
+// identically, and it is the single-variable experiment behind "would
+// dequantising to f16 be faster".  A Q4_K/Q5_K value is
+// `d * sc[b] * nib - dmin * mm[b]` - two multiplies and a subtract per value - and
+// f16's entire contribution to that expression is doing those two multiplies and
+// the subtract in half precision instead of f32.  There is no precision question:
+// `d` and `dmin` are already f16 in the block.  So if dropping the two multiplies
+// does not move the kernel, f16 cannot either, and the cost is in the loads or in
+// the schedule rather than in the arithmetic.  Q6_K is left on the full path (3 of
+// 40 layers), and the knob is deliberately wrong-answering.
+// `dq2` arrives as a KERNEL ARGUMENT, not as an env read here: this function runs
+// inside SYCL kernels, which may not call a host function or read a non-constexpr
+// static (both are hard compile errors, not warnings).  The launcher reads
+// PF_MOE_DQ2 on the host and passes it down.
+template <uint32_t TYPE> inline void dequant_sb_lane_impl(const char * sb, int lane, float w[8]);
+
+template <uint32_t TYPE> inline void dequant_sb_lane_typed(const char * sb, int lane, float w[8], bool dq2 = false) {
+    if (dq2) {
+        // Same bytes read, same f16 conversions, no multiplies.  `one` is derived
+        // from every load so none of them can be optimised away.
+        switch (TYPE) {
+        case 12: { // Q4_K: d, dmin, 12 scale bytes, 4 qs bytes per lane
+            const auto * b = (const block_q4_K *)sb;
+            const float d = fast_h2f(b->d), dm = fast_h2f(b->dmin);
+            const uint32_t q0 = (uint32_t)b->qs[lane] | ((uint32_t)b->qs[32 + lane] << 8) |
+                                ((uint32_t)b->qs[64 + lane] << 16) | ((uint32_t)b->qs[96 + lane] << 24);
+            const uint32_t sc0 = b->scales[0], sc1 = b->scales[4], sc2 = b->scales[8], sc3 = b->scales[12];
+            const float one = (float)((q0 ^ sc0 ^ sc1 ^ sc2 ^ sc3 ^ (uint32_t)(d + dm)) & 1u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                w[i] = one - (float)i;
+            }
+        } break;
+        case 13: { // Q5_K: the same plus the one high bit per lane
+            const auto * b = (const block_q5_K *)sb;
+            const float d = fast_h2f(b->d), dm = fast_h2f(b->dmin);
+            const uint32_t q0 = (uint32_t)b->qs[lane] | ((uint32_t)b->qs[32 + lane] << 8) |
+                                ((uint32_t)b->qs[64 + lane] << 16) | ((uint32_t)b->qs[96 + lane] << 24);
+            const uint32_t sc0 = b->scales[0], sc1 = b->scales[4], sc2 = b->scales[8], sc3 = b->scales[12];
+            const uint32_t qh = b->qh[lane];
+            const float one = (float)((q0 ^ qh ^ sc0 ^ sc1 ^ sc2 ^ sc3 ^ (uint32_t)(d + dm)) & 1u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                w[i] = one - (float)i;
+            }
+        } break;
+        default: // Q6_K and everything else: keep the real path rather than fake it
+            dequant_sb_lane_impl<TYPE>(sb, lane, w);
+            break;
+        }
+        return;
+    }
+    dequant_sb_lane_impl<TYPE>(sb, lane, w);
+}
+
+template <uint32_t TYPE> inline void dequant_sb_lane_impl(const char * sb, int lane, float w[8]) {
     switch (TYPE) {
     case 11: { // Q3_K
         const auto * x = (const block_q3_K *)sb;
@@ -300,10 +355,21 @@ template <uint32_t TYPE> inline void dequant_sb_lane_typed(const char * sb, int 
                 mm[b] = (uint8_t)((blk->scales[b + 4] >> 4) | ((blk->scales[b] >> 6) << 4));
             }
         }
+        // FOUR loads, not eight.  `b >> 1` is 0 for both b = 0 and b = 1, so the
+        // loop body above read the SAME byte twice and took a different nibble -
+        // eight load instructions for the four bytes a lane actually owns (a
+        // 256-value Q4_K superblock is 128 bytes of qs = 32 lanes x 4).  Since a
+        // lane's load here is ONE byte, that is 32 B per warp instruction where
+        // an int8 GEMV's 4-bytes-per-lane access gets 128 B, and the 83% of a
+        // decode step that is expert weight reading is bound by exactly this.
+        uint8_t qb[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            qb[j] = blk->qs[32 * j + lane];
+        }
 #pragma unroll
         for (int b = 0; b < 8; b++) {
-            const uint8_t byte = blk->qs[32 * (b >> 1) + lane];
-            const int nib = (b & 1) ? (byte >> 4) : (byte & 0xF);
+            const int nib = (b & 1) ? (qb[b >> 1] >> 4) : (qb[b >> 1] & 0xF);
             w[b] = d * sc[b] * nib - dmin * mm[b];
         }
     } break;
@@ -323,10 +389,16 @@ template <uint32_t TYPE> inline void dequant_sb_lane_typed(const char * sb, int 
                 mm[b] = (uint8_t)((blk->scales[b + 4] >> 4) | ((blk->scales[b] >> 6) << 4));
             }
         }
+        // four loads, not eight - see the Q4_K case for why `b >> 1` made the
+        // two nibbles of one byte two separate load instructions
+        uint8_t qb[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            qb[j] = blk->qs[32 * j + lane];
+        }
 #pragma unroll
         for (int b = 0; b < 8; b++) {
-            const uint8_t byte = blk->qs[32 * (b >> 1) + lane];
-            int nib = (b & 1) ? (byte >> 4) : (byte & 0xF);
+            int nib = (b & 1) ? (qb[b >> 1] >> 4) : (qb[b >> 1] & 0xF);
             nib += ((qhb >> b) & 1) << 4;
             w[b] = d * sc[b] * nib - dmin * mm[b];
         }

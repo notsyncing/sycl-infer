@@ -41,6 +41,10 @@ const profile & unknown_profile() {
         u.hw.compute_units = 0;
         u.hw.max_work_group_size = 0;
         u.hw.local_mem_size = 0;
+        // -1, not a copy of arc_a770's 1: an unrecognised card must be ASKED, not
+        // assumed to have the unit.  A card that does have it loses nothing (the
+        // query wins); a card that does not would otherwise fail to JIT.
+        u.hw.has_dpas = -1;
         return u;
     }();
     return unknown;
@@ -97,6 +101,9 @@ struct dev_record {
     sycl::device dev;
     const profile * prof = nullptr;
     int max_wg = 0;
+    // Queried once per device: does the driver advertise the DPAS/XMX capability.
+    // -1 = the query did not answer, so the profile's hw.has_dpas is the fallback.
+    int has_dpas = -1;
 };
 
 std::mutex & dev_cache_mutex() {
@@ -151,6 +158,41 @@ const dev_record & fill(sycl::device d) {
     }
     if (rec.max_wg < 32) {
         rec.max_wg = 32; // a sub-group is the floor for anything below this
+    }
+    // DPAS / XMX presence.  Queried, not inferred from the name or from a
+    // generation number: the driver advertises
+    // cl_intel_subgroup_matrix_multiply_accumulate on Xe-HPG (A770) and omits it
+    // on Xe-LP (Iris Xe), and the same split is what IGC's ISA builder enforces
+    // when it refuses llvm.genx.dpas2 outright.  Measured on both cards of this
+    // setup: A770 advertises it AND JITs dpas<8,8,float> and
+    // dpas<8,8,int32_t,...,u4,s8,64,32,64>; the Iris Xe advertises neither and
+    // fails to build both.
+    try {
+        // `extensions` is deprecated in SYCL 2020 in favour of
+        // info::device::aspects, but aspects describes memory/scalar/vector
+        // capabilities and does NOT carry the XMX matrix-multiply unit - this
+        // string is the only thing the driver reports that says whether DPAS
+        // exists on the card.  It still works on both cards here (A770 advertises
+        // it, Iris Xe does not), and it is read once per device behind the cache.
+        // Suppression is local to the one call for that reason.
+#if defined(__SYCL_COMPILER_VERSION) && __SYCL_COMPILER_VERSION >= 202001
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        auto ext = d.get_info<sycl::info::device::extensions>();
+#if defined(__SYCL_COMPILER_VERSION) && __SYCL_COMPILER_VERSION >= 202001
+#pragma clang diagnostic pop
+#endif
+        for (const auto & e : ext) {
+            if (e == "cl_intel_subgroup_matrix_multiply_accumulate" || e == "cl_intel_subgroup_split_matrix_multiply_accumulate") {
+                rec.has_dpas = 1;
+            }
+        }
+        if (rec.has_dpas < 0) {
+            rec.has_dpas = 0;
+        }
+    } catch (...) {
+        rec.has_dpas = rec.prof->hw.has_dpas; // driver would not answer
     }
     dev_cache().push_back(rec);
     return dev_cache().back();
@@ -207,6 +249,29 @@ int wg_clamped_for_queue(const sycl::queue & q, int want) {
     return wg_clamped_impl(want, &d);
 }
 
+bool has_dpas_for_queue(const sycl::queue & q) {
+    const dev_record & r = record_for(q.get_device());
+    if (r.has_dpas >= 0) {
+        return r.has_dpas != 0;
+    }
+    const int fb = r.prof->hw.has_dpas;
+    if (fb > 0) {
+        return true;
+    }
+    // Unknown card AND the driver would not answer: say so once rather than
+    // letting a kernel compile-and-fail later, which on Xe-LP is a JIT error
+    // inside the first launch and not a fallback.
+    return false;
+}
+
+bool has_dpas(const sycl::device & d) {
+    const dev_record & r = record_for(d);
+    if (r.has_dpas >= 0) {
+        return r.has_dpas != 0;
+    }
+    return r.prof->hw.has_dpas > 0;
+}
+
 // Env values are the same on every card, so they are read once and cached.  The
 // cache is a small fixed table keyed by the *name*, not a function-local static:
 // a static inside profile_int would be per function, so two different env names
@@ -252,7 +317,7 @@ void report(const profile & p, const char * how) {
         fprintf(stderr,
                 "[dev] profile=%s  (%s)\n"
                 "      provenance: %s\n"
-                "      hw: eus=%d max_wg=%d slm=%d B\n"
+                "      hw: eus=%d max_wg=%d slm=%d B xmx(dpas)=%d\n"
                 "      occupancy: warps_per_eu=%.1f (x2=%d)\n"
                 "      slm_budget=%d B\n"
                 "      split rows: gemv=%d gemm=%d max=%d\n"
@@ -261,7 +326,7 @@ void report(const profile & p, const char * how) {
                 "split_keys=%d dec_group=%d\n"
                 "      weights: w4=%d k5=%d cb4=%d dp4a=%d gemm_dnnl=%d dpas=%d\n",
                 p.key, how, p.provenance, p.hw.compute_units, p.hw.max_work_group_size,
-                p.hw.local_mem_size, p.occ.warps_per_eu_x2 / 2.0, p.occ.warps_per_eu_x2,
+                p.hw.local_mem_size, p.hw.has_dpas, p.occ.warps_per_eu_x2 / 2.0, p.occ.warps_per_eu_x2,
                 p.slm.budget_bytes, p.split.gemv_rows, p.split.gemm_rows, p.split.max,
                 p.shape.gemv_rows_per_wg, p.shape.rmsnorm_wg, p.shape.gdn_cols,
                 p.shape.gdn_warps_per_wg, p.shape.gdn_vec_max_rows, p.attn.xmx_gather_red,

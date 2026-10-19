@@ -255,11 +255,17 @@ void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, in
                        int nsb, int n_tok_blocks = 0);
 // kscales/vscales: the int8/int4 per-32 fp16 scale planes (nullptr for the
 // other storage types); one plane entry per (block, kv head, token, 32 dims)
+// PF_KVSTORE_SUM accessors (see qk_norm_rope.cpp).  `kv_store_sum_slot` allocates
+// on first use and returns -1 when the knob is off or the table is full.
+int kv_store_sum_slot(sycl::queue & q, int n_rows = 1, int n_real = 1);
+int64_t * kv_store_sum_ptr(sycl::queue & q);
+
 void qk_norm_rope_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vbuf, const float * q_norm,
                          const float * k_norm, void * kpool, void * vpool, const int32_t * tables,
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,
                          const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
-                         int n_real, const void * kscales = nullptr, const void * vscales = nullptr);
+                         int n_real, const void * kscales = nullptr, const void * vscales = nullptr,
+                         int sum_slot = -1, int64_t * sum_kv = nullptr);
 void attn_launch(sycl::queue & q, const float * qbuf, const float * gate, const void * kpool, const void * vpool,
                  float * partials, const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
                  const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out = nullptr,
@@ -485,14 +491,14 @@ void moe_actq_launch(sycl::queue & q, const float * x, int x_stride, int n_rows,
 // caller must then use moe_gate_up_launch.
 bool moe_grp_gate_up_launch(sycl::queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
                             size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
-                            const int32_t * active, const int32_t * n_active, int n_act_max, const int8_t * xq,
-                            const uint16_t * asa, const float * xs, float * h, int h_stride, int n_embd, int n_ff_exp,
-                            int top_k, uint32_t gtype, uint32_t utype);
+                            const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
+                            int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * h, int h_stride,
+                            int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype);
 // down: [p_e, n_ff_exp] x [n_ff_exp, n_embd] per active expert.  Same contract.
 bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                          const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
-                         int n_act_max, const int8_t * xq, const uint16_t * asa, const float * xs, float * acc,
-                         int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype);
+                         int n_act_max, int n_expert, int n_pairs, const int8_t * xq, const uint16_t * asa,
+                         const float * xs, float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype);
 void moe_reduce_launch(sycl::queue & q, const float * acc, const float * wts, int top_k, int n_tok, int n_embd,
                        int acc_stride, float * out, int out_stride);
 // MoE epilogue: out[t] += sigmoid(gate . x[t]) * shared[t].  A null `gate`
