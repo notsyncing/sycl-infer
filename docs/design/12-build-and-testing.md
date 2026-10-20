@@ -417,8 +417,9 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 ## 6. 测量报告不进仓库，数字的归档位置
 
 一次性的性能/正确性报告写在 `reports/`，该目录在 `.gitignore` 里，**内容永远不会被提交**，所以
-仓库内任何文档都不引用它。需要保留的数字必须连同测量条件（硬件、开关、环境变量）写进本文档或
-`AGENTS.md`；性能数字尤其必须注明所用的环境变量，因为不同开关会选择不同 kernel 变体。
+仓库内任何文档都不引用它。需要保留的数字必须连同测量条件（硬件、开关、环境变量）写进本文档、
+`AGENTS.md` 或 [PERFORMANCE.md](../PERFORMANCE.md)；性能数字尤其必须注明所用的环境变量，因为不同
+开关会选择不同 kernel 变体。
 
 ### 6.1 实测数字归档在哪
 
@@ -427,6 +428,7 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 | 主题 | 归档位置 |
 |---|---|
 | 构建/AOT/测试矩阵、快速验证清单 | 本文档 §1-§3 |
+| **吞吐率（prefill/decode × 深度 × batch × 投机路径）** | **[PERFORMANCE.md](../PERFORMANCE.md)** |
 | decode 的 attention 占用率、`PF_DEC_SPLIT` 悬崖、8 warps/EU | `AGENTS.md` 的 Environment variables |
 | dp4a vs DPAS 的 issue 率、算术强度、M\* 的推导 | `AGENTS.md` 的 MTP 章节 |
 | GEMV/native store 的实测带宽、per-format B/weight | `AGENTS.md` 的 Weight representation |
@@ -434,7 +436,9 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 | 逐调优常数的出处（哪个数在哪张卡上测的） | `AGENTS.md` 的 Device profiles |
 
 一条测量只有在"数字 + 硬件 + 环境变量 + 怎么复现的命令"四件齐全时才可以被引用；只写数字不写条件
-的数字在下次复现时会变成噪音。
+的数字在下次复现时会变成噪音。**吞吐率的四件套写在
+[PERFORMANCE.md](../PERFORMANCE.md) 每一张表的表头**，新测出来的吞吐率要加进那张表，而不是只加进
+commit message。
 
 ---
 

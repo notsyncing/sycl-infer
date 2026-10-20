@@ -80,6 +80,11 @@ measurements and gotchas.
 * [`docs/design/15-moe-ncmoe.md`](docs/design/15-moe-ncmoe.md) — the MoE
   architecture, the routed experts' GEMM, the ncmoe split and the three-tier
   expert cache.
+* [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **the measured throughput
+  table**: prefill and decode by context depth and batch size, per model and
+  per speculative path, each with the hardware, the build, the harness and the
+  command that reproduces it.  A performance number belongs there (see *Measured
+  results* below).
 
 ## Build
 
@@ -895,6 +900,40 @@ the engine differs between those cells; only how many of the 4 drafted tokens th
 NextN head gets right.  So **acceptance is the entire story**, and it is a property
 of the prompt, not of the engine.
 
+**The verify's USM copies are where the speculative paths die, and they die in
+the driver, not in the engine.**  Two failures, both measured 2026-10-20 on the
+2x A770 box and both silent until the first speculative cycle:
+
+* **The DFlash2 drafter segfaults, and its only working configuration is the
+  broken one.**  The drafter requires the draft on device 0 ("[dflash] needs a
+  multi-device oneDNN GPU partition with draft on device 0 - disabled"), and
+  with the draft on device 0 it dies with SIGSEGV *inside the Level Zero
+  driver*, in `urEnqueueUSMMemcpy` reached from `engine::mtp_verify` (the
+  DFlash2's verify reuses the MTP's verify machinery).  It reproduces with a
+  32-token generation and a 45-token prompt, and it is not a VRAM shortage:
+  `PF_MAX_SLOTS` 1 / 4 / 8 / 16 all crash, and card 0 holds 9 072 MiB of
+  weights plus the 1 050 MiB draft.  **So the DFlash2 path does not run at all
+  in this build** — and the numbers in the table below are the 2026-10-09 pass,
+  the last one where it did.  (Beware the measurement trap: with
+  `--spec-draft-device 1` the drafter is *disabled* and the run is a plain
+  decode, so it still exits 0 and still produces text — at the plain decode's
+  rate, which is how a "the drafter works if you put it on the other device"
+  reading gets formed.)
+* **The 35B A3B's MTP does not run at all.**  Its GGUF bundles the NextN head,
+  the engine's gate passes and the verify's command graphs are recorded
+  ("[mtp] verify command graphs: 3 phase(s), 5 rows"), and the plain decode is
+  fine (38.7 ms/token) - but the first speculative cycle fails: with the
+  default 16 slots (and with 4) the driver reports
+  `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`, and with `PF_MAX_SLOTS=1` it
+  segfaults in the same place as the DFlash2 crash.  The MTP layer's own KV
+  slice, the draft's ring and the verify's partials all come out of a card the
+  routed experts have already filled.
+
+A USM copy that dies in the driver is a *pointer* or an *ordering* bug, not a
+performance one, and the engine's own gates do not catch either: the plan
+builds, the graphs are recorded and the plain decode is fine.  **So the MTP
+path is a 27B feature in this build, and the DFlash2 path needs a fix.**
+
 `PF_MTP_ADAPT` (default on) shrinks the draft length by one on a cycle that accepts
 nothing and grows it back on a full-acceptance cycle, never changing the emitted
 stream (acceptance ignores `k`).  **Its sign is prompt-dependent, so measure both
@@ -1061,17 +1100,33 @@ tb`), so a 512-token prompt is **one** mode-2 forward at M=512 and no prefill ca
 lands inside the M <= 13 window.  On the main configuration prefill is always mode 2
 and mode 1's M=kMaxT=32 chunks are never used.
 
-**What prefill actually costs** (27B / 2x A770, `llama-benchy 0.4.0 --pp 512 --tg
-128 --depth 0 --runs 3 --exact-tg`, `PF_PREFIX_CACHE=0`): **pp512 2 390 tok/s**,
-tg128 14.05 tok/s, cold full-prompt TTFT 1.44 s.  512 tokens in 214 ms against
-24.5 GB of *int8* weight bytes is ~114 GB/s effective, i.e. ~35 % of the card's read
-ceiling, so prefill is not purely weight-bound; oneDNN's grouped-scale int8 matmul
-is doing real work here.  Replaying the same 497-call list with the production dp4a
-launchers would cost ~1.93 s at M=512, i.e. **oneDNN is ~11x better than dp4a at
-this M** — which is why prefill needs a *blocked large-M* kernel and neither
-`nat_gemm` (M-capped) nor dp4a is the answer.  At depth 16k/64k the whole-prompt
-rates are 865 / 560 tok/s.  See *Benchmarking* below for why the harness's own
-`pp512` column cannot be quoted.
+**What prefill actually costs** (27B / 2x A770).  The **in-process mode-2
+prefill of 512 tokens is 1.010 s = 507 tok/s** (`dev/bench_pf`, 5 reps, the
+mean 504), and the server's cold time-to-first-*content* for a 512-token prompt
+is **1.459 s = 351 tok/s** (measured 2026-10-20: the first SSE *chunk* arrives
+at 0.150 s, the first content token at 1.459 s).  The ~0.45 s between them is
+the server's own overhead: the KV pool grows lazily and its first request pays
+for the reallocation, on top of the HTTP, the chat template, the tokenization
+and the first token's head.
+
+**`llama-benchy`'s `pp512` column says 2 390 tok/s (214 ms) and that number is
+an artefact** - it is the prompt length divided by the time to the first
+*streamed SSE chunk*, which the server sends **before** the prefill runs.  The
+same trap the depth>0 cells fall into applies at depth 0; the AGENTS.md's own
+"the harness's `pp512` column cannot be quoted" note was right and the file
+quoted it anyway.  **It is not physically possible**: 512 tokens over 25e9
+active parameters is 25.6 TFLOP, and two A770s at the measured dp4a rate
+(7.1-7.6 T-MAC/s each) need ~850 ms for the compute alone, so 214 ms is off by
+4x.  The measured 1.01 s sits at the compute bound.
+
+Replaying the same 497-call list with the production dp4a launchers would cost
+~1.93 s at M=512, i.e. **oneDNN is ~11x better than dp4a at this M** - which is
+why prefill needs a *blocked large-M* kernel and neither `nat_gemm` (M-capped)
+nor dp4a is the answer.  At depth 16k/64k the whole-prompt rates are 865 / 560
+tok/s (llama-benchy, a prompt *on top of* a context of that depth) against the
+harness's 984 / 882 (a prompt of that length from an empty KV) - the two are
+different shapes, not different engines.  See *Benchmarking* below, and
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the table.
 
 **The verify's own floor.**  A `k` sweep prices it at ~one plain decode's weight
 pass plus ~4 ms per extra row (the verify is 83-87 ms at k=4 across all three
@@ -1914,6 +1969,32 @@ activation quantizer is not part of the gap**).
 
 ## Measured results and dead ends
 
+**A throughput number belongs in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md),
+not only here.**  This file holds the *conclusions* a change must be read
+against; `docs/PERFORMANCE.md` holds the measured table (prefill and decode, by
+context depth and batch size, per model and per speculative path) with the
+conditions each number was taken under.  The rule for a change that moves or adds
+a number:
+
+1. **Update the affected table in `docs/PERFORMANCE.md`** — with the model, the
+   layer split, the KV type, the harness, the exact command and the date.  A
+   throughput number without its conditions is not a number: the same binary
+   measures 13 % apart on different days, and a different `PF_*` switch selects
+   a different kernel.
+2. **Update the conclusion here only if the shape changed** — a new knee, a new
+   floor, a different bottleneck.  The raw numbers live in the table; this file
+   says what they mean.
+3. **Fix every quote of the old number in the same change** — the README, a
+   design doc, a comment.  A number that is correct in one file and stale in
+   another is worse than no number, because the reader cannot tell which is
+   which.
+
+The reason the table is a separate document: the numbers change with every
+kernel, but the *shape* of the curves does not, and a future change has to be
+read against both.  A measurement that exists only in a commit message, a chat
+log or a local file is not in the record - if it is worth quoting, it goes in
+the table.
+
 Everything in this section is a **conclusion with the number it came from**, not
 the hunt that produced it.  The hunt is in the commit history; what a future
 change needs is the conclusion, so that it does not have to be re-derived.
@@ -2095,17 +2176,31 @@ was two bugs at once:
    measured on an engine that is computing the wrong thing is worse than no
    table**, and the only reason this one looked plausible is that it was smooth.
 
-**The concurrency curve, on the fixed engine** (35B A3B, prompt 512 tok/slot,
-128 decode steps, one process per cell):
+**The dense model's batch curve has a CLIFF at the native GEMM's M ≤ 13
+boundary, and it is worth 2.5x.**  The 27B's aggregate throughput *falls* from
+8 rows to 16: 62.53 tok/s (127.9 ms/step) at N=8 against **45.22 tok/s (353.8
+ms/step)** at N=16.  The cause is `nat_gemm_launch`, which refuses M > 13: above
+13 rows the dense layers leave the native u4 path for oneDNN's int8 matmul.
+`PF_NAT=0` (which forces the oneDNN path at every M) prices it exactly:
+**315.2 ms/step at N=8** against 127.9 with the native path, and **353.9 vs
+353.8 ms/step at N=16** - i.e. at 16 rows the native path is already not being
+used.  The MoE model crosses the same boundary far more gently, because only
+its dense layers are affected.  **This is the same M > 13 boundary the native
+GEMM's extension was measured against, and on a dense model it is not a
+rounding detail but a 28 % loss of aggregate throughput.**
 
-| N | pp (t/s) | tg (tok/s) | ms/step |
-|---:|---:|---:|---:|
-| 1 | 776.5 | 26.36 | 37.93 |
-| 2 | 1028.7 | 35.67 | 56.06 |
-| 4 | 1226.1 | 60.43 | 66.19 |
-| 8 | 1355.2 | 101.86 | 78.54 |
-| 16 | 1426.7 | 123.43 | 129.63 |
-| 32 | 1460.5 | 167.21 | 191.37 |
+**The concurrency curve, on the fixed engine** (35B A3B, depth 512, 128 decode
+steps, one process per cell; the full table with the prefill column and the
+conditions is in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)):
+
+| N | decode (aggregate) | ms/step |
+|---:|---:|---:|
+| 1 | 26.38 tok/s | 37.91 |
+| 2 | 35.70 tok/s | 56.03 |
+| 4 | 60.91 tok/s | 65.67 |
+| 8 | 101.12 tok/s | 79.11 |
+| 16 | 122.05 tok/s | 131.09 |
+| 32 | 168.33 tok/s | 190.11 |
 
 **pp saturates at 16** (+2.4% for twice the concurrency) and **tg does not stop
 at 32** (+41.5% over the same doubling, a marginal row of 3.86 ms against
@@ -2331,26 +2426,34 @@ at full speed - but the KV budget per card is what buys the context.
 **The decode's cost is linear in depth and has no knee** (N=1, 128 decode steps
 at the depth, best of 2, depth 512 run first and last as the drift control):
 
-| depth | pp (t/s) | tg (tok/s) | ms/step |
+| depth | prefill rate | tg (tok/s) | ms/step |
 |---:|---:|---:|---:|
-| 512 | 775.2 | 25.73 | 38.86 |
-| 4096 | 1323.7 | 25.34 | 39.46 |
-| **16384** | **1415.2** | 23.95 | 41.75 |
-| 65536 | 1307.5 | 19.81 | 50.47 |
-| 131072 | 1148.1 | 15.41 | 64.90 |
-| 262144 | 690.3 | 11.02 | 90.74 |
+| 512 | 745 | 26.38 | 37.91 |
+| 4096 | 1 269 | 25.91 | 38.59 |
+| **16384** | **1 477** | 24.54 | 40.76 |
+| 65536 | 1 399 | 20.20 | 49.50 |
+| 131072 | 1 242 | 15.54 | 64.34 |
+| 262144 | – | 11.02 | 90.74 |
 
-`ms/step = 38.8 + 0.198 us * depth` predicts 38.86 / 39.57 / 42.01 / 51.76 /
-64.75 / 90.75 against the measured - **the 38.8 ms floor is the weight pass**
-(the whole N=1 decode step at depth 0) and everything above it is attention,
-linear in depth with nothing to bend.  **At 256k, 43% of the step is attention
-and 57% is the weight pass, and only the first grows with context.**
+(the 512..131072 rows are the 2026-10-20 sweep in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md), whose `pp` column is the average
+rate of a whole prompt of `depth - 128` tokens; the 262144 row is the earlier
+measurement, where the prompt was 262144 tokens)
 
-**The prefill turns over at 16k and is strictly worse beyond it**: 1415.2 at 16k,
-1307.5 (-7.6%) at 64k, 1148.1 (-18.9%) at 128k, **690.3 (-51.2%) at 256k**.  So
-the prefill's best rate is at ~16k tokens of context and the whole "2000 t/s"
-framing should be stated at a depth - 512 tokens gives 775.2 and 16k gives
-1415.2, a 1.83x spread from the context alone.
+`ms/step = 37.8 + 0.202 us * depth` predicts 37.90 / 38.63 / 41.11 / 51.03 /
+64.27 against the measured 37.91 / 38.59 / 40.76 / 49.50 / 64.34 - **the 37.8 ms
+floor is the weight pass** (the whole N=1 decode step at depth 0) and everything
+above it is attention, linear in depth with nothing to bend.  **At 256k, 43% of
+the step is attention and 57% is the weight pass, and only the first grows with
+context.**
+
+**The prefill turns over at 16k and is strictly worse beyond it**: the average
+rate of a whole prompt peaks at ~16k (1 477 tok/s for a 16 256-token prompt)
+and falls to 1 399 at 64k and 1 242 at 128k, while **690.3 (-51.2%) at 256k**
+(the earlier measurement).  So the prefill's best rate is at ~16k tokens of
+context and the whole "2000 t/s" framing should be stated at a depth - a
+384-token prompt gives 745 tok/s and a 16 256-token one gives 1 477, a 1.98x
+spread from the context alone.
 
 **Where the 131k prefill's time goes** (`dev/bench_conc` with a 131072-token
 prompt, so the KV pool is sized right; the `PF_ABL_*` arms are wrong-answer-by-

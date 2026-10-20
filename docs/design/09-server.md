@@ -572,7 +572,7 @@ stop 字符串由**服务器侧**在生成文本上匹配（`stop_filter`）：
   看到的顺序），`chat_part` 带 `kind` 标记。
 * `load_media_bytes` 接受 `data:`（要求 `;base64`；`b64_decode` 容忍空白、遇到 `=` 停止）、
   内联 `input_audio` base64 与 `http(s)://`。其它 scheme 一律 400。远程抓取的策略见
-  [§5 远程媒体抓取与 SSRF 边界](#5-远程媒体抓取与-ssrf-边界)（`src/server/url_fetch.{h,cpp}`，
+  [§6.1 远程媒体抓取与 SSRF 边界](#61-远程媒体抓取与-ssrf-边界srcserverurl_fetchhcpp)（`src/server/url_fetch.{h,cpp}`，
   默认关闭，开启时只允许公网可达地址且逐跳复检跳转）。
 * 图片 `mm_image_decode_mem` → `mm_image_preprocess`；视频 `mm_video_decode_mem`（`max_frames`/
   `max_side` 由上面两个字段控制，探测/解码分别走 `PF_AV_FFPROBE`/`PF_AV_FFMPEG`）；音频
