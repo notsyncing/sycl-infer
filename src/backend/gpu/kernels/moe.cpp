@@ -1033,7 +1033,7 @@ template <int FUSE, uint32_t QT>
 static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane0, size_t plane1, const int32_t * slot_map,
                        const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
                        int n_act_max, int n_expert, int n_pairs, bool flat, const int8_t * xq, const uint16_t * asa,
-                       const float * xs, float * out, int out_stride, int K, int N, int top_k, bool persist) {
+                       const float * xs, float * out, int out_stride, int K, int N, int top_k, bool persist, bool dec) {
     // One-shot launch geometry: this kernel's cost is set by the grid
     // (experts x N/RB) and by the row tiles, neither of which is visible from
     // outside, and the quiet way to be wrong is to launch a grid that does not
@@ -1060,7 +1060,25 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
     // refutes it - the optimum has ratio 2.67, BELOW the M=16 tile's 3.20.)
     static const int cfg_gate = si::env::i32("PF_MOE_CFG", 43);
     static const int cfg_down = si::env::i32("PF_MOE_CFG_DOWN", 43);
-    const int cfg = (FUSE == 2) ? cfg_gate : cfg_down;
+    // The DECODE tile.  0 = auto: ONE row per expert for a single-token decode
+    // (every selected expert gets exactly one pair, so a wider tile is pure
+    // waste) and TWO rows for a batched one (some experts get two or three
+    // pairs, and a one-row tile would re-read their weights once per extra
+    // pair).  A non-zero value forces that tile for both projections.
+    //
+    // Measured on the 35B A3B / 2x A770 (dev/bench_conc, the decode step, the
+    // grouped dp4a path, the fp32 path at 38.98 / 87.62 / 135.84 / 191.96 ms
+    // for N=1 / 8 / 16 / 32):
+    //
+    //   N=1    M=1 37.69   M=2 41.50
+    //   N=8    M=1 79.62   M=2 78.62
+    //   N=16   M=1 136.01  M=2 130.50
+    //   N=32   M=1 212.77  M=2 191.64
+    //
+    // (cases 58 and 59 are those two tiles)
+    static const int cfg_dec = si::env::i32("PF_MOE_CFG_DEC", 0);
+    const int cfg = dec ? (cfg_dec ? cfg_dec : ((n_pairs <= top_k) ? 58 : 59))
+                         : ((FUSE == 2) ? cfg_gate : cfg_down);
 #define SI_MOE_TILE5(MV, NSGV, CV, HV)                                                                                       \
     do {                                                                                                                 \
         constexpr int NSG = NSGV, C = CV, RB = NSG * C;                                                                  \
@@ -1164,6 +1182,13 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
     case 55: SI_MOE_TILE3(16, 8, 2);  // 128 thr, RB=16
     case 56: SI_MOE_TILE3(24, 16, 2);
     case 57: SI_MOE_TILE3(8, 16, 2);  // == the winner, kept as a named case
+    // Decode-shaped tiles: a decode step routes ONE token per expert, so the
+    // M=8 tile is seven eighths empty - the same weights are read but eight
+    // times the dp4a work is done.  M=1 is the shape a decode step actually
+    // has.  (PF_MOE_DP4A_DEC=1 runs the grouped dp4a path on a decode step;
+    // these are the tiles for it.)
+    case 58: SI_MOE_TILE3(1, 16, 2);  // decode: one row per expert
+    case 59: SI_MOE_TILE3(2, 16, 2);  // two rows per expert
     default: SI_MOE_TILE(16, 2);  // 128 thr, 32 col
     }
 #undef SI_MOE_TILE
@@ -1178,7 +1203,7 @@ bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, c
                             size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
                             const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
                             int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * h, int h_stride,
-                            int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype) {
+                            int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype, bool dec) {
     // one work-group reads both banks, so they must agree on K, N and type
     if (gtype != utype) {
         return false;
@@ -1192,7 +1217,7 @@ bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, c
     const char * g = (const char *)gbank, * u = (const char *)ubank;
 #define SI_MOE_GRP_GU(QT)                                                                                                   \
     moe_grp_go<2, QT>(q, g, u, slot_gb, slot_ub, slot_map, off, pair, active, n_active, n_act_max, n_expert, n_pairs,  \
-                      flat, xq, asa, xs, h, h_stride, n_embd, n_ff_exp, top_k, persist_env != 0)
+                      flat, xq, asa, xs, h, h_stride, n_embd, n_ff_exp, top_k, persist_env != 0, dec)
     switch (gtype) {
     case 12: return SI_MOE_GRP_GU(12);
     case 13: return SI_MOE_GRP_GU(13);
@@ -1205,7 +1230,7 @@ bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, c
 bool moe_grp_down_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db, const int32_t * off,
                          const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
                          int n_expert, int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * acc,
-                         int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype) {
+                         int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype, bool dec) {
     const char * d = (const char *)dbank;
     const bool flat = si::env::i32("PF_MOE_FLAT_DOWN", 0) != 0;
     // PF_MOE_PERSIST: work-stealing grid.  Read here, ONCE per process, and passed
@@ -1214,7 +1239,7 @@ bool moe_grp_down_launch(queue & q, const void * dbank, const int32_t * slot_map
     static const int persist_env = si::env::i32("PF_MOE_PERSIST", 0);
 #define SI_MOE_GRP_D(QT)                                                                                                   \
     moe_grp_go<1, QT>(q, d, nullptr, slot_db, 0, slot_map, off, pair, active, n_active, n_act_max, n_expert, n_pairs, \
-                      flat, xq, asa, xs, acc, acc_stride, n_ff_exp, n_embd, 1, persist_env != 0)
+                      flat, xq, asa, xs, acc, acc_stride, n_ff_exp, n_embd, 1, persist_env != 0, dec)
     switch (dtype) {
     case 12: return SI_MOE_GRP_D(12);
     case 13: return SI_MOE_GRP_D(13);

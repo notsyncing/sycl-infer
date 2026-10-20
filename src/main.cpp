@@ -181,7 +181,7 @@ int main(int argc, char ** argv) {
     if (const char * e = si::env::str("PF_KV_CAP_MB")) {
         kv_cap_mb = atoi(e);
     }
-    int max_slots = kMaxB;      // --max-slots: concurrent sequences (recurrent state)
+    int max_slots = 16;       // --max-slots: concurrent sequences (recurrent state)
     int moe_resident = 0;      // --moe-resident: experts kept on the device per layer
     size_t moe_vram_mb = 0;     // --moe-vram-mb: device budget for the expert bank
     size_t moe_ram_mb = 0;      // --moe-ram-mb: host budget for the decoded-expert tier

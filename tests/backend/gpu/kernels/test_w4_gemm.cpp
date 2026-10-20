@@ -101,7 +101,13 @@ int main(int argc, char ** argv) {
                 return 0;
             }
         }
-        for (int M : {1, 5, 6, 7, 8, 32, 512}) {
+        // M = 13 is the last row count the native GEMM is instantiated for, and
+        // 14..32 are the ones a batched decode of more than thirteen rows
+        // actually asks for - those go down oneDNN's int8 matmul instead.  The
+        // boundary is where the native path's own rate falls to oneDNN's
+        // (AGENTS.md, *The native GEMM's rate falls off a cliff above M=13*),
+        // so both sides of it are worth pinning here.
+        for (int M : {1, 5, 6, 7, 8, 13, 14, 16, 20, 24, 32, 512}) {
         // random activations in [-1,1], then the same quantization the engine uses
         std::vector<float> x((size_t)M * K);
         for (auto & v : x) {

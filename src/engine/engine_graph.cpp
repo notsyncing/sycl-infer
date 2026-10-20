@@ -707,6 +707,13 @@ static const bool moe_grp_on = si::env::i32("PF_MOE_DP4A", 1) != 0;
 // at 64k (1.24x), the routed experts being 39.6 ms of the 56.7 - 70% of the whole
 // decode step.
 //
+// That measurement was with the PREFILL's tile, and it is what the "the kernel
+// is prefill-shaped" note meant.  The decode now has its own tile
+// (PF_MOE_CFG_DEC, one or two rows), and with it the grouped path is the
+// FASTER one: 37.69 ms/token against 38.98 for the fp32 path at N=1, and
+// 78.62 against 87.62 at N=8.  So the decode uses the grouped dp4a path by
+// default now, and PF_MOE_DP4A_DEC=0 restores the fp32 dequant experts.
+//
 // Note what the diagnosis is NOT.  The obvious reading of the shape is "the grid
 // is starved": n_act x N/RB = 8 x 16 = 128 work-groups on 512 EUs.  That is wrong,
 // and it was measured rather than assumed - halving RB through the existing cfg
@@ -716,7 +723,7 @@ static const bool moe_grp_on = si::env::i32("PF_MOE_DP4A", 1) != 0;
 // size for work-group count and net zero.  What limits this shape is 16384 threads =
 // 512 warps = one warp per EU, and no tile shape reaches past it - which is also
 // why a split-K rewrite is not obviously the answer either.
-static const bool moe_grp_dec = si::env::i32("PF_MOE_DP4A_DEC", 0) != 0;
+static const bool moe_grp_dec = si::env::i32("PF_MOE_DP4A_DEC", 1) != 0;
 // Prefill side: the kernel needs enough row tiles to fill the machine, which is a
 // function of the chunk's token count, not of the model.
 static const int moe_grp_min_tok = si::env::i32("PF_MOE_GRP_MIN_TOK", 8);
@@ -923,7 +930,18 @@ auto moe_call = [&](size_t idx) {
             // The grouped dp4a kernel is PREFILL-shaped and decode is not (see the
             // `n_tok > 1` note below), so PF_MOE_DP4A_DEC chooses between them per
             // mode rather than per process.
-            const bool dec_step = (n_tok <= 1);
+            //
+            // "Decode" is the MODE, not the token count.  This used to be
+            // `n_tok <= 1`, which is true only for a ONE-row decode: a batched
+            // decode has n_tok = rows = N, so every batched decode step was
+            // treated as a prefill and ran the prefill's M=8 row tile - which
+            // is seven eighths empty on a decode step, where each selected
+            // expert contributes exactly ONE row.  Measured on the 35B A3B /
+            // 2x A770 (dev/bench_conc, the decode step, the dp4a path):
+            // N=8 87.94 ms with the M=8 tile against **78.62** with a decode
+            // tile, N=16 137.43 against **130.50**, N=32 193.32 against
+            // **191.64**, and N=1 53.95 against **37.69** with a one-row tile.
+            const bool dec_step = (mode == 0);
             const bool grp_want = dec_step ? moe_grp_dec : moe_grp_on;
             bool grp_ok = grp_want && A.xq && !moe_host_split() && !on_cpu && (dec_step || n_tok >= moe_grp_min_tok);
             if (grp_ok) {
@@ -933,7 +951,7 @@ auto moe_call = [&](size_t idx) {
                                                 moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off,
                                                 d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq,
                                                 A.asa, A.xs, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
-                                                M.gate_exps.type, M.up_exps.type);
+                                                M.gate_exps.type, M.up_exps.type, dec_step);
             }
             if (!grp_ok) {
                 moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
@@ -946,7 +964,7 @@ auto moe_call = [&](size_t idx) {
                     moe_actq_launch(qq, d_moe_h, hp.n_ff_exp, n_pairs, hp.n_ff_exp, A.xq, A.asa, A.xs);
                 grp_ok = moe_grp_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off,
                                              d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq, A.asa,
-                                             A.xs, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type);
+                                             A.xs, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type, dec_step);
             }
             if (!grp_ok) {
                 moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
@@ -2420,6 +2438,10 @@ void engine::build_plans() {
         if (b.plan.segs.size() > 1024) {
             throw std::runtime_error("segment buffer too small");
         }
+        // sized from the plan, not a fixed 1024: there is a bucket per row
+        // count now, and 32 x 1024 gemv_segs would be ~6 MB of device memory
+        // for nothing.
+        b.d_segs = alloc_elems<gemv_seg>(b.plan.segs.size());
         q.memcpy(b.d_segs, b.plan.segs.data(), b.plan.segs.size() * sizeof(gemv_seg)).wait();
     }
     // leave the members on the primary device for any runtime use
@@ -2651,6 +2673,15 @@ void engine::replay_md_verify_graphs() {
     bind_acts(0);
 }
 
+// The row counts that get a recorded command graph on the single-device
+// decode path.  Recording one costs a whole forward's worth of kernels at
+// startup, so the set is deliberately coarse: the other row counts decode by
+// direct replay, which runs the exact row count rather than rounding up to a
+// power of two.  kMaxB is included so the largest batch has a graph too.
+static bool dec_graph_rows(int tb) {
+    return tb == 1 || tb == 2 || tb == 4 || tb == 8 || tb == 16 || tb == kMaxB;
+}
+
 void engine::build_graphs() {
     if (cpu_mode || multi_dev) {
         build_plans();
@@ -2676,7 +2707,15 @@ void engine::build_graphs() {
         if (b.plan.segs.size() > 1024) {
             throw std::runtime_error("segment buffer too small");
         }
+        b.d_segs = alloc_elems<gemv_seg>(b.plan.segs.size());
         q.memcpy(b.d_segs, b.plan.segs.data(), b.plan.segs.size() * sizeof(gemv_seg)).wait();
+        // A command graph per bucket costs a whole forward recording at
+        // startup, so only the coarse row counts get one; the rest decode by
+        // direct replay (the multi-device / CPU path's mechanism), which runs
+        // the exact row count instead of rounding up.
+        if (!dec_graph_rows(b.tb)) {
+            continue;
+        }
         b.g = std::make_unique<sx::command_graph<sx::graph_state::modifiable>>(q.get_context(), q.get_device());
         b.g->begin_recording(q);
         record_forward(0, b.plan, b.d_segs, b.tb);

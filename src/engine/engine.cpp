@@ -2531,10 +2531,27 @@ void engine::alloc_buffers() {
             mtp.d_mtp_convsave_[d] = (float *)dev_alloc_on((int)d, (size_t)ng * 2 * conv_per * 4);
         }
     }
-    for (int tb : {1, 2, 4, 8, 16}) {
+    // One bucket per row count: the decode runs EXACTLY n_rows rows, so the
+    // bucket set has to contain every count the scheduler can ask for.
+    //
+    // The old set {1,2,4,8,16} rounded the batch UP to the next power of two,
+    // which was two bugs at once.  Nine concurrent sequences ran a sixteen-row
+    // forward: seven rows of dead work, a 38 ms cliff on the 35B A3B / 2x A770
+    // (125.6 ms/step against 87.8 at eight rows) and a waste that grows with
+    // the batch.  And MORE THAN SIXTEEN SEQUENCES WERE NEVER COMPUTED AT ALL:
+    // `buckets_.back()` is tb=16, so rows 16.. of d_logits kept the previous
+    // step's values and the sampler read them.
+    //
+    // A bucket is one plan plus one device copy of its segments, and both are
+    // sized from the plan below (build_plans / build_graphs), so the extra
+    // buckets cost a few hundred KB each.  On the multi-device / CPU path the
+    // decode is a direct replay, so a bucket is cheap and every row count gets
+    // one.  The single-device path records a command graph per bucket, which
+    // costs a whole forward recording at startup, so only the coarse counts
+    // get a graph there (engine_graph.cpp) and the rest replay directly.
+    for (int tb = 1; tb <= kMaxB; tb++) {
         dec_bucket b;
         b.tb = tb;
-        b.d_segs = alloc_elems<gemv_seg>(1024);
         buckets_.push_back(std::move(b));
     }
     if (pc_enabled && pc_max_states > 0) {
@@ -2903,18 +2920,29 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
         sync_all();
         return;
     }
-    // pick the smallest captured graph that fits the batch
+    // The decode runs EXACTLY n_rows rows: there is a bucket per row count, so
+    // there is no rounding and no dead work.  (The old "smallest bucket that
+    // fits" rule ran a sixteen-row forward for nine sequences, and for more
+    // than sixteen sequences it ran a sixteen-row forward that could not even
+    // hold them - rows 16.. of d_logits kept the previous step's values.)
     dec_bucket * b = nullptr;
     for (auto & bk : buckets_) {
-        if (bk.tb >= n_rows) {
+        if (bk.tb == n_rows) {
             b = &bk;
             break;
         }
     }
     if (!b) {
-        b = &buckets_.back();
+        if (n_rows < 1) {
+            b = &buckets_.front(); // tb == 1: an empty batch still runs the shape
+        } else {
+            throw std::runtime_error("decode batch exceeds the row ceiling (" + std::to_string(n_rows) + " > "
+                                     + std::to_string(kMaxB) + ")");
+        }
     }
-    if (cpu_mode || multi_dev) {
+    if (cpu_mode || multi_dev || !b->e) {
+        // no recorded graph for this row count (the single-device path records
+        // one only for the coarse counts): replay the plan directly.
         record_forward(0, b->plan, b->d_segs, b->tb);
         sync_all();
         return;

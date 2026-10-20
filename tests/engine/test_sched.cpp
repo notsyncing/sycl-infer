@@ -7,6 +7,7 @@
 // Anything refactoring that path has no oracle without this.
 //
 // usage: test_sched <model.gguf>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -81,6 +82,9 @@ int main(int argc, char ** argv) {
         ec.max_seq = 2048;
         ec.n_blocks = 256;
         ec.layer_map = lm ? lm : "";
+        // 20 slots, so section 8 can drive a decode batch of more than sixteen
+        // rows - the size the old bucket set silently truncated to.
+        ec.max_slots = 20;
         engine e(ec);
         const std::vector<int> prompt = e.tk.encode("user\nHello\nassistant\n", /*parse_special=*/true);
         CHECK(!prompt.empty());
@@ -255,6 +259,77 @@ int main(int argc, char ** argv) {
                    done, nseq, same, nseq);
             CHECK(done == nseq);
             CHECK(same == nseq);
+        }
+
+        // ---- 8. a decode batch of more than sixteen rows computes EVERY row ----
+        //
+        // The decode's row count used to be quantised to a small set of captured
+        // shapes ({1,2,4,8,16}) and the batch was rounded UP to the next one.
+        // That is dead work for nine rows - a 38 ms cliff on the 35B A3B / 2x
+        // A770 - and a silent wrong answer for more than sixteen: the forward
+        // only ran sixteen rows, so rows 16.. of d_logits kept the previous
+        // step's values and the sampler read them.  Nothing in the output said
+        // so, and no existing test had more than two concurrent sequences.
+        //
+        // The oracle is the one that cannot be faked: a row whose logits were
+        // never written does not MOVE between two steps, while every row the
+        // forward really computed does.  So decode twice with different inputs
+        // and require every row's logits to change.  Comparing the argmax would
+        // be weaker - a stale vector still has an argmax, and a real row can
+        // legitimately keep its argmax across a step.
+        {
+            const int N = 20;
+            const int nvoc = e.m.hp.n_vocab;
+            std::vector<int32_t> toks((size_t)N, 0), poss((size_t)N, 0), slots((size_t)N, 0);
+            int blocks_ok = 0;
+            for (int r = 0; r < N; r++) {
+                const int b = e.alloc_block();
+                if (b < 0) {
+                    break;
+                }
+                e.set_table(r, std::vector<int>{b});
+                slots[(size_t)r] = r;
+                blocks_ok++;
+            }
+            CHECK(blocks_ok == N);
+            if (blocks_ok == N) {
+                std::vector<float> a((size_t)N * nvoc), b((size_t)N * nvoc);
+                for (int r = 0; r < N; r++) {
+                    toks[(size_t)r] = 1000 + r;
+                    poss[(size_t)r] = 0;
+                }
+                e.decode_batch(toks.data(), poss.data(), slots.data(), N);
+                e.sync_all();
+                for (int r = 0; r < N; r++) {
+                    e.fetch_logits(r, a.data() + (size_t)r * nvoc);
+                }
+                for (int r = 0; r < N; r++) {
+                    toks[(size_t)r] = 2000 + r;
+                    poss[(size_t)r] = 1;
+                }
+                e.decode_batch(toks.data(), poss.data(), slots.data(), N);
+                e.sync_all();
+                for (int r = 0; r < N; r++) {
+                    e.fetch_logits(r, b.data() + (size_t)r * nvoc);
+                }
+                int moved = 0;
+                double worst = 1e300;
+                for (int r = 0; r < N; r++) {
+                    double d = 0.0;
+                    for (int v = 0; v < nvoc; v++) {
+                        d += std::fabs((double)a[(size_t)r * nvoc + v] - (double)b[(size_t)r * nvoc + v]);
+                    }
+                    if (d > 0.0) {
+                        moved++;
+                    }
+                    if (d < worst) {
+                        worst = d;
+                    }
+                }
+                printf("decode batch of %d rows: %d/%d rows moved between two steps (smallest row's L1 move %.6g)\n",
+                       N, moved, N, worst);
+                CHECK(moved == N);
+            }
         }
 
         if (g_fail) {

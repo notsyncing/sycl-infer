@@ -1605,6 +1605,21 @@ name.
   change with tuning — they are queried, with the profile as the fallback.  And
   anything a *model* dictates rather than a card (`kBlockSize`, `kI8Q`,
   `kMaxT`/`kMaxB`, `head_dim`).
+* **`kMaxB` is asked about often, and the answer is "neither a CLI flag nor a
+  profile field" - for two separate reasons that have to be kept apart.**  A
+  *profile* field is a category error: it is for a number whose measured optimum
+  differs per card, and the concurrency ceiling is a capacity policy - putting it
+  in the profile would make the same binary's VRAM footprint change with the
+  card, which is the hardest class of bug to chase.  A *CLI flag* is
+  infeasible: `step_info` is a POD with `int32_t pos[kMaxB]`,
+  `tokens[kMaxB*kMaxT]` and `mrope[4*kMaxB*kMaxT]`, plus `h_argmax[kMaxB]` and
+  `std::array<pc_slot, kMaxB>`, so the row count is compile-time by
+  construction.  **The user-facing knob already exists and is `--max-slots`**
+  (how many sequences the engine will actually run, and how much recurrent
+  state it reserves); `kMaxB` is only the *ceiling* those buffers are dimensioned
+  for.  The one thing `--max-slots` does **not** shrink is the row buffers
+  (`d_logits`, `d_partials_dec`, the activation rows), which are `kMaxB`-sized
+  regardless - that is the real gap, and it is a refactor, not a knob.
 * **An env var still overrides** the profile: the profile is the default, the env
   var is the A/B.  Keep that ordering (`env ? atoi(env) : profile`), and keep the
   profile value the one that is *measured* — an env default that was never
@@ -2008,10 +2023,15 @@ work-steal `(expert, row tile, column block)` triples off an atomic cursor, with
 item total summed on the device; **exact at every configuration, and 3% SLOWER -
 refuted, see the section below, so leave it off**), `PF_MOE_PERSIST_WG` (its grid,
 default `2 * compute_units`), `PF_MOE_GRPDBG` prints the resolved tile and grid and is the assertion on the
-tile selection path; `PF_DNNL_FPMATH` (widen the oneDNN int8/u4 matmul's accumulation to `fpmath_mode::any,true`; a guard against the K >= 5376 NaN the A770 library records, **default off** because no model here reaches it and it measures neutral), `PF_MOE_DP4A_DEC=1` (run the grouped dp4a expert GEMM on a DECODE step too;
-default off because decode is the wrong shape for it and the fp32 dequant path
-is 1.29-1.38x faster at all three depths - see *Decode: the grouped expert GEMM
-is prefill-shaped*), `PF_MOE_GRP_MIN_TOK` (prefill chunk size below which the
+tile selection path; `PF_DNNL_FPMATH` (widen the oneDNN int8/u4 matmul's accumulation to `fpmath_mode::any,true`; a guard against the K >= 5376 NaN the A770 library records, **default off** because no model here reaches it and it measures neutral), `PF_MOE_DP4A_DEC` (run the grouped dp4a expert GEMM on a DECODE step too;
+**default ON**, because the decode now has its own tile - the old "decode is the
+wrong shape for it" verdict was measured with the PREFILL's M=8 tile and a
+batched decode was never even on the decode branch, see *Decode: the grouped
+expert GEMM had the PREFILL's tile*; `=0` restores the fp32 dequant experts),
+`PF_MOE_CFG_DEC` (the DECODE's tile, 0 = auto: one row per expert for a
+single-token decode and two for a batched one, because the weight re-read factor
+is `ceil(p_e/M)`; a non-zero value forces that tile for both projections),
+`PF_MOE_GRP_MIN_TOK` (prefill chunk size below which the
 grouped kernel declines, default 8), `PF_MOE_DQ2` (halves the dequant
 arithmetic with every load unchanged - **wrong results by design**, and the
 experiment that bounds the f16 idea at 18%), `PF_MOE_NOACTQ` skips `moe_actq_launch` (wrong results -
@@ -2523,7 +2543,7 @@ at 1/35 of the bandwidth roofline while the softmax beside it runs at 48% of it,
 and the reason is structural rather than arithmetic - see *The gather's second
 stage* below.
 
-### Decode: the grouped expert GEMM is prefill-shaped, and decode takes fp32
+### Decode: the grouped expert GEMM had the PREFILL's tile, and that was the bug
 
 `tg128` on the 35B A3B / 2x A770 (`--layer-map 0-19:gpu.0,20-39:gpu.1`), measured
 with `dev/bench_tg`, which prefills `depth` tokens and then times ONLY the decode
@@ -2544,6 +2564,69 @@ path it replaced, and `PF_MOE_DP4A_DEC` (default 0) now chooses per mode instead
 of per process.  **Prefill is untouched**: pp512 / pp16384 / pp65536 stay at
 860.8 / 1565.4 / 1437.0 t/s with argmax 11171 / 1204 / 4779, and the MoE exactness
 oracle stays 0/8192.
+
+**That diagnosis was right about the shape and wrong about the fix, and the
+conclusion it reached ("decode takes fp32") is now reversed.**  The tile is a
+compile-time template parameter, so "the M=8 tile is 7/8 empty on a decode" was
+never a reason to give up on the path - it was a reason to give the decode its
+own tile.  Two things had to be true for that, and one of them was a **design
+bug**:
+
+* **"Decode" has to mean the MODE, not the token count.**  The selection was
+  `const bool dec_step = (n_tok <= 1);` - and a *batched* decode has
+  `n_tok = rows = N > 1`, so **every batched decode step was treated as a
+  prefill** and ran the prefill's M=8 row tile.  Only a one-row decode ever
+  reached the decode branch, which is why the old measurement (1.38x slower) was
+  taken on a one-row decode and the batched case was never in the picture.  It
+  is now `mode == 0`.
+* **The decode needs a tile of its own, and its shape changes with the batch.**
+  `M` is the number of (token, expert) pairs a work-group handles, so the
+  weight re-read factor is `ceil(p_e/M)`: a **single-token** decode gives every
+  selected expert exactly one pair (one row, no re-read), and a **batched**
+  decode gives some experts two or three, where a one-row tile would re-read
+  their weights once per extra pair.  So the decode's tile is one row for a
+  single token and two for a batched one, and the two new cfg cases are M=1 and
+  M=2.
+
+Measured on the 35B A3B / 2x A770 (`dev/bench_conc`, the decode step, the
+grouped dp4a path; the fp32 path at 38.98 / 60.29 / 80.21 / 87.62 / 135.84 /
+191.96 ms for N=1 / 2 / 4 / 8 / 16 / 32):
+
+| N | fp32 | dp4a, M=8 | dp4a, M=1 | dp4a, M=2 | **shipped** |
+|---|---:|---:|---:|---:|---:|
+| 1 | 38.98 | 53.95 | **37.69** | 41.50 | **37.91** |
+| 2 | 60.29 | 60.32 | 60.34 | 60.38 | **56.03** |
+| 4 | 80.21 | 81.27 | 81.05 | 81.44 | **66.25** |
+| 8 | 87.62 | 87.94 | 79.62 | **78.62** | **78.54** |
+| 16 | 135.84 | 137.43 | 136.01 | **130.50** | **130.20** |
+| 32 | 191.96 | 193.32 | 212.77 | **191.64** | **191.70** |
+
+**-17.4% at N=4, -10.4% at N=8, -7.1% at N=2, -4.1% at N=16, -2.7% at N=1** - and
+the M=1 tile is the right one only for a single token (41.50 against 37.69 at
+N=1, and 212.77 against 191.64 at N=32, where the batched decode's experts
+carry two and three pairs and a one-row tile re-reads their weights).  The
+decode's tile is therefore chosen by the pair count, not by a constant:
+`PF_MOE_CFG_DEC` (default 0 = auto) picks M=1 for a single-token decode and
+M=2 for a batched one, and a non-zero value forces that tile.
+
+**And the decode now quantizes its activation like the prefill does**, which is
+why `test_decode_vs_prefill` - the decode's own oracle, and one that now
+compares two paths which agree on the activation quantization - still passes
+3/3, and the prefill oracles are unchanged (pp512 11171 / pp16384 1204 /
+pp65536 4779).
+
+**The decode's token stream changes, and that is expected rather than alarming.**
+`dev/bench_conc`'s hash over the generated ids moves with the activation
+quantization (N=1 8f2d6aad3fb2cd4d -> e9a5e7b8f96c8e84, N=8 4ebe0aa5c433dc0a ->
+99ae758536636cf8, N=16 72f3f41188e83f8f -> 7455a4c0d57a4361), because the
+decode's logits move by a hair and a near-tie can flip - the same class of change
+the file already records for batching ("the flip happens at a near-tie argmax").
+What matters is the property the engine is judged on, and it holds: **the
+decode's argmax still equals the prefill's** on all three lengths of the 27B
+split case, which is a stronger statement now than before, because the two
+phases agree on the activation quantization instead of the decode being the odd
+one out.  The MTP and DFlash verifies are **mode 2** (a batch of k+1 rows), so
+they keep the prefill's tile and are unaffected.
 
 **The decode budget, by ablation** (`PF_ABL_*`, one process per cell).  Note that
 `PF_ABL_NOATTN` crashes at both depths, so attention is the difference between the
@@ -4065,6 +4148,489 @@ the engine's real routing is less smooth than the benchmark's synthetic one.  Wi
 price paid for the 17%; a grouped-M formulation (16 rows for the 95 experts with
 p<=32, 8 for the rest) is what would recover it.
 
+### Concurrency: the aggregate curve, and a 38 ms cliff at nine rows
+
+`dev/bench_conc.cpp` drives the engine the way the scheduler does - N slots
+prefilled one sequence per call, then ONE `decode_batch` with N rows per step -
+so it prices the forward pass at a given N with no HTTP and no admission loop in
+the way.  35B A3B, 2x A770, `--layer-map 0-19:gpu.0,20-39:gpu.1`, prompt 512
+tok/slot, 64 decode steps/slot, one process per cell:
+
+| N | pp (t/s) | tg (tok/s) | ms/step |
+|---:|---:|---:|---:|
+| 1 | 776.5 | 26.36 | 37.93 |
+| 2 | 1028.7 | 35.67 | 56.06 |
+| 4 | 1226.1 | 60.43 | 66.19 |
+| 8 | 1355.2 | 101.86 | 78.54 |
+| 16 | **1426.7** | **123.43** | 129.63 |
+
+**At N=16 both curves are still rising - and 16 was `kMaxB`, a constant, not a
+property.**  Raising the ceiling is measured below, and it separates the two: pp
+saturates at 16 while tg does not stop at 32.  Read that section before quoting
+this table as an optimum.
+
+**The row counts in the table are the ones the engine actually ran.**  They were
+not, for a long time: the decode's row count was quantised to `{1,2,4,8,16}` and
+rounded up, so most of these cells were running a padded batch - and above
+sixteen rows the engine was not computing the extra rows at all.  The cliff
+section below has the whole story; the numbers in *this* table are the fixed
+engine's.
+
+**pp's entire 1.84x is pipeline overlap, not extra machine - and it gives a
+request nothing.**  Timing each slot's own prefill settles it: slot by slot, with
+each waited on, a 512-token prefill costs **696 ms at N=1 and 667 ms at N=16**
+(slot 15 included), so serial aggregate pp is **flat** - 763.2 t/s at N=8 against
+764.8 at N=16.  The rise comes entirely from the 3-phase multi-device pipeline
+letting consecutive prefills overlap across the two cards (8 slots in 3.05 s
+against 5.37 s serial).  Two consequences worth stating: **concurrency buys
+aggregate throughput and zero per-request TTFT** - the 16th prompt waits exactly as
+long as the 1st - and **pp at N=16 is 1426 t/s against 1548.8 for a single
+16384-token prefill, i.e. 92% of the machine's prefill rate**, so the prefill side
+is close to squeezed.  The residual 8% is the pipeline's fill and drain per
+prefill.
+
+**tg's cost is a fit of `38.5 + 6.1*N` ms**, so the asymptote is ~163 tok/s and
+N=16's 117 is 72% of it - but that fit is wrong above 8 rows, and the reason is
+the one real finding here.
+
+#### A 38 ms cliff at exactly nine rows, and it was the decode's row count
+
+| N | 8 | **9** | 10 | 11 | 13 | 16 |
+|---|---:|---:|---:|---:|---:|---:|
+| ms/step | 87.61 | **125.59** | 127.77 | 129.25 | 131.68 | 136.26 |
+
+**One extra row costs +38 ms at N=9 and 1.3 ms at N=10.**  It is not a smooth
+saturation curve, it is a threshold, and three independent controls say it is the
+engine and not the harness:
+
+* **depth-independent** - the jump is at N=9 with a 128-token prompt (87.91 ->
+  126.11) exactly as with 512, so it is not a KV- or attention-shaped effect;
+* it survives `PF_ABL_NOMOE=1` (+20 of the 38) and `PF_ABL_NOGDN=1` (+32), so it
+  is not one component;
+* the per-slot prefill control above rules out first-touch amortisation, which is
+  what a rising aggregate curve would otherwise be.
+
+**It was not a kernel at all, and two plausible suspects were exonerated on the
+way.**  `PF_LAUNCHCNT` named the right symptom and the wrong cause: submissions
+for one decode `record_forward` (mode 0) went from 211 to 291 GEMV segments, and
+`PF_FUSEDBG` said the narrow int8 group fusion (`engine_graph.cpp`, the
+`gemm_i8_group` path guarded by `gr.n > 1 && tbm <= 13`) fired 200 times at N=8
+and 40 at N=9.  Turning the two fused paths off one at a time on the SAME build
+leaves both endpoints where they were:
+
+| arm | N=8 | N=9 |
+|---|---:|---:|
+| default | 87.84 | 125.60 |
+| `PF_NOFUSE=1` (no `gemm_i8_group` at all) | 88.46 | 125.40 |
+| `PF_ABL_NOGEMV=1` (no `i8_row_gemv_multi`) | 87.63 | 125.94 |
+| both off | 88.61 | 125.81 |
+
+So the fusion was worth 0.6 ms at N=8 despite firing 200 times - a no-op that
+costs a branch - and the 80 extra launches are 0.5 ms of grid cost, not 38.  The
+`PF_FUSEDBG` reading was a correlation: the plan reshapes at nine rows for a
+reason that has nothing to do with the fusion.  **A fusion that fires 200 times
+and buys nothing is not a fusion.**
+
+**The cause is that the decode's row count was quantised.**  The engine captured
+a decode *plan* per row count, but only for `{1, 2, 4, 8, 16}`, and the batch was
+rounded **up** to the next member.  Nine sequences therefore ran a **sixteen-row**
+forward: seven rows of dead work, and the whole step paid for them.  The proof is
+one line from the plan itself - `PF_DBG_PFB=1` prints the row count of every
+call, and it says `rows=8` at N=8 and `rows=16` at N=9 (the `mode=0 rows=1`
+calls, 231 of them, are the same in both).
+
+**The per-call-group profile is NOT where this shows, and that is worth
+recording.**  `prof_ci_t` accumulates over the whole run while `prof_acc` resets
+every eight calls, so a per-`ci` diff is dominated by the prefill: every `ci`
+moved by the same +12.3 ms, which is one extra slot's prefill and not the cliff.
+The *summary* line is the right level, and it puts the cliff exactly where the
+dead rows would be.  **These are the OLD engine's numbers, and the row counts
+they ran are the point**: N=7 and N=8 both ran eight rows, N=9 and N=10 both ran
+sixteen, so the pairs are flat and the *step* is what jumps.
+
+| bucket | N=7 (ran 8) | N=8 (ran 8) | **N=9 (ran 16)** | N=10 (ran 16) |
+|---|---:|---:|---:|---:|
+| gemv | 71.51 | 70.19 | **101.56** | 100.94 |
+| **head** | 1.72 | 1.72 | **4.72** | 4.65 |
+| attn | 4.34 | 4.36 | 5.96 | 6.01 |
+| gdn | 5.46 | 5.77 | 6.33 | 6.64 |
+| total | 83.34 | 82.40 | **116.08** | 115.87 |
+
+**The head - the one call whose batch dimension is the whole output - triples,
+and it is 1.72 ms at eight rows and 4.72 ms at nine, which is what a sixteen-row
+weight pass looks like.**
+
+**And the same quantisation was a silent WRONG ANSWER above sixteen rows.**
+`buckets_.back()` is tb=16, so a batch of twenty rows ran a sixteen-row forward:
+rows 16.. of `d_logits` were never written, kept the previous step's values, and
+the sampler read them.  No error, no NaN, just plausible text - and the
+concurrency table above was measured on that broken engine.  **A test that only
+runs two concurrent sequences cannot see this**, which is why `test_sched` now
+carries a twenty-row case whose oracle is the one thing a stale row cannot fake:
+a row whose logits were never written does not *move* between two steps, while
+every row the forward really computed does.
+
+**And that test has been seen to fail, on the old engine - which is the only
+thing that makes it a verifier rather than a decoration.**  The old
+`engine.cpp` / `engine_graph.cpp` / `engine.h` (the coarse bucket set) were put
+back, `test_sched` was rebuilt against them, and it failed with exactly the
+signature the bug predicts:
+
+| engine | `test_sched` section 8 |
+|---|---|
+| old (`{1,2,4,8,16}`) | **16/20** rows moved, the dead four by **0** -> exit 1 |
+| new (one bucket per row count) | **20/20** rows moved -> exit 0 |
+
+**Sixteen of twenty**, and the four that did not move moved by *exactly* zero -
+their logits were never written, so they held the same bytes across both steps.
+A test that has only ever passed proves nothing; this one has been seen red.
+
+**The fix is one bucket per row count (1..kMaxB)**, so the decode runs exactly
+`n_rows` rows.  A bucket is one plan plus one device copy of its segments, both
+sized from the plan, and on the multi-device / CPU path the decode is a direct
+replay - so a bucket is cheap and every row count gets one.  The single-device
+path records a command graph per bucket, which costs a whole forward recording at
+startup, so only the coarse counts get a graph and the rest replay directly.
+
+The cliff is gone and the staircase with it.  Same harness and protocol
+(`dev/bench_conc`, prompt 512 tok/slot, 64 decode steps, one process per cell):
+
+| N | 8 | **9** | 16 |
+|---|---:|---:|---:|
+| the padded batch (the old bucket set) | 87.62 | **125.60** | 135.84 |
+| exact rows, the prefill's tile | 87.62 | **96.27** | 135.84 |
+| exact rows + the decode's own tile | **78.54** | **87.76** | **129.63** |
+
+**-30% at N=9 and -11% at N=8**, from two independent fixes: the row count
+(the padded batch) and the tile (the decode was running the prefill's M=8 tile,
+which is seven eighths empty on a decode step - see *Decode: the grouped expert
+GEMM had the PREFILL's tile*).  N=8 and N=16 are the controls: both were
+already exact in the old code, and both reproduce their old numbers to within
+0.6% - so the box has not drifted and the difference is the fixes.
+
+#### What the batch angle did NOT find
+
+Re-swept at N=16, both tuned at N=1, both flat inside this box's drift:
+
+| `PF_MOE_NPB` | 1 | 2 | **4** | 8 |
+|---|---:|---:|---:|---:|
+| ms/step | 137.04 | 136.82 | **136.77** | 136.51 |
+
+| `PF_DEC_SPLIT` | **128** | 160 | 256 (profile) | 384 |
+|---|---:|---:|---:|---:|
+| ms/step | **134.49** | 134.63 | 136.45 | 141.10 |
+
+Two same-run controls bracket the second table at 136.18 and 136.37, so 128's
+1.4% is inside the noise and **the N=1 tuning carries to N=16 unchanged**.
+
+`PF_MOE_DP4A_DEC=1` measured **neutral** at N=16 (136.3 / 137.1 against 136.9) - but
+that was with the PREFILL's M=8 tile, and the knob was reaching the decode
+branch only on a one-row decode.  With the decode's own tile it is not neutral:
+see *Decode: the grouped expert GEMM had the PREFILL's tile*.
+
+At N=16 the step is **48% routed experts** (65.9 ms of 136.86, by
+`PF_ABL_NOMOE`), 9% GDN, and 43% dense GEMVs + head + norms + attention; on the
+prefill 75% / 7.5% / 17.5%.  The routed-expert wall is the same wall as at N=1,
+and it is now 5x better amortised (153 GB/s of the card's 376 at N=16 against
+16-26 GB/s at N=1) but still the same GGUF-layout problem the decode section
+below describes.
+
+#### The native GEMM's rate falls off a cliff above M=13, and that is why the
+#### decode's dense layers change path there
+
+The decode's dense layers and the LM head go through oneDNN's int8 matmul
+above thirteen rows and the native GEMM below that, and the boundary looked like
+an arbitrary leftover: `nat_gemm_launch` rejects `M > 13` with a comment that
+says nothing, and `M` is a *template* parameter of the kernel (`acc[M*C]`
+registers, `M*KT*APAD` bytes of SLM), so every row count is a separate
+instantiation.  **Extending it to 32 was implemented and it is a loss**, and the
+reason is worth having.
+
+`dev/bench_natgemm` (the native GEMM against a host reference) at the 27B shape
+K=5120, N=17408, one row count per run:
+
+| M | u4 | k5 | cb4 | i8 | (the M=1 decode GEMV, for reference) |
+|---|---:|---:|---:|---:|---|
+| 7 | 91.8 | 75.9 | 75.2 | 157.0 | 164.4 / 248.5 |
+| 8 | 60.0 | 56.8 | 56.2 | 120.7 | 138.5 / 216.2 |
+| 12 | 56.0 | 62.4 | 63.2 | 130.4 | 174.8 / 259.9 |
+| **13** | 51.6 | 59.6 | 61.5 | **122.3** | 174.0 / 256.2 |
+| 14 | 50.7 | 57.6 | 58.7 | 119.7 | 179.2 / 260.7 |
+| **16** | **36.0** | 33.2 | 31.7 | **68.3** | 123.2 / 195.0 |
+| 20 | 14.1 | 29.3 | 29.1 | 65.6 | 126.4 / 204.1 |
+| 32 | 7.0 | 10.3 | 12.6 | 26.4 | 125.2 / 199.0 |
+
+**The native path's rate falls monotonically with M, and oneDNN's int8 matmul
+holds ~110 GB/s at the LM head's shape (M=16: 508 MB in 4.64 ms), so the two
+cross exactly at the existing boundary.**  The M=16 step down is the
+accumulator (`acc[M*C]` is 32 SIMD8 vectors at M=16 and 64 at M=32), and the
+u4 bump at M=12 is the `APAD` 32->48 change for u4 at M>=12 (the M=11 -> M=12
+step up).  **So the M>13 boundary is the right place and not a leftover**, and
+the decode's dense layers and head changing path there is not a bug to fix.
+
+End to end it is a loss and not a wash: with the native GEMM extended to 32, the
+batched decode at N=32 measured **210.34 ms/step against 191.96** for the same
+cell before the change.  The *correctness* was fine - `dev/bench_natgemm`
+reports `ok=1 maxdiff=0.0000` for every format at every M from 8 to 32, i.e. the
+kernel is exact at the row counts it was never asked for, and still slower.
+**A switch that is exact and slower is still a switch that should not exist**,
+so the extension was reverted and only the measurement was kept.
+
+**What the M>13 path costs, and why it is not "19 ms of bug".**  The decode's
+dense layers plus the LM head are 21.3 ms at N=8 and 38.2 ms at N=16, and the
+difference is the eight extra rows' arithmetic rather than a wrong path: the
+`M*` arithmetic above puts the crossover at M* ~ 12 (below it extra rows are
+nearly free, above it each one costs real time), and oneDNN's int8 matmul
+reaches 1.8 T-MAC/s there against dp4a's 7.1-7.6.  So there is a real gap -
+but **both** paths lose it, because the native path's rate falls faster, and the
+native path was the only one that could have been extended without a weight
+repack.
+
+#### Above sixteen: pp saturates there, tg does not stop at thirty-two
+
+`kMaxB` (the ceiling - `step_info` rows, the block table, `d_logits`) is now **32**,
+while `engine_config::max_slots` and `main.cpp`'s default stay at **16**, because
+raising the default would double the recurrent state (16 slots is 1.125 GiB per
+card on a 27B, 32 is 2.25 GiB) and that is a shipping decision nobody asked for.
+**The two are deliberately different numbers now** and conflating them is how the
+VRAM tables in this file went stale the first time.
+
+Prompt 512 tok/slot, 64 decode steps, one process per cell, **on the fixed engine**
+(the numbers this section used to quote were measured before the decode's row
+count was fixed, and above sixteen rows the engine was silently computing only
+sixteen of them - see the cliff section above):
+
+| N | pp (t/s) | tg (tok/s) | ms/step |
+|---:|---:|---:|---:|
+| 8 | 1355.2 | 101.86 | 78.54 |
+| 16 | 1426.7 | 123.43 | 129.63 |
+| 20 | 1442.1 | 132.58 | 150.86 |
+| 24 | 1448.5 | 145.40 | 165.06 |
+| 28 | 1455.9 | 156.98 | 178.36 |
+| **32** | **1460.5** | **167.21** | 191.37 |
+
+**pp's answer is 16.**  1426.7 at N=16 becomes 1460.5 at N=32 - **+2.4% for twice
+the concurrency** - which matches the 92%-of-one-big-prefill finding above: the
+prefill side is done, and sixteen is where it stops.
+
+**Raising the ceiling also raised the prefill batch, and that is worth 4.3% on its
+own - a second, independent effect riding on the same constant.**  `batched_prefill_fit`
+caps a mode-2 batch at `kMaxB * kMaxT` tokens, so 16 -> 32 doubled it from 512 to
+1024 and halved the number of forwards a long prefill takes.  Isolated on ONE
+build with `PF_PFB_MAX_M` (which caps the same number - note it is in **tokens**
+despite the `_M` name), interleaved 512/1024/512/1024 at depth 16384 with argmax
+1204 in all four:
+
+| batch tokens | pp16384 |
+|---|---:|
+| 512 | 1422.1 / 1409.9 t/s |
+| **1024** | **1479.7 / 1478.9 t/s** |
+
+**+4.3%**, and it is why a tg gain and a pp gain arrived in one commit from
+different mechanisms.  So `kMaxB` is doing two jobs - the row ceiling and the
+prefill batch - and the second is a genuine performance knob; it just is not a
+concurrency property, and the coupling is by allocation (the activations are
+`kMaxB*kMaxT` rows because a prefill row is one `kMaxT` chunk), not by policy.
+That is also why `kMaxB` is **not** something to expose as a CLI flag or a device
+profile field: `step_info` is a POD with `int32_t pos[kMaxB]`, `tokens[kMaxB*kMaxT]`
+and `mrope[4*kMaxB*kMaxT]`, so its dimensions are compile-time by construction,
+and the user-facing concurrency knob already exists as `--max-slots` (which sizes
+the recurrent state, not the row buffers).  The row buffers are the one thing
+`--max-slots` does *not* shrink; that is the gap worth closing if a small-VRAM
+card ever needs it, not a profile field.
+
+**tg's answer is "not 16, and not 32 either" - but the number is much smaller
+than it was, and the old one was an artefact of the bug.**  123.43 -> 167.21 tok/s
+is **+35.5%** over the same doubling, and the marginal row costs **3.86 ms**
+(191.37 - 129.63 over 16 rows) against 6.39 ms/row over the 8-to-16 segment - so a
+decode row gets cheaper as the batch grows, and the asymptote of the 16-to-32
+slope is ~259 tok/s, which N=32's 167.2 is 65% of.  **32 is as arbitrary as 16
+was**: the previous "16 is the ceiling" was a constant being read as a property,
+and it is worth repeating that distinction because the pp side genuinely does
+stop at 16.
+
+**What the old table claimed and why it was wrong.**  It read "+73% and a 1.31
+ms/row from 16 to 32", and it also read "the N=9 cliff is worth 39% of tg at
+N=16".  Both came from the same bug: at N=20..32 the engine ran a **sixteen-row**
+forward, so the step was doing half the work it claimed to, and N=16 - where the
+old bucket set was exact - never had a cliff to price at all.  **A performance
+table measured on an engine that is computing the wrong thing is worse than no
+table**, and the only reason this one looked plausible is that it was smooth.
+
+Validated at a 512-token prompt only.  N=32 with a deep context does not fit - 32
+slots of KV plus 2.25 GiB of recurrent state per card is more than the pool has
+after 18.22 GiB of experts - so `kMaxB = 32` is a *capability*, and `--max-slots`
+is still what picks a usable number.
+
+One harness bug, and it is the same shape as the one `bench_pf` carried for a whole
+campaign: `cfg.max_seq` was set from ONE sequence's token count, so
+`kv_cap_mb = -1` ("reserve what `max_seq` needs") reserved the pool for one slot.
+N<=16 fitted inside the 512-block default by luck; N=20 died at slot 18 with
+"KV pool exhausted".  **A pool sized from one sequence's length is not a pool.**
+`max_seq` and `n_blocks` now scale with N, and `alloc_block()`'s -1 is still
+checked.
+
+**And the harness itself is inside the timed region, which is worth knowing
+before quoting any of these numbers.**  `bench_conc`'s decode loop does
+`e.fetch_logits(i, ...)` (a blocking 1 MB device-to-host copy per row) and a
+host-side argmax over 248320 floats **per row, between the timed
+`decode_batch` and the next step** - so the reported ms/step carries about
+**0.45 ms per row of harness overhead**: 7.2 ms of N=16's 129.63 (5.6%) and
+14.4 ms of N=32's 191.37 (7.5%).  It is charged to the *marginal* row cost
+too, so the engine's own marginal row is ~3.41 ms and not 3.86.  The engine
+side of the same gap is small: `PF_HOSTPROF` at N=16 measures the host at
+**111.48 ms against the device's 122.89 ms**, i.e. **the host is not the
+critical path** and the 12.9 ms between the profile's total and the wall is
+mostly the harness.  That closes the "record a command graph for the batched
+multi-device decode" idea - it was worth at most the 12.9 ms, and it is not
+available above thirteen rows anyway, because oneDNN's int8 matmul cannot be
+recorded into a SYCL command graph and that is the path the dense layers take
+at M > 13.
+
+#### The five-to-twelve range was not a row-count curve, and now it is
+
+**This section's conclusion was wrong, and it is kept because the way it was wrong
+is the useful part.**  On the engine with the row count fixed but the tile still
+the prefill's, the curve was smooth where it used to jump but NOT monotone, and
+one cell was a local minimum: **N=8 was 20 ms CHEAPER than N=7** (87.8 against
+108.6 ms/step), reproducibly - four independent measurements per cell,
+interleaved, agreeing to within 0.1%:
+
+| N | 6 | **7** | **8** | 9 |
+|---|---:|---:|---:|---:|
+| ms/step | 100.1 | **108.6** | **87.8** | 96.6 |
+
+Two independent instruments put it in the routed experts' decode path:
+
+* The per-bucket profile, with the experts' share taken as `c_gemv` minus the
+  dense groups and the head.  (`c_gemv` *includes* the MoE: `gemv_at` dispatches
+  a MoE call and returns, but the whole call is still timed into it, while
+  `c_g8`/`c_gf` only count the dense groups.)
+
+  | N | 6 | **7** | 8 | 9 |
+  |---|---:|---:|---:|---:|
+  | gemv | 82.67 | **90.18** | **69.44** | 76.09 |
+  | of which the routed experts | 61.6 | **68.8** | **50.4** | 51.8 |
+
+* The ablation, which removes the experts entirely (`PF_ABL_NOMOE=1` - a
+  wrong-answer-by-design knob, so this is a timing cell and not a correctness
+  one): **38.9 / 40.3 / 39.2 / 46.1 ms/step at N=6 / 7 / 8 / 9** - the anomaly
+  is gone.
+
+And the reading was "the experts' decode cost is a function of WHICH experts
+the routing picks, not of how many rows there are - a routing lottery".
+
+**That was a misattribution, and the tile was the reason.**  With the decode's
+own tile (M=1 for a single token, M=2 for a batched one) the non-monotonicity is
+**gone** and the range is flat and monotone:
+
+| N | 6 | 7 | 8 | 9 |
+|---|---:|---:|---:|---:|
+| ms/step | **75.45 / 75.60** | **78.80 / 78.63** | **78.88 / 78.63** | **87.82 / 87.94** |
+
+**-24.6% at N=6, -27.5% at N=7, -10.4% at N=8, -9.0% at N=9**, and N=7 and N=8
+are now the same cell.  So the anomaly was never the routing: it was the M=8
+tile's *interaction* with it.  The tile's weight re-read factor is
+`ceil(p_e/M)`, so with M=8 on a decode step every expert with fewer than eight
+pairs still paid for eight rows of dp4a - and how many pairs an expert gets
+depends on the routing, which is why the anomaly looked like a routing effect
+and was localised to the experts' path by two independent instruments.
+
+**The generalisable part: a shape mismatch between a kernel's tile and the
+shape it is actually given can look like anything.**  Here it read as a
+"routing lottery" and survived four interleaved measurements and a two-instrument
+attribution, because every instrument agreed on WHERE the time was and none of
+them asked whether the tile was the right shape.  The fix was one line of
+plumbing (`mode == 0` instead of `n_tok <= 1`) and two new cfg cases, and it
+moved the whole range by 10-27%.
+
+`PF_MOE_RAM_MB=0` did NOT change the anomaly (108.45 against 108.63 at N=7, and
+the rest inside the noise) - and that was **not** exoneration and should not be
+read as such: with the RAM tier off, a non-resident expert is read from the
+GGUF mmap and transferred instead, so the transfer happens either way.  The knob
+that would actually test the residency hypothesis is the expert bank's VRAM
+budget (`PF_MOE_VRAM_MB`), not the RAM tier, and it has not been run.
+
+#### Depth: pp turns over at 16k, tg has no knee out to 256k
+
+N=1, 128 decode steps at the depth, best of 2, one process per cell.  Depth 512 is
+run **first and last** as the drift control, and this sweep is much quieter than
+the tg sweeps above (775.2 vs 773.0 t/s, 38.86 vs 38.89 ms - 0.3%), because the
+depth cells differ only in length rather than in the generated stream.
+
+| depth | pp (t/s) | tg (tok/s) | ms/step |
+|---:|---:|---:|---:|
+| 512 | 775.2 | 25.73 | 38.86 |
+| 4096 | 1323.7 | 25.34 | 39.46 |
+| **16384** | **1415.2** | 23.95 | 41.75 |
+| 65536 | 1307.5 | 19.81 | 50.47 |
+| 131072 | 1148.1 | 15.41 | 64.90 |
+| 262144 | 690.3 | 11.02 | 90.74 |
+
+**pp turns over at 16384 and is strictly worse beyond it**: 1415.2 at 16k,
+1307.5 (-7.6%) at 64k, 1148.1 (-18.9%) at 128k, **690.3 (-51.2%) at 256k**.  So the
+prefill's best rate is at ~16k tokens of context and the whole "2000 t/s" framing
+should be stated at a depth - 512 tokens gives 775.2 and 16k gives 1415.2, a 1.83x
+spread from the context alone.
+
+**tg has no inflection out to 256k - it is linear, and the fit is good enough to
+use**: `ms/step = 38.8 + 0.198 us * depth` predicts 38.86 / 39.57 / 42.01 / 51.76 /
+64.75 / 90.75 against 38.86 / 39.46 / 41.75 / 50.47 / 64.90 / 90.74 measured.  The
+**38.8 ms floor is the weight pass** (the whole N=1 decode step at depth 0), and
+everything above it is attention, linear in depth with nothing to bend.  The
+practical consequence is the one worth having: **at 256k, 43% of the step is
+attention and 57% is the weight pass, and only the first grows with context** - so
+a deeper context costs exactly what a linear attention model says it should, and
+there is no knee to design around.  The 256k cell allocated (no `alloc_block()`
+failure), so the 690.3 t/s is not a memory artifact.
+
+**Where the 131k prefill's time actually goes, re-measured on the fixed engine**
+(`dev/bench_conc` with a 131072-token prompt, so the KV pool is sized right;
+`PF_ABL_*` are wrong-answer-by-design knobs and these are **timing cells, not
+correctness ones**):
+
+| arm | pp (t/s) | the prefill | share |
+|---|---:|---:|---:|
+| default | ~1148 | 114.2 s | - |
+| `PF_ABL_NOMOE=1` (no routed experts) | 3044.8 | 43.0 s | **the experts = 62%** |
+| `PF_ABL_NOGDN=1` (no GDN) | 1350.7 | 97.0 s | the GDN = 15% |
+| `PF_ATTN_XMX=0` (the classic attention) | **103.9** | **1261.4 s** | the oneDNN int8 attention is worth **10x** |
+
+**So the long-context prefill is the routed experts again** - the same wall as
+the batched decode, and 62% of it - and the oneDNN int8 attention
+(`attn_xmx`) is worth an order of magnitude at this depth, which is why the
+turn-over at 16k is not the attention's fault but the point where the experts'
+depth-independent share stops shrinking.
+
+**`PF_DEC_GROUP` is a NO-OP on this model, and the file's note about it is
+wrong for it.**  The grouped decode attention is the GQA-sharing kernel ("one
+warp owns all HPG heads of a kv head: K/V are loaded once per key and reused
+from registers for every head"), and it is the one thing that could have taken
+the 8x K/V re-read out of the decode attention at 256k.  It is not available:
+the grouped kernel requires the **256-wide** head (`constexpr int HD = 256`)
+and the 35B A3B has head_dim 128, so `PF_DEC_GROUP=1` silently falls back to
+the classic kernel.  Measured, at 64k and 256k: **50.0 vs 49.9 ms/tok** and
+**90.0 vs 90.1 ms/tok** - identical, because the knob is a no-op and not
+because the two kernels are equal.  **The A770's "5x slower" note was measured
+on a model whose classic kernel has 4 query heads per KV head; on one with 8 the
+grouped kernel would have 8x fewer warps, which is the wrong direction for a
+kernel that is latency-bound at 4 warps per EU.**  So the GQA sharing is *not*
+an available win here, and the decode attention's 51.9 ms at 256k stays where
+it is.
+
+**And the number that would decide whether anything is left there is not
+settled.**  The decode attention moves 51.9 ms for 20 layers at 256k, i.e.
+2.6 ms per layer for a 32.8 MB kv head: **12.6 GB/s of useful traffic, or
+100 GB/s if the 8x GQA re-read misses the L2.**  Which of the two it is
+decides the whole question - if the redundancy is served by the L2 there is no
+traffic to save and the attention is simply latency-bound, and if it is not,
+the sharing is worth up to 8x on 51.9 ms.  It is not answered here: the 8
+warps of one split are `n_splits` apart in the grid index, so they are
+co-resident (and the L2 able to serve the redundancy) only by accident of the
+scheduler, and the 256k cell's 32.8 MB per layer against an 8 MB L2 is
+borderline either way.  **A measurement that cannot tell 12.6 from 100 GB/s
+cannot price the fix**, so the next step there is a counter, not a kernel.
+
 ### What an external A770 kernel library did and did not settle
 
 Reviewed the A770/DG2 fork of Intel's `omni_xpu_kernel` (the PyTorch/XRT kernel
@@ -4829,8 +5395,14 @@ cmake --build build -j$(nproc)          # must be warning-free (except the linke
 ./build/test_gpu_vs_ref                 # argmax SAME
 ./build/test_forward                    # default prompt predicted_argmax=248068
 ./build/test_decode_vs_prefill          # decode == re-prefill (any single-token change)
+./build/test_sched                      # the batched decode, incl. the 20-row case
 clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include -checks='-*,misc-include-cleaner' <changed files>
 ```
+
+`test_sched` is the one that covers a **batched** decode, and its last section
+decodes twenty rows and requires every row's logits to move between two steps -
+the oracle for "the engine computed every row".  It has been seen red (on the
+engine that quantised the row count), so it is a verifier and not a decoration.
 
 For the 27B (needs the layer split - it does not fit on one card), also run:
 

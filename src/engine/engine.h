@@ -174,8 +174,12 @@ struct engine_config {
     // dominates VRAM on a 27B: 16 slots x 24 GDN layers x 48*128*128 f32 is
     // 1.125 GiB per card, of which a single-stream long-context run uses one
     // slot.  Lowering this gives that memory back; the server never hands out a
-    // slot index >= max_slots.  Default kMaxB = the historical behaviour.
-    int max_slots = kMaxB;
+    // slot index >= max_slots.  NOT kMaxB: kMaxB is the CEILING (step_info rows, the
+    // block table, d_logits) and is 32, but the default must stay at 16 or the
+    // recurrent state doubles - 16 slots is 1.125 GiB per card on a 27B, 32 is
+    // 2.25 GiB - which is a shipping regression nobody asked for.  Raising the
+    // default is a separate decision from raising the ceiling.
+    int max_slots = 16;
     // ncmoe-style split: experts kept on the device per layer (0 = all of them).
     // Everything outside the resident set is computed on the host, which is
     // also what makes the VRAM/RAM/disk expert cache tiers meaningful.
@@ -609,11 +613,15 @@ struct engine {
     seg_plan plan_pf_nh_slot[kPfSlots]; // fp32, no head (scheduler non-final chunk)
     gemv_seg * d_segs_pf_slot[kPfSlots] = {};
     gemv_seg * d_segs_pf_nh_slot[kPfSlots] = {};
-    // decode graphs bucketed by batch size (1, 2, 4, 8, 16)
+    // Decode buckets, one per row count (1..kMaxB): the decode runs EXACTLY
+    // n_rows rows.  `g`/`e` are the recorded command graph, which only the
+    // single-device path uses and only for the coarse row counts (see
+    // engine_graph.cpp's dec_graph_rows); a bucket without one is replayed
+    // directly from its plan.
     struct dec_bucket {
         int tb;
         seg_plan plan;
-        gemv_seg * d_segs;
+        gemv_seg * d_segs = nullptr;
         std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g;
         std::unique_ptr<sx::command_graph<sx::graph_state::executable>> e;
     };
