@@ -98,7 +98,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
 
 ## 3. 缓冲区布局（`engine.cpp:1678-1909`）
 
-行数 `R = kMaxB*kMaxT = 512`：
+行数 `R = kMaxB*kMaxT = 1024`：
 
 | 缓冲 | 大小 |
 |---|---|
@@ -143,7 +143,7 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
   `d_segs_aux`（8）、`d_segs_vf`（verify plan）、`d_segs_dec8`、`d_segs_pf_slot[i]` /
   `d_segs_pf_nh_slot[i]`。
 * SI8 scratch：`d_x8`、`d_xmeta`（float2）、`d_xsumq`，行数 `kMaxB*kMaxT`。
-* decode 桶 `{1,2,4,8,16}` 各带自己的 `d_segs`（1024）。
+* decode 桶 `1..kMaxB`（**每个行数一个**，§6.2）各带自己的 `d_segs`，大小按该桶 plan 的段数分配。
 * 前缀缓存检查点池 `d_pc_states[pc_max_states][pc_state_floats]` + 空闲/时间戳/owner 向量。
 * MTP（`mtp_on`）另有一组 `d_mtp_*` 缓冲（`engine.cpp:1760-1891`），见 §12.4。
 * 最后 `reset_state()`。
@@ -247,7 +247,7 @@ call 有 xq 描述）。
 | plan | 形状 | 用途 |
 |---|---|---|
 | `plan_pf_` | `build_plan(kMaxT, 8, false)` | fp32 prefill，1 行 × 32 token，8-token 切片 |
-| `buckets_[b].plan` | `build_plan(b.tb, b.tb, true)` | decode，`T=tb`、头批处理、无 w8（多设备 `build_plans` 里 `use_w8 = multi_dev \|\| md_int8`） |
+| `buckets_[b].plan` | `build_plan(b.tb, b.tb, true)` | decode，`T=tb`、头批处理、无 w8（多设备 `build_plans` 里 `use_w8 = multi_dev \|\| md_int8`）；**每个行数一个桶**（`tb ∈ 1..kMaxB`），decode 选 `tb == n_rows` 的那个（§6.2） |
 | `plan_pf8_` | `build_plan(kMaxT, kMaxT, false, true, true)` | w8 prefill 带 head |
 | `plan_pf8_nh` | `build_plan(kMaxT, kMaxT, false, true, false)` | w8 prefill 不带 head（非最终 chunk） |
 | `plan_dec8_` | `build_plan(1, 1, true, true, true)` | w8 batch-1 decode |
@@ -406,9 +406,25 @@ attn/gdn/norm/other 分组计时，并打印每 call 的 top-8 表。
 
 ### 6.2 decode 桶
 
-`buckets_` 对应 `tb ∈ {1,2,4,8,16}`（`engine.cpp:1892`）。批式 decode 选最小的 `tb >= n_rows` 的桶，
-否则最后一个；超出 `n_rows` 的行标 `active=0`，kernel 跳过。batch-1 的 int8 路径（单设备
-`e_dec8`、多设备 `plan_dec8_` + 逐分区图）在选桶之前就短路了（§7.1）。
+`buckets_` **每个行数一个桶**：`tb ∈ 1..kMaxB`（`engine.cpp` 的 `alloc_buffers`）。批式 decode 选
+**`tb == n_rows` 的那个桶**（`decode_batch`），所以 decode **恰好算 n_rows 行**：既不向上取整，
+也没有多算的行（`n_rows` 之外的槽根本不会进这次前向）。batch-1 的 int8 路径
+（单设备 `e_dec8`、多设备 `plan_dec8_` + 逐分区图）在选桶之前就短路了（§7.1）。
+
+> **为什么行数必须精确。** 旧实现只有 `tb ∈ {1,2,4,8,16}` 五个桶，并**向上取整**（取最小的
+> `tb >= n_rows`）。两个后果：
+>
+> 1. 九个并发序列跑的是 **16 行**的前向——7 行是纯死活。35B A3B / 2×A770 上 N=9 每步多 38 ms
+>    （125.60 vs 87.62 ms/step），而且浪费随批量增长。
+> 2. **超过 16 个序列根本没被计算。** `buckets_.back()` 是 tb=16，20 行的批量跑 16 行前向，
+>    `d_logits[16..]` 从未被写、留着上一轮的值，采样器照读。**没有报错、没有 NaN，只是看起来
+>    合理的文本**，而 AGENTS.md 里的并发表就是在那个引擎上测的。
+>
+> 现在每个行数一个桶，精确行数由构造保证；`n_rows > kMaxB` 直接抛异常，不静默截断。
+
+**图只对粗桶存在。** 单设备路径给 32 个桶各录一张图太贵（一次录制 = 一整个 forward 的提交量），
+所以只有 `dec_graph_rows()`（`engine_graph.cpp`）列出的 `{1,2,4,8,16,kMaxB}` 录图；其余桶
+**直接重放 plan**（`record_forward` + `sync_all`），与 multi-device / CPU 路径同一条机制。
 
 ### 6.3 prefill 变体
 
@@ -418,7 +434,7 @@ attn/gdn/norm/other 分组计时，并打印每 call 的 top-8 表。
 | `e_pf8` | `pf8` | w8 prefill 带 head（最终 chunk） |
 | `e_pf8_nh` | `pf8` | w8 prefill 不带 head（非最终 chunk） |
 | `e_dec8` | `pf8_dec` | w8 batch-1 decode |
-| `buckets_[b].e` | 单设备 GPU | 每个 `tb ∈ {1,2,4,8,16}` 一张 decode 图 |
+| `buckets_[b].e` | 单设备 GPU | 只对 `dec_graph_rows()` 的粗桶（`{1,2,4,8,16,kMaxB}`）各一张 decode 图；其余桶直放 plan（§6.2） |
 | `pfb_vars_` | `pf8 && !use_dnnl` | `ntok ∈ {2,4,8,16}*kMaxT` 的 chunk-batched 图，每个尺寸一张；`use_dnnl` 时只登记 `ntok` 让 `batched_prefill_fit` 能选中同样的尺寸（oneDNN 不能录制），`batched_prefill_fit` 允许任意 `kMaxT` 倍数直到 `kMaxB*kMaxT`；DP4A 时只能选已录制尺寸 |
 
 `cpu_mode || multi_dev` 时 `build_graphs` 只 `build_plans()`（不录任何图）；多设备另外走
@@ -461,11 +477,11 @@ command graph 记录的是 kernel 命令列表；录制时按值传入的主机�
   chunk 的 device-1 相位落地，再用 `d_info`/`d_info2_` 交替录 device-0 相位并置
   `pf_pipe_pending_`），`nog || use_dnnl || multi_dev` 直接 `record_forward(2, plan_pfb_, …)`，
   否则重放 `ntok == n` 的 `pfb_variant` 图（没有就 throw）。
-* `decode_batch(tokens, poss, slots, n_rows)`（`engine.cpp:2198-2254`）：先 `prefill_flush()`；
+* `decode_batch(tokens, poss, slots, n_rows)`（`engine.cpp` 的 `engine::decode_batch`）：先 `prefill_flush()`；
   填 `n_rows/n_real/tpb=1`、`pc_active=0` 与每行 `pos/slot/active/tokens/n_real_row=1`；然后依次
   尝试：单设备 `pf8_dec && n_rows==1` → `e_dec8`；CPU `pf8_dec && n_rows==1` → `plan_dec8_` 直放；
-  多设备 int8 且 `n_rows==1` → `replay_md_dec_graphs()`（没有图则直放）；否则选最小的 `tb >= n_rows`
-  的桶并直放（CPU/多设备）或重放它的图。直放路径统一 `sync_all()`。
+  多设备 int8 且 `n_rows==1` → `replay_md_dec_graphs()`（没有图则直放）；否则选 **`tb == n_rows`**
+  的桶（`n_rows > kMaxB` 抛异常），有图就重放、没图就直放（CPU/多设备）。直放路径统一 `sync_all()`。
 * `fetch_logits(row, out)`：`d_logits[row]` → `h_logits` → `out`。
 
 **部分（不足 `kMaxT` 的）mode-2 batch 需要 oneDNN 权重路径**：`batched_prefill_fit`
@@ -560,6 +576,17 @@ token，慢 6 倍）。
 
 实测收益只有 ~1-2 ms/token，说明**逐 kernel 提交开销不是层 GEMV 效率差距的主因**。
 
+> **这些图只服务 `n_rows == 1`。** 批式 decode（`n_rows > 1`）走的是桶 plan 的**直放**，没有图：
+> 多设备下 M > 13 的 dense 层走 oneDNN 的 int8 matmul，而 **oneDNN 的 `prim.execute` 不能被录进
+> SYCL command graph**（`dnnl_capture_guard` 会在录制期间从每次 `prim.execute` 抛出来）。M ≤ 13 时
+> dense 走原生 dp4a（可录制），但那条路在 M > 13 也不划算：原生路径的率随 M 单调下降
+> （u4 91.8 GB/s @ M=7 → 7.0 @ M=32），而 oneDNN 的 int8 matmul 在 LM head 的形状上稳在 ~110 GB/s
+> ——两者正好在 **M = 13** 交叉，所以那条边界不是遗留而是对的。
+>
+> 宿主也不是瓶颈：`PF_HOSTPROF` 在 N=16 量到宿主 111.48 ms、设备 122.89 ms，所以给批式 decode
+> 录图最多只能拿回 profile 总数与 wall clock 之间的那点差，而那点差里大部分是 harness 自己的
+> logits 取回与宿主 argmax（每行 ~0.45 ms）。
+
 ## 9.2 LM head 与 oneDNN（`wkey` / `dnnl_call`）
 
 head 是固定在 backend 0 的全局张量，按 **untied / tied** 两条路走（`setup_md_dnnl`，
@@ -637,7 +664,8 @@ head 已经不再上传它。`d_segs_aux` 的 fp32 回落仍然保留，但只�
   key）；`record_forward` 用 `cur_be = &be_of(il)` 逐层切换后端，并在层边界 `handoff_x(prev, dev,
   nrows*nreal)`。**交接确实要拷贝**：激活在 host USM（`host_act = true`），所以
   `handoff_x`（`engine.cpp:796-830`）先 `qf.wait()` 再 `D2H → host staging → H2D`，并只为**活着的
-  行**拷（`nrows * nreal`，不是整块 `kMaxB*kMaxT`——旧实现每 token 两次交接白搬 10.5 MB）。
+  行**拷（`nrows * nreal`，不是整块 `kMaxB*kMaxT`——旧实现每 token 两次交接白搬 10.5 MB，27B、当时
+  kMaxB=16）。
   层循环之后还有一次把最后分区的隐状态交回 primary 的 `handoff_x`（`engine_graph.cpp:1217-1226`）。
 * `upload_device_weights(dev)`（`engine.cpp:866-995`）只上传**该分区层**的张量 + 落在 dev0 的全局
   张量（`tok_embd`/`output`/`output_norm`；`mtp_on` 时还有 MTP 层的 F32 norm 与线性），因此 GPU 只
@@ -708,7 +736,7 @@ MTP 需要 GGUF 里有一个额外的**全注意力块** `blk.<n_layer>.*`（由
 所以单设备的 `--mtp 4` 在 0.8B 上（无头）和在一张卡放得下的 27B 上（单设备）**都是静默 no-op**，
 只有一行 stderr 说明原因。
 
-* draft 长度 clamp 到 **12**（`engine.cpp:112-114`）：`n = mtp_k+1 ≤ kMaxB = 16`，这是 `d_logits`
+* draft 长度 clamp 到 **12**（`engine.cpp:112-114`）：`n = mtp_k+1 ≤ kMaxB = 32`，这是 `d_logits`
   行数与 `step_info` 的上限。
 * `--mtp-device N`（默认 0）选草稿层跑在哪个分区上，越界退回 0（`engine.cpp:150-153`）。
 * MTP 层是**多设备预算的一部分**：它是一个全注意力块，拥有自己的一份 paged KV 切片（全局注意力

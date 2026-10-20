@@ -10,7 +10,7 @@
 | 1 | [architecture.md](architecture.md) | 总体架构、模块划分、运行时对象模型、数据流、线程模型、设备内存布局、命令行 flag、MTP 路径、全局不变量 |
 | 2 | [design/01-model-loading.md](design/01-model-loading.md) | GGUF 解析、内存映射、架构注册表、张量绑定（含 MTP/NextN 头）、权重一次性上传与主机页回收、CLI 参数 |
 | 3 | [design/02-quantization.md](design/02-quantization.md) | ggml K-quant 布局、SIn int8 权重格式、原生位宽存储（u4 / 5-bit / codebook 4-bit / 2-bit）、DP4A 数学、激活量化（`do_split`）、oneDNN 路径 |
-| 4 | [design/03-kernels.md](design/03-kernels.md) | 各 SYCL kernel 的设计与数据布局：norm/embed/gemv/nat_gemm/attn（含 oneDNN int8 prefill attention）/qk-rope/conv/gdn/gated-norm/vit/at/MTP，以及设备 profile 如何提供形状 |
+| 4 | [design/03-kernels.md](design/03-kernels.md) | 各 SYCL kernel 的设计与数据布局：norm/embed/gemv/nat_gemm/MoE 专家 GEMM（grouped dp4a 与它的 decode tile）/attn（含 oneDNN int8 prefill attention）/qk-rope/conv/gdn/gated-norm/vit/at/MTP，以及设备 profile 如何提供形状 |
 | 5 | [design/04-engine.md](design/04-engine.md) | `engine` 编排、`seg_plan`、`record_forward`、SYCL command graph、prefill/decode、连续批处理、多设备分层交接、MTP/NextN 投机解码 |
 | 6 | [design/05-kv-cache.md](design/05-kv-cache.md) | 分页 KV cache、动态虚拟内存块池、KV 存储类型与 K/V 独立定尺、块分配器、池的定尺 |
 | 7 | [design/06-prefix-cache.md](design/06-prefix-cache.md) | 跨请求前缀缓存、链式哈希、递归状态检查点、VRAM/RAM/磁盘三层 LRU |
@@ -22,7 +22,7 @@
 | 13 | [design/12-build-and-testing.md](design/12-build-and-testing.md) | 构建系统（含 AOT）、测试矩阵、验证流程、调试手册（27B 案例分析）与经验教训、实测数字的归档位置 |
 | 14 | [design/13-audio-video.md](design/13-audio-video.md) | 音频与视频输入：解码、音频编码塔、视频/音频 M-RoPE、混合 prompt 装配 |
 | 15 | [design/14-dflash2.md](design/14-dflash2.md) | DFlash2 块草稿器：块扩散前向、动态卷积、selector lattice、verify 定价、与参考实现逐元素对比 |
-| 16 | [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md) | MoE 架构加载（每层混合量化）、ncmoe 专家切分（GPU 固定部分 / CPU 可变部分）、disk→RAM→VRAM 三级专家缓存 |
+| 16 | [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md) | MoE 架构加载（每层混合量化）、路由专家的 grouped dp4a GEMM（以及 **decode 自己的 tile**）、ncmoe 专家切分（GPU 固定部分 / CPU 可变部分）、disk→RAM→VRAM 三级专家缓存 |
 
 ## 快速定位
 
@@ -36,6 +36,8 @@
 * 想动 MTP / 投机解码 → [design/04-engine.md §12](design/04-engine.md)、[design/03-kernels.md §15](design/03-kernels.md)、[design/14-dflash2.md](design/14-dflash2.md)
 * 想动 DFlash2 块草稿器（卷积下标、RoPE 宽度、lattice、top-k）→ [design/14-dflash2.md](design/14-dflash2.md)
 * 想动 MoE / 专家切分 / 三级专家缓存 → [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md)
+* 想动 MoE 专家 GEMM 的 tile（prefill 的 M=8 与 decode 的 M=1/M=2）→ [design/15-moe-ncmoe.md §3.4](design/15-moe-ncmoe.md)、[design/03-kernels.md §5.10](design/03-kernels.md)
+* 想动批量 decode 的行数（每个行数一个 plan 桶，精确不取整）→ [design/04-engine.md §6.2](design/04-engine.md)
 * 想让 prefill 更快（batch 形状、oneDNN prefill attention）→ [design/04-engine.md §7](design/04-engine.md)、[design/03-kernels.md §5.8](design/03-kernels.md)、[design/03-kernels.md §7.5](design/03-kernels.md)
 * 想调优内存/前缀缓存 → [design/05-kv-cache.md](design/05-kv-cache.md)、[design/06-prefix-cache.md](design/06-prefix-cache.md)
 * 环境变量总表 → [AGENTS.md](../AGENTS.md#environment-variables)

@@ -343,7 +343,7 @@ watchdog 线程每 100 ms 轮询 `g_term_requested` 与 `listen_done` 并调用 
 
 ### 3.1 `sequence`（`scheduler.h:16-89`）
 
-* 身份/位置：`id`、`slot`（引擎状态槽 `[0, e.max_slots)`，默认 `kMaxB`，由 `--max-slots` 收窄）、`prompt`、`prompt_pos`、`blocks`、`recent`。
+* 身份/位置：`id`、`slot`（引擎状态槽 `[0, e.max_slots)`，**默认 16**——`--max-slots` 收窄，**天花板 `kMaxB`=32**）、`prompt`、`prompt_pos`、`blocks`、`recent`。
 * 生成状态：`gp`、`ss`（`sampler_state`，每序列独立的 RNG）、`n_generated`、
   `finish_reason`（默认 `"stop"`）、`stops`。
 * 生命周期：`admitted`、`finished`。
@@ -425,7 +425,12 @@ submit/shutdown 时唤醒循环。
 
 **阶段 2 — 批量 decode**（每个外层循环都执行，因此 prefill 与 decode 交错；`scheduler.cpp:316-408`）：
 
-* 收集最多 `kMaxB` 个“已 prefill 完成且 `recent` 非空”的 active 序列。
+* 收集最多 `max_slots`（默认 16；天花板 `kMaxB`=32）个“已 prefill 完成且 `recent` 非空”的 active 序列。**引擎精确算这 `n_rows` 行**
+  （每个行数一个 plan 桶，`design/04-engine.md` §6.2），所以调度的每一行都真的被算了——旧的
+  "取整到下一个 2 的幂"既浪费又在 16 行以上静默漏算。
+* 之后逐行取 logits 并采样（`e.fetch_logits(r, …)` + `sample_and_emit`）：**这是宿主侧的，每行
+  每步约 0.45 ms**（1 MB 的 D2H + 248320 次宿主 argmax），在 N=32 时是每步 14.4 ms 的纯采样开销。
+  细节与已存在的设备侧 argmax 见 [design/07-sampler.md §5.1](07-sampler.md)。
 * `pos = recent.size()`（下一写入位置），按 `ceil(pos/32)` 扩块表。
 * 有效性检查：decode 写入 `recent.back()` 于 `wpos = pos-1`；`wpos >= max_seq` 或
   `>= blocks.size()*32` 则 `retire(s,"length")` 且该行不进 batch。
@@ -441,7 +446,7 @@ submit/shutdown 时唤醒循环。
 
 ### 3.5 调度策略与边界
 
-* **准入**：FIFO、贪心，遇到第一个不可准入者停止；容量受空闲槽（`kMaxB`=16）与空闲 KV 块限制。
+* **准入**：FIFO、贪心，遇到第一个不可准入者停止；容量受空闲槽（`max_slots`，默认 16；天花板 `kMaxB`=32）与空闲 KV 块限制。
 * **prefill**：round-robin，每序列每循环一个 chunk，优先用最大可容纳的 chunk-batched 尺寸。
 * **decode**：所有合格序列合并成一次 `decode_batch`。
 * **无显式优先级、无 decode-first、不驱逐 active 序列**。块压力在 `alloc_block` 内解决；再失败则相关

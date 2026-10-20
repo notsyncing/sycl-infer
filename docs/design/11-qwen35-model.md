@@ -232,9 +232,12 @@ gemv: ffn_down (SiLU 门控)
 
 * `d_gdn_state`：每 GDN 层一个 `[dt_rank][d_state][d_state]` 矩阵，每序列一份 slot。
 * `d_conv_state`：每 GDN 层 `(conv_k-1) * qkv_dim()` 的滑窗（**不是 `3*d_inner`**）。
-* 单设备布局：`[kMaxB][n_gdn][dt_rank][d_state][d_state]` 与
-  `[kMaxB][n_gdn][conv_k-1][qkv_dim()]`，分配在 `engine.cpp:1722-1723`；`n_gdn` 只数 GDN 层
-  （`attn_layers()` 数 attention 层，两者互斥，见 `engine_kvpool.cpp:102-124`）。
+* 单设备布局：`[state_slots_][n_gdn][dt_rank][d_state][d_state]` 与
+  `[state_slots_][n_gdn][conv_k-1][qkv_dim()]`，分配在 `engine.cpp` 的 `alloc_act_set` 附近；
+  `n_gdn` 只数 GDN 层（`attn_layers()` 数 attention 层，两者互斥，见 `engine_kvpool.cpp`）。
+  **slot 轴是 `state_slots_`（`--max-slots`，默认 16）而不是 `kMaxB`（天花板 32）**——`kMaxB` 是
+  编译期上限，`state_slots_` 才是实际分配量；两者混用就是往 USM 池外写（`design/04-engine.md` 的
+  `state_slots_` 一节）。
 * 多设备布局：**每个分区只分配自己那几层**的状态（`engine.cpp` 里按分区分配递归状态那段，用 per-device 的
   `n_gdn_dev_` 计数），并通过 `bind_acts(dev)` 在设备间切换（`engine.cpp:792-793`）。所以“层 n 的状态”
   在多设备下不是全局第 n 个 slot，而是“第 n 层所在分区的第 n_gdn_dev_[dev] 个”。

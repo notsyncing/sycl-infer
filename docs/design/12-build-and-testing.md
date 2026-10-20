@@ -178,6 +178,7 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_w4_topk` | **27B** | GPU | 打印 chat prompt 的 top-12 prefill logits（u4 vs int8 对比）；`PF_DUMP_LOGITS=<path>` 落盘整条 logit 向量 |
 | `test_27b_prefill` | **27B** | GPU | 27B 分卡 prefill 的接线/阈值排查（依次加长 prompt），带 `TEST_LAYER_MAP`/`TEST_DEVICE`/`TEST_FP32`/`TEST_KERNEL_BENCH`/`TEST_SKIP_DECODE`/`STOP_AFTER_LAYER` |
 | `test_decode_vs_prefill` | 0.8B | GPU | **单 token decode 与同序列重新 prefill 必须给出同一预测**；纯 prefill 的测试对解码路径是盲区，这个测试是唯一覆盖 |
+| `test_sched` | 0.8B | GPU | 调度器的 token 流路径（不走 HTTP）：贪心流、logprobs、`max_tokens`、取消、空 prompt、两个并发序列、prefill oracle，以及**20 行批量 decode 的"每一行都真被算了"判据**——一行若从未被写过，它的 logits 在两步之间**不会动**（`design/04-engine.md` §6.2 的静默漏算就是靠这条抓住的；该用例在旧引擎上亲眼失败过：16/20 行动了，死的那 4 行位移精确为 0） |
 | `test_pc_gpu` | 0.8B | GPU | 磁盘 spill + promote 往返，第二次相同 prompt 从磁盘恢复需与首次 logits 一致 |
 | `test_pc_ram_gpu` | 0.8B | GPU | VRAM→RAM→VRAM 往返；新引擎不得看到陈旧 RAM 条目 |
 | `test_dflash_kernels` | 无 | GPU | DFlash top-k 与卷积的合成输入对照 |
@@ -241,10 +242,12 @@ cmake --build build -j$(nproc)
 ./build/test_gpu_vs_ref     # argmax ... SAME
 ./build/test_forward        # default prompt predicted_argmax=248068 (input_last_id is not a prediction)
 ./build/test_decode_vs_prefill   # OK
+./build/test_sched          # all checks OK（含 20 行批量 decode 那一节）
 ```
 
-**四个都要跑。** 前三个是 prefill-only，对 decode-only 的 bug 完全盲（§7.2 第 6 条就是这个 bug 的藏身处），
-所以**任何影响单 token 路径的改动都必须跑 `test_decode_vs_prefill`**。
+**五个都要跑。** 前三个是 prefill-only，对 decode-only 的 bug 完全盲（§7.2 第 6 条就是这个 bug 的藏身处），
+所以**任何影响单 token 路径的改动都必须跑 `test_decode_vs_prefill`**；而 `test_sched` 是**批量** decode
+的唯一覆盖——单 token 判据看不见"多行时只算了其中一部分"。
 
 ### 3.2.1 已知失败（2026-10-03，两台机器都复现，与当次改动无关）
 

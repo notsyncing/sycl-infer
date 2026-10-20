@@ -89,6 +89,49 @@ stride 32（`src/backend/gpu/kernels/moe.cpp`）。
 所有 MoE kernel（gate/up、down）第一件事就是 `if (slot < 0) return;`。
 所以"哪些专家在设备上"是一个**纯主机侧**的决定，内核不需要改。
 
+### 3.4 路由专家的 GEMM：两条实现，和 decode 自己的 tile
+
+专家的 GEMM 有两套实现，算的是同一个乘积、读的是同一批 GGUF block：
+
+| | 激活 | 乘法 | 谁在用 |
+|---|---|---|---|
+| `moe_gate_up_launch` / `moe_down_launch` | fp32 | 反量化后 FMA | fallback，也是 dp4a 路径的参考实现 |
+| `moe_grp_gate_up_launch` / `moe_grp_down_launch` | int8 + 每 32 组 f16 scale | dp4a | **prefill 的默认**（`PF_MOE_DP4A=1`），**decode 的默认**（`PF_MOE_DP4A_DEC=1`） |
+
+**tile 就是形状，而 prefill 与 decode 的形状不同。** `M` 是一个 work-group 处理多少个
+(token, expert) pair，**权重重读因子是 `ceil(p_e/M)`**：
+
+* **prefill**：512 token × top-8 = 4096 pair 摊到 256 个专家（每专家约 54 对）。M=8 的 tile
+  （`PF_MOE_CFG`，默认 case 43 = M=8 / C=2 / NSG=16）把权重重读约 7 遍，但这个 kernel 的
+  **唯一权重只有 50-68 GB/s**（对 376 GB/s 的卡），所以**带宽不是稀缺资源，占用率才是**；真正绑住
+  的是寄存器预算 `P = M*FUSE*C`（每个 P=32 的配置都落在 6.0-6.1 ms，P=64 是 7.0-7.3，P=128 是
+  20-51）。
+* **decode**：每个被选中的专家只贡献**一行**，所以 M=8 的 tile **有 7/8 是空的**——权重读一样多，
+  dp4a 的活干了八倍。
+
+**decode 的 tile 按 pair 数选**：单 token decode 用 M=1（每个专家恰好一对，更宽的 tile 是纯浪费），
+批量 decode 用 M=2（有的专家拿两到三对，一行的 tile 会为每多出来的一对把它的权重重读一遍）。
+`PF_MOE_CFG_DEC`（默认 0 = auto）选它，非 0 强制某个 tile。
+
+> **"decode" 必须是模式，不能是 token 数。** 选路曾经是 `dec_step = (n_tok <= 1)`，而**批量 decode
+> 的 `n_tok = rows = N > 1`**——于是每一个批量 decode 步都被当成 prefill，跑的是 prefill 的 M=8
+> tile。现在是 `mode == 0`（`engine_graph.cpp`）。这条曾被记成"decode 的形状不对 grouped dp4a，
+> 所以 decode 走 fp32"，那是**形状诊断对、结论错**：tile 是编译期模板参数，"M=8 在 decode 上
+> 7/8 空"从来不是放弃这条路的理由，而是给 decode 一份自己的 tile 的理由。
+>
+> 35B A3B / 2×A770 的 decode 步实测（`dev/bench_conc`）：fp32 路径 38.98 / 60.29 / 80.21 /
+> 87.62 / 135.84 / 191.96 ms（N=1/2/4/8/16/32），而 shipped 的 dp4a + decode tile 是
+> **37.93 / 56.06 / 66.19 / 78.54 / 129.63 / 191.37**——N=6 是 -24.6%、N=7 -27.5%、
+> N=8 -10.4%、N=9 -30%。M=1 只对单 token decode 是对的（N=1 时 37.69 vs M=2 的 41.50；
+> N=32 时反过来，212.77 vs 191.64）。
+
+**decode 现在也和 prefill 一样量化激活**（int8 + 每 32 组 scale），所以 `test_decode_vs_prefill`
+——decode 自己的判据——比较的是两个**在激活量化上一致**的路径，27B 分卡下仍然 3/3 通过；
+prefill 的 oracle 不变（pp512 11171 / pp16384 1204 / pp65536 4779），MoE 精确性 oracle
+对新旧 tile 都是 0/8192。代价是 **decode 的 token 流会变**（logits 动了，近似平局可能翻转），
+这与文件里早已记录的"批处理会翻转近似平局"是同一类变化。MTP / DFlash 的 verify 是 **mode 2**
+（k+1 行的批），所以仍用 prefill 的 tile，不受影响。
+
 ---
 
 ## 4. ncmoe 切分：固定部分在 GPU，可变部分在 CPU
@@ -260,6 +303,11 @@ slot 表按 `n_layer + 1` 行构建（最后一行是 NextN），并 memcpy 到*
 | `PF_MOE_RAM_MB=MB` | 0 | 主机 RAM 层预算；0 = 关闭该层 |
 | `PF_MOE_CPUDBG=1` | off | 每层 spilled/总数 |
 | `PF_MOE_REFDUMP_ALL=1` | off | 逐层 routed 指纹 |
+| `PF_MOE_DP4A` | 1 | prefill 走 grouped dp4a 专家 GEMM；0 = fp32 反量化路径 |
+| `PF_MOE_DP4A_DEC` | **1** | **decode 也走 grouped dp4a**（配 decode 自己的 tile，§3.4）；0 = fp32 反量化路径 |
+| `PF_MOE_CFG` | 43 | prefill 的 tile（case 43 = M=8 / C=2 / NSG=16） |
+| `PF_MOE_CFG_DOWN` | 43 | prefill 的 down tile（与 gate/up 同 case） |
+| `PF_MOE_CFG_DEC` | 0 | **decode 的 tile**：0 = auto（单 token 用 M=1、批量用 M=2），非 0 强制该 case（§3.4） |
 
 测试侧：`TEST_MOE_RESIDENT`（`stage_env::make`）让 stage 测试也走切分路径；
 `test_decode_vs_prefill`/`test_gpu_vs_ref`/`test_multimodal` 都认这个变量。

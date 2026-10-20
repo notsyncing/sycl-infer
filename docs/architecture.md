@@ -269,6 +269,8 @@ sequenceDiagram
 调度器每个外层循环：先给一个 active 序列做一个 prefill step（round-robin、公平），再做一次最多
 `kMaxB` 行的批量 decode。prefill 与 decode 因此交错执行。prefill 步本身优先取 mode-2 的
 `prefill_batch`（`batched_prefill_fit` 给出的最大整块），只有尾部或无批量变体时退回 `prefill_chunk`。
+**decode 精确算 `n_rows` 行**（每个行数一个 plan 桶），不向上取整——旧的"取整到下一个 2 的幂"
+既浪费又会在 16 行以上**静默漏算**（`design/04-engine.md` §6.2）。
 细节见 [design/09-server.md](design/09-server.md)。
 
 ### 5.2 一次 forward step（引擎内部）
@@ -341,9 +343,9 @@ prefill；prefill 走 oneDNN 的 `PF_GEMM_DNNL` 路径。见 §9 不变量 3 与
 |---|---|
 | `dev_weights` | 整个 GGUF 映射的副本（由 `model::upload` 分配） |
 | SIn 权重副本 | `PF_DP4A` 打开时约 700 MB（`model::build_w8`） |
-| 激活缓冲 | 行数 `R = kMaxB*kMaxT = 512`（`src/engine/engine.cpp:957` 的 `alloc_act_set`），各阶段按需分配 |
+| 激活缓冲 | 行数 `R = kMaxB*kMaxT = 1024`（`src/engine/engine.cpp` 的 `alloc_act_set`），各阶段按需分配 |
 | KV 池 | 虚拟 USM 预留 + 物理 extent 按需提交（`engine_kvpool.cpp`） |
-| 递归状态 | `d_gdn_state`、`d_conv_state`，每序列一个 slot；slot 轴是 `state_slots_`（`--max-slots`，默认 `kMaxB`）而不是 `kMaxB`——27B 上每卡 1.125 GiB，单流长上下文只需一个 slot（`src/engine/engine.h`） |
+| 递归状态 | `d_gdn_state`、`d_conv_state`，每序列一个 slot；slot 轴是 `state_slots_`（`--max-slots`，**默认 16**）而不是 `kMaxB`——27B 上每卡 1.125 GiB，单流长上下文只需一个 slot（`src/engine/engine.h`） |
 | 前缀缓存检查点 | `d_pc_states[pc_max_states][pc_state_floats]`（`src/engine/engine.cpp:2205`） |
 | MTP 缓冲 | `d_mtp_*`：草稿层的激活、per-token 递归状态快照（`d_mtp_hist_`）、候选集；MTP 开时才有（`src/engine/engine.h:459` 起） |
 | command graph | 单设备：decode 桶 `1/2/4/8/16` + prefill 变体；多设备：每个连续设备段一份 decode 图 + MTP verify 图 |
@@ -367,7 +369,7 @@ static——两个 `--layer-map` 设备各有自己的队列，共用一份 scra
 | 常量 | 值 | 含义 |
 |---|---|---|
 | `kMaxT` | 32 | 每行最大 prefill token 数 |
-| `kMaxB` | 16 | 并发序列数的**硬上限**（`step_info` 行数、block 表、`d_logits`）；实际分配由 `--max-slots` 的 `state_slots_` 决定 |
+| `kMaxB` | 32 | 并发序列数的**硬上限**（`step_info` 行数、block 表、`d_logits`）；**天花板与策略是两个数**：`kMaxB` 是编译期上限（`step_info` 的数组维数是编译期的），`--max-slots` 的 `state_slots_`（默认 16）才是实际分配量——抬 `kMaxB` 不该顺带把递归状态翻倍 |
 | `kMaxRows` | 32 | 每 token 缓冲的最大行数 |
 | `kBlockSize` | 32 | paged KV 块大小（token） |
 | `kI8Q` | 32 | int8/int4 KV 每多少 head dim 一个 scale |
@@ -524,7 +526,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
   `as_[to].x`（in-order 队列保证目标端自己的 kernel 在这次拷贝之后）；目标设备是 CPU 分区时
   `as_[to].x` 本身就是主机 USM（`dev_alloc_on` 对 `dev_kind == cpu` 走 `sycl::malloc_host`）。
   (2) 只拷**活着的那些行**：激活布局是 `[token][n_embd]`，所以单 token decode 拷 1 行而不是整个
-  `kMaxB*kMaxT`——旧的全量拷贝每次交接搬 10.5 MB，一个 token 的 decode 要搬两次。
+  `kMaxB*kMaxT`——旧的全量拷贝每次交接搬 10.5 MB（27B、当时 kMaxB=16），一个 token 的 decode 要搬两次。
 * GPU 后端只上传它自己那部分层（加全局 tok_embd / output_norm）的权重张量，CPU 后端直接读 mmap；
   `wptr(dev, host)` 通过 `weight_maps_` 为每个权重张量解析出该设备的指针，`build_plan` 因此能生成一份
   含正确指针的计划。GPU 显存不再持有整份 GGUF 副本。

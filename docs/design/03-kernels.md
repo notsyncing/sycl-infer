@@ -414,6 +414,24 @@ residual 的 epilogue 在同一个 kernel 内完成，`M <= 13` 时取代 `gemm_
 它返回 `false` 表示调用方要回落：`M < 2 || M > 13 || K % 32 != 0`（`w4_gemv.cpp:1858-1860`），
 `PF_NAT=0` 则整条路径关闭、回落 oneDNN 分组-scale matmul + epilogue。
 
+> **为什么边界是 13 而不是 32。** `M` 是模板参数，所以每个行数都是一份独立的实例化，而
+> `nat_gemm_impl` 的累加器是 `acc[M*C]` 个寄存器、激活 tile 是 `M*KT*APAD` 字节的 SLM——**M 大了
+> 两个资源一起涨**。实测（`dev/bench_natgemm`，27B 形状 K=5120 N=17408，A770，每行数一次运行，
+> GB/s）：
+>
+> | M | u4 | k5 | cb4 | int8 |
+> |---|---:|---:|---:|---:|
+> | 7 | 91.8 | 75.9 | 75.2 | 157.0 |
+> | 8 | 60.0 | 56.8 | 56.2 | 120.7 |
+> | 13 | 51.6 | 59.6 | 61.5 | 122.3 |
+> | 16 | **36.0** | 33.2 | 31.7 | **68.3** |
+> | 32 | **7.0** | 10.3 | 12.6 | 26.4 |
+>
+> 原生路径的率**随 M 单调下降**，而 oneDNN 的 int8 matmul 在 LM head 的形状（M=16，508 MB）
+> 上稳在 ~110 GB/s——**两者正好在现有的 M=13 边界交叉**。所以那条边界不是遗留，而是对的：把它扩到
+> 32 被实现过、逐位精确（每个 M、每个格式都 `ok=1 maxdiff=0.0000`），但**每字节慢 2-6 倍**，
+> N=32 的 decode 步从 191.96 变成 210.34 ms/step。**逐位精确但更慢的开关仍然是不该存在的开关。**
+
 **SLM 预算与模板参数**（`nat_gemm_impl<FMT,M,C,KT,SG,ORDER,TX,OPQ,TREE,ABL,VECST,VECA,NOX,DIRECT>`，
 `w4_gemv.cpp:1370-1797`）：
 
@@ -489,6 +507,31 @@ sum_k w_k x_k = sx * (sw * sum_k qw_k qx_k - mw * sum_k qx_k)
   保持未量化）。
 * `up` 非空时按 `silu(x)*up` 量化，与 fp32 kernel 同序。
 * `permute_group_by_xor` 是**子组集合操作**，必须所有 lane 都执行（发散的调用返回垃圾）。
+
+### 5.10 路由专家的 grouped dp4a GEMM（`moe.cpp` 的 `moe_grp_*`）
+
+专家的 GEMM 有两套实现，算的是同一个乘积、读的是同一批 GGUF block：
+
+| | 激活 | 乘法 | 谁在用 |
+|---|---|---|---|
+| `moe_gate_up_launch` / `moe_down_launch` | fp32 | 反量化后 FMA | fallback，也是 dp4a 路径的参考实现 |
+| `moe_grp_gate_up_launch` / `moe_grp_down_launch` | int8 + 每 32 组 f16 scale | dp4a | **prefill 的默认**（`PF_MOE_DP4A=1`），**decode 的默认**（`PF_MOE_DP4A_DEC=1`） |
+
+dp4a 路径把激活量化成 int8 + 每 32 组 f16 scale，直接对**原始 GGUF block** 做 dp4a——Q4_K 的
+32 值组就是 32 字节的 nibble，正好两个 dp4a 操作数，所以没有展开 pass、也没有额外的权重存储。
+
+**tile 是形状，而 prefill 与 decode 的形状不同。** `M` 是一个 work-group 处理多少个
+(token, expert) pair，**权重重读因子是 `ceil(p_e/M)`**：prefill 是每专家约 54 对 → M=8；
+**decode 每个被选中的专家只贡献一行**，所以 M=8 的 tile 有 7/8 是空的。decode 因此有自己的
+tile：单 token 用 M=1、批量用 M=2（`PF_MOE_CFG_DEC`，0 = auto）。
+
+> **"decode" 必须是模式，不能是 token 数。** 选路曾经是 `dec_step = (n_tok <= 1)`，而**批量 decode
+> 的 `n_tok = rows = N > 1`**——于是每一个批量 decode 步都被当成 prefill，跑的是 prefill 的 M=8
+> tile。现在是 `mode == 0`。35B A3B / 2×A770 实测：decode 步 N=6/7/8/9 分别
+> -24.6% / -27.5% / -10.4% / -30%。
+
+设计讨论、其余 MoE kernel（router / CSR / reduce）、ncmoe 切分与三级专家缓存见
+[design/15-moe-ncmoe.md §3.4](15-moe-ncmoe.md)。
 
 ---
 

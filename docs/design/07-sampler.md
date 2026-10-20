@@ -171,6 +171,28 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 * **MTP 路径没有随机采样**：它只在贪时下进入（`engine::generate_impl` 的 `gp.speculative_greedy()` 条件），verify 里的 bonus token 或走
   `sample_token`、或直接用设备 argmax（`engine_mtp.cpp:1354-1357`、`:1435`），对贪心二者等价。
 
+### 5.1 采样器是宿主侧的，而它每行每步要搬 1 MB
+
+**已知成本，不是设计选择。** 调度器在批量 decode 之后逐行取 logits（`scheduler.cpp` 的
+`e.fetch_logits(r, logits.data())`——`d_logits` 的第 r 行，**248320 个 float ≈ 1 MB**），
+再在宿主上做 argmax 与采样。实测（35B A3B / 2×A770，`dev/bench_conc` 的 harness 做的是同一件事）：
+**每行每步约 0.45 ms**——1 MB 的 D2H 加上 248320 次宿主比较。
+
+所以它**同时**是 harness 的测量噪声**和** server 的真实开销：
+
+* 报告的 `ms/step` 里含这部分（N=16 时 7.2 ms / 5.6%，N=32 时 14.4 ms / 7.5%），所以**引擎自己的
+  边际行成本是 3.41 ms 而不是 3.86**；
+* server 的批量吞吐也真的付它——N=32 时每步 14.4 ms 是纯采样开销。
+
+**设备侧 argmax 已经存在**：`mtp_argmax_launch`（`gpu/kernels/mtp_argmax.cpp`）是每行一个
+256-lane 工作组、跨行 strided 合并 + SLM 树归约，**并列时取最小下标**（与宿主的
+`if (v[i] > best)` 一致），实测把 MTP verify 的 accept argmax 从 33.7 ms 降到 1.2 ms（28x）。
+server 的采样器没有用它。
+
+> **这是一个已识别的、还没做的优化**，不在本文档的改动范围内：**宿主只取 4 字节的 argmax，
+> 而不是 1 MB 的 logits**。注意它不能照搬 MTP 那版——MTP 只需要 argmax，而 `logprobs` 报告
+> 需要被选中 token 的 logprob（`fill_logprobs`），贪心 + logprobs 时仍要回宿主取那一个值。
+
 ---
 
 ## 6. 测试

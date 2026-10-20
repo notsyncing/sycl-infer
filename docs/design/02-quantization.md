@@ -365,7 +365,7 @@ scalar 下是 `nullptr`（CPU kernel `common.cpp` 的 scalar ISA 分支），而
 
 `impl`（`dnnl_gemm.cpp` 的 `impl`）持有：
 
-* 激活 scratch（`dnnl_gemm.cpp:547-564`，`cap_M = kMaxB*kMaxT = 512`、`cap_K = kActMaxK = 32768`）：
+* 激活 scratch（`dnnl_gemm.cpp` 的 `impl` 持有，`cap_M = kMaxB*kMaxT = 1024`、`cap_K = kActMaxK = 32768`）：
   每 32 组形式 `axg`（int8）+ `asa`（f16 组 scale）+ `xs`（组内 int32 和写成 f32）+ `axe`/`axo`
   （偶/奇 k 拆分），加上 f32 累加器 `accf`，以及**只有 `PF_ROWACT=1` 才发射**的每行形式
   `ax`/`axs`/`axsum`；
