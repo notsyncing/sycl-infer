@@ -23,14 +23,22 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_options(-O2)
 endif()
 
-find_program(ICXX NAMES icpx PATHS /opt/intel/oneapi/compiler/latest/bin ENV PATH)
-if(NOT ICXX)
-    message(FATAL_ERROR "icpx not found")
-endif()
-set(CMAKE_CXX_COMPILER ${ICXX})
+# The router is a plain host program: it needs neither SYCL nor oneDNN.  This
+# option builds ONLY it, with the system compiler, so its container image does
+# not need the oneAPI toolchain at all (and the build does not pay for the
+# device pass).  See docs/design/16-router.md §11.
+option(SI_ROUTER_ONLY "build only the router (no SYCL, no oneDNN, no GPU)" OFF)
 
-add_compile_options(-fsycl)
-add_link_options(-fsycl)
+if(NOT SI_ROUTER_ONLY)
+    find_program(ICXX NAMES icpx PATHS /opt/intel/oneapi/compiler/latest/bin ENV PATH)
+    if(NOT ICXX)
+        message(FATAL_ERROR "icpx not found")
+    endif()
+    set(CMAKE_CXX_COMPILER ${ICXX})
+
+    add_compile_options(-fsycl)
+    add_link_options(-fsycl)
+endif()
 
 option(SYCL_INFER_AOT "AOT compile for the target GPU (avoids runtime JIT)" OFF)
 # The ocloc target is device-specific and must agree with the device profile the
@@ -40,7 +48,7 @@ option(SYCL_INFER_AOT "AOT compile for the target GPU (avoids runtime JIT)" OFF)
 # Check `ocloc query` for any other SKU rather than inheriting either default.
 set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (adl-p = Iris Xe, acm-g10 = A770/DG2)")
 set(SYCL_INFER_AOT_PROFILE "" CACHE STRING "device profile key baked into the binary; empty = auto-detect from the SYCL device name")
-if(SYCL_INFER_AOT)
+if(SYCL_INFER_AOT AND NOT SI_ROUTER_ONLY)
     add_compile_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
     add_link_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
     if(SYCL_INFER_AOT_PROFILE)
@@ -72,6 +80,10 @@ if(SYCL_INFER_AOT)
     # slower to lower; configure with `-DCMAKE_BUILD_TYPE=Release` for AOT.
 endif()
 # ---------------------------------------------------------------- core library
+# Everything from here to the router section needs SYCL; SI_ROUTER_ONLY skips
+# it (the router links none of it).
+if(NOT SI_ROUTER_ONLY)
+
 add_library(sycl_infer_core STATIC
     third_party/unicode.cpp
     third_party/unicode-data.cpp
@@ -217,20 +229,65 @@ endif()
 target_include_directories(sycl_infer_core PRIVATE "${DNNL_ROOT}/include")
 target_link_libraries(sycl_infer_core PUBLIC "${DNNL_LIBRARY}")
 
+endif() # NOT SI_ROUTER_ONLY
+
 # ------------------------------------------------- OpenSSL (remote https images)
 # The HTTP server downloads `image_url` parts that point at http(s) URLs.  TLS
 # needs cpp-httplib built with OpenSSL; without it plain http:// still works and
 # https:// fails with an explicit error.  Found here so server.cpp sees the
-# same macro everywhere it is used.
+# same macro everywhere it is used.  The router uses it too (its own upstream
+# connections), and it is found outside the SYCL guard so the router-only
+# build gets it as well.
 find_package(OpenSSL QUIET)
-if(OpenSSL_FOUND)
+if(OpenSSL_FOUND AND NOT SI_ROUTER_ONLY)
     target_compile_definitions(sycl_infer_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
     target_link_libraries(sycl_infer_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # ------------------------------------------------------------------- binaries
+if(NOT SI_ROUTER_ONLY)
 add_executable(sycl-infer src/main.cpp)
 target_link_libraries(sycl-infer PRIVATE sycl_infer_core)
+endif()
+
+# --------------------------------------------------------------------- router
+# The multi-model front end (docs/design/16-router.md).  It is a plain host
+# C++17 program: no SYCL device pass, no oneDNN, and it does NOT link
+# sycl_infer_core - so its container is tiny and its tests need neither a GPU
+# nor a model.  `-fno-sycl` has to come after the global `-fsycl`, which is
+# why it is set per source file (the same trick SI_CPU_SOURCES uses).
+add_library(si_router_core STATIC
+    src/router/config.cpp
+    src/router/registry.cpp
+    src/router/rpc_client.cpp
+    src/router/supervisor.cpp
+    src/router/proxy.cpp
+)
+if(NOT SI_ROUTER_ONLY)
+    # The global -fsycl would drag the router through the device pass; this
+    # puts it back on the host path (the same trick SI_CPU_SOURCES uses).
+    set_source_files_properties(
+        src/router/config.cpp
+        src/router/registry.cpp
+        src/router/rpc_client.cpp
+        src/router/supervisor.cpp
+        src/router/proxy.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+endif()
+target_include_directories(si_router_core PUBLIC src/router src/common third_party)
+find_package(Threads REQUIRED)
+target_link_libraries(si_router_core PUBLIC Threads::Threads)
+if (OpenSSL_FOUND)
+    target_compile_definitions(si_router_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(si_router_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
+add_executable(sycl-infer-router src/router/main.cpp)
+if(NOT SI_ROUTER_ONLY)
+    set_source_files_properties(src/router/main.cpp PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+    target_link_options(sycl-infer-router PRIVATE -fno-sycl)
+endif()
+target_link_libraries(sycl-infer-router PRIVATE si_router_core)
 
 # ------------------------------------------------------------------- tests
 # Tests mirror the src/ layout: tests/model, tests/engine, tests/kernels (one
@@ -243,6 +300,18 @@ function(si_add_test name)
     target_include_directories(${name} PRIVATE ${SI_TEST_INCLUDE_DIRS})
 endfunction()
 
+# The router's tests link si_router_core, not sycl_infer_core: they must run
+# without a GPU, without a model and without the SYCL runtime.
+function(si_add_router_test name)
+    add_executable(${name} ${ARGN})
+    if(NOT SI_ROUTER_ONLY)
+        set_source_files_properties(${ARGN} PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+        target_link_options(${name} PRIVATE -fno-sycl)
+    endif()
+    target_include_directories(${name} PRIVATE ${SI_TEST_INCLUDE_DIRS} third_party src/router)
+    target_link_libraries(${name} PRIVATE si_router_core)
+endfunction()
+
 # dev/ benchmark harnesses (off by default: they are measurement tools, not
 # part of the shipped build, and each one re-lowers the device image at link).
 option(SI_DEV_BENCH "build the dev/ measurement harnesses" OFF)
@@ -250,12 +319,15 @@ if (SI_DEV_BENCH)
   si_add_test(bench_mtp dev/bench_mtp.cpp)
 endif()
 
+if(NOT SI_ROUTER_ONLY)
+
 si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
 si_add_test(test_response_parser tests/server/test_response_parser.cpp)
 si_add_test(test_request_parse  tests/server/test_request_parse.cpp)
 si_add_test(test_response_json   tests/server/test_response_json.cpp)
 si_add_test(test_sse_cancel     tests/server/test_sse_cancel.cpp)
+si_add_test(test_control         tests/server/test_control.cpp)
 si_add_test(test_url_fetch     tests/server/test_url_fetch.cpp)
 si_add_test(test_sampler tests/engine/test_sampler.cpp)
 si_add_test(test_sched   tests/engine/test_sched.cpp)
@@ -306,21 +378,41 @@ si_add_test(test_gpu_stages
     tests/backend/gpu/kernels/gated_norm_stage.cpp
 )
 
+endif() # NOT SI_ROUTER_ONLY
+
+# The router's tests: they need neither SYCL nor a GPU, so they exist in every
+# build (including the router-only one the container image uses).
+si_add_router_test(test_router_config    tests/router/test_router_config.cpp)
+si_add_router_test(test_router_proxy     tests/router/test_router_proxy.cpp)
+si_add_router_test(test_router_supervisor tests/router/test_router_supervisor.cpp)
+si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
+
 if(BUILD_TESTING)
-    foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_hparams test_f16conv test_yarn test_dev_profile)
+    if(NOT SI_ROUTER_ONLY)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_f16conv test_yarn test_dev_profile)
+            add_test(NAME ${name} COMMAND ${name})
+            set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
+        endforeach()
+    endif()
+    # The router's tests are hermetic in every build.
+    foreach(name IN ITEMS test_router_config test_router_proxy test_router_supervisor test_router_control)
         add_test(NAME ${name} COMMAND ${name})
         set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
     endforeach()
-    add_test(NAME test_video_hermetic COMMAND test_multimodal --video-only)
-    set_tests_properties(test_video_hermetic PROPERTIES LABELS "hermetic;media")
+    if(NOT SI_ROUTER_ONLY)
+        add_test(NAME test_video_hermetic COMMAND test_multimodal --video-only)
+        set_tests_properties(test_video_hermetic PROPERTIES LABELS "hermetic;media")
+    endif()
 
     # One binary, three processes: url_fetch_mode() caches its answer in a
     # static, so each policy needs its own process.  The test sets/clears the
     # env itself, so an ambient PF_MM_URL_FETCH cannot skew the default case.
-    foreach(mode default public private)
-        add_test(NAME test_url_fetch_${mode} COMMAND test_url_fetch 18141 ${mode})
-        set_tests_properties(test_url_fetch_${mode} PROPERTIES LABELS "hermetic;cpu")
-    endforeach()
+    if(NOT SI_ROUTER_ONLY)
+        foreach(mode default public private)
+            add_test(NAME test_url_fetch_${mode} COMMAND test_url_fetch 18141 ${mode})
+            set_tests_properties(test_url_fetch_${mode} PROPERTIES LABELS "hermetic;cpu")
+        endforeach()
+    endif()
 
     # Model-backed tests are explicit: a machine without the GGUF or GPU must
     # not claim a green run by silently skipping them.  Keep the 27B split out

@@ -6,3 +6,4 @@ __pycache__/
 dev/
 reports/
 .vscode/
+logs/
