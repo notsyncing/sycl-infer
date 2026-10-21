@@ -280,6 +280,11 @@ engine::engine(const engine_config & cfg)
     // upload weights after setup_multi_device so multi-device can skip the
     // full-blob device copy and instead upload only each partition's tensors
     m.upload(q, /*host=*/cpu_mode || multi_dev);
+    if (m.dev_weights) {
+        // The single-device path keeps the whole GGUF blob on the device.
+        dev_used_bytes_.assign(1, 0);
+        dev_used_bytes_[0] += m.dev_weights_size;
+    }
     {
         // fp32 scale side arrays: measured as a net loss on this GPU (the packed
         // scales share cache lines with the weights; a separate array adds a
@@ -984,13 +989,24 @@ void * engine::alloc_bytes(size_t bytes) {
 
 void * engine::dev_alloc_on(int dev, size_t bytes) {
     if (!multi_dev) {
-        return alloc_bytes(bytes);
+        void * p = alloc_bytes(bytes);
+        // The single-device path allocates on the primary queue, so the
+        // footprint belongs to device 0.
+        if (dev_used_bytes_.empty()) {
+            dev_used_bytes_.assign(1, 0);
+        }
+        dev_used_bytes_[0] += bytes;
+        return p;
     }
     void * p = dev_kind_[(size_t)dev] == 1 ? sycl::malloc_host(bytes, q)
                                            : sycl::malloc_device(bytes, *dev_queues_[(size_t)dev]);
     if (!p) {
         throw std::runtime_error("device alloc failed");
     }
+    if ((size_t)dev >= dev_used_bytes_.size()) {
+        dev_used_bytes_.resize((size_t)dev + 1, 0);
+    }
+    dev_used_bytes_[(size_t)dev] += bytes;
     return p;
 }
 
@@ -1415,6 +1431,11 @@ void engine::upload_device_weights(int dev) {
         if (!g) {
             throw std::runtime_error("multi-device weight upload failed (out of device memory)");
         }
+        // The uploaded weights are this model's footprint on that card.
+        if ((size_t)dev >= dev_used_bytes_.size()) {
+            dev_used_bytes_.resize((size_t)dev + 1, 0);
+        }
+        dev_used_bytes_[(size_t)dev] += t.nbytes();
         qd.memcpy(g, t.data, t.nbytes()).wait();
         // PF_MOE_VERIFY: byte-compare the freshly uploaded copy against the host
         // mmap for the routed expert tensors.  A partial or clobbered expert
@@ -1947,6 +1968,15 @@ bool engine::setup_md_dnnl() {
         if (dev_ok) {
             fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
                     n_w4, n_k5, n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
+            // The stores live in the oneDNN partition, which allocates them
+            // itself, so the engine's own allocation counter does not see
+            // them.  Add them here: they are this model's footprint on that
+            // card, and the control plane reports it (the router's VRAM
+            // admission is measured against it).
+            if ((size_t)d >= dev_used_bytes_.size()) {
+                dev_used_bytes_.resize((size_t)d + 1, 0);
+            }
+            dev_used_bytes_[(size_t)d] += D->weight_bytes();
             // Upper (and lower, for device 0) halves of the split draft head:
             // out[n] = w[n].h is independent per row, so each card can hold one
             // range and the readout costs half the wall time.  Each side runs the

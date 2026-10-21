@@ -172,6 +172,7 @@ add_library(sycl_infer_core STATIC
     src/server/response.cpp
     src/server/response_parser.cpp
     src/server/scheduler.cpp
+    src/server/control.cpp
     src/server/server.cpp
     src/server/url_fetch.cpp
 )

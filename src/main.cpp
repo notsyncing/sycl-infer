@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "chat_util.h"
 #include "cpu_isa.h"
 #include "cpu_types.h"
+#include "common/exit_codes.h"
 #include "engine.h"
 #include "image.h"
 #include "model.h"
@@ -127,6 +129,15 @@ static void usage(const char * prog) {
             "  --host H                     bind address (default 127.0.0.1; pass 0.0.0.0\n"
             "                               to expose it - the API has no authentication)\n"
             "  --port N                     HTTP port (default 8080)\n"
+            "  --control-port N             enable the control plane (JSON-RPC over TCP): the\n"
+            "                               router's channel for the model's identity, its\n"
+            "                               device memory and a graceful stop (default: off)\n"
+            "  --control-host H             the control plane's bind address (default\n"
+            "                               127.0.0.1)\n"
+            "  --control-token T            the control plane's shared secret: the router\n"
+            "                               has to present it in the handshake\n"
+            "  --control-token-file P       read the secret from a file (a mounted\n"
+            "                               secret) instead of the command line\n"
             "\n"
             "gen:\n"
             "  --prompt \"...\"               prompt text (chat-templated unless --raw)\n"
@@ -171,6 +182,10 @@ int main(int argc, char ** argv) {
     // address hands anyone who can reach the port a free inference engine
     std::string host = "127.0.0.1";
     int port = 8080;
+    std::string control_host = "127.0.0.1"; // the control plane (router RPC)
+    int control_port = 0;                     // 0 = the control plane is off
+    std::string control_token;                // the control plane's shared secret
+    std::string control_token_file;           // ... read from a file (a secret)
     int ctx = 0; // 0 = auto (kDefaultCtx)
     if (const char * e = si::env::str("PF_CTX")) {
         ctx = atoi(e);
@@ -257,6 +272,14 @@ int main(int argc, char ** argv) {
             port = atoi(next().c_str());
         } else if (a == "--host") {
             host = next();
+        } else if (a == "--control-host") {
+            control_host = next();
+        } else if (a == "--control-port") {
+            control_port = atoi(next().c_str());
+        } else if (a == "--control-token") {
+            control_token = next();
+        } else if (a == "--control-token-file") {
+            control_token_file = next();
         } else if (a == "--max-tokens") {
             max_tokens = atoi(next().c_str());
         } else if (a == "--temp") {
@@ -502,7 +525,21 @@ int main(int argc, char ** argv) {
         ec.draft_path = stype == "dflash2" ? spec_draft : std::string();
         ec.draft_k = draft_k;
         ec.draft_dev = spec_dev;
-        engine e(ec);
+        // The engine construction is the STARTUP: loading the GGUF, uploading
+        // the weights, sizing the KV pool.  A failure here is a configuration
+        // or environment problem, and the same attempt would fail the same
+        // way - so it gets its own exit code and the router does not retry
+        // it.  Everything after it is a runtime failure.
+        std::unique_ptr<engine> ep;
+        try {
+            ep = std::make_unique<engine>(ec);
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "error: %s\n", ex.what());
+            fprintf(stderr, "(exit %d: a startup failure - do not retry, the same attempt would fail the same way)\n",
+                    kExitStartupFailure);
+            return kExitStartupFailure;
+        }
+        engine & e = *ep;
         {
             const char * isa = cpu_isa_spec();
             if (e.cpu_mode) {
@@ -546,6 +583,24 @@ int main(int argc, char ** argv) {
             server_config cfg;
             cfg.host = host;
             cfg.port = port;
+            cfg.control_host = control_host;
+            cfg.control_port = control_port;
+            // A token file is the container-friendly way to hand a secret to
+            // a worker (a mounted secret, not an environment variable).
+            if (!control_token_file.empty()) {
+                std::ifstream f(control_token_file, std::ios::binary);
+                if (!f) {
+                    fprintf(stderr, "error: cannot read the control token file '%s'\n", control_token_file.c_str());
+                    return 1;
+                }
+                std::string tok;
+                std::getline(f, tok);
+                while (!tok.empty() && (tok.back() == '\n' || tok.back() == '\r')) {
+                    tok.pop_back();
+                }
+                control_token = tok;
+            }
+            cfg.control_token = control_token;
             cfg.mmproj_path = mmproj_path;
             cfg.audio_mmproj_path = audio_mmproj_path;
             cfg.max_video_frames = max_video_frames;
@@ -733,7 +788,7 @@ int main(int argc, char ** argv) {
         }
     } catch (const std::exception & ex) {
         fprintf(stderr, "error: %s\n", ex.what());
-        return 1;
+        return kExitRuntimeError;
     }
     usage(argv[0]);
     return 1;

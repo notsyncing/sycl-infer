@@ -43,6 +43,11 @@ void scheduler::shutdown() {
     }
 }
 
+int scheduler::inflight() {
+    std::lock_guard<std::mutex> lk(m);
+    return (int)active.size();
+}
+
 std::shared_ptr<sequence> scheduler::submit(std::vector<int> prompt, const gen_params & gp,
                                             std::vector<std::string> stops) {
     auto s = std::make_shared<sequence>();

@@ -148,6 +148,10 @@ struct scheduler {
     void shutdown();
     std::shared_ptr<sequence> submit(std::vector<int> prompt, const gen_params & gp, std::vector<std::string> stops);
 
+    // How many sequences are running.  The control plane publishes it, so it
+    // has to be read under the same lock the loop uses.
+    int inflight();
+
 private:
     void loop();
     bool admit(std::shared_ptr<sequence> & s);

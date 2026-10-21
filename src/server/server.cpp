@@ -1,5 +1,7 @@
 #include "server.h"
 
+#include "control.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -93,6 +95,13 @@ struct media_permit {
 // shutdown, then the engine destructor flushes the prefix cache).
 std::atomic<bool> g_term_requested{false};
 void on_term_signal(int) {
+    g_term_requested.store(true);
+}
+
+// The control plane's `shutdown` takes exactly the same path as a signal:
+// that is the path that flushes the prefix cache, so the router's graceful
+// stop must not be a different thing.
+void request_terminate() {
     g_term_requested.store(true);
 }
 
@@ -565,6 +574,63 @@ void stream_completion_text_choice(std::shared_ptr<sse_session> sc, scheduler & 
 int serve(engine & e, const server_config & cfg) {
     scheduler sched(e);
     sched.start();
+
+    // ---- the control plane -------------------------------------------------
+    // The router's channel for everything the OpenAI API does not carry: the
+    // model's identity, the device memory it occupies (which is what drives
+    // the router's VRAM admission), and a graceful stop.
+    const auto start_time = std::chrono::steady_clock::now();
+    auto make_report = [&]() -> control_report {
+        control_report r;
+        for (const engine::device_mem_info & d : e.device_memory()) {
+            control_report::device_t dd;
+            dd.index = d.index;
+            dd.name = d.name;
+            dd.total_vram_bytes = d.total_vram_bytes;
+            dd.free_vram_bytes = d.free_vram_bytes;
+            dd.driver_free_vram_bytes = d.driver_free_vram_bytes;
+            dd.used_bytes = d.used_bytes;
+            dd.kv_bytes = d.kv_bytes;
+            r.devices.push_back(dd);
+        }
+        r.kv_used_bytes = e.kv_bytes_total();
+        r.kv_cap_bytes = e.kv_bytes_cap();
+        r.kv_pool_blocks = e.pool_blocks;
+        r.kv_pool_cap = e.pool_cap;
+        r.kv_used_blocks = e.pool_used_blocks();
+        r.pc_vram_bytes = e.pc_vram_bytes;
+        r.pc_ram_records = e.pc_ram_records();
+        r.pc_disk_records = e.pc_disk_records();
+        r.host_rss_bytes = host_rss_bytes();
+        r.inflight = sched.inflight();
+        r.uptime_s = (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - start_time)
+                         .count();
+        if (const std::string * name = e.m.gguf.get_str("general.name"); name && !name->empty()) {
+            r.model_id = *name;
+        }
+        r.max_seq = e.max_seq;
+        r.n_vocab = e.m.hp.n_vocab;
+        r.n_layer = e.m.hp.n_layer;
+        return r;
+    };
+    control_server ctl(make_report, []() { request_terminate(); }, cfg.control_token);
+    if (cfg.control_port > 0) {
+        std::string err;
+        if (!ctl.start(cfg.control_host, cfg.control_port, err)) {
+            fprintf(stderr, "[ctl] %s\n", err.c_str());
+        } else {
+            fprintf(stderr, "[ctl] control plane on %s:%d%s\n", cfg.control_host.c_str(), ctl.port(),
+                    ctl.needs_token() ? " (token required)" : " (NO token: loopback only)");
+            if (cfg.control_host != "127.0.0.1" && cfg.control_host != "localhost" && !ctl.needs_token()) {
+                fprintf(stderr,
+                        "[ctl] bound to %s with NO token - anyone who can reach it can stop this worker and "
+                        "read its device report; set --control-token or keep it on a private network\n",
+                        cfg.control_host.c_str());
+            }
+        }
+    }
+
     auto mm_req = std::make_shared<media_gate>();
     mm_server mm;
     if (!cfg.mmproj_path.empty()) {

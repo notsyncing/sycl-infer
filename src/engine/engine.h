@@ -293,6 +293,11 @@ struct engine {
     std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)
     std::vector<int> dev_kind_;                            // backend -> 0 gpu / 1 cpu
     std::vector<void *> dev_kpool_, dev_vpool_, dev_kscales_, dev_vscales_;
+    // What this engine put on each device (the weights, the activations, the
+    // recurrent state, the KV pool).  The Level Zero backend does NOT
+    // implement the free-memory aspect, so this is how the control plane
+    // answers "how much of the card is left" (docs/design/16-router.md §7.3).
+    std::vector<uint64_t> dev_used_bytes_;
     compute_backend * cur_be = nullptr; // backend of the layer being recorded
     compute_backend & be_of(int layer) {
         return multi_dev ? *backends_[(size_t)layer_dev_[layer]] : *be;
@@ -1069,6 +1074,26 @@ struct engine {
     size_t kv_bytes_total() const {
         return (kv_block_bytes() + kv_v_block_bytes()) * (size_t)attn_layers() * pool_blocks;
     }
+    // ---------------- control plane: the device memory view ----------------
+    // What the router's control plane asks about: per device, its identity
+    // and its memory, plus how much of it this model holds.  The router uses
+    // it for the empirical VRAM admission (docs/design/16-router.md §9): the
+    // free memory a worker reports AFTER it loaded is what the next model of
+    // the same device group has to fit into.
+    struct device_mem_info {
+        int index = 0;                // the physical GPU ordinal
+        std::string name;
+        uint64_t total_vram_bytes = 0;
+        // What this model leaves on the card (the capacity minus its own
+        // footprint).  The driver's figure is kept separately: on the Level
+        // Zero backend it does not count the SYCL allocations.
+        uint64_t free_vram_bytes = 0;
+        uint64_t driver_free_vram_bytes = 0;
+        uint64_t used_bytes = 0;      // what THIS model put on the device
+        uint64_t kv_bytes = 0;        // the KV pool this device holds
+    };
+    std::vector<device_mem_info> device_memory() const;
+
     size_t kv_bytes_cap() const {
         return (kv_block_bytes() + kv_v_block_bytes()) * (size_t)attn_layers() * pool_cap;
     }
@@ -1274,6 +1299,7 @@ private:
     // so `block` offsets within each device's local layer stride are the same)
     // backend index that owns global attention layer `a` (0 when single-device)
     int attn_dev(int a) const;
+
 
     // prefix cache internals
     struct pc_node {

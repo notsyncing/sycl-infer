@@ -187,6 +187,84 @@ void engine::kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char
     vsc = d_vscales ? (const char *)d_vscales + (size_t)a * kv_v_scale_stride : nullptr;
 }
 
+// The control plane's view of the devices (docs/design/16-router.md §7.3).
+// The router asks the worker this over the JSON-RPC control plane, and uses
+// the free memory reported AFTER the load to decide whether the next model
+// of the same device group fits.
+std::vector<engine::device_mem_info> engine::device_memory() const {
+    std::vector<device_mem_info> out;
+
+    // The devices this engine runs on: the primary queue in the single-device
+    // case, one per partition in the multi-device case.
+    std::vector<const sycl::queue *> queues;
+    if (multi_dev) {
+        for (size_t d = 0; d < dev_queues_.size(); d++) {
+            queues.push_back(dev_queues_[d]);
+        }
+    } else {
+        queues.push_back(&q);
+    }
+
+    // The KV bytes per device: in the multi-device case each partition holds
+    // the attention layers it computes (the same split kv_setup() allocates);
+    // in the single-device case everything is on the primary queue.
+    std::vector<uint64_t> kv_bytes(queues.size(), 0);
+    if (multi_dev) {
+        std::vector<int> local_attn(queues.size(), 0);
+        for (int il = 0; il < m.hp.n_layer; il++) {
+            if (!m.hp.is_recr(il) && layer_dev_[(size_t)il] >= 0 &&
+                (size_t)layer_dev_[(size_t)il] < local_attn.size()) {
+                local_attn[(size_t)layer_dev_[(size_t)il]]++;
+            }
+        }
+        if (mtp.mtp_on && mtp.mtp_dev >= 0 && (size_t)mtp.mtp_dev < local_attn.size()) {
+            local_attn[(size_t)mtp.mtp_dev]++;
+        }
+        for (size_t d = 0; d < local_attn.size(); d++) {
+            kv_bytes[d] = ((uint64_t)kv_layer_stride + (uint64_t)kv_v_layer_stride) * (uint64_t)local_attn[d];
+        }
+    } else {
+        kv_bytes[0] = (uint64_t)kv_bytes_total();
+    }
+
+    for (size_t i = 0; i < queues.size(); i++) {
+        if (!queues[i]) {
+            continue;
+        }
+        device_mem_info info;
+        info.index = (int)i;
+        info.kv_bytes = kv_bytes[i];
+        if ((size_t)i < dev_used_bytes_.size()) {
+            info.used_bytes = dev_used_bytes_[(size_t)i];
+        }
+        try {
+            const sycl::device d = queues[i]->get_device();
+            info.name = d.get_info<sycl::info::device::name>();
+            info.total_vram_bytes = (uint64_t)d.get_info<sycl::info::device::global_mem_size>();
+            // Best effort: not every backend implements the free-memory
+            // aspect, and where it does exist it does NOT count the SYCL
+            // allocations (the Level Zero backend reported 13 GB free on a
+            // card holding 9 GB of weights).  So it is reported, but the
+            // admission uses the model-side number below.
+            if (d.has(sycl::aspect::ext_intel_free_memory)) {
+                info.driver_free_vram_bytes = (uint64_t)d.get_info<sycl::ext::intel::info::device::free_memory>();
+            }
+        } catch (const std::exception &) {
+            // A device that cannot be queried is reported without its memory
+            // figures rather than not at all.
+        }
+        if (info.total_vram_bytes > info.used_bytes) {
+            // What this model leaves on the card.  The model's own accounting
+            // over-counts a little (the cumulative allocations count the
+            // prefix cache's churn), so this free figure is an
+            // UNDER-estimate - the safe direction for an admission decision.
+            info.free_vram_bytes = info.total_vram_bytes - info.used_bytes;
+        }
+        out.push_back(info);
+    }
+    return out;
+}
+
 int engine::attn_dev(int a) const {
     if (!multi_dev) {
         return 0;
