@@ -1,0 +1,77 @@
+# The worker image: the SYCL binary.
+#
+# Two things this image has to get right, and both are about matching the
+# HOST:
+#
+#   * the user-space runtime (the oneAPI runtime + the Level Zero compute
+#     runtime) must match the host's kernel driver;
+#   * with AOT, the device image is compiled for one SKU, so
+#     SYCL_INFER_AOT_DEVICE must be that SKU's ocloc target ('acm-g10' for
+#     the A770, 'adl-p' for the Iris Xe).  Check `ocloc query` rather than
+#     inheriting a default.
+#
+# Build (from the repository root):
+#   docker build -f docker/Dockerfile.worker \
+#     --build-arg ONEAPI_VERSION=2026.2 \
+#     --build-arg AOT_DEVICE=acm-g10 \
+#     -t sycl-infer/worker:latest .
+#
+# Run:
+#   docker run --rm --device /dev/dri:/dev/dri \
+#     -v /srv/models:/models:ro \
+#     sycl-infer/worker:latest --model /models/x.gguf --port 8081 \
+#       --control-host 0.0.0.0 --control-port 8082 serve
+
+ARG ONEAPI_VERSION=2026.2
+ARG UBUNTU_TAG=ubuntu24.04
+
+FROM intel/oneapi-basekit:${ONEAPI_VERSION}-devel-${UBUNTU_TAG} AS build
+ARG ONEAPI_VERSION
+ARG UBUNTU_TAG
+ARG DNNL_VERSION=2026.1
+ARG AOT=ON
+ARG AOT_DEVICE=acm-g10
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake git wget gnupg \
+ && wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list" \
+ && wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      dnnl-${DNNL_VERSION}--devel \
+      intel-level-zero-gpu \
+      intel-opencl-icd \
+      level-zero \
+ && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
+WORKDIR /src
+COPY . /src
+# The AOT device image is lowered at the final link, which is the expensive
+# step: it is serial, and it takes minutes per kernel.  It is worth it in
+# production (no run-time JIT) and not worth it in a test build, hence the
+# AOT build argument.
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DDNNL_ROOT=/opt/intel/oneapi/dnnl/${DNNL_VERSION} \
+      -DSYCL_INFER_AOT=${AOT} -DSYCL_INFER_AOT_DEVICE=${AOT_DEVICE} \
+ && cmake --build build --target sycl-infer -j"$(nproc)"
+
+FROM intel/oneapi-runtime:${ONEAPI_VERSION}-${UBUNTU_TAG}
+ARG ONEAPI_VERSION
+ARG UBUNTU_TAG
+ENV DEBIAN_FRONTEND=noninteractive
+RUN wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list" \
+ && wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      dnnl-${ONEAPI_VERSION}-runtime \
+      intel-level-zero-gpu \
+      intel-opencl-icd \
+      level-zero \
+ && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
+COPY --from=build /src/build/sycl-infer /usr/local/bin/sycl-infer
+# The dynamic loader needs the runtime's libraries; the router adds these to
+# the workers it starts, but a worker started by hand needs them here.
+ENV LD_LIBRARY_PATH=/opt/intel/oneapi/${ONEAPI_VERSION}/lib:/opt/intel/oneapi/dnnl/${ONEAPI_VERSION}/lib:${LD_LIBRARY_PATH}
+ENTRYPOINT ["/usr/local/bin/sycl-infer"]
+CMD ["--help"]

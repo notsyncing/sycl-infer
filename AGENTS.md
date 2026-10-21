@@ -80,6 +80,10 @@ measurements and gotchas.
 * [`docs/design/15-moe-ncmoe.md`](docs/design/15-moe-ncmoe.md) — the MoE
   architecture, the routed experts' GEMM, the ncmoe split and the three-tier
   expert cache.
+* [`docs/design/16-router.md`](docs/design/16-router.md) — the multi-model
+  router: one worker process per model, a JSON config, the JSON-RPC control
+  plane, the HTTP/SSE data-plane proxy, per-model VRAM budget admission, remote
+  workers and Docker deployment.
 * [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **the measured throughput
   table**: prefill and decode by context depth and batch size, per model and
   per speculative path, each with the hardware, the build, the harness and the
@@ -178,10 +182,25 @@ export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2
 ./build/sycl-infer --model ... gen --prompt "Hello" --max-tokens 32
 ```
 
+The **router** (`sycl-infer-router`, a separate binary that needs neither
+SYCL nor oneDNN) serves several models behind one endpoint; it starts one
+worker process per model and proxies the OpenAI API to them:
+
+```bash
+cmake -S . -B build-router-only -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-router-only -j
+./build-router-only/sycl-infer-router --config router.json --check   # validate
+./build-router-only/sycl-infer-router --config router.json          # serve
+```
+
+Its config is JSON **with comments**; see
+[docs/design/16-router.md](docs/design/16-router.md).
+
 `main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --kv-type
 --port --host --device --cpu-threads --layer-map --mmproj --mtp --mtp-device
 --audio-mmproj`, the three prefix-cache budgets `--pc-vram-mb`/`--pc-mem-mb`
-(alias) `--pc-ram-mb`/`--pc-dir`+`--pc-disk-mb`, and
+(alias) `--pc-ram-mb`/`--pc-dir`+`--pc-disk-mb`, the control plane
+`--control-port`/`--control-host`/`--control-token`/`--control-token-file`, and
 for `gen`:
 `--prompt --max-tokens --temp --top-p --top-k --raw --thinking --image --video
 --audio --max-video-frames --max-video-side`).  `--device cpu|gpu|auto`
@@ -313,7 +332,12 @@ src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
                 codebook 4-bit store for IQ4_XS/IQ4_NL: 4-bit index plane in the
                 interleaved nibble order + per-32 f16 scale, `cb4t`/`cb4_pack`),
                 dp4a.h (portable dp4a helper),
-                cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch)
+                cpu_isa.{h,cpp} (host CPU feature detection + ISA dispatch),
+                jsonrpc.h (the control plane's wire protocol: JSON-RPC 2.0
+                over TCP, NDJSON framing; shared by the worker's server and
+                the router's client),
+                exit_codes.h (the worker's exit codes: 78 = a startup
+                failure, do not retry)
 src/device/     device_profile.h (the `profile` struct + the registry API),
                 device_registry.cpp (the `kDevices[]` list, name -> profile
                 selection, `PF_DEVICE_INFO` report, the cached `wg_clamped`),
@@ -413,6 +437,33 @@ tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
                 test_27b_prefill.cpp (27B prefill bring-up probe)
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
                 prompts, audio kernels, positions)
+src/router/     the multi-model front end (a SEPARATE binary, `sycl-infer-router`:
+                config.cpp (JSON with comments), registry.cpp (the model table and
+                its state machine), rpc_client.cpp (the control-plane client),
+                supervisor.cpp (spawn/monitor/restart a worker per model, the
+                VRAM ledger), proxy.cpp (the OpenAI HTTP/SSE proxy)).  It is
+                built with `-fno-sycl` and links neither SYCL nor oneDNN, so it
+                needs no GPU - see docs/design/16-router.md
+src/common/     ... quant.h/w8/w4/dp4a/cpu_isa as above, plus jsonrpc.h (the
+                control plane's wire protocol: JSON-RPC 2.0 over TCP, NDJSON
+                framing; shared by the worker's server and the router's
+                client so the two cannot drift) and exit_codes.h (78 = a
+                startup failure)
+src/server/     ... control.cpp: the worker's control plane (`--control-port`),
+                the channel the router uses for the model's identity, its device
+                memory and a graceful stop
+tests/router/   test_router_config.cpp (the config parser + the validation
+                rules), test_router_proxy.cpp (routing, the error shapes, the SSE
+                passthrough, the cancel chain across the extra hop),
+                test_router_supervisor.cpp (spawn/ready/restart, the per-device
+                start gate), test_router_control.cpp (the control-plane client,
+                the empirical VRAM admission).  All four are hermetic: no GPU,
+                no model
+docker/          Dockerfile.router (the router alone, built with
+                -DSI_ROUTER_ONLY=ON so it needs no oneAPI toolchain),
+                Dockerfile.worker, Dockerfile.all (both binaries, for the
+                "the router starts the workers" topology), compose.yaml,
+                router.example.json
 third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
                 unicode tables (vendored llama.cpp MIT), stb/stb_image.h
                 (public-domain image decode)
@@ -2548,6 +2599,40 @@ the point where the experts' depth-independent share stops shrinking.
 The rules that are not obvious from the code, and what breaks when they are
 broken.  Each one is a thing that *was* broken, or that fails silently.
 
+* **Each child process has exactly one owner, and the owner is the only one
+  that waits for it.**  The router's supervisor thread `waitpid`s its own
+  worker; nothing else may `waitpid` the same pid.  Two `waitpid`s on one pid
+  is a race: the loser sees `ECHILD`, reads it as "the child is gone", and
+  SIGKILLs a worker that is still shutting down gracefully - which loses the
+  prefix cache flush, silently.  This was measured: the worker's log stopped
+  at "server listening" with no "[srv] shutting down" line.  The regression
+  case is `test_router_control.cpp`'s `test_graceful_shutdown`: the fake
+  worker deliberately outlives the shutdown request by two seconds (standing
+  in for the flush) and the test asserts it was allowed to finish.
+
+* **A worker that cannot start says so with exit code 78, and the router
+  does not retry it.**  78 is `sysexits.h`'s `EX_CONFIG` ("the process cannot
+  start because of its configuration or its environment"): the model does not
+  load, the card is out of memory, the arguments are wrong - the same attempt
+  would fail the same way, so retrying only fills the log.  The router's
+  rule is: exit 78 -> not retryable; otherwise the *phase* decides (a death
+  before the worker was ready is a startup failure, a death after it is a
+  crash and is retried).  The phase rule is the fallback for a worker that
+  dies without the code (the OOM killer, for one).  78 is also what an
+  external supervisor (systemd, docker, k8s) sees, so a restart policy can
+  act on it.
+
+* **A child's VRAM footprint has to be counted where it is allocated.**  The
+  router's admission decision is the *measured* free memory, and the Level
+  Zero backend does not implement the free-memory aspect - worse, where it
+  does report one it does NOT count the SYCL allocations (it said 13 GB free
+  on a card holding 9 GB of weights).  So the engine counts its own device
+  allocations (`dev_alloc_on` plus the oneDNN partition's `weight_bytes()`,
+  which allocates the weight stores itself), and the control plane reports
+  `total - used` as the free memory.  That figure matches the hand-computed
+  capacity table in this file (card 0 of the 27B: 9072 weights + 1484 state +
+  1024 KV = 11501 used, 3973 free of 15474).
+
 * **`compute_backend::synchronize()` must actually wait, and the CPU backend's
   used to be an empty override** - which was a heap use-after-free, not a slow
   path.  `cpu_backend.cpp` is compiled with `-fno-sycl` (it is in
@@ -3103,6 +3188,25 @@ cmake --build build -j$(nproc)          # must be warning-free (except the linke
 ./build/test_decode_vs_prefill          # decode == re-prefill (any single-token change)
 ./build/test_sched                      # the batched decode, incl. the 20-row case
 clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include -checks='-*,misc-include-cleaner' <changed files>
+```
+
+If the change touches `src/router/`, the router's own tests are the ones that
+matter, and they need **no GPU and no model**:
+
+```bash
+cmake --build build --target sycl-infer-router test_router_config test_router_proxy test_router_supervisor test_router_control -j$(nproc)
+ctest --test-dir build -R router --output-on-failure      # ~15 s
+ldd build/sycl-infer-router | grep -c sycl                 # must be 0
+```
+
+The whole router can also be built **without SYCL at all** - that is the
+container image's build path, and it is what proves the router needs neither a
+GPU nor the oneAPI toolchain:
+
+```bash
+cmake -S . -B build-router-only -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-router-only -j$(nproc)
+ctest --test-dir build-router-only --output-on-failure    # the 4 router tests
 ```
 
 `test_sched` is the one that covers a **batched** decode, and its last section

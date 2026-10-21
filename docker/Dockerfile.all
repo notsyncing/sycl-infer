@@ -1,0 +1,71 @@
+# The combined image: the router AND the worker binary.
+#
+# This is the topology the router was designed for: ONE router process starts
+# ONE worker process per model, on the same box, so the router owns the
+# workers' lifecycle and their VRAM budget.  For that the router and the
+# workers have to share a process namespace - which they do inside one
+# container.
+#
+# (The alternative topology - the router on one host and the workers on
+# others - is the `compose.yaml` next to this file; there the router only
+# connects, it does not spawn.)
+#
+# Build:
+#   docker build -f docker/Dockerfile.all --build-arg ONEAPI_VERSION=2026.2 \
+#     --build-arg AOT_DEVICE=acm-g10 -t sycl-infer/all:latest .
+
+ARG ONEAPI_VERSION=2026.2
+ARG UBUNTU_TAG=ubuntu24.04
+
+# ---- stage 1: the worker (the SYCL binary) ---------------------------------
+FROM intel/oneapi-basekit:${ONEAPI_VERSION}-devel-${UBUNTU_TAG} AS worker
+ARG ONEAPI_VERSION
+ARG UBUNTU_TAG
+ARG DNNL_VERSION=2026.1
+ARG AOT=ON
+ARG AOT_DEVICE=acm-g10
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake git wget gnupg \
+ && wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list" \
+ && wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends dnnl-${DNNL_VERSION}--devel \
+ && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
+WORKDIR /src
+COPY . /src
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DDNNL_ROOT=/opt/intel/oneapi/dnnl/${DNNL_VERSION} \
+      -DSYCL_INFER_AOT=${AOT} -DSYCL_INFER_AOT_DEVICE=${AOT_DEVICE} \
+ && cmake --build build --target sycl-infer -j"$(nproc)"
+
+# ---- stage 2: the router (a plain host binary) ------------------------------
+FROM debian:bookworm-slim AS router
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends g++ cmake make ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+RUN cmake -S . -B build -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build -j"$(nproc)"
+
+# ---- the combined image -----------------------------------------------------
+FROM intel/oneapi-runtime:${ONEAPI_VERSION}-${UBUNTU_TAG}
+ARG ONEAPI_VERSION
+ARG UBUNTU_TAG
+ENV DEBIAN_FRONTEND=noninteractive
+RUN wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list" \
+ && wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      dnnl-${ONEAPI_VERSION}-runtime intel-level-zero-gpu intel-opencl-icd level-zero \
+ && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
+COPY --from=worker /src/build/sycl-infer /usr/local/bin/sycl-infer
+COPY --from=router /src/build/sycl-infer-router /usr/local/bin/sycl-infer-router
+ENV LD_LIBRARY_PATH=/opt/intel/oneapi/${ONEAPI_VERSION}/lib:/opt/intel/oneapi/dnnl/${ONEAPI_VERSION}/lib:${LD_LIBRARY_PATH}
+RUN mkdir -p /etc/sycl-infer /var/log/sycl-infer
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/sycl-infer-router"]
+CMD ["--config", "/etc/sycl-infer/router.json"]

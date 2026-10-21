@@ -1,0 +1,117 @@
+{
+  // The router's configuration.  JSON with comments: `//` and `/* */` are
+  // stripped by the parser, so a human can annotate it.
+  //
+  // The numbers below are for a 16 GB card; the ones marked "measured" come
+  // from the 2x A770 box (AGENTS.md's capacity table).
+  "router": {
+    // The router's own HTTP face.  It has no authentication of its own, so
+    // bind it to the loopback and put a reverse proxy in front of it.
+    "listen": "0.0.0.0:8080",
+    "access_log": true,
+
+    // Optional: a bearer token for the router's API.  The WORKERS have no
+    // authentication at all, so they must stay on a private network.
+    "auth": { "bearer_tokens": ["change-me"] },
+
+    // How long a worker may take to load (a 27B needs ~80 s), how long a
+    // generation may take, and how the workers are restarted.
+    "startup_timeout_s": 900,
+    "request_timeout_s": 3600,
+    "health_interval_s": 10,
+    "health_failures": 3,
+    "max_restarts": 3,
+    "restart_backoff_s": 2,
+
+    // Where the workers' stdout/stderr go: one file per model.
+    "log_dir": "/var/log/sycl-infer",
+
+    // The DECLARED usable VRAM of one card (MiB).  With it, the router
+    // refuses a configuration whose per-model budgets do not fit; without
+    // it, the budgets are only checked against what the cards REPORT (the
+    // measured admission).
+    "device_vram_mb": 15541
+  },
+
+  "defaults": {
+    // The worker executable.  The image puts it next to the router, so the
+    // default ("sycl-infer") resolves.
+    "binary": "/usr/local/bin/sycl-infer",
+    "env": {
+      "PF_PREFIX_CACHE": "1"
+    }
+  },
+
+  "models": [
+    {
+      "id": "qwen35-0.8b",
+      "path": "/models/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "http": "127.0.0.1:18081",
+      // The control plane (JSON-RPC over TCP): the model's identity, its
+      // device memory and a graceful stop.  Without it the router falls
+      // back to the OpenAI API and a signal.
+      "control": "127.0.0.1:18082",
+      // The control plane's shared secret.  Use the FILE form: both ends read
+      // the same file, so the secret never appears on a command line (`ps`
+      // shows command lines).  Mount it as a secret and keep it 0600.
+      // "control_token": "change-me",
+      // "control_token_file": "/run/secrets/control-token",
+      "args": ["--ctx", "20480"],
+      "device": {
+        // The budget grouping: the models of one group share a card, so they
+        // start one at a time and are admitted against each other.
+        "group": "gpu0",
+        // SYCL_DEVICE_FILTER for the worker: it pins the worker to one card
+        // (a container sees every card the host has).
+        "filter": "level_zero:0",
+        // How many cards the model runs on.  A model split with --layer-map
+        // uses several, and its budget is the TOTAL over them.
+        "count": 1
+      },
+      "memory": {
+        // The router's admission budget for this model (MiB).
+        "vram_budget_mb": 4096,
+        // The knobs that are the REAL cap: the KV pool stops growing at its
+        // cap instead of failing, and the recurrent state shrinks with the
+        // slot count.
+        "kv_cap_mb": 2048,
+        "max_slots": 8,
+        "prefix_cache_vram_mb": 512,
+        "prefix_cache_dir": "/var/lib/sycl-infer/pc/qwen35-0.8b"
+      }
+    },
+    {
+      "id": "qwen38-27b",
+      "path": "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "http": "127.0.0.1:18083",
+      "control": "127.0.0.1:18084",
+      // The 27B does not fit on one card: the layer map splits it, and each
+      // card keeps the KV of the layers it computes.
+      "args": ["--ctx", "131072", "--layer-map", "0-31:gpu.0,32-63:gpu.1"],
+      // The 27B spans both cards, so its group is both of them and its
+      // budget is the total over the two.
+      "device": { "group": "gpu0+gpu1", "count": 2 },
+      "memory": {
+        "vram_budget_mb": 30720,
+        // A single-stream long-context run needs one slot: the recurrent
+        // state is 1.125 GiB per card at 16 slots.
+        "kv_cap_mb": 4096,
+        "max_slots": 1,
+        "prefix_cache_vram_mb": 0,
+        "prefix_cache_dir": "/var/lib/sycl-infer/pc/qwen38-27b"
+      }
+    },
+    {
+      // A worker on ANOTHER machine: the router connects to it instead of
+      // starting it.  The control plane takes a shared secret, so the
+      // worker on that machine needs the SAME one (it is started by
+      // somebody else, with --control-token-file).
+      "id": "remote-35b",
+      "remote": {
+        "http": "http://gpu-host-b:18081"
+      },
+      "control": "gpu-host-b:18082"
+      // "control_token_file": "/run/secrets/control-token"
+    }
+  ]
+}

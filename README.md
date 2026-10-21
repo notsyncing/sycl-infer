@@ -43,6 +43,11 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
 * **Cross-request prefix cache** — hashed 32-token blocks with recurrent-state
   checkpoints, so a shared prompt prefix is prefilled only once.  Three LRU
   tiers: device (VRAM) → host RAM → disk.
+* **Several models at once** — `sycl-infer-router` runs one worker process per
+  model behind a single OpenAI-compatible endpoint, with a per-model VRAM
+  budget that is *measured* (the worker publishes its own device footprint) and
+  a control plane for the model's identity, its memory and a graceful stop.
+  See [Multiple models: the router](#multiple-models-the-router).
 * **Quantized compute** — in-house int8 DP4A/SIn kernels on the GPU and an
   integer int8 GEMV straight from the GGUF blocks on the CPU, plus an optional
   oneDNN int8 GEMM path for prefill; KV cache stored as int8 (default), 4-bit,
@@ -183,6 +188,17 @@ cmake --build build -j
 
 Optional: AOT-compile the device image with `-DSYCL_INFER_AOT=ON` (defaults to
 `adl-p`; edit `CMakeLists.txt` for another target).
+
+The **router** (the multi-model front end) builds on its own, without SYCL,
+oneDNN or even `icpx`:
+
+```bash
+cmake -S . -B build-router-only -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-router-only -j
+```
+
+That is the container image's build path, and it is what proves the router
+needs neither a GPU nor the oneAPI toolchain.
 
 ## Usage
 
@@ -377,6 +393,95 @@ Notes:
   automatically;
 * continuous batching, the prefix cache and the OpenAI API work unchanged.
 
+## Multiple models: the router
+
+`sycl-infer-router` is a separate front end that serves **several models at
+once**: one worker process per model, one OpenAI-compatible endpoint in front
+of them.  The request's `model` field picks the worker.
+
+It is a plain host program - it links neither SYCL nor oneDNN - so its container
+is ~130 MB, it needs no GPU to build, and its own tests are hermetic.
+
+```bash
+cmake -S . -B build-router-only -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-router-only -j$(nproc)
+
+./build-router-only/sycl-infer-router --config router.json --check   # validate
+./build-router-only/sycl-infer-router --config router.json          # serve
+```
+
+```jsonc
+{
+  // JSON with comments: `//` and `/* */` are stripped by the parser.
+  "router": { "listen": "0.0.0.0:8080", "device_vram_mb": 15541 },
+  "models": [
+    {
+      "id": "qwen35-0.8b",                        // the client's `model` field
+      "path": "/models/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "http": "127.0.0.1:18081",                  // the worker's OpenAI port
+      "control": "127.0.0.1:18082",               // its control plane (RPC)
+      "control_token_file": "/run/secrets/ctl",   // the control plane's secret
+      "args": ["--ctx", "20480"],
+      "device": { "group": "gpu0", "filter": "level_zero:0", "count": 1 },
+      "memory": {
+        "vram_budget_mb": 4096,                    // the router's admission budget
+        "kv_cap_mb": 2048,                         // -> --kv-cap-mb
+        "max_slots": 8,                            // -> --max-slots
+        "prefix_cache_vram_mb": 512                // -> --pc-vram-mb
+      }
+    }
+  ]
+}
+```
+
+What it does:
+
+* **one worker process per model**, started, watched and restarted by the
+  router; the models of one device start one at a time, in configuration
+  order, so two models never fight over the same card's memory;
+* **per-model VRAM budget**: the router admits a model against what the card
+  has *measured* free (the worker publishes its own device footprint over the
+  control plane) and refuses one that does not fit - with the measured
+  figure, not a guess:
+  `the device group 'gpu0' has 9874 MB free, and this model needs 12288 MB`;
+* **the OpenAI API unchanged**: `/v1/chat/completions`, `/v1/completions`,
+  `/v1/models`, streaming, `reasoning_content`, tool calls, logprobs - the
+  router proxies them, it does not reimplement them;
+* **a client that disconnects cancels the generation**, across the extra hop;
+* **a worker that cannot start is not retried**: the worker exits with 78
+  (`EX_CONFIG`) and says so; the same attempt would fail the same way;
+* **workers on other machines**: a model with a `remote` entry is connected to
+  instead of started.
+
+The VRAM figure the router admits against is the **model's own accounting**
+(`total - what this model put on the card`), not the driver's: the Level Zero
+backend either does not implement the free-memory aspect or reports a number
+that does not count the SYCL allocations (it said 13 GB free on a card holding
+9 GB of weights).  The model-side figure agrees with the hand-computed
+capacity table in AGENTS.md.
+
+The worker's control plane is optional but recommended:
+
+```bash
+./build/sycl-infer --model model.gguf --port 8081 --control-port 8082 \
+    --control-token-file /run/secrets/control-token serve
+```
+
+It adds a JSON-RPC channel (model identity, device memory, graceful stop).
+It takes a shared secret, presented once in the handshake; use the **file**
+form so the secret never appears on a command line.  Without a secret the
+control plane is open, so it must stay on a private network.
+
+The router presents the same secret (`models[].control_token` /
+`models[].control_token_file`); if it does not match, the router says so and
+falls back to the OpenAI API - the model still serves, it just has no device
+report.
+
+Containers: `docker/Dockerfile.router` (the router alone), `docker/Dockerfile.worker`
+(a worker), `docker/Dockerfile.all` (both, for the "the router starts the
+workers" topology) and `docker/compose.yaml`.  The full design is in
+[docs/design/16-router.md](docs/design/16-router.md).
+
 ## Performance
 
 Measured on **two Arc A770 16 GB** (i9-10940X, driver 12.55.8), an AOT Release
@@ -534,6 +639,7 @@ cmake --build build -j
 ./build/test_pc_ram_gpu   # prefix-cache VRAM->RAM->VRAM round-trip (GPU)
 ./build/test_cpuref       # CPU reference head output (CPU)
 ./build/test_compare      # CPU reference vs llama.cpp dumps (CPU)
+./build/test_control      # the worker's control plane: the protocol + its auth (CPU)
 ```
 
 Each test takes an optional model path as its first argument and otherwise falls

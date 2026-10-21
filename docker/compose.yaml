@@ -1,0 +1,49 @@
+# The router plus its workers, on one box.
+#
+# This is the topology the router was designed for: the router process starts
+# ONE worker process per model, owns their lifecycle, and admits them against
+# each other's VRAM budget.
+#
+#   docker compose -f docker/compose.yaml up --build
+#
+# The models are mounted, not baked in (they are large and they change), and
+# the config is mounted too.  The GPU is passed through; SYCL_DEVICE_FILTER
+# pins a worker to one card - the router's worker needs it, because a
+# container sees every card the host has.
+#
+# The prefix-cache disk tier is a named volume per model: the records are
+# per-model by fingerprint, but the directory has to exist and be writable.
+
+services:
+  router:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.all
+      args:
+        ONEAPI_VERSION: "2026.2"
+        AOT_DEVICE: "acm-g10"      # 'adl-p' for the Iris Xe
+    image: sycl-infer/all:latest
+    ports:
+      - "8080:8080"
+    devices:
+      - "/dev/dri:/dev/dri"
+    volumes:
+      - ./router.example.json:/etc/sycl-infer/router.json:ro
+      - /srv/models:/models:ro
+      # The control plane's shared secret: a file both ends read, so it never
+      # appears on a command line.  Create it with 0600.
+      - ./control-token:/run/secrets/control-token:ro
+      - pc-qwen35:/var/lib/sycl-infer/pc/qwen35-0.8b
+      - pc-qwen38:/var/lib/sycl-infer/pc/qwen38-27b
+      - router-logs:/var/log/sycl-infer
+    # The router's HTTP API has no authentication of its own (unless
+    # `router.auth.bearer_tokens` is set): bind it to the loopback and put a
+    # reverse proxy in front, or keep the port on a private network.
+    command: ["--config", "/etc/sycl-infer/router.json"]
+    restart: unless-stopped
+    shm_size: "1gb"
+
+volumes:
+  pc-qwen35:
+  pc-qwen38:
+  router-logs:

@@ -1,0 +1,39 @@
+# The router image.
+#
+# The router is a plain host program: it links neither SYCL nor oneDNN, so its
+# image needs no oneAPI toolchain and no GPU libraries at all.  The build
+# stage is a stock Debian with g++; the runtime stage is smaller still.
+#
+# Build (from the repository root):
+#   docker build -f docker/Dockerfile.router -t sycl-infer/router:latest .
+#
+# The config file is mounted, not baked in: it names the models, and the
+# models live in volumes.
+#
+#   docker run --rm -p 8080:8080 \
+#     -v "$PWD/router.json:/etc/sycl-infer/router.json:ro" \
+#     sycl-infer/router:latest --config /etc/sycl-infer/router.json
+
+FROM debian:bookworm-slim AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends g++ cmake make ca-certificates libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+# SI_ROUTER_ONLY=ON: no icpx, no device pass, no oneDNN.  The router's tests
+# are built here too, and they need neither a GPU nor a model.
+RUN cmake -S . -B build -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build -j"$(nproc)" \
+ && ctest --test-dir build --output-on-failure
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/build/sycl-infer-router /usr/local/bin/sycl-infer-router
+# The router logs to stderr; the config's `log_dir` is where it puts the
+# workers' logs.
+RUN mkdir -p /etc/sycl-infer /var/log/sycl-infer
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/sycl-infer-router"]
+CMD ["--config", "/etc/sycl-infer/router.json"]

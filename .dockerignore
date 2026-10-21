@@ -1,0 +1,12 @@
+# The build context: the image builds from source, so the local build trees
+# (several GiB) must not be sent to the daemon.
+build/
+build-*/
+cmake-build-*/
+.git/
+.gitignore
+reports/
+dev/
+*.o
+*.gguf
+.vscode/
