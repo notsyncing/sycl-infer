@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -103,6 +104,8 @@ int serve_onnx(const onnx_service_config & cfg) {
     // The models.
     std::vector<std::pair<std::string, std::string>> models; // id, path
     std::map<std::string, std::string> model_devices;
+    std::map<std::string, std::vector<std::string>> model_drops;
+    std::map<std::string, bool> model_dnnl;
     std::string default_device = cfg.device;
 
     if (!cfg.config_path.empty()) {
@@ -114,6 +117,12 @@ int serve_onnx(const onnx_service_config & cfg) {
                 if (!m.contains("path")) throw std::runtime_error("model '" + kv.key() + "' has no path");
                 models.emplace_back(kv.key(), m["path"].get<std::string>());
                 if (m.contains("device")) model_devices[kv.key()] = m["device"].get<std::string>();
+                if (m.contains("drop_outputs")) {
+                    for (const auto & o : m["drop_outputs"]) {
+                        model_drops[kv.key()].push_back(o.get<std::string>());
+                    }
+                }
+                if (m.contains("dnnl")) model_dnnl[kv.key()] = m["dnnl"].get<bool>();
             }
         }
     }
@@ -153,6 +162,12 @@ int serve_onnx(const onnx_service_config & cfg) {
         try {
             s->graph = onnx::build_graph(s->path, true);
             s->ex.reset(new onnx::executor(s->graph, queue_for(dev)));
+            if (auto it = model_drops.find(s->id); it != model_drops.end()) {
+                s->ex->skip_outputs(it->second);
+            }
+            if (auto it = model_dnnl.find(s->id); it != model_dnnl.end() && !it->second) {
+                s->ex->set_dnnl(false);
+            }
         } catch (const std::exception & e) {
             // A model that cannot be loaded is a reported failure, not a
             // reason to take the whole service down: the other models are
@@ -234,6 +249,7 @@ int serve_onnx(const onnx_service_config & cfg) {
     });
 
     srv.Post("/v1/onnx/run", [&](const httplib::Request & req, httplib::Response & res) {
+        const auto th0 = std::chrono::steady_clock::now();
         std::string model;
         std::vector<onnxwire::tensor> inputs;
         std::string err;
@@ -242,6 +258,7 @@ int serve_onnx(const onnx_service_config & cfg) {
             send_binary(res, onnxwire::encode_response(1, "bad request: " + err, {}));
             return;
         }
+        const auto th1 = std::chrono::steady_clock::now();
         served * target = nullptr;
         for (const auto & s : served_models) {
             if (s->id == model) {
@@ -268,7 +285,13 @@ int serve_onnx(const onnx_service_config & cfg) {
                 out_names.push_back(target->graph.tensors[s].name);
             }
             std::vector<std::vector<uint8_t>> out_bufs(out_names.size());
-            for (size_t i = 0; i < out_names.size(); ++i) outs.emplace_back(out_names[i], out_bufs[i]);
+            std::vector<bool> keep(out_names.size(), true);
+            for (size_t i = 0; i < out_names.size(); ++i) {
+                // An output the model config dropped is not read back by the
+                // executor and is not put on the wire.
+                keep[i] = !target->ex->output_skipped(i);
+                if (keep[i]) outs.emplace_back(out_names[i], out_bufs[i]);
+            }
             if (getenv("SI_ONNX_LOOPDBG")) {
                 fprintf(stderr, "[onnx] the service: the run of '%s' with %zu inputs\n",
                         target->id.c_str(), feeds.size());
@@ -278,6 +301,7 @@ int serve_onnx(const onnx_service_config & cfg) {
             // executor: it is only known once the graph has run.
             std::vector<onnxwire::tensor> results;
             for (size_t i = 0; i < out_names.size(); ++i) {
+                if (!keep[i]) continue;
                 const onnx::tensor & gt = target->ex->output(i);
                 onnxwire::tensor t;
                 t.name = out_names[i];
@@ -288,13 +312,28 @@ int serve_onnx(const onnx_service_config & cfg) {
                                    : (gt.dtype == onnxpb::INT32 ? onnxwire::dtype::i32
                                                                  : onnxwire::dtype::f32));
                 t.shape.assign(gt.shape.begin(), gt.shape.end());
-                t.data = out_bufs[i];
+                t.data = std::move(out_bufs[i]);
                 results.push_back(std::move(t));
             }
             target->calls++;
             target->last_ms = target->ex->last_ms();
             target->total_ms += target->last_ms;
-            send_binary(res, onnxwire::encode_response(0, "", results));
+            const auto th2 = std::chrono::steady_clock::now();
+            std::vector<uint8_t> encoded = onnxwire::encode_response(0, "", results);
+            const auto th3 = std::chrono::steady_clock::now();
+            send_binary(res, encoded);
+            const auto th4 = std::chrono::steady_clock::now();
+            if (getenv("SI_ONNX_HOSTTIME")) {
+                auto ms = [](std::chrono::steady_clock::time_point a,
+                             std::chrono::steady_clock::time_point b) {
+                    return std::chrono::duration<double, std::milli>(b - a).count();
+                };
+                fprintf(stderr,
+                        "[onnx] http: '%s': the request %zu bytes, the decode %.1f ms, the run "
+                        "%.1f ms, the encode %.1f (%.1f MB), the set_content %.1f\n",
+                        target->id.c_str(), req.body.size(), ms(th0, th1), ms(th1, th2), ms(th2, th3),
+                        encoded.size() / 1048576.0, ms(th3, th4));
+            }
         } catch (const std::exception & e) {
             fprintf(stderr, "[onnx] the request failed: %s\n", e.what());
             send_binary(res, onnxwire::encode_response(3, e.what(), {}));

@@ -62,7 +62,8 @@ struct act_params_t {
 // not `b - a`, and a flag that only says "one of them is a scalar" reads
 // the wrong one.
 void ew_launch(sycl::queue & q, const float * a, const float * b, float * y, size_t n,
-               ew_op op, const std::vector<float> & params, bool probe = false, int scalar_op = -1);
+               ew_op op, const std::vector<float> & params, bool probe = false, int scalar_op = -1,
+               ew_op act = ew_op::none, act_params_t act_params = {});
 
 // The kinds of value a cast converts between.  The *output*'s kind matters
 // as much as the input's: a cast from int64 to int64 has to write eight
@@ -95,7 +96,8 @@ void where_launch(sycl::queue & q, const float * cond, const float * a, const fl
 // them.
 void ew_bcast_launch(sycl::queue & q, const float * a, const int64_t * a_stride,
                      const float * b, const int64_t * b_stride, float * y, const int64_t * out_shape,
-                     int rank, size_t n, ew_op op, const std::vector<float> & params);
+                     int rank, size_t n, ew_op op, const std::vector<float> & params,
+                     ew_op act = ew_op::none, act_params_t act_params = {});
 
 // A batched matrix multiply with broadcast leading dims: a (..., M, K) * b
 // (..., K, N) -> c (..., M, N).  The leading dims of the two inputs are
@@ -106,6 +108,22 @@ void matmul_bcast_launch(sycl::queue & q, const float * a, const float * b, floa
                          const int64_t * a_stride, const int64_t * b_stride, int64_t a_batch,
                          int64_t b_batch);
 
+// y[i] = act(y[i] + bias[i % N]): the MatMul's bias and fused activation in
+// one pass.  `bias` may be null (activation only).
+void bias_act_launch(sycl::queue & q, float * y, const float * bias, size_t n, int64_t width,
+                     ew_op act, act_params_t act_params);
+
+// The layout detector's mask-to-box head in one scan.  `logits` is
+// [rows][height*width] (the bmm's output), the grids are [height][width]
+// coordinate maps, and the outputs are one value per row: whether the mask
+// is non-empty, the max of each grid over the mask, and the min (or the
+// sentinel when the mask is empty).  The original graph materialised ten
+// 12M-element tensors to compute these five values.
+void mask_box_launch(sycl::queue & q, const float * logits, const float * grid_a,
+                     const float * grid_b, float * any, float * max_a, float * max_b,
+                     float * min_a, float * min_b, int64_t rows, int64_t height, int64_t width,
+                     float threshold, float sentinel);
+
 // A convolution: x (N, C, H, W) * w (M, C/g, kh, kw) + bias + scale*add, with
 // an activation in the epilogue.  The weights are pre-transposed to
 // (C/g, kh, kw, M) so that the M weights of one (c, kh, kw) are contiguous.
@@ -115,6 +133,14 @@ void conv2d_launch(sycl::queue & q, const float * x, const float * w, const floa
                    int W, int M, int Ho, int Wo, int kh, int kw, int sh, int sw, int ph, int pw, int dh,
                    int dw, int group, int tm, ew_op act, act_params_t act_params,
                    bool probe = false);
+
+// The convolution's epilogue, as a separate pass: after oneDNN has written
+// the convolution's output, `y = act(y*scale[c] + add[c] + bias[c])`.  The
+// order is the SYCL conv's own (bias, then the batch norm's scale, then its
+// add, then the activation).
+void conv_epilogue_launch(sycl::queue & q, float * y, int N, int C, int H, int W,
+                          const float * bias, const float * scale, const float * add, ew_op act,
+                          act_params_t act_params);
 
 // The transposed convolution: x (N, C, H, W) * w (C, M/g, kh, kw) -> y
 // (N, M, Ho, Wo).  The weights are pre-transposed to (kh, kw, C, M).
@@ -145,6 +171,13 @@ void resize_launch(sycl::queue & q, const float * x, float * y, int N, int C, in
 // A global average pool over the spatial dims.
 void global_avg_pool_launch(sycl::queue & q, const float * x, float * y, int N, int C, int H,
                             int W);
+
+// The argmax over `n` values with stride `inner`: one work-item per
+// (outer, inner) position.  The layout/UNET masks are tens of millions of
+// elements, and the host loop that did this was 14.6 ms for the UNET's
+// 3-class 1024x288 map.
+void argmax_launch(sycl::queue & q, const float * x, int64_t * y, int64_t outer, int64_t n,
+                   int64_t inner);
 
 // A reduction over the trailing axes (mean, max, min, sum).
 // The reduction's element types: 0 = float32, 1 = int32, 2 = int64.
@@ -206,10 +239,12 @@ void gather_launch(sycl::queue & q, const float * x, const int64_t * idx, float 
 // the *smallest* k (largest=0), and picking the largest instead reorders
 // every anchor - the boxes come out in the wrong places.
 //
-// The scratch is the per-row sorted list (k values and k indices per row);
-// it has to be rows*k*12 bytes.
+// The top-k of every row.  A work-group selects the k-th (value, index) key
+// with a radix scan when k < cols; `indices` is the k indices per row that
+// the caller reads back, `values` the k values.  The small-k fallback (k >=
+// cols) uses one heap per row.
 void topk_launch(sycl::queue & q, const float * x, float * values, int64_t * indices, size_t rows,
-                  int64_t cols, int k, bool largest, float * scratch_v, int64_t * scratch_i);
+                  int64_t cols, int k, bool largest);
 
 // A grid sample (bilinear, "bilinear" padding mode, align_corners = 0).
 // A grid sample: the grid gives, for every output pixel, the (x, y) point

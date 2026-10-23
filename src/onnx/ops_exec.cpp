@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "kernels.h"
+#include "conv_dnnl.h"
 
 namespace si {
 namespace onnx {
@@ -126,6 +127,7 @@ ew_op ew_from_name(const std::string & n) {
     if (n == "HardSwish") return ew_op::hardswish;
     if (n == "Gelu") return ew_op::gelu;
     if (n == "Silu") return ew_op::silu;
+    if (n == "Clip") return ew_op::clip;
     if (n == "Softplus") return ew_op::softplus;
     if (n == "Abs") return ew_op::abs;
     if (n == "Greater") return ew_op::greater;
@@ -247,6 +249,13 @@ float ew_host(ew_op op, float a, float b, const std::vector<float> & params) {
 void exec_elementwise(op_ctx & c) {
     const std::string & name = c.node.op_type;
     const ew_op op = ew_from_name(name);
+    // The activation the graph fused into this operator's epilogue (the
+    // layout model's 41 "Add -> Relu/Clip/Sigmoid" pairs).  The same
+    // apply_act the convolution uses, so the result cannot drift from the
+    // standalone activation.
+    const ew_op act = ew_from_name(c.activation.empty() ? "none" : c.activation);
+    act_params_t ap;
+    for (size_t k = 0; k < c.act_params.size() && k < 4; ++k) ap.p[k] = c.act_params[k];
     // The inputs of a comparison or a logical operator may be integers or
     // booleans - a loop's condition compares an int64 counter with an int64
     // limit, and a model's mask is a float - and the device kernel reads
@@ -289,29 +298,29 @@ void exec_elementwise(op_ctx & c) {
                     // a is the integer, b is the float.
                     const float * bb = (const float *)c.in[1]->dev;
                     if (c.in[1]->count == 1) {
-                        ew_launch(c.q, conv, bb, yy, c.out[0]->count, op, act_params(c, name), false, 0);
+                        ew_launch(c.q, conv, bb, yy, c.out[0]->count, op, act_params(c, name), false, 0, act, ap);
                     } else if (c.in[1]->count == c.out[0]->count) {
-                        ew_launch(c.q, conv, bb, yy, c.out[0]->count, op, act_params(c, name));
+                        ew_launch(c.q, conv, bb, yy, c.out[0]->count, op, act_params(c, name), false, -1, act, ap);
                     } else {
                         std::vector<int64_t> as, bs;
                         broadcast_strides(sa, so, as);
                         broadcast_strides(sb, so, bs);
                         ew_bcast_launch(c.q, conv, as.data(), bb, bs.data(), yy, so.data(),
-                                        (int)so.size(), c.out[0]->count, op, act_params(c, name));
+                                        (int)so.size(), c.out[0]->count, op, act_params(c, name), act, ap);
                     }
                 } else {
                     // b is the integer, a is the float.
                     const float * aa = (const float *)c.in[0]->dev;
                     if (c.in[0]->count == 1) {
-                        ew_launch(c.q, aa, conv, yy, c.out[0]->count, op, act_params(c, name), false, 1);
+                        ew_launch(c.q, aa, conv, yy, c.out[0]->count, op, act_params(c, name), false, 1, act, ap);
                     } else if (c.in[0]->count == c.out[0]->count) {
-                        ew_launch(c.q, aa, conv, yy, c.out[0]->count, op, act_params(c, name));
+                        ew_launch(c.q, aa, conv, yy, c.out[0]->count, op, act_params(c, name), false, -1, act, ap);
                     } else {
                         std::vector<int64_t> as, bs;
                         broadcast_strides(sa, so, as);
                         broadcast_strides(sb, so, bs);
                         ew_bcast_launch(c.q, aa, as.data(), conv, bs.data(), yy, so.data(),
-                                        (int)so.size(), c.out[0]->count, op, act_params(c, name));
+                                        (int)so.size(), c.out[0]->count, op, act_params(c, name), act, ap);
                     }
                 }
                 return;
@@ -349,7 +358,7 @@ void exec_elementwise(op_ctx & c) {
     }
     if (c.in.size() == 1) {
         ew_launch(c.q, (const float *)c.in[0]->dev, nullptr, (float *)c.out[0]->dev, c.out[0]->count,
-                  op, act_params(c, name), getenv("SI_ONNX_ECHO") != nullptr);
+                  op, act_params(c, name), getenv("SI_ONNX_ECHO") != nullptr, -1, act, ap);
         return;
     }
     // Two inputs: they may need broadcasting.
@@ -358,7 +367,7 @@ void exec_elementwise(op_ctx & c) {
     const std::vector<int64_t> & so = c.out[0]->shape;
     if (sa == sb) {
         ew_launch(c.q, (const float *)c.in[0]->dev, (const float *)c.in[1]->dev,
-                  (float *)c.out[0]->dev, c.out[0]->count, op, act_params(c, name));
+                  (float *)c.out[0]->dev, c.out[0]->count, op, act_params(c, name), false, -1, act, ap);
         return;
     }
     // One operand is a single value: the broadcast kernel would work out
@@ -370,12 +379,12 @@ void exec_elementwise(op_ctx & c) {
         // (a subtraction and a division are not), so the flag has to say
         // which one it is.
         ew_launch(c.q, (const float *)c.in[0]->dev, (const float *)c.in[1]->dev,
-                  (float *)c.out[0]->dev, c.out[0]->count, op, act_params(c, name), false, 0);
+                  (float *)c.out[0]->dev, c.out[0]->count, op, act_params(c, name), false, 0, act, ap);
         return;
     }
     if (c.in[1]->count == 1 && c.in[0]->count != 1) {
         ew_launch(c.q, (const float *)c.in[0]->dev, (const float *)c.in[1]->dev,
-                  (float *)c.out[0]->dev, c.out[0]->count, op, act_params(c, name), false, 1);
+                  (float *)c.out[0]->dev, c.out[0]->count, op, act_params(c, name), false, 1, act, ap);
         return;
     }
     std::vector<int64_t> as, bs;
@@ -386,7 +395,7 @@ void exec_elementwise(op_ctx & c) {
     // so they stay on the host.
     ew_bcast_launch(c.q, (const float *)c.in[0]->dev, as.data(), (const float *)c.in[1]->dev,
                     bs.data(), (float *)c.out[0]->dev, so.data(), rank, c.out[0]->count, op,
-                    act_params(c, name));
+                    act_params(c, name), act, ap);
 }
 
 void exec_conv(op_ctx & c) {
@@ -445,6 +454,31 @@ void exec_conv(op_ctx & c) {
                 N, C, H, W, M, Ho, Wo, kh, kw, sh, sw, eph, epw, dh, dw, (int)group, tm, (int)act);
         for (size_t k = 0; k < 4; ++k) fprintf(stderr, " %g", ap.p[k]);
         fprintf(stderr, "\n");
+    }
+    // oneDNN's f32 convolution for the group-1 calls: the primitive picks
+    // its own blocked layout and vectorised loop, which measured 1.3-4.5x
+    // faster than the SYCL kernel on the deep layers of the layout model.
+    // A grouped/depthwise convolution, a probe run or a primitive oneDNN
+    // refuses falls back to the SYCL kernel (which stays the only path for
+    // those shapes).
+    const char * dnnl_env = getenv("PF_ONNX_DNNL");
+    const bool try_dnnl = !dnnl_env || atoi(dnnl_env) != 0;
+    if (try_dnnl && group == 1 && getenv("SI_ONNX_PROBE") == nullptr) {
+        if (conv_dnnl_launch(c.q, (const float *)x->dev, (const float *)w->dev,
+                             (float *)c.out[0]->dev, N, C, H, W, M, Ho, Wo, kh, kw, sh, sw,
+                             eph, epw, dh, dw)) {
+            // The epilogue is a separate pass so the semantics are the SYCL
+            // conv's exactly (bias, then scale, then add, then the
+            // activation).  It returns early for a convolution with no
+            // epilogue at all.
+            if (bias || scale || add || act != ew_op::none) {
+                conv_epilogue_launch(c.q, (float *)c.out[0]->dev, N, M, Ho, Wo,
+                                     bias ? (const float *)bias->dev : nullptr,
+                                     scale ? (const float *)scale->dev : nullptr,
+                                     add ? (const float *)add->dev : nullptr, act, ap);
+            }
+            return;
+        }
     }
     conv2d_launch(c.q, (const float *)x->dev, (const float *)w->dev,
                   bias ? (const float *)bias->dev : nullptr, scale ? (const float *)scale->dev : nullptr,
@@ -959,12 +993,6 @@ void exec_scatter_nd(op_ctx & c) {
             off += id * stride[d];
         }
         if (off < 0) continue;
-        if (n < 4) {
-            fprintf(stderr, "    the scatter: n %lld off %lld (the strides %lld %lld, the data's shape %lld "
-                            "%lld)\n",
-                    (long long)n, (long long)off, (long long)stride[0], (long long)stride[1],
-                    (long long)data->shape[0], (long long)data->shape[1]);
-        }
         for (int64_t i = 0; i < inner; ++i) {
             const int64_t src = n * inner + i;
             if (src < (int64_t)u.size() && off + i < (int64_t)res.size()) {
@@ -1231,10 +1259,34 @@ void exec_layer_norm(op_ctx & c) {
 void exec_matmul(op_ctx & c) {
     const tensor * a = c.in[0];
     const tensor * b = c.in[1];
+    // The bias the graph fused into this MatMul (an "Add(const)" after it).
+    // The third input is not part of ONNX's MatMul: only the builder puts it
+    // there, and it checks the width.
+    const float * bias = c.in.size() > 2 && c.in[2] >= 0 ? (const float *)c.in[2]->dev : nullptr;
+    if (bias && (c.in[2]->count != (size_t)b->shape.back() || c.in[2]->dtype != onnxpb::FLOAT)) {
+        throw std::runtime_error("the fused MatMul bias does not match the output width");
+    }
+    const ew_op act = ew_from_name(c.activation.empty() ? "none" : c.activation);
+    act_params_t ap;
+    for (size_t k = 0; k < c.act_params.size() && k < 4; ++k) ap.p[k] = c.act_params[k];
+    // The bias and the activation are one pass over the output.  oneDNN's
+    // *bias* matmul was 4.5x slower than the same primitive without a bias
+    // (36 ms against 8 ms for the layout's 123 matmuls), so the bias is a
+    // separate epilogue here, as the convolution's already is.
+    auto epilogue = [&](int64_t width) {
+        if (bias || act != ew_op::none) {
+            bias_act_launch(c.q, (float *)c.out[0]->dev, bias, c.out[0]->count, width, act, ap);
+        }
+    };
     // The 2-D case: (M, K) x (K, N).
     if (a->shape.size() == 2 && b->shape.size() == 2) {
-        matmul_launch(c.q, (const float *)a->dev, (const float *)b->dev, (float *)c.out[0]->dev, 1,
-                      a->shape[0], a->shape[1], b->shape[1], false);
+        if (!matmul_dnnl_launch(c.q, (const float *)a->dev, (const float *)b->dev,
+                                (float *)c.out[0]->dev, a->shape[0], a->shape[1], b->shape[1])) {
+            matmul_launch(c.q, (const float *)a->dev, (const float *)b->dev,
+                          (float *)c.out[0]->dev, 1, a->shape[0], a->shape[1], b->shape[1],
+                          false);
+        }
+        epilogue(b->shape[1]);
         return;
     }
     // The batched case: the leading dims are broadcast.
@@ -1287,8 +1339,22 @@ void exec_matmul(op_ctx & c) {
         for (int64_t d : c.out[0]->shape) fprintf(stderr, " %lld", (long long)d);
         fprintf(stderr, "  M %lld K %lld N %lld\n", (long long)M, (long long)K, (long long)N);
     }
-    matmul_bcast_launch(c.q, (const float *)a->dev, (const float *)b->dev, (float *)c.out[0]->dev,
-                        out_batch.data(), (int)l, M, K, N, as.data(), bs.data(), 0, 0);
+    // A batch of one (the layout's decoder bmm is [1,300,32] x [1,32,40000])
+    // is a plain matmul; the leading dims of >1 keep the SYCL kernel.
+    bool one = true;
+    for (int64_t d : out_batch) {
+        if (d != 1) {
+            one = false;
+            break;
+        }
+    }
+    if (!one || !matmul_dnnl_launch(c.q, (const float *)a->dev, (const float *)b->dev,
+                                    (float *)c.out[0]->dev, M, K, N)) {
+        matmul_bcast_launch(c.q, (const float *)a->dev, (const float *)b->dev,
+                            (float *)c.out[0]->dev, out_batch.data(), (int)l, M, K, N,
+                            as.data(), bs.data(), 0, 0);
+    }
+    epilogue(N);
 }
 
 void exec_batch_norm(op_ctx & c) {
@@ -1733,22 +1799,20 @@ void exec_topk(op_ctx & c) {
     // written by the kernel *on the device* (a host array would be freed
     // before the kernel runs).
     const size_t n = (size_t)(rows * k);
-    // The workspace: the per-row sorted list (the values and the indices),
-    // and then the indices themselves.  It is half a megabyte of values and
-    // a megabyte of indices.
-    int64_t * ws = op_workspace(c, 5);
-    if (!ws || c.workspace_bytes < 3 * 1024 * 1024) {
+    // The only workspace the top-k needs is the index output the caller
+    // reads back: the values go straight to the model's output, and the
+    // radix selection keeps its histogram and its running prefix in local
+    // memory.  No per-row candidate list.
+    int64_t * idx_out = (int64_t *)c.workspace;
+    if (!idx_out || (size_t)(rows * k) * 8 > c.workspace_bytes) {
         throw std::runtime_error("the top-k needs a workspace");
     }
-    float * sv = (float *)ws;
-    int64_t * si = (int64_t *)((uint8_t *)ws + 2 * 1024 * 1024);
-    int64_t * idx_out = (int64_t *)((uint8_t *)ws + 3 * 1024 * 1024);
     // The `largest` attribute: 0 picks the smallest k (the layout model's
     // anchor selection), and picking the largest instead reorders every
     // anchor - the boxes come out in the wrong places.
     const bool largest = c.attr_i("largest", 1) != 0;
-    topk_launch(c.q, (const float *)x->dev, (float *)c.out[0]->dev, idx_out, rows, cols, (int)k, largest, sv,
-                si);
+    topk_launch(c.q, (const float *)x->dev, (float *)c.out[0]->dev, idx_out, rows, cols, (int)k,
+                largest);
     c.out[1]->host.assign(n * 8, 0);
     q_download(c.q, idx_out, c.out[1]->host.data(), n * 8);
     c.out[1]->on_host = true;
@@ -1779,6 +1843,14 @@ void exec_argmax(op_ctx & c) {
     for (int64_t i = axis + 1; i < rank; ++i) inner *= x->shape[i];
     const int64_t n = x->shape[axis];
     const int64_t outer = x->count / (n * inner);
+    // A device-resident float input: one work-item per output position scans
+    // the `n` values.  The host loop below was 14.6 ms for the UNET's
+    // 3-class 1024x288 map (a download and a serial scan), and the write-back
+    // downloads the int64 result, which is what the consumers need.
+    if (x->dev && !x->on_host && c.out[0]->dtype == onnxpb::INT64 && c.out[0]->dev) {
+        argmax_launch(c.q, (const float *)x->dev, (int64_t *)c.out[0]->dev, outer, n, inner);
+        return;
+    }
     // The host does it: the rows are few.
     //
     const std::vector<float> tmp = read_host_floats(c.q, x);
@@ -2456,6 +2528,50 @@ void exec_tile(op_ctx & c) {
     });
 }
 
+// ------------------------------------------------------------- mask head
+
+// The fused mask-to-box scan (see graph.cpp).  The bmm's output is
+// [rows][H*W], the grids are [H][W], and the five results are [1][rows]:
+// bool(any mask), max(grid_a), max(grid_b), min(grid_a), min(grid_b).
+bool shape_mask_box(const op_ctx & c, std::vector<std::vector<int64_t>> & out) {
+    if (c.in.size() < 3 || !c.in[0] || !c.in[1] || !c.in[2]) return false;
+    const tensor * logits = c.in[0];
+    const tensor * ga = c.in[1];
+    const tensor * gb = c.in[2];
+    if (ga->shape.size() != 2 || gb->shape.size() != 2) return false;
+    if (ga->count == 0 || gb->count != ga->count) return false;
+    if (logits->count == 0 || logits->shape.empty() || logits->count % ga->count != 0) return false;
+    // The original reductions drop the two spatial axes and keep every
+    // leading axis: [B,300,200,200] -> [B,300], not [1,B*300].  The layout
+    // batch is 1 normally, but a batch of 2 is a valid call and the
+    // consumers' Add/MatMul shapes depend on the batch axis staying there.
+    if (logits->shape.back() != (int64_t)ga->count) return false;
+    std::vector<int64_t> oshape(logits->shape.begin(), logits->shape.end() - 1);
+    if (oshape.empty()) oshape.push_back(1);
+    out.assign(c.out.size(), oshape);
+    if (!c.out.empty()) c.out[0]->dtype = onnxpb::BOOL;
+    for (size_t k = 1; k < c.out.size(); ++k) c.out[k]->dtype = onnxpb::FLOAT;
+    return true;
+}
+
+void exec_mask_box(op_ctx & c) {
+    const float * logits = (const float *)c.in[0]->dev;
+    const float * ga = (const float *)c.in[1]->dev;
+    const float * gb = (const float *)c.in[2]->dev;
+    const int64_t area = c.in[1]->count;
+    const int64_t height = c.in[1]->shape[c.in[1]->shape.size() - 2];
+    const int64_t width = c.in[1]->shape.back();
+    const int64_t rows = area > 0 ? (int64_t)(c.in[0]->count / area) : 0;
+    float threshold = 0.0f, sentinel = 1.0e8f;
+    const std::vector<float> th = c.attr_floats("threshold");
+    const std::vector<float> se = c.attr_floats("sentinel");
+    if (!th.empty()) threshold = th[0];
+    if (!se.empty()) sentinel = se[0];
+    mask_box_launch(c.q, logits, ga, gb, (float *)c.out[0]->dev, (float *)c.out[1]->dev,
+                    (float *)c.out[2]->dev, (float *)c.out[3]->dev, (float *)c.out[4]->dev, rows,
+                    height, width, threshold, sentinel);
+}
+
 } // namespace
 
 // ------------------------------------------------------------- the registry
@@ -2523,6 +2639,7 @@ const op_entry kOps[] = {
     {"Softmax", shape_softmax, exec_softmax},
     {"LayerNormalization", shape_layer_norm, exec_layer_norm},
     {"MatMul", shape_matmul, exec_matmul},
+    {"MaskBox", shape_mask_box, exec_mask_box},
     {"BatchNormalization", shape_same, exec_batch_norm},
     {"Gemm", shape_gemm, exec_gemm},
     // The shape operators.

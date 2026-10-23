@@ -1665,28 +1665,216 @@ operator times, `SI_ONNX_TIME=1`):
 
 | what | time |
 |---|---:|
-| the whole model | **281 ms** |
-| the `Conv`s (118 of them) | 107 ms |
-| the `Concat`s (140 of them) | 39 ms |
-| the `MatMul`s (123 of them) | 38 ms |
-| the `ReduceMax`es (4 of them) | 17 ms |
-| the `TopK` (300 of 13 125) | 16 ms |
-| the `ReduceMin`s (2 of them) | 12 ms |
-| the `GatherND` (12 million elements) | 0.7 ms |
-| the first call, with the runtime's JIT | +2 589 ms |
+| the whole model | **129-141 ms** |
+| the `Conv`s (118 of them, oneDNN) | 93 ms |
+| the `TopK` (300 of 13 125, three calls) | **4 ms** |
+| the `MatMul`s (123 of them, plus the bias/act epilogue) | 9 ms |
+| the `Concat`s (140 of them) | 5.5 ms |
+| the `LayerNormalization`s | 3.3 ms |
+| the `Transpose`s | 3 ms |
+| the `Add`s | 1.9 ms |
+| the mask-to-box head | 0.2 ms (was 9.5 ms and ten 48 MB tensors) |
+| the first call, with the runtime's JIT | ~1.2-1.4 s |
 
 **End to end** (the document pipeline, 17 pages, one A770, the layout
-and the OCR over HTTP): **987 ms/page**, of which the inference is
-328 ms (the layout 261, the detector 24, the recogniser 54) and the
-rest is the pipeline's own PDF rendering.  The same run on
-ONNXRuntime's CPU provider is 888 ms/page, and its layout alone is
-360 ms against our 261.
+and the OCR over HTTP, after the fusions): **865-893 ms/page**; the layout
+stage is 168-184 ms/page (its own service call is 129-141 ms at batch 1,
+146 ms/page at batch 2), the table stage 505-518, and the rest is the
+pipeline's PDF rendering and OCR post-processing.  The same run on ONNXRuntime's CPU
+provider was 888 ms/page with a 360 ms layout.
 
 **Three operators were 58% of the layout model and all three were on
 the host.**  The `Einsum` is a batched matrix multiply (`bmd,bnd->bmn`),
 the `GatherND` is a strided copy, and the `TopK` is a selection - and
 the device already had a kernel for the first two.  Moving them to the
 device is the 686 ms -> 282 ms.
+
+**The host path was the other half, and it was not the kernels**
+(measured 2026-10-23, one A770, the layout model, 800x800):
+
+* 3 508 uploads of 707 MB per call -> **366 of 7.4 MB**, once the device
+  copies became mirrors keyed by `host_gen`/`dev_gen` and the constants
+  stopped being released at their last use.  A warm call is **265 ms**
+  before the oneDNN convolutions and **208-215 ms** after them.
+* **A `q.memcpy` out of pageable host memory is synchronous on this
+  backend**: it blocks until the in-order queue drains, so a 0-byte upload
+  behind 80 ms of kernels cost 80 ms.  The uploads are staged through a
+  pinned USM buffer (8 MB/executor) and enqueued; `run()` drains once
+  before it overwrites the next call's input bytes.  **Do not move a host
+  value into the operator loop as a temporary** - the staging buffer and
+  the drain are what make the copy safe.
+* The layout's mask output is 300x200x200 f32 = **48 MB per page**, and
+  the postprocess only uses it for polygon points.  `drop_outputs` in the
+  model config drops it from the wire *and* from the computation (a
+  backward mark from the kept outputs prunes 28 operators); with the
+  pipeline's rectangles the digest is byte-identical with and without it.
+  Do not drop it on documents whose layout needs mask-derived quads.
+* `SI_ONNX_MIRRORCHK=1` downloads every reused mirror and compares it with
+  the host bytes - the generation pair is an invariant, so it is checked
+  rather than assumed.  `SI_ONNX_UPLOADDBG=1` attributes the copies.
+* The kernels that were re-shaped: `Concat` (one kernel over each *input*,
+  not one per input over the whole output: 39 -> 5.5 ms) and the
+  elementwise broadcast (a 2D range over the run where the second operand
+  does not vary, removing four 64-bit divisions per element; `Div` was
+  14 ms), plus the reduction (templated operator, four accumulator chains).
+  **`ArgMax` was a host loop** ("the rows are few") that downloaded the
+  whole map and scanned it serially: the table UNET's 3-class 1024x288 map
+  cost **14.6 ms/table**, and one work-item per output position on the
+  device took the UNET's operator total 56.2 -> 41.3 ms.  A segmentation
+  argmax has hundreds of thousands of "rows", so the comment was the bug.
+  **The MatMuls are on oneDNN** (`matmul_dnnl_launch`, the plain layouts,
+  the primitive cached by `M:K:N`): the decoder's `bmm [1,300,32] x
+  [1,32,40000]` and the 2-D matmuls took **36 -> 8 ms**.  **The reductions
+  were one thread per row** - the mask max is 300 rows of 40 000 int
+  elements - and a work-group per row (256 lanes, SLM tree) took **29 ->
+  ~1 ms**.  **The mask-to-box branch is one scan**: the ten 12M-element
+  intermediates from `bmm -> reshape -> greater -> cast -> mul -> add ->
+  where -> reshape -> reduce` are replaced by `MaskBox`
+  (`mask_box_launch`), which reads the bmm once and writes five `[B,300]`
+  values (**9.5 -> 0.2 ms**, one live 48 MB tensor instead of ten).  The
+  output shape keeps the batch axis (`[B,300]`), not `[1,B*300]`.  **The
+  layout's service call is now 129-141 ms** (the operator sum with per-op
+  waits is 148).  The smaller fusions:
+  `MatMul` + a constant bias is one op with `bias_act_launch` (oneDNN's
+  matmul *bias* primitive was 4.5x slower: 36 vs 8 ms), and an
+  elementwise op followed by `Relu`/`Clip`/`Sigmoid` gets the activation in
+  its epilogue (41 nodes).  `Reshape`/`Flatten`/`Squeeze`/`Unsqueeze`/
+  `Identity` borrow a dead input's buffer, and an elementwise op may reuse a
+  same-shape input buffer; **never in a `Loop` body** - its carried values
+  are read again on the next iteration and per-op liveness cannot see that.
+* **The convolutions run on oneDNN** (`src/onnx/conv_dnnl.cpp`, the
+  `PF_ONNX_DNNL` switch, default on; group-1 only).  The weights stay in the
+  runtime's (C, kh, kw, M) layout and are reordered once into the
+  primitive's layout and cached; the epilogue (bias/scale/add/activation)
+  stays a separate kernel, so its semantics are the SYCL conv's exactly.
+  The layout call went 265 -> 208-215 ms and the whole 17-page document
+  1 150 -> 1 039-1 120 ms/page, with the digest **unchanged**.  The first
+  document after a service start pays ~5-7 s for primitive creation
+  (~100 shapes).  A **deconvolution** path was tried and **reverted**: its
+  output was wrong on the detector's 2x2 stride-2 transposed convolutions,
+  and the UNET's deconvs are only 26 ms of its forward.
+* **bf16/XMX was probed, not adopted.**  oneDNN bf16 reaches 9-19 TFLOP/s
+  on the shapes where XMX helps (C128 100x100 -> M256: 0.16 vs 0.56 ms f32;
+  C96 64x240 -> M96: 0.13 vs 0.57) but the gain is shape-dependent (1.0x on
+  several), and the layout detector's accuracy is sensitive to bf16 (the
+  engine's earlier all-bf16 layout was 17% wrong).  The cheap variant -
+  `PF_ONNX_DNNL_BF16=1`, oneDNN's `fpmath_mode::bf16` on the f32 descriptors
+  - was tested on the real layout: the digest is **identical**, but the call
+  is **not faster** (233 ms against 208-225).  The probe's fast path used
+  bf16 *memory descriptors*, which need an f32<->bf16 conversion pass per
+  conv in a mixed graph; that is the only remaining bf16 option and it is
+  not a switch.
+
+**The `Resize` was a table-accuracy bug, and it is the one to remember.**
+The OCR detector's `Resize(mode=nearest, coordinate_transformation_mode=
+asymmetric, nearest_mode=floor)` computed its source index in float:
+
+    iw = (int)((float)wo * W / (float)Wo)
+
+The device compiler turns the division into a reciprocal multiply, and the
+reciprocal is slightly *below* the true value: at an exact multiple
+(upsampling 30 -> 60, wo = 2) the floor came out one short, the first source
+pixel took three columns, and the whole probability map shifted by a pixel.
+The text boxes moved with it, and the PDF text spans clipped to those boxes
+lost their leading character (`190,083,517` -> `90,083,517`, `-77,332` ->
+`77,332`) - **33 of the 45 tables** on the reference document.  The fix is
+integer arithmetic, `(int)(((int64_t)wo * W) / Wo)`, exact and floor-correct
+for non-negative indices.  After it the detector's raw output is within
+1.5e-5 of ONNXRuntime's, its boxes are identical, and the pipeline digest is
+byte-identical on 15/17 pages (the other two: one 0.1 px box coordinate) and
+**all 45 tables match cell for cell**.  **The lesson: a floor of a float
+quotient at an exact integer boundary is not a rounding detail when the
+result selects a pixel.**
+
+**End to end on the bank report** (`浦发银行2014年年度报告摘要.pdf`, 17
+pages, the pipeline's HTTP layout/OCR/table engines, warm): **14.71-15.18 s
+= 865-893 ms/page** with the layout batched 2 pages per call (from 930-957
+before the mask/alias fusions, and 1 708 before the upload/mask work).  The
+split is the table 505-518 ms/page, the layout 168-184 (its own service call:
+129-141 ms at batch 1, 146 ms/page at batch 2), the PDF render 76, the OCR
+post-process 65 and the OCR 42.  **The content is exact against the local ONNXRuntime/OpenVINO reference**
+(**15-16 of 17 pages byte-identical**, all 45 tables cell-for-cell with the
+layout batch at 2 as well; the remaining one or two differ by one 0.1 px box
+coordinate; see the `Resize` note).
+
+**VRAM and the batch sizes (measured 2026-10-23, one A770 16 GB, JIT build,
+`xpu-smi` - not the service's accounting, which sees only its own pool).**
+The card's allocatable VRAM is 15.54 GiB (`global_mem_size`; xpu-smi reports
+the 16 GiB tile).  A fresh process that has loaded the models but not run
+them holds 20 MiB: the weights are uploaded and the kernels compiled on
+first use.  The steady 12-model service after the mask/alias fusions holds **2 776 MiB**
+at layout batch 2 (it was 3 906).  The layout's own executor is **443 MiB at
+N=1** (live 148), 818 at N=2, 1 567 at N=4, 3 066 at N=8, 5 161 at N=12,
+6 812 at N=16 and 9 287 at N=24; the per-image cost is **~0.42 GiB**, down
+from ~0.94, and **N=24 fits** where N=16 used to fail.
+
+The two causes, in order:
+
+* **The constant-pool bug (the old 8-15.9 GiB).**  The executor uploaded its
+  *constants* (weights and folded values) through the activation pool, and
+  the pool's best-fit handed a 4 KB bias a 48 MB block.  A constant is never
+  released, so that block was lost for the rest of the process: **362
+  constants held 1.95 GB** in the layout model alone.  **Tight allocation
+  for the constant mirrors (and for the folded outputs, which are constants
+  too)** cut the layout's first call **2 424 -> 1 361 MiB**, its steady
+  footprint **3 178 -> 1 379**, the service at layout batch 1
+  **8 159 -> 3 260 MiB** and at batch 4 **15 882 -> 5 662 MiB**.  The AOT
+  build measured the same 2 424 before the fix, which ruled the JIT compiler
+  out.
+* **The mask head (the old 911 MB executor at N=1, 889 MB peak).**  The
+  decoder's mask-to-box branch materialised **ten concurrent 12M-element
+  (48 MB) tensors**; `drop_outputs` removed the final 48 MB transfer but not
+  the computation, because the box extrema come from the mask's
+  `ReduceMax`/`ReduceMin`.  `MaskBox` now reads the bmm once and writes the
+  five `[B,300]` values, and the reshape aliases/in-place elementwise reuse
+  remove the remaining copies: **911 -> 443 MiB at N=1, 889 -> 465 MB peak**.
+  The per-image cost and the max batch follow from that.
+
+The oneDNN cache is still per (weight, input shape) - a **time** cost
+(primitive creation per table shape), not the memory one.  The per-model
+`"dnnl": false` keeps the table models on the SYCL kernel because that is
+faster for them (batch-4 table stage 8 902 ms against 9 239 with oneDNN on);
+the fixed-shape layout keeps oneDNN.
+
+**Max batch per stage** (the non-layout rows are all models resident at
+their normal batches; the layout row is a layout-only service after the
+mask-head fusion.  `N` = tested batch sizes, "max" extrapolated from the
+per-image cost and the first failure):
+
+| stage | probe input | cost/image | tested | max (memory) | time per image, N=1 -> best |
+|---|---|---:|---:|---:|---|
+| layout | 3x800x800 | ~0.42 GiB | 24 (9.3 GB) | ~24 (32 fails) | 150 -> 118.9 ms (N=12) |
+| ocr_det | 3x960x960 | ~0.17 GiB | 32 (8.3 GB) | ~32 (64 crashes the service) | 121 -> 82 ms (N=32) |
+| ocr_rec | 3x48x320 | ~18.7 MiB | 128 | ~600 | 34 -> 14.7 ms (N=128) |
+| ocr_cls | 3x48x192 | ~2.3 MiB | 128 | ~5000 | 6.7 -> 0.5 ms (N=32) |
+| table_cls | 3x224x224 | ~7.4 MiB | 64 | ~1600 | 8.5 -> 2.1 ms (N=16) |
+| table_q_cls | 3x224x224 | ~13.6 MiB | 64 | ~900 | 15.2 -> 2.9 ms (N=16) |
+| table_unet | 3x288x1024 | ~140 MiB | 32 (7.6 GB) | ~80 | 50 -> 58 ms (no gain) |
+| table_slanet | 3x488x488 | ~50 MiB | 64 (6.4 GB) | ~240 | 193 -> 34.5 ms (N=64) |
+| slanet1m | 3x488x488 | ~50 MiB | 16 | ~240 | 109 -> 28 ms (N=16) |
+| seal_det | 3x960x960 | ~165 MiB | 32 | ~70 | 130 -> 85 ms |
+| orientation | 3x224x224 | ~7.5 MiB | 128 | ~1600 | 8.6 -> 2.1 ms (N=16) |
+| formula | 1x384x384 | ~210 MiB | 32 (10.5 GB) | ~55 | 274 -> 79 ms (N=32) |
+
+**What to use:** layout **2** for latency (865-893 ms/page; 0.8 GiB) or 8-12 for
+throughput (125/119 ms per image, 3.1/5.2 GiB); ocr_det 8-16; ocr_rec 64-128; ocr_cls 32;
+table_cls / table_q_cls 16-32; table_unet **1** (compute-bound: its per-image
+time is flat); table_slanet 8-16 (5.6x per image); seal_det 4-8; orientation
+16; formula 8-16.  The table UNET's per-image cost is flat, so batching it
+buys nothing; the slanet/formula/rec gains are real.  The pipeline already
+batches rec at up to 128 and the classifiers at 32; the layout's `batch_num`
+and the table det/unet batching are the two places with room.
+
+Two attempts at the table stage's per-table detector were **rejected on
+content**, and both are worth not retrying blind: the PDF's own span boxes
+(and its *line* boxes) are not the detector's segmentation - a line that
+crosses a cell border merges the cell's label with the next cell's number
+(`加权平均净资产收` + `益率（%）21` instead of `加权平均净资产收益率（%）`
+and `21.02`) - and grouping equal-shape tables into one UNET batch is
+content-neutral but **no faster** (the model's cost is per image).  The
+PDF render *was* a one-process default: `ceil(pages/30)` workers capped at 3
+meant 17 pages rendered serially; 4 pages per worker and 8 workers took it
+1 616 -> 1 287 ms (95 -> 76 ms/page, content-neutral).
 
 Two of those numbers are the *lesson*:
 
@@ -1704,7 +1892,11 @@ Two of those numbers are the *lesson*:
   10.5 ms.  **The copy has to go from the top down**: a block copy from
   the bottom up is four times faster and it is *wrong*, because each
   block overwrites the next one's source - and the boxes come out in a
-  different order.
+  different order.  **The list still had one thread per row and an O(k)
+  shift**, so the shipped version is a 64-bit rank-key radix select with
+  one work-group per row (eight coalesced byte passes, one gather, one
+  small sort): the three layout calls are **4 ms total (1.2-1.4 ms each)**,
+  exact against `std::sort` for both directions on quantised random data.
 * **The 2 589 ms is the runtime's JIT, and the AOT build removes it.**
   `SYCL_INFER_AOT=ON` with `SYCL_INFER_AOT_DEVICE=acm-g10` bakes the
   device image in: the first call after a fresh start goes from 3 274 ms
@@ -3379,6 +3571,40 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   executor's slot: the body's operators read their inputs through the
   tensor, and it was still the old (empty) buffer - so the body
   computed with zeros.
+
+* **Buffer borrowing is valid only inside one execution, so it is disabled
+  in a `Loop` body.**  A `Reshape`/`Flatten`/`Squeeze`/`Unsqueeze`/
+  `Identity` may take over a dead input's buffer, and an elementwise op may
+  reuse a same-shape input that dies there; the executor transfers the
+  allocation between the slots.  In a `Loop` body the carried values are
+  read **again on the next iteration**, which per-op liveness cannot see:
+  borrowing a carried value writes the next iteration's input.  The builder
+  therefore sets `op.kind = alias/elementwise` only when `scope == nullptr`
+  (the top-level graph).  The in-place reuse also requires the *same shape*
+  for an elementwise op, not merely the same byte count - a broadcast kernel
+  indexed by output coordinates can read a different element than the one
+  it is overwriting.
+
+* **The formula recogniser is a single-call model in this build.**  A
+  random 384x384 input can drive its `Loop` long enough to grow the pool; the
+  second call then fails with OOM or DEVICE_LOST **even with
+  `SI_ONNX_NOFUSE=1 SI_ONNX_NOINPLACE=1`**, so it is not a fusion regression.
+  A zero input is stable (output sum 1853) and the five real formula crops
+  were integer-exact; exercise it one crop per process, or with the real
+  crops, until the loop's memory is bounded.
+
+* **The layout mask-head fusion must keep the leading batch axis.**
+  `MaskBox` replaces `[B,300,200,200]` reductions with five outputs shaped
+  like the bmm minus its spatial axis: **`[B,300]`, not `[1,B*300]`**.  The
+  `[1,B*300]` form is correct for batch 1 and broke the layout batch-2
+  pipeline at the first decoder `Add` (`[2,300,256]` against `[1,600,256]`);
+  `--layout-batch 2` is the regression test.
+
+* **oneDNN's matmul bias primitive is 4.5x slower than its no-bias form**
+  on the layout's shapes (36 ms against 8 ms for 123 matmuls).  A fused
+  `MatMul`+`Add` therefore keeps the no-bias matmul and applies the bias in
+  `bias_act_launch` (with the fused activation, if any), not through
+  `DNNL_ARG_BIAS`.
 
 * **An operator's output type is not always its input's, and the
   executor's default ("the output takes the input's type") is wrong for

@@ -308,6 +308,7 @@ if(SI_ONNX)
         src/onnx/ops_shape.cpp
         src/onnx/ops_exec.cpp
         src/onnx/kernels.cpp
+        src/onnx/conv_dnnl.cpp
         src/onnx/exec.cpp
         src/onnx/wire.cpp
         src/onnx/service.cpp
@@ -327,6 +328,11 @@ if(SI_ONNX)
     )
     find_package(Threads REQUIRED)
     target_link_libraries(si_onnx_core PUBLIC Threads::Threads)
+    # oneDNN for the group-1 f32 convolution path (conv_dnnl.cpp): the same
+    # library the engine's int8 GEMM uses, and the same include/lib search
+    # (DNNL_ROOT above).
+    target_include_directories(si_onnx_core PRIVATE "${DNNL_ROOT}/include")
+    target_link_libraries(si_onnx_core PUBLIC "${DNNL_LIBRARY}")
     if(OpenSSL_FOUND)
         target_compile_definitions(si_onnx_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
         target_link_libraries(si_onnx_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)

@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "device/device_profile.h"
 
@@ -95,7 +96,13 @@ struct ew_functor {
 float apply_act(float v, ew_op act, const act_params_t & params) {
     switch (act) {
     case ew_op::relu: return v > 0.0f ? v : 0.0f;
-    case ew_op::sigmoid: return 1.0f / (1.0f + std::exp(-v));
+    case ew_op::sigmoid: {
+        // Stable form, the same one ew_functor uses: the exponent is never
+        // positive, so a large negative activation cannot turn exp into inf.
+        if (v >= 0.0f) return 1.0f / (1.0f + std::exp(-v));
+        const float e = std::exp(v);
+        return e / (1.0f + e);
+    }
     case ew_op::hardsigmoid: {
         // The linear form: clamp(a * x + b, 0, 1).  (The opset decides what
         // a and b are; see hardsigmoid_params.)
@@ -217,10 +224,12 @@ void q_copy_dev(sycl::queue & q, const void * src, void * dst, size_t bytes) {
 // lives on the host, and a comparison of two int64 masks has to be an
 // integer comparison - reading an integer as a float reads its bits).
 void ew_launch(sycl::queue & q, const float * a, const float * b, float * y, size_t n, ew_op op,
-               const std::vector<float> & params, bool probe, int scalar_op) {
+               const std::vector<float> & params, bool probe, int scalar_op, ew_op act,
+               act_params_t ap) {
     if (n == 0) return;
     float p[4] = {-3.0f, 3.0f, 0.0f, 0.0f};
     for (size_t i = 0; i < params.size() && i < 4; ++i) p[i] = params[i];
+    const act_params_t actp = ap;
     q.submit([&](sycl::handler & h) {
         h.parallel_for(sycl::range<1>(n), [=](sycl::item<1> it) {
             const size_t i = it.get_id(0);
@@ -229,8 +238,8 @@ void ew_launch(sycl::queue & q, const float * a, const float * b, float * y, siz
             const float x = scalar_op == 0 ? (a ? a[0] : 0.0f) : a[i];
             const float z = b ? (scalar_op == 1 ? b[0] : b[i]) : 0.0f;
             ew_functor f{op, {p[0], p[1], p[2], p[3]}};
-            y[i] = f(x, z);
-            if (probe) y[i] = x;  // the probe: echo the input
+            const float v = f(x, z);
+            y[i] = probe ? x : apply_act(v, act, actp);  // the probe: echo the input
         });
     });
 }
@@ -297,10 +306,12 @@ void where_launch(sycl::queue & q, const float * cond, const float * a, const fl
 
 void ew_bcast_launch(sycl::queue & q, const float * a, const int64_t * a_stride, const float * b,
                      const int64_t * b_stride, float * y, const int64_t * out_shape, int rank,
-                     size_t count, ew_op op, const std::vector<float> & params) {
+                     size_t count, ew_op op, const std::vector<float> & params, ew_op act,
+                     act_params_t ap) {
     if (count == 0) return;
     float p[4] = {-3.0f, 3.0f, 0.0f, 0.0f};
     for (size_t i = 0; i < params.size() && i < 4; ++i) p[i] = params[i];
+    const act_params_t actp = ap;
     // The strides and the shape are copied out: the kernel may not capture
     // a host pointer (and a std::vector is not device copyable).
     int64_t as[8] = {0}, bs[8] = {0}, os[8] = {0};
@@ -309,6 +320,48 @@ void ew_bcast_launch(sycl::queue & q, const float * a, const int64_t * a_stride,
         as[d] = a_stride[d];
         bs[d] = b_stride ? b_stride[d] : 0;
         os[d] = out_shape[d];
+    }
+    // The elementwise broadcast that matters: one operand is constant over a
+    // long *contiguous* suffix of the output (the model's normalize divides
+    // each NCHW channel by one scalar over H*W elements).  The generic
+    // kernel decomposes every element's coordinates once per axis - four
+    // 64-bit divisions for an 800x800 image - which measured 14 ms for 1.9M
+    // elements.  A 2D range gives the run index and the position inside the
+    // run with no division at all, and the run is coalesced.
+    if (b) {
+        int suffix = 0;
+        int64_t inner = 1, a_expected = 1;
+        for (int d = n - 1; d >= 0; --d) {
+            if (bs[d] != 0) break;
+            if (as[d] != a_expected) break;
+            inner *= os[d];
+            a_expected *= os[d];
+            ++suffix;
+        }
+        if (suffix > 0 && inner >= 64) {
+            const int64_t outer = (int64_t)count / inner;
+            if (outer * inner == (int64_t)count) {
+                q.submit([&](sycl::handler & h) {
+                    h.parallel_for(sycl::range<2>((size_t)outer, (size_t)inner),
+                                   [=](sycl::item<2> it) {
+                                       const int64_t o = (int64_t)it.get_id(0);
+                                       const int64_t r = (int64_t)it.get_id(1);
+                                       int64_t rest = o, ao = 0, bo = 0;
+                                       for (int d = n - suffix - 1; d >= 0; --d) {
+                                           const int64_t dim = os[d] > 0 ? os[d] : 1;
+                                           const int64_t c = rest % dim;
+                                           rest /= dim;
+                                           ao += c * as[d];
+                                           bo += c * bs[d];
+                                       }
+                                       ew_functor f{op, {p[0], p[1], p[2], p[3]}};
+                                       y[o * inner + r] =
+                                           apply_act(f(a[ao + r], b[bo]), act, actp);
+                                   });
+                });
+                return;
+            }
+        }
     }
     q.submit([&](sycl::handler & h) {
         h.parallel_for(sycl::range<1>(count), [=](sycl::item<1> it) {
@@ -322,7 +375,82 @@ void ew_bcast_launch(sycl::queue & q, const float * a, const int64_t * a_stride,
                 bo += dim * bs[d];
             }
             ew_functor f{op, {p[0], p[1], p[2], p[3]}};
-            y[idx] = f(a[ao], b ? b[bo] : 0.0f);
+            y[idx] = apply_act(f(a[ao], b ? b[bo] : 0.0f), act, actp);
+        });
+    });
+}
+
+void bias_act_launch(sycl::queue & q, float * y, const float * bias, size_t n, int64_t width,
+                     ew_op act, act_params_t ap) {
+    if (!y || n == 0 || (bias && width <= 0)) return;
+    const int64_t w = width;
+    const act_params_t actp = ap;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(n), [=](sycl::item<1> it) {
+            const size_t i = it.get_id(0);
+            float v = y[i];
+            if (bias) v += bias[(int64_t)(i % (size_t)w)];
+            y[i] = apply_act(v, act, actp);
+        });
+    });
+}
+
+void mask_box_launch(sycl::queue & q, const float * logits, const float * grid_a,
+                     const float * grid_b, float * any, float * max_a, float * max_b,
+                     float * min_a, float * min_b, int64_t rows, int64_t height, int64_t width,
+                     float threshold, float sentinel) {
+    if (!logits || !grid_a || !grid_b || rows <= 0 || height <= 0 || width <= 0) return;
+    const int64_t area = height * width;
+    constexpr int WG = 256;
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> part(5 * WG, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)rows * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t row = it.get_group(0);
+            const int lane = (int)it.get_local_id(0);
+            const float * p = logits + row * area;
+            float vany = 0.0f;
+            float vmax_a = -INFINITY, vmax_b = -INFINITY;
+            float vmin_a = sentinel, vmin_b = sentinel;
+            for (int64_t k = lane; k < area; k += WG) {
+                if (p[k] > threshold) {
+                    vany = 1.0f;
+                    const float a = grid_a[k];
+                    const float b = grid_b[k];
+                    vmax_a = a > vmax_a ? a : vmax_a;
+                    vmax_b = b > vmax_b ? b : vmax_b;
+                    vmin_a = a < vmin_a ? a : vmin_a;
+                    vmin_b = b < vmin_b ? b : vmin_b;
+                }
+            }
+            part[0 * WG + lane] = vany;
+            part[1 * WG + lane] = vmax_a;
+            part[2 * WG + lane] = vmax_b;
+            part[3 * WG + lane] = vmin_a;
+            part[4 * WG + lane] = vmin_b;
+            it.barrier(sycl::access::fence_space::local_space);
+            for (int stride = WG / 2; stride > 0; stride /= 2) {
+                if (lane < stride) {
+                    const int a = lane, b = lane + stride;
+                    part[0 * WG + a] = part[0 * WG + b] > part[0 * WG + a]
+                                           ? part[0 * WG + b] : part[0 * WG + a];
+                    part[1 * WG + a] = part[1 * WG + b] > part[1 * WG + a]
+                                           ? part[1 * WG + b] : part[1 * WG + a];
+                    part[2 * WG + a] = part[2 * WG + b] > part[2 * WG + a]
+                                           ? part[2 * WG + b] : part[2 * WG + a];
+                    part[3 * WG + a] = part[3 * WG + b] < part[3 * WG + a]
+                                           ? part[3 * WG + b] : part[3 * WG + a];
+                    part[4 * WG + a] = part[4 * WG + b] < part[4 * WG + a]
+                                           ? part[4 * WG + b] : part[4 * WG + a];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+            if (lane == 0) {
+                any[row] = part[0 * WG];
+                max_a[row] = part[0 * WG] != 0.0f ? part[1 * WG] : 0.0f;
+                max_b[row] = part[0 * WG] != 0.0f ? part[2 * WG] : 0.0f;
+                min_a[row] = part[3 * WG];
+                min_b[row] = part[4 * WG];
+            }
         });
     });
 }
@@ -348,6 +476,29 @@ void conv2d_launch(sycl::queue & q, const float * x, const float * w, const floa
     case 2: conv2d_kernel<2>(q, x, w, bias, scale, add, y, N, C, H, W, M, Ho, Wo, kh, kw, sh, sw, ph, pw, dh, dw, group, act, p, probe); break;
     default: conv2d_kernel<1>(q, x, w, bias, scale, add, y, N, C, H, W, M, Ho, Wo, kh, kw, sh, sw, ph, pw, dh, dw, group, act, p, probe); break;
     }
+}
+
+void conv_epilogue_launch(sycl::queue & q, float * y, int N, int C, int H, int W,
+                          const float * bias, const float * scale, const float * add, ew_op act,
+                          act_params_t act_params) {
+    const int64_t hw = (int64_t)H * W;
+    const int64_t n = (int64_t)N * C * hw;
+    if (n <= 0) return;
+    const act_params_t p = act_params;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(n), [=](sycl::item<1> it) {
+            const int64_t i = it.get_id(0);
+            const int c = (int)((i / hw) % C);
+            float v = y[i];
+            // The order matters: the convolution's own bias, then the batch
+            // norm's scale, then its bias - the same sequence conv2d_kernel
+            // applies.
+            if (bias) v += bias[c];
+            if (scale) v *= scale[c];
+            if (add) v += add[c];
+            y[i] = apply_act(v, act, p);
+        });
+    });
 }
 
 void conv_transpose2d_launch(sycl::queue & q, const float * x, const float * w, const float * bias,
@@ -459,8 +610,18 @@ void resize_launch(sycl::queue & q, const float * x, float * y, int N, int C, in
             const float * xp = x + (((int64_t)n * C + c) * H) * W;
             float v = 0.0f;
             if (nearest) {
-                const int ih = (int)((float)ho * H / (float)Ho);
-                const int iw = (int)((float)wo * W / (float)Wo);
+                // The source index is floor(wo * W / Wo) for
+                // coordinate_transformation_mode=asymmetric with
+                // nearest_mode=floor.  **Integer arithmetic, not float**:
+                // `wo * W / Wo` in float is compiled to a reciprocal
+                // multiply, and on this device the reciprocal is slightly
+                // below 1/60 - so at an exact multiple (upsampling 30 -> 60,
+                // wo = 2) the floor came out one short and the first source
+                // pixel took three columns instead of two.  That shifted the
+                // whole detector probability map by a pixel (and the table
+                // text boxes with it).
+                const int ih = (int)(((int64_t)ho * H) / Ho);
+                const int iw = (int)(((int64_t)wo * W) / Wo);
                 v = xp[(int64_t)ih * W + iw];
             } else {
                 // Bilinear, align_corners = false: the source coordinate is
@@ -499,68 +660,144 @@ void global_avg_pool_launch(sycl::queue & q, const float * x, float * y, int N, 
     });
 }
 
+void argmax_launch(sycl::queue & q, const float * x, int64_t * y, int64_t outer, int64_t n,
+                   int64_t inner) {
+    if (outer <= 0 || inner <= 0 || n <= 0) return;
+    const int64_t total = outer * inner;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
+            const int64_t idx = it.get_id(0);
+            const int64_t o = idx / inner;
+            const int64_t i = idx % inner;
+            const float * p = x + o * n * inner + i;
+            float best = p[0];
+            int64_t bi = 0;
+            // The host's tie-break: the first maximum wins (`v > best`).
+            for (int64_t k = 1; k < n; ++k) {
+                const float v = p[k * inner];
+                if (v > best) {
+                    best = v;
+                    bi = k;
+                }
+            }
+            y[idx] = bi;
+        });
+    });
+}
+
 // The reduction over an *integer* input.
 //
 // The layout model's decoder reduces a mask of twelve million int32
 // elements, and the host does that in 282 milliseconds - the device does
 // it in about a millisecond.  The kernel is the same walk with a
 // different element type, and the *output* is an integer too.
-template <typename T, typename U>
-void reduce_launch_int(sycl::queue & q, const T * x, U * y, int64_t outer, int64_t axis,
-                        int64_t inner, ew_op op, bool mean) {
+// (The implementation is templated on the operator, below: the switch that
+// used to sit in the inner loop was the reason 12M elements took 6 ms.)
+
+// The reduction's combine, as a template so the operator is *not* a switch
+// inside the inner loop.  The switch was the whole cost: 12M elements took
+// 6 ms (8 GB/s) because every iteration was a branch on a uniform value the
+// compiler could not hoist, which also kept the accumulator chain serial.
+template <ew_op OP, class U>
+static inline U red_bin(U a, U b) {
+    if constexpr (OP == ew_op::add) return (U)(a + b);
+    else if constexpr (OP == ew_op::mul) return (U)(a * b);
+    else if constexpr (OP == ew_op::max_) return b > a ? b : a;
+    else if constexpr (OP == ew_op::min_) return b < a ? b : a;
+    else return (U)(a + b);
+}
+
+template <ew_op OP, class T, class U>
+static inline U red_init() {
+    if constexpr (OP == ew_op::add) return (U)0;
+    else if constexpr (OP == ew_op::mul) return (U)1;
+    else if constexpr (OP == ew_op::max_) return std::numeric_limits<U>::lowest();
+    else if constexpr (OP == ew_op::min_) return std::numeric_limits<U>::max();
+    else return (U)0;
+}
+
+template <ew_op OP, class T, class U>
+static void reduce_launch_op(sycl::queue & q, const T * x, U * y, int64_t outer, int64_t axis,
+                             int64_t inner, bool mean) {
+    if (axis <= 0 || inner <= 0 || outer <= 0) return;
     const int64_t total = outer * inner;
+    const U init = red_init<OP, T, U>();
     q.submit([&](sycl::handler & h) {
         h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
             const int64_t idx = it.get_id(0);
             const int64_t o = idx / inner;
             const int64_t i = idx % inner;
             const T * xp = x + o * axis * inner + i;
-            U acc = (U)xp[0];
-            for (int64_t k = 1; k < axis; ++k) {
-                const U v = (U)xp[k * inner];
-                switch (op) {
-                case ew_op::add: acc += v; break;
-                case ew_op::mul: acc *= v; break;
-                case ew_op::max_: acc = v > acc ? v : acc; break;
-                case ew_op::min_: acc = v < acc ? v : acc; break;
-                default: acc += v; break;
-                }
+            // Four independent chains: the reduction is associative, and one
+            // dependent load per iteration leaves the memory system idle.
+            U a0 = init, a1 = init, a2 = init, a3 = init;
+            int64_t k = 0;
+            for (; k + 3 < axis; k += 4) {
+                a0 = red_bin<OP>(a0, (U)xp[k * inner]);
+                a1 = red_bin<OP>(a1, (U)xp[(k + 1) * inner]);
+                a2 = red_bin<OP>(a2, (U)xp[(k + 2) * inner]);
+                a3 = red_bin<OP>(a3, (U)xp[(k + 3) * inner]);
             }
+            for (; k < axis; ++k) a0 = red_bin<OP>(a0, (U)xp[k * inner]);
+            U acc = red_bin<OP>(red_bin<OP>(a0, a1), red_bin<OP>(a2, a3));
             if (mean) acc = (U)(acc / (U)axis);
             y[idx] = acc;
         });
     });
 }
 
-void reduce_launch(sycl::queue & q, const float * x, float * y, int64_t outer, int64_t axis,
-                   int64_t inner, ew_op op, bool mean) {
-    // The reduction is over the `axis` elements that follow every `inner`
-    // elements, for each of the `outer` rows.
-    const int64_t total = outer * inner;
+// A reduction over the *last* axis (inner == 1) with many rows and a long
+// axis is the layout's mask head: 300 rows of 40 000 values.  The one
+// work-item per row form gives 300 threads and leaves the card idle; a
+// work-group per row gives 256 threads each and a tree reduction in SLM.
+// (The layout's six 12M-element reductions were 6 ms each at ~8 GB/s.)
+template <ew_op OP, class T, class U>
+static void reduce_rows_launch(sycl::queue & q, const T * x, U * y, int64_t outer,
+                               int64_t axis, bool mean) {
+    constexpr int WG = 256;
+    const U init = red_init<OP, T, U>();
     q.submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
-            const int64_t idx = it.get_id(0);
-            const int64_t o = idx / inner;
-            const int64_t i = idx % inner;
-            const float * xp = x + o * axis * inner + i;
-            float acc = xp[0];
-            for (int64_t k = 1; k < axis; ++k) {
-                const float v = xp[k * inner];
-                switch (op) {
-                case ew_op::add: acc += v; break;
-                case ew_op::mul: acc *= v; break;
-                case ew_op::max_: acc = v > acc ? v : acc; break;
-                case ew_op::min_: acc = v < acc ? v : acc; break;
-                default: acc += v; break;
-                }
+        sycl::local_accessor<U, 1> part(WG, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)outer * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t o = it.get_group(0);
+            const int lane = (int)it.get_local_id(0);
+            const T * p = x + o * axis;
+            U acc = init;
+            for (int64_t k = lane; k < axis; k += WG) acc = red_bin<OP>(acc, (U)p[k]);
+            part[lane] = acc;
+            it.barrier(sycl::access::fence_space::local_space);
+            for (int stride = WG / 2; stride > 0; stride /= 2) {
+                if (lane < stride) part[lane] = red_bin<OP>(part[lane], part[lane + stride]);
+                it.barrier(sycl::access::fence_space::local_space);
             }
-            // The mean divides by the count of the reduced elements.  (The
-            // kernel used to divide whenever the operator was a sum, which
-            // made the *sum* wrong and the mean wrong twice over.)
-            if (mean) acc /= (float)axis;
-            y[idx] = acc;
+            if (lane == 0) y[o] = mean ? (U)(part[0] / (U)axis) : part[0];
         });
     });
+}
+
+template <class T, class U>
+static void reduce_dispatch(sycl::queue & q, const T * x, U * y, int64_t outer, int64_t axis,
+                            int64_t inner, ew_op op, bool mean) {
+    // The long last-axis case: one work-group per row.  The layout's mask
+    // max is an *int* cast of the mask (12M elements) with 300 rows, and the
+    // one-work-item-per-row form left it at 300 threads (6 ms); the
+    // work-group form is 256 threads per row.
+    if (inner == 1 && axis >= 512 && outer >= 8) {
+        switch (op) {
+        case ew_op::add: reduce_rows_launch<ew_op::add>(q, x, y, outer, axis, mean); return;
+        case ew_op::mul: reduce_rows_launch<ew_op::mul>(q, x, y, outer, axis, mean); return;
+        case ew_op::max_: reduce_rows_launch<ew_op::max_>(q, x, y, outer, axis, mean); return;
+        case ew_op::min_: reduce_rows_launch<ew_op::min_>(q, x, y, outer, axis, mean); return;
+        default: reduce_rows_launch<ew_op::add>(q, x, y, outer, axis, mean); return;
+        }
+    }
+    switch (op) {
+    case ew_op::add: reduce_launch_op<ew_op::add>(q, x, y, outer, axis, inner, mean); break;
+    case ew_op::mul: reduce_launch_op<ew_op::mul>(q, x, y, outer, axis, inner, mean); break;
+    case ew_op::max_: reduce_launch_op<ew_op::max_>(q, x, y, outer, axis, inner, mean); break;
+    case ew_op::min_: reduce_launch_op<ew_op::min_>(q, x, y, outer, axis, inner, mean); break;
+    default: reduce_launch_op<ew_op::add>(q, x, y, outer, axis, inner, mean); break;
+    }
 }
 
 // The reduction's dispatch: the element type of the input and of the output.
@@ -571,20 +808,21 @@ void reduce_launch(sycl::queue & q, const float * x, float * y, int64_t outer, i
 void reduce_launch_typed(sycl::queue & q, const void * x, void * y, int64_t outer, int64_t axis,
                         int64_t inner, ew_op op, bool mean, int in_kind, int out_kind) {
     if (in_kind == 2 && out_kind == 2) {
-        reduce_launch_int<int64_t, int64_t>(q, (const int64_t *)x, (int64_t *)y, outer, axis, inner,
-                                            op, mean);
+        reduce_dispatch(q, (const int64_t *)x, (int64_t *)y, outer, axis, inner, op, mean);
     } else if (in_kind == 1 && out_kind == 1) {
-        reduce_launch_int<int32_t, int32_t>(q, (const int32_t *)x, (int32_t *)y, outer, axis, inner,
-                                            op, mean);
+        reduce_dispatch(q, (const int32_t *)x, (int32_t *)y, outer, axis, inner, op, mean);
     } else if (in_kind == 1 && out_kind == 2) {
-        reduce_launch_int<int32_t, int64_t>(q, (const int32_t *)x, (int64_t *)y, outer, axis, inner,
-                                            op, mean);
+        reduce_dispatch(q, (const int32_t *)x, (int64_t *)y, outer, axis, inner, op, mean);
     } else if (in_kind == 2 && out_kind == 1) {
-        reduce_launch_int<int64_t, int32_t>(q, (const int64_t *)x, (int32_t *)y, outer, axis, inner,
-                                            op, mean);
+        reduce_dispatch(q, (const int64_t *)x, (int32_t *)y, outer, axis, inner, op, mean);
     } else {
-        reduce_launch(q, (const float *)x, (float *)y, outer, axis, inner, op, mean);
+        reduce_dispatch(q, (const float *)x, (float *)y, outer, axis, inner, op, mean);
     }
+}
+
+void reduce_launch(sycl::queue & q, const float * x, float * y, int64_t outer, int64_t axis,
+                   int64_t inner, ew_op op, bool mean) {
+    reduce_dispatch(q, x, y, outer, axis, inner, op, mean);
 }
 
 void softmax_launch(sycl::queue & q, const float * x, float * y, size_t rows, int64_t cols) {
@@ -800,7 +1038,7 @@ void concat_launch(sycl::queue & q, const std::vector<const float *> & in,
 
     int64_t offs[kMaxIn] = {0};
     int64_t asz[kMaxIn] = {0};
-    int64_t istride[kMaxIn][kMaxRank] = {{0}};
+    int64_t ishape[kMaxIn][kMaxRank] = {{0}};
     const float * ptrs[kMaxIn] = {nullptr};
     {
         int64_t acc = 0;
@@ -809,49 +1047,37 @@ void concat_launch(sycl::queue & q, const std::vector<const float *> & in,
             asz[i] = in_shapes[i][axis];
             acc += asz[i];
             ptrs[i] = in[i];
-            int64_t s = 1;
-            for (int d = n - 1; d >= 0; --d) {
-                if (d == axis) {
-                    istride[i][d] = s;
-                } else {
-                    istride[i][d] = (in_shapes[i][d] == 1) ? 0 : s;
-                }
-                s *= in_shapes[i][d];
-            }
+            for (int d = 0; d < n; ++d) ishape[i][d] = in_shapes[i][d];
         }
     }
 
+    // The copy runs over each *input's* own elements, not over the output:
+    // the input is contiguous, so its element index is its source offset,
+    // and only the destination offset needs the coordinates.  The old version
+    // launched one kernel per input over the whole output and made every
+    // element work out which input owned it - nin passes over the output and
+    // a full coordinate decomposition per element, which is what made 140
+    // concats 42 ms of the layout model.
     for (int k = 0; k < nin; ++k) {
         const float * src_ptr = ptrs[k];
+        const int64_t base = offs[k] * ostride[axis];
+        int64_t count = 1;
+        for (int d = 0; d < n; ++d) count *= ishape[k][d];
+        if (count == 0) continue;
         q.submit([&](sycl::handler & h) {
-            h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
+            h.parallel_for(sycl::range<1>(count), [=](sycl::item<1> it) {
                 const int64_t idx = it.get_id(0);
-                // The element's coordinates in the output's index space.
-                int64_t coord[kMaxRank] = {0};
                 int64_t rest = idx;
+                int64_t dp = base;
+                // The input's own coordinates; a size-1 dim broadcasts (its
+                // coordinate is 0, so it adds nothing).
                 for (int d = n - 1; d >= 0; --d) {
-                    coord[d] = rest % out_shape[d];
-                    rest /= out_shape[d];
+                    const int64_t dim = ishape[k][d];
+                    const int64_t c = dim > 0 ? rest % dim : 0;
+                    rest /= dim > 0 ? dim : 1;
+                    dp += c * ostride[d];
                 }
-                // The axis: the element belongs to the input that covers it.
-                const int64_t a = coord[axis];
-                int which = 0;
-                for (int i = 0; i < nin; ++i) {
-                    if (a < offs[i] + asz[i]) {
-                        which = i;
-                        break;
-                    }
-                }
-                if (which != k) return;  // another input's element
-                // The source uses the input's own axis index, the
-                // destination the output's.
-                int64_t sp = 0, dp = 0;
-                for (int d = 0; d < n; ++d) {
-                    const int64_t cd = (d == axis) ? (a - offs[which]) : coord[d];
-                    sp += cd * istride[k][d];
-                    dp += coord[d] * ostride[d];
-                }
-                y[dp] = src_ptr[sp];
+                y[dp] = src_ptr[idx];
             });
         });
     }
@@ -902,96 +1128,214 @@ void gather_launch(sycl::queue & q, const float * x, const int64_t * idx, float 
     });
 }
 
+// The order key: a larger key is a better candidate for both directions.
+// The float bits are made monotonic (the sign flip), the direction is
+// inverted for the smallest-k case, and the low 32 bits are the *inverted*
+// column index so that an equal value prefers the lower index.  The index
+// makes every key unique, which is what lets the radix select stop at an
+// exact k-th key instead of dealing with ties separately.
+static inline uint64_t topk_key(float v, int64_t idx, bool largest) {
+    union {
+        float f;
+        uint32_t u;
+    } bits;
+    bits.f = v;
+    uint32_t k = (bits.u & 0x80000000u) ? ~bits.u : (bits.u | 0x80000000u);
+    if (!largest) k = ~k;
+    return ((uint64_t)k << 32) | (uint32_t)(0xffffffffu - (uint32_t)idx);
+}
+
+// Sort k existing (value, index) pairs best-first.  The heap's root is the
+// worst pair (smallest value for largest, largest for smallest; on a tie the
+// higher index), and moving it to the shrinking end leaves the array
+// best-first.
+static inline void topk_sort_in_place(int k, bool largest, float * hv, int64_t * hi) {
+    if (k <= 0) return;
+    auto worse = [=](float av, int64_t ai, float bv, int64_t bi) {
+        if (largest) return av < bv || (av == bv && ai > bi);
+        return av > bv || (av == bv && ai > bi);
+    };
+    auto sift = [&](int start, int n) {
+        int i = start;
+        while (true) {
+            const int l = 2 * i + 1;
+            if (l >= n) break;
+            const int rr = l + 1;
+            int w = l;
+            if (rr < n && worse(hv[rr], hi[rr], hv[l], hi[l])) w = rr;
+            if (!worse(hv[w], hi[w], hv[i], hi[i])) break;
+            const float tv = hv[i];
+            const int64_t ti = hi[i];
+            hv[i] = hv[w];
+            hi[i] = hi[w];
+            hv[w] = tv;
+            hi[w] = ti;
+            i = w;
+        }
+    };
+    for (int i = k / 2 - 1; i >= 0; --i) sift(i, k);
+    for (int n = k; n > 1;) {
+        --n;
+        const float tv = hv[0];
+        const int64_t ti = hi[0];
+        hv[0] = hv[n];
+        hi[0] = hi[n];
+        hv[n] = tv;
+        hi[n] = ti;
+        sift(0, n);
+    }
+}
+
+// The fallback for k >= cols (and for very short rows): one heap per row.
+// It writes exactly k entries, with the unused tail marked index -1, which
+// is the ONNX TopK output that the old implementation produced.
+static inline void topk_heap_row(const float * xp, int64_t begin, int64_t end, int k, bool largest,
+                                 float * hv, int64_t * hi) {
+    auto worse = [=](float av, int64_t ai, float bv, int64_t bi) {
+        if (largest) return av < bv || (av == bv && ai > bi);
+        return av > bv || (av == bv && ai > bi);
+    };
+    auto sift_down = [&](int n) {
+        int i = 0;
+        while (true) {
+            const int l = 2 * i + 1;
+            if (l >= n) break;
+            const int rr = l + 1;
+            int w = l;
+            if (rr < n && worse(hv[rr], hi[rr], hv[l], hi[l])) w = rr;
+            if (!worse(hv[w], hi[w], hv[i], hi[i])) break;
+            const float tv = hv[i];
+            const int64_t ti = hi[i];
+            hv[i] = hv[w];
+            hi[i] = hi[w];
+            hv[w] = tv;
+            hi[w] = ti;
+            i = w;
+        }
+    };
+    int m = 0;
+    for (int64_t c = begin; c < end; ++c) {
+        const float v = xp[c];
+        if (m < k) {
+            int i = m++;
+            hv[i] = v;
+            hi[i] = c;
+            while (i > 0) {
+                const int p = (i - 1) / 2;
+                if (!worse(hv[i], hi[i], hv[p], hi[p])) break;
+                const float tv = hv[i];
+                const int64_t ti = hi[i];
+                hv[i] = hv[p];
+                hi[i] = hi[p];
+                hv[p] = tv;
+                hi[p] = ti;
+                i = p;
+            }
+        } else if (worse(hv[0], hi[0], v, c)) {
+            hv[0] = v;
+            hi[0] = c;
+            sift_down(m);
+        }
+    }
+    topk_sort_in_place(m, largest, hv, hi);
+    for (int j = m; j < k; ++j) {
+        hv[j] = 0.0f;
+        hi[j] = -1;
+    }
+}
+
 void topk_launch(sycl::queue & q, const float * x, float * values, int64_t * indices, size_t rows,
-                   int64_t cols, int k, bool largest, float * scratch_v, int64_t * scratch_i) {
-    // One work-item per row, and the row's sorted list in the scratch.
-    //
-    // The obvious implementation - k passes over the columns, each picking
-    // the best of the ones not yet picked - is O(k^2 * cols) because the
-    // "is it taken" test is O(k).  The layout model's decoder asks for the
-    // top 300 of 13 125 columns, and that is 1.2 billion comparisons per
-    // row: 60 seconds for one page.
-    //
-    // The list is kept sorted instead, and a column is inserted into it: the
-    // whole pass is O(cols * k), which is 4 million - a millisecond.
-    //
-    // The tie-break is the lower index, which is what the reference
-    // implementation does: a new element with the same value does not
-    // displace the one that is already there.
+                   int64_t cols, int k, bool largest) {
+    if (k <= 0 || rows == 0 || cols <= 0) return;
+    if (k >= cols || cols < 256) {
+        q.submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>(rows), [=](sycl::item<1> it) {
+                const size_t r = it.get_id(0);
+                topk_heap_row(x + (int64_t)r * cols, 0, cols, k, largest,
+                              values + (int64_t)r * k, indices + (int64_t)r * k);
+            });
+        });
+        return;
+    }
+
+    // One work-group per row, one radix pass per key byte.  The 64-bit key is
+    // (monotonic float, inverted index), so a pass bins a byte and the
+    // work-group keeps the bucket that contains the k-th key.  Eight passes
+    // read the row eight times (104k values for 13 125 columns), but the
+    // reads are coalesced across the 256 lanes and the work-group is the
+    // unit of parallelism: the old implementation used one thread per row
+    // and random global shifts.
+    constexpr int WG = 256;
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<uint32_t, 1> hist(256, h);
+        sycl::local_accessor<uint64_t, 1> lprefix(1, h);
+        sycl::local_accessor<int, 1> lrem(1, h);
+        sycl::local_accessor<int, 1> lpos(1, h);
+        h.parallel_for(sycl::nd_range<1>((size_t)rows * WG, WG), [=](sycl::nd_item<1> it) {
+            const size_t r = it.get_group(0);
+            const int lane = (int)it.get_local_id(0);
+            const float * xp = x + (int64_t)r * cols;
+            if (lane == 0) {
+                lprefix[0] = 0;
+                lrem[0] = k;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            for (int shift = 56; shift >= 0; shift -= 8) {
+                for (int i = lane; i < 256; i += WG) hist[i] = 0;
+                it.barrier(sycl::access::fence_space::local_space);
+                const uint64_t mask = shift == 56 ? 0ULL : (~0ULL << (shift + 8));
+                const uint64_t pref = lprefix[0];
+                for (int64_t c = lane; c < cols; c += WG) {
+                    const uint64_t key = topk_key(xp[c], c, largest);
+                    if ((key & mask) != pref) continue;
+                    const uint32_t b = (uint32_t)((key >> shift) & 0xff);
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+                                     sycl::memory_scope::work_group,
+                                     sycl::access::address_space::local_space>
+                        a(hist[b]);
+                    a.fetch_add(1);
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                if (lane == 0) {
+                    const int rem = lrem[0];
+                    int acc = 0, b = -1;
+                    for (int xb = 255; xb >= 0; --xb) {
+                        acc += (int)hist[xb];
+                        if (acc >= rem) {
+                            b = xb;
+                            break;
+                        }
+                    }
+                    if (b >= 0) {
+                        lprefix[0] |= (uint64_t)(uint32_t)b << shift;
+                        lrem[0] = rem - (acc - (int)hist[b]);
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+            const uint64_t cutoff = lprefix[0];
+            if (lane == 0) lpos[0] = 0;
+            it.barrier(sycl::access::fence_space::local_space);
+            for (int64_t c = lane; c < cols; c += WG) {
+                const float v = xp[c];
+                const uint64_t key = topk_key(v, c, largest);
+                if (key < cutoff) continue;
+                sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                                 sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>
+                    a(lpos[0]);
+                const int slot = a.fetch_add(1);
+                if (slot < k) {
+                    values[(int64_t)r * k + slot] = v;
+                    indices[(int64_t)r * k + slot] = c;
+                }
+            }
+        });
+    });
     q.submit([&](sycl::handler & h) {
         h.parallel_for(sycl::range<1>(rows), [=](sycl::item<1> it) {
             const size_t r = it.get_id(0);
-            const float * xp = x + (int64_t)r * cols;
-            float * sv = scratch_v + (int64_t)r * k;
-            int64_t * si = scratch_i + (int64_t)r * k;
-            int m = 0;
-            for (int64_t c = 0; c < cols; ++c) {
-                const float v = xp[c];
-                if (m == k) {
-                    // The list is full: only a better value can get in.
-                    const float worst = largest ? sv[k - 1] : sv[0];
-                    if (largest ? (v <= worst) : (v >= worst)) continue;
-                }
-                // The position: the list is sorted, so a binary search finds
-                // it in log2(k) comparisons instead of k.
-                //
-                // The position is the first element that is *worse* than the
-                // new one, which is what puts an equal value after the one
-                // that is already there (the lower index first).
-                int lo = 0, hi = m;
-                while (lo < hi) {
-                    const int mid = (lo + hi) / 2;
-                    const bool worse = largest ? (sv[mid] < v) : (sv[mid] > v);
-                    if (worse) hi = mid;
-                    else lo = mid + 1;
-                }
-                const int pos = lo;
-                // The shift: the elements from the position on move up by
-                // one.  It is a block copy and not a loop: the loop is a
-                // chain of dependent global reads and writes, and the chain
-                // *is* the cost (the layout model's top-k was 59
-                // milliseconds of it).  The blocks are read into registers
-                // first, so there is no dependency between the read and the
-                // write.
-                //
-                // (A memmove here is five times *slower*: the device's libc
-                // call is not inlined, and the top-k does one per column.)
-                //
-                // A full list drops its last element.
-                const int n = (m < k ? m : m - 1) - pos;
-                // The blocks, from the top: the copy moves the elements up,
-                // so a block that is read after the one below it has been
-                // written reads the *written* values.  (The copy from the
-                // bottom up is 4 times faster and it is wrong: the boxes
-                // come out in a different order.)
-                int end = pos + n;
-                while (end - pos >= 8) {
-                    const int i = end - 8;
-                    float tv[8];
-                    int64_t ti[8];
-                    for (int j = 0; j < 8; ++j) {
-                        tv[j] = sv[i + j];
-                        ti[j] = si[i + j];
-                    }
-                    for (int j = 0; j < 8; ++j) {
-                        sv[i + j + 1] = tv[j];
-                        si[i + j + 1] = ti[j];
-                    }
-                    end = i;
-                }
-                // The tail, from the top as well.
-                for (int i = end; i > pos; --i) {
-                    sv[i] = sv[i - 1];
-                    si[i] = si[i - 1];
-                }
-                sv[pos] = v;
-                si[pos] = c;
-                if (m < k) ++m;
-            }
-            for (int j = 0; j < k; ++j) {
-                values[(int64_t)r * k + j] = j < m ? sv[j] : 0.0f;
-                indices[(int64_t)r * k + j] = j < m ? si[j] : -1;
-            }
+            topk_sort_in_place(k, largest, values + (int64_t)r * k, indices + (int64_t)r * k);
         });
     });
 }

@@ -355,28 +355,31 @@ A different workload from everything above: the document pipeline's ONNX
 models (a layout detector, a text detector and recogniser, two table
 structurers, a formula recogniser), run by `sycl-infer-onnx` on one device.
 The numbers are the service's own operator timing (`SI_ONNX_TIME=1`), and the
-conditions are: **one Arc A770 16 GB**, an AOT Release build
-(`-DSI_ONNX=ON -DSYCL_INFER_AOT=ON -DSYCL_INFER_AOT_DEVICE=acm-g10`), one
-800x800 page, a warm service.
+conditions are: **one Arc A770 16 GB**, a JIT Release build
+(`-DSI_ONNX=ON`), one 800x800 page, a warm service (2026-10-23).
 
 ### 7.1 The layout detector, by operator
 
 | what | time |
 |---|---:|
-| the whole model | **281 ms** |
-| the `Conv`s (118 of them) | 107 ms |
-| the `Concat`s (140 of them) | 39 ms |
-| the `MatMul`s (123 of them) | 38 ms |
-| the `ReduceMax`es (4 of them) | 17 ms |
-| the `TopK` (300 of 13 125) | 16 ms |
-| the `ReduceMin`s (2 of them) | 12 ms |
+| the whole model | **129-141 ms** |
+| the `Conv`s (118 of them, oneDNN) | 93 ms |
+| the `TopK` (300 of 13 125, three calls) | **4 ms** |
+| the `MatMul`s (123, plus the bias/activation epilogue) | 9 ms |
+| the `Concat`s (140 of them) | 5.5 ms |
+| the `LayerNormalization`s | 3.3 ms |
+| the `Transpose`s | 3 ms |
+| the `Add`s | 1.9 ms |
+| the mask-to-box head (one `MaskBox` scan) | 0.2 ms |
 | the `GatherND` (12 million elements) | 0.7 ms |
-| the first call, with the runtime's JIT (no AOT) | +2 589 ms |
+| the first call, with the runtime's JIT and weight upload | ~1.2-1.4 s |
 
-The service's call is **401 ms** (the operator sum plus the executor's own
-work) and the wire is **228 ms** - the layout detector's outputs are 48 MB
-(three tensors, the largest an 12-million-element mask), and the client reads
-all of them back.
+The service's call is **129-141 ms at batch 1** (146 ms per page at batch 2).
+The pipeline's config drops the 48 MB mask output (`drop_outputs`), so it
+never crosses the wire; the executor now holds 443 MiB at batch 1 instead of
+911 MiB, because the mask branch is one scan and the reshapes borrow their
+input buffers.  The full table and the dead ends are in
+[`design/17-onnx-service.md`](design/17-onnx-service.md).
 
 ### 7.2 The formula recogniser
 
@@ -387,7 +390,8 @@ output is integer-equal to ONNXRuntime's on five real formula crops.
 ### 7.3 What the ONNX path taught, in one line each
 
 * A selection that is quadratic in `k` looks like a hang: the layout model's
-  `TopK` was 60 seconds a page before the sorted-insertion rewrite (10.5 ms).
+  `TopK` was 60 seconds a page before the sorted-insertion rewrite (10.5 ms);
+  a 64-bit rank-key radix select now does the three layout calls in 4 ms.
 * A device wait per operator costs the pipeline its depth: the guard band and
   the per-operator wait were 2.7x the formula model's device time.
 * A value that no operator of a graph reads still has to stay alive when a

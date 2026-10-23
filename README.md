@@ -516,11 +516,13 @@ formula crops) is **integer-equal** to ONNXRuntime.  (The formula model is not
 in the captured corpus: the captured pages have no formulas.)
 
 **The performance** (one Arc A770, one 800x800 page, the layout detector):
-**281 ms of operator time**, of which the convolutions are 107 ms, the
-concatenations 39, the matmuls 38, the reductions 29 and the top-k 16.  The
-service's own call is 401 ms and the wire (the 48 MB of masks and boxes the
-client reads back) 228 ms.  The full table, the conditions and the dead ends
-are in
+**129-141 ms of service call**, of which the convolutions are 93-103 ms, the
+top-k **4**, the matmuls 9 (bias and the fused activation included) and the
+Concats 5.5.  The mask-to-box head - six reductions and ten 48 MB intermediates in
+the model as exported - is one 0.2 ms scan now.  The service's call is
+129-141 ms at batch 1 and 146 ms per page at batch 2; the pipeline drops the
+48 MB mask output (`drop_outputs`), so it never crosses the wire.  The full
+table, the conditions and the dead ends are in
 [`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md).
 
 ## Performance

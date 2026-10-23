@@ -80,10 +80,17 @@ enum class op_kind {
     // A convolution with the batch norm folded in and an optional
     // activation in the epilogue.
     conv,
-    // An elementwise binary/unary operator.
+    // An elementwise binary/unary operator.  It may run in place: the
+    // executor reuses an input buffer that dies at this operator instead of
+    // allocating a new one (the mask head's Add chains are ten 48 MB
+    // tensors, and a chain of adds needs one buffer, not ten).
     elementwise,
-    // A copy with a permutation of the axes (Reshape/Transpose/Squeeze/
-    // Unsqueeze/Flatten/Identity/Slice/Gather all reduce to this).
+    // A value-preserving metadata change (Reshape/Flatten/Squeeze/
+    // Unsqueeze/Identity).  The executor borrows the input's buffer when it
+    // is the input's last use, instead of copying the whole tensor.  The
+    // output keeps its own shape, so the tensor metadata is still correct.
+    alias,
+    // A copy with a permutation of the axes (Transpose).
     permute,
 };
 

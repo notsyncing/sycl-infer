@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -214,7 +215,10 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
         v.t.shape = vi.shape;
     }
 
-    const std::vector<onnxpb::node_proto> & nodes = graph.node;
+    // A mutable copy: the fusion passes rewrite node inputs/outputs (a
+    // MatMul grows a bias input, the mask head's Greater becomes one fused
+    // operator), and the graph owns the copy.
+    std::vector<onnxpb::node_proto> nodes = graph.node;
 
     // The constant analysis.
     std::map<std::string, bool> is_const;
@@ -240,13 +244,137 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
         node_const[i] = all;
     }
 
-    // The consumer of a value (the first one).
+    // The consumer of a value (the first one), all of them, and the node
+    // that produces it.
     std::map<std::string, int> consumer;
+    std::map<std::string, std::vector<int>> users;
+    std::map<std::string, int> producer_of;
     for (size_t i = 0; i < nodes.size(); ++i) {
         for (const std::string & in : nodes[i].input) {
-            if (!in.empty() && consumer.find(in) == consumer.end()) consumer[in] = (int)i;
+            if (in.empty()) continue;
+            if (consumer.find(in) == consumer.end()) consumer[in] = (int)i;
+            users[in].push_back((int)i);
+        }
+        for (const std::string & out : nodes[i].output) {
+            if (!out.empty()) producer_of[out] = (int)i;
         }
     }
+    std::set<std::string> graph_outputs;
+    for (const onnxpb::value_info & vi : graph.output) graph_outputs.insert(vi.name);
+
+    // The activation parameters, in the linear form the epilogue computes.
+    // This is the same parse the convolution fusion uses; keeping it in one
+    // place is what makes "Add -> Relu" and "Conv -> Relu" agree.
+    auto parse_activation = [&](const onnxpb::node_proto & cn,
+                                std::vector<float> & params) -> bool {
+        const std::string & op = cn.op_type;
+        if (getenv("SI_ONNX_NOFUSE_ACT")) return false;
+        params.clear();
+        if (op == "HardSigmoid") {
+            float alpha = 0.2f, beta = 0.5f;
+            for (const onnxpb::attribute & a : cn.attribute) {
+                if (a.name == "alpha") alpha = a.f;
+                if (a.name == "beta") beta = a.f;
+            }
+            float p[2] = {0.0f, 0.0f};
+            hardsigmoid_params(opset, alpha, beta, p);
+            params = {p[0], p[1]};
+            return true;
+        }
+        if (op == "HardSwish") {
+            float p[2] = {0.0f, 0.0f};
+            hardswish_params(p);
+            params = {p[0], p[1]};
+            return true;
+        }
+        if (op == "Clip") {
+            float lo = -3.0e38f, hi = 3.0e38f;
+            for (size_t k = 1; k < cn.input.size(); ++k) {
+                if (cn.input[k].empty()) continue;
+                auto it = slot.find(cn.input[k]);
+                if (it == slot.end() || !values[it->second].is_init ||
+                    values[it->second].t.host.size() < 4) {
+                    return false;
+                }
+                const float v = *(const float *)values[it->second].t.host.data();
+                if (k == 1) lo = v;
+                else hi = v;
+            }
+            params = {lo, hi};
+            return true;
+        }
+        if (op == "Gelu") {
+            std::string approx;
+            for (const onnxpb::attribute & a : cn.attribute) {
+                if (a.name == "approximate") approx = a.s;
+            }
+            return approx == "tanh";
+        }
+        return op == "Relu" || op == "Sigmoid" || op == "Tanh" || op == "Silu";
+    };
+
+    // Whether a value is a broadcast scalar with a known value.  The mask
+    // head's zero is built as Expand(0, Shape(x)) and then cast and added,
+    // so the value is constant while the *shape* is dynamic.  This walk is
+    // what proves the "+ 0" around the mask's grid coordinates is a no-op
+    // (and that the sentinel is 1e8), without materialising ten 48 MB
+    // tensors to discover it at run time.
+    std::function<bool(const std::string &, double &, int)> splat =
+        [&](const std::string & name, double & val, int depth) -> bool {
+        if (depth > 32) return false;
+        auto sit = slot.find(name);
+        if (sit != slot.end() && values[sit->second].is_init) {
+            const tensor & t = values[sit->second].t;
+            if (t.dtype != onnxpb::FLOAT || t.host.size() < 4) return false;
+            const size_t n = std::max<size_t>(1, t.host.size() / 4);
+            float v0 = 0.0f;
+            std::memcpy(&v0, t.host.data(), 4);
+            for (size_t k = 1; k < n; ++k) {
+                float v = 0.0f;
+                std::memcpy(&v, t.host.data() + k * 4, 4);
+                if (v != v0) return false;
+            }
+            val = v0;
+            return true;
+        }
+        auto pit = producer_of.find(name);
+        if (pit == producer_of.end()) return false;
+        const onnxpb::node_proto & p = nodes[(size_t)pit->second];
+        if (p.op_type == "Constant") {
+            for (const onnxpb::attribute & a : p.attribute) {
+                if (a.name != "value" || a.type_ != onnxpb::attribute::type::t) continue;
+                if (a.t.data_type != onnxpb::FLOAT || a.t.raw.size() < 4) return false;
+                float v0 = 0.0f;
+                std::memcpy(&v0, a.t.raw.data(), 4);
+                for (size_t k = 1; k * 4 < a.t.raw.size(); ++k) {
+                    float v = 0.0f;
+                    std::memcpy(&v, a.t.raw.data() + k * 4, 4);
+                    if (v != v0) return false;
+                }
+                val = v0;
+                return true;
+            }
+            return false;
+        }
+        if (p.input.empty()) return false;
+        if (p.op_type == "Expand" || p.op_type == "Cast" || p.op_type == "Unsqueeze" ||
+            p.op_type == "Squeeze" || p.op_type == "Reshape" || p.op_type == "Flatten" ||
+            p.op_type == "Identity") {
+            return splat(p.input[0], val, depth + 1);
+        }
+        if (p.op_type == "Add" || p.op_type == "Sub" || p.op_type == "Mul" ||
+            p.op_type == "Div") {
+            if (p.input.size() < 2 || p.input[0].empty() || p.input[1].empty()) return false;
+            double a = 0.0, b = 0.0;
+            if (!splat(p.input[0], a, depth + 1) || !splat(p.input[1], b, depth + 1)) return false;
+            if (p.op_type == "Add") val = a + b;
+            else if (p.op_type == "Sub") val = a - b;
+            else if (p.op_type == "Mul") val = a * b;
+            else val = b == 0.0 ? 0.0 : a / b;
+            return true;
+        }
+        return false;
+    };
 
     // The fusion: a convolution followed by the multiplication and the
     // addition of a folded batch norm, and by an activation.
@@ -412,6 +540,460 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
         }
     }
 
+    // ----------------------------------------------------------------
+    // Elementwise + activation: "Add -> Relu/Clip/Sigmoid" is one pass.
+    // The epilogue is the same code the convolution uses, so its semantics
+    // cannot drift from the standalone activation.
+    // ----------------------------------------------------------------
+    std::map<size_t, std::string> ew_act;
+    std::map<size_t, std::vector<float>> ew_act_params;
+    for (size_t i = 0; i < nodes.size() && fuse; ++i) {
+        if (dead[i]) continue;
+        const onnxpb::node_proto & n = nodes[i];
+        if (n.op_type != "Add" && n.op_type != "Sub" && n.op_type != "Mul" &&
+            n.op_type != "Div") {
+            continue;
+        }
+        if (n.output.empty() || graph_outputs.count(n.output[0])) continue;
+        auto uit = users.find(n.output[0]);
+        if (uit == users.end() || uit->second.size() != 1) continue;
+        const int ai = uit->second[0];
+        if (dead[ai]) continue;
+        const onnxpb::node_proto & an = nodes[ai];
+        if (an.output.empty() || graph_outputs.count(an.output[0])) continue;
+        bool is_act = false;
+        for (const char * a : kActivations) {
+            if (an.op_type == a) is_act = true;
+        }
+        if (!is_act) continue;
+        std::vector<float> params;
+        if (!parse_activation(an, params)) continue;
+        ew_act[i] = an.op_type;
+        ew_act_params[i] = params;
+        dead[ai] = true;
+        alias[an.output[0]] = n.output[0];
+        if (getenv("SI_ONNX_TRACE")) {
+            fprintf(stderr, "[onnx] the fusion: %s <- %s (elementwise epilogue %s)\n",
+                    n.name.c_str(), an.name.c_str(), an.op_type.c_str());
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // MatMul + a constant bias.  oneDNN's matmul takes the bias as a
+    // primitive argument, so the whole decoder's "linear then add" is one
+    // kernel instead of two.  Only the Add that has no fused activation is
+    // folded (the Add+activation rule above then owns that case).
+    // ----------------------------------------------------------------
+    for (size_t i = 0; i < nodes.size() && fuse; ++i) {
+        if (dead[i] || nodes[i].op_type != "MatMul") continue;
+        const onnxpb::node_proto & n = nodes[i];
+        if (n.output.empty() || n.input.size() < 2 || graph_outputs.count(n.output[0])) continue;
+        auto uit = users.find(n.output[0]);
+        if (uit == users.end() || uit->second.size() != 1) continue;
+        const int ai = uit->second[0];
+        if (dead[ai]) continue;
+        const onnxpb::node_proto & an = nodes[ai];
+        if (an.op_type != "Add" || an.output.empty() || graph_outputs.count(an.output[0])) continue;
+        // The bias has to be a constant 1-D vector of the MatMul's N.  The
+        // weight is a constant for every such call in the layout model, and
+        // its last dimension is the output width.
+        auto bit = slot.find(n.input[1]);
+        if (bit == slot.end() || !values[bit->second].is_init) continue;
+        const tensor & w = values[bit->second].t;
+        if (w.shape.size() < 2) continue;
+        const int64_t N = w.shape.back();
+        std::string bias_name;
+        int nconst = 0;
+        for (const std::string & in : an.input) {
+            if (in.empty()) continue;
+            auto it = slot.find(in);
+            if (it == slot.end() || !values[it->second].is_init) continue;
+            const tensor & b = values[it->second].t;
+            if (b.dtype != onnxpb::FLOAT || b.count != (size_t)N) continue;
+            bias_name = in;
+            ++nconst;
+        }
+        if (nconst != 1) continue;
+        // If the Add already carries a fused activation from the pass above,
+        // move it onto the MatMul; if not, look for a single activation
+        // consumer here.  The result is one epilogue pass (bias + act) after
+        // the matmul, not three operators.
+        std::string act;
+        std::vector<float> aps;
+        auto eait = ew_act.find((size_t)ai);
+        if (eait != ew_act.end()) {
+            act = eait->second;
+            auto apit = ew_act_params.find((size_t)ai);
+            if (apit != ew_act_params.end()) aps = apit->second;
+            ew_act.erase(eait);
+            ew_act_params.erase((size_t)ai);
+        } else if (!an.output.empty() && !graph_outputs.count(an.output[0])) {
+            auto aut = users.find(an.output[0]);
+            if (aut != users.end() && aut->second.size() == 1) {
+                const int acti = aut->second[0];
+                const onnxpb::node_proto & actn = nodes[(size_t)acti];
+                bool is_act = false;
+                for (const char * a : kActivations) {
+                    if (actn.op_type == a) is_act = true;
+                }
+                if (is_act && !actn.output.empty() && !graph_outputs.count(actn.output[0])) {
+                    std::vector<float> p2;
+                    if (parse_activation(actn, p2)) {
+                        act = actn.op_type;
+                        aps = p2;
+                        dead[(size_t)acti] = true;
+                        alias[actn.output[0]] = n.output[0];
+                    }
+                }
+            }
+        }
+        if (!act.empty()) {
+            ew_act[i] = act;
+            ew_act_params[i] = aps;
+        }
+        dead[ai] = true;
+        alias[an.output[0]] = n.output[0];
+        nodes[i].input.push_back(bias_name);
+        if (getenv("SI_ONNX_TRACE")) {
+            fprintf(stderr, "[onnx] the fusion: %s <- %s (bias %s)\n", n.name.c_str(),
+                    an.name.c_str(), bias_name.c_str());
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // The Paddle layout detector's mask head: one pass over the 300x200x200
+    // mask logits instead of ten materialised 48 MB tensors.
+    //
+    // The graph is
+    //
+    //   bmm [1,300,40000] -> reshape -> (logits > 0)
+    //     -> Cast(float) -> Mul(x-grid) / Mul(y-grid)
+    //     -> Add(0) -> Add to 1e8 -> Where(mask, coord, 1e8)
+    //     -> Reshape -> ReduceMin
+    //     -> Reshape -> ReduceMax
+    //   and (logits > 0) -> Cast(int) -> ReduceMax -> Cast(bool)
+    //
+    // The box coordinates are the mask's min/max row and column, the "any"
+    // flag is whether the mask is non-empty, and the x/y grids are
+    // initialisers.  All of it is one scan per query, so the six
+    // reductions and the ten intermediates disappear.  The matcher is
+    // deliberately narrow (it proves the +0 chain and both grids), and
+    // falls back to the original graph when anything does not line up.
+    // ----------------------------------------------------------------
+    if (fuse && !getenv("SI_ONNX_NOMASKFUSE")) {
+        auto uof = [&](const std::string & name) -> const std::vector<int> & {
+            static const std::vector<int> empty;
+            auto it = users.find(name);
+            return it == users.end() ? empty : it->second;
+        };
+        auto to_int = [&](const onnxpb::node_proto & n) -> int64_t {
+            for (const onnxpb::attribute & a : n.attribute) {
+                if (a.name == "to") return a.i;
+            }
+            return -1;
+        };
+        auto keepdims = [&](const onnxpb::node_proto & n) -> int64_t {
+            for (const onnxpb::attribute & a : n.attribute) {
+                if (a.name == "keepdims") return a.i;
+            }
+            return 1;
+        };
+        auto axes_are = [&](const onnxpb::node_proto & n,
+                           const std::vector<int64_t> & want) -> bool {
+            for (const onnxpb::attribute & a : n.attribute) {
+                if (a.name == "axes") return a.ints == want;
+            }
+            return false;
+        };
+        auto sole_after_reshape = [&](const std::string & v, const char * want) -> int {
+            for (int ci : uof(v)) {
+                const onnxpb::node_proto & cn = nodes[(size_t)ci];
+                if (cn.op_type == want) return ci;
+                if (cn.op_type == "Reshape" && cn.output.size() == 1) {
+                    for (int ri : uof(cn.output[0])) {
+                        if (nodes[(size_t)ri].op_type == want) return ri;
+                    }
+                }
+            }
+            return -1;
+        };
+        struct mask_path {
+            int mul = -1;
+            int rmax = -1;
+            int rmin = -1;
+            std::string grid;
+            std::string max_name;
+            std::string min_name;
+        };
+        bool found = false;
+        for (size_t mi = 0; mi < nodes.size() && !found; ++mi) {
+            if (dead[mi] || nodes[mi].op_type != "MatMul") continue;
+            const onnxpb::node_proto & mm = nodes[mi];
+            if (mm.output.empty()) continue;
+            const std::string & mm_out = mm.output[0];
+            if (uof(mm_out).size() != 1) continue;
+            const int r1 = uof(mm_out)[0];
+            if (nodes[(size_t)r1].op_type != "Reshape" || nodes[(size_t)r1].output.empty()) continue;
+            if (uof(nodes[(size_t)r1].output[0]).size() != 1) continue;
+            const int gt = uof(nodes[(size_t)r1].output[0])[0];
+            const onnxpb::node_proto & gn = nodes[(size_t)gt];
+            if (gn.op_type != "Greater" || gn.input.size() < 2 || gn.output.empty()) continue;
+            double threshold = 0.0;
+            if (!splat(gn.input[1], threshold, 0)) {
+                continue;
+            }
+            const std::string & gt_out = gn.output[0];
+            std::string cf, ci_name;
+            int ci = -1, any_rmax = -1, any_cast = -1;
+            for (int ui : uof(gt_out)) {
+                const onnxpb::node_proto & un = nodes[(size_t)ui];
+                if (un.op_type != "Cast") continue;
+                const int64_t to = to_int(un);
+                if (to == onnxpb::FLOAT) cf = un.output[0];
+                if (to == onnxpb::INT32 || to == onnxpb::INT64) {
+                    ci = ui;
+                    ci_name = un.output[0];
+                }
+            }
+            if (cf.empty() || ci < 0) {
+                continue;
+            }
+            any_rmax = sole_after_reshape(ci_name, "ReduceMax");
+            if (any_rmax < 0) {
+                continue;
+            }
+            const onnxpb::node_proto & arn = nodes[(size_t)any_rmax];
+            if (arn.output.empty() || keepdims(arn) != 0 || !axes_are(arn, {2, 3})) {
+                continue;
+            }
+            for (int ui : uof(arn.output[0])) {
+                const onnxpb::node_proto & un = nodes[(size_t)ui];
+                if (un.op_type == "Cast" && to_int(un) == onnxpb::BOOL) any_cast = ui;
+            }
+            if (any_cast < 0) {
+                continue;
+            }
+            std::vector<mask_path> paths;
+            double sentinel = 0.0;
+            bool ok = true;
+            for (int ui : uof(cf)) {
+                const onnxpb::node_proto & mul = nodes[(size_t)ui];
+                if (mul.op_type != "Mul" || mul.input.size() < 2 || mul.output.empty()) continue;
+                std::string grid;
+                for (const std::string & in : mul.input) {
+                    if (in == cf) continue;
+                    auto it = slot.find(in);
+                    if (it == slot.end() || !values[it->second].is_init) continue;
+                    const tensor & g = values[it->second].t;
+                    if (g.dtype == onnxpb::FLOAT && g.shape.size() == 2 && g.count > 1) {
+                        grid = in;
+                    }
+                }
+                if (grid.empty()) continue;
+                mask_path p;
+                p.mul = ui;
+                p.grid = grid;
+                p.rmax = sole_after_reshape(mul.output[0], "ReduceMax");
+                if (p.rmax < 0 || nodes[(size_t)p.rmax].output.empty() ||
+                    keepdims(nodes[(size_t)p.rmax]) != 0 ||
+                    !axes_are(nodes[(size_t)p.rmax], {-1})) {
+                    continue;
+                }
+                p.max_name = nodes[(size_t)p.rmax].output[0];
+                // The min path: Mul -> Add(+0) -> Where -> Reshape -> ReduceMin.
+                int add1 = -1;
+                for (int ai : uof(mul.output[0])) {
+                    const onnxpb::node_proto & an = nodes[(size_t)ai];
+                    if (an.op_type != "Add" || an.input.size() < 2) continue;
+                    bool other_zero = false;
+                    for (const std::string & in : an.input) {
+                        if (in == mul.output[0]) continue;
+                        double z = 0.0;
+                        if (splat(in, z, 0) && z == 0.0) other_zero = true;
+                    }
+                    if (other_zero) {
+                        add1 = ai;
+                        break;
+                    }
+                }
+                if (add1 < 0) {
+                    ok = false;
+                    break;
+                }
+                int wh = -1;
+                for (int wi : uof(nodes[(size_t)add1].output[0])) {
+                    if (nodes[(size_t)wi].op_type == "Where") wh = wi;
+                }
+                if (wh < 0) {
+                    ok = false;
+                    break;
+                }
+                const onnxpb::node_proto & wn = nodes[(size_t)wh];
+                if (wn.input.size() < 3) {
+                    ok = false;
+                    break;
+                }
+                // The condition is Cast(bool, Add(mask_float, 0)).
+                auto cond_it = producer_of.find(wn.input[0]);
+                if (cond_it == producer_of.end()) {
+                    ok = false;
+                    break;
+                }
+                const onnxpb::node_proto & cond = nodes[(size_t)cond_it->second];
+                if (cond.op_type != "Cast" || to_int(cond) != onnxpb::BOOL || cond.input.empty()) {
+                    ok = false;
+                    break;
+                }
+                auto cond_add_it = producer_of.find(cond.input[0]);
+                if (cond_add_it == producer_of.end()) {
+                    ok = false;
+                    break;
+                }
+                const onnxpb::node_proto & cond_add = nodes[(size_t)cond_add_it->second];
+                if (cond_add.op_type != "Add") {
+                    ok = false;
+                    break;
+                }
+                bool has_cf = false, has_zero = false;
+                for (const std::string & in : cond_add.input) {
+                    if (in == cf) has_cf = true;
+                    double z = 0.0;
+                    if (splat(in, z, 0) && z == 0.0) has_zero = true;
+                }
+                if (!has_cf || !has_zero) {
+                    ok = false;
+                    break;
+                }
+                // The false branch is Add(1e8, 0).
+                auto false_it = producer_of.find(wn.input[2]);
+                if (false_it == producer_of.end()) {
+                    ok = false;
+                    break;
+                }
+                const onnxpb::node_proto & fn = nodes[(size_t)false_it->second];
+                if (fn.op_type != "Add") {
+                    ok = false;
+                    break;
+                }
+                bool has_sentinel = false, has_false_zero = false;
+                double this_sentinel = 0.0;
+                for (const std::string & in : fn.input) {
+                    double v = 0.0;
+                    if (!splat(in, v, 0)) continue;
+                    if (v == 0.0) has_false_zero = true;
+                    else {
+                        has_sentinel = true;
+                        this_sentinel = v;
+                    }
+                }
+                if (!has_sentinel || !has_false_zero) {
+                    ok = false;
+                    break;
+                }
+                if (sentinel == 0.0) sentinel = this_sentinel;
+                if (this_sentinel != sentinel) {
+                    ok = false;
+                    break;
+                }
+                p.rmin = sole_after_reshape(wn.output[0], "ReduceMin");
+                if (p.rmin < 0 || nodes[(size_t)p.rmin].output.empty() ||
+                    keepdims(nodes[(size_t)p.rmin]) != 0 ||
+                    !axes_are(nodes[(size_t)p.rmin], {-1})) {
+                    ok = false;
+                    break;
+                }
+                p.min_name = nodes[(size_t)p.rmin].output[0];
+                paths.push_back(p);
+            }
+            if (!ok || paths.size() != 2) {
+                continue;
+            }
+            if (sentinel == 0.0) {
+                continue;
+            }
+            const std::string any_name = nodes[(size_t)any_cast].output[0];
+            const std::string & max_a = paths[0].max_name;
+            const std::string & max_b = paths[1].max_name;
+            const std::string & min_a = paths[0].min_name;
+            const std::string & min_b = paths[1].min_name;
+            const std::string & grid_a = paths[0].grid;
+            const std::string & grid_b = paths[1].grid;
+
+            // Everything in the cone below the five outputs is dead.  The
+            // cone stops at the MatMul (the bmm is still computed) and at
+            // this Greater (it becomes the fused operator).
+            std::set<int> cone;
+            std::function<void(const std::string &)> mark = [&](const std::string & v) {
+                auto pit = producer_of.find(v);
+                if (pit == producer_of.end()) return;
+                const int p = pit->second;
+                if (p == (int)mi || p == gt) return;
+                if (!cone.insert(p).second) return;
+                for (const std::string & in : nodes[(size_t)p].input) mark(in);
+            };
+            mark(any_name);
+            mark(max_a);
+            mark(max_b);
+            mark(min_a);
+            mark(min_b);
+            // The reshape in front of the Greater only reinterprets the
+            // bmm's [1,300,40000] as [1,300,200,200].  It dies with the
+            // fused scan, but its *target* is built from Shape(add.40) -
+            // and following that target would walk into the whole decoder
+            // and mark it dead.  The target chain is small and stays; only
+            // the reshape itself is removed.
+            cone.insert(r1);
+            std::set<std::string> fused_out = {any_name, max_a, max_b, min_a, min_b};
+            bool safe = true;
+            for (int p : cone) {
+                for (const std::string & out : nodes[(size_t)p].output) {
+                    if (out.empty() || fused_out.count(out)) continue;
+                    if (graph_outputs.count(out)) {
+                        safe = false;
+                        break;
+                    }
+                    for (int u : uof(out)) {
+                        if (u == (int)mi || u == gt || cone.count(u) || dead[(size_t)u]) continue;
+                        safe = false;
+                        break;
+                    }
+                    if (!safe) break;
+                }
+                if (!safe) break;
+            }
+            if (!safe) {
+                continue;
+            }
+            for (int p : cone) dead[(size_t)p] = true;
+            // The Greater becomes the fused scan.  Its inputs are the bmm
+            // and the two coordinate grids; the threshold and the empty-mask
+            // sentinel ride as attributes.
+            onnxpb::node_proto fused;
+            fused.name = gn.name.empty() ? "MaskBox" : gn.name;
+            fused.op_type = "MaskBox";
+            fused.input = {mm_out, grid_a, grid_b};
+            fused.output = {any_name, max_a, max_b, min_a, min_b};
+            onnxpb::attribute at;
+            at.name = "threshold";
+            at.type_ = onnxpb::attribute::type::f;
+            at.f = (float)threshold;
+            fused.attribute.push_back(at);
+            onnxpb::attribute as;
+            as.name = "sentinel";
+            as.type_ = onnxpb::attribute::type::f;
+            as.f = (float)sentinel;
+            fused.attribute.push_back(as);
+            nodes[(size_t)gt] = fused;
+            if (getenv("SI_ONNX_TRACE")) {
+                fprintf(stderr,
+                        "[onnx] the fusion: %s (mask head: rows from '%s', grids '%s'/'%s', "
+                        "sentinel %g) -> one scan\n",
+                        fused.name.c_str(), mm_out.c_str(), grid_a.c_str(), grid_b.c_str(), sentinel);
+            }
+            found = true;
+        }
+    }
+
     // The executable ops.  The nodes are copied into the graph, because the
     // operators point at their attributes.
     g.nodes = nodes;
@@ -479,6 +1061,38 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
         for (const std::string & out : n.output) {
             if (out.empty()) continue;
             op.out.push_back(add_value(out));
+        }
+        // In-place reuse is only valid inside one execution.  A Loop body
+        // runs many times, and its carried values are read again on the
+        // next iteration: the body's last-use liveness knows nothing about
+        // that, so borrowing a carried value's buffer writes the *next*
+        // iteration's input.  Subgraphs therefore keep the copy.
+        const bool inplace = scope == nullptr && getenv("SI_ONNX_NOINPLACE") == nullptr;
+        if (inplace && (n.op_type == "Reshape" || n.op_type == "Flatten" ||
+                        n.op_type == "Squeeze" || n.op_type == "Unsqueeze" ||
+                        n.op_type == "Identity")) {
+            op.kind = op_kind::alias;
+        }
+        if (inplace && (n.op_type == "Add" || n.op_type == "Sub" || n.op_type == "Mul" ||
+            n.op_type == "Div" || n.op_type == "Neg" || n.op_type == "Abs" ||
+            n.op_type == "Exp" || n.op_type == "Log" || n.op_type == "Sqrt" ||
+            n.op_type == "Erf" || n.op_type == "Floor" || n.op_type == "Ceil" ||
+            n.op_type == "Round" || n.op_type == "Relu" || n.op_type == "Sigmoid" ||
+            n.op_type == "Tanh" || n.op_type == "HardSigmoid" || n.op_type == "HardSwish" ||
+            n.op_type == "Gelu" || n.op_type == "Silu" || n.op_type == "Softplus" ||
+            n.op_type == "Where" || n.op_type == "Greater" || n.op_type == "Less" ||
+            n.op_type == "Equal" || n.op_type == "GreaterOrEqual" ||
+            n.op_type == "LessOrEqual" || n.op_type == "And" || n.op_type == "Or" ||
+            n.op_type == "Sign" || n.op_type == "Max" || n.op_type == "Min" ||
+            n.op_type == "Mod")) {
+            op.kind = op_kind::elementwise;
+        }
+        // The activation fused into an elementwise operator's epilogue.
+        auto eait = ew_act.find(idx);
+        if (eait != ew_act.end()) {
+            op.activation = eait->second;
+            auto apit = ew_act_params.find(idx);
+            if (apit != ew_act_params.end()) op.act_params = apit->second;
         }
         if (n.op_type == "Conv" || n.op_type == "ConvTranspose") {
             op.kind = op_kind::conv;

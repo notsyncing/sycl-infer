@@ -69,6 +69,17 @@ public:
     size_t num_outputs() const { return g_.output_slots.size(); }
     const tensor & output(size_t i) const { return g_.tensors[g_.output_slots[i]]; }
 
+    // The outputs the client never reads (a model config's `drop_outputs`):
+    // the executor does not read them back to the host, and the service does
+    // not put them on the wire.  The layout model's 300x200x200 mask is 48 MB
+    // per page, and the pipeline's rect mode never looks at it.
+    void skip_outputs(const std::vector<std::string> & names);
+    bool output_skipped(size_t i) const;
+    // Whether this model's convolutions may use oneDNN.  A model whose
+    // input shape changes per request turns it off: the primitive cache is
+    // per shape, and the table pipeline presents dozens of them.
+    void set_dnnl(bool on) { dnnl_ = on; }
+
 private:
     struct slot_state {
         // The device buffer (null when the value lives on the host).
@@ -79,6 +90,19 @@ private:
         // The last operator that reads the value.
         int last_use = -1;
         bool live = false;
+        // The device copy of a host-resident value, and whether it is
+        // current.
+        //
+        // A value that lives on the host (an integer, a shape, a constant)
+        // is read by the device through a mirror, and the write-back used to
+        // throw that mirror away at every operator - so a value read by N
+        // operators was uploaded N times, and a constant was uploaded again
+        // on every call (3508 copies of 707 MB per layout call, which was
+        // half of the call's time).  `host_gen` counts the writes of the
+        // host bytes and `dev_gen` is the generation the mirror was made
+        // from; they are equal while the device copy is current.
+        uint64_t host_gen = 0;
+        uint64_t dev_gen = 0;
     };
 
     // The host copy of a slot.
@@ -130,6 +154,47 @@ private:
     // rebuild dominates everything else.  The body is built the first time
     // the loop runs and kept.
     std::map<size_t, std::unique_ptr<executor>> loop_bodies_;
+    // How many times the pool had to ask the device for a new buffer (a
+    // pool miss: the diagnostic SI_ONNX_HOSTTIME reports it).
+    size_t malloc_count_ = 0;
+    // The host->device uploads of the inputs, and their bytes.  Per run:
+    // their total is what SI_ONNX_HOSTTIME reports, and a cumulative counter
+    // made the second call look exactly like the first.
+    size_t upload_count_ = 0;
+    size_t upload_bytes_ = 0;
+    // Whether the uploads of the last run may still be in the queue.  The
+    // copies read the graph tensors' host bytes, and the next run overwrites
+    // them (a graph input's bytes are replaced before the first operator), so
+    // it waits once for the previous run's copies instead of waiting at every
+    // upload - a wait per upload drains the whole in-order queue.
+    bool uploads_pending_ = false;
+    // SI_ONNX_MIRRORCHK: verify every reused mirror against its host bytes
+    // before the consumer reads it.  The generations are what make the reuse
+    // correct, and a missed bump is invisible in the output - so the
+    // invariant is checked on demand rather than assumed.
+    bool mirror_chk_ = false;
+    bool dnnl_ = true;
+    // The live device bytes and their high-water mark, maintained on
+    // acquire/release (the pool's own total is the set of distinct buffers,
+    // which is not the same thing as the peak concurrent need).
+    size_t live_now_ = 0;
+    size_t peak_live_ = 0;
+    // The pinned (USM host) staging buffer an upload is copied through.  A
+    // copy from pageable memory is synchronous on this backend: it blocks
+    // until the queue drains, so a tiny value uploaded behind 80 ms of
+    // kernels cost 80 ms.  The staging copy is asynchronous, and the buffer
+    // is reused only after the queue has drained.
+    static constexpr size_t kUpStageBytes = (size_t)8 << 20;
+    void * up_stage_ = nullptr;
+    size_t up_stage_cap_ = 0;
+    size_t up_stage_off_ = 0;
+    // Per-slot upload tallies for SI_ONNX_UPLOADDBG: which values are copied
+    // again and again.  The sizes are counted only when the diagnostic is
+    // armed, because the arrays are one entry per tensor and a model can
+    // have thousands.
+    bool upload_dbg_ = false;
+    std::vector<uint32_t> upload_by_slot_;
+    std::vector<size_t> upload_bytes_by_slot_;
     // The tag in the dump file names (empty for the enclosing graph).
     std::string dump_tag_;
     // The free device buffers, by their *real* size.  The size a buffer is
@@ -146,6 +211,11 @@ private:
     std::set<void *> live_;
     // The operator that wrote each slot, so a value written twice is caught.
     std::vector<int> producer_;
+    // The graph's output slots the client asked not to receive.
+    std::set<int> skip_out_;
+    // The operators a kept output needs, for the backward mark in
+    // skip_outputs().  Empty when nothing is dropped (every op runs).
+    std::vector<bool> live_ops_;
     // The live and the pooled device bytes, for the report.
     size_t live_bytes_calc() const;
     size_t pooled_bytes_calc() const;
