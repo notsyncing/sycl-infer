@@ -401,6 +401,14 @@ src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 of server.cpp so it is testable without a model),
                 scheduler.{h,cpp}, server.{h,cpp} (OpenAI chat/completions +
                 /v1/models)
+src/onnx/       the ONNX model service (the document pipeline's models):
+                proto.{h,cpp} (the ONNX protobuf reader), graph.{h,cpp}
+                (the constant folding and the operator fusion),
+                ops.{h,cpp} / ops_shape.cpp / ops_exec.cpp (the operator
+                library), kernels.{h,cpp} (the SYCL kernels),
+                exec.{h,cpp} (the executor and its memory plan),
+                wire.{h,cpp} (the binary wire protocol), service.{h,cpp}
+                (the HTTP service), main.cpp (the sycl-infer-onnx binary)
 src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
@@ -1561,6 +1569,171 @@ Reasoning and tool markup are split by `src/server/response_parser.cpp`
 (unit-tested by `test_response_parser`); `docs/design/09-server.md` is the source
 of truth, including its §8 field-by-field support matrix (what is implemented,
 partial or not).
+
+## The ONNX model service (the document pipeline)
+
+The document pipeline (the one this engine's ONNX half serves) needs
+*graphs*, not a transformer: a layout detector, a text detector, a text
+recogniser, a table segmenter, a formula recogniser.  Those come as ONNX,
+and `src/onnx/` runs them.
+
+* **The runtime is ours.**  No OpenVINO, no ONNX Runtime: a protobuf
+  reader for the ONNX schema, a graph builder that folds the constants and
+  fuses the operators, an operator library, SYCL kernels, and an executor
+  that plans the memory.  See
+  [`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md).
+* **There is no runtime JIT anywhere in this path.**  Every kernel takes
+  its shapes as *runtime* arguments, so one compiled kernel handles every
+  shape the document produces - the same property the LLM path has, and
+  the reason the engine has an AOT build at all.  The reference point:
+  measured on the A770, a graph runtime's GPU plugin compiles a new
+  kernel set per input shape, and the first inference at three shapes of
+  the same model took **8.9 s / 3.0 s / 2.9 s** (the same shapes cost
+  47 ms / 46 ms / 42 ms once compiled).  A document pipeline's shapes vary
+  per page, so that is a cost paid per document.
+  **That is the *graph*'s JIT, and it is not the same thing as the SYCL
+  runtime's kernel JIT** - the second one is real here (2 589 ms on the
+  first call) and the AOT build removes it.  Two different JITs, two
+  different fixes: a kernel's shape is an argument, a kernel's *code* is
+  not.
+* **The inference precision is f32, and it is not negotiable for the
+  detector.**  The reference point: measured on the A770, the layout
+  detector in the GPU plugin's implicit bf16 comes out *wrong* - the
+  decoder amplifies the 0.6% bf16 noise into a 17% error, the boxes
+  differ by 3 578, the mask plane is all zero and the class ids are
+  permuted - while in f32 the class ids and the scores are **equal** to
+  ONNXRuntime's.  f32 costs about 1.6x the time (160 ms/page against
+  100 ms/page).
+* **The service is a separate binary** (`sycl-infer-onnx`, `-DSI_ONNX=ON`),
+  because it is a different kind of workload from the LLM engine and it
+  must not drag the device pass into the router's container.
+
+The client lives in the document pipeline's tree
+(`rapid_doc/model/http_infer.py`): it speaks the binary protocol in
+`src/onnx/wire.h` and returns numpy arrays, so every `InferSession` there
+can be swapped for it without touching the code that calls it, and the
+pipeline's own post-processing (the box filtering, the CTC decoding, the
+table HTML assembly) stays where it is.
+
+**The state of it**: the reader, the graph and the fusion, the executor,
+the protocol and the service work, and about seventy operators are
+implemented.  **All twelve of the document pipeline's models load, and
+all seven of the models the corpus covers run.**  Against ONNXRuntime on
+the captured corpus (136 calls from a real three-page run):
+
+| model | verdict |
+|---|---|
+| `table_q_cls` (the wired/wireless classifier) | **OK** - 1.6e-06 |
+| `table_cls` (the Paddle classifier) | **OK** - 2.0e-05 |
+| `ocr_rec` (the recogniser) | **OK** - 6.3e-06 |
+| `ocr_det` (the text detector) | 1.9e-05, the float32 accumulation |
+| `layout` (the layout detector) | 2 of 12 000 000 elements differ, by 1 |
+| `table_unet` (the wired table structurer) | 1 of 662 528 elements differs, by 1 |
+| `table_slanet` (the wireless table structurer) | 0.026 max abs, 97 of 98 argmaxes agree |
+
+**Three of the seven are exact and the other four are within the
+float32 noise.**  The formula recogniser is not in the corpus (the
+captured pages have no formulas), and it is now **exact** as well: five
+real crops, integer-equal.  The oracle's verdict is strict (any difference is a
+`DIFF`), so the last four rows are the noise and not a wrong answer:
+the detector's probability map, the layout's mask and the UNet's output
+differ in one or two elements by one unit, and the wireless table
+structurer's class scores differ by 0.026 (its argmax agrees on 97 of
+the 98 classes).  The formula recogniser's model (`pp_formulanet_plus_m`)
+**runs** - it loads, its `If`, `CumSum` and bitwise operators are
+implemented, and its `Loop` now runs.  (It used to exit after one
+iteration: the loop's condition is a *boolean*, and a boolean was a
+one-byte value that the runtime read as a byte - the low byte of `1.0f`
+is `0x00`, so a condition that was true read as false.)  **It is now
+exact**: on five real formula crops from a paper template, every output
+is integer-equal to ONNXRuntime's, and the backbone matches to the last
+value (793 intermediates, no difference).  Getting there needed three
+fixes that are worth knowing about: the loop's body reads the enclosing
+graph's values and *no* operator of that graph does, so their buffers
+were recycled before the loop ran (the decoder was blind to the image);
+the body's copy of them has to live for the whole loop; and the exit
+check is an `If` whose **then branch is empty** (the Paddle export
+declares a constant as its output), so the inliner needs a copy for it -
+and an operator inside a branch must not be skipped as "constant", or
+the If's slot becomes a constant that was never computed.  It is also
+the slowest model here: its loop re-runs the body (1 742 operators) per
+iteration, and we spend 145 ms on an iteration where ONNXRuntime spends
+12.4.
+
+**The performance** (one A770, one 800x800 page, the layout model; the
+operator times, `SI_ONNX_TIME=1`):
+
+| what | time |
+|---|---:|
+| the whole model | **281 ms** |
+| the `Conv`s (118 of them) | 107 ms |
+| the `Concat`s (140 of them) | 39 ms |
+| the `MatMul`s (123 of them) | 38 ms |
+| the `ReduceMax`es (4 of them) | 17 ms |
+| the `TopK` (300 of 13 125) | 16 ms |
+| the `ReduceMin`s (2 of them) | 12 ms |
+| the `GatherND` (12 million elements) | 0.7 ms |
+| the first call, with the runtime's JIT | +2 589 ms |
+
+**End to end** (the document pipeline, 17 pages, one A770, the layout
+and the OCR over HTTP): **987 ms/page**, of which the inference is
+328 ms (the layout 261, the detector 24, the recogniser 54) and the
+rest is the pipeline's own PDF rendering.  The same run on
+ONNXRuntime's CPU provider is 888 ms/page, and its layout alone is
+360 ms against our 261.
+
+**Three operators were 58% of the layout model and all three were on
+the host.**  The `Einsum` is a batched matrix multiply (`bmd,bnd->bmn`),
+the `GatherND` is a strided copy, and the `TopK` is a selection - and
+the device already had a kernel for the first two.  Moving them to the
+device is the 686 ms -> 282 ms.
+
+Two of those numbers are the *lesson*:
+
+* **The `TopK` was 60 seconds per page** before the rewrite.  The obvious
+  implementation (k passes over the columns, each picking the best of the
+  ones not yet picked) is O(k^2*cols), because the "is it taken" test is
+  O(k): 1.2 billion comparisons for 300 of 13 125.  Keeping the row's
+  list sorted and inserting into it is O(cols*k) - 4 million, 59 ms.  **A
+  selection that is quadratic in k looks like a hang, not like a
+  performance problem**, and it was 99.7% of the model's time.
+* **The `TopK`'s 59 ms were its insertion, not its comparisons.**  The
+  list is sorted, so the position is a binary search - but the *shift*
+  is a chain of dependent global reads and writes, and the chain is the
+  cost.  Copying eight elements at a time, from the top down, took it to
+  10.5 ms.  **The copy has to go from the top down**: a block copy from
+  the bottom up is four times faster and it is *wrong*, because each
+  block overwrites the next one's source - and the boxes come out in a
+  different order.
+* **The 2 589 ms is the runtime's JIT, and the AOT build removes it.**
+  `SYCL_INFER_AOT=ON` with `SYCL_INFER_AOT_DEVICE=acm-g10` bakes the
+  device image in: the first call after a fresh start goes from 3 274 ms
+  to 686 ms.  This is the same property the LLM path has, and the same
+  reason the engine has an AOT build at all.
+
+Three things the ONNX path teaches that the LLM path does not:
+
+* **An operator's output shape is not always known before it runs** (a
+  `Resize` whose sizes are computed, a `Range` whose limit is the number
+  of the boxes).  The executor asks the operator for its size when the
+  shape function cannot answer, and an operator that can answer neither
+  is an *error* - a count of 1 makes it write past the end of its buffer.
+* **The integer values are a separate path.**  The dimensions, the axes
+  and the indices are int32 or int64, and the *shape* functions read them
+  from the host - they run before the operator does.  The models mix the
+  two widths for the same kind of value, so every integer read follows the
+  tensor's type.
+* **A value that is on the host has no device copy.**  Its device pointer
+  was never written, so keeping it makes the next operator read
+  uninitialised memory.
+
+The oracle that found all of this is in the design document: the model is
+rewritten so that the intermediates are graph outputs too, both engines run
+it, and the first difference in the topological order is where the runtime
+goes wrong.  The tooling is in `dev/` (`onnx_oracle.py`, `full_diff.py`,
+`value_diff.py`, `shape_diff.py`, `ort_shapes.py`, `make_mini.py`) and it
+is the only way to tell a wrong number from a different accumulation
+order.
 
 ## Device profiles: where a GPU-specific number belongs
 
@@ -3178,6 +3351,270 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   ~3x short of what the same model's dense layers do, and the remaining levers
   are listed in the measured-results section (the tile's register budget, the
   weight representation, the roofline gap).
+
+### The ONNX path
+
+* **A subgraph may read the enclosing graph's values (ONNX's "outer
+  scope"), and the exporter uses it.**  The formula recogniser's `Loop`
+  body reads a transpose that the *enclosing* graph computes, and its
+  `If` branches read the values around them.  A subgraph built on its
+  own cannot resolve such a name, so the builder has to be given the
+  enclosing graph and the executor has to copy the value in before each
+  **call** - the value changes between the calls, and a copy taken once
+  is stale.  It is copied **once per call**, not once per iteration:
+  ONNX's outer scope is read-only, so the body cannot change it, and
+  the formula recogniser's body reads 816 of those values.  The copy is
+  a *device* copy: a round trip through the host costs a device wait,
+  and the body waits for it.
+
+  **Two things about that copy are not obvious, and both were bugs.**
+  *The value has to stay alive until the copy*: the executor hands a
+  value's device buffer back to the pool after the last operator that
+  reads it, and an outer-scope value is read by *no* operator of the
+  enclosing graph - only by the body.  So the pool had already recycled
+  the buffer, and the copy read whatever the pool had put there: the
+  body then computed the same thing for every input, and the formula
+  recogniser's output did not depend on the image at all.  And *the
+  copy has to set the tensor's own device pointer*, not only the
+  executor's slot: the body's operators read their inputs through the
+  tensor, and it was still the old (empty) buffer - so the body
+  computed with zeros.
+
+* **An operator's output type is not always its input's, and the
+  executor's default ("the output takes the input's type") is wrong for
+  the ones where it is.**  The `OneHot`'s output is the *values'* type
+  (its indices are int64 and its vector is a float), the `ArgMax`'s and
+  the `Range`'s are int64 whatever the input is, and a
+  `ConstantOfShape`'s is its `value` attribute's.  **The mismatch is
+  silent**: the operator writes the right bytes and the consumer reads
+  them at the wrong width.  The wireless table structurer's one-hot was
+  written as int64 and concatenated with a float score, so the decoder's
+  argmax picked a random column and its `Loop` never terminated.
+
+* **The two branches of an `If` write the *same* output slot, so a
+  folded constant in one of them is destroyed by the other branch's
+  operator the first time that branch runs - and the next time *this*
+  branch is selected, the slot holds nothing.**  A constant inside a
+  branch therefore has to run as an operator, in the selected branch
+  only, and not be folded.  (The same slot is also why the branch's
+  *initializers* have to come with the branch: they are the branch's
+  own weights, not the enclosing graph's.)
+
+* **An `If` branch may declare an output that none of its nodes produces,
+  and then the value is the *enclosing scope's*.**  The formula
+  recogniser's exit check is `If(all_found)`, and the *then* branch is
+  **empty** - it declares the constant `p2o.sub_block.pd_op.full.299.0`
+  (true) as its output.  The branches are inlined, so nothing writes the
+  If's slot and it keeps the other branch's zero for ever: the loop never
+  stops.  The inliner has to add the copy (an `Identity` from the scope's
+  value into the If's slot, inside that branch's range) - and **not**
+  alias the branch output's name, or the copy reads the If's own stale
+  slot.  Then the copy itself must not be skipped as a "constant
+  input": only the selected branch runs, so an operator inside a branch
+  is never constant - and skipping it marked the If's slot as a
+  constant that was never computed, so every consumer of it was skipped
+  too - the `all_const` skip has to exclude `op.in_if_branch`.
+
+* **A `CumSum` is not a `Reduce`.**  It has no `keepdims` attribute and
+  it does not remove the axis: the output has the input's shape and the
+  values are the cumulative sums along the axis.  Treating it as a
+  reduction - which is what copying the `Reduce`'s shape function does -
+  drops the axis, and the formula recogniser's mask of the classes seen
+  so far collapses to one element: the count of each class can then
+  never grow, the loop's exit condition can never become true, and the
+  loop runs until the card's memory is gone.
+
+* **A boolean is a float32 0/1 inside the runtime, and the one-byte
+  form is the *wire's*.**  The device holds float32, so a one-byte
+  boolean on the device is three bytes of whatever is next; and
+  `1.0f`'s first byte is `0x00`, so a boolean that was *true* reads as
+  false when it is tested as a byte.  Both halves of that are silent:
+  the formula recogniser's `Loop` condition was a boolean, and the
+  loop exited after one iteration.  **Every place that touches a
+  boolean has to agree on the representation** - the element size, the
+  host copy, the device buffer, the wire - and the boundary is where
+  the model's one-byte form is converted.
+
+* **A device wait per operator costs the pipeline its depth, and the
+  waits were most of the runtime.**  The guard band behind every
+  output (a diagnostic that catches an operator writing past the end
+  of its buffer) was *written and read back* per output, and the
+  operator was waited for after every operator: three device waits
+  per output.  The formula recogniser's body has 1 742 operators and
+  the waits were 2.7x its device time.  The band is now off by default
+  (`SI_ONNX_GUARD=<n>` turns it on) and the wait happens only when a
+  diagnostic needs the result - the queue is in order, so the next
+  operator's kernels see this one's writes anyway.
+
+* **An integer value that the device reduces must be reduced on the
+  device, in its own type.**  The layout model's decoder reduces a
+  mask of twelve million int32 elements, and the host takes 300
+  milliseconds for it (the device: 17 ms).  The same goes for the
+  elementwise operators: the device's kernel reads floats, so an
+  integer operand needs either a typed kernel or a host path - and
+  the *host* path is the one that is only correct for the few values
+  (a condition is a scalar).  Reading an integer as a float reads its
+  bits, which is how a comparison of two int64 masks came out right
+  by accident and a division by an integer shape came out as
+  garbage.
+
+* **A `Loop`'s trip count is optional, and an empty one means "no
+  limit".**  The formula recogniser's loop omits it, and the omitted
+  input is a slot of -1 - so reading it as a tensor reads whatever is
+  next to it in memory, and the "trip count" comes out as several
+  exabytes.
+
+* **A boolean is one byte, and reading it as a float reads three bytes
+  of whatever is next.**  The runtime keeps a boolean as a float 0/1 on
+  the device (the device holds float32), so an operator that takes one
+  has to convert it on the host.  The same is true of a `Loop`'s
+  condition: it is a float 0/1 whose host copy the write-back *clears*
+  (a float lives on the device), so it has to be read back from the
+  device - and read **as a float**, because the first byte of 1.0f is
+  0x00 and a byte test says "false".
+
+* **The `ScatterElements`' updates have either the indices' shape (one
+  value per index) or the data's shape (a slice of the axis).**  The
+  wireless table structurer uses the first form, and reading it as the
+  second writes nothing at all - the decoder's mask stays empty and its
+  `Loop` runs to the trip count instead of stopping when the rows are
+  filled.
+
+* **The `GatherND`'s trailing block is contiguous.**  The index tuple
+  addresses the data's *first* dims and the rest is one flat run - so
+  the gather is `data[sum(index[d] * stride[d]) + t]`, with no
+  coordinate decomposition.  (The `ScatterElements` is a different
+  operator with a different convention, and mixing the two is how the
+  layout's mask came out wrong.)
+
+* **An operator's parameter is not always an attribute.**  The `TopK`'s
+  `largest` is one, and the layout model's decoder asks for the *smallest*
+  300 of 13 125 scores: picking the largest instead reorders every anchor,
+  and the boxes come out in the wrong places.  The `Split`'s sizes are an
+  *input* since opset 13, and reading only the attribute divides the
+  encoder's 13 125 positions into three equal thirds instead of the model's
+  10 000 / 2 500 / 625.  **Read the opset before the operator.**
+
+* **The `HardSwish` has no attributes at all, and the `HardSigmoid`'s
+  formula never changed.**  ONNXRuntime rejects an `alpha` attribute on a
+  `HardSwish` ("Unrecognized attribute"), so the form is fixed:
+  `x * max(0, min(1, (x + 3) / 6))`.  Using `alpha=0.2` (what most
+  sources quote) is the difference between the Paddle classifier's scores
+  and the reference's - every one of its six million hardswish values was
+  wrong, and the recogniser was wrong with it.  The hard sigmoid is
+  `max(0, min(1, alpha*x + beta))` with alpha=0.2 at *every* opset
+  (measured with a one-node model at opset 11, 12 and 14): an earlier
+  "legacy" form for the opsets before 14 was wrong for every model that
+  has a hard sigmoid and is older than that.
+
+* **A broadcast flag has to say *which* operand is the broadcast.**  The
+  layout model's decoder adds a scalar to a tensor, and the scalar is the
+  *first* operand: a flag that only says "one of them is a scalar" reads
+  the wrong one, and the result is a tensor of zeros where the reference
+  has the `1e8` sentinel - which then makes every box wrong.  The
+  operator is not commutative either (a subtraction and a division are
+  not), so the operands cannot be swapped.
+
+* **A `ConvTranspose` has an `output_padding`.**  It is "additional
+  elements added to the side of the output shape", and without it the
+  UNet's decoder comes out one pixel short in both directions - and a
+  decoder that is one pixel short puts every box one pixel off.  The
+  `output_shape` attribute, when it is there, replaces the geometry
+  altogether.
+
+* **An operator that writes float32 into an integer output leaves half
+  of it unwritten.**  The `Tile`'s input can be an `int64` (the layout
+  model's anchor indices are an `arange`), and a float kernel over an
+  8-byte buffer writes every other element - the rest is whatever the
+  pool handed out.  The `Tile` also has an `axis` attribute, and its
+  repeats are an int32 in some models and an int64 in others.
+
+* **The `Slice` keeps its rank (opset 10 and later).**  The sliced axes stay
+  where they are, they are only shorter.  The gather has to follow the
+  *output's* coordinates, and the source's stride has to include the slice's
+  *start* - without it the second slice of a tensor reads the first slice's
+  elements again, which looks exactly like a correct result.
+
+* **The `Concat` promotes a rank-0 value.**  numpy's rule: an input is
+  left-padded with 1s to the output's rank, and the output's rank is at
+  least `axis + 1`.  Paddle's export builds vectors out of scalars, and
+  without the promotion the vector comes out one element short - and the
+  operator downstream (a `Resize`, whose sizes are the vector) reads a
+  truncated size.
+
+* **The `Gemm` has a bias.**  It is the third input, per output column.
+  Without it the scores are off by a whole vector and the class that wins
+  flips.
+
+* **The activation's parameters travel by value.**  A host pointer read from
+  a device kernel is garbage: the convolution's epilogue read whatever the
+  host's stack held, and the hard sigmoid came out as zero.
+
+* **The integer values live on the host, and the host is not the device.**
+  An operator that produces an integer value and one that consumes it must
+  agree on where it is.  The `Expand` of an integer read a host-only buffer
+  through the *device* pointer and scattered garbage.  **The inverse is also
+  true: an integer value that is an *output* of a device operator has to be
+  uploaded** - the `GatherND`'s output was read as zeros.
+
+* **The fusion's alias is a rename, and a rename breaks a consumer that reads
+  both.**  `y = x * sigmoid(x)` reads the convolution's output *and* the
+  activation's output; folding the activation renames the second to the
+  first, and the consumer reads one value twice.
+
+* **The device memory is the pool's, and the pool's keys are the real sizes.**
+  A buffer released under the size it was *asked* for is handed out to an
+  operator that wants more, which writes past the end of it - and that is a
+  device fault, not a wrong number.
+
+* **A value that is dead is still holding a buffer.**  The graph's *outputs*
+  are never released by the "dead value" rule, so every call allocated a new
+  output buffer and dropped the old one: 48 MB a call for the layout model,
+  and a card that filled up after a few pages.
+
+* **A selection that is quadratic in k looks like a hang.**  The `TopK`'s
+  obvious implementation is O(k^2*cols) because the "is it taken" test is
+  O(k) - 1.2 billion comparisons for the layout model, **60 seconds per
+  page**, and 99.7% of the model's time.  The sorted-insertion rewrite is
+  O(cols*k).  **When one operator is 99% of a model's time, the shape of
+  its complexity is the thing to check, not the hardware.**
+
+* **A host loop over millions of elements is a device kernel waiting to
+  happen.**  The `Cast` was 70 ms a call and the `Where` 150 ms, both on the
+  host, because the integers are host-side values; the device does the
+  conversion now (the executor uploads the integer value's bytes, so the
+  device reads it in its own width).  The `Div` was 230 ms because its
+  operand was a *scalar* and the broadcast kernel worked out every
+  element's coordinates - an integer division per axis - to read one number.
+
+* **A cast writes the *output's* width, not the input's.**  A cast from
+  int64 to int64 that writes floats leaves the consumer reading the
+  float's bits as an integer - and the consumer is usually a `Concat`
+  that builds a shape, so the *next* operator reads a garbage size and
+  the model dies with a dimension of 4.9e18.  The kernel takes the
+  input's kind and the output's kind, and not a boolean.
+
+* **A rank-0 value has no axis.**  Every operator that indexes the
+  shape (`shape[0]`, `shape.back()`, the axes of a `Slice`) has to
+  handle it: a `Slice` of a scalar is the scalar, and `shape[0]` on an
+  empty vector is a wild read.  The models produce rank-0 values (a
+  `Gather` of one element, a loop-carried scalar), so this is a normal
+  input and not an edge case.
+
+* **A `Loop`'s outputs are the final values and the scans - the
+  condition is an *input*.**  The *body*'s outputs are different: they
+  start with the condition.  And the body's output buffers have to be
+  built *before* the body runs: the executor fills the buffers the
+  caller asks for, so an empty list means the body's outputs are never
+  collected and the loop reads past the end of an empty vector.
+
+* **An operator the runtime does not implement is an error, even in a
+  folded sub-graph.**  The fold skips what it does not know, and the
+  runtime skips a folded operator whose inputs are all constants - so
+  its output is an *empty* value, and a consumer that reads it (a
+  loop-carried value) reads garbage instead of failing.  The runtime
+  now says so.
+
 ## Quick verification before finishing a change
 
 ```bash

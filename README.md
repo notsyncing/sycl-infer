@@ -482,6 +482,47 @@ Containers: `docker/Dockerfile.router` (the router alone), `docker/Dockerfile.wo
 workers" topology) and `docker/compose.yaml`.  The full design is in
 [docs/design/16-router.md](docs/design/16-router.md).
 
+## The document pipeline: the ONNX model service
+
+`sycl-infer-onnx` is the other half of the engine: a service that runs the
+**ONNX** models a document pipeline needs - the layout detector, the OCR
+detector and recogniser, the table classifiers and structurers, the formula
+recogniser.  The runtime is this project's own: an ONNX protobuf reader, a
+graph optimiser (constant folding and operator fusion), an operator library,
+a SYCL kernel library and an executor that plans the memory - **all
+ahead-of-time compiled**, so there is no per-shape kernel compilation and no
+runtime JIT.
+
+It is a separate binary because it is a different workload: the kernels are
+the only part that needs the device, and the service is useful without the LLM
+engine.
+
+```bash
+cmake -S . -B build -DSI_ONNX=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target sycl-infer-onnx -j$(nproc)
+
+./build/sycl-infer-onnx --config onnx_models.json --port 8890
+```
+
+The client speaks a small binary protocol over HTTP and returns numpy arrays
+(the document pipeline's `rapid_doc/model/http_infer.py`), so each model can be
+swapped for the service without touching the code that calls it.
+
+**The state**: all twelve of the pipeline's models load, and the eight that
+have been verified are **either exact or within the float32 accumulation** -
+three of the captured corpus's seven are integer-exact, four differ in one or
+two elements of millions by one unit, and the formula recogniser (five real
+formula crops) is **integer-equal** to ONNXRuntime.  (The formula model is not
+in the captured corpus: the captured pages have no formulas.)
+
+**The performance** (one Arc A770, one 800x800 page, the layout detector):
+**281 ms of operator time**, of which the convolutions are 107 ms, the
+concatenations 39, the matmuls 38, the reductions 29 and the top-k 16.  The
+service's own call is 401 ms and the wire (the 48 MB of masks and boxes the
+client reads back) 228 ms.  The full table, the conditions and the dead ends
+are in
+[`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md).
+
 ## Performance
 
 Measured on **two Arc A770 16 GB** (i9-10940X, driver 12.55.8), an AOT Release

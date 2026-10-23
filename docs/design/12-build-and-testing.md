@@ -29,6 +29,7 @@
 | `SYCL_INFER_AOT_DEVICE` | `adl-p` | ocloc target。`adl-p` = Iris Xe，`acm-g10` = A770/DG2 |
 | `SYCL_INFER_AOT_PROFILE` | 空 | 把 device profile key 烤进二进制（`SI_FORCE_DEVICE_PROFILE`）；空 = 运行时按设备名自选 |
 | `SYCL_INFER_AOT_JOBS` | `nproc` | AOT 设备链接阶段的并行 ocloc/IGC 进程数（RAM 随此数线性增长） |
+| `SI_ONNX` | `ON` | 构建文档流水线的 ONNX 模型服务 `sycl-infer-onnx`（见 [design/17](17-onnx-service.md)） |
 | `SI_DEV_BENCH` | `OFF` | 构建 `dev/` 测量 harness（见 §1.5） |
 
 `SYCL_INFER_AOT_DEVICE` 与 `SYCL_INFER_AOT_PROFILE` 必须与二进制运行时选中的 profile 一致——前者是
@@ -68,6 +69,14 @@ vendored 的 llama.cpp Unicode 表留了一个故意未用的 helper，编译单
 `-DSI_DEV_BENCH=ON` 会额外构建 `bench_mtp`（源文件 `dev/bench_mtp.cpp`）——`dev/` 里**只有这一个**
 harness 挂在 CMake 上（`CMakeLists.txt:233-238`）。它默认关闭，因为这些是测量工具而不是交付物，
 而且每个都会在链接期重新 lower 一遍设备镜像。
+
+**ONNX 模型服务的验证**没有 CTest target：它的被测对象是**模型**，不是 kernel。验证是
+"对 ONNXRuntime 逐值比对"（oracle）：把流水线真实跑过的每次调用（输入 + ONNXRuntime 的输出）
+录下来，再向服务重放同一批输入，逐张量比较。工具在 `dev/`（gitignored）：`onnx_oracle.py`
+（录制/重放）、`full_diff.py`（顶层逐算子）、`flat_diff.py`（把一个 `Loop` 的 body 摊平进顶层图，
+让 ONNXRuntime 也能给出子图内部的值）、`formula_cap.py`（公式模型按真实公式图比对）。
+`SI_ONNX_TRACE` / `SI_ONNX_TIME` / `SI_ONNX_DUMP` / `SI_ONNX_DUMP_FILE` / `SI_ONNX_LOOPDBG` /
+`SI_ONNX_LOOPMAX` / `SI_ONNX_GUARD` 是这条路径的诊断开关（见 [design/17](17-onnx-service.md)）。
 
 ### 1.4 AOT 构建（`SYCL_INFER_AOT`）
 

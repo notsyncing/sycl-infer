@@ -290,6 +290,52 @@ if(NOT SI_ROUTER_ONLY)
 endif()
 target_link_libraries(sycl-infer-router PRIVATE si_router_core)
 
+# ------------------------------------------------------ the ONNX model service
+# The document-pipeline half of the engine: a service that runs the ONNX
+# models (the layout detector, the OCR recogniser, the table segmenter) on
+# the GPU and answers over HTTP.  The runtime is this project's own: an ONNX
+# parser, a graph optimiser (constant folding and operator fusion) and a SYCL
+# kernel library - all ahead-of-time compiled, so there is no runtime JIT.
+#
+# It is a SEPARATE binary (sycl-infer-onnx): the kernels are the only part
+# that needs the device, and the service is useful without the LLM engine.
+option(SI_ONNX "build the ONNX model service (sycl-infer-onnx)" ON)
+if(SI_ONNX)
+    add_library(si_onnx_core STATIC
+        src/onnx/proto.cpp
+        src/onnx/graph.cpp
+        src/onnx/ops.cpp
+        src/onnx/ops_shape.cpp
+        src/onnx/ops_exec.cpp
+        src/onnx/kernels.cpp
+        src/onnx/exec.cpp
+        src/onnx/wire.cpp
+        src/onnx/service.cpp
+    )
+    target_include_directories(si_onnx_core PUBLIC
+        src
+        src/onnx
+        src/common
+        src/device
+        third_party)
+    # The device profile: the kernels ask it for the work-group size the
+    # card accepts.
+    target_sources(si_onnx_core PRIVATE
+        src/device/device_registry.cpp
+        src/device/profiles/arc_a770.cpp
+        src/device/profiles/iris_xe.cpp
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(si_onnx_core PUBLIC Threads::Threads)
+    if(OpenSSL_FOUND)
+        target_compile_definitions(si_onnx_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
+        target_link_libraries(si_onnx_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    endif()
+
+    add_executable(sycl-infer-onnx src/onnx/main.cpp)
+    target_link_libraries(sycl-infer-onnx PRIVATE si_onnx_core)
+endif()
+
 # ------------------------------------------------------------------- tests
 # Tests mirror the src/ layout: tests/model, tests/engine, tests/kernels (one
 # source file per kernel stage, next to the test_gpu_stages runner).

@@ -24,7 +24,8 @@
 | 15 | [design/14-dflash2.md](design/14-dflash2.md) | DFlash2 块草稿器：块扩散前向、动态卷积、selector lattice、verify 定价、与参考实现逐元素对比 |
 | 16 | [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md) | MoE 架构加载（每层混合量化）、路由专家的 grouped dp4a GEMM（以及 **decode 自己的 tile**）、ncmoe 专家切分（GPU 固定部分 / CPU 可变部分）、disk→RAM→VRAM 三级专家缓存 |
 | 17 | [design/16-router.md](design/16-router.md) | 多模型路由进程：JSON-with-comments 配置文件与模型注册表、JSON-RPC 控制面（模型身份/设备显存/优雅停机）、HTTP/SSE 数据面代理、worker 生命周期与显存预算的实测准入、远程 worker、Docker 部署 |
-| 18 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+| 18 | [design/17-onnx-service.md](design/17-onnx-service.md) | 文档流水线的 ONNX 模型服务：自研的 ONNX protobuf 解析、常量折叠与算子融合（BatchNorm/激活融进卷积）、算子库与 SYCL kernel、执行器的内存计划、二进制线协议与 HTTP 端点 |
+| 19 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 ## 快速定位
 
@@ -43,6 +44,7 @@
 * 想让 prefill 更快（batch 形状、oneDNN prefill attention）→ [design/04-engine.md §7](design/04-engine.md)、[design/03-kernels.md §5.8](design/03-kernels.md)、[design/03-kernels.md §7.5](design/03-kernels.md)
 * 想调优内存/前缀缓存 → [design/05-kv-cache.md](design/05-kv-cache.md)、[design/06-prefix-cache.md](design/06-prefix-cache.md)
 * 想同时部署多个模型、或要给每个模型单独一份显存预算 → [design/16-router.md](design/16-router.md)
+* 想跑文档流水线的 ONNX 模型（版面/OCR/表格/公式）→ [design/17-onnx-service.md](design/17-onnx-service.md)
 * 想看实测吞吐（按深度 / batch / 投机路径）→ [PERFORMANCE.md](PERFORMANCE.md)
 * 环境变量总表 → [AGENTS.md](../AGENTS.md#environment-variables)
 * 排查"模型输出不正常"（decode/prefill 不一致、量化路径差异、参考实现不可信等）→ [design/12-build-and-testing.md §7](design/12-build-and-testing.md)
