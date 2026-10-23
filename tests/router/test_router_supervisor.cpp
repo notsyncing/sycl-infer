@@ -236,12 +236,12 @@ void test_same_group_starts_serially() {
     registry reg;
     model_config a = make_model(self_path(), port_a);
     a.id = "a";
-    a.device_group = "gpu0";
+    a.device_group = "gpu.0";
     a.env.push_back("TEST_ROUTER_FAKE_DELAY=4"); // slow to come up
     auto slot_a = reg.add(a);
     model_config b = make_model(self_path(), port_b);
     b.id = "b";
-    b.device_group = "gpu0"; // the same card
+    b.device_group = "gpu.0"; // the same card
     auto slot_b = reg.add(b);
 
     router_config cfg;

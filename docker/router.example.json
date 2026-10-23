@@ -60,15 +60,18 @@
       // "control_token": "change-me",
       // "control_token_file": "/run/secrets/control-token",
       "args": ["--ctx", "20480"],
+      // `device` is either the worker's --device value as a string
+      // ("cpu" / "gpu" / "auto") or this object.  `kind`, `layer_map` and
+      // `count` all use the worker command line's own syntax.
       "device": {
         // The budget grouping: the models of one group share a card, so they
         // start one at a time and are admitted against each other.
-        "group": "gpu0",
+        "group": "gpu.0",
         // SYCL_DEVICE_FILTER for the worker: it pins the worker to one card
         // (a container sees every card the host has).
         "filter": "level_zero:0",
-        // How many cards the model runs on.  A model split with --layer-map
-        // uses several, and its budget is the TOTAL over them.
+        // How many cards the model runs on.  Omit it when `layer_map` is
+        // given: the router derives it from the map's distinct GPUs.
         "count": 1
       },
       "memory": {
@@ -90,10 +93,11 @@
       "control": "127.0.0.1:18084",
       // The 27B does not fit on one card: the layer map splits it, and each
       // card keeps the KV of the layers it computes.
-      "args": ["--ctx", "131072", "--layer-map", "0-31:gpu.0,32-63:gpu.1"],
+      "args": ["--ctx", "131072"],
+      // `layer_map` is the worker's --layer-map, character for character.
       // The 27B spans both cards, so its group is both of them and its
-      // budget is the total over the two.
-      "device": { "group": "gpu0+gpu1", "count": 2 },
+      // budget is the total over the two (`count` is derived from the map).
+      "device": { "group": "gpu.0,gpu.1", "layer_map": "0-31:gpu.0,32-63:gpu.1" },
       "memory": {
         "vram_budget_mb": 30720,
         // A single-stream long-context run needs one slot: the recurrent
@@ -115,7 +119,7 @@
       "path": "/models/pp_doclayoutv3.onnx",
       "http": "127.0.0.1:18085",
       "control": "127.0.0.1:18086",
-      "device": { "kind": "gpu", "group": "gpu0", "filter": "level_zero:0", "count": 1 },
+      "device": { "kind": "gpu", "group": "gpu.0", "filter": "level_zero:0", "count": 1 },
       "memory": { "vram_budget_mb": 4096 },
       "onnx": { "drop_outputs": ["fetch_name_2"], "dnnl": true }
     },

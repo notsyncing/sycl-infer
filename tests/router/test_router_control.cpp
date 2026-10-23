@@ -338,7 +338,7 @@ void test_identity_comes_from_the_control_plane() {
     const int http_port = free_port();
     const int ctl_port = free_port();
     registry reg;
-    auto slot = reg.add(make_model(self_path(), http_port, ctl_port, "gpu0"));
+    auto slot = reg.add(make_model(self_path(), http_port, ctl_port, "gpu.0"));
 
     router_config cfg;
     cfg.log_dir = "/tmp/sycl-infer-router-test-log";
@@ -366,11 +366,11 @@ void test_vram_admission() {
     const int http_b = free_port();
     const int ctl_b = free_port();
     registry reg;
-    model_config a = make_model(self_path(), http_a, ctl_a, "gpu0");
+    model_config a = make_model(self_path(), http_a, ctl_a, "gpu.0");
     a.id = "a";
     a.vram_budget_mb = 400; // fits in the 600 MB the card reports free
     auto slot_a = reg.add(a);
-    model_config b = make_model(self_path(), http_b, ctl_b, "gpu0");
+    model_config b = make_model(self_path(), http_b, ctl_b, "gpu.0");
     b.id = "b";
     b.vram_budget_mb = 900; // does NOT fit
     auto slot_b = reg.add(b);
@@ -410,7 +410,7 @@ void test_graceful_shutdown() {
     const int http_port = free_port();
     const int ctl_port = free_port();
     registry reg;
-    auto slot = reg.add(make_model(self_path(), http_port, ctl_port, "gpu0"));
+    auto slot = reg.add(make_model(self_path(), http_port, ctl_port, "gpu.0"));
 
     router_config cfg;
     cfg.log_dir = "/tmp/sycl-infer-router-test-log";

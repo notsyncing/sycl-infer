@@ -156,7 +156,7 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
       "path": "/models/Qwen3.5-0.8B-Q4_K_M.gguf",
       "http": "127.0.0.1:18081",
       "args": ["--ctx", "20480"],
-      "device": { "group": "gpu0", "filter": "level_zero:0" },
+      "device": { "group": "gpu.0", "filter": "level_zero:0" },
       "memory": {
         "vram_budget_mb": 4096,
         "kv_cap_mb": 2048,
@@ -169,8 +169,8 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
       "id": "qwen38-27b",
       "path": "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
       "http": "127.0.0.1:18083",
-      "args": ["--ctx", "131072", "--layer-map", "0-31:gpu.0,32-63:gpu.1"],
-      "device": { "group": "gpu1" },
+      "args": ["--ctx", "131072"],
+      "device": { "group": "gpu.0,gpu.1", "layer_map": "0-31:gpu.0,32-63:gpu.1" },
       "memory": {
         "vram_budget_mb": 30720,
         "kv_cap_mb": 4096,
@@ -210,10 +210,12 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
 | `models[].http` | 本地必填 | worker 的 OpenAI HTTP 地址 `host:port` |
 | `models[].args` | 否 | 追加到派生命令行之后的额外参数。**`--model` / `--host` / `--port` 由路由器生成，不允许覆盖**（冲突即配置错误） |
 | `models[].env` | 否 | 传给该 worker 的额外环境变量（与 `defaults.env` 合并，子进程优先） |
-| `models[].device.group` | 否 | 预算分组键：同组的模型视为共用一组卡，它们的预算必须相加 |
+| `models[].device` | 否 | 要么是一个字符串（就是 `--device` 的取值：`cpu` / `gpu` / `auto`），要么是下面这些字段组成的对象。字符串形式是常用写法 |
+| `models[].device.group` | 否 | 预算分组键：同组的模型视为共用一组卡，它们的预算必须相加。**命名沿用设备语法**：单卡 `gpu.0`，多卡 `gpu.0,gpu.1`（与 `--layer-map` 里的 device token 一致）；它只是分组标签，路由器不解析它 |
 | `models[].device.kind` | 否 | 传给 worker 的 `--device`：`cpu` / `gpu` / `auto`（与 LLM 主程序相同）。`filter` 仍然负责钉卡；ONNX 默认 `gpu` |
+| `models[].device.layer_map` | 否 | 传给 worker 的 `--layer-map`，**语法与命令行完全相同**：`begin-end:device,...`，device 为 `gpu` / `gpu.N` / `cpu`。路由器在启动时校验范围连续；`count` 未给时按其中不同的 GPU 数推导 |
 | `models[].device.filter` | 否 | 传给子进程的 `SYCL_DEVICE_FILTER`，用来把 worker 钉到某张卡（**这是多进程方案白拿的好处**：单进程方案要改 `make_queue` 才能选卡） |
-| `models[].device.count` | 否 | 这个模型跑在几张卡上（用 `--layer-map` 切分的模型是多张）。预算是**跨这些卡的总和**，所以静态检查用 `budget / count` 与单卡容量比较；ONNX 没有 layer map，必须为 1 |
+| `models[].device.count` | 否 | 这个模型跑在几张卡上（用 `--layer-map` 切分的模型是多张）。预算是**跨这些卡的总和**，所以静态检查用 `budget / count` 与单卡容量比较；省略时由 `layer_map` 推导；ONNX 没有 layer map，必须为 1 |
 | `models[].onnx.drop_outputs` | 否 | ONNX 模型不读回的输出（→ `--drop-outputs`）；layout 的 48 MB mask 就是这里丢掉的 |
 | `models[].onnx.dnnl` | 否 | ONNX 的 oneDNN f32 卷积/matmul 开关（→ `--dnnl 0/1`，默认 1） |
 | `models[].control` | 否 | worker 的控制面地址 `host:port`（JSON-RPC over TCP）。给了它，路由器就用它拿模型身份与显存、并优雅停机；不给就退回 HTTP + 信号 |
@@ -230,10 +232,15 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
 
 ```
 sycl-infer --model <path> --host <http.host> --port <http.port> \
+           [--device K] [--layer-map L] \
            [--control-port N] [--control-token-file P] \
            [--kv-cap-mb N] [--max-slots N] [--pc-vram-mb N] [--pc-dir D] \
            [args...] serve
 ```
+
+`K` 和 `L` 就是 worker 自己的 `--device` / `--layer-map` 取值，路由器不做语法转换。
+`--layer-map` 也可以直接写在 `args` 里（同样的命令行语法），解析时会并入
+`device.layer_map`；两处同时给是配置错误。
 
 `--control-port` 由路由器派生（它要连的面就是 worker 要开的面）；令牌用**文件**形式传给 worker
 （`--control-token-file`），这样令牌从不出现在命令行上——`ps` 是能看见命令行的。
@@ -256,8 +263,8 @@ sycl-infer-onnx --model <id>=<path> --device <kind> --host <http.host> --port <h
 1. `id` 唯一、非空、不含空白。
 2. HTTP 端口不重复，且不与 `router.listen` 冲突。
 3. 本地模型的 `path` 存在且可读。
-4. `args` 里不出现 `--model` / `--host` / `--port` / `--control-port` / `--control-host` / `--device` / `--drop-outputs` / `--dnnl` / `--config`。
-5. `kv_cap_mb` / `max_slots` 不为 0。
+4. `args` 里不出现 `--model` / `--host` / `--port` / `--control-port` / `--control-host` / `--device` / `--drop-outputs` / `--dnnl` / `--config`。`--layer-map` 允许出现在 `args`，并被并入 `device.layer_map`。
+5. `kv_cap_mb` / `max_slots` 不为 0；`device.layer_map` 的范围从 0 开始且连续，device 只接受 `gpu` / `gpu.N` / `cpu`；ONNX 模型不接受 `layer_map`。
 6. 同一 `device.group` 的 `vram_budget_mb` 之和 ≤ `router.device_vram_mb`（给了后者才检查）。
 7. 远程模型不要求 `path`。
 8. 所有超时与重试计数为正。
@@ -560,7 +567,7 @@ shutdown 后**故意多活 2 秒**（模拟 flush），测试断言它走完了�
 | 层 | 机制 | 谁执行 | 失败表现 |
 |---|---|---|---|
 | ① 静态预算 | 配置里的 `memory.vram_budget_mb`，按设备组求和 ≤ `router.device_vram_mb` | 路由器（配置校验，§4.5） | 路由器拒绝启动，配置错误 |
-| ② 经验准入 | worker 加载后通过控制面回报**加载后**的 `free_vram_bytes`；路由器据此决定同组的下一个模型能否启动 | 路由器（supervisor 的账本） | 标 `failed`，附原因（"the device group 'gpu0' has 600 MB free, and this model needs 900 MB"） |
+| ② 经验准入 | worker 加载后通过控制面回报**加载后**的 `free_vram_bytes`；路由器据此决定同组的下一个模型能否启动 | 路由器（supervisor 的账本） | 标 `failed`，附原因（"the device group 'gpu.0' has 600 MB free, and this model needs 900 MB"） |
 | ③ 池内退让 | worker 自己的 `--kv-cap-mb` / `--max-slots` / `--pc-vram-mb` 决定实际峰值；KV 池按需增长、到 cap 停止 | worker | KV 池停在上限，**不是崩溃**（`src/engine/engine_kvpool.cpp:411`） |
 
 **第 ② 层是这套设计里最值钱的部分**：它把显存准入从"预测"变成"实测"。27B 加载完才占满 9 072 MiB，

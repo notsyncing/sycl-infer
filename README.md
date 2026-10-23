@@ -426,7 +426,7 @@ cmake --build build-router-only -j$(nproc)
       "control": "127.0.0.1:18082",               // its control plane (RPC)
       "control_token_file": "/run/secrets/ctl",   // the control plane's secret
       "args": ["--ctx", "20480"],
-      "device": { "group": "gpu0", "filter": "level_zero:0", "count": 1 },
+      "device": { "group": "gpu.0", "filter": "level_zero:0", "count": 1 },
       "memory": {
         "vram_budget_mb": 4096,                    // the router's admission budget
         "kv_cap_mb": 2048,                         // -> --kv-cap-mb
@@ -447,7 +447,7 @@ What it does:
   has *measured* free (the worker publishes its own device footprint over the
   control plane) and refuses one that does not fit - with the measured
   figure, not a guess:
-  `the device group 'gpu0' has 9874 MB free, and this model needs 12288 MB`;
+  `the device group 'gpu.0' has 9874 MB free, and this model needs 12288 MB`;
 * **the OpenAI API unchanged**: `/v1/chat/completions`, `/v1/completions`,
   `/v1/models`, streaming, `reasoning_content`, tool calls, logprobs - the
   router proxies them, it does not reimplement them;

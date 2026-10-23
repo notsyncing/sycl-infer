@@ -1012,7 +1012,7 @@ A model entry is:
   "id": "layout", "backend": "onnx",
   "path": "/models/pp_doclayoutv3.onnx",
   "http": "127.0.0.1:18085", "control": "127.0.0.1:18086",
-  "device": { "kind": "gpu", "group": "gpu0", "filter": "level_zero:0", "count": 1 },
+  "device": { "kind": "gpu", "group": "gpu.0", "filter": "level_zero:0", "count": 1 },
   "memory": { "vram_budget_mb": 4096 },
   "onnx": { "drop_outputs": ["fetch_name_2"], "dnnl": true }
 }

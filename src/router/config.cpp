@@ -171,6 +171,63 @@ bool file_readable(const std::string & p) {
     return access(p.c_str(), R_OK) == 0;
 }
 
+// `device.layer_map` is passed to the worker verbatim, so it uses the same
+// grammar as `--layer-map`: "begin-end:device[,begin-end:device...]" with
+// gpu | gpu.N | cpu.  Parsing it here turns a typo into a configuration error
+// at router startup instead of a worker that loads a model and then dies, and
+// it lets `device.count` default to the number of distinct GPUs the map names.
+// Returns the GPU count (0 for an all-CPU map).  The final range is checked
+// against the model's layer count by the worker, which is where that
+// information lives.
+int layer_map_gpu_count(const std::string & map, const std::string & where) {
+    std::set<int> gpus;
+    int entries = 0;
+    int expect = 0;
+    size_t pos = 0;
+    while (pos < map.size()) {
+        const size_t comma = map.find(',', pos);
+        const std::string tok =
+                map.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? map.size() : comma + 1;
+        if (tok.empty()) {
+            continue;
+        }
+        const size_t colon = tok.find(':');
+        if (colon == std::string::npos) {
+            cfg_err(where + ": bad --layer-map entry (expect begin-end:device): " + tok);
+        }
+        const std::string rng = tok.substr(0, colon);
+        const std::string dev = tok.substr(colon + 1);
+        const size_t dash = rng.find('-');
+        if (dash == std::string::npos) {
+            cfg_err(where + ": bad --layer-map range: " + rng);
+        }
+        const int l0 = atoi(rng.substr(0, dash).c_str());
+        const int l1 = atoi(rng.substr(dash + 1).c_str()) + 1;
+        if (l0 != expect) {
+            cfg_err(where + ": --layer-map must cover every layer, in order, from 0");
+        }
+        if (l1 <= l0) {
+            cfg_err(where + ": bad --layer-map range: " + rng);
+        }
+        expect = l1;
+        if (dev == "cpu" || dev == "host" || dev == "1") {
+            // no card to count
+        } else if (dev == "gpu") {
+            gpus.insert(0);
+        } else if (dev.rfind("gpu.", 0) == 0) {
+            gpus.insert(atoi(dev.c_str() + 4));
+        } else {
+            cfg_err(where + ": bad --layer-map device (expect gpu[.N] or cpu): " + dev);
+        }
+        entries++;
+    }
+    if (entries == 0) {
+        cfg_err(where + ": empty --layer-map");
+    }
+    return (int)gpus.size();
+}
+
 } // namespace
 
 std::vector<std::string> build_worker_argv(const model_config & m) {
@@ -232,6 +289,10 @@ std::vector<std::string> build_worker_argv(const model_config & m) {
     if (!m.device_kind.empty()) {
         a.push_back("--device");
         a.push_back(m.device_kind);
+    }
+    if (!m.device_layer_map.empty()) {
+        a.push_back("--layer-map");
+        a.push_back(m.device_layer_map);
     }
     control();
     if (m.kv_cap_mb >= 0) {
@@ -414,22 +475,58 @@ router_config parse_config(const std::string & text) {
         m.env = get_kv_map(e, "env");
 
         const json * dev = member(e, "device");
+        bool count_set = false;
         if (dev) {
-            if (!dev->is_object()) {
-                cfg_err(where + ": 'device' must be an object");
+            // `device` is either the worker's --device value as a plain string
+            // ("gpu", "cpu", "auto" - the command line's own grammar) or an
+            // object for the router-side placement knobs.
+            if (dev->is_string()) {
+                m.device_kind = dev->get<std::string>();
+            } else if (dev->is_object()) {
+                m.device_group = get_str(*dev, "group", m.device_group);
+                m.device_kind = get_str(*dev, "kind", m.device_kind);
+                m.device_layer_map = get_str(*dev, "layer_map", m.device_layer_map);
+                m.device_filter = get_str(*dev, "filter", m.device_filter);
+                if (member(*dev, "count")) {
+                    m.device_count = get_int(*dev, "count", m.device_count);
+                    count_set = true;
+                }
+            } else {
+                cfg_err(where + ": 'device' must be a string (cpu|gpu|auto) or an object");
             }
-            m.device_group = get_str(*dev, "group", m.device_group);
-            m.device_kind = get_str(*dev, "kind", m.device_kind);
-            m.device_filter = get_str(*dev, "filter", m.device_filter);
-            m.device_count = get_int(*dev, "count", m.device_count);
-            if (m.device_count < 1) {
-                cfg_err(where + ": 'device.count' must be at least 1");
+        }
+        // `--layer-map` in `args` is the same syntax, so accept it there too
+        // and lift it into the typed field: one value, one place to validate.
+        for (size_t i = 0; i < m.args.size();) {
+            if (m.args[i] != "--layer-map") {
+                ++i;
+                continue;
             }
+            if (i + 1 >= m.args.size()) {
+                cfg_err(where + ": '--layer-map' in 'args' needs a value");
+            }
+            if (!m.device_layer_map.empty()) {
+                cfg_err(where + ": '--layer-map' is set more than once");
+            }
+            m.device_layer_map = m.args[i + 1];
+            m.args.erase(m.args.begin() + i, m.args.begin() + i + 2);
+        }
+        if (m.device_count < 1) {
+            cfg_err(where + ": 'device.count' must be at least 1");
         }
         if (m.device_kind.empty() && m.is_onnx()) m.device_kind = "gpu";
         if (!m.device_kind.empty() && m.device_kind != "cpu" && m.device_kind != "gpu" &&
             m.device_kind != "auto" && m.device_kind != "host") {
-            cfg_err(where + ": 'device.kind' must be cpu, gpu or auto");
+            cfg_err(where + ": 'device.kind' must be cpu, gpu, auto or host");
+        }
+        if (m.is_onnx() && !m.device_layer_map.empty()) {
+            cfg_err(where + ": an ONNX model runs on one device (no layer map)");
+        }
+        if (!m.device_layer_map.empty()) {
+            const int gpus = layer_map_gpu_count(m.device_layer_map, where);
+            if (!count_set) {
+                m.device_count = gpus > 0 ? gpus : 1;
+            }
         }
         if (m.is_onnx() && m.device_count != 1) {
             cfg_err(where + ": an ONNX model runs on one device (no layer map)");
@@ -465,7 +562,7 @@ router_config parse_config(const std::string & text) {
         static const char * kReserved[] = {"--model", "--host", "--port", "--control-port",
                                           "--control-host", "--control-token",
                                           "--control-token-file", "--device", "--drop-outputs",
-                                          "--dnnl", "--config", "--layer-map"};
+                                          "--dnnl", "--config"};
         for (const std::string & a : m.args) {
             for (const char * r : kReserved) {
                 if (a == r) {

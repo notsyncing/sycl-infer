@@ -85,7 +85,7 @@ void test_derived_fields() {
   "models": [{
     "id": "m1", "path": "/etc/hostname", "http": "127.0.0.1:18081",
     "args": ["--ctx", "32768"],
-    "device": { "group": "gpu0", "filter": "level_zero:0" },
+    "device": { "group": "gpu.0", "filter": "level_zero:0" },
     "memory": { "vram_budget_mb": 4096, "kv_cap_mb": 2048, "max_slots": 4,
                 "prefix_cache_vram_mb": 512, "prefix_cache_dir": "/tmp/pc" }
   }]
@@ -103,7 +103,7 @@ void test_derived_fields() {
     CHECK(m.max_slots == 4, "max slots: %d", m.max_slots);
     CHECK(m.pc_vram_mb == 512, "pc vram: %d", m.pc_vram_mb);
     CHECK(m.pc_dir == "/tmp/pc", "pc dir: %s", m.pc_dir.c_str());
-    CHECK(m.device_group == "gpu0", "device group: %s", m.device_group.c_str());
+    CHECK(m.device_group == "gpu.0", "device group: %s", m.device_group.c_str());
     CHECK(m.device_filter == "level_zero:0", "device filter: %s", m.device_filter.c_str());
     CHECK(c.request_timeout_s == 120, "request timeout: %d", c.request_timeout_s);
     CHECK(c.default_env.size() == 1 && c.default_env[0] == "PF_PREFIX_CACHE=1", "default env");
@@ -128,13 +128,76 @@ void test_derived_fields() {
 }
 
 
+// The device specification uses the worker's own command-line grammar:
+// `device` is the --device string, and `device.layer_map` is the --layer-map.
+void test_device_syntax() {
+    {
+        const char * text = R"({
+  "models": [{ "id": "m1", "path": "/etc/hostname", "http": "127.0.0.1:18081",
+               "device": "gpu" }]
+})";
+        router_config c = parse_config(text);
+        const model_config & m = c.models[0];
+        CHECK(m.device_kind == "gpu", "a string device is the --device value: %s", m.device_kind.c_str());
+        auto has = [&](const std::string & s) {
+            for (const std::string & x : m.argv) {
+                if (x == s) return true;
+            }
+            return false;
+        };
+        CHECK(has("--device") && has("gpu"), "the string device must reach the worker");
+    }
+    {
+        const char * text = R"({
+  "models": [{ "id": "m1", "path": "/etc/hostname", "http": "127.0.0.1:18081",
+               "device": { "kind": "gpu", "group": "gpu.0,gpu.1",
+                           "layer_map": "0-31:gpu.0,32-63:gpu.1" } }]
+})";
+        router_config c = parse_config(text);
+        const model_config & m = c.models[0];
+        CHECK(m.device_layer_map == "0-31:gpu.0,32-63:gpu.1", "layer map: %s",
+              m.device_layer_map.c_str());
+        CHECK(m.device_count == 2, "the card count is derived from the map: %d", m.device_count);
+        auto has = [&](const std::string & s) {
+            for (const std::string & x : m.argv) {
+                if (x == s) return true;
+            }
+            return false;
+        };
+        CHECK(has("--layer-map") && has("0-31:gpu.0,32-63:gpu.1"),
+              "the map must reach the worker as --layer-map");
+    }
+    {
+        // The same value in `args` is the same syntax: it is lifted into the
+        // typed field rather than rejected as a reserved flag.
+        const std::string text = std::string("{\"models\": [{\"id\": \"m1\", \"path\": \"") + kModelPath +
+                                 "\", \"http\": \"127.0.0.1:18081\", \"device\": \"gpu\", "
+                                 "\"args\": [\"--layer-map\", \"0-11:gpu.0,12-23:cpu\"]}]}";
+        router_config c = parse_config(text);
+        CHECK(c.models[0].device_layer_map == "0-11:gpu.0,12-23:cpu", "args layer map: %s",
+              c.models[0].device_layer_map.c_str());
+        CHECK(c.models[0].device_count == 1, "only one GPU in the map: %d", c.models[0].device_count);
+    }
+    // A layer map with a gap is a configuration error, not a worker failure.
+    CHECK(parse_fails(one_model(", \"device\": { \"layer_map\": \"0-31:gpu.0,33-63:gpu.1\" }")),
+          "a non-contiguous layer map must be rejected");
+    CHECK(parse_fails(one_model(", \"device\": { \"layer_map\": \"0-31\" }")),
+          "a layer map entry without a device must be rejected");
+    CHECK(parse_fails(one_model(", \"device\": { \"layer_map\": \"0-31:npu\" }")),
+          "a layer map device the engine does not know must be rejected");
+    // ONNX has no layer map.
+    CHECK(parse_fails("{\"models\": [{\"id\": \"m1\", \"backend\": \"onnx\", \"path\": \"/etc/hostname\", "
+                       "\"http\": \"127.0.0.1:18081\", \"device\": { \"layer_map\": \"0-1:gpu.0\" }}]}"),
+          "an ONNX model must reject a layer map");
+}
+
 void test_onnx_backend() {
     const char * text = R"({
   "defaults": { "binary": "sycl-infer", "binary_onnx": "sycl-infer-onnx" },
   "models": [{
     "id": "layout", "backend": "onnx", "path": "/etc/hostname",
     "http": "127.0.0.1:18081", "control": "127.0.0.1:18082",
-    "device": { "kind": "gpu", "group": "gpu0", "filter": "level_zero:0" },
+    "device": { "kind": "gpu", "group": "gpu.0", "filter": "level_zero:0" },
     "onnx": { "drop_outputs": ["fetch_name_2"], "dnnl": false }
   }]
 })";
@@ -214,9 +277,9 @@ void test_validation() {
   "router": { "device_vram_mb": 4096 },
   "models": [
     { "id": "a", "path": "/etc/hostname", "http": "127.0.0.1:18081",
-      "device": { "group": "gpu0" }, "memory": { "vram_budget_mb": 3000 } },
+      "device": { "group": "gpu.0" }, "memory": { "vram_budget_mb": 3000 } },
     { "id": "b", "path": "/etc/hostname", "http": "127.0.0.1:18082",
-      "device": { "group": "gpu0" }, "memory": { "vram_budget_mb": 3000 } }
+      "device": { "group": "gpu.0" }, "memory": { "vram_budget_mb": 3000 } }
   ]
 })";
     CHECK(parse_fails(over), "budgets that overflow the device must be rejected");
@@ -256,6 +319,7 @@ int main() {
     test_comments();
     test_comment_in_string();
     test_derived_fields();
+    test_device_syntax();
     test_validation();
     test_remote();
     test_bearer_tokens();

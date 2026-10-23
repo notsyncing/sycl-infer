@@ -47,6 +47,11 @@ struct model_config {
     // as the LLM engine).  Empty for an LLM model means "leave it to the
     // engine"; an ONNX worker defaults to gpu.
     std::string device_kind;
+    // The worker's --layer-map value, verbatim: the config uses the engine's
+    // own device grammar (gpu | gpu.N | cpu) rather than translating it.
+    // Empty means one device.  `device_count` defaults to the number of
+    // distinct GPUs the map names when it is not given explicitly.
+    std::string device_layer_map;
     std::string device_filter;
     int device_count = 1;
 
