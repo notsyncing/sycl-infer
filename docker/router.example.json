@@ -37,6 +37,9 @@
     // The worker executable.  The image puts it next to the router, so the
     // default ("sycl-infer") resolves.
     "binary": "/usr/local/bin/sycl-infer",
+    // The ONNX backend is a different worker binary; the router uses this
+    // when a model entry says "backend": "onnx".
+    "binary_onnx": "/usr/local/bin/sycl-infer-onnx",
     "env": {
       "PF_PREFIX_CACHE": "1"
     }
@@ -100,6 +103,21 @@
         "prefix_cache_vram_mb": 0,
         "prefix_cache_dir": "/var/lib/sycl-infer/pc/qwen38-27b"
       }
+    },
+    {
+      // The ONNX document-pipeline backend.  It uses the same device
+      // specification as the LLM workers: `kind` is the --device value and
+      // `filter` pins the card through SYCL_DEVICE_FILTER.  There is no
+      // layer map for ONNX.  The model id is the routing key in the binary
+      // /v1/onnx/run request.
+      "id": "layout",
+      "backend": "onnx",
+      "path": "/models/pp_doclayoutv3.onnx",
+      "http": "127.0.0.1:18085",
+      "control": "127.0.0.1:18086",
+      "device": { "kind": "gpu", "group": "gpu0", "filter": "level_zero:0", "count": 1 },
+      "memory": { "vram_budget_mb": 4096 },
+      "onnx": { "drop_outputs": ["fetch_name_2"], "dnnl": true }
     },
     {
       // A worker on ANOTHER machine: the router connects to it instead of

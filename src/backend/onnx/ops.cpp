@@ -140,14 +140,6 @@ std::vector<double> host_values_any(sycl::queue & q, const tensor * t) {
     return v;
 }
 
-std::vector<uint8_t> bool_to_runtime_bytes(const std::vector<uint8_t> & raw) {
-    std::vector<uint8_t> out(raw.size() * 4, 0);
-    for (size_t i = 0; i < raw.size(); ++i) {
-        const float v = raw[i] ? 1.0f : 0.0f;
-        std::memcpy(out.data() + i * 4, &v, 4);
-    }
-    return out;
-}
 
 // ------------------------------------------------------------- the shapes
 std::vector<int64_t> broadcast_shapes(const std::vector<std::vector<int64_t>> & in) {

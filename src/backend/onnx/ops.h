@@ -19,6 +19,8 @@
 #include <vector>
 
 #include "graph.h"
+#include "onnx_activation.h"
+#include "onnx_types.h"
 #include "proto.h"
 
 namespace si {
@@ -210,41 +212,6 @@ inline spatial_geom spatial_geometry(int64_t auto_pad, int64_t H, int64_t W, int
     return g;
 }
 
-// The hard sigmoid's and the hard swish's parameters, in the linear form
-// the epilogue computes: clamp(a * x + b, 0, 1).
-//
-// The definition changed in opset 14:
-//
-//   opset <= 13:  y = clamp((x + alpha) / (beta + alpha), 0, 1)
-//   opset >= 14:  y = clamp(alpha * x + beta, 0, 1)
-//
-// The old form is linear too - the slope is 1/(beta + alpha) and the
-// intercept is alpha/(beta + alpha) - so one epilogue serves both, and the
-// model's opset decides which pair of coefficients it is.
-inline void hardsigmoid_params(int64_t /*opset*/, float alpha, float beta, float * out) {
-    // The formula did not change with the opset: the hard sigmoid is
-    // max(0, min(1, alpha*x + beta)) with alpha=0.2 and beta=0.5, and
-    // ONNXRuntime's is the same at opset 11, 12 and 14 (measured, with a
-    // one-node model).  An earlier version had a "legacy" form for the
-    // opsets before 14 - and it was wrong for every model that has a hard
-    // sigmoid and is older than that.
-    out[0] = alpha;
-    out[1] = beta;
-}
-
-// The hard swish's parameters: the linear form's slope and intercept.
-//
-// The operator has **no attributes at all** - ONNXRuntime rejects an
-// "alpha" one ("Unrecognized attribute: alpha for operator HardSwish") -
-// so the form is fixed: x * max(0, min(1, (x + 3) / 6)), whose linear part
-// is x/6 + 0.5.  (Using alpha=0.2, the value most other sources quote,
-// is the difference between the Paddle classifier's scores and the
-// reference's: every one of its six million hardswish values was wrong.)
-inline void hardswish_params(float * out) {
-    out[0] = 1.0f / 6.0f;
-    out[1] = 0.5f;
-}
-
 // The transposed convolution's output geometry.
 //
 // The output is bigger than the input by the stride, and the geometry is the
@@ -328,7 +295,6 @@ std::vector<double> host_values_any(sycl::queue & q, const tensor * t);
 // The model's bytes are one byte per element (that is the wire's format, and
 // the ONNX one); the runtime's is a float 0/1, four bytes per element, because
 // the device holds float32 and the operators write floats.
-std::vector<uint8_t> bool_to_runtime_bytes(const std::vector<uint8_t> & raw);
 
 // The ONNX broadcast rules for a set of shapes.
 std::vector<int64_t> broadcast_shapes(const std::vector<std::vector<int64_t>> & in);

@@ -263,6 +263,7 @@ add_library(si_router_core STATIC
     src/router/rpc_client.cpp
     src/router/supervisor.cpp
     src/router/proxy.cpp
+    src/common/onnx_wire.cpp
 )
 if(NOT SI_ROUTER_ONLY)
     # The global -fsycl would drag the router through the device pass; this
@@ -273,6 +274,7 @@ if(NOT SI_ROUTER_ONLY)
         src/router/rpc_client.cpp
         src/router/supervisor.cpp
         src/router/proxy.cpp
+        src/common/onnx_wire.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-sycl")
 endif()
 target_include_directories(si_router_core PUBLIC src/router src/common third_party)
@@ -299,23 +301,38 @@ target_link_libraries(sycl-infer-router PRIVATE si_router_core)
 #
 # It is a SEPARATE binary (sycl-infer-onnx): the kernels are the only part
 # that needs the device, and the service is useful without the LLM engine.
+# The sources are NOT a separate tree: the graph/transforms live under
+# src/model/onnx, the executor and kernels under src/backend/onnx, the
+# service under src/server/onnx, and the wire protocol in src/common so the
+# router can link it without SYCL or oneDNN.
 option(SI_ONNX "build the ONNX model service (sycl-infer-onnx)" ON)
-if(SI_ONNX)
+if(NOT SI_ROUTER_ONLY AND SI_ONNX)
     add_library(si_onnx_core STATIC
-        src/onnx/proto.cpp
-        src/onnx/graph.cpp
-        src/onnx/ops.cpp
-        src/onnx/ops_shape.cpp
-        src/onnx/ops_exec.cpp
-        src/onnx/kernels.cpp
-        src/onnx/conv_dnnl.cpp
-        src/onnx/exec.cpp
-        src/onnx/wire.cpp
-        src/onnx/service.cpp
+        src/model/onnx/proto.cpp
+        src/model/onnx/graph.cpp
+        src/model/onnx/transforms/pipeline.cpp
+        src/model/onnx/transforms/transform_util.cpp
+        src/model/onnx/transforms/conv_epilogue.cpp
+        src/model/onnx/transforms/elementwise_activation.cpp
+        src/model/onnx/transforms/matmul_bias.cpp
+        src/model/onnx/transforms/mask_box.cpp
+        src/backend/onnx/ops.cpp
+        src/backend/onnx/ops_shape.cpp
+        src/backend/onnx/ops_exec.cpp
+        src/backend/onnx/kernels.cpp
+        src/backend/onnx/conv_dnnl.cpp
+        src/backend/onnx/exec.cpp
+        src/backend/onnx/constant_fold.cpp
+        src/common/onnx_wire.cpp
+        src/server/onnx/service.cpp
+        src/server/control.cpp
     )
     target_include_directories(si_onnx_core PUBLIC
         src
-        src/onnx
+        src/model/onnx
+        src/backend/onnx
+        src/server/onnx
+        src/server
         src/common
         src/device
         third_party)
@@ -338,7 +355,7 @@ if(SI_ONNX)
         target_link_libraries(si_onnx_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     endif()
 
-    add_executable(sycl-infer-onnx src/onnx/main.cpp)
+    add_executable(sycl-infer-onnx src/server/onnx/main.cpp)
     target_link_libraries(sycl-infer-onnx PRIVATE si_onnx_core)
 endif()
 

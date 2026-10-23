@@ -47,6 +47,8 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
   model behind a single OpenAI-compatible endpoint, with a per-model VRAM
   budget that is *measured* (the worker publishes its own device footprint) and
   a control plane for the model's identity, its memory and a graceful stop.
+  The same router also supervises **ONNX** workers (`"backend": "onnx"`) and
+  proxies their binary `/v1/onnx/run` endpoint.
   See [Multiple models: the router](#multiple-models-the-router).
 * **Quantized compute** — in-house int8 DP4A/SIn kernels on the GPU and an
   integer int8 GEMV straight from the GGUF blocks on the CPU, plus an optional
@@ -397,7 +399,9 @@ Notes:
 
 `sycl-infer-router` is a separate front end that serves **several models at
 once**: one worker process per model, one OpenAI-compatible endpoint in front
-of them.  The request's `model` field picks the worker.
+of them.  The request's `model` field picks the worker.  LLM workers serve
+the OpenAI API; ONNX workers (`"backend": "onnx"`) serve the binary
+`/v1/onnx/run` API, which the router proxies from the same process.
 
 It is a plain host program - it links neither SYCL nor oneDNN - so its container
 is ~130 MB, it needs no GPU to build, and its own tests are hermetic.
@@ -488,14 +492,17 @@ workers" topology) and `docker/compose.yaml`.  The full design is in
 **ONNX** models a document pipeline needs - the layout detector, the OCR
 detector and recogniser, the table classifiers and structurers, the formula
 recogniser.  The runtime is this project's own: an ONNX protobuf reader, a
-graph optimiser (constant folding and operator fusion), an operator library,
-a SYCL kernel library and an executor that plans the memory - **all
-ahead-of-time compiled**, so there is no per-shape kernel compilation and no
-runtime JIT.
+graph IR with a fixed-point pipeline of independent transform passes
+(`src/model/onnx/transforms/`), an operator library, a SYCL kernel library and
+an executor that plans the memory - **all ahead-of-time compiled**, so there
+is no per-shape kernel compilation and no runtime JIT.
 
-It is a separate binary because it is a different workload: the kernels are
-the only part that needs the device, and the service is useful without the LLM
-engine.
+The source follows the project's layering rather than a private tree:
+`src/model/onnx/` is the graph and its transforms, `src/backend/onnx/` is the
+operator/kernel/executor backend, `src/server/onnx/` is the service and
+`src/common/onnx_wire.h` is the binary protocol.  It is still a separate
+binary because it is a different workload, and because it can run without the
+LLM engine.
 
 ```bash
 cmake -S . -B build -DSI_ONNX=ON -DCMAKE_BUILD_TYPE=Release
@@ -507,6 +514,13 @@ cmake --build build --target sycl-infer-onnx -j$(nproc)
 The client speaks a small binary protocol over HTTP and returns numpy arrays
 (the document pipeline's `rapid_doc/model/http_infer.py`), so each model can be
 swapped for the service without touching the code that calls it.
+
+The router supports the ONNX backend as `"backend": "onnx"`: one
+`sycl-infer-onnx` worker per model, the same `--device cpu|gpu|auto` and
+`SYCL_DEVICE_FILTER` card pinning as the LLM workers, and a binary
+`POST /v1/onnx/run` proxy.  See
+[`docs/design/16-router.md`](docs/design/16-router.md) and the example in
+[`docker/router.example.json`](docker/router.example.json).
 
 **The state**: all twelve of the pipeline's models load, and the eight that
 have been verified are **either exact or within the float32 accumulation** -

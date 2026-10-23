@@ -198,19 +198,24 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
 | `router.health_interval_s` / `router.health_failures` | 否 | 存活探测的周期与连续失败次数（超过即判定 worker 失联并重启） |
 | `router.max_restarts` / `router.restart_backoff_s` | 否 | 重启次数上限与首次退避（之后翻倍） |
 | `router.log_dir` | 否 | worker 日志目录，每个模型一个 `<id>.log` |
-| `router.binary` | 否 | worker 可执行文件的默认路径（默认 `sycl-infer`，按 PATH 找，找不到则找路由器自己旁边的） |
+| `router.binary` | 否 | LLM worker 可执行文件的默认路径（默认 `sycl-infer`，按 PATH 找，找不到则找路由器自己旁边的） |
+| `router.binary_onnx` | 否 | ONNX worker 可执行文件的默认路径（默认 `sycl-infer-onnx`） |
 | `router.device_vram_mb` | 否 | **声明**的单卡可用显存。给了它，路由器就在配置阶段检查同组模型的预算之和（§9） |
 | `defaults.env` | 否 | 传给所有 worker 的环境变量（`"K=V"` 形式） |
 | `defaults.binary` | 否 | worker 可执行文件的默认路径 |
 | `models[].id` | 是 | 客户端 `model` 字段用的名字，路由键，必须唯一且不含空白 |
-| `models[].path` | 本地必填 | GGUF 路径（在 worker 的挂载命名空间里）。**必须在路由器所在的主机上也存在可读**——路由器在启动前校验它（早期发现挂载漏了，比等到 worker 启动失败好） |
+| `models[].backend` | 否 | `llm`（默认，GGUF 引擎）或 `onnx`（文档流水线运行时） |
+| `models[].path` | 本地必填 | GGUF/ONNX 路径（在 worker 的挂载命名空间里）。**必须在路由器所在的主机上也存在可读**——路由器在启动前校验它（早期发现挂载漏了，比等到 worker 启动失败好） |
 | `models[].binary` | 否 | 该模型 worker 的可执行文件 |
 | `models[].http` | 本地必填 | worker 的 OpenAI HTTP 地址 `host:port` |
 | `models[].args` | 否 | 追加到派生命令行之后的额外参数。**`--model` / `--host` / `--port` 由路由器生成，不允许覆盖**（冲突即配置错误） |
 | `models[].env` | 否 | 传给该 worker 的额外环境变量（与 `defaults.env` 合并，子进程优先） |
 | `models[].device.group` | 否 | 预算分组键：同组的模型视为共用一组卡，它们的预算必须相加 |
+| `models[].device.kind` | 否 | 传给 worker 的 `--device`：`cpu` / `gpu` / `auto`（与 LLM 主程序相同）。`filter` 仍然负责钉卡；ONNX 默认 `gpu` |
 | `models[].device.filter` | 否 | 传给子进程的 `SYCL_DEVICE_FILTER`，用来把 worker 钉到某张卡（**这是多进程方案白拿的好处**：单进程方案要改 `make_queue` 才能选卡） |
-| `models[].device.count` | 否 | 这个模型跑在几张卡上（用 `--layer-map` 切分的模型是多张）。预算是**跨这些卡的总和**，所以静态检查用 `budget / count` 与单卡容量比较 |
+| `models[].device.count` | 否 | 这个模型跑在几张卡上（用 `--layer-map` 切分的模型是多张）。预算是**跨这些卡的总和**，所以静态检查用 `budget / count` 与单卡容量比较；ONNX 没有 layer map，必须为 1 |
+| `models[].onnx.drop_outputs` | 否 | ONNX 模型不读回的输出（→ `--drop-outputs`）；layout 的 48 MB mask 就是这里丢掉的 |
+| `models[].onnx.dnnl` | 否 | ONNX 的 oneDNN f32 卷积/matmul 开关（→ `--dnnl 0/1`，默认 1） |
 | `models[].control` | 否 | worker 的控制面地址 `host:port`（JSON-RPC over TCP）。给了它，路由器就用它拿模型身份与显存、并优雅停机；不给就退回 HTTP + 信号 |
 | `models[].control_token` | 否 | 控制面的共享密钥（路由器在握手里出示）。**本地模型**：路由器会把它以 `--control-token` 传给 worker；**远程模型**：worker 自己起，令牌要一致 |
 | `models[].control_token_file` | 否 | 从文件读密钥。容器里推荐这个：两端读同一个文件，令牌从不出现在命令行上 |
@@ -233,6 +238,16 @@ sycl-infer --model <path> --host <http.host> --port <http.port> \
 `--control-port` 由路由器派生（它要连的面就是 worker 要开的面）；令牌用**文件**形式传给 worker
 （`--control-token-file`），这样令牌从不出现在命令行上——`ps` 是能看见命令行的。
 
+ONNX 的派生命令行没有 `serve`，并且它的模型名就是路由键：
+
+```
+sycl-infer-onnx --model <id>=<path> --device <kind> --host <http.host> --port <http.port> \
+                [--control-port N] [--control-token-file P] \
+                [--drop-outputs NAME]... [--dnnl 0] [args...]
+```
+
+`id` 里不能出现 `=`（它是 `id=path` 的分隔符）；`device.count` 必须是 1。
+
 `main.cpp` 的参数解析是**顺序无关**的（`src/main.cpp:231` 起的循环把任何非 `-` 开头的参数当作命令），
 所以 `serve` 放最后即可。注意 `serve` 是唯一的非选项参数。
 
@@ -241,7 +256,7 @@ sycl-infer --model <path> --host <http.host> --port <http.port> \
 1. `id` 唯一、非空、不含空白。
 2. HTTP 端口不重复，且不与 `router.listen` 冲突。
 3. 本地模型的 `path` 存在且可读。
-4. `args` 里不出现 `--model` / `--host` / `--port` / `--control-port` / `--control-host`。
+4. `args` 里不出现 `--model` / `--host` / `--port` / `--control-port` / `--control-host` / `--device` / `--drop-outputs` / `--dnnl` / `--config`。
 5. `kv_cap_mb` / `max_slots` 不为 0。
 6. 同一 `device.group` 的 `vram_budget_mb` 之和 ≤ `router.device_vram_mb`（给了后者才检查）。
 7. 远程模型不要求 `path`。
@@ -324,7 +339,9 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
 |---|---|---|
 | `POST` | `/v1/chat/completions` | 按 `model` 路由，代理到 worker |
 | `POST` | `/v1/completions` | 同上 |
-| `GET` | `/v1/models` | 汇总所有 worker 的模型条目（每个 worker 一条，用路由器的 `id`） |
+| `GET` | `/v1/models` | 汇总所有 worker 的模型条目（每个 worker 一条，用路由器的 `id`；ONNX 条目带 `backend: onnx`） |
+| `POST` | `/v1/onnx/run` | ONNX 二进制协议：从请求体读出 `model`，原样转发到对应 worker（无重试，§6.3） |
+| `GET` | `/v1/onnx/models` | 汇总各 ONNX worker 的模型表 |
 | `GET` | `/v1/models/{id}` | 单条；未知 id → 404 |
 | `GET` | `/health` | 路由器自身 + 各模型状态（`up` / `starting` / `down` / `degraded`） |
 | `GET` | `/router/status` | 监督视图：重启次数、显存记账、每个模型的最近错误（运维用，不在 OpenAI 规范内） |
@@ -333,8 +350,8 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
 ### 6.2 代理语义
 
 * **请求**：原样转发方法、路径、查询串、请求体；剥掉逐跳头（`Connection`、`Keep-Alive`、
-  `Transfer-Encoding`、`TE`、`Upgrade`），其余（含 `Authorization`）转发。请求体上限 ≥ worker 的
-  64 MiB（base64 图片）。
+  `Transfer-Encoding`、`TE`、`Upgrade`），其余（含 `Authorization`）转发。请求体上限为 512 MiB
+  （ONNX 一次可以带多张大图；OpenAI 的 base64 图片远小于它）。
 * **`model` 字段**：路由器是路由的权威。它按 `model` 找到 worker，然后**把请求体里的 `model` 改写成
   worker 自报的 id**（`general.name`，见 `src/server/server.cpp:615`），避免 worker 侧的
   `/v1/models/{id}` 语义与路由器的别名不一致。
@@ -347,6 +364,14 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
   | 缺 `model` 且有多个模型 | 400 | `invalid_request_error` |
   | worker 不在 `up` | 503 | `{"error":{"message":"model 'x' is unavailable (state: down)","type":"server_error"}}` |
   | 上游超时 | 504 | `server_error` |
+
+### 6.2.1 ONNX 二进制路由
+
+`/v1/onnx/run` 的请求体是 `src/common/onnx_wire.h` 的二进制帧。路由器只读帧头的
+`(version, model name)`（`peek_request_model`），不复制张量载荷；随后把整个 body 原样转给
+`models[].id == model` 且 `backend == onnx` 的 worker。响应（包括 worker 的 wire error）也原样
+返回。未知模型/worker 不在 `up` 时，路由器生成一个 `SIOR` 错误帧，客户端看到的仍是同一种协议。
+这一条不是 OpenAI 路由，因此不做 `model` 字段改写、SSE 或重试。
 
 ### 6.3 不重试
 

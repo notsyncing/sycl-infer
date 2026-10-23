@@ -401,14 +401,19 @@ src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 of server.cpp so it is testable without a model),
                 scheduler.{h,cpp}, server.{h,cpp} (OpenAI chat/completions +
                 /v1/models)
-src/onnx/       the ONNX model service (the document pipeline's models):
-                proto.{h,cpp} (the ONNX protobuf reader), graph.{h,cpp}
-                (the constant folding and the operator fusion),
-                ops.{h,cpp} / ops_shape.cpp / ops_exec.cpp (the operator
-                library), kernels.{h,cpp} (the SYCL kernels),
-                exec.{h,cpp} (the executor and its memory plan),
-                wire.{h,cpp} (the binary wire protocol), service.{h,cpp}
-                (the HTTP service), main.cpp (the sycl-infer-onnx binary)
+src/model/onnx/ the ONNX graph: proto.{h,cpp} (the protobuf reader),
+                graph.{h,cpp} (the builder and the lowering),
+                graph_build.h (the transform IR), transforms/ (one file per
+                graph transform: conv_epilogue, elementwise_activation,
+                matmul_bias, mask_box, transform_util, pipeline)
+src/backend/onnx/ the ONNX execution backend: ops.{h,cpp} / ops_shape.cpp /
+                ops_exec.cpp, kernels.{h,cpp}, exec.{h,cpp} (the memory plan
+                and run loop), constant_fold.cpp, conv_dnnl.{h,cpp}
+src/server/onnx/ service.{h,cpp} (the HTTP service), main.cpp
+                (the sycl-infer-onnx binary)
+src/common/     ... plus onnx_wire.{h,cpp} (the binary protocol, shared with
+                the router), onnx_activation.h and onnx_types.h (host-only
+                ONNX semantics shared by the graph and the executor)
 src/main.cpp    CLI
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
@@ -1575,12 +1580,15 @@ partial or not).
 The document pipeline (the one this engine's ONNX half serves) needs
 *graphs*, not a transformer: a layout detector, a text detector, a text
 recogniser, a table segmenter, a formula recogniser.  Those come as ONNX,
-and `src/onnx/` runs them.
+and `src/model/onnx/` + `src/backend/onnx/` run them.
 
 * **The runtime is ours.**  No OpenVINO, no ONNX Runtime: a protobuf
-  reader for the ONNX schema, a graph builder that folds the constants and
-  fuses the operators, an operator library, SYCL kernels, and an executor
-  that plans the memory.  See
+  reader for the ONNX schema, a `graph_build` IR, a fixed-point pipeline of
+  independent transforms (`src/model/onnx/transforms/`: conv epilogue,
+  elementwise activation, MatMul bias, mask-to-box), an operator library,
+  SYCL kernels, and an executor that plans the memory.  Constant folding is
+  the one pass that needs device execution and lives in
+  `src/backend/onnx/constant_fold.cpp`.  See
   [`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md).
 * **There is no runtime JIT anywhere in this path.**  Every kernel takes
   its shapes as *runtime* arguments, so one compiled kernel handles every
@@ -1606,11 +1614,23 @@ and `src/onnx/` runs them.
   100 ms/page).
 * **The service is a separate binary** (`sycl-infer-onnx`, `-DSI_ONNX=ON`),
   because it is a different kind of workload from the LLM engine and it
-  must not drag the device pass into the router's container.
+  must not drag the device pass into the router's container.  It is **not**
+  a separate tree: `src/model/onnx`, `src/backend/onnx`,
+  `src/server/onnx` and `src/common/onnx_*` are the project's model,
+  backend, server and common layers.
+* **The router supports it as `"backend": "onnx"`.**  One
+  `sycl-infer-onnx` worker per model, `--device cpu|gpu|auto` plus
+  `SYCL_DEVICE_FILTER` (the same device specification as an LLM worker),
+  a JSON-RPC control plane, and a transparent `POST /v1/onnx/run` proxy
+  that reads only the wire header to route.  `device.count` is 1 (no layer
+  map).  The model id is the routing key; `onnx.drop_outputs` and
+  `onnx.dnnl` are first-class config fields.  The combined Docker image
+  ships both worker binaries; the router-only image has no local ONNX
+  worker.
 
 The client lives in the document pipeline's tree
 (`rapid_doc/model/http_infer.py`): it speaks the binary protocol in
-`src/onnx/wire.h` and returns numpy arrays, so every `InferSession` there
+`src/common/onnx_wire.h` and returns numpy arrays, so every `InferSession` there
 can be swapped for it without touching the code that calls it, and the
 pipeline's own post-processing (the box filtering, the CTC decoding, the
 table HTML assembly) stays where it is.
@@ -1742,7 +1762,7 @@ device is the 686 ms -> 282 ms.
   `Identity` borrow a dead input's buffer, and an elementwise op may reuse a
   same-shape input buffer; **never in a `Loop` body** - its carried values
   are read again on the next iteration and per-op liveness cannot see that.
-* **The convolutions run on oneDNN** (`src/onnx/conv_dnnl.cpp`, the
+* **The convolutions run on oneDNN** (`src/backend/onnx/conv_dnnl.cpp`, the
   `PF_ONNX_DNNL` switch, default on; group-1 only).  The weights stay in the
   runtime's (C, kh, kw, M) layout and are reordered once into the
   primitive's layout and cached; the epilogue (bias/scale/add/activation)

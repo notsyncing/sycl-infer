@@ -1,4 +1,5 @@
 #include "config.h"
+#include "onnx_wire.h"
 
 #include <cstdio>
 #include <exception>
@@ -126,6 +127,56 @@ void test_derived_fields() {
     CHECK(a.back() == "serve", "the command goes last: %s", a.back().c_str());
 }
 
+
+void test_onnx_backend() {
+    const char * text = R"({
+  "defaults": { "binary": "sycl-infer", "binary_onnx": "sycl-infer-onnx" },
+  "models": [{
+    "id": "layout", "backend": "onnx", "path": "/etc/hostname",
+    "http": "127.0.0.1:18081", "control": "127.0.0.1:18082",
+    "device": { "kind": "gpu", "group": "gpu0", "filter": "level_zero:0" },
+    "onnx": { "drop_outputs": ["fetch_name_2"], "dnnl": false }
+  }]
+})";
+    router_config c;
+    try {
+        c = parse_config(text);
+    } catch (const std::exception & ex) {
+        CHECK(false, "an ONNX model must parse: %s", ex.what());
+        return;
+    }
+    const model_config & m = c.models[0];
+    CHECK(m.backend == "onnx", "backend: %s", m.backend.c_str());
+    CHECK(m.binary == "sycl-infer-onnx", "binary: %s", m.binary.c_str());
+    CHECK(m.device_kind == "gpu", "device kind: %s", m.device_kind.c_str());
+    CHECK(m.device_filter == "level_zero:0", "device filter: %s", m.device_filter.c_str());
+    CHECK(m.drop_outputs.size() == 1 && m.drop_outputs[0] == "fetch_name_2",
+          "drop_outputs");
+    CHECK(m.dnnl_set && !m.dnnl, "dnnl must be carried through");
+    auto has = [&](const std::string & s) {
+        for (const std::string & x : m.argv) {
+            if (x == s) return true;
+        }
+        return false;
+    };
+    CHECK(has("--model"), "ONNX argv must carry --model");
+    CHECK(has("layout=/etc/hostname"), "ONNX argv must carry the id=path spec");
+    CHECK(has("--device") && has("gpu"), "ONNX argv must carry the device kind");
+    CHECK(has("--drop-outputs") && has("fetch_name_2"), "ONNX argv must carry drop_outputs");
+    CHECK(has("--dnnl") && has("0"), "ONNX argv must carry dnnl=0");
+    CHECK(!has("serve"), "an ONNX worker has no serve subcommand");
+}
+
+void test_onnx_wire_peek() {
+    const std::vector<uint8_t> body = si::onnxwire::encode_request("layout", {});
+    std::string model, err;
+    CHECK(si::onnxwire::peek_request_model(body.data(), body.size(), model, err),
+          "a valid ONNX request must expose its model: %s", err.c_str());
+    CHECK(model == "layout", "model: %s", model.c_str());
+    CHECK(!si::onnxwire::peek_request_model(body.data(), 5, model, err),
+          "a truncated header must be rejected");
+}
+
 void test_validation() {
     // duplicate ids
     CHECK(parse_fails("{\"models\": ["
@@ -208,6 +259,8 @@ int main() {
     test_validation();
     test_remote();
     test_bearer_tokens();
+    test_onnx_backend();
+    test_onnx_wire_peek();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

@@ -18,7 +18,9 @@ namespace router {
 // shrinks with the slot count.
 struct model_config {
     std::string id;         // the routing key: the client's `model` field
-    std::string path;       // GGUF path inside the worker's mount namespace
+    // "llm" (the GGUF engine) or "onnx" (the document-pipeline runtime).
+    std::string backend = "llm";
+    std::string path;       // GGUF/ONNX path inside the worker's mount namespace
     std::string binary;     // worker executable (local models only)
     std::string http_host = "127.0.0.1";
     int http_port = 0;      // the worker's OpenAI HTTP port
@@ -31,6 +33,7 @@ struct model_config {
     std::string control_token_file;
     bool remote = false;    // a remote worker: connect, do not spawn
     std::vector<std::string> args; // extra worker CLI args
+    bool is_onnx() const { return backend == "onnx"; }
     std::vector<std::string> env;  // "K=V" pairs for the child
 
     // Device placement.  `device_group` is the budget grouping key (two models
@@ -40,8 +43,18 @@ struct model_config {
     // `device_count` is how many cards the model runs on: a model split with
     // --layer-map uses several, and its budget is the TOTAL over them.
     std::string device_group = "default";
+    // The worker's own backend name: cpu|gpu|auto (the same --device values
+    // as the LLM engine).  Empty for an LLM model means "leave it to the
+    // engine"; an ONNX worker defaults to gpu.
+    std::string device_kind;
     std::string device_filter;
     int device_count = 1;
+
+    // ONNX-only: the model's outputs the pipeline never reads, and whether
+    // the fixed-shape convolutions/matmuls use oneDNN.
+    std::vector<std::string> drop_outputs;
+    bool dnnl = true;
+    bool dnnl_set = false;
 
     uint64_t vram_budget_mb = 0;
     int kv_cap_mb = -1;     // -> --kv-cap-mb
@@ -73,7 +86,8 @@ struct router_config {
     int max_restarts = 3;         // restart attempts before giving up
     int restart_backoff_s = 2;    // first backoff; it doubles per attempt
     std::string log_dir = "logs";
-    std::string binary;           // default worker executable
+    std::string binary;           // default LLM worker executable
+    std::string binary_onnx = "sycl-infer-onnx"; // default ONNX worker executable
     uint64_t device_vram_mb = 0;  // declared usable VRAM per device group
     std::vector<std::string> default_env;
     std::vector<model_config> models;

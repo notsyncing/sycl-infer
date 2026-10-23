@@ -175,32 +175,65 @@ bool file_readable(const std::string & p) {
 
 std::vector<std::string> build_worker_argv(const model_config & m) {
     std::vector<std::string> a;
+    // The control plane is common to both worker kinds.
+    auto control = [&]() {
+        if (m.control_port > 0 && !m.remote) {
+            a.push_back("--control-port");
+            a.push_back(std::to_string(m.control_port));
+            if (!m.control_host.empty() && m.control_host != "127.0.0.1" &&
+                m.control_host != "localhost") {
+                a.push_back("--control-host");
+                a.push_back(m.control_host);
+            }
+            if (!m.control_token_file.empty()) {
+                a.push_back("--control-token-file");
+                a.push_back(m.control_token_file);
+            } else if (!m.control_token.empty()) {
+                a.push_back("--control-token");
+                a.push_back(m.control_token);
+            }
+        }
+    };
+
+    if (m.is_onnx()) {
+        // One ONNX worker per model; its model id is the router's routing
+        // key, so the binary wire request's `model` needs no rewrite.
+        a.push_back("--model");
+        a.push_back(m.id + "=" + m.path);
+        if (!m.device_kind.empty()) {
+            a.push_back("--device");
+            a.push_back(m.device_kind);
+        }
+        a.push_back("--host");
+        a.push_back(m.http_host);
+        a.push_back("--port");
+        a.push_back(std::to_string(m.http_port));
+        control();
+        for (const std::string & d : m.drop_outputs) {
+            a.push_back("--drop-outputs");
+            a.push_back(d);
+        }
+        if (m.dnnl_set && !m.dnnl) {
+            a.push_back("--dnnl");
+            a.push_back("0");
+        }
+        for (const std::string & s : m.args) {
+            a.push_back(s);
+        }
+        return a;
+    }
+
     a.push_back("--model");
     a.push_back(m.path);
     a.push_back("--host");
     a.push_back(m.http_host);
     a.push_back("--port");
     a.push_back(std::to_string(m.http_port));
-    if (m.control_port > 0 && !m.remote) {
-        // A spawned worker has to open the control plane the router is going
-        // to talk to.  A remote worker is started by somebody else, so the
-        // operator sets its flags there.
-        a.push_back("--control-port");
-        a.push_back(std::to_string(m.control_port));
-        if (!m.control_host.empty() && m.control_host != "127.0.0.1" && m.control_host != "localhost") {
-            a.push_back("--control-host");
-            a.push_back(m.control_host);
-        }
-        if (!m.control_token_file.empty()) {
-            // The file form: both ends read the same secret, so it never
-            // appears on a command line (where `ps` would show it).
-            a.push_back("--control-token-file");
-            a.push_back(m.control_token_file);
-        } else if (!m.control_token.empty()) {
-            a.push_back("--control-token");
-            a.push_back(m.control_token);
-        }
+    if (!m.device_kind.empty()) {
+        a.push_back("--device");
+        a.push_back(m.device_kind);
     }
+    control();
     if (m.kv_cap_mb >= 0) {
         a.push_back("--kv-cap-mb");
         a.push_back(std::to_string(m.kv_cap_mb));
@@ -269,6 +302,7 @@ router_config parse_config(const std::string & text) {
     cfg.restart_backoff_s = get_int(rsec, "restart_backoff_s", cfg.restart_backoff_s);
     cfg.log_dir = get_str(rsec, "log_dir", cfg.log_dir);
     cfg.binary = get_str(rsec, "binary", cfg.binary);
+    cfg.binary_onnx = get_str(rsec, "binary_onnx", cfg.binary_onnx);
     cfg.device_vram_mb = get_u64(rsec, "device_vram_mb", cfg.device_vram_mb);
 
     // ---- defaults ----------------------------------------------------------
@@ -281,6 +315,7 @@ router_config parse_config(const std::string & text) {
     if (cfg.binary.empty()) {
         cfg.binary = get_str(dsec, "binary", cfg.binary);
     }
+    cfg.binary_onnx = get_str(dsec, "binary_onnx", cfg.binary_onnx);
 
     // ---- models ------------------------------------------------------------
     const json * ms = member(root, "models");
@@ -309,10 +344,18 @@ router_config parse_config(const std::string & text) {
         if (m.id.find_first_of(" \t\n") != std::string::npos) {
             cfg_err(where + ": 'id' must not contain whitespace");
         }
+        if (m.id.find('=') != std::string::npos) {
+            cfg_err(where + ": 'id' must not contain '=' (it prefixes the ONNX model spec)");
+        }
         if (!ids.insert(m.id).second) {
             cfg_err("duplicate model id '" + m.id + "'");
         }
-        m.binary = get_str(e, "binary", cfg.binary);
+        m.backend = get_str(e, "backend", get_str(dsec, "backend", "llm"));
+        if (m.backend != "llm" && m.backend != "onnx") {
+            cfg_err(where + ": 'backend' must be 'llm' or 'onnx'");
+        }
+        m.binary = get_str(e, "binary",
+                           m.is_onnx() ? cfg.binary_onnx : cfg.binary);
 
         const json * rem = member(e, "remote");
         if (rem) {
@@ -376,11 +419,20 @@ router_config parse_config(const std::string & text) {
                 cfg_err(where + ": 'device' must be an object");
             }
             m.device_group = get_str(*dev, "group", m.device_group);
+            m.device_kind = get_str(*dev, "kind", m.device_kind);
             m.device_filter = get_str(*dev, "filter", m.device_filter);
             m.device_count = get_int(*dev, "count", m.device_count);
             if (m.device_count < 1) {
                 cfg_err(where + ": 'device.count' must be at least 1");
             }
+        }
+        if (m.device_kind.empty() && m.is_onnx()) m.device_kind = "gpu";
+        if (!m.device_kind.empty() && m.device_kind != "cpu" && m.device_kind != "gpu" &&
+            m.device_kind != "auto" && m.device_kind != "host") {
+            cfg_err(where + ": 'device.kind' must be cpu, gpu or auto");
+        }
+        if (m.is_onnx() && m.device_count != 1) {
+            cfg_err(where + ": an ONNX model runs on one device (no layer map)");
         }
 
         const json * mem = member(e, "memory");
@@ -395,10 +447,25 @@ router_config parse_config(const std::string & text) {
             m.pc_dir = get_str(*mem, "prefix_cache_dir", m.pc_dir);
         }
 
+        const json * onnx = member(e, "onnx");
+        if (onnx) {
+            if (!onnx->is_object()) {
+                cfg_err(where + ": 'onnx' must be an object");
+            }
+            m.drop_outputs = get_str_list(*onnx, "drop_outputs");
+            if (member(*onnx, "dnnl")) {
+                m.dnnl = get_bool(*onnx, "dnnl", m.dnnl);
+                m.dnnl_set = true;
+            }
+        }
+
         // The router owns --model/--host/--port: an operator who sets them
         // in `args` would silently desynchronise the router's idea of the
         // worker's endpoint from the worker's actual one.
-        static const char * kReserved[] = {"--model", "--host", "--port", "--control-port", "--control-host"};
+        static const char * kReserved[] = {"--model", "--host", "--port", "--control-port",
+                                          "--control-host", "--control-token",
+                                          "--control-token-file", "--device", "--drop-outputs",
+                                          "--dnnl", "--config", "--layer-map"};
         for (const std::string & a : m.args) {
             for (const char * r : kReserved) {
                 if (a == r) {

@@ -5,17 +5,29 @@ text detector, a text recogniser, a table segmenturer and a formula
 recogniser.  Those models come as ONNX, and this is the subsystem that runs
 them.
 
-    src/onnx/
+    src/model/onnx/
         proto.h/.cpp      the ONNX protobuf reader
-        graph.h/.cpp      the graph, the constant folding, the operator fusion
+        graph.h/.cpp      the graph builder, the lowering and the If inliner
+        graph_build.h     the graph the transforms rewrite
+        transforms/       one file per transform (conv_epilogue,
+                          elementwise_activation, matmul_bias, mask_box,
+                          transform_util, pipeline)
+    src/backend/onnx/
         ops.h/.cpp        the operator interface and the shared helpers
         ops_shape.cpp     the shape functions (what the outputs look like)
         ops_exec.cpp      the operators themselves
         kernels.h/.cpp    the SYCL kernels
         exec.h/.cpp       the executor: the memory plan and the run loop
-        wire.h/.cpp       the wire protocol
-        service.h/.cpp    the HTTP service
+        constant_fold.cpp the device-executed constant folding pass
+        conv_dnnl.h/.cpp  the oneDNN f32 convolution/matmul path
+    src/server/onnx/
+        service.h/.cpp    the HTTP service and its control plane
         main.cpp          the sycl-infer-onnx binary
+    src/common/
+        onnx_wire.h/.cpp  the binary wire protocol (also linked by the router)
+        onnx_activation.h ONNX activation semantics shared by the graph and
+                          the executor
+        onnx_types.h      the boolean representation at the boundary
 
 ## The three measurements that shaped the design
 
@@ -73,11 +85,32 @@ rest of the pipeline has to be measured against.
 
     ONNX file
       -> proto            the protobuf reader (the ONNX schema, read directly)
-      -> graph            the constant folding and the operator fusion
-      -> ops              the shape functions and the operators
-      -> kernels          the SYCL kernels (ahead-of-time compiled)
-      -> exec             the memory plan and the run loop
-      -> service          the HTTP endpoint
+      -> graph_build      the named values, constants, consumers and liveness
+      -> transforms       a fixed-point pipeline of independent graph passes
+                          (conv epilogue, elementwise activation, MatMul bias,
+                          mask-to-box); each is one file under transforms/
+      -> lowering         the executor op list (graph.cpp)
+      -> ops/kernels      the shape functions, the operators and the SYCL
+                          kernels (ahead-of-time compiled)
+      -> exec             the memory plan and the run loop; the constant
+                          sub-graphs are evaluated once, on the device
+      -> service          the HTTP endpoint and the JSON-RPC control plane
+
+The graph transforms are deliberately *not* branches in the builder:
+
+* `graph_build.h` is the IR: nodes, named values, the constant analysis,
+  consumers, dead nodes and the alias map.
+* Every pass is a function over that IR with its own `.cpp` under
+  `src/model/onnx/transforms/`: `conv_epilogue`, `elementwise_activation`,
+  `matmul_bias`, `mask_box`.  `pipeline.cpp` runs them in order to a bounded
+  fixed point; `SI_ONNX_NOFUSE=1` skips the whole pipeline.
+* The builder lowers the settled graph to the executor's `exec_op` list.
+  Constant folding is the exception: its sub-graphs are evaluated by the
+  executor because they run operator kernels, so it lives in
+  `src/backend/onnx/constant_fold.cpp` and runs once on the device.
+
+Adding a transform means adding one file and one entry in `pipeline.cpp`; it
+does not touch the loader or the executor.
 
 ### The protobuf reader (`proto.h`)
 
@@ -204,7 +237,7 @@ client sent.
     GET  /v1/onnx/models  the model table, with each model's ports
     GET  /health          liveness, the device, and the per-model statistics
 
-One model per id, one device per model (`--device GPU`, `GPU.0`, `CPU`), and
+One model per id, one device per model (`--device cpu|gpu|auto`, with the old `GPU.0`/`CPU` aliases still accepted), and
 a model that cannot be loaded is a *reported* failure rather than a reason
 to take the service down.
 
@@ -718,7 +751,7 @@ same-shape, same-type input buffer that dies there.  Both are disabled in a
 per-op liveness cannot see.  The aliasing and in-place reuse cut the
 layout's executor footprint roughly in half (below).
 
-**The convolutions run on oneDNN** (`src/onnx/conv_dnnl.cpp`,
+**The convolutions run on oneDNN** (`src/backend/onnx/conv_dnnl.cpp`,
 `PF_ONNX_DNNL=0` turns it off).  The runtime's weights stay in their own
 (C, kh, kw, M) layout; the primitive's layout is reordered into once per
 weight and cached, and the bias/scale/add/activation epilogue stays a
@@ -947,6 +980,49 @@ the next lever is the table client/GPU overlap.  bf16 is not the lever: the f32
 descriptor with `fpmath_mode::bf16` was digest-exact but not faster (233 ms
 against 208-225), and the 1.0-4.3x probe used bf16 *memory descriptors*,
 which need a conversion pass per conv in a mixed graph.
+
+## Running under the router
+
+The ONNX worker is now a first-class router backend.  There is no separate
+per-process model table in that topology: the router starts **one
+`sycl-infer-onnx` worker per ONNX model**, exactly as it starts one
+`sycl-infer` per GGUF model, and the routing key is the model id in the
+binary wire request.
+
+The worker gets the same device specification as the LLM worker:
+
+* `--device cpu|gpu|auto` (the `--device` names of `sycl-infer`), and
+* `SYCL_DEVICE_FILTER` from the router's `device.filter`, which pins the
+  card.
+
+There is no layer map for ONNX (`device.count` must be 1).  The worker also
+opens the router's JSON-RPC control plane (`--control-port` /
+`--control-host` / `--control-token[-file]`), so the router gets the model
+identity, the device's measured free VRAM and a graceful stop.  The data
+plane is `POST /v1/onnx/run`: the router reads only the wire header's model
+name, forwards the body unchanged, and returns the worker's wire response.
+`GET /v1/onnx/models` is aggregated.  The router's `POST /v1/chat/completions`
+does not route ONNX models, and the ONNX endpoint does not do OpenAI-style
+`model` rewriting, SSE or retries.
+
+A model entry is:
+
+```json
+{
+  "id": "layout", "backend": "onnx",
+  "path": "/models/pp_doclayoutv3.onnx",
+  "http": "127.0.0.1:18085", "control": "127.0.0.1:18086",
+  "device": { "kind": "gpu", "group": "gpu0", "filter": "level_zero:0", "count": 1 },
+  "memory": { "vram_budget_mb": 4096 },
+  "onnx": { "drop_outputs": ["fetch_name_2"], "dnnl": true }
+}
+```
+
+The ONNX and LLM workers can share a card only if their declared budgets
+fit; the router's measured admission reads the ONNX control report just as
+it reads the LLM one.  The combined Docker image ships both worker binaries;
+the router-only image has no local ONNX worker (it can still connect to
+remote workers through a `remote` entry).
 
 ## The environment switches
 

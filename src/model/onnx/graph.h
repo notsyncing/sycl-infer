@@ -4,26 +4,21 @@
 //
 // The pipeline from a file to a runnable graph is:
 //
-//   parse (proto.h)  ->  constant folding  ->  operator fusion  ->  shape
-//   inference  ->  the execution plan
+//   parse (proto.h) -> graph_build -> transforms (fixed point) -> lowering
+//   -> shape inference -> the execution plan
 //
-// The two middle steps are where the performance comes from, and they are
-// the reason a hand-written runtime can be competitive:
-//
-//   * Constant folding evaluates the sub-graphs whose inputs are all
-//     constants.  A torch-exported model is full of them: the table models
-//     carry 484 Constant nodes, and the layout model's shape arithmetic
-//     (78 Shape, 165 Reshape) collapses into constants.
-//   * Operator fusion removes the memory traffic between the operators.  The
-//     text detector is 83 convolutions followed by 88 Mul/Add pairs (the
-//     batch norm that was folded into the weights) and 20 activations; fused,
-//     that is 83 kernels instead of 200, and each convolution's epilogue
-//     does the scale, the bias and the activation in registers.
+// The graph/transforms split is deliberate.  `graph_build.h` holds the IR
+// (named values, constants, consumers, dead nodes, aliases); every pass in
+// `transforms/` is one independent function over it, and `pipeline.cpp` runs
+// the list until it stops changing.  The loader therefore does not grow a
+// branch for every new fusion.
 //
 // The fusion rules are deliberately narrow and explicit: each one is a
 // pattern with a name, and each one is checked against the operator's
 // semantics (a BatchNorm folds into a Conv only when the Conv has no
 // padding that the norm's spatial extent would disagree with, and so on).
+// Constant folding is the one pass that needs device execution, so it lives
+// in the executor (`src/backend/onnx/constant_fold.cpp`).
 
 #include <cstdint>
 #include <map>

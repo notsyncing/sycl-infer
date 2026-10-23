@@ -26,13 +26,23 @@ struct onnx_service_config {
     std::string host = "127.0.0.1";
     int port = 8890;
     int n_threads = 4;
-    // The device the models run on: "GPU", "GPU.0", "CPU" or "AUTO".
-    std::string device = "GPU";
+    // The same names as the LLM worker: cpu, gpu, auto (uppercase and GPU.N
+    // are accepted for the standalone configs).
+    std::string device = "gpu";
     // Extra models, "id=path" or "id=path:device".
     std::vector<std::string> models;
     // A JSON config file:
-    //   {"device": "GPU", "models": {"<id>": {"path": "...", "device": "CPU"}}}
+    //   {"device": "gpu", "models": {"<id>": {"path": "...", "device": "cpu"}}}
     std::string config_path;
+    // The router gives a worker one model and its control plane; the
+    // standalone --model form accepts the same per-model options.
+    std::vector<std::string> drop_outputs;
+    bool dnnl = true;
+    bool dnnl_set = false;
+    std::string control_host = "127.0.0.1";
+    int control_port = 0;
+    std::string control_token;
+    std::string control_token_file;
 };
 
 // Run the service until it is stopped.  Returns the process exit code.

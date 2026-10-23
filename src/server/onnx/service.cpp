@@ -15,9 +15,16 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <atomic>
+#include <chrono>
+
+#include <sycl/sycl.hpp>
+
+#include "control.h"
+#include "conv_dnnl.h"
 #include "exec.h"
 #include "graph.h"
-#include "wire.h"
+#include "onnx_wire.h"
 
 using json = nlohmann::json;
 
@@ -47,7 +54,9 @@ bool parse_model_spec(const std::string & spec, std::string & id, std::string & 
     const size_t colon = rest.rfind(':');
     if (colon != std::string::npos && colon + 1 < rest.size()) {
         const std::string tail = rest.substr(colon + 1);
-        if (tail == "GPU" || tail == "CPU" || tail == "AUTO" || tail.rfind("GPU.", 0) == 0) {
+        if (tail == "GPU" || tail == "gpu" || tail == "CPU" || tail == "cpu" ||
+            tail == "AUTO" || tail == "auto" || tail == "host" ||
+            tail.rfind("GPU.", 0) == 0 || tail.rfind("gpu.", 0) == 0) {
             device = tail;
             rest = rest.substr(0, colon);
         }
@@ -58,12 +67,12 @@ bool parse_model_spec(const std::string & spec, std::string & id, std::string & 
 
 // The SYCL device the models run on.
 sycl::device pick_device(const std::string & name) {
-    if (name == "CPU") return sycl::device{sycl::cpu_selector_v};
-    if (name == "AUTO" || name.empty()) {
+    if (name == "CPU" || name == "cpu" || name == "host") return sycl::device{sycl::cpu_selector_v};
+    if (name == "AUTO" || name == "auto" || name.empty()) {
         if (sycl::device{sycl::gpu_selector_v}.is_gpu()) return sycl::device{sycl::gpu_selector_v};
         return sycl::device{sycl::cpu_selector_v};
     }
-    if (name.rfind("GPU.", 0) == 0) {
+    if (name.rfind("GPU.", 0) == 0 || name.rfind("gpu.", 0) == 0) {
         const int idx = atoi(name.c_str() + 4);
         int n = 0;
         for (const auto & d : sycl::device{sycl::gpu_selector_v}.get_devices()) {
@@ -71,7 +80,7 @@ sycl::device pick_device(const std::string & name) {
         }
         throw std::runtime_error("there is no GPU with the index " + name);
     }
-    if (name == "GPU") {
+    if (name == "GPU" || name == "gpu") {
         if (!sycl::device{sycl::gpu_selector_v}.is_gpu()) {
             fprintf(stderr, "[onnx] no GPU is available; running on the CPU\n");
             return sycl::device{sycl::cpu_selector_v};
@@ -150,6 +159,16 @@ int serve_onnx(const onnx_service_config & cfg) {
         queues.emplace(dev, sycl::queue(d, sycl::property::queue::in_order()));
         return queues[dev];
     };
+
+    // The standalone --model form has no per-model config block; its
+    // --drop-outputs/--dnnl flags apply to every model it names.  The router
+    // names exactly one.
+    if (!cfg.drop_outputs.empty()) {
+        for (const auto & m : models) model_drops[m.first] = cfg.drop_outputs;
+    }
+    if (cfg.dnnl_set) {
+        for (const auto & m : models) model_dnnl[m.first] = cfg.dnnl;
+    }
 
     std::vector<std::unique_ptr<served>> served_models;
     for (const auto & m : models) {
@@ -347,9 +366,75 @@ int serve_onnx(const onnx_service_config & cfg) {
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
     });
 
+    // The router's control plane: the model identity, this worker's device
+    // memory and a graceful stop, over the same JSON-RPC protocol as the LLM
+    // worker (src/server/control.cpp).  Standalone runs leave it off.
+    std::unique_ptr<si::control_server> control;
+    const auto started = std::chrono::steady_clock::now();
+    if (cfg.control_port > 0) {
+        std::string token = cfg.control_token;
+        if (!cfg.control_token_file.empty()) {
+            std::ifstream f(cfg.control_token_file, std::ios::binary);
+            if (!f) {
+                fprintf(stderr, "[onnx] cannot read the control token file '%s'\n",
+                        cfg.control_token_file.c_str());
+                return 1;
+            }
+            std::getline(f, token);
+            while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) token.pop_back();
+        }
+        auto report = [&]() {
+            si::control_report r;
+            r.model_id = served_models.empty() ? std::string() : served_models.front()->id;
+            r.max_seq = 0;
+            r.n_vocab = 0;
+            r.n_layer = 0;
+            r.inflight = 0;
+            r.uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+            uint64_t used = 0;
+            for (const auto & s : served_models) {
+                if (s->ex) used += s->ex->live_bytes() + s->ex->pooled_bytes();
+            }
+            size_t dw = 0, ds = 0;
+            onnx::conv_dnnl_mem(&dw, &ds);
+            used += dw + ds;
+            if (!served_models.empty()) {
+                const std::string & name = served_models.front()->device;
+                try {
+                    sycl::device d = pick_device(name);
+                    si::control_report::device_t dev;
+                    dev.index = (name.rfind("GPU.", 0) == 0 || name.rfind("gpu.", 0) == 0)
+                                    ? atoi(name.c_str() + 4) : 0;
+                    dev.name = d.get_info<sycl::info::device::name>();
+                    dev.total_vram_bytes = d.get_info<sycl::info::device::global_mem_size>();
+                    dev.used_bytes = used;
+                    dev.free_vram_bytes = dev.total_vram_bytes > used
+                                              ? dev.total_vram_bytes - used : 0;
+                    r.devices.push_back(dev);
+                } catch (...) {
+                }
+            }
+            r.host_rss_bytes = si::host_rss_bytes();
+            return r;
+        };
+        control = std::make_unique<si::control_server>(
+            report, [&]() { srv.stop(); }, token);
+        std::string err;
+        if (!control->start(cfg.control_host, cfg.control_port, err)) {
+            fprintf(stderr, "[onnx] control plane: %s\n", err.c_str());
+            return 1;
+        }
+        fprintf(stderr, "[onnx] control plane on %s:%d%s\n", cfg.control_host.c_str(),
+                control->port(), control->needs_token() ? " (token required)" : "");
+    }
+
     fprintf(stderr, "[onnx] listening on %s:%d (%zu models)\n", cfg.host.c_str(), cfg.port,
             served_models.size());
-    if (!srv.listen(cfg.host.c_str(), cfg.port)) {
+    const bool listening = srv.listen(cfg.host.c_str(), cfg.port);
+    if (control) control->stop();
+    if (!listening) {
         fprintf(stderr, "[onnx] failed to listen on %s:%d\n", cfg.host.c_str(), cfg.port);
         return 1;
     }

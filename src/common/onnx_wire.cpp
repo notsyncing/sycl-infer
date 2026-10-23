@@ -1,4 +1,4 @@
-#include "wire.h"
+#include "onnx_wire.h"
 
 #include <cstring>
 
@@ -187,6 +187,26 @@ bool decode_request(const uint8_t * p, size_t n, std::string & model, std::vecto
         }
         inputs.push_back(std::move(t));
     }
+    return true;
+}
+
+bool peek_request_model(const uint8_t * p, size_t n, std::string & model, std::string & err) {
+    if (n < 10 || std::memcmp(p, kReqMagic, 4) != 0) {
+        err = "not a request (magic/header)";
+        return false;
+    }
+    reader r{p, n, 4, false};
+    const uint32_t version = r.u32();
+    if (version != kVersion) {
+        err = "unsupported request version " + std::to_string(version);
+        return false;
+    }
+    const uint16_t len = r.u16();
+    if (r.bad || r.off + len > n) {
+        err = "truncated model name";
+        return false;
+    }
+    model.assign(reinterpret_cast<const char *>(p + r.off), len);
     return true;
 }
 

@@ -34,10 +34,12 @@ void usage(const char * prog) {
             "  --config <path>   the router configuration (JSON, comments allowed)\n"
             "  --check           validate the configuration and exit\n"
             "\n"
-            "The configuration lists every model: its GGUF path, its HTTP port,\n"
-            "its memory budget and the extra worker arguments.  The router\n"
-            "starts one `sycl-infer serve` process per model and proxies the\n"
-            "OpenAI API to them.  See docs/design/16-router.md.\n"
+            "The configuration lists every model: its backend (llm/onnx), its\n"
+            "GGUF/ONNX path, its HTTP port, its memory budget and the extra\n"
+            "worker arguments.  The router starts one worker per model -\n"
+            "`sycl-infer serve` for LLM models and `sycl-infer-onnx` for ONNX\n"
+            "models - and proxies the OpenAI API and /v1/onnx/run to them.\n"
+            "See docs/design/16-router.md.\n"
             "\n"
             "A model entry:\n"
             "  id                  the name clients use in the `model` field\n"
@@ -47,9 +49,12 @@ void usage(const char * prog) {
             "  control             the worker's control plane (host:port): its\n"
             "                      identity, its device memory, a graceful stop\n"
             "  control_token[_file]  the control plane's shared secret\n"
-            "  device              {group, filter, count}: the budget group, the\n"
-            "                      SYCL_DEVICE_FILTER for the worker, how many\n"
-            "                      cards it runs on\n"
+            "  backend             llm (default) or onnx\n"
+            "  device              {kind, group, filter, count}: the worker's\n"
+            "                      --device value, the budget group, the\n"
+            "                      SYCL_DEVICE_FILTER and the card count\n"
+            "  onnx                {drop_outputs, dnnl}: the ONNX worker's\n"
+            "                      output pruning and oneDNN switch\n"
             "  memory              {vram_budget_mb, kv_cap_mb, max_slots,\n"
             "                      prefix_cache_vram_mb, prefix_cache_dir}\n"
             "  args                extra worker arguments\n"
@@ -126,8 +131,9 @@ int main(int argc, char ** argv) {
     httplib::Server srv;
     srv.set_read_timeout(cfg.request_timeout_s + 60, 0);
     srv.set_write_timeout(cfg.request_timeout_s + 60, 0);
-    // The payload limit matches the worker's: a base64 image is 64 MiB.
-    srv.set_payload_max_length(64 * 1024 * 1024);
+    // The payload limit matches the ONNX worker's: a tensor request can be
+    // hundreds of MiB (the LLM OpenAI face's base64 image is much smaller).
+    srv.set_payload_max_length(512 * 1024 * 1024);
 
     proxy px(reg, cfg);
     px.install(srv);

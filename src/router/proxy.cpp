@@ -3,6 +3,7 @@
 #include "config.h"
 #include "httplib.h"
 #include "json.hpp"
+#include "onnx_wire.h"
 #include "registry.h"
 
 #include <cctype>
@@ -152,10 +153,87 @@ void proxy::access_log(const std::string & method, const std::string & path, int
     fflush(stderr);
 }
 
+namespace {
+void set_onnx_error(httplib::Response & res, const std::string & msg) {
+    const std::vector<uint8_t> body = si::onnxwire::encode_response(2, msg, {});
+    res.set_content(reinterpret_cast<const char *>(body.data()), body.size(),
+                    "application/octet-stream");
+}
+} // namespace
+
+void proxy::handle_onnx_run(const httplib::Request & req, httplib::Response & res) {
+    if (!authorized(req)) {
+        set_error(res, 401, "missing or invalid bearer token", "invalid_request_error");
+        return;
+    }
+    set_cors(res);
+    std::string model, err;
+    if (!si::onnxwire::peek_request_model(reinterpret_cast<const uint8_t *>(req.body.data()),
+                                          req.body.size(), model, err)) {
+        set_onnx_error(res, "bad request: " + err);
+        return;
+    }
+    auto slot = reg_.find(model);
+    if (!slot || !slot->cfg.is_onnx()) {
+        set_onnx_error(res, "unknown ONNX model '" + model + "'");
+        return;
+    }
+    if (!slot->is_up()) {
+        set_onnx_error(res, "the ONNX worker for '" + model + "' is not up");
+        return;
+    }
+    httplib::Client cli(slot->cfg.http_host, slot->cfg.http_port);
+    cli.set_read_timeout(cfg_.request_timeout_s, 0);
+    cli.set_write_timeout(cfg_.request_timeout_s, 0);
+    cli.set_connection_timeout(5, 0);
+    auto out = cli.Post("/v1/onnx/run", req.body, "application/octet-stream");
+    if (!out) {
+        set_onnx_error(res, "the ONNX worker did not answer");
+        return;
+    }
+    res.status = out->status;
+    res.set_content(out->body, "application/octet-stream");
+}
+
+void proxy::handle_onnx_models(const httplib::Request & req, httplib::Response & res) {
+    if (!authorized(req)) {
+        set_error(res, 401, "missing or invalid bearer token", "invalid_request_error");
+        return;
+    }
+    set_cors(res);
+    ojson models = ojson::array();
+    for (const auto & slot : reg_.all()) {
+        if (!slot->cfg.is_onnx() || !slot->is_up()) continue;
+        httplib::Client cli(slot->cfg.http_host, slot->cfg.http_port);
+        cli.set_read_timeout(5, 0);
+        cli.set_connection_timeout(2, 0);
+        auto out = cli.Get("/v1/onnx/models");
+        if (!out || out->status != 200) continue;
+        try {
+            const ojson j = ojson::parse(out->body);
+            const auto it = j.find("models");
+            if (it != j.end() && it->is_array()) {
+                for (const auto & m : *it) models.push_back(m);
+            }
+        } catch (...) {
+        }
+    }
+    ojson j;
+    j["models"] = std::move(models);
+    res.set_content(j.dump(), "application/json");
+}
+
 void proxy::install(httplib::Server & srv) {
     srv.Options(".*", [](const httplib::Request &, httplib::Response & res) {
         set_cors(res);
         res.status = 204;
+    });
+
+    srv.Post("/v1/onnx/run", [this](const httplib::Request & req, httplib::Response & res) {
+        handle_onnx_run(req, res);
+    });
+    srv.Get("/v1/onnx/models", [this](const httplib::Request & req, httplib::Response & res) {
+        handle_onnx_models(req, res);
     });
 
     srv.Get("/health", [this](const httplib::Request &, httplib::Response & res) {
@@ -204,6 +282,8 @@ void proxy::install(httplib::Server & srv) {
             }
             e["http"] = slot->http_base();
             e["remote"] = slot->cfg.remote;
+            e["backend"] = slot->cfg.backend;
+            e["device_kind"] = slot->cfg.device_kind;
             e["device_group"] = slot->cfg.device_group;
             e["vram_budget_mb"] = slot->cfg.vram_budget_mb;
             e["kv_cap_mb"] = slot->cfg.kv_cap_mb;
@@ -231,6 +311,17 @@ void proxy::install(httplib::Server & srv) {
         set_cors(res);
         ojson data = ojson::array();
         for (const auto & slot : reg_.all()) {
+            if (slot->cfg.is_onnx()) {
+                // The ONNX worker's /v1/onnx/models is the authoritative
+                // table; this is the OpenAI-shaped discovery entry.
+                ojson e;
+                e["id"] = slot->cfg.id;
+                e["object"] = "model";
+                e["owned_by"] = "local";
+                e["backend"] = "onnx";
+                data.push_back(e);
+                continue;
+            }
             std::string advertised;
             {
                 std::lock_guard<std::mutex> lk(slot->mtx);

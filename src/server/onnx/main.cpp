@@ -6,7 +6,7 @@
 // CPU plugin).  The container for it is therefore tiny.
 //
 //   sycl-infer-onnx --config models.json
-//   sycl-infer-onnx --model layout=/path/pp_doclayoutv3.onnx --device GPU
+//   sycl-infer-onnx --model layout=/path/pp_doclayoutv3.onnx --device gpu
 //
 // See docs/design/17-onnx-service.md for the config format and the wire
 // protocol.
@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "onnx/service.h"
+#include "service.h"
 
 static void usage(const char * prog) {
     fprintf(stderr,
@@ -25,19 +25,26 @@ static void usage(const char * prog) {
             "options:\n"
             "  --config <file.json>      the model table (see below)\n"
             "  --model id=path[:device]  add a model (repeatable)\n"
-            "  --device GPU|CPU|AUTO     the default device (default GPU)\n"
+            "  --device cpu|gpu|auto     the compute device (default gpu; the\n"
+            "                            same names as `sycl-infer --device`;\n"
+            "                            SYCL_DEVICE_FILTER pins the card)\n"
             "  --host <addr>             bind address (default 127.0.0.1)\n"
             "  --port <n>                port (default 8890)\n"
             "  --threads <n>             HTTP worker threads (default 4)\n"
+            "  --drop-outputs <name>     do not read this model output (repeatable)\n"
+            "  --dnnl <0|1>              oneDNN f32 convolution/matmul (default 1)\n"
+            "  --control-host <addr>     the router's control plane address\n"
+            "  --control-port <n>        the control plane port (0 = off)\n"
+            "  --control-token <s>       the control plane's shared secret\n"
+            "  --control-token-file <f>  ... read it from a file\n"
             "\n"
             "the config file:\n"
             "  {\n"
-            "    \"device\": \"GPU\",\n"
-            "    \"props\": { \"INFERENCE_PRECISION_HINT\": \"f32\" },\n"
+            "    \"device\": \"gpu\",\n"
             "    \"models\": {\n"
             "      \"layout\": { \"path\": \"/path/pp_doclayoutv3.onnx\" },\n"
             "      \"formula\": { \"path\": \"/path/pp_formulanet_plus_m.onnx\",\n"
-            "                     \"device\": \"CPU\" }\n"
+            "                     \"device\": \"cpu\" }\n"
             "    }\n"
             "  }\n"
             "\n"
@@ -65,6 +72,19 @@ int main(int argc, char ** argv) {
             cfg.models.push_back(next("--model"));
         } else if (a == "--device") {
             cfg.device = next("--device");
+        } else if (a == "--drop-outputs") {
+            cfg.drop_outputs.push_back(next("--drop-outputs"));
+        } else if (a == "--dnnl") {
+            cfg.dnnl = atoi(next("--dnnl").c_str()) != 0;
+            cfg.dnnl_set = true;
+        } else if (a == "--control-host") {
+            cfg.control_host = next("--control-host");
+        } else if (a == "--control-port") {
+            cfg.control_port = atoi(next("--control-port").c_str());
+        } else if (a == "--control-token") {
+            cfg.control_token = next("--control-token");
+        } else if (a == "--control-token-file") {
+            cfg.control_token_file = next("--control-token-file");
         } else if (a == "--host") {
             cfg.host = next("--host");
         } else if (a == "--port") {

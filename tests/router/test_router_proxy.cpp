@@ -6,6 +6,8 @@
 #include <httplib.h>
 #include <json.hpp>
 
+#include "onnx_wire.h"
+
 #include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
@@ -51,6 +53,7 @@ struct fake_worker {
     std::atomic<bool> client_disconnected{false};
     std::atomic<int> sse_chunks{0};
     std::string last_model;
+    std::string last_onnx_model;
     std::mutex mtx;
 
     // How many chunks the stream carries and how long it waits between them.
@@ -64,6 +67,18 @@ struct fake_worker {
         srv.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
             res.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"worker-model\",\"object\":\"model\"}]}",
                             "application/json");
+        });
+        srv.Post("/v1/onnx/run", [this](const httplib::Request & req, httplib::Response & res) {
+            std::string model, err;
+            si::onnxwire::peek_request_model(reinterpret_cast<const uint8_t *>(req.body.data()),
+                                             req.body.size(), model, err);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                last_onnx_model = model;
+            }
+            const std::vector<uint8_t> out = si::onnxwire::encode_response(0, "", {});
+            res.set_content(reinterpret_cast<const char *>(out.data()), out.size(),
+                            "application/octet-stream");
         });
         srv.Post("/v1/chat/completions", [this](const httplib::Request & req, httplib::Response & res) {
             json body;
@@ -132,6 +147,7 @@ struct router_fixture {
     fake_worker worker;
     registry reg;
     std::shared_ptr<model_slot> slot;
+    std::shared_ptr<model_slot> onnx_slot;
     // The proxy must outlive the server: httplib keeps the handlers, and the
     // handlers capture the proxy's `this`.
     std::unique_ptr<proxy> px;
@@ -331,6 +347,47 @@ void test_models_aggregate() {
 }
 
 } // namespace
+
+
+void test_onnx_binary_route() {
+    router_fixture fx;
+    fx.start();
+    model_config om;
+    om.id = "onnx-model";
+    om.backend = "onnx";
+    om.http_host = "127.0.0.1";
+    om.http_port = fx.worker.port;
+    fx.onnx_slot = fx.reg.add(om);
+    fx.onnx_slot->set_state(model_state::up);
+    const std::vector<uint8_t> req = si::onnxwire::encode_request("onnx-model", {});
+    httplib::Client cli("127.0.0.1", fx.port);
+    cli.set_read_timeout(10, 0);
+    auto res = cli.Post("/v1/onnx/run", reinterpret_cast<const char *>(req.data()), req.size(),
+                        "application/octet-stream");
+    std::vector<si::onnxwire::tensor> outs;
+    int32_t status = -1;
+    std::string msg, err;
+    if (res) {
+        si::onnxwire::decode_response(reinterpret_cast<const uint8_t *>(res->body.data()),
+                                      res->body.size(), status, msg, outs, err);
+    }
+    CHECK(res && res->status == 200, "the binary route must return HTTP 200");
+    CHECK(status == 0, "the ONNX response status: %d (%s)", status, msg.c_str());
+    {
+        std::lock_guard<std::mutex> lk(fx.worker.mtx);
+        CHECK(fx.worker.last_onnx_model == "onnx-model", "worker saw '%s'",
+              fx.worker.last_onnx_model.c_str());
+    }
+    const std::vector<uint8_t> unknown = si::onnxwire::encode_request("no-such-model", {});
+    res = cli.Post("/v1/onnx/run", reinterpret_cast<const char *>(unknown.data()), unknown.size(),
+                   "application/octet-stream");
+    if (res) {
+        si::onnxwire::decode_response(reinterpret_cast<const uint8_t *>(res->body.data()),
+                                      res->body.size(), status, msg, outs, err);
+    }
+    CHECK(res && status == 2, "an unknown ONNX model must be a wire error (status %d)", status);
+    fx.stop();
+}
 
 int main() {
     test_non_streaming();

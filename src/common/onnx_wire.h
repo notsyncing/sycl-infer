@@ -63,6 +63,9 @@ constexpr char kRespMagic[4] = {'S', 'I', 'O', 'R'};
 // buffer and a malformed one must not be able to walk off the end.
 bool decode_request(const uint8_t * p, size_t n, std::string & model, std::vector<tensor> & inputs,
                     std::string & err);
+// Read only the model name from a request.  The router needs the routing key
+// and must not copy the (potentially multi-hundred-MB) tensor payloads.
+bool peek_request_model(const uint8_t * p, size_t n, std::string & model, std::string & err);
 bool decode_response(const uint8_t * p, size_t n, int32_t & status, std::string & msg,
                      std::vector<tensor> & outputs, std::string & err);
 

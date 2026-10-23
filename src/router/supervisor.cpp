@@ -369,7 +369,8 @@ void supervisor::stop() {
 
 bool supervisor::spawn(const model_slot & slot, pid_t & pid, std::string & err) {
     const model_config & m = slot.cfg;
-    const std::string binary = resolve_binary(m.binary.empty() ? std::string("sycl-infer") : m.binary);
+    const std::string fallback = m.is_onnx() ? "sycl-infer-onnx" : "sycl-infer";
+    const std::string binary = resolve_binary(m.binary.empty() ? fallback : m.binary);
     if (::access(binary.c_str(), X_OK) != 0) {
         err = "worker binary '" + binary + "' is not executable (looked next to the router and in PATH)";
         return false;

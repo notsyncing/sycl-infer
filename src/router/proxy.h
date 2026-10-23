@@ -28,6 +28,10 @@ public:
 
 private:
     void handle_completions(const httplib::Request & req, httplib::Response & res, const char * path);
+    // The ONNX binary data plane: the model is the first field of the
+    // request body, so the router can route it without decoding the tensors.
+    void handle_onnx_run(const httplib::Request & req, httplib::Response & res);
+    void handle_onnx_models(const httplib::Request & req, httplib::Response & res);
     void handle_models(const httplib::Request & req, httplib::Response & res);
     void handle_model_one(const httplib::Request & req, httplib::Response & res);
     void handle_health(const httplib::Request & req, httplib::Response & res);

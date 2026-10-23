@@ -38,7 +38,7 @@ COPY . /src
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DDNNL_ROOT=/opt/intel/oneapi/dnnl/${DNNL_VERSION} \
       -DSYCL_INFER_AOT=${AOT} -DSYCL_INFER_AOT_DEVICE=${AOT_DEVICE} \
- && cmake --build build --target sycl-infer -j"$(nproc)"
+ && cmake --build build --target sycl-infer sycl-infer-onnx -j"$(nproc)"
 
 # ---- stage 2: the router (a plain host binary) ------------------------------
 FROM debian:bookworm-slim AS router
@@ -63,6 +63,7 @@ RUN wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-onea
       dnnl-${ONEAPI_VERSION}-runtime intel-level-zero-gpu intel-opencl-icd level-zero \
  && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
 COPY --from=worker /src/build/sycl-infer /usr/local/bin/sycl-infer
+COPY --from=worker /src/build/sycl-infer-onnx /usr/local/bin/sycl-infer-onnx
 COPY --from=router /src/build/sycl-infer-router /usr/local/bin/sycl-infer-router
 ENV LD_LIBRARY_PATH=/opt/intel/oneapi/${ONEAPI_VERSION}/lib:/opt/intel/oneapi/dnnl/${ONEAPI_VERSION}/lib:${LD_LIBRARY_PATH}
 RUN mkdir -p /etc/sycl-infer /var/log/sycl-infer

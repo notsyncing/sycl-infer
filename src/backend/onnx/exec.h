@@ -20,7 +20,7 @@
 #include <sycl/sycl.hpp>
 
 #include "graph.h"
-#include "wire.h"
+#include "onnx_wire.h"
 
 namespace si {
 namespace onnx {
