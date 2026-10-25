@@ -109,8 +109,8 @@ struct gpu_backend : compute_backend {
                    conv_dim, scale, n_slots, n_rows, row0, tpb_arg, nreal_arg, snap);
     }
     void gated_norm(const float * attn, const float * z, const float * weight, float * out, const step_info * info,
-                    int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0) override {
-        gated_norm_launch(q, attn, z, weight, out, info, n_heads, head_dim, eps, n_rows, n_real, row0);
+                    int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0, bool sigmoid_gate) override {
+        gated_norm_launch(q, attn, z, weight, out, info, n_heads, head_dim, eps, n_rows, n_real, row0, sigmoid_gate);
     }
     void xq(const float * x, const float * up, int x_stride, int up_stride, int8_t * x8, sycl::float2 * xmeta,
             int32_t * xsumq, const step_info * info, int TB, int K) override {

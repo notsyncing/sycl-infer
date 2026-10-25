@@ -186,6 +186,9 @@ struct engine_config {
     int moe_resident = 0;
     size_t moe_vram_mb = 0;
     size_t moe_ram_mb = 0;
+    // qwen4exp PLE ("engram") row cache in host RAM.  Misses fall through to
+    // the 26.8 GiB mmap, i.e. the OS page cache / disk tier.
+    size_t engram_ram_mb = 4096;
 
     // YaRN context extension (src/common/yarn.h).  `yarn` off by default: it is
     // a scaling method whose gains in the paper come from long-context
@@ -476,6 +479,9 @@ struct engine {
     // which is a *construction-time* fact: release_host_weight_pages() runs
     // before setup_moe_slots(), so it cannot ask the cache
     bool moe_resident = true;
+    // qwen4exp: every routed expert is computed on the host (the 70 GiB bank
+    // cannot live on the cards); set before setup_moe_slots()
+    bool moe_host_only_ = false;
     // set once the expert cache has decided its residency, so the constructor's
     // page release can hand the decision to the post-setup one
     bool moe_host_weights_deferred_ = false;
@@ -492,6 +498,124 @@ struct engine {
     size_t moe_slot_gb_max = 0, moe_slot_ub_max = 0, moe_slot_db_max = 0;
     int moe_topk = 0;
     void bind_moe_acts(int dev);
+
+    // ---- qwen4exp (hyper-connections + PLE) -----------------------------
+    // Per-device scratch for the trunk.  The residual is [token][hc][n_embd];
+    // `xn`, `gate`, `mixed`, `block` are the per-layer temporaries.  The PLE
+    // module and the routed MoE run on the host (their tables and expert bank
+    // are host-resident), so their buffers are engine-wide, not per device.
+    struct q4_bufs {
+        float * res = nullptr;
+        float * xn = nullptr;
+        float * gate = nullptr;
+        float * mixed = nullptr;
+        float * block = nullptr;
+        float * lo = nullptr;
+        float * inj = nullptr;
+        gemv_seg * segs = nullptr;      // device (or host, for a cpu partition)
+        gemv_seg * host_segs = nullptr; // staging ring for the async copy
+        int segs_cap = 0;
+        int seg_used = 0;
+        float * router_logits = nullptr;
+        int32_t * router_ids = nullptr;
+        float * router_wts = nullptr;
+    };
+    std::vector<q4_bufs> q4b_;
+    float * q4_host_res_ = nullptr; // host staging for a partition handoff
+    float * q4_host_mix_ = nullptr;
+    float * q4_host_out_ = nullptr;
+    float * q4_moe_logits_ = nullptr;
+    float * q4_moe_wts_ = nullptr;
+    float * q4_moe_acc_ = nullptr;
+    float * q4_moe_sh_ = nullptr;
+    float * q4_moe_shout_ = nullptr;
+    int32_t * q4_moe_ids_ = nullptr;
+    // routing histogram (PF_Q4_HIST): (layer, expert) pair counts, prefill and
+    // decode kept apart.  Diagnostic only - it is never read by a kernel.
+    // Per-expert hot bank: R slots per GPU layer, calibrated from the first
+    // prefill's routing (PF_Q4_HOT, the default when --moe-vram-mb > 0).
+    // PF_Q4_BANK_LAYER=1 keeps the older whole-layer bank for A/B.
+    bool q4_hot_ = false;
+    bool q4_hot_ready_ = false;
+    int q4_hot_r_ = 0;
+    std::vector<uint32_t> q4_cal_;
+    size_t q4_cal_pairs_ = 0;
+    std::vector<int32_t> q4_sm_host_;
+    // Pinned staging ring for the LRU expert uploads.  A q.memcpy whose source
+    // is pageable blocks the host until the in-order queue drains (measured
+    // 1.7 ms for 1 MB behind a kernel against 0.016 ms from pinned USM), and
+    // the LRU's source is the GGUF mmap: PF_Q4_HOT_TIME priced the uploads at
+    // 1.43 ms/expert, 112 ms of a decode token.  Staging keeps the ordering
+    // (the device copy is still enqueued before the kernels that read the
+    // bank) and takes the host out of the wait.
+    std::vector<char *> q4_up_stage_;    // per device: pinned ring base
+    std::vector<sycl::event> q4_up_ev_;  // [dev * q4_up_slots_ + slot]
+    std::vector<unsigned char> q4_up_live_;
+    std::vector<int> q4_up_next_;        // per device: next ring slot
+    size_t q4_up_stride_ = 0;            // bytes per ring slot (max plane)
+    int q4_up_slots_ = 0;
+    double q4_up_wait_ms_ = 0.0;         // diagnostic: ring-slot waits
+    void q4_upload(int dev, void * dst, const void * src, size_t n);
+    void q4_upload_init(int nd, size_t max_plane);
+    std::vector<uint32_t> q4_lru_age_; // [n_layer][R], the per-slot LRU clock
+    uint32_t q4_lru_tick_ = 0;
+    bool q4_hotchk_done_ = false;
+    float * q4_spill_acc_ = nullptr;
+    void q4_hot_calibrate();
+    std::vector<uint64_t> q4_hist_pre_, q4_hist_dec_;
+    size_t q4_hist_pre_pairs_ = 0, q4_hist_dec_pairs_ = 0;
+    void q4_hist_report() const;
+    float * q4_ple_hist_ = nullptr;
+    int32_t * q4_ple_nhist_ = nullptr;
+    float * q4_ple_emb_ = nullptr;
+    float * q4_ple_key_ = nullptr;
+    float * q4_ple_val_ = nullptr;
+    float * q4_ple_gate_ = nullptr;
+    float * q4_ple_a_ = nullptr;
+    float * q4_ple_b_ = nullptr;
+    int32_t * q4_ple_prev_ = nullptr; // [slot][ple_ngram-1] last tokens before the batch
+    std::vector<void *> q4_owned_; // host buffers freed in ~engine
+    // full-layer VRAM expert banks (all 512 experts of a layer); `--moe-vram-mb`
+    // is the per-device byte budget.  A layer with a bank runs its whole MoE on
+    // the GPU instead of the host.
+    struct q4_bank_t {
+        void * g = nullptr;
+        void * u = nullptr;
+        void * d = nullptr;
+        size_t sg = 0, su = 0, sd = 0;
+        int32_t * sm = nullptr; // identity slot map on the layer's device
+    };
+    std::vector<q4_bank_t> q4_bank_layer_;
+    std::vector<void *> q4_host_usm_; // pinned expert mirrors, freed with sycl::free
+    bool q4_mirror_ = false;
+    size_t engram_ram_mb_ = 0;
+    size_t engram_cap_ = 0; // power of two
+    std::vector<int32_t> engram_tag_;
+    std::vector<float> engram_row_;
+    size_t engram_hits_ = 0, engram_misses_ = 0;
+    // QSA: host-side indexer cache/mirror and the sparse attention.  The main
+    // KV stays on the device; full-attention layers keep a host copy of their
+    // own K/V so the selected keys can be attended on the CPU without a gather
+    // kernel.  Allocated lazily per (attention layer, slot).
+    struct qsa_slot_state {
+        std::vector<float> k, v; // [max_seq][n_head_kv*head_dim]
+        std::vector<float> pool; // [(max_seq/4+1)][idx_head_dim]
+        std::vector<float> ring; // [4][idx_head_dim]
+        int n_pool = 0;
+    };
+    std::vector<std::vector<std::unique_ptr<qsa_slot_state>>> qsa_cache_;
+    bool qsa_on_ = false;
+    int qsa_max_seq_ = 0;
+    bool qsa_attention(int a, const layer_t & L, int dev, int n_tok, const step_info * inf, const float * mixed,
+                       float * qbuf, const float * kbuf, const float * vbuf, float * attn_out);
+    void q4_alloc_banks();
+    void q4_alloc();
+    void q4_prefault();
+    // mode 0 = decode (n_rows sequences, one token each), mode 2 = prefill
+    // (one sequence, n_tok tokens laid out in kMaxT-wide rows)
+    void q4_forward(int mode, int n_tok, bool with_head);
+    void q4_prefill_text(const std::vector<int> & toks, int slot, int n, int start);
+    void q4_zero_state(int slot);
 
     // paged KV cache + tables.  The pools are raw byte storage whose element
     // type is kv_dtype() (f32/bf16/f16/i8/i4, see kernels.h); sizes are in

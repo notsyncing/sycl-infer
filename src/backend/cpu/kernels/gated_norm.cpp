@@ -5,7 +5,7 @@
 namespace si {
 
 void cpu_gated_norm(const float * attn, const float * z, const float * weight, float * out, const cpu_step_info * info,
-                    int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0) {
+                    int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0, bool sigmoid_gate) {
     const int total = n_rows * n_real * n_heads;
     par(total, [&](int gid) {
         const int r = gid / (n_real * n_heads);
@@ -22,7 +22,7 @@ void cpu_gated_norm(const float * attn, const float * z, const float * weight, f
         const float ss = sumsq_f32(a, head_dim);
         const float inv = 1.0f / std::sqrt(ss / head_dim + eps);
         for (int d = 0; d < head_dim; d++) {
-            o[d] = a[d] * inv * weight[d] * cpu_silu(zv[d]);
+            o[d] = a[d] * inv * weight[d] * (sigmoid_gate ? cpu_sigmoid(zv[d]) : cpu_silu(zv[d]));
         }
     });
 }

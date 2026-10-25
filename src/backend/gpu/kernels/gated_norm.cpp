@@ -12,7 +12,8 @@ using namespace si::kd;
 
 // ---------------------------------------------------------------------------
 void gated_norm_launch(queue & q, const float * attn, const float * z, const float * weight, float * out,
-                       const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0) {
+                       const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0,
+                       bool sigmoid_gate) {
     q.parallel_for(
         nd_range<1>((size_t)n_rows * n_real * n_heads * 32, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const int gid = it.get_group(0);
@@ -38,7 +39,8 @@ void gated_norm_launch(queue & q, const float * attn, const float * z, const flo
             for (int i = 0; i < head_dim / 32; i++) {
                 const int idx = lane + 32 * i;
                 const float zv = z[(size_t)row * n_heads * head_dim + head * head_dim + idx];
-                out[(size_t)row * n_heads * head_dim + head * head_dim + idx] = a[idx] * inv * weight[idx] * silu_f(zv);
+                out[(size_t)row * n_heads * head_dim + head * head_dim + idx] =
+                    a[idx] * inv * weight[idx] * (sigmoid_gate ? sigmoid_f(zv) : silu_f(zv));
             }
         });
 }

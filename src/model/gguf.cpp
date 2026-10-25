@@ -5,7 +5,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 const char * ggml_type_name(uint32_t t) {
@@ -178,21 +180,101 @@ struct reader {
 
 gguf_file::~gguf_file() {
     if (map_base) {
+        // one range: for a split file this also unmaps the per-shard MAP_FIXED
+        // sub-mappings placed inside the reservation
         munmap(map_base, map_size);
     }
-    if (fd >= 0) {
+    for (const shard_t & s : shards) {
+        if (s.fd >= 0) {
+            close(s.fd);
+        }
+    }
+    if (shards.empty() && fd >= 0) {
         close(fd);
     }
 }
 
 void gguf_file::drop_cache(size_t off, size_t len) const {
-    if (fd < 0 || len == 0) {
+    if (len == 0) {
         return;
     }
-    posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
+    if (!is_split()) {
+        if (fd >= 0) {
+            posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
+        }
+        return;
+    }
+    // Translate the reservation-relative range into each shard's own file range.
+    // The caller's range is page-aligned and may span the padding between two
+    // shards; clip it to every shard it touches.
+    const uint64_t a = off;
+    const uint64_t b = off + len;
+    for (const shard_t & s : shards) {
+        const uint64_t s0 = (uint64_t)((const uint8_t *)s.base - (const uint8_t *)map_base);
+        const uint64_t s1 = s0 + s.size;
+        const uint64_t lo = std::max<uint64_t>(a, s0);
+        const uint64_t hi = std::min<uint64_t>(b, s1);
+        if (hi > lo) {
+            posix_fadvise(s.fd, (off_t)(lo - s0), (off_t)(hi - lo), POSIX_FADV_DONTNEED);
+        }
+    }
 }
 
-void gguf_file::load(const std::string & path) {
+namespace {
+
+struct parsed_header {
+    uint32_t version = 0;
+    size_t data_offset = 0;
+    std::map<std::string, gguf_kv> kv;
+    std::vector<gguf_tensor_info> tensors;
+};
+
+// Parse the header block of one already-mapped shard.  `base` is that shard's
+// own mapping: tensor data pointers are left unset here and rebased by load().
+parsed_header parse_header(const uint8_t * base, size_t size) {
+    reader r{base, base + size};
+    parsed_header h;
+    uint32_t magic = r.read<uint32_t>();
+    if (magic != 0x46554747) { // 'GGUF' little endian
+        throw std::runtime_error("not a gguf file");
+    }
+    h.version = r.read<uint32_t>();
+    uint64_t n_tensors = r.read<uint64_t>();
+    uint64_t n_kv = r.read<uint64_t>();
+
+    for (uint64_t i = 0; i < n_kv; i++) {
+        std::string key = r.read_str();
+        uint32_t t = r.read<uint32_t>();
+        h.kv[key] = r.read_value(t);
+    }
+
+    h.tensors.resize(n_tensors);
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_tensor_info & ti = h.tensors[i];
+        ti.name = r.read_str();
+        uint32_t nd = r.read<uint32_t>();
+        ti.dims.resize(nd);
+        for (uint32_t d = 0; d < nd; d++) {
+            ti.dims[d] = r.read<uint64_t>();
+        }
+        ti.type = r.read<uint32_t>();
+        ti.offset = r.read<uint64_t>();
+    }
+
+    auto u32_of = [&h](const std::string & key, uint32_t def) {
+        auto it = h.kv.find(key);
+        return it == h.kv.end() ? def : it->second.as_u32();
+    };
+    const uint32_t alignment = u32_of("general.alignment", 32);
+    const size_t pos = (size_t)(r.p - base);
+    h.data_offset = (pos + alignment - 1) / alignment * alignment;
+    if (h.data_offset > size) {
+        throw std::runtime_error("gguf: bad data offset");
+    }
+    return h;
+}
+
+int open_shard(const std::string & path, size_t & size) {
     int f = open(path.c_str(), O_RDONLY);
     if (f < 0) {
         throw std::runtime_error("cannot open " + path);
@@ -202,51 +284,159 @@ void gguf_file::load(const std::string & path) {
         close(f);
         throw std::runtime_error("fstat failed");
     }
-    map_size = (size_t)st.st_size;
-    map_base = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, f, 0);
-    if (map_base == MAP_FAILED) {
-        close(f);
-        throw std::runtime_error("mmap failed");
-    }
-    fd = f; // kept open for drop_cache(); closed in ~gguf_file
+    size = (size_t)st.st_size;
+    return f;
+}
 
-    reader r{(const uint8_t *)map_base, (const uint8_t *)map_base + map_size};
-    uint32_t magic = r.read<uint32_t>();
-    if (magic != 0x46554747) { // 'GGUF' little endian
-        throw std::runtime_error("not a gguf file");
+// If `path` names one shard of a split GGUF ("...-00002-of-00004.gguf"), return
+// the sibling paths in index order.  The count is taken from the file name; the
+// metadata's split.count is only used to validate it.
+std::vector<std::string> shard_paths(const std::string & path) {
+    const std::string suffix = ".gguf";
+    const size_t of = path.rfind("-of-");
+    if (of == std::string::npos || path.size() < of + 4 + 5 + suffix.size()
+        || path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return {path};
     }
-    version = r.read<uint32_t>();
-    uint64_t n_tensors = r.read<uint64_t>();
-    uint64_t n_kv = r.read<uint64_t>();
-
-    for (uint64_t i = 0; i < n_kv; i++) {
-        std::string key = r.read_str();
-        uint32_t t = r.read<uint32_t>();
-        kv[key] = r.read_value(t);
+    const size_t dash = path.rfind('-', of - 1);
+    if (dash == std::string::npos) {
+        return {path};
     }
-
-    tensors.resize(n_tensors);
-    for (uint64_t i = 0; i < n_tensors; i++) {
-        gguf_tensor_info & ti = tensors[i];
-        ti.name = r.read_str();
-        uint32_t nd = r.read<uint32_t>();
-        ti.dims.resize(nd);
-        for (uint32_t d = 0; d < nd; d++) {
-            ti.dims[d] = r.read<uint64_t>();
+    const std::string idx_s = path.substr(dash + 1, of - dash - 1);
+    const std::string cnt_s = path.substr(of + 4, path.size() - suffix.size() - (of + 4));
+    if (idx_s.size() != 5 || cnt_s.size() != 5) {
+        return {path};
+    }
+    for (char c : idx_s + cnt_s) {
+        if (c < '0' || c > '9') {
+            return {path};
         }
-        ti.type = r.read<uint32_t>();
-        ti.offset = r.read<uint64_t>();
-        tensor_index[ti.name] = i;
+    }
+    const int count = atoi(cnt_s.c_str());
+    if (count <= 1) {
+        return {path};
+    }
+    std::vector<std::string> out;
+    out.reserve((size_t)count);
+    for (int i = 1; i <= count; i++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%05d", i);
+        out.push_back(path.substr(0, dash + 1) + buf + "-of-" + cnt_s + suffix);
+    }
+    return out;
+}
+
+} // namespace
+
+void gguf_file::load(const std::string & path) {
+    std::vector<std::string> paths = shard_paths(path);
+    if (paths.size() == 1) {
+        size_t size = 0;
+        int f = open_shard(path, size);
+        map_size = size;
+        map_base = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, f, 0);
+        if (map_base == MAP_FAILED) {
+            close(f);
+            throw std::runtime_error("mmap failed");
+        }
+        fd = f;
+        shard_t s;
+        s.fd = f;
+        s.base = map_base;
+        s.size = map_size;
+        parsed_header h = parse_header((const uint8_t *)map_base, map_size);
+        version = h.version;
+        kv = std::move(h.kv);
+        tensors = std::move(h.tensors);
+        data_offset = h.data_offset;
+        s.data_offset = data_offset;
+        shards.push_back(s);
+        split_count = 1;
+        split_no = 0;
+        for (size_t i = 0; i < tensors.size(); i++) {
+            tensor_index[tensors[i].name] = i;
+        }
+        for (auto & ti : tensors) {
+            ti.data = (const uint8_t *)map_base + data_offset + ti.offset;
+        }
+        return;
     }
 
-    uint32_t alignment = get_u32("general.alignment", 32);
-    size_t pos = (size_t)(r.p - (const uint8_t *)map_base);
-    data_offset = (pos + alignment - 1) / alignment * alignment;
-    if (data_offset > map_size) {
-        throw std::runtime_error("gguf: bad data offset");
+    // Split file: reserve one contiguous range and place every shard inside it
+    // at a page-aligned slot, so a tensor's address minus map_base is a stable
+    // offset through the whole (multi-file) model.
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    struct pending {
+        int f = -1;
+        size_t size = 0;
+        parsed_header h;
+    };
+    std::vector<pending> pend(paths.size());
+    size_t total = 0;
+    for (size_t i = 0; i < paths.size(); i++) {
+        pend[i].f = open_shard(paths[i], pend[i].size);
+        // Parse the header through a temporary mapping: the metadata is a few MB
+        // and this keeps the parse independent of the placement arithmetic.
+        void * tmp = mmap(nullptr, pend[i].size, PROT_READ, MAP_PRIVATE, pend[i].f, 0);
+        if (tmp == MAP_FAILED) {
+            close(pend[i].f);
+            throw std::runtime_error("mmap failed");
+        }
+        try {
+            pend[i].h = parse_header((const uint8_t *)tmp, pend[i].size);
+        } catch (...) {
+            munmap(tmp, pend[i].size);
+            close(pend[i].f);
+            throw;
+        }
+        munmap(tmp, pend[i].size);
+        total += (pend[i].size + page - 1) / page * page;
+        if (i == 0) {
+            version = pend[i].h.version;
+            split_count = pend[i].h.kv.count("split.count") ? (int)pend[i].h.kv["split.count"].as_u32() : (int)paths.size();
+            split_no = pend[i].h.kv.count("split.no") ? (int)pend[i].h.kv["split.no"].as_u32() : 0;
+        } else {
+            const int no = pend[i].h.kv.count("split.no") ? (int)pend[i].h.kv["split.no"].as_u32() : (int)i;
+            if (no != (int)i) {
+                throw std::runtime_error("gguf: shard " + paths[i] + " has split.no " + std::to_string(no));
+            }
+        }
+        if (pend[i].h.kv.count("split.count") && (int)pend[i].h.kv["split.count"].as_u32() != (int)paths.size()) {
+            throw std::runtime_error("gguf: split.count does not match the shard file names");
+        }
+        for (auto & e : pend[i].h.kv) {
+            if (!kv.count(e.first)) {
+                kv[e.first] = e.second;
+            }
+        }
     }
 
-    for (auto & ti : tensors) {
-        ti.data = (const uint8_t *)map_base + data_offset + ti.offset;
+    map_size = total;
+    map_base = mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (map_base == MAP_FAILED) {
+        throw std::runtime_error("gguf: cannot reserve the split mapping");
     }
+    size_t off = 0;
+    for (size_t i = 0; i < paths.size(); i++) {
+        const size_t slot = (pend[i].size + page - 1) / page * page;
+        void * at = mmap((uint8_t *)map_base + off, slot, PROT_READ, MAP_PRIVATE | MAP_FIXED, pend[i].f, 0);
+        if (at == MAP_FAILED) {
+            throw std::runtime_error("gguf: cannot map shard " + paths[i]);
+        }
+        shard_t s;
+        s.fd = pend[i].f;
+        s.base = at;
+        s.size = pend[i].size;
+        s.data_offset = pend[i].h.data_offset;
+        shards.push_back(s);
+        for (auto & t : pend[i].h.tensors) {
+            gguf_tensor_info copy = t;
+            copy.data = (const uint8_t *)at + pend[i].h.data_offset + copy.offset;
+            tensor_index[copy.name] = tensors.size();
+            tensors.push_back(std::move(copy));
+        }
+        off += slot;
+    }
+    data_offset = shards[0].data_offset;
+    fd = shards[0].fd;
 }

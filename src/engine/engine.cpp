@@ -109,6 +109,7 @@ engine::engine(const engine_config & cfg)
     {
         moe_cache_cfg mc = moe_cache_cfg::from_env(cfg.moe_resident);
         mc.vram_mb = cfg.moe_vram_mb ? cfg.moe_vram_mb : mc.vram_mb;
+        engram_ram_mb_ = cfg.engram_ram_mb;
         mc.ram_mb = cfg.moe_ram_mb ? cfg.moe_ram_mb : mc.ram_mb;
         mc.ram_tier = mc.ram_tier || mc.ram_mb > 0;
         moe_cfg_ = mc;
@@ -125,11 +126,22 @@ engine::engine(const engine_config & cfg)
     yarn_beta_slow_ = si::env::f32("PF_YARN_BETA_SLOW", cfg.yarn_beta_slow);
     yarn_attn_factor_ = si::env::f32("PF_YARN_ATTN_FACTOR", cfg.yarn_attn_factor);
     const std::string & model_path = cfg.model_path;
-    const std::string & layer_map = cfg.layer_map;
+    std::string layer_map = cfg.layer_map;
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     tk.load(m.gguf);
+    // qwen4exp: the routed expert bank is 70 GiB in the reference file, so it
+    // stays in host RAM and every routed pair is computed by the host half.
+    // Compact drafting (the separate MTP file) and the prefix cache are not
+    // wired for the hyper-connection/PLE state yet; leave them off rather than
+    // snapshot a state the cache does not understand.
+    if (m.q4exp) {
+        moe_host_only_ = true;
+        moe_cfg_.host_only = true;
+        mtp.mtp_k = 0;
+        mtp.mtp_on = false;
+    }
     // YaRN: build the per-pair frequency table here, before *anything* allocates a
     // buffer that embeds it.  alloc_act_set() (reached from setup_multi_device)
     // copies the table onto each partition, so building it later would leave the
@@ -185,6 +197,26 @@ engine::engine(const engine_config & cfg)
     }
     if (const char * ed = si::env::str("PF_MTP_DEV")) {
         mtp.mtp_dev = atoi(ed);
+    }
+    if (m.q4exp && layer_map.empty() && !cpu_mode) {
+        // A split GGUF cannot use the single-blob upload, so even one GPU goes
+        // through the per-tensor (multi-device) path.  With two cards, split the
+        // trunk evenly; --layer-map overrides this and may place layers on cpu.
+        int ngpu = 0;
+        try {
+            ngpu = (int)sycl::device::get_devices(sycl::info::device_type::gpu).size();
+        } catch (...) {
+            ngpu = 1;
+        }
+        const int n = m.hp.n_layer;
+        if (ngpu >= 2) {
+            const int half = (n + 1) / 2;
+            layer_map = "0-" + std::to_string(half - 1) + ":gpu.0," + std::to_string(half) + "-"
+                        + std::to_string(n - 1) + ":gpu.1";
+        } else {
+            layer_map = "0-" + std::to_string(n - 1) + ":gpu.0";
+        }
+        fprintf(stderr, "[q4] no --layer-map: using %s\n", layer_map.c_str());
     }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
@@ -272,7 +304,7 @@ engine::engine(const engine_config & cfg)
         // cap (PF_MTP_SPLITS), because a single-token attention over a long KV
         // is the worst case for a fixed 1-split grid (13x at 128k).
         const char * emd = si::env::str("PF_MD_SPLITS");
-        if (!(emd && atoi(emd) != 0)) {
+        if (!(emd && atoi(emd) != 0) && !m.q4exp) {
             n_splits = 1;
             dec_splits = 1;
         }
@@ -367,6 +399,9 @@ engine::engine(const engine_config & cfg)
         }
         const char * ep = si::env::str("PF_PREFIX_CACHE");
         pc_enabled = !(ep && atoi(ep) == 0);
+        if (m.q4exp) {
+            pc_enabled = false; // the q4 state (PLE history) is not in a checkpoint
+        }
         // multi-device note: block ids and recurrent-state checkpoints are global
         // (host-USM shared buffers), so the three-tier cache works here too; only
         // the block serialize/deserialize must resolve each attention layer to its
@@ -602,7 +637,11 @@ engine::engine(const engine_config & cfg)
     }
     n_blocks = pool_cap;
     alloc_buffers();
-    build_graphs();
+    if (m.q4exp) {
+        q4_alloc();
+    } else {
+        build_graphs();
+    }
     // all weights are on their devices now: release the host pages of the GGUF
     // so the process does not carry the whole file in its RSS.  This cannot run
     // earlier: the release's keep-set includes the expert tensors whenever the
@@ -611,10 +650,30 @@ engine::engine(const engine_config & cfg)
     if (!moe_host_weights_deferred_) {
         release_host_weight_pages();
     }
+    if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
+        q4_hist_report();
+    }
+    if (m.q4exp) {
+        q4_prefault();
+    }
 }
 
 engine::~engine() {
-    if (moe_cache_.active()) {
+    if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
+        q4_hist_report();
+    }
+    if (engram_hits_ + engram_misses_ > 0) {
+        fprintf(stderr, "[q4] engram cache: %zu hits / %zu misses (%.1f%% hit rate)\n", engram_hits_, engram_misses_,
+                100.0 * (double)engram_hits_ / (double)(engram_hits_ + engram_misses_));
+    }
+    for (void * p : q4_owned_) {
+        std::free(p);
+    }
+    q4_owned_.clear();
+    for (void * p : q4_host_usm_) {
+        sycl::free(p, q);
+    }
+    q4_host_usm_.clear();
     if (moe_cache_.active()) {
         // The three tiers in one line, so a run says what it used rather than
         // only what it was configured with: the VRAM bank's size is a *measured*
@@ -628,7 +687,6 @@ engine::~engine() {
                 moe_cache_.resident(), moe_cache_.n_expert(), moe_cache_.resident_pairs(),
                 (double) moe_cache_.ram_bytes() / (1024.0 * 1024.0), ram_h, ram_m,
                 (ram_h + ram_m) ? 100.0 * (double) ram_h / (double) (ram_h + ram_m) : 0.0);
-    }
     }
     // complete a pending pipelined prefill chunk and drain the device queues
     // before freeing their buffers
@@ -1334,6 +1392,12 @@ void engine::upload_device_weights(int dev) {
         addp(m.tok_embd.data);
         addp(m.output.data);
         addp(m.output_norm);
+        if (m.q4exp) {
+            addp(m.hc_head.norm);
+            addp(m.hc_head.down.data);
+            addp(m.hc_head.up.data);
+            // m.ple_table intentionally NOT uploaded: 26.8 GiB, gathered on the host
+        }
         if (mtp.mtp_on) {
             const mtp_layer_t & M = m.mtp;
             addp(M.attn_norm);
@@ -1384,7 +1448,35 @@ void engine::upload_device_weights(int dev) {
             addp(L.q_norm);
             addp(L.k_norm);
         }
-        if (L.moe.ok()) {
+        if (m.q4exp) {
+            // the router and the shared-expert gate stay on the device even when
+            // every routed expert is computed on the host
+            addp(L.moe.gate_inp);
+            addp(L.moe.gate_inp_shexp);
+            addp(L.hc_attn.norm);
+            addp(L.hc_attn.down.data);
+            addp(L.hc_attn.up.data);
+            addp(L.hc_attn.inject.data);
+            addp(L.hc_ffn.norm);
+            addp(L.hc_ffn.down.data);
+            addp(L.hc_ffn.up.data);
+            addp(L.hc_ffn.inject.data);
+            if (L.ple.ok()) {
+                addp(L.ple.key.data);
+                addp(L.ple.value.data);
+                addp(L.ple.norm_key);
+                addp(L.ple.norm_query);
+                addp(L.ple.norm_conv);
+                addp(L.ple.conv);
+            }
+            if (L.idx.ok()) {
+                addp(L.idx.q_proj.data);
+                addp(L.idx.k_proj.data);
+                addp(L.idx.q_norm);
+                addp(L.idx.k_norm);
+            }
+        }
+        if (L.moe.ok() && !moe_host_only_) {
             // the routed experts.  They are the bulk of a MoE model's file, so
             // they ride the same per-device upload as the dense tensors: a
             // `--layer-map` partition then holds exactly its own layers'
@@ -1407,7 +1499,7 @@ void engine::upload_device_weights(int dev) {
             // the int8 (SIn) view replaces the raw device copy
             continue;
         }
-        if (dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
+        if (!m.q4exp && dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
             && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data)
                 || dnnl_dev_[(size_t)dev]->has_weight_k5(t.data) || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
             // the oneDNN int8 (XMX) copy - or the u4 (4-bit) copy - replaces the
@@ -1616,6 +1708,11 @@ void engine::release_host_weight_pages() {
             keep.insert(m.tok_embd.data);
             keep.insert(m.output.data);
             keep.insert(m.output_norm);
+            if (m.q4exp) {
+                keep.insert(m.hc_head.norm);
+                keep.insert(m.hc_head.down.data);
+                keep.insert(m.hc_head.up.data);
+            }
         }
         for (int il = 0; il < m.hp.n_layer; il++) {
             const int d = layer_dev_[(size_t)il];
@@ -1630,6 +1727,30 @@ void engine::release_host_weight_pages() {
             };
             kp(L.attn_norm);
             kp(L.post_attn_norm);
+            if (m.q4exp) {
+                kp(L.hc_attn.norm);
+                kp(L.hc_attn.down.data);
+                kp(L.hc_attn.up.data);
+                kp(L.hc_attn.inject.data);
+                kp(L.hc_ffn.norm);
+                kp(L.hc_ffn.down.data);
+                kp(L.hc_ffn.up.data);
+                kp(L.hc_ffn.inject.data);
+                if (L.ple.ok()) {
+                    kp(L.ple.key.data);
+                    kp(L.ple.value.data);
+                    kp(L.ple.norm_key);
+                    kp(L.ple.norm_query);
+                    kp(L.ple.norm_conv);
+                    kp(L.ple.conv);
+                }
+                if (L.idx.ok()) {
+                    kp(L.idx.q_proj.data);
+                    kp(L.idx.k_proj.data);
+                    kp(L.idx.q_norm);
+                    kp(L.idx.k_norm);
+                }
+            }
             kp(L.ffn_gate.data);
             kp(L.ffn_up.data);
             kp(L.ffn_down.data);
@@ -1652,6 +1773,10 @@ void engine::release_host_weight_pages() {
                 kp(L.k_norm);
             }
         }
+    }
+    if (m.q4exp && m.ple_table.data) {
+        // gathered by the host on the PLE layer's step: keep it out of page-out
+        keep.insert(m.ple_table.data);
     }
     if (!moe_resident) {
         // The ncmoe host half evaluates the non-resident experts straight out of
@@ -1779,12 +1904,14 @@ bool engine::setup_md_dnnl() {
                 n_i8++;
                 converted = true;
             }
-            if (converted) {
+            if (converted && !m.q4exp) {
                 // the host read is done and the tensor lives on the device now,
                 // so drop its file pages immediately: this keeps the load-time
                 // peak at one tensor's worth instead of the whole GGUF (the
                 // upload pass below skips converted tensors, so nothing re-reads
-                // them from the host)
+                // them from the host).  qwen4exp keeps the raw copy as well (its
+                // decode path is the fp32 GEMV), so its pages are needed by the
+                // upload right after this.
                 m.page_out_tensor(t);
             }
         };
@@ -2198,8 +2325,11 @@ void engine::setup_multi_device(const std::string & layer_map) {
     {
         const char * env = si::env::str("PF_DP4A");
         const bool dp4a_env_off = env && atoi(env) == 0;
+        // qwen4exp keeps the raw GGUF weights: its file mixes Q8_0/Q5_1/BF16,
+        // which neither the oneDNN grouped-scale converter nor the SIn packer
+        // accepts, and the fp32 dequant GEMV handles them all.
         md_xmx = has_gpu && !dp4a_env_off && setup_md_dnnl();
-        md_int8 = has_gpu && !dp4a_env_off && !md_xmx;
+        md_int8 = has_gpu && !dp4a_env_off && !m.q4exp && !md_xmx;
         // md_xmx means "oneDNN int8 weights are available", not that the XMX
         // arrays are used: for the grouped-scale shapes here oneDNN selects
         // jit:gemm:any (and ocl:ref:any with a blocked layout), so name the
@@ -2422,7 +2552,9 @@ void engine::alloc_buffers() {
             fprintf(stderr, "[moe] expert cache: host expert split active, the decode graph is disabled\n");
         }
         setup_moe_slots();
-        bind_moe_acts(0);
+        if (!moe_as_.empty()) {
+            bind_moe_acts(0);
+        }
         moe_host_weights_deferred_ = true;
         // unconditional: with a fully-resident expert set the keep-set is empty
         // and this is exactly the sweep the constructor used to do
@@ -2610,6 +2742,7 @@ void engine::zero_slot(int slot) {
     if (slot < 0 || slot >= state_slots_) {
         return;
     }
+    q4_zero_state(slot);
     for (int il = 0; il < hp.n_layer; il++) {
         if (!hp.is_recr(il)) {
             continue;
@@ -2653,6 +2786,17 @@ void engine::reset_state() {
         q.memset(d_conv_state, 0, (size_t)state_slots_ * n_gdn * conv_per * 4);
         q.wait();
     }
+    if (m.q4exp) {
+        const int hist_rows = (m.hp.ple_conv - 1) * m.hp.ple_ngram;
+        const int hc_dim = m.hp.hc_mult * m.hp.n_embd;
+        if (q4_ple_hist_) {
+            std::memset(q4_ple_hist_, 0, (size_t)state_slots_ * hist_rows * hc_dim * sizeof(float));
+            std::memset(q4_ple_nhist_, 0, (size_t)state_slots_ * sizeof(int32_t));
+            for (int i = 0; i < state_slots_ * 8; i++) {
+                q4_ple_prev_[i] = m.hp.ple_eos;
+            }
+        }
+    }
     reset_step_info(d_info);
     // the single-sequence entry points (eval/generate) do not run the prefix
     // cache: never let a stale tracking flag capture snapshots for them
@@ -2680,6 +2824,10 @@ void engine::reset_single() {
 }
 // ---------------------------------------------------------------------------
 void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head) {
+    if (m.q4exp) {
+        q4_prefill_text(toks, slot, n, start);
+        return;
+    }
     // a pending pipelined mode-2 chunk must complete (and its device-1 phase be
     // done) before a mode-1 chunk reuses the shared step_info
     if (pf_pipe_pending_) {
@@ -2748,6 +2896,10 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // (chunked) only for the tail: mode 2 reads each weight once per forward, so it
 // is ~2x the chunked throughput for the same tokens
 void engine::prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
+    if (m.q4exp) {
+        q4_prefill_text(toks, slot, n, start);
+        return;
+    }
     int pos = start;
     const int end = start + n;
     while (pos < end) {
@@ -2903,6 +3055,25 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
 }
 
 void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows) {
+    if (m.q4exp) {
+        prefill_flush();
+        pf_info_ = nullptr;
+        d_info->pc_active = 0;
+        d_info->n_rows = n_rows;
+        d_info->tpb = 1;
+        d_info->n_real = 1;
+        d_info->mrope_on = 0;
+        d_info->img_embd = nullptr;
+        for (int r = 0; r < kMaxB; r++) {
+            d_info->pos[r] = (r < n_rows) ? poss[r] : 0;
+            d_info->slot[r] = (r < n_rows) ? slots[r] : (r % kMaxB);
+            d_info->active[r] = (r < n_rows) ? 1 : 0;
+            d_info->tokens[r] = (r < n_rows) ? tokens[r] : 0;
+            d_info->n_real_row[r] = 1;
+        }
+        q4_forward(0, n_rows, true);
+        return;
+    }
     // One-shot freeze of the expert bank.  By now every layer's router output of
     // the prefill is in moe_calib_ids_ and the forward that produced it has ended,
     // so the bank is being decided between steps rather than under one.  (The
@@ -2988,6 +3159,33 @@ void engine::fetch_logits(int row, float * out) {
 }
 
 std::vector<float> engine::run_head() {
+    if (m.q4exp) {
+        q.memcpy(h_logits, d_logits, (size_t)m.hp.n_vocab * 4).wait();
+        if (const char * dp = si::env::str("PF_DUMP_Q4LOG")) {
+            if (FILE * fp = fopen(dp, "wb")) {
+                fwrite(h_logits, sizeof(float), (size_t)m.hp.n_vocab, fp);
+                fclose(fp);
+            }
+            int top[5] = {0};
+            for (int i = 0; i < m.hp.n_vocab; i++) {
+                for (int j = 0; j < 5; j++) {
+                    if (h_logits[i] > h_logits[top[j]] || (j == 0 && i == 0)) {
+                        for (int k = 4; k > j; k--) {
+                            top[k] = top[k - 1];
+                        }
+                        top[j] = i;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[q4] top5:");
+            for (int j = 0; j < 5; j++) {
+                fprintf(stderr, " %d(%.4f)", top[j], h_logits[top[j]]);
+            }
+            fprintf(stderr, "\n");
+        }
+        return std::vector<float>(h_logits, h_logits + m.hp.n_vocab);
+    }
     // the pipelined multi-device prefill may still owe the last chunk's device-1
     // phase (and the head, which writes d_last_hidden)
     prefill_flush();

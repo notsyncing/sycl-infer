@@ -40,6 +40,17 @@ struct block_q8_0 {
 };
 static_assert(sizeof(block_q8_0) == 34, "q8_0 size");
 
+// Q5_1: 32 values as `q = low4 | (high_bit << 4)` scaled by d and offset by m.
+// The Unsloth UD-Q4_K_XL quants put Q5_1 on the MoE down projections, so the
+// format has to be readable by both the host and the device GEMV.
+struct block_q5_1 {
+    uint16_t d;
+    uint16_t m;
+    uint8_t qh[QK8_0 / 8];
+    uint8_t qs[QK8_0 / 2];
+};
+static_assert(sizeof(block_q5_1) == 24, "q5_1 size");
+
 // ---------------------------------------------------------------- f16 -> f32
 static inline float ggml_half_to_float(uint16_t h) {
     uint32_t sign = (uint32_t)(h >> 15) & 1u;
@@ -199,6 +210,29 @@ static inline void dequantize_block_q8_0(const block_q8_0 * x, float * y) {
     for (int i = 0; i < QK8_0; i++) {
         y[i] = d * x->qs[i];
     }
+}
+
+static inline void dequantize_block_q5_1(const block_q5_1 * x, float * y) {
+    const float d = ggml_half_to_float(x->d);
+    const float m = ggml_half_to_float(x->m);
+    // q5_1 splits each 32-value block into two halves: elements 0..15 are the
+    // low nibbles of qs[0..15], elements 16..31 the high nibbles.  The high bit
+    // is qh's bit `i` (a 32-bit little-endian word).
+    for (int i = 0; i < QK8_0; i++) {
+        const int half = i / 16;
+        const int j = i % 16;
+        const int hi = (x->qh[i / 8] >> (i % 8)) & 1;
+        const int lo = (x->qs[j] >> (4 * half)) & 0xF;
+        y[i] = d * (float)(lo | (hi << 4)) + m;
+    }
+}
+
+// bfloat16 is the top half of an f32 - no rounding, no table.
+static inline float ggml_bf16_to_float(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
 }
 
 // ------------------------------------------------- Q3_K / IQ codebooks
@@ -418,6 +452,24 @@ static inline void dequantize_row(uint32_t type, const void * data, float * y, i
             dequantize_block_q8_0(p + i, y + i * QK8_0);
         }
     } break;
+    case 7: { // Q5_1
+        auto * p = (const block_q5_1 *)data;
+        for (int64_t i = 0; i < n / QK8_0; i++) {
+            dequantize_block_q5_1(p + i, y + i * QK8_0);
+        }
+    } break;
+    case 1: { // F16
+        auto * p = (const uint16_t *)data;
+        for (int64_t i = 0; i < n; i++) {
+            y[i] = ggml_half_to_float(p[i]);
+        }
+    } break;
+    case 30: { // BF16
+        auto * p = (const uint16_t *)data;
+        for (int64_t i = 0; i < n; i++) {
+            y[i] = ggml_bf16_to_float(p[i]);
+        }
+    } break;
     case 11: { // Q3_K
         auto * p = (const block_q3_K *)data;
         for (int64_t i = 0; i < n / QK_K; i++) {
@@ -453,6 +505,9 @@ static inline size_t quant_row_bytes(uint32_t type, int64_t n) {
     case 13: return (size_t)(n / QK_K) * sizeof(block_q5_K);
     case 14: return (size_t)(n / QK_K) * sizeof(block_q6_K);
     case 8: return (size_t)(n / QK8_0) * sizeof(block_q8_0);
+    case 7: return (size_t)(n / QK8_0) * sizeof(block_q5_1);
+    case 1:
+    case 30: return (size_t)n * 2;
     case 11: return (size_t)(n / QK_K) * sizeof(block_q3_K);
     case 20: return (size_t)(n / QK8_0) * sizeof(block_iq4_nl);
     case 21: return (size_t)(n / QK_K) * sizeof(block_iq3_s);

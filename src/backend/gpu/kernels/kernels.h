@@ -297,7 +297,25 @@ void gdn_launch(sycl::queue & q, const float * conv_out, const float * alpha, co
                 int row0 = 0, int tpb_arg = -1, int nreal_arg = -1, pc_snap snap = {});
 void gated_norm_launch(sycl::queue & q, const float * attn, const float * z, const float * weight, float * out,
                        const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real,
-                       int row0 = 0);
+                       int row0 = 0, bool sigmoid_gate = false);
+
+// qwen4exp hyper-connections (see src/backend/gpu/kernels/q4exp.cpp).  The
+// buffers are flat [token][hc][n_embd]; `residual` is the stream array and the
+// mixer's output is one n_embd-wide token vector.
+void q4_hc_norm_launch(sycl::queue & q, const float * x, const float * w, float * out, int n_tok, int n_embd, int hc,
+                       float eps);
+void q4_hc_mix_launch(sycl::queue & q, const float * xn, const float * gate, float * mixed, int n_tok, int n_embd,
+                      int hc);
+void q4_hc_combine_launch(sycl::queue & q, float * residual, const float * block_out, const float * inject, int n_tok,
+                          int n_embd, int hc);
+void q4_silu_scale_launch(sycl::queue & q, float * x, int n, float scale);
+// K is not a multiple of 256 (the HC up projection's 320): the ordinary GEMV
+// works in 256-value superblocks and would drop the tail.
+void q4_up_gemv_launch(sycl::queue & q, const void * w, uint32_t type, const float * x, int xs, float * out, int os,
+                       int n_tok, int K, int N);
+void q4_inject_launch(sycl::queue & q, const void * w, uint32_t type, const float * x, int xs, float * out, int os,
+                      int n_tok, int K, int N);
+void q4_repeat_launch(sycl::queue & q, const float * emb, float * residual, int n_tok, int n_embd, int hc);
 
 // ---------------------------------------------------------------------------
 // DP4A (int8) path.  Weights live in the SI8 format (see w8.h); activations
@@ -505,6 +523,17 @@ bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * sl
                          const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
                          int n_act_max, int n_expert, int n_pairs, const int8_t * xq, const uint16_t * asa,
                          const float * xs, float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype, bool dec);
+// Native Q5_1 down: the same grouped [pairs][n_ff_exp] x [n_ff_exp][n_embd]
+// contract as the grouped path, but straight off the Q5_1 blocks (24 B per
+// 32-value group, no superblock).  The grouped kernel works in 256-value
+// superblocks and so declines this dtype/K; this one runs dp4a per 32-value
+// group with the +m zero point in the group sum.  `xq`/`asa`/`xs` are the
+// pair-row activation tile written by `moe_actq_launch`.
+void moe_down_q5_1_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                          const int32_t * off, const int32_t * pair, const int32_t * active,
+                          const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
+                          const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                          int n_ff_exp);
 void moe_reduce_launch(sycl::queue & q, const float * acc, const float * wts, int top_k, int n_tok, int n_embd,
                        int acc_stride, float * out, int out_stride);
 // MoE epilogue: out[t] += sigmoid(gate . x[t]) * shared[t].  A null `gate`

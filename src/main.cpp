@@ -199,6 +199,7 @@ int main(int argc, char ** argv) {
     int max_slots = 16;       // --max-slots: concurrent sequences (recurrent state)
     int moe_resident = 0;      // --moe-resident: experts kept on the device per layer
     size_t moe_vram_mb = 0;     // --moe-vram-mb: device budget for the expert bank
+    size_t engram_ram_mb = 4096; // --engram-ram-mb: PLE row cache in host RAM
     size_t moe_ram_mb = 0;      // --moe-ram-mb: host budget for the decoded-expert tier
     bool yarn = false;          // --yarn: YaRN context extension
     int yarn_orig_ctx = 0;      // 0 = the GGUF's declared context_length
@@ -368,6 +369,8 @@ int main(int argc, char ** argv) {
             moe_resident = std::atoi(next().c_str());
         } else if (a == "--moe-vram-mb") {
             moe_vram_mb = (size_t) std::atoi(next().c_str());
+        } else if (a == "--engram-ram-mb") {
+            engram_ram_mb = (size_t) std::atoi(next().c_str());
         } else if (a == "--moe-ram-mb") {
             moe_ram_mb = (size_t) std::atoi(next().c_str());
         } else if (a == "--max-slots") {
@@ -502,6 +505,7 @@ int main(int argc, char ** argv) {
         ec.max_slots = max_slots;
         ec.moe_resident = moe_resident;
         ec.moe_vram_mb = moe_vram_mb;
+        ec.engram_ram_mb = engram_ram_mb;
         ec.moe_ram_mb = moe_ram_mb;
         ec.n_splits = 16;
         ec.n_blocks = n_blocks;
@@ -781,9 +785,18 @@ int main(int argc, char ** argv) {
                 }
                 fprintf(stderr, "\n");
             }
-            e.generate(toks, gp, emit);
-            fputs(ub.flush().c_str(), stdout);
-            printf("\n");
+            const char * rp = si::env::str("PF_GEN_REPEAT");
+            const int nrep = rp ? std::max(1, atoi(rp)) : 1;
+            const std::vector<int> toks_orig = toks;
+            for (int rep = 0; rep < nrep; rep++) {
+                std::vector<int> tcopy = toks_orig;
+                const auto t0 = std::chrono::steady_clock::now();
+                e.generate(tcopy, gp, emit);
+                fputs(ub.flush().c_str(), stdout);
+                printf("\n");
+                const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                fprintf(stderr, "[gen] repeat %d: %.3f s\n", rep, dt);
+            }
             return 0;
         }
     } catch (const std::exception & ex) {

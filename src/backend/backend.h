@@ -82,7 +82,7 @@ struct compute_backend {
                      int tpb_arg, int nreal_arg, pc_snap snap) = 0;
     virtual void gated_norm(const float * attn, const float * z, const float * weight, float * out,
                             const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real,
-                            int row0) = 0;
+                            int row0, bool sigmoid_gate = false) = 0;
 
     // ---- SIn int8 (DP4A) path ----
     virtual void xq(const float * x, const float * up, int x_stride, int up_stride, int8_t * x8, sycl::float2 * xmeta,

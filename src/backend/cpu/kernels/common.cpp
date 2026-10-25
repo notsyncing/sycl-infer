@@ -578,6 +578,9 @@ int sb_bytes(uint32_t type) {
     case 21: return 110;
     case 23: return 136;
     case 8: return 8 * 34; // 8 Q8_0 blocks per 256-value superblock
+    case 7: return 8 * 24; // 8 Q5_1 blocks per 256-value superblock
+    case 1:
+    case 30: return 256 * 2; // f16 / bf16
     case 0: return 1024;
     default: return 0;
     }
@@ -602,6 +605,21 @@ int dequant_sb(uint32_t type, const char * p, float * dst) {
     case 8:
         for (int b = 0; b < 8; b++) {
             dequantize_block_q8_0((const block_q8_0 *)(p + b * 34), dst + b * 32);
+        }
+        return 256;
+    case 7:
+        for (int b = 0; b < 8; b++) {
+            dequantize_block_q5_1((const block_q5_1 *)(p + b * 24), dst + b * 32);
+        }
+        return 256;
+    case 1:
+        for (int i = 0; i < 256; i++) {
+            dst[i] = ggml_half_to_float(((const uint16_t *)p)[i]);
+        }
+        return 256;
+    case 30:
+        for (int i = 0; i < 256; i++) {
+            dst[i] = ggml_bf16_to_float(((const uint16_t *)p)[i]);
         }
         return 256;
     case 11:

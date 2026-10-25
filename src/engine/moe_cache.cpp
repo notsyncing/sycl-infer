@@ -41,7 +41,7 @@ void moe_cache::init(const model & m, const moe_cache_cfg & cfg, int n_slots_nee
     slot_.assign(freq_.size(), -1);
     frozen_ = false;
 
-    const int total = cfg_.resident_per_layer > 0 ? cfg_.resident_per_layer : n_expert_;
+    const int total = cfg_.host_only ? 0 : (cfg_.resident_per_layer > 0 ? cfg_.resident_per_layer : n_expert_);
     resident_ = std::min(total, n_expert_);
     if (cfg_.vram_mb > 0) {
         // a VRAM budget is authoritative: keep as many of the hottest experts as

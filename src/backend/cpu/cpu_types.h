@@ -124,7 +124,7 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
              int n_k_heads, int n_heads, int conv_dim, float scale, int n_slots, int n_rows, int row0, int tpb_arg,
              int nreal_arg, cpu_pc_snap snap);
 void cpu_gated_norm(const float * attn, const float * z, const float * weight, float * out, const cpu_step_info * info,
-                    int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0);
+                    int n_heads, int head_dim, float eps, int n_rows, int n_real, int row0, bool sigmoid_gate);
 
 // activation quantization + SIn int8 GEMV/GEMM (DP4A path, AVX-VNNI when present)
 void cpu_xq(const float * x, const float * up, int x_stride, int up_stride, int8_t * x8, float * xmeta, int32_t * xsumq,
@@ -160,15 +160,71 @@ struct cpu_moe {
     const void * gate_inp_shexp = nullptr;      // shared expert's gate
     uint32_t gate_inp_shexp_type = GGML_TYPE_F32;
     int n_expert = 0, top_k = 0, n_ff_exp = 0, n_embd = 0;
+    // optional qwen4exp down store (see model.h): uint8 q+128, one float scale
+    // per 32-value group, [E][N][K] and [E][N][K/32]
+    const uint8_t * down_i8 = nullptr;
+    const float * down_sc = nullptr;
+    int down_K = 0, down_N = 0, down_E = 0;
+    // native down: read the raw GGUF blocks instead of the int8 store when the
+    // file's down projection is Q5_1 (0.75 vs 1.125 B/weight).  plane_bytes is
+    // per expert; row_bytes is one output row.
+    const void * down_raw = nullptr;
+    size_t down_row_bytes = 0;
+    uint32_t down_type = 0;
 };
 
 void cpu_moe_route(const float * x, int x_stride, const void * gate_inp, uint32_t gp_type, int n_tok, int n_embd,
-                   int n_expert, int top_k, float * logits, int32_t * ids, float * wts);
+                   int n_expert, int top_k, float * logits, int32_t * ids, float * wts, bool fast_f32 = false);
 void cpu_moe_experts(const cpu_moe & M, const float * x, int x_stride, int n_tok, int top_k, const int32_t * ids,
-                     const int * slots, float * acc, int acc_stride);
+                     const int * slots, float * acc, int acc_stride, bool fast_f32 = false);
 void cpu_moe_reduce(const float * acc, const float * wts, int top_k, int n_tok, int n_embd, int acc_stride, float * out,
                     int out_stride);
 void cpu_moe_epilogue(const float * x, int x_stride, const void * gate, uint32_t gtype, int n_tok, int n_embd,
                       const float * shared, int sh_stride, float * out, int out_stride);
+
+// ---- qwen4exp (hyper-connections + PLE) host kernels -----------------------
+void cpu_q4_hc_norm(const float * x, const float * w, float * out, const int32_t * rows, int n_tok, int n_embd,
+                    int hc, float eps);
+void cpu_q4_hc_mix(const float * xn, const float * gate, float * mixed, const int32_t * rows, int n_tok, int n_embd,
+                   int hc);
+void cpu_q4_hc_combine(float * residual, const float * block_out, const float * inject, const int32_t * rows,
+                       int n_tok, int n_embd, int hc);
+void cpu_q4_silu_scaled(float * x, int n, float scale);
+// Convert one routed-expert down tensor to the symmetric int8 store above.
+void cpu_q4_convert_down(const void * src, uint32_t type, int K, int N, int E, size_t plane_bytes, uint8_t * dst,
+                         float * sc);
+// Grouped down projection: P pairs of one expert, weights read once per
+// 64-pair tile.  `pairs` maps a local pair to the caller's acc row.
+void cpu_q4_down_grouped(const uint8_t * w, const float * sc, const int8_t * x8, const float * xmeta,
+                         const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                         const int * pairs);
+void cpu_q4_down_grouped_serial(const uint8_t * w, const float * sc, const int8_t * x8, const float * xmeta,
+                                const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                                const int * pairs);
+void cpu_q5_1_down_grouped_serial(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                                  const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                                  const int * pairs);
+// Batch int8 GEMM straight from GGUF K-quant blocks (gate/up of one expert).
+void cpu_i8_gemm_batch(uint32_t type, const void * w, const int8_t * x8, const float * xmeta, const int32_t * xsumq,
+                       int K, int rows, int TB, float * out, int out_stride);
+void cpu_i8_gemm_batch_serial(uint32_t type, const void * w, const int8_t * x8, const float * xmeta,
+                              const int32_t * xsumq, int K, int rows, int TB, float * out, int out_stride);
+void cpu_i8_expert_gemm(uint32_t type, const void * w, const int8_t * x8, const float * xmeta, const int32_t * xsumq,
+                        int K, int rows, int TB, float * out, int out_stride);
+// y[t][n] = sum_k W[n][k] * x[t][k] for a K that is not a multiple of 256 (the
+// HC up-projection has K = hc_low_rank = 320); the ordinary GEMV works in
+// 256-value superblocks and truncates such a row.
+void cpu_q4_up_gemv(const void * w, uint32_t type, const float * x, int xs, float * out, int os, int n_tok, int K,
+                    int N);
+// arbitrary-K GEMV with an optional act_up (silu(x)*up) operand - the shared
+// expert's down projection has K = 640, also not a 256 multiple
+void cpu_q4_arb_gemv(const void * w, uint32_t type, const float * x, int xs, const float * up, float * out, int os,
+                     int n_tok, int K, int N);
+void cpu_q4_ple_gate(const float * key, const float * hidden, const float * w_key, const float * w_query, float * gate,
+                     const int32_t * rows, int n_tok, int n_embd, int hc, float eps);
+void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_conv, const float * conv_w,
+                      float * residual, float * gated, float * normed, float * hist, int32_t * n_hist,
+                      const int32_t * rows, const int32_t * slots, const int32_t * poss, int n_tok, int n_embd, int hc,
+                      int ngram, int kern, float eps);
 
 } // namespace si

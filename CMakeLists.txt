@@ -115,6 +115,7 @@ add_library(sycl_infer_core STATIC
     src/backend/cpu/kernels/dp4a.cpp
     src/backend/cpu/kernels/i8.cpp
     src/backend/cpu/kernels/moe.cpp
+    src/backend/cpu/kernels/q4exp.cpp
     # gpu kernels: one translation unit per device kernel
     src/backend/gpu/kernels/kv_type.cpp
     src/backend/gpu/kernels/rmsnorm.cpp
@@ -138,12 +139,14 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/dp4a_gemm.cpp
     src/backend/gpu/kernels/vit.cpp
     src/backend/gpu/kernels/at.cpp
+    src/backend/gpu/kernels/q4exp.cpp
     # model: GGUF loading, weights, tokenizer
     src/model/gguf.cpp
     src/model/model.cpp
     src/model/model_w8.cpp
     src/model/qwen35.cpp
     src/model/qwen35moe.cpp
+    src/model/qwen4exp.cpp
     src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
@@ -158,6 +161,8 @@ add_library(sycl_infer_core STATIC
     src/engine/engine_graph.cpp
     src/engine/engine_mtp.cpp
     src/engine/engine_dflash.cpp
+    src/engine/engine_q4exp.cpp
+    src/engine/engine_qsa.cpp
     src/engine/engine_kvpool.cpp
     src/engine/moe_cache.cpp
     src/engine/engine_prefix_cache.cpp
@@ -208,6 +213,7 @@ set(SI_CPU_SOURCES
     src/backend/cpu/kernels/dp4a.cpp
     src/backend/cpu/kernels/i8.cpp
     src/backend/cpu/kernels/moe.cpp
+    src/backend/cpu/kernels/q4exp.cpp
 )
 if(NOT SYCL_INFER_AOT)
     set_source_files_properties(${SI_CPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-sycl")

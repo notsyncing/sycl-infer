@@ -187,6 +187,113 @@ Against the same batch at depth 512 (101.12 tok/s, 79.11 ms/step), the batched
 decode is **24 % slower** at 16k of context: eight rows' worth of attention
 over a 16k KV is what the extra 25.6 ms/step buys.
 
+### 4.4 Qwen3.8-Flash-Next — the 104 GiB hybrid on host experts
+
+`Qwen3.8-Flash-Next-UD-Q4_K_XL` (4 shards, `qwen4exp`), **i8 KV** (f16 and i4
+also work), AOT Release, 2×Arc A770 + CPU, 2026-10-24.  The routed bank
+(71.7 GiB) and the PLE table (26.8 GiB) are host-resident; only the ~5.3 GiB
+dense trunk is uploaded.  `--moe-vram-mb` pins whole expert layers on the
+cards; the per-expert LRU is opt-in (`PF_Q4_HOT=1`).  The rest of the experts
+stream from RAM.
+
+| placement | prefill | decode, one stream | ms/token |
+|---|---:|---:|---:|
+| host experts, bank off | 10.5 tok/s (512 tokens, 48.7 s) | ~2 tok/s | ~500 |
+| whole-layer bank 18 000 MB (12/48) | 11.25 tok/s (512 tokens, 45.5 s) | ~2 tok/s | ~470 |
+| per-expert LRU, `40-47:cpu` (179 slots/layer) | 12.9 tok/s (512 tokens, 39.6 s) | ~2.4 tok/s | ~420 |
+| **per-expert LRU, `40-43:cpu,44-47:gpu.1` (162 slots, 39 layers)** | **15.7 tok/s** (512 tokens, 32.6 s) | **~2.7 tok/s** | **~372** |
+
+The per-expert LRU is the default.  The recommended map puts layers 44-47 on
+the second card as well (`40-43:cpu,44-47:gpu.1`): the bank then holds 162
+slots in 39 layers (18.1 GiB), prefill walks in 64-token chunks, and the
+512-token prefill is **32.6 s (15.7 tok/s)**; the first request is 35.3 s.
+Decode is **~372 ms/token (2.7 tok/s)**, down from 475 with the old pageable
+uploads and flat grid.  Three changes produced that:
+
+* a **pinned staging ring** for the LRU uploads (32 x 1.17 MB per device) -
+  the pageable `q.memcpy` of the GGUF mmap blocked the host until the queue
+  drained and ran at ~2 GB/s; steady-state uploads went 112 -> 39 ms/token
+  (`PF_Q4_STAGE=0` restores the old copies);
+* the **decode gate/up uses the looped grid**: the flat grid is sized from a
+  host upper bound, so a 10-expert decode launched 10 440 work-groups against
+  the 200 that have work (`PF_MOE_FLAT_DEC=1` restores the flat grid);
+* the **CPU tail moved to GPU** (44-47), worth another 6.3 % (397 -> 372 ms).
+  The all-GPU map (`0-23:gpu.0,24-47:gpu.1`) does not load
+  (`UR_RESULT_ERROR_DEVICE_LOST`).
+
+A dedicated **Q5_1 dp4a down kernel** (`moe_down_q5_1_launch`, 32-value groups)
+replaced the fp32-lane generic down: 50.0 -> 39.6 s before the staging/map
+work, and the GPU-vs-host acc cosine is 0.99998.  The grid change also helps
+the 35B A3B (41.7 -> 36.1 ms/token, byte-identical output); batched decode is
+unmeasured for qwen4exp.  `PF_Q4_BANK_LAYER=1` restores the whole-layer bank.
+
+**The expert down kernel was reading the wrong weights for K = 640.**  The
+generic down used `n_sb = n_ff_exp / 256` (2 for 640) as the row stride, so
+every output row after the first was read 384 bytes into the plane instead of
+480, and the last partial superblock read into the next row.  The GPU expert
+FFN was therefore wrong on every banked layer (the host path was unaffected);
+the table above is corrected after the fix (`ceil(K/256)`, the real row stride,
+masking the blocks past K, a 256-byte guard on the down bank).  The earlier
+39.0 / 31.2 / 13.1 figures were measured through the broken kernel and are
+withdrawn.  The LRU now answers `108` and `thinking...` correctly; its
+remaining cost is that the generic Q5_1 down is slower than the grouped
+Q4_K gate/up.  The next step is a dedicated Q5_1 dp4a down kernel (32-value
+groups), not more cache work.  The remaining split is the 8 CPU-tail layers (40-47), which still
+compute their experts on the host (~8.5 s of the 35.3), and the banked GPU FFN
+(~9.5 s); the dense/attention/HC rest is ~16 s (chunking costs ~3 s against one
+512-token batch).  Decode is ~520 ms/token: the GPU FFN is ~230 ms because a
+decode selects only 10 experts/layer and the grouped kernel's grid is
+`n_act x column-blocks` (bounded by the pair count, but still ~30k tiny
+workgroups), the CPU tail ~50 ms and the rest ~230 ms.  Decode is therefore not
+faster than the host path; the prefill is.
+
+The whole-layer bank is still available with `PF_Q4_BANK_LAYER=1` (39.0 s,
+13.1 tok/s) as the A/B baseline.  21 000 MB of whole-layer bank fails to
+allocate (the 13th layer needs another 1.5 GiB on a device that has none).
+
+**The LRU is correct and is the default.**  GPU-vs-host acc cosine 0.99998
+(with `PF_Q4_FFCMP`), `What is 12 multiplied by 9?` reaches 108 and the
+TCP/UDP prompt answers coherently.  The remaining decode cost is the grouped
+expert grid (one layer selects 10 experts against a grid of
+`n_act x column-blocks`, ~30k tiny workgroups) and the 8 CPU-tail layers;
+that is the next kernel, not a cache issue.
+
+**A host-spill split was tried first and rejected.**  A static top-R set with
+the non-resident pairs computed on the host gave 39.2 s against the layer
+bank's 39.0 and never converged: even with a native Q5_1 down and an f16
+activation scale, 5 498 of 5 957 slots changed on the next calibration.
+Routing is a discrete function of the hidden state, so a one-ulp difference
+between the GPU-resident and host-spill arithmetic flips the top-10 boundary
+for many tokens.  The all-GPU upload-on-miss LRU avoids the split by
+construction; its 64-token prefill chunks keep a chunk's active set inside the
+161 slots.
+
+**The banked FFN accumulates.**  `moe_reduce_launch` does `out += a`, and the
+banked branch passed `b.block` without zeroing it, so each banked layer added
+onto the previous layer's residual: cos 0.27 against the host FFN for one
+layer, `||```` for seven.  The fix is one device memset before the reduce; the
+bank path is enabled by default (`PF_Q4_BANK=0` disables it, `PF_Q4_BANK_LAYER=1`
+selects the whole-layer variant).  Only Q4_K gate/up + Q5_1 down layers are
+banked; the GPU Q5_K gate/up (layer 2) and Q8_0 down
+(layers 4, 30) paths are not output-validated and stay on the host.
+
+KV types: at a 17-token prompt, f16, bf16, f32, i8, i4, `i4:i8` and `i8:i4`
+all answer `Paris`; over 32 greedy tokens f16, i8 and i4 stay coherent.  At
+2 048 keys i8 is also faster than f16 (rest 47.5 s against 52.8 s, `attn_xmx`).
+
+Native Q5_1 down on the **host** (0.75 vs 1.125 B/weight) is slower (27.8/28.5
+vs 25.7-28.4 s experts); `PF_Q4_DOWN_NATIVE=1`, default off.  The pinned host
+mirror (`PF_Q4_MIRROR=1`, 4.28 GB/s per card, 27 s prefill) is not
+output-validated and off by default.
+
+```bash
+./build/sycl-infer \
+  --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --layer-map 0-19:gpu.0,20-39:gpu.1,40-47:cpu --ctx 4096 --kv-type i8 \
+  --moe-vram-mb 16000 --engram-ram-mb 4096 \
+  gen --prompt "The capital of France is" --max-tokens 48 --temp 0 --raw
+```
+
 ## 5. Qwen3.8-27B — the dense model
 
 `Qwen3.8-27B-UD-Q4_K_M.gguf`, `qwen35`: 64 layers, 16 full-attention (24 query

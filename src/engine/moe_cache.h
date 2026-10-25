@@ -45,6 +45,10 @@ struct moe_cache_cfg {
     // is always there underneath, so this only has to be set if the RAM tier is
     // actually wanted)
     bool ram_tier = false;
+    // every expert is computed on the host: the device gets no expert weights
+    // at all.  Used when the routed bank cannot fit any card (qwen4exp's 70 GiB
+    // of experts on two 16 GB cards); the kernels see an all -1 slot table.
+    bool host_only = false;
 
     static moe_cache_cfg from_env(int resident_per_layer);
 };
@@ -54,7 +58,7 @@ public:
     void init(const model & m, const moe_cache_cfg & cfg, int n_slots_needed);
 
     bool active() const {
-        return cfg_.resident_per_layer > 0 || cfg_.vram_mb > 0 || cfg_.ram_tier;
+        return cfg_.host_only || cfg_.resident_per_layer > 0 || cfg_.vram_mb > 0 || cfg_.ram_tier;
     }
 
     // Per layer: which experts are resident and in which device slot.  Rows of

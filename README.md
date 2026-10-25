@@ -134,13 +134,13 @@ to a per-architecture loader; the engine itself is not tied to any model family.
 | Qwen3.5-0.8B (Q4_K_M) | `qwen35` | supported | hybrid Gated DeltaNet + full attention; the reference model for the test suite |
 | Qwen3.8-27B (UD-Q4_K_M) | `qwen35` | supported | dense, 64 layers; 15.4 GiB of weights, so it needs the two-card split |
 | Qwen3.6-35B-A3B (UD-Q4_K_M) | `qwen35moe` | supported | routed MoE, 256 experts / 8 active, 40 layers; 21.1 GiB of weights, so it needs the two-card split too |
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | `qwen4exp` | **not supported** | two independent reasons: `qwen4exp` is not in the architecture registry (the loader refuses it by name), and the file is split into 4 shards, which the single-file mmap loader cannot open |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL, 4 shards) | `qwen4exp` | **supported** | hyper-connections + n-gram PLE + 512-expert MoE; needs host-RAM experts, so run it with `--device gpu` (dense trunk on both cards, routed bank on the host), a `--layer-map` with a CPU tail, or `--device cpu`.  Dense attention is used above 2 048 keys (the QSA selector is not implemented yet - see the note below) |
 
 | | |
 |---|---|
-| file format | GGUF (memory-mapped, single file) |
-| weight quantization | Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, IQ3_S, Q8_0, F32; Q4_K uses the native 4-bit (u4) path by default |
-| architecture registry | selected via `general.architecture`; `qwen35` and `qwen35moe` (routed MoE) implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry |
+| file format | GGUF (memory-mapped; single file **or split shards**, merged into one virtual mapping) |
+| weight quantization | Q4_K, Q5_K, Q6_K, Q3_K, Q5_1, IQ4_XS, IQ4_NL, IQ3_S, Q8_0, F16, BF16, F32; Q4_K uses the native 4-bit (u4) path by default |
+| architecture registry | selected via `general.architecture`; `qwen35`, `qwen35moe` (routed MoE) and `qwen4exp` (Qwen3.8-Flash-Next) implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry |
 | expert placement | routed-MoE models can keep part of the experts on the GPU and compute the rest on the host per step (llama.cpp's ncmoe), with a disk → host-RAM → VRAM three-tier expert cache (`--moe-resident` / `--moe-vram-mb` / `--moe-ram-mb`) |
 | KV cache dtype | `i8` (default), `i4`, `bf16`, `f16`, `f32`; `--kv-type K:V` sizes K and V independently (`i4:i8`) |
 | tokenizer | GPT-2 byte-level BPE from the GGUF vocabulary + special tokens / chat template |
@@ -159,6 +159,7 @@ context depth, every batch size, both speculative paths — are in
 | Qwen3.5-0.8B | 1 card | **6 336 tok/s** | **78.7 tok/s** (12.7 ms/token) | – |
 | Qwen3.8-27B | 2 cards | **507 tok/s** | **13.4 tok/s** (74.6 ms/token) | **76.5 tok/s** |
 | Qwen3.6-35B-A3B | 2 cards | **779 tok/s** | **26.4 tok/s** (37.9 ms/token) | **168 tok/s** |
+| Qwen3.8-Flash-Next | 2 cards + CPU (host experts) | 5.5 tok/s (128 tokens) | **1.8 tok/s** (551 ms/token) | – |
 
 The first two columns are the *isolated* prefill of a 512-token prompt and a
 single-stream decode, measured in-process; the last column is the aggregate
@@ -553,6 +554,29 @@ exact command and the date; this section is the summary and the caveats.
 | Qwen3.5-0.8B | 1 card | **6 336 tok/s** | **78.7 tok/s** (12.7 ms/token) | – |
 | Qwen3.8-27B | 2 cards | **507 tok/s** | **13.4 tok/s** (74.6 ms/token) | **76.5 tok/s** |
 | Qwen3.6-35B-A3B | 2 cards | **779 tok/s** | **26.4 tok/s** (37.9 ms/token) | **168 tok/s** |
+| Qwen3.8-Flash-Next | 2 cards + CPU (host experts) | 5.5 tok/s (128 tokens) | **1.8 tok/s** (551 ms/token) | – |
+
+**Qwen3.8-Flash-Next is the exception in both columns**: its file is 104 GiB,
+of which the 512-expert routed bank is 71.7 GiB and the n-gram PLE table 26.8
+GiB; neither fits on two 16 GB cards.  The dense trunk (~3.3 + 2.0 GiB) lives
+on the two cards, every routed pair is computed on the host, and the decode step
+is therefore host-RAM bound.  Point the loader at the first shard:
+
+```bash
+./build/sycl-infer \
+  --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --layer-map 0-19:gpu.0,20-39:gpu.1,40-47:cpu --ctx 2048 --kv-type f16 \
+  gen --prompt "The capital of France is"
+```
+
+`--device cpu` and a plain `--device gpu` (trunk on both cards, experts on the
+host) work too.  Use `--kv-type f16` for this model: its residual stream is a
+hyper-connection cancellation, so the i8 KV error costs more than it does on the
+27B/35B.  **Known limits**: above 2 048 keys the reference's QSA indexer selects
+the top 2 048 keys, while this engine falls back to dense attention and prints
+one warning, so output beyond that depth diverges from the reference; the
+separate MTP draft GGUF and multimodal input are not wired for this
+architecture.
 
 The prefill column is the isolated 512-token chunk, measured in-process; the
 decode columns are the aggregate over N concurrent streams, i.e. what a server

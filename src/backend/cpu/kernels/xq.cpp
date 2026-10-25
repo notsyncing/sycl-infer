@@ -25,10 +25,11 @@ void cpu_xq(const float * x, const float * up, int x_stride, int up_stride, int8
             mx = std::max(mx, std::fabs(a));
         }
         const float scale = mx > 0.0f ? mx / 127.0f : 1.0f;
+        const float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
         int32_t s0 = 0, s1 = 0;
         int8_t * dst = x8 + ((size_t)g * TB + t) * 32;
         for (int i = 0; i < 32; i++) {
-            const int32_t q = (int32_t)std::max(-127.0f, std::min(127.0f, std::round(v[i] / scale)));
+            const int32_t q = (int32_t)std::max(-127.0f, std::min(127.0f, std::round(v[i] * inv)));
             dst[i] = (int8_t)q;
             if (i < 16) {
                 s0 += q;
@@ -37,7 +38,11 @@ void cpu_xq(const float * x, const float * up, int x_stride, int up_stride, int8
             }
         }
         const size_t gi = (size_t)g * TB + t;
-        xmeta[gi * 2] = scale; // sycl::float2 {scale, 0}
+        // The device quantizer stores the scale as f16 (`asa` is uint16 and the
+        // grouped expert kernels read it through fast_h2f).  Round here too, or
+        // the host and device expert paths differ by one f16 ulp per group -
+        // which is enough to flip the next prefill's top-k routing.
+        xmeta[gi * 2] = ggml_half_to_float(ggml_float_to_half(mx > 0.0f ? scale : 0.0f));
         xmeta[gi * 2 + 1] = 0.0f;
         xsumq[gi * 2 + 0] = s0;
         xsumq[gi * 2 + 1] = s1;

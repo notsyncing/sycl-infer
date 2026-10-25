@@ -70,6 +70,31 @@ struct hparams {
     int n_ff_shexp = 0;
     float expert_weights_scale = 1.0f;
 
+    // ---- Qwen3.8-Flash-Next / qwen4exp -------------------------------------
+    // Hyper-connections replace every layer norm: the residual stream is `hc`
+    // parallel copies of the hidden state and each block mixes them through a
+    // low-rank gate.  PLE is an n-gram-hash embedding table on one layer; QSA
+    // is a sparse selector on the full-attention layers.  See qwen4exp.cpp.
+    bool q4exp = false;
+    int hc_mult = 0;
+    int hc_low_rank = 0;
+    int idx_n_head = 0;
+    int idx_head_dim = 0;
+    int idx_top_k = 0;
+    int idx_kpool = 0; // QSA compress ratio (0 = dense)
+    int ple_layer = -1;
+    int ple_n_heads = 0;
+    int ple_head_dim = 0;
+    int ple_ngram = 0;
+    int ple_heads_per_ngram = 0;
+    int ple_conv = 0;
+    int ple_eos = 0;
+    int ple_image = 0;
+    int64_t ple_mult[8] = {0};
+    uint32_t ple_off[64] = {0};
+    uint32_t ple_vocab[64] = {0};
+    bool gdn_sigmoid_gate = false; // qwen4exp's gated norm uses sigmoid, not silu
+
     bool is_moe() const {
         return n_expert > 0;
     }
@@ -100,12 +125,51 @@ struct moe_t {
     uint32_t gate_inp_type = 0;
     const void * gate_inp_shexp = nullptr;
     uint32_t gate_inp_shexp_type = 0;
+    // qwen4exp: the down projection converted once to a symmetric int8 store
+    // with one scale per 32-value group (the Q5_1/Q8_0 mixed bank cannot be
+    // consumed by the K-quant int8 GEMM otherwise).  Host-only.
+    uint8_t * down_i8 = nullptr;
+    float * down_sc = nullptr;
+    int down_i8_K = 0, down_i8_N = 0, down_i8_E = 0;
 
     bool ok() const {
         return gate_exps.ok();
     }
     size_t bytes() const {
         return gate_exps.total_bytes() + up_exps.total_bytes() + down_exps.total_bytes();
+    }
+};
+
+// A hyper-connection module: grouped RMSNorm gamma [hc][n_embd], the low-rank
+// gate down/up, and the per-stream scatter projection [hc].
+struct hc_wt {
+    const float * norm = nullptr;
+    wt down, up, inject;
+    bool ok() const {
+        return norm && down.data && up.data && inject.data;
+    }
+};
+
+// PLE (per-layer n-gram embedding) tensors on the one layer that has them.
+struct ple_wt {
+    wt key, value;
+    const float * norm_key = nullptr;
+    const float * norm_query = nullptr;
+    const float * norm_conv = nullptr;
+    const float * conv = nullptr; // depthwise taps [ple_conv][hc*n_embd]
+    bool ok() const {
+        return key.data && value.data && norm_key && norm_query && norm_conv && conv;
+    }
+};
+
+// QSA (query-side sparse attention) indexer projections on a full-attention
+// layer.  The stored keys are 128-wide, four indexer heads.
+struct indexer_wt {
+    wt q_proj, k_proj;
+    const float * q_norm = nullptr;
+    const float * k_norm = nullptr;
+    bool ok() const {
+        return q_proj.data && k_proj.data && q_norm && k_norm;
     }
 };
 
@@ -139,6 +203,11 @@ struct layer_t {
         }
         return n;
     }
+    // qwen4exp: hyper-connection mixers before the token mixer and before the
+    // FFN, plus the optional PLE module and the full-attention indexer.
+    hc_wt hc_attn, hc_ffn;
+    ple_wt ple;
+    indexer_wt idx;
     const float * attn_norm = nullptr;
     const float * post_attn_norm = nullptr;
     wt ffn_gate, ffn_up, ffn_down;
@@ -204,6 +273,11 @@ struct model {
     // LM-head weight: `output.weight` when the GGUF is untied, else tok_embd
     wt output;
     const float * output_norm = nullptr;
+    // qwen4exp: the final hyper-connection mixer is the output norm, and this
+    // is the n-gram hash table (host-only: 26.8 GiB in the reference Q4 file).
+    hc_wt hc_head;
+    wt ple_table;
+    bool q4exp = false;
     size_t tok_embd_row_bytes = 0;
     w8t output8;
 

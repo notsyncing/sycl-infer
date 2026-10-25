@@ -46,6 +46,7 @@ const float * bind_f32(const gguf_file & f, const std::string & name) {
 static const loader kLoaders[] = {
     {"qwen35", &load_qwen35},
     {"qwen35moe", &load_qwen35moe},
+    {"qwen4exp", &load_qwen4exp},
 };
 
 const loader * find(const std::string & name) {
@@ -162,6 +163,13 @@ void model::upload(sycl::queue & q, bool host) {
         dev_weights = nullptr;
         dev_weights_size = 0;
         return;
+    }
+    // A split GGUF is mapped as several files inside one virtual reservation;
+    // copying the whole reservation would upload its padding and needs the
+    // entire model in device memory.  Large split models take the per-tensor
+    // upload path instead (the multi-device/layer-map one).
+    if (gguf.is_split()) {
+        throw std::runtime_error("single-blob upload is not supported for a split GGUF: use --layer-map");
     }
     dev_weights_size = gguf.map_size;
     dev_weights = sycl::malloc_device(dev_weights_size, q);

@@ -16,6 +16,7 @@
 #include <immintrin.h>
 
 #include "common.h"
+#include "common/cpu_isa.h"
 
 namespace si {
 
@@ -204,6 +205,27 @@ __attribute__((target("avx2,fma"))) void q4k_g_contrib(const block_q4_K * blk, i
     }
 }
 
+// AVX-512 VNNI: one dpbusd per (row, token, 32-value group) replaces the
+// maddubs + madd + hsum chain.  q is the unsigned 4-bit value, xq is the signed
+// activation quant, which is exactly dpbusd's operand order.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma"))) void q4k_g_contrib_vnni(
+        const block_q4_K * blk, int g, const qx_t & qx, int TT, float * acc) {
+    const float d = ggml_half_to_float(blk->d);
+    const float dm = ggml_half_to_float(blk->dmin);
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    uint8_t sc, mm;
+    get_scale_min_k4(g, blk->scales, &sc, &mm);
+    const __m256i bytes = _mm256_loadu_si256((const __m256i *)(blk->qs + (g / 2) * 32));
+    const __m256i q = (g & 1) ? _mm256_and_si256(_mm256_srli_epi16(bytes, 4), m0f) : _mm256_and_si256(bytes, m0f);
+    const float dsc = d * sc;
+    const float dmm = dm * mm;
+    for (int v = 0; v < TT; v++) {
+        const int32_t wd = hsum_i32_256(_mm256_dpbusd_epi32(zero, q, qx.xv[v]));
+        acc[v] += qx.xm[v] * (dsc * (float)wd - dmm * (float)(qx.xs0[v] + qx.xs1[v]));
+    }
+}
+
 __attribute__((target("avx2,fma"))) void q5k_g_contrib(const block_q5_K * blk, int g, const qx_t & qx, int TT,
                                                       float * acc) {
     const float d = ggml_half_to_float(blk->d);
@@ -279,7 +301,13 @@ __attribute__((target("avx2,fma"))) void i8_gemm_tile_part(uint32_t type, const 
                 const char * wb = (const char *)w + (size_t)(r0 + rr) * nblocks * row_bytes + (size_t)b * row_bytes;
                 float * ar = acc + rr * kI8Tt;
                 switch (type) {
-                case 12: q4k_g_contrib((const block_q4_K *)wb, g, qx, TT, ar); break;
+                case 12:
+                    if (cpu_features_of().avx512vnni) {
+                        q4k_g_contrib_vnni((const block_q4_K *)wb, g, qx, TT, ar);
+                    } else {
+                        q4k_g_contrib((const block_q4_K *)wb, g, qx, TT, ar);
+                    }
+                    break;
                 case 13: q5k_g_contrib((const block_q5_K *)wb, g, qx, TT, ar); break;
                 default: q6k_g_contrib((const block_q6_K *)wb, g, qx, TT, ar); break;
                 }
@@ -317,6 +345,86 @@ void cpu_i8_gemm_tiled(uint32_t type, const void * w, const int8_t * x8, const f
 }
 
 } // namespace
+
+void cpu_i8_gemm_batch(uint32_t type, const void * w, const int8_t * x8, const float * xmeta, const int32_t * xsumq,
+                       int K, int rows, int TB, float * out, int out_stride) {
+    if (!w || !i8_supported(type) || TB <= 0) {
+        return;
+    }
+    cpu_i8_gemm_tiled(type, w, x8, xmeta, xsumq, K, rows, TB, out, out_stride, nullptr, 1.0f);
+}
+
+void cpu_i8_gemm_batch_serial(uint32_t type, const void * w, const int8_t * x8, const float * xmeta,
+                              const int32_t * xsumq, int K, int rows, int TB, float * out, int out_stride) {
+    if (!w || !i8_supported(type) || TB <= 0) {
+        return;
+    }
+    const int nblocks = K / 256;
+    const size_t row_bytes = (type == 12) ? sizeof(block_q4_K) : (type == 13) ? sizeof(block_q5_K) : sizeof(block_q6_K);
+    const int TT = std::min(kI8Tt, TB);
+    const int nr = (rows + kI8Rt - 1) / kI8Rt;
+    for (int rti = 0; rti < nr; rti++) {
+        float acc[kI8Rt * kI8Tt];
+        const int r0 = rti * kI8Rt;
+        const int rn = std::min(kI8Rt, rows - r0);
+        for (int t0 = 0; t0 < TB; t0 += TT) {
+            std::memset(acc, 0, sizeof(acc));
+            i8_gemm_tile_part(type, w, x8, xmeta, xsumq, TB, t0, TT, r0, rn, nblocks, row_bytes, acc);
+            for (int rr = 0; rr < rn; rr++) {
+                const float * a = acc + rr * kI8Tt;
+                for (int v = 0; v < TT; v++) {
+                    out[(size_t)(t0 + v) * out_stride + (r0 + rr)] = a[v];
+                }
+            }
+        }
+    }
+}
+
+// Row-stationary K-quant GEMM for one expert: each weight row is read
+// sequentially (144 B per 256-value block) and reused for TB tokens.  The
+// row-tile form above reads 32 B from 16 rows per group, which is the wrong
+// access pattern for a small per-expert token count (measured 12 GB/s on the
+// 512-expert prefill); this form is what the grouped expert path calls.
+__attribute__((target("avx2,fma"))) void cpu_i8_expert_gemm(uint32_t type, const void * w, const int8_t * x8, const float * xmeta, const int32_t * xsumq,
+                        int K, int rows, int TB, float * out, int out_stride) {
+    if (!w || !i8_supported(type) || TB <= 0) {
+        return;
+    }
+    const int nblocks = K / 256;
+    const size_t row_bytes = (type == 12) ? sizeof(block_q4_K) : (type == 13) ? sizeof(block_q5_K) : sizeof(block_q6_K);
+    const int TT = std::min(kI8Tt, TB);
+    for (int t0 = 0; t0 < TB; t0 += TT) {
+        const int pn = std::min(TT, TB - t0);
+        for (int row = 0; row < rows; row++) {
+            float acc[kI8Tt];
+            for (int v = 0; v < pn; v++) {
+                acc[v] = 0.f;
+            }
+            const char * wrow = (const char *)w + (size_t)row * nblocks * row_bytes;
+            for (int b = 0; b < nblocks; b++) {
+                for (int g = 0; g < 8; g++) {
+                    const int gg = b * 8 + g;
+                    qx_t qx;
+                    for (int v = 0; v < pn; v++) {
+                        const size_t ai = (size_t)gg * TB + (t0 + v);
+                        qx.xv[v] = _mm256_loadu_si256((const __m256i *)(x8 + ai * 32));
+                        qx.xm[v] = xmeta[ai * 2];
+                        qx.xs0[v] = xsumq[ai * 2];
+                        qx.xs1[v] = xsumq[ai * 2 + 1];
+                    }
+                    switch (type) {
+                    case 12: q4k_g_contrib((const block_q4_K *)wrow + b, g, qx, pn, acc); break;
+                    case 13: q5k_g_contrib((const block_q5_K *)wrow + b, g, qx, pn, acc); break;
+                    default: q6k_g_contrib((const block_q6_K *)wrow + b, g, qx, pn, acc); break;
+                    }
+                }
+            }
+            for (int v = 0; v < pn; v++) {
+                out[(size_t)(t0 + v) * out_stride + row] = acc[v];
+            }
+        }
+    }
+}
 
 void cpu_i8_gemv(const cpu_gemv_seg & seg, int n_threads) {
     (void)n_threads;

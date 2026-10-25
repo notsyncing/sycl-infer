@@ -1212,7 +1212,22 @@ bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, c
     // instead of looping it inside an (expert, column block) work-group.  The
     // trade is not uniform across the two projections - see the note on `flat`
     // in moe_grp_impl and AGENTS.md.
-    const bool flat = si::env::i32("PF_MOE_FLAT", 1) != 0;
+    //
+    // A DECODE step uses the looped grid, and that is a measured decision, not
+    // a default.  The flat grid has to be sized from a host-side UPPER bound
+    // (sum_e ceil(p_e/M) <= n_pairs/M + n_expert, because p_e lives on the
+    // device), so on a decode - where n_pairs == top_k and every selected
+    // expert has exactly one tile - it launches n_expert surplus work-groups
+    // that each scan the whole CSR and exit.  qwen4exp's bank has 10 active
+    // experts of 512 per layer, so the flat gate/up grid is 10440 work-groups
+    // against the looped form's 200, and the measured decode is 426.3 ms/token
+    // against 395.4 (interleaved A/B, two pairs per setting, 37 banked layers).
+    // The prefill keeps the flat grid: its tile count is genuinely large, so
+    // the surplus is ~1/3 and lifting the tile out of the work-group is what
+    // makes every work-group exactly one tile.
+    // PF_MOE_FLAT_DEC=1 restores the flat grid on a decode for the A/B.
+    static const int flat_dec = si::env::i32("PF_MOE_FLAT_DEC", 0);
+    const bool flat = dec ? (flat_dec != 0) : (si::env::i32("PF_MOE_FLAT", 1) != 0);
     static const int persist_env = si::env::i32("PF_MOE_PERSIST", 0);
     const char * g = (const char *)gbank, * u = (const char *)ubank;
 #define SI_MOE_GRP_GU(QT)                                                                                                   \
@@ -1247,6 +1262,178 @@ bool moe_grp_down_launch(queue & q, const void * dbank, const int32_t * slot_map
     default: return false;
     }
 #undef SI_MOE_GRP_D
+}
+
+// ---------------------------------------------------------------------------
+// Native Q5_1 down, for the qwen4exp expert bank.
+//
+// WHY.  The grouped dp4a down above reads K-quant superblocks (256 values,
+// eight 32-value groups with a shared d/dmin), and Q5_1 is neither: its block
+// IS one 32-value group with its own d and m, and qwen4exp's expert FFN down
+// has K = n_ff_exp = 640 = 20 groups, not a multiple of 256.  So
+// `moe_grp_down_launch` declines the shape and the fp32-lane dequant kernel
+// (`moe_down_impl<7>`) took over - a full 5-bit reconstruction and an fp32 FMA
+// per weight, which is why the per-expert LRU bank prefilled at 50 s instead
+// of the ~32 s the gate/up path suggests.
+//
+// The format is dp4a-friendly once the nibble split is respected.  A Q5_1
+// block is 24 B per 32 values:
+//
+//     d (f16 at 0)  m (f16 at 2)  qh (u32 at 4)  qs[16] at 8
+//     q_i = ((qs[i%16] >> 4*(i/16)) & 0xF) | (((qh >> i) & 1) << 4)
+//
+// and a lane's four values i = 4*(lane%8) .. +3 all fall in ONE 16-value half,
+// so the nibble shift is a single uniform `>> 4` and the four high bits are one
+// shift-and-spread out of qh - exactly one dp4a operand per lane per group,
+// with w = d*q + m so the group sum (`xs`) carries the +m term:
+//
+//     out = sum_g asa_g * (d_g * dot(q, xq) + m_g * sum(xq))
+//
+// WORK DECOMPOSITION.  One warp per output row and NPB rows walked per warp.
+// The 32 lanes split the row's groups four ways (`lane/8` is the group slice,
+// `lane%8` the four-value chunk), so for K=640 each lane owns five groups; the
+// row's blocks are decoded ONCE into registers and the expert's routed pairs
+// are looped INSIDE, so a weight byte is read once for all of the expert's
+// pairs rather than once per pair (the fp32 kernel's superblock-outer,
+// pair-inner order is the same idea, but per 8-pair tile).  One warp reduction
+// per pair folds the four group slices.
+//
+// The whole-row register cache is why the group count per lane is a template
+// constant: a runtime-indexed array would land in private scratch, and a
+// scratch-resident accumulator is ~350x slower on this part (see the note on
+// moe_grp_impl).  `ng > 4*NGL` walks the row in passes and adds the partial
+// sums; K=640 is exactly one pass.
+// ---------------------------------------------------------------------------
+template <int NPB>
+static void moe_down_q5_1_impl(queue & q, const char * dbank, const int32_t * slot_map, size_t slot_db,
+                               const int32_t * off, const int32_t * pair, const int32_t * active,
+                               const int32_t * n_active, int n_act_max, const int8_t * xq, const uint16_t * asa,
+                               const float * xs, float * acc, int acc_stride, int n_embd, int n_ff_exp) {
+    constexpr int SG = 8;   // lanes per 32-value group: 8 x 4 values
+    constexpr int GSL = 4;  // group slices per warp (SG * GSL == 32 lanes)
+    constexpr int NGL = 5;  // groups per lane per pass: 20 = K/32 for this model
+    const int ng = n_ff_exp / 32;
+    const size_t row_bytes = (size_t)ng * sizeof(block_q5_1);
+    const int nrb = (n_embd + NPB - 1) / NPB;
+    const int nw = n_act_max * nrb;
+    if (nw <= 0) {
+        return;
+    }
+    q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
+                   [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int lid = (int)it.get_local_id(0);
+        const int sg = lid / 32;
+        const int lane = lid % 32;
+        const sub_group sgg = it.get_sub_group();
+        const int w = (int)it.get_group(0) * kMoENW + sg; // global warp id
+        if (w >= nw) {
+            return;
+        }
+        const int ia = w / nrb;
+        const int nb = w % nrb;
+        if (ia >= n_active[0]) {
+            return;
+        }
+        const int e = active[ia];
+        const int slot = slot_map[e];
+        if (slot < 0) {
+            return; // host-resident expert: the host computes it
+        }
+        const int b0 = off[e], b1 = off[e + 1];
+        const int gs = lane / SG; // which group slice this lane owns
+        const int ch = lane % SG; // the lane's four-value chunk inside a group
+        const char * base = dbank + (size_t)slot * slot_db;
+        for (int rr = 0; rr < NPB; rr++) {
+            const int n = nb * NPB + rr;
+            if (n >= n_embd) {
+                break;
+            }
+            const char * dr = base + (size_t)n * row_bytes;
+            for (int g0 = 0; g0 < ng; g0 += GSL * NGL) {
+                // Decode this pass's groups once, into registers.  `gr` is
+                // compile-time-offset inside the unrolled loop, which is what
+                // keeps these arrays in registers instead of scratch.
+                uint32_t wq[NGL];
+                float wd[NGL], wm[NGL];
+#pragma unroll
+                for (int j = 0; j < NGL; j++) {
+                    const int gr = g0 + gs + GSL * j;
+                    wq[j] = 0u;
+                    wd[j] = 0.f;
+                    wm[j] = 0.f;
+                    if (gr < ng) {
+                        const char * b = dr + (size_t)gr * sizeof(block_q5_1);
+                        const auto * blk = (const block_q5_1 *)b;
+                        const uint32_t qh = *reinterpret_cast<const uint32_t *>(blk->qh);
+                        const uint32_t v = *reinterpret_cast<const uint32_t *>(blk->qs + 4 * (ch & 3));
+                        // i = 4*ch .. +3 is entirely inside one 16-value half,
+                        // so every one of the lane's four values takes the same
+                        // nibble shift; the high bit plane is per value.
+                        const uint32_t nib = (ch < 4) ? (v & 0x0F0F0F0Fu) : ((v >> 4) & 0x0F0F0F0Fu);
+                        const uint32_t hb = (qh >> (4 * ch)) & 0xFu;
+                        const uint32_t hi = ((hb & 1u) << 4) | ((hb & 2u) << 11) | ((hb & 4u) << 18) |
+                                            ((hb & 8u) << 25);
+                        wq[j] = nib | hi;
+                        wd[j] = fast_h2f(blk->d);
+                        wm[j] = fast_h2f(blk->m);
+                    }
+                }
+                for (int i0 = b0; i0 < b1; i0++) {
+                    const int pr = pair[i0];
+                    const int8_t * xr = xq + (size_t)pr * (size_t)n_ff_exp;
+                    const uint16_t * ar = asa + (size_t)pr * (size_t)ng;
+                    const float * sr = xs + (size_t)pr * (size_t)ng;
+                    float a = 0.f;
+#pragma unroll
+                    for (int j = 0; j < NGL; j++) {
+                        const int gr = g0 + gs + GSL * j;
+                        if (gr < ng) {
+                            const uint32_t xa =
+                                *reinterpret_cast<const uint32_t *>(xr + (size_t)gr * 32 + (size_t)ch * 4);
+                            const int32_t qd = dp4a_s8u8(xa, wq[j], 0);
+                            const float A = fast_h2f(ar[gr]);
+                            a = sycl::fma(A * wd[j], (float)qd, a);
+                            // The +m zero point is `m * (sum of the WHOLE
+                            // 32-value group)`, and a group is split over eight
+                            // lanes here.  Adding it on every lane multiplies it
+                            // by eight - which is exactly how this kernel first
+                            // measured cos 0.08 with an output ~16x too large
+                            // (m is negative and comparable to d*q).  One lane
+                            // per group carries it, so the warp reduction sums
+                            // it once.
+                            if (ch == 0) {
+                                a = sycl::fma(A * wm[j], sr[gr], a);
+                            }
+                        }
+                    }
+                    // every lane must enter the collective
+                    const float v = sg_sum(a, sgg);
+                    if (lane == 0) {
+                        // one pass for K=640; the later passes only exist so a
+                        // wider Q5_1 tensor is still correct.
+                        if (g0 == 0) {
+                            acc[(size_t)pr * (size_t)acc_stride + n] = v;
+                        } else {
+                            acc[(size_t)pr * (size_t)acc_stride + n] += v;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+void moe_down_q5_1_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                          const int32_t * off, const int32_t * pair, const int32_t * active,
+                          const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
+                          const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                          int n_ff_exp) {
+    (void)n_expert; // the grid is bounded by n_act_max, as the callers pass it
+    if (n_pairs <= 0 || n_embd <= 0 || (n_ff_exp % 32) != 0) {
+        return;
+    }
+    moe_down_q5_1_impl<8>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq, asa,
+                          xs, acc, acc_stride, n_embd, n_ff_exp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,8 +1600,15 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
                           const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
                           const float * h, int h_stride, float * acc, int acc_stride, int n_embd, int n_ff_exp,   \
                           bool dq2, bool noact, int npb) {
-    const int n_sb = n_ff_exp / 256;
+    // n_ff_exp is NOT always a multiple of 256: qwen4exp's expert down has
+    // K = 640 = 2.5 superblocks.  Integer-dividing here used 2, so every output
+    // row after the first was read 384 bytes into the plane instead of 480 -
+    // the whole down projection was the wrong weights - and the last partial
+    // superblock read past the row.  Round up, use the real row stride, and
+    // mask the blocks beyond n_ff_exp.
+    const int n_sb = (n_ff_exp + 255) / 256;
     const int sdb = superblock_bytes(DT);
+    const size_t row_bytes = quant_row_bytes(DT, n_ff_exp);
     const int nrb = (n_embd + npb - 1) / npb; // one warp per NPB adjacent output rows
     const int nw = n_act_max * nrb;
     q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
@@ -1442,7 +1636,7 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
         if (n >= n_embd) {
             break;
         }
-        const char * dr = dbank + (size_t)slot * slot_db + (size_t)n * n_sb * sdb;
+        const char * dr = dbank + (size_t)slot * slot_db + (size_t)n * row_bytes;
         // superblock-outer, pair-inner with per-pair accumulators, for the same
         // reason as moe_gate_up_impl: the row used to be re-read and
         // re-dequantized once per routed pair.
@@ -1457,13 +1651,22 @@ static void moe_down_impl(queue & q, const char * dbank, const int32_t * slot_ma
                 float w[8];
                 dequant_sb_lane_typed<DT>(dr + (size_t)sb * sdb, lane, w, dq2);
 #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    if (sb * 256 + 32 * b >= n_ff_exp) {
+                        w[b] = 0.f; // past a partial last superblock
+                    }
+                }
+#pragma unroll
                 for (int j = 0; j < kMoEPB; j++) {
                     if (j < np) {
                         const float * hr = h + (size_t)pair[i0 + j] * h_stride;
 #pragma unroll
                         for (int b = 0; b < 8; b++) {
-                            const float hv = noact ? (float)(sb * 8 + b + lane)
-                                                    : hr[(size_t)sb * 256 + 32 * b + lane];
+                            const int kk = sb * 256 + 32 * b + lane;
+                            if (kk >= n_ff_exp) {
+                                continue;
+                            }
+                            const float hv = noact ? (float)(sb * 8 + b + lane) : hr[(size_t)kk];
                             a[j] += w[b] * hv;
                         }
                     }
@@ -1495,6 +1698,7 @@ void moe_down_launch(queue & q, const void * dbank, const int32_t * slot_map, si
     case 13: SI_MOE_D(13); break;
     case 14: SI_MOE_D(14); break;
     case 8: SI_MOE_D(8); break;
+    case 7: SI_MOE_D(7); break;
     case 0: SI_MOE_D(0); break;
     default: throw std::runtime_error("moe: unsupported down expert type " + std::to_string(dtype));
     }

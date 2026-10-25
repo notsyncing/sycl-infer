@@ -358,6 +358,9 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
     case 21: GEMV_DISPATCH_CFG(21, TB_, CFG); break;                                                                   \
     case 23: GEMV_DISPATCH_CFG(23, TB_, CFG); break;                                                                   \
     case 8: GEMV_DISPATCH_CFG(8, TB_, CFG); break;                                                                     \
+    case 7: GEMV_DISPATCH_CFG(7, TB_, CFG); break;                                                                     \
+    case 30: GEMV_DISPATCH_CFG(30, TB_, CFG); break;                                                                   \
+    case 1: GEMV_DISPATCH_CFG(1, TB_, CFG); break;                                                                     \
     default: GEMV_DISPATCH_CFG(0, TB_, CFG); break;                                                                    \
     }
         if (TB == 1) {
@@ -427,6 +430,15 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
         } else {
             GEMV_DISPATCH_TB(8, 32);
         }
+        break;
+    case 7:
+        GEMV_TB_SWITCH(7);
+        break;
+    case 30:
+        GEMV_TB_SWITCH(30);
+        break;
+    case 1:
+        GEMV_TB_SWITCH(1);
         break;
     default:
         if (TB == 1) {

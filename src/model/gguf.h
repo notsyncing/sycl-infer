@@ -85,6 +85,17 @@ struct gguf_tensor_info {
 };
 
 struct gguf_file {
+    // A split GGUF (`split.count > 1`) is mapped as one contiguous virtual
+    // range: each shard's file is mapped at its own page-aligned slot of a
+    // PROT_NONE reservation, so `tensor.data - map_base` stays a valid offset
+    // into a single address space and `dev_ptr`/page_out_host keep working.
+    // The gaps between shards are padding, not file bytes.
+    struct shard_t {
+        int fd = -1;
+        void * base = nullptr;
+        size_t size = 0;
+        size_t data_offset = 0;
+    };
     void * map_base = nullptr;
     size_t map_size = 0;
     size_t data_offset = 0;
@@ -92,6 +103,12 @@ struct gguf_file {
     std::map<std::string, size_t> tensor_index;
     std::map<std::string, gguf_kv> kv;
     uint32_t version = 0;
+    std::vector<shard_t> shards;
+    int split_count = 0;
+    int split_no = -1;
+    bool is_split() const {
+        return shards.size() > 1;
+    }
     // kept open after load() so drop_cache() can issue posix_fadvise; closed in
     // the destructor
     int fd = -1;
