@@ -674,6 +674,10 @@ engine::~engine() {
         sycl::free(p, q);
     }
     q4_host_usm_.clear();
+    for (auto & pr : q4_pin_src_) {
+        sycl::free(pr.first, dev_queue(pr.second));
+    }
+    q4_pin_src_.clear();
     if (moe_cache_.active()) {
         // The three tiers in one line, so a run says what it used rather than
         // only what it was configured with: the VRAM bank's size is a *measured*

@@ -111,10 +111,13 @@ void engine::q4_alloc() {
     q4_moe_logits_ = (float *)sycl::malloc_host((size_t)R * hp.n_expert * sizeof(float), q);
     q4_moe_wts_ = (float *)sycl::malloc_host((size_t)R * hp.n_expert_used * sizeof(float), q);
     q4_moe_acc_ = (float *)sycl::malloc_host((size_t)R * hp.n_expert_used * hp.n_embd * sizeof(float), q);
+    // Only the decode CPU-miss path uses this, and its pair count is bounded
+    // by kMaxB rows x top-k (not by the kMaxT-token prefill rows).
+    q4_miss_acc_ = (float *)sycl::malloc_host((size_t)kMaxB * hp.n_expert_used * hp.n_embd * sizeof(float), q);
     q4_moe_sh_ = (float *)sycl::malloc_host((size_t)R * 2 * hp.n_ff * sizeof(float), q);
     q4_moe_shout_ = (float *)sycl::malloc_host((size_t)R * hp.n_embd * sizeof(float), q);
     q4_moe_ids_ = (int32_t *)sycl::malloc_host((size_t)R * hp.n_expert_used * sizeof(int32_t), q);
-    if (!q4_host_res_ || !q4_moe_logits_ || !q4_moe_acc_ || !q4_moe_ids_) {
+    if (!q4_host_res_ || !q4_moe_logits_ || !q4_moe_acc_ || !q4_moe_ids_ || !q4_miss_acc_) {
         throw std::runtime_error("qwen4exp: host scratch allocation failed");
     }
     q4_alloc_banks();
@@ -125,6 +128,7 @@ void engine::q4_alloc() {
         for (auto & v : qsa_cache_) {
             v.resize((size_t)state_slots_);
         }
+        qsa_pending_.resize((size_t)attn_layers());
         fprintf(stderr, "[q4] QSA: host indexer, top-%d of %d-key pools (ctx %d > %d)\n", hp.idx_top_k, hp.idx_kpool,
                 max_seq, hp.idx_top_k);
     }
@@ -337,15 +341,52 @@ void engine::q4_upload_init(int nd, size_t max_plane) {
         }
         q4_up_stage_[(size_t)d] = p;
     }
-    fprintf(stderr, "[q4] upload staging: %d x %.2f MB pinned per device\n", q4_up_slots_,
+    q4_up_q_.resize((size_t)nd);
+    q4_up_last_ev_.assign((size_t)nd, sycl::event());
+    q4_up_last_live_.assign((size_t)nd, 0);
+    for (int d = 0; d < nd; d++) {
+        if (multi_dev && d < (int)dev_kind_.size() && dev_kind_[(size_t)d] == 1) {
+            continue;
+        }
+        // Same context as the compute queue: the pinned staging USM belongs
+        // to it, and the bank pointers the copy writes are allocated from it.
+        sycl::queue & qd = dev_queue(d);
+        q4_up_q_[(size_t)d] = std::make_unique<sycl::queue>(
+            qd.get_context(), qd.get_device(), sycl::property_list{sycl::property::queue::in_order()});
+    }
+    fprintf(stderr, "[q4] upload staging: %d x %.2f MB pinned per device (async copy queue)\n", q4_up_slots_,
             (double)q4_up_stride_ / (1024.0 * 1024.0));
 }
 
-void engine::q4_upload(int dev, void * dst, const void * src, size_t n) {
-    sycl::queue & qd = dev_queue(dev);
+void engine::q4_upload_impl(int dev, sycl::queue & q, void * dst, const void * src, size_t n, bool async,
+                            bool pinned) {
+    static const bool upstat = si::env::flag("PF_Q4_UPSTAT");
+    if (pinned) {
+        // The source is a pinned host mirror: the device copy can read it
+        // directly, so there is no staging memcpy at all.  This is the whole
+        // point of PF_Q4_PIN_SRC - the 4.6 s of per-prefill host memcpy was
+        // the largest single cost after the five host-expert layers.
+        const auto c0 = upstat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+        const sycl::event ev = q.memcpy(dst, src, n);
+        if (async && dev >= 0 && dev < (int)q4_up_last_ev_.size()) {
+            q4_up_last_ev_[(size_t)dev] = ev;
+            q4_up_last_live_[(size_t)dev] = 1;
+        }
+        if (upstat) {
+            const auto c1 = std::chrono::steady_clock::now();
+            q4_up_enq_ms_ += std::chrono::duration<double, std::milli>(c1 - c0).count();
+            q4_up_bytes_ += n;
+            q4_up_calls_++;
+        }
+        return;
+    }
     if (q4_up_slots_ <= 0 || dev < 0 || dev >= (int)q4_up_stage_.size() || !q4_up_stage_[(size_t)dev]
         || n > q4_up_stride_) {
-        qd.memcpy(dst, src, n);
+        const sycl::event ev = q.memcpy(dst, src, n);
+        if (async && dev >= 0 && dev < (int)q4_up_last_ev_.size()) {
+            q4_up_last_ev_[(size_t)dev] = ev;
+            q4_up_last_live_[(size_t)dev] = 1;
+        }
         return;
     }
     int & nx = q4_up_next_[(size_t)dev];
@@ -359,9 +400,31 @@ void engine::q4_upload(int dev, void * dst, const void * src, size_t n) {
         q4_up_live_[idx] = 0;
     }
     char * st = q4_up_stage_[(size_t)dev] + (size_t)slot * q4_up_stride_;
+    const auto c0 = upstat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     std::memcpy(st, src, n);
-    q4_up_ev_[idx] = qd.memcpy(dst, st, n);
+    const auto c1 = upstat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    q4_up_ev_[idx] = q.memcpy(dst, st, n);
+    if (async && dev >= 0 && dev < (int)q4_up_last_ev_.size()) {
+        q4_up_last_ev_[(size_t)dev] = q4_up_ev_[idx];
+        q4_up_last_live_[(size_t)dev] = 1;
+    }
+    if (upstat) {
+        const auto c2 = std::chrono::steady_clock::now();
+        q4_up_copy_ms_ += std::chrono::duration<double, std::milli>(c1 - c0).count();
+        q4_up_enq_ms_ += std::chrono::duration<double, std::milli>(c2 - c1).count();
+        q4_up_bytes_ += n;
+        q4_up_calls_++;
+    }
     q4_up_live_[idx] = 1;
+}
+
+void engine::q4_upload(int dev, void * dst, const void * src, size_t n, bool pinned) {
+    q4_upload_impl(dev, dev_queue(dev), dst, src, n, false, pinned);
+}
+
+void engine::q4_upload_async(int dev, void * dst, const void * src, size_t n, bool pinned) {
+    sycl::queue * qc = (dev >= 0 && dev < (int)q4_up_q_.size()) ? q4_up_q_[(size_t)dev].get() : nullptr;
+    q4_upload_impl(dev, qc ? *qc : dev_queue(dev), dst, src, n, true, pinned);
 }
 
 // Move whole layers' routed banks into VRAM, up to --moe-vram-mb per device.
@@ -475,6 +538,23 @@ void engine::q4_alloc_banks() {
         // evenly per card and R is one uniform count, which the histogram says
         // costs almost nothing against a global oracle set (per-layer R=155
         // covers 97.5% of the pairs, global top-6200 95.8%).
+        //
+        // PF_Q4_BANK_Q5K=1 also banks a layer whose routed gate/up are Q5_K
+        // (type 13) - qwen4exp's layer 2.  The grouped gate/up has a Q5_K
+        // instantiation, but it had not been output-validated on this model, so
+        // the gate is opt-in and PF_Q4_FFCMP=<layer> is the oracle.  The Q8_0
+        // down has its own dp4a kernel (`moe_down_q8_0_launch`), which is what
+        // lets the four Q4_K-gate/Q8_0-down layers 4, 30, 46 and 47 bank too;
+        // before it they ran their routed experts on the host.
+        static const bool bank_q5k = si::env::flag("PF_Q4_BANK_Q5K");
+        auto bankable = [&](const layer_t & L) {
+            if (L.moe.gate_exps.type == 12 && L.moe.up_exps.type == 12
+                && (L.moe.down_exps.type == 7 || L.moe.down_exps.type == 8)) {
+                return true;
+            }
+            return bank_q5k && L.moe.gate_exps.type == 13 && L.moe.up_exps.type == 13
+                   && (L.moe.down_exps.type == 7 || L.moe.down_exps.type == 8);
+        };
         const int E = hp.n_expert;
         int nd_gpu = 0;
         std::vector<size_t> sum_e((size_t)nd, 0);
@@ -484,7 +564,7 @@ void engine::q4_alloc_banks() {
                 continue;
             }
             const layer_t & L = m.layers[(size_t)il];
-            if (L.moe.gate_exps.type != 12 || L.moe.up_exps.type != 12 || L.moe.down_exps.type != 7) {
+            if (!bankable(L)) {
                 continue;
             }
             sum_e[(size_t)dev] += L.moe.gate_exps.plane_bytes + L.moe.up_exps.plane_bytes +
@@ -511,6 +591,15 @@ void engine::q4_alloc_banks() {
         }
         int nbank = 0;
         size_t total = 0;
+        // Pinned host source for the banked experts.  The GGUF mmap is
+        // pageable, so every upload used to pay a host memcpy into the staging
+        // ring first (4.6 s of the 544-token prefill).  A one-time copy into
+        // pinned host memory lets the copy engine read the expert plane
+        // directly; PF_Q4_PIN_SRC=0 restores the staging path for the A/B.
+        static const bool pin_src = si::env::i32("PF_Q4_PIN_SRC", 1) != 0;
+        size_t pin_bytes = 0;
+        int pin_layers = 0;
+        sycl::queue & pin_q = q;
         const char * hln = si::env::str("PF_Q4_HOT_LAYERS");
         const int hn = hln ? std::max(0, atoi(hln)) : 1 << 30;
         const char * hon = si::env::str("PF_Q4_HOT_ONLY");
@@ -524,7 +613,7 @@ void engine::q4_alloc_banks() {
                 continue;
             }
             layer_t & L = m.layers[(size_t)il];
-            if (L.moe.gate_exps.type != 12 || L.moe.up_exps.type != 12 || L.moe.down_exps.type != 7) {
+            if (!bankable(L)) {
                 continue;
             }
             q4_bank_t b;
@@ -534,7 +623,8 @@ void engine::q4_alloc_banks() {
             b.u = dev_alloc_on(dev, (size_t)R * ub);
             b.d = dev_alloc_on(dev, (size_t)R * db + 256);
             b.sm = (int32_t *)dev_alloc_on(dev, (size_t)E * sizeof(int32_t));
-            if (!b.g || !b.u || !b.d || !b.sm) {
+            b.sm2 = (int32_t *)dev_alloc_on(dev, (size_t)E * sizeof(int32_t));
+            if (!b.g || !b.u || !b.d || !b.sm || !b.sm2) {
                 throw std::runtime_error("qwen4exp: hot expert bank allocation failed (lower --moe-vram-mb)");
             }
             b.sg = gb;
@@ -542,6 +632,28 @@ void engine::q4_alloc_banks() {
             b.sd = db;
             std::vector<int32_t> mh((size_t)E, -1);
             dev_queue(dev).memcpy(b.sm, mh.data(), mh.size() * sizeof(int32_t));
+            dev_queue(dev).memcpy(b.sm2, mh.data(), mh.size() * sizeof(int32_t));
+            if (pin_src) {
+                b.hg = sycl::malloc_host((size_t)E * gb, pin_q);
+                b.hu = sycl::malloc_host((size_t)E * ub, pin_q);
+                b.hd = sycl::malloc_host((size_t)E * db, pin_q);
+                if (b.hg && b.hu && b.hd) {
+                    std::memcpy(b.hg, L.moe.gate_exps.data, (size_t)E * gb);
+                    std::memcpy(b.hu, L.moe.up_exps.data, (size_t)E * ub);
+                    std::memcpy(b.hd, L.moe.down_exps.data, (size_t)E * db);
+                    q4_pin_src_.push_back({b.hg, dev});
+                    q4_pin_src_.push_back({b.hu, dev});
+                    q4_pin_src_.push_back({b.hd, dev});
+                    pin_bytes += (size_t)E * (gb + ub + db);
+                    pin_layers++;
+                } else {
+                    if (b.hg) sycl::free(b.hg, pin_q);
+                    if (b.hu) sycl::free(b.hu, pin_q);
+                    if (b.hd) sycl::free(b.hd, pin_q);
+                    b.hg = b.hu = b.hd = nullptr;
+                    fprintf(stderr, "[q4] pinned expert source: allocation failed at layer %d; using staging\n", il);
+                }
+            }
             q4_bank_layer_[(size_t)il] = b;
             total += (size_t)R * (gb + ub + db);
             nbank++;
@@ -551,8 +663,13 @@ void engine::q4_alloc_banks() {
         q4_hot_r_ = R;
         q4_sm_host_.assign((size_t)hp.n_layer * (size_t)E, -1);
         q4_lru_age_.assign((size_t)hp.n_layer * (size_t)R, 0);
+        q4_lru_heat_.assign((size_t)hp.n_layer * (size_t)R, 0.f);
         fprintf(stderr, "[q4] hot expert bank: %d slots/layer, %d layers, %.1f GiB (calibrating on first prefill)\n", R,
                 nbank, (double)total / (1024.0 * 1024.0 * 1024.0));
+        if (pin_src) {
+            fprintf(stderr, "[q4] pinned expert source: %d layers, %.1f GiB (direct H2D, no staging memcpy)\n",
+                    pin_layers, (double)pin_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
         size_t max_plane = 0;
         for (int il = 0; il < hp.n_layer; il++) {
             const q4_bank_t & b = q4_bank_layer_[(size_t)il];
@@ -580,17 +697,18 @@ void engine::q4_alloc_banks() {
                         const int dev = multi_dev ? layer_dev_[(size_t)il] : 0;
                         sycl::queue & qd = dev_queue(dev);
                         qd.memcpy(b.sm, row, (size_t)E * sizeof(int32_t));
+                        const bool pin = b.hg && b.hu && b.hd;
+                        const char * gsrc = pin ? (const char *)b.hg : (const char *)L.moe.gate_exps.data;
+                        const char * usrc = pin ? (const char *)b.hu : (const char *)L.moe.up_exps.data;
+                        const char * dsrc = pin ? (const char *)b.hd : (const char *)L.moe.down_exps.data;
                         for (int e = 0; e < E; e++) {
                             const int i = row[(size_t)e];
                             if (i < 0 || i >= R) {
                                 continue;
                             }
-                            q4_upload(dev, (char *)b.g + (size_t)i * b.sg,
-                                      (const char *)L.moe.gate_exps.data + (size_t)e * b.sg, b.sg);
-                            q4_upload(dev, (char *)b.u + (size_t)i * b.su,
-                                      (const char *)L.moe.up_exps.data + (size_t)e * b.su, b.su);
-                            q4_upload(dev, (char *)b.d + (size_t)i * b.sd,
-                                      (const char *)L.moe.down_exps.data + (size_t)e * b.sd, b.sd);
+                            q4_upload(dev, (char *)b.g + (size_t)i * b.sg, gsrc + (size_t)e * b.sg, b.sg, pin);
+                            q4_upload(dev, (char *)b.u + (size_t)i * b.su, usrc + (size_t)e * b.su, b.su, pin);
+                            q4_upload(dev, (char *)b.d + (size_t)i * b.sd, dsrc + (size_t)e * b.sd, b.sd, pin);
                         }
                     }
                     q4_hot_ready_ = true;
@@ -747,19 +865,19 @@ void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int
     // in the mode-2 layout would process padding tokens (and pollute the KV and
     // the GDN state).  Full kMaxT rows go through mode 2; the < kMaxT tail goes
     // through mode 1, which is a single row of exactly `rem` tokens.
-    // The per-expert bank holds R slots in a layer; a 1024-token mode-2 batch
-    // selects more distinct experts than that, so prefill walks in chunks whose
-    // active set fits (the LRU uploads on miss and never falls back to the host).
     const char * pfc = si::env::str("PF_Q4_PF_CHUNK");
-    // A 128-token chunk keeps a layer's active set under ~180 experts; that
-    // needs the 20 GiB bank (179 slots).  With the 18 GiB bank (161) a 128
-    // chunk overflows the slots, so the safe default follows the slot count.
-    // Only the LRU needs small chunks (its slot set must hold the chunk's
-    // active experts); the whole-layer bank and the host path keep the large
-    // batch that made them 3-4 s faster.
+    // The per-expert bank used to need small chunks because a chunk's active
+    // set had to fit its slots; the two-pass batching in q4_forward removes
+    // that constraint, and with it the reason to shrink the chunk.  Measured
+    // on a 480-token prompt, all-GPU map, --moe-vram-mb 16000 (R=124), steady
+    // repeat: 64-token chunks 25.5 s, 128 20.3, 256 16.8, 512/1024 (one
+    // forward) 14.0 - because every extra chunk boundary re-uploads the
+    // experts its first batch does not find resident.  So the bank keeps the
+    // large batch the whole-layer bank and the host path already use, and
+    // PF_Q4_PF_CHUNK stays as the A/B override.
     int CH = kMaxB * kMaxT;
-    if (q4_hot_) {
-        CH = pfc ? std::max(kMaxT, atoi(pfc)) : (q4_hot_r_ >= 176 ? 128 : 64);
+    if (q4_hot_ && pfc) {
+        CH = std::max(kMaxT, atoi(pfc));
     }
     CH = std::max(kMaxT, (CH / kMaxT) * kMaxT);
     const int R = std::min(kMaxB * kMaxT, CH);
@@ -899,6 +1017,9 @@ void engine::q4_hot_calibrate() {
 }
 
 void engine::q4_forward(int mode, int n_tok, bool with_head) {
+    if (mode == 0) {
+        q4_dec_step_++;
+    }
     const hparams & hp = m.hp;
     const step_info * inf = d_info;
     const int hc = hp.hc_mult;
@@ -908,9 +1029,6 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     const int nblocks = (mode == 2 && n_tok > kMaxT) ? (n_tok + kMaxT - 1) / kMaxT : 1;
     const float inv_hc = 1.0f / (float)hc;
     const bool multi = multi_dev;
-    for (q4_bufs & qb : q4b_) {
-        qb.seg_used = 0;
-    }
     auto is_cpu = [&](int d) { return multi ? (dev_kind_[(size_t)d] == 1) : cpu_mode; };
     auto DQ = [&](int d) -> sycl::queue & { return dev_queue(d); };
     auto BE = [&](int d) -> compute_backend & { return multi ? *backends_[(size_t)d] : *be; };
@@ -997,6 +1115,44 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     auto slot_of = [&](int i) -> int {
         return inf->slot[mode == 2 ? i / kMaxT : i];
     };
+    // PF_Q4_PHASE lives up here because the GEMV launcher splits its own cost
+    // into the segment-descriptor copy and the kernel.  Decode only.
+    const bool q4phase = si::env::flag("PF_Q4_PHASE") && mode == 0;
+    auto now_ms = [] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    double t_segc = 0, t_gemvk = 0, tc_last = 0;
+    int n_gemv_calls = 0;
+
+    // Segment-descriptor ring.  Each GEMV call writes its descriptor into a
+    // pinned host slot and enqueues the 184-byte H2D copy on the same in-order
+    // queue as the kernel that reads it, so the host never waits for the copy.
+    // The cursor is persistent across forwards: a slot is reused only after a
+    // full ring (4096 calls, ~17 decode tokens), and the queue is drained
+    // before that reuse.  Resetting the cursor per forward is what once
+    // overwrote a descriptor while its kernel was still reading it (the
+    // prefill-chunk crash); the ring is sized so a forward never wraps.
+    //
+    // PF_Q4_GEMVSEG=0 keeps the blocking copy for A/B.  Measured on the
+    // qwen4exp all-GPU decode (64-token request, 3 pairs, byte-identical):
+    // 122.5 -> 120.9 ms/token.  The old copy's 19.9 ms/token of wait was
+    // mostly device work still queued in front of it (the wait *is* the
+    // pipeline), so what this removes is the per-call launch/wake-up gap,
+    // not the 19.9 ms.
+    static const int gs_on = si::env::i32("PF_Q4_GEMVSEG", 1);
+    auto seg_alloc = [&](q4_bufs & b, int d, int n) -> int {
+        if (b.seg_alloc + n > b.segs_cap) {
+            if (!is_cpu(d)) {
+                DQ(d).wait();
+            }
+            b.seg_alloc = 0;
+            b.seg_used = 0;
+        }
+        const int si = b.seg_used;
+        b.seg_used = (si + n) % b.segs_cap;
+        b.seg_alloc += n;
+        return si;
+    };
 
     auto gemv = [&](int d, const wt & w, const float * x, int xs, float * out, int os, int tb_use, int nb_use) {
         if (!w.data) {
@@ -1033,25 +1189,127 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         s.out_stride = os;
         s.alpha = 1.0f;
         q4_bufs & b = buf(d);
-        if (b.seg_used >= b.segs_cap) {
-            DQ(d).wait();
-            b.seg_used = 0;
-        }
-        const int si = b.seg_used++;
+        const int si = seg_alloc(b, d, 1);
         gemv_seg * sp = b.segs + si;
         if (is_cpu(d)) {
             std::memcpy(sp, &s, sizeof(s));
         } else {
-            // Blocking copy: the async host-ring version is cheaper but crosses
-            // prefill-chunk boundaries with an in-flight copy source and kills
-            // the Level Zero driver inside urEnqueueUSMMemcpy on a 2-chunk
-            // prompt.  56 bytes per call is not where the time goes.
+            // The copy source is the pinned ring slot, not a stack temporary,
+            // so an async copy stays valid; the kernel is enqueued after it on
+            // the same in-order queue and therefore reads the new descriptor.
             if (q4trace) {
-            fprintf(stderr, "[q4] seg copy d=%d K=%d N=%d\n", d, w.K, w.N);
+                fprintf(stderr, "[q4] seg copy d=%d K=%d N=%d\n", d, w.K, w.N);
+            }
+            std::memcpy(b.host_segs + si, &s, sizeof(s));
+            if (gs_on) {
+                DQ(d).memcpy(sp, b.host_segs + si, sizeof(s));
+            } else if (q4phase) {
+                const double tc0 = now_ms();
+                DQ(d).memcpy(sp, b.host_segs + si, sizeof(s)).wait();
+                tc_last = now_ms() - tc0;
+                t_segc += tc_last;
+            } else {
+                DQ(d).memcpy(sp, b.host_segs + si, sizeof(s)).wait();
+            }
         }
-        DQ(d).memcpy(sp, &s, sizeof(s)).wait();
+        if (q4phase) {
+            const double tk0 = now_ms();
+            BE(d).gemv_group(w.type, sp, 1, w.N, tb_use, 0, nb_use);
+            const double te = now_ms();
+            if (!is_cpu(d)) {
+                DQ(d).wait();
+            }
+            const double tk = now_ms() - tk0;
+            t_gemvk += tk;
+            n_gemv_calls++;
+            if (si::env::flag("PF_Q4_GEMVDET")) {
+                fprintf(stderr, "[q4gemv] d=%d K=%d N=%d type=%u segc=%.3f enq=%.3f wait=%.3f ms\n", d, w.K, w.N,
+                        w.type, tc_last, te - tk0, tk - (te - tk0));
+            }
+        } else {
+            BE(d).gemv_group(w.type, sp, 1, w.N, tb_use, 0, nb_use);
         }
-        BE(d).gemv_group(w.type, sp, 1, w.N, tb_use, 0, nb_use);
+    };
+
+    // One launch for several weights that read the same activation: a single
+    // descriptor write and a single dispatch instead of one of each per tensor.
+    // The arithmetic is per output row and unchanged, so this is bit-exact; the
+    // win is that a 48-row tail (ssm_beta/alpha) stops paying a launch of its
+    // own and the matrices overlap each other.  Decode only - the prefill's
+    // in-GEMV oneDNN fast path is per tensor.
+    struct gemv_item {
+        const wt * w;
+        float * out;
+        int os;
+    };
+    auto gemv_many = [&](int d, const gemv_item * it, int n, const float * x, int xs, int tb_use, int nb_use) {
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+            if (it[i].w->data) {
+                m++;
+            }
+        }
+        if (m == 0) {
+            return;
+        }
+        q4_bufs & b = buf(d);
+        const int base = seg_alloc(b, d, m);
+        gemv_seg * dst = b.host_segs + base;
+        int total = 0;
+        int j = 0;
+        uint32_t type = 0;
+        for (int i = 0; i < n; i++) {
+            const wt & w = *it[i].w;
+            if (!w.data) {
+                continue;
+            }
+            if (j == 0) {
+                type = w.type;
+            }
+            gemv_seg & s = dst[j];
+            s.dev = d;
+            s.w = wptr(d, w.data);
+            s.type = w.type;
+            s.K = w.K;
+            s.n_rows = w.N;
+            s.x = x;
+            s.x_stride = xs;
+            s.out = it[i].out;
+            s.out_stride = it[i].os;
+            s.alpha = 1.0f;
+            total += w.N;
+            j++;
+        }
+        const double tk0 = q4phase ? now_ms() : 0.0;
+        if (is_cpu(d)) {
+            std::memcpy(b.segs + base, b.host_segs + base, (size_t)m * sizeof(gemv_seg));
+        } else if (gs_on) {
+            // Async, ordered before the kernel on the same in-order queue; the
+            // source slot is not reusable until the ring wraps (see seg_alloc).
+            DQ(d).memcpy(b.segs + base, b.host_segs + base, (size_t)m * sizeof(gemv_seg));
+        } else {
+            DQ(d).memcpy(b.segs + base, b.host_segs + base, (size_t)m * sizeof(gemv_seg)).wait();
+        }
+        BE(d).gemv_group(type, b.segs + base, m, total, tb_use, 0, nb_use);
+        if (q4phase) {
+            const double te = now_ms();
+            if (!is_cpu(d)) {
+                DQ(d).wait();
+            }
+            const double tk = now_ms() - tk0;
+            t_gemvk += tk;
+            n_gemv_calls++;
+            if (si::env::flag("PF_Q4_GEMVDET")) {
+                fprintf(stderr, "[q4gemv] group d=%d n=%d total=%d enq=%.3f wait=%.3f ms:", d, m, total, te - tk0,
+                        tk - (te - tk0));
+                for (int i = 0; i < n; i++) {
+                    if (it[i].w->data) {
+                        fprintf(stderr, " [type=%u K=%d N=%d]", it[i].w->type, it[i].w->K, it[i].w->N);
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     };
     // host GEMV helpers (the shared expert and PLE); TB is the token count
     auto hgemv1 = [&](const wt & w, const float * x, int xs, float * out, int os) {
@@ -1104,29 +1362,115 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         cpu_gemv_group(w.type, &s, 1, w.N, n_tok, 0, 0, 0);
     };
 
-    auto hc_mix = [&](int d, const hc_wt & H, float *& inject) {
+    // ---- phase attribution (PF_Q4_PHASE, decode only) ---------------------
+    // On an in-order queue a phase boundary without a wait charges its work to
+    // whoever blocks next, so every boundary here waits.  Diagnostic only: the
+    // waits cost a few ms over a token and are gated off in production.
+    struct hc_ph {
+        double norm = 0, lo = 0, silu = 0, up = 0, inj = 0, mix = 0, comb = 0;
+        bool rest = true; // false: the FFN group, which is inside the moe timing
+    };
+    hc_ph ph_ha, ph_hf;
+    ph_hf.rest = false;
+    // PF_Q4_HCTIME: device time of the four small HC elementwise kernels from
+    // their event profiling info, so the split is measured without a wait (on
+    // an in-order queue a wait charges the next kernel's stall to them).
+    static const bool hctime_flag = si::env::flag("PF_Q4_HCTIME");
+    const bool hctime = hctime_flag && mode == 0;
+    std::vector<std::pair<int, sycl::event>> hc_evs; // 0 norm, 1 silu, 2 mix, 3 combine
+    if (hctime) {
+        hc_evs.reserve(8 * (size_t)hp.n_layer + 8);
+    }
+    double t_ple = 0, t_gg = 0, t_gc = 0, t_gn = 0, t_go = 0;
+    double t_ag = 0, t_ar = 0, t_ac = 0, t_ao = 0;
+    double t_xc = 0, t_head = 0, t_emb = 0, t_cpu_rest = 0;
+    int n_gdn_l = 0, n_attn_l = 0;
+    static const bool q4time = si::env::flag("PF_Q4_TIME");
+    static const bool qsatime = si::env::flag("PF_QSA_TIME");
+    const double t_start = q4time ? now_ms() : 0.0;
+    // Wall clock of the whole forward, printed with PF_QSA_TIME.  The `[q4]`
+    // line above is emitted before the LM head and the deferred QSA flush, so
+    // its moe+rest sum is not a token time when the QSA update is deferred;
+    // this one is taken after the final synchronise.
+    const double t_wall0 = qsatime ? now_ms() : 0.0;
+    double t_qsa = 0.0;
+    qsa_copy_ms_ = qsa_gemv_ms_ = qsa_upd_ms_ = qsa_sel_ms_ = qsa_attn_ms_ = 0.0;
+    qsa_rows_ = qsa_nsel_ = 0;
+    // PF_Q4_UPSTAT: the upload split for this forward (host copy into the
+    // staging ring, device-copy enqueues, ring-slot waits, bytes).
+    const bool upstat = si::env::flag("PF_Q4_UPSTAT");
+    const double up_c0 = upstat ? q4_up_copy_ms_ : 0.0;
+    const double up_e0 = upstat ? q4_up_enq_ms_ : 0.0;
+    const double up_w0 = upstat ? q4_up_wait_ms_ : 0.0;
+    const double up_d0 = upstat ? q4_up_dma_ms_ : 0.0;
+    const size_t up_b0 = upstat ? q4_up_bytes_ : 0;
+    const size_t up_n0 = upstat ? q4_up_calls_ : 0;
+    double t_moe = 0.0, t_route = 0.0, t_exp = 0.0, t_shared = 0.0, t_cp = 0.0;
+    // PF_Q4_PF_STATS: what the prefill's two-pass batching costs in upload
+    // traffic and kernel launches (one line per forward).  Diagnostic only.
+    size_t pf_upb = 0;
+    int pf_layers = 0, pf_batches = 0, pf_act = 0;
+    auto ph0 = [&](int d) {
+        if (!q4phase) {
+            return 0.0;
+        }
+        if (!is_cpu(d)) {
+            DQ(d).wait();
+        }
+        return now_ms();
+    };
+    auto ph1 = [&](int d, double t0, double & acc, bool rest) {
+        if (!q4phase) {
+            return;
+        }
+        if (!is_cpu(d)) {
+            DQ(d).wait();
+        }
+        const double dt = now_ms() - t0;
+        acc += dt;
+        if (rest && is_cpu(d)) {
+            t_cpu_rest += dt;
+        }
+    };
+
+    auto hc_mix = [&](int d, const hc_wt & H, float *& inject, hc_ph & ph) {
         q4_bufs & b = buf(d);
+        double t0 = ph0(d);
         if (is_cpu(d)) {
             cpu_q4_hc_norm(b.res, H.norm, b.xn, nullptr, n_tok, n_embd, hc, hp.rms_eps);
         } else {
-            q4_hc_norm_launch(DQ(d), b.res, wf32(d, H.norm), b.xn, n_tok, n_embd, hc, hp.rms_eps);
+            sycl::event e = q4_hc_norm_launch(DQ(d), b.res, wf32(d, H.norm), b.xn, n_tok, n_embd, hc, hp.rms_eps);
+            if (hctime) {
+                hc_evs.emplace_back(0, e);
+            }
         }
+        ph1(d, t0, ph.norm, ph.rest);
         dbg_stats("hc_norm", d, b.xn, (size_t)n_tok * hc_dim, hc);
+        t0 = ph0(d);
         gemv(d, H.down, b.xn, hc_dim, b.lo, hp.hc_low_rank, tb, nblocks);
+        ph1(d, t0, ph.lo, ph.rest);
         dbg_stats("hc_lo_pre", d, b.lo, (size_t)n_tok * hp.hc_low_rank, 0);
+        t0 = ph0(d);
         if (is_cpu(d)) {
             cpu_q4_silu_scaled(b.lo, n_tok * hp.hc_low_rank, inv_hc);
         } else {
-            q4_silu_scale_launch(DQ(d), b.lo, n_tok * hp.hc_low_rank, inv_hc);
+            sycl::event e = q4_silu_scale_launch(DQ(d), b.lo, n_tok * hp.hc_low_rank, inv_hc);
+            if (hctime) {
+                hc_evs.emplace_back(1, e);
+            }
         }
+        ph1(d, t0, ph.silu, ph.rest);
         // K = hc_low_rank = 320 is not a 256 multiple: use the tail-aware GEMV
+        t0 = ph0(d);
         if (is_cpu(d)) {
             cpu_q4_up_gemv(H.up.data, H.up.type, b.lo, hp.hc_low_rank, b.gate, hc_dim, n_tok, hp.hc_low_rank, hc_dim);
         } else {
             q4_up_gemv_launch(DQ(d), wptr(d, H.up.data), H.up.type, b.lo, hp.hc_low_rank, b.gate, hc_dim, n_tok,
                               hp.hc_low_rank, hc_dim);
         }
+        ph1(d, t0, ph.up, ph.rest);
         dbg_stats("hc_gate", d, b.gate, (size_t)n_tok * hc_dim, hc);
+        t0 = ph0(d);
         if (is_cpu(d)) {
             cpu_gemv_seg s{};
             s.w = H.inject.data;
@@ -1143,33 +1487,39 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             q4_inject_launch(DQ(d), wptr(d, H.inject.data), H.inject.type, b.xn, hc_dim, b.inj, hc, n_tok,
                              H.inject.K, H.inject.N);
         }
+        ph1(d, t0, ph.inj, ph.rest);
         dbg_stats("hc_inject", d, b.inj, (size_t)n_tok * hc, 0);
+        t0 = ph0(d);
         if (is_cpu(d)) {
             cpu_q4_hc_mix(b.xn, b.gate, b.mixed, nullptr, n_tok, n_embd, hc);
         } else {
-            q4_hc_mix_launch(DQ(d), b.xn, b.gate, b.mixed, n_tok, n_embd, hc);
+            sycl::event e = q4_hc_mix_launch(DQ(d), b.xn, b.gate, b.mixed, n_tok, n_embd, hc);
+            if (hctime) {
+                hc_evs.emplace_back(2, e);
+            }
         }
+        ph1(d, t0, ph.mix, ph.rest);
         inject = b.inj;
     };
-    auto hc_combine = [&](int d, const float * inject) {
+    auto hc_combine = [&](int d, const float * inject, hc_ph & ph) {
         q4_bufs & b = buf(d);
+        const double t0 = ph0(d);
         if (is_cpu(d)) {
             cpu_q4_hc_combine(b.res, b.block, inject, nullptr, n_tok, n_embd, hc);
         } else {
-            q4_hc_combine_launch(DQ(d), b.res, b.block, inject, n_tok, n_embd, hc);
+            sycl::event e = q4_hc_combine_launch(DQ(d), b.res, b.block, inject, n_tok, n_embd, hc);
+            if (hctime) {
+                hc_evs.emplace_back(3, e);
+            }
         }
+        ph1(d, t0, ph.comb, ph.rest);
     };
-
-    static const bool q4time = si::env::flag("PF_Q4_TIME");
-    auto now_ms = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
-    const double t_start = q4time ? now_ms() : 0.0;
-    double t_moe = 0.0, t_route = 0.0, t_exp = 0.0, t_shared = 0.0, t_cp = 0.0;
     // ---- embedding + hc copies on device 0 --------------------------------
     const int d0 = 0;
     {
         q4_bufs & b = buf(d0);
+        const double t0 = ph0(d0);
         BE(d0).embed(wptr(d0, m.tok_embd.data), m.tok_embd.type, inf, b.mixed, n_embd, m.tok_embd_row_bytes);
-        dbg_stats("embed", d0, b.mixed, (size_t)n_tok * n_embd, 0);
         if (is_cpu(d0)) {
             for (int i = 0; i < n_tok; i++) {
                 for (int s = 0; s < hc; s++) {
@@ -1180,6 +1530,8 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         } else {
             q4_repeat_launch(DQ(d0), b.mixed, b.res, n_tok, n_embd, hc);
         }
+        ph1(d0, t0, t_emb, true);
+        dbg_stats("embed", d0, b.mixed, (size_t)n_tok * n_embd, 0);
     }
 
     const bool hist_on = si::env::flag("PF_Q4_HIST");
@@ -1232,14 +1584,17 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         const layer_t & L = m.layers[(size_t)il];
         const int dev = multi ? layer_dev_[(size_t)il] : 0;
         if (dev != cur_dev) {
+            const double tx0 = ph0(dev);
             to_host(cur_dev, q4_host_res_, buf(cur_dev).res, (size_t)n_tok * hc_dim * sizeof(float));
             from_host(dev, buf(dev).res, q4_host_res_, (size_t)n_tok * hc_dim * sizeof(float));
             cur_dev = dev;
+            ph1(dev, tx0, t_xc, true);
         }
         q4_bufs & b = buf(dev);
 
         // ---- PLE: host gather + projections + gate + conv -----------------
         if (il == hp.ple_layer && L.ple.ok() && !si::env::flag("PF_Q4_NOPLE")) {
+            const double tp0 = ph0(dev);
             std::vector<int32_t> idx((size_t)hp.ple_n_heads * n_tok);
             for (int i = 0; i < n_tok; i++) {
                 const int32_t tok = tok_of(i);
@@ -1318,15 +1673,17 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
                 p[hp.ple_ngram - 2] = tok_of(i);
             }
+            ph1(dev, tp0, t_ple, true);
         }
 
         dbg_stats("res_in", dev, b.res, (size_t)n_tok * hc_dim, hc);
         // ---- token mixer ---------------------------------------------------
         float * inj1 = nullptr;
-        hc_mix(dev, L.hc_attn, inj1);
+        hc_mix(dev, L.hc_attn, inj1, ph_ha);
         dbg_stats("hc_mixed_attn", dev, b.mixed, (size_t)n_tok * n_embd, 0);
         compute_backend & be = BE(dev);
         if (L.recurrent) {
+            n_gdn_l++;
             float * QKV = multi ? as_[(size_t)dev].qkv : d_qkv;
             float * Z = multi ? as_[(size_t)dev].z : d_z;
             float * BETA = multi ? as_[(size_t)dev].beta : d_beta;
@@ -1334,10 +1691,22 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             float * CONVOUT = multi ? as_[(size_t)dev].conv_out : d_conv_out;
             float * ATTNPRE = multi ? as_[(size_t)dev].attn_pre : d_attn_pre;
             float * ATTMERGED = multi ? as_[(size_t)dev].attn_merged : d_attn_merged;
-            gemv(dev, L.wqkv, b.mixed, n_embd, QKV, hp.qkv_dim(), tb, nblocks);
-            gemv(dev, L.wgate, b.mixed, n_embd, Z, hp.d_inner, tb, nblocks);
-            gemv(dev, L.ssm_beta, b.mixed, n_embd, BETA, hp.dt_rank, tb, nblocks);
-            gemv(dev, L.ssm_alpha, b.mixed, n_embd, ALPHA, hp.dt_rank, tb, nblocks);
+            double ph_t = ph0(dev);
+            if (mode == 0) {
+                // Decode: one dispatch per weight type instead of one per
+                // tensor (bit-exact; see gemv_many).  The prefill keeps the
+                // per-tensor calls because its oneDNN fast path is per tensor.
+                gemv_item gi[2] = {{&L.wqkv, QKV, hp.qkv_dim()}, {&L.wgate, Z, hp.d_inner}};
+                gemv_many(dev, gi, 2, b.mixed, n_embd, tb, nblocks);
+                gemv_item gb[2] = {{&L.ssm_beta, BETA, hp.dt_rank}, {&L.ssm_alpha, ALPHA, hp.dt_rank}};
+                gemv_many(dev, gb, 2, b.mixed, n_embd, tb, nblocks);
+            } else {
+                gemv(dev, L.wqkv, b.mixed, n_embd, QKV, hp.qkv_dim(), tb, nblocks);
+                gemv(dev, L.wgate, b.mixed, n_embd, Z, hp.d_inner, tb, nblocks);
+                gemv(dev, L.ssm_beta, b.mixed, n_embd, BETA, hp.dt_rank, tb, nblocks);
+                gemv(dev, L.ssm_alpha, b.mixed, n_embd, ALPHA, hp.dt_rank, tb, nblocks);
+            }
+            ph1(dev, ph_t, t_gg, true);
             dbg_stats("qkv", dev, QKV, (size_t)n_tok * hp.qkv_dim(), 0);
             dbg_stats("z", dev, Z, (size_t)n_tok * hp.d_inner, 0);
             const int gi = m.gdn_layer_index[(size_t)il];
@@ -1346,6 +1715,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
             float * cs = (multi ? as_[(size_t)dev].conv_state : d_conv_state) + (size_t)gl * state_slots_ * conv_per;
             float * gs = (multi ? as_[(size_t)dev].gdn_state : d_gdn_state) + (size_t)gl * state_slots_ * gdn_per;
+            ph_t = ph0(dev);
             if (mode == 2) {
                 const int NCH = (n_tok + kMaxT - 1) / kMaxT;
                 be.conv_l2(QKV, cs, wf32(dev, L.ssm_conv1d), CONVOUT, inf, hp.qkv_dim(), hp.conv_k, hp.d_state,
@@ -1364,22 +1734,37 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                        hp.n_group, hp.dt_rank, hp.qkv_dim(), 1.0f / std::sqrt((float)hp.d_state), state_slots_, nrows,
                        0, -1, nreal_call, {});
             }
+            ph1(dev, ph_t, t_gc, true);
             dbg_stats("conv_out", dev, CONVOUT, (size_t)n_tok * hp.qkv_dim(), 0);
             dbg_stats("attn_pre_gdn", dev, ATTNPRE, (size_t)n_tok * hp.d_inner, 0);
+            ph_t = ph0(dev);
             be.gated_norm(ATTNPRE, Z, wf32(dev, L.ssm_norm), ATTMERGED, inf, hp.dt_rank, hp.d_state, hp.rms_eps,
                           inf->n_rows, mode == 2 ? kMaxT : ((mode == 1) ? n_tok : 1), 0, true);
+            ph1(dev, ph_t, t_gn, true);
             dbg_stats("gdn_normed", dev, ATTMERGED, (size_t)n_tok * hp.d_inner, 0);
+            ph_t = ph0(dev);
             gemv(dev, L.ssm_out, ATTMERGED, hp.d_inner, b.block, n_embd, tb, nblocks);
+            ph1(dev, ph_t, t_go, true);
         } else {
+            n_attn_l++;
             float * QBUF = multi ? as_[(size_t)dev].qbuf : d_qbuf;
             float * KBUF = multi ? as_[(size_t)dev].kbuf : d_kbuf;
             float * VBUF = multi ? as_[(size_t)dev].vbuf : d_vbuf;
             float * ATTN_OUT = multi ? as_[(size_t)dev].attn_out : d_attn_out;
             float * PART = multi ? as_[(size_t)dev].partials : d_partials;
             float * PARTD = multi ? as_[(size_t)dev].partials_dec : d_partials_dec;
-            gemv(dev, L.wq, b.mixed, n_embd, QBUF, hp.n_head * 2 * hp.head_dim, tb, nblocks);
-            gemv(dev, L.wk, b.mixed, n_embd, KBUF, hp.n_head_kv * hp.head_dim, tb, nblocks);
-            gemv(dev, L.wv, b.mixed, n_embd, VBUF, hp.n_head_kv * hp.head_dim, tb, nblocks);
+            double ph_t = ph0(dev);
+            if (mode == 0) {
+                gemv_item ga[3] = {{&L.wq, QBUF, hp.n_head * 2 * hp.head_dim},
+                                   {&L.wk, KBUF, hp.n_head_kv * hp.head_dim},
+                                   {&L.wv, VBUF, hp.n_head_kv * hp.head_dim}};
+                gemv_many(dev, ga, 3, b.mixed, n_embd, tb, nblocks);
+            } else {
+                gemv(dev, L.wq, b.mixed, n_embd, QBUF, hp.n_head * 2 * hp.head_dim, tb, nblocks);
+                gemv(dev, L.wk, b.mixed, n_embd, KBUF, hp.n_head_kv * hp.head_dim, tb, nblocks);
+                gemv(dev, L.wv, b.mixed, n_embd, VBUF, hp.n_head_kv * hp.head_dim, tb, nblocks);
+            }
+            ph1(dev, ph_t, t_ag, true);
             dbg_stats("Qraw", dev, QBUF, (size_t)n_tok * hp.n_head * 2 * hp.head_dim, 0);
             dbg_stats("Kraw", dev, KBUF, (size_t)n_tok * hp.n_head_kv * hp.head_dim, 0);
             dbg_stats("Vraw", dev, VBUF, (size_t)n_tok * hp.n_head_kv * hp.head_dim, 0);
@@ -1389,15 +1774,22 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             const void * vsc = nullptr;
             kv_layer_ptrs(attn_idx, (const char *&)kp, (const char *&)vp, (const char *&)ksc, (const char *&)vsc);
             const int nreal_call = (mode == 2) ? kMaxT : ((mode == 1) ? n_tok : 1);
+            ph_t = ph0(dev);
             be.qk_norm_rope(QBUF, KBUF, VBUF, wf32(dev, L.q_norm), wf32(dev, L.k_norm), kp, vp, d_tables, inf,
                             hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base, rope_freqs_for(dev),
                             d_rope_mscale_, hp.rms_eps, max_blocks, inf->n_rows, nreal_call, ksc, vsc);
+            ph1(dev, ph_t, t_ar, true);
             dbg_stats("Qrope", dev, QBUF, (size_t)n_tok * hp.n_head * 2 * hp.head_dim, 0);
             dbg_stats("Krope", dev, KBUF, (size_t)n_tok * hp.n_head_kv * hp.head_dim, 0);
+            ph_t = ph0(dev);
+            const double q_c0 = qsatime ? now_ms() : 0.0;
             const bool qsa_done = qsa_on_ && qsa_attention(attn_idx, L, dev, n_tok, inf, b.mixed, QBUF, KBUF, VBUF,
                                                            ATTN_OUT);
+            if (qsatime) {
+                t_qsa += now_ms() - q_c0;
+            }
             if (qsa_done) {
-                gemv(dev, L.wo, ATTN_OUT, hp.n_head * hp.head_dim, b.block, n_embd, tb, nblocks);
+                ph1(dev, ph_t, t_ac, true);
             } else {
             int nsp = 1;
             float * part = PART;
@@ -1422,26 +1814,41 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             be.attn(QBUF, QBUF, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf, hp.attn_scale,
                     max_blocks, inf->n_rows, nreal_call, nullptr, -1, ksc, vsc);
             be.attn_combine(part, QBUF, ATTN_OUT, inf, hp.n_head, hp.head_dim, nsp, inf->n_rows, nreal_call);
+            ph1(dev, ph_t, t_ac, true);
             dbg_stats("attn_gated", dev, ATTN_OUT, (size_t)n_tok * hp.n_head * hp.head_dim, 0);
-            gemv(dev, L.wo, ATTN_OUT, hp.n_head * hp.head_dim, b.block, n_embd, tb, nblocks);
             }
+            ph_t = ph0(dev);
+            gemv(dev, L.wo, ATTN_OUT, hp.n_head * hp.head_dim, b.block, n_embd, tb, nblocks);
+            ph1(dev, ph_t, t_ao, true);
             attn_idx++;
         }
         dbg_stats("block_attn", dev, b.block, (size_t)n_tok * n_embd, 0);
-        hc_combine(dev, inj1);
+        hc_combine(dev, inj1, ph_ha);
         dbg_stats("hc_combine1", dev, b.res, (size_t)n_tok * hc_dim, hc);
 
         // ---- FFN: routed bank + shared expert on the host ------------------
         const double tm0 = q4time ? now_ms() : 0.0;
         float * inj2 = nullptr;
-        hc_mix(dev, L.hc_ffn, inj2);
+        hc_mix(dev, L.hc_ffn, inj2, ph_hf);
         dbg_stats("hc_mixed_ffn", dev, b.mixed, (size_t)n_tok * n_embd, 0);
         const double tc0 = q4time ? now_ms() : 0.0;
         const int k = hp.n_expert_used;
         const q4_bank_t * bank = nullptr;
+        // PF_Q4_BANK_Q5K: the same gate as q4_alloc_banks(), so a bank that
+        // exists is always used and a layer without one always falls through
+        // to the host path.  Read once per process (the env cannot change).
+        static const bool bank_q5k_fwd = si::env::flag("PF_Q4_BANK_Q5K");
+        // PF_Q4_BANK_Q5K is a *decode* bank: layer 2's Q5_K gate/up was 6 %
+        // slower than the host on the prefill, while its Q8_0-down decode is
+        // what the host layer costs ~5 ms/token for.  Keep the prefill on the
+        // host and use the bank on the token path only.
+        const bool gate_ok =
+            (L.moe.gate_exps.type == 12 && L.moe.up_exps.type == 12
+             && (L.moe.down_exps.type == 7 || L.moe.down_exps.type == 8))
+            || (bank_q5k_fwd && mode == 0 && L.moe.gate_exps.type == 13 && L.moe.up_exps.type == 13
+                && (L.moe.down_exps.type == 7 || L.moe.down_exps.type == 8));
         if (!is_cpu(dev) && il < (int)q4_bank_layer_.size() && q4_bank_layer_[(size_t)il].g
-            && (!q4_hot_ || q4_hot_ready_) && L.moe.gate_exps.type == 12 && L.moe.up_exps.type == 12
-            && L.moe.down_exps.type == 7) {
+            && (!q4_hot_ || q4_hot_ready_) && gate_ok) {
             bank = &q4_bank_layer_[(size_t)il];
         }
         if (bank) {
@@ -1450,6 +1857,51 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             moe_act & A = moe_as_[(size_t)dev];
             sycl::queue & qd = DQ(dev);
             const int np = n_tok * k;
+            // PF_Q4_CPU_MISS: Strata's CUDA "kind = -1" expert split, for the
+            // decode.  The calibrated resident set stays in the bank and is
+            // computed by the grouped dp4a kernels; a non-resident pair is NOT
+            // uploaded - the host computes it from the pinned source into a
+            // pinned row buffer, enqueues that row into A.acc (ordered before
+            // the reduction) and returns.  The GPU's resident chain is
+            // submitted first so the host arithmetic runs under it.  The
+            // resident set is deliberately not churned by the LRU here, so no
+            // miss is uploaded.  Measured: this loses (the frozen set misses
+            // 3.2x more and a host miss is not cheaper than the H2D), see
+            // AGENTS.md and docs/design/18-qwen4exp.md §6.1 - the flag is a
+            // probe, not a recommendation.
+            static const int cmiss_mode = si::env::i32("PF_Q4_CPU_MISS", 0);
+            static const int cmiss_layer = si::env::i32("PF_Q4_CPU_MISS_LAYER", -1);
+            // A short prompt leaves the bank calibrated on the *prefill's*
+            // routing, which is a poor predictor of the decode's (18.2% top-10
+            // overlap measured).  The warm-up keeps the LRU admitting for the
+            // first N decode steps - the same cost the baseline pays - and
+            // freezes the set it reached; the last-32 cells then compare two
+            // steady states.  Send 0 to freeze the post-prefill set instead.
+            static const int cmiss_warm = si::env::i32("PF_Q4_CPU_MISS_WARM", 16);
+            const bool cmiss = cmiss_mode != 0 && mode == 0 && n_tok == 1 && q4_hot_ && q4_hot_ready_
+                               && (int)q4_dec_step_ > cmiss_warm && (cmiss_layer < 0 || cmiss_layer == il);
+            static const bool cmiss_time_flag = si::env::flag("PF_Q4_CPU_MISS_TIME");
+            const bool cmiss_time = cmiss && cmiss_time_flag;
+            std::vector<int> cmiss_pr; // pair indices the host computes
+            int cmiss_tail = 0;        // of the misses, the tail-skipped ones
+            double t_cmiss_submit = 0.0, t_cmiss_host = 0.0;
+            // The router writes its ids straight into the pinned host buffer
+            // the LRU reads, instead of a device buffer plus a D2H memcpy per
+            // layer.  The memcpy is a queue round trip (a 40-byte copy pays the
+            // whole enqueue -> device -> completion latency) and the host needs
+            // the ids before it can do anything else in the layer, so removing
+            // it removes one command from the critical path.  The values and
+            // every consumer are unchanged: the CSR kernels and the reduce read
+            // the same ids from host USM, which is device-accessible because
+            // all GPU partitions share the context.  PF_Q4_IDS_HOST=0 restores
+            // the device buffer + copy: measured 166.3 vs 169.3 ms/token over
+            // two alternating pairs on the 64-token TCP prompt (164.4 vs 165.4
+            // on a 48-token one), with byte-identical output.  PF_Q4_ROUTIME
+            // prices the two halves against a drained queue: router 13.0 and
+            // copy 6.2 ms/token, i.e. most of what the HOT_TIME `ids` column
+            // shows is the router itself, not the copy.
+            static const bool ids_host = si::env::i32("PF_Q4_IDS_HOST", 1) != 0;
+            int32_t * ids_out = ids_host ? q4_moe_ids_ : A.ids;
             const bool htt = si::env::flag("PF_Q4_HOT_TIME");
             double thl = htt ? now_ms() : 0.0;
             const double th0 = thl;
@@ -1465,6 +1917,15 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 thl = now_ms();
             }
             double ts0 = 0.0;
+            // PF_Q4_ROUTIME: split the router kernel from the ids D2H.  Both
+            // halves are timed with a drain, so the numbers are host-observed
+            // latencies, not pure device time - diagnostic only.
+            static const bool q4rt = si::env::flag("PF_Q4_ROUTIME");
+            double trt = 0.0;
+            if (q4rt) {
+                qd.wait();
+                trt = now_ms();
+            }
             if (si::env::flag("PF_Q4_HOSTROUTER")) {
                 to_host(dev, q4_host_mix_, b.mixed, (size_t)n_tok * n_embd * sizeof(float));
                 cpu_moe_route(q4_host_mix_, n_embd, L.moe.gate_inp, L.moe.gate_inp_type, n_tok, n_embd, hp.n_expert, k,
@@ -1473,24 +1934,84 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 qd.memcpy(A.wts, q4_moe_wts_, (size_t)np * sizeof(float)).wait();
             } else {
                 moe_router_launch(qd, wptr(dev, L.moe.gate_inp), L.moe.gate_inp_type, b.mixed, n_embd, n_tok, n_embd,
-                                  hp.n_expert, k, A.logits, A.ids, A.wts);
+                                  hp.n_expert, k, A.logits, ids_out, A.wts);
+            }
+            if (q4rt) {
+                const double ts = now_ms();
+                qd.wait();
+                const double t = now_ms();
+                fprintf(stderr, "[q4rt] il=%d router=%.3f sub=%.3f drain=%.3f", il, t - trt, ts - trt, t - ts);
+                trt = t;
             }
             if (hist_on || (q4_hot_ && mode != 0)) {
                 if (!si::env::flag("PF_Q4_HOSTROUTER")) {
-                    qd.memcpy(q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
+                    if (ids_host) {
+                        // The ids are written straight to host USM; the queue
+                        // wait is the fence the D2H copy used to provide.
+                        qd.wait();
+                    } else {
+                        qd.memcpy(q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
+                    }
                 }
                 if (hist_on) {
                     hist_add(il);
                 }
                 cal_add(il);
             }
+            // A prefill chunk can select more distinct experts than the bank
+            // has slots (a 64-token chunk selects 155-212 in some layers
+            // against the all-GPU bank's 124).  One pass with an LRU cannot
+            // represent that: evicting an ACTIVE expert sets its slot to -1
+            // and the grouped kernels skip it, so its pairs were silently
+            // dropped (the 23.2 s prefill was wrong).  The fix keeps the slot
+            // map, the uploads and both GEMMs identical but runs the layer's
+            // active set in batches of at most R.  Each pair's expert is in
+            // exactly one batch, so every pair is still computed once and the
+            // arithmetic is unchanged.  PF_Q4_PF_ONEPASS=1 restores the old
+            // single pass for the A/B (it drops pairs when act > R).
+            int32_t * sm = nullptr;
+            std::vector<int> act;
+            // The two-pass schedule: a flat list of (expert, slot, copy) batch
+            // entries with batch boundaries.  Built from the layer's routing
+            // and the bank's current residency.
+            std::vector<int> pf_e;
+            std::vector<int32_t> pf_slot;
+            std::vector<char> pf_copy;
+            std::vector<int> pf_bstart;
+            std::vector<int> pf_bset; // 0/1 = workspace set for the reuse fence, -1 = kept/final
+            bool two_pass = false;
+            // PF_Q4_TAIL_SKIP: Strata's tail-skip (CUDA path) - an expert
+            // that every token routes at rank >= T is not admitted when it is
+            // a miss.  It is declared here because both the two-pass schedule
+            // and the single-pass decode need it; rank_min is filled after the
+            // ids are available.
+            static const int tail_skip = si::env::i32("PF_Q4_TAIL_SKIP", 0);
+            std::vector<int> rank_min;
             if (q4_hot_ && q4_hot_ready_) {
                 // All-GPU LRU: every expert the step selects is uploaded into a
                 // slot before the kernels run, so resident and newly uploaded
                 // experts use the same arithmetic and the next step's routing
                 // does not depend on where an expert happened to live.
                 const double ti0 = htt ? now_ms() : 0.0;
-                qd.memcpy(q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
+                if (cmiss) {
+                    // The host needs this token's mixed activation for its
+                    // miss pairs.  Enqueue the 10 KB D2H BEFORE the ids wait so
+                    // the existing drain covers it; putting it after the
+                    // resident GEMMs would make it wait for them on the
+                    // in-order queue, which is exactly the overlap this split
+                    // exists for.
+                    qd.memcpy(q4_host_mix_, b.mixed, (size_t)n_embd * sizeof(float));
+                }
+                if (ids_host) {
+                    // The ids are already in this buffer: wait for the router
+                    // itself rather than for a copy queued behind it.
+                    qd.wait();
+                } else {
+                    qd.memcpy(q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
+                }
+                if (q4rt) {
+                    fprintf(stderr, " copy=%.3f\n", now_ms() - trt);
+                }
                 if (htt) {
                     const double t = now_ms();
                     fprintf(stderr, " ids=%.1f", t - ti0);
@@ -1498,10 +2019,24 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
                 const int E = hp.n_expert;
                 const int R = q4_hot_r_;
-                int32_t * sm = &q4_sm_host_[(size_t)il * (size_t)E];
-                uint32_t * age = &q4_lru_age_[(size_t)il * (size_t)R];
+                sm = &q4_sm_host_[(size_t)il * (size_t)E];
                 std::vector<char> seen((size_t)E, 0);
-                std::vector<int> act;
+                const int k_used = hp.n_expert_used;
+                // Resident experts still run; a skipped pair keeps sm[e] = -1,
+                // so the grouped kernels write nothing into A.acc (zeroed
+                // before the down) and it contributes zero.
+                if (tail_skip > 0) {
+                    rank_min.assign((size_t)E, k_used);
+                    for (int pr = 0; pr < np; pr++) {
+                        const int e = q4_moe_ids_[pr];
+                        if (e >= 0 && e < E) {
+                            const int j = pr % k_used;
+                            if (j < rank_min[(size_t)e]) {
+                                rank_min[(size_t)e] = j;
+                            }
+                        }
+                    }
+                }
                 for (int pr = 0; pr < np; pr++) {
                     const int e = q4_moe_ids_[pr];
                     if (e >= 0 && e < E && !seen[(size_t)e]) {
@@ -1509,6 +2044,137 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         act.push_back(e);
                     }
                 }
+                if ((int)act.size() > R) {
+                    if (si::env::flag("PF_Q4_PF_ONEPASS")) {
+                        fprintf(stderr,
+                                "[q4] hot bank: layer %d selects %zu experts against %d slots "
+                                "(PF_Q4_PF_ONEPASS=1: pairs whose expert did not fit are dropped)\n",
+                                il, act.size(), R);
+                    } else {
+                        // Schedule, not just a split.  The bank's resident set
+                        // is the best predictor of the next chunk's hot set, so
+                        // the LAST batch keeps as many resident experts as it
+                        // can in their existing slots, and fills the rest with
+                        // the most frequently routed newcomers.  Everything
+                        // else runs in earlier batches through slots that hold
+                        // no kept expert (dead residents and the few resident
+                        // experts deliberately given up to keep the workspace
+                        // wide enough that this stays a handful of batches).
+                        two_pass = true;
+                        std::vector<uint32_t> freq((size_t)E, 0);
+                        for (int pr = 0; pr < np; pr++) {
+                            const int e = q4_moe_ids_[pr];
+                            if (e >= 0 && e < E) {
+                                freq[(size_t)e]++;
+                            }
+                        }
+                        std::vector<int32_t> old_e((size_t)R, -1);
+                        for (int e = 0; e < E; e++) {
+                            const int s = sm[e];
+                            if (s >= 0 && s < R) {
+                                old_e[(size_t)s] = e;
+                            }
+                        }
+                        auto by_freq = [&](int a, int b) {
+                            return freq[(size_t)a] != freq[(size_t)b] ? freq[(size_t)a] > freq[(size_t)b] : a < b;
+                        };
+                        std::vector<int> hot, rest;
+                        for (int e : act) {
+                            const bool resident = sm[e] >= 0 && sm[e] < R;
+                            // A slot outside [0,R) cannot be kept (and must not
+                            // be handed to a kernel), so treat it as cold.
+                            // A tail miss (rank >= T for every token) is not
+                            // worth a slot or a copy; it stays sm[e] = -1.
+                            if (!resident && tail_skip > 0 && rank_min[(size_t)e] >= tail_skip) {
+                                continue;
+                            }
+                            (resident ? hot : rest).push_back(e);
+                        }
+                        std::sort(hot.begin(), hot.end(), by_freq);
+                        const int h = (int)hot.size();
+                        // A minimum workspace keeps the number of rounds
+                        // bounded when the bank is nearly all resident; giving
+                        // up k residents costs k copies and saves a batch.
+                        const int wmin = std::max(1, std::min(R - 1, si::env::i32("PF_Q4_PF_WMIN", 24)));
+                        const int k = (R - h < wmin) ? std::min(h, wmin - (R - h)) : 0;
+                        const int kept_n = h - k;
+                        std::vector<char> keep_e((size_t)E, 0);
+                        for (int i = 0; i < kept_n; i++) {
+                            keep_e[(size_t)hot[(size_t)i]] = 1;
+                        }
+                        for (int i = kept_n; i < h; i++) {
+                            rest.push_back(hot[(size_t)i]);
+                        }
+                        std::sort(rest.begin(), rest.end(), by_freq);
+                        std::vector<int> ws;
+                        for (int s = 0; s < R; s++) {
+                            const int e = old_e[(size_t)s];
+                            if (e >= 0 && keep_e[(size_t)e]) {
+                                continue;
+                            }
+                            ws.push_back(s);
+                        }
+                        const int W = (int)ws.size();
+                        const int fill_n = std::min((int)rest.size(), R - kept_n);
+                        pf_bstart.push_back(0);
+                        // Double-buffer the workspace so batch i+1's upload can
+                        // run while batch i's expert GEMMs read the bank: the
+                        // two halves never alias.  The final fill (the hottest
+                        // newcomers) still uses the whole workspace after the
+                        // kept batch; its copy waits for the last early batch's
+                        // compute, while the kept batch does not use `ws`.
+                        const int W2 = std::max(1, W / 2);
+                        int set = 0;
+                        for (size_t i = (size_t)fill_n; i < rest.size(); i += (size_t)W2) {
+                            const size_t j1 = std::min(rest.size(), i + (size_t)W2);
+                            const int base = set ? W2 : 0;
+                            for (size_t j = i; j < j1; j++) {
+                                pf_e.push_back(rest[j]);
+                                pf_slot.push_back(ws[(size_t)base + (j - i)]);
+                                pf_copy.push_back(1);
+                            }
+                            pf_bset.push_back(set);
+                            set ^= 1;
+                            pf_bstart.push_back((int)pf_e.size());
+                        }
+                        for (int i = 0; i < kept_n; i++) {
+                            const int e = hot[(size_t)i];
+                            pf_e.push_back(e);
+                            pf_slot.push_back(sm[e]);
+                            pf_copy.push_back(0);
+                        }
+                        pf_bset.push_back(-1);
+                        for (int i = 0; i < fill_n; i++) {
+                            pf_e.push_back(rest[(size_t)i]);
+                            pf_slot.push_back(ws[(size_t)i]);
+                            pf_copy.push_back(1);
+                        }
+                        pf_bset.push_back(-1);
+                        pf_bstart.push_back((int)pf_e.size());
+                        int ncopy = 0;
+                        for (char c : pf_copy) {
+                            ncopy += c;
+                        }
+                        pf_layers++;
+                        pf_batches += (int)pf_bstart.size() - 1;
+                        pf_act += (int)act.size();
+                        pf_upb += (size_t)ncopy * (bank->sg + bank->su + bank->sd);
+                        if (si::env::flag("PF_Q4_PF_STATS")) {
+                            fprintf(stderr, "[q4pf2] il=%d act=%zu hot=%d kept=%d batches=%zu copies=%d\n", il,
+                                    act.size(), h, kept_n, pf_bstart.size() - 1, ncopy);
+                        }
+                    }
+                }
+            }
+            if (q4_hot_ && q4_hot_ready_ && !two_pass) {
+                // The single-pass LRU is the decode fast path (act <= R) and
+                // the A/B path above; everything it uploads is resident when
+                // the kernels below run.
+                const int E = hp.n_expert;
+                const int R = q4_hot_r_;
+                uint32_t * age = &q4_lru_age_[(size_t)il * (size_t)R];
+                float * heat = &q4_lru_heat_[(size_t)il * (size_t)R];
+                static const bool use_heat = si::env::flag("PF_Q4_HEAT");
                 std::vector<int> slot_e((size_t)R, -1);
                 std::vector<char> slot_act((size_t)R, 0);
                 for (int e = 0; e < E; e++) {
@@ -1518,39 +2184,86 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     }
                 }
                 ++q4_lru_tick_;
+                // Strata decays once per 4 windows.  Here the tick advances
+                // once per layer, so four tokens is 4*n_layer ticks; decay
+                // every layer's heat at that boundary, not once per layer.
+                if (use_heat && il == 0 && (q4_lru_tick_ % (4u * (uint32_t)hp.n_layer)) == 0) {
+                    for (float & h : q4_lru_heat_) {
+                        h *= 0.7f;
+                    }
+                }
                 for (int e : act) {
                     const int sl = sm[e];
                     if (sl >= 0 && sl < R) {
                         slot_act[(size_t)sl] = 1;
                         age[(size_t)sl] = q4_lru_tick_;
+                        if (use_heat) {
+                            heat[(size_t)sl] += 1.f;
+                        }
                     }
                 }
-                if ((int)act.size() > R) {
-                    fprintf(stderr,
-                            "[q4] hot bank: layer %d selects %zu experts against %d slots; lower PF_Q4_PF_CHUNK\n", il,
-                            act.size(), R);
-                }
+                // Slot selection.  The old loops carried `victim < 0` in their
+                // own condition, so they stopped at the FIRST non-active slot
+                // instead of the least-recently-used one: slots 0..~10 were the
+                // only ones ever reused and every other slot kept the expert it
+                // was filled with in the first ~12 decode tokens.  Measured on
+                // the 72-token TCP prompt (tokens 33..64): 95 misses/token and
+                // 280 MB of uploads before, 58 and 169 MB after, and the wall
+                // 179 -> 166 ms/token.  PF_Q4_LRU_OLD restores the old loops for
+                // the A/B; it is not an LRU and must stay off.
+                static const bool old_lru = si::env::flag("PF_Q4_LRU_OLD"); // A/B only
+                auto pick_victim = [&](bool include_active) -> int {
+                    if (old_lru) {
+                        // The pre-fix behaviour, kept for the A/B: the first
+                        // vacant non-active slot, else the first non-active
+                        // slot, else slot 0.  This is not an LRU.
+                        if (!include_active) {
+                            for (int sl = 0; sl < R; sl++) {
+                                if (slot_e[(size_t)sl] < 0 && !slot_act[(size_t)sl]) {
+                                    return sl;
+                                }
+                            }
+                            for (int sl = 0; sl < R; sl++) {
+                                if (!slot_act[(size_t)sl]) {
+                                    return sl;
+                                }
+                            }
+                        }
+                        return 0;
+                    }
+                    int vic = -1;
+                    for (int sl = 0; sl < R; sl++) {
+                        if (!include_active && slot_act[(size_t)sl]) {
+                            continue;
+                        }
+                        if (vic < 0) {
+                            vic = sl;
+                            continue;
+                        }
+                        if (use_heat ? heat[(size_t)sl] < heat[(size_t)vic] : age[(size_t)sl] < age[(size_t)vic]) {
+                            vic = sl;
+                        }
+                    }
+                    return vic;
+                };
                 bool changed = false;
+                const bool pin = bank->hg && bank->hu && bank->hd;
+                const char * gsrc = pin ? (const char *)bank->hg : (const char *)L.moe.gate_exps.data;
+                const char * usrc = pin ? (const char *)bank->hu : (const char *)L.moe.up_exps.data;
+                const char * dsrc = pin ? (const char *)bank->hd : (const char *)L.moe.down_exps.data;
                 for (int e : act) {
                     if (sm[e] >= 0) {
                         continue;
                     }
-                    int victim = -1;
-                    for (int sl = 0; sl < R; sl++) {
-                        if (slot_e[(size_t)sl] < 0 && !slot_act[(size_t)sl]) {
-                            victim = sl;
-                            break;
-                        }
+                    if (tail_skip > 0 && rank_min[(size_t)e] >= tail_skip) {
+                        continue; // tail miss: no slot, no copy, zero contribution
                     }
-                    for (int sl = 0; sl < R && victim < 0; sl++) {
-                        if (!slot_act[(size_t)sl] && (victim < 0 || age[(size_t)sl] < age[(size_t)victim])) {
-                            victim = sl;
-                        }
+                    if (cmiss) {
+                        continue; // CPU miss: no slot, no copy, no eviction
                     }
-                    for (int sl = 0; sl < R && victim < 0; sl++) {
-                        if (victim < 0 || age[(size_t)sl] < age[(size_t)victim]) {
-                            victim = sl;
-                        }
+                    int victim = pick_victim(false);
+                    if (victim < 0) {
+                        victim = pick_victim(true);
                     }
                     if (victim < 0) {
                         break;
@@ -1562,19 +2275,48 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     slot_e[(size_t)victim] = e;
                     slot_act[(size_t)victim] = 1;
                     age[(size_t)victim] = q4_lru_tick_;
+                    if (use_heat) {
+                        heat[(size_t)victim] = 1.f;
+                    }
                     const size_t gb = bank->sg, ub = bank->su, db = bank->sd;
-                    q4_upload(dev, (char *)bank->g + (size_t)victim * gb,
-                              (const char *)L.moe.gate_exps.data + (size_t)e * gb, gb);
-                    q4_upload(dev, (char *)bank->u + (size_t)victim * ub,
-                              (const char *)L.moe.up_exps.data + (size_t)e * ub, ub);
-                    q4_upload(dev, (char *)bank->d + (size_t)victim * db,
-                              (const char *)L.moe.down_exps.data + (size_t)e * db, db);
+                    q4_upload(dev, (char *)bank->g + (size_t)victim * gb, gsrc + (size_t)e * gb, gb, pin);
+                    q4_upload(dev, (char *)bank->u + (size_t)victim * ub, usrc + (size_t)e * ub, ub, pin);
+                    q4_upload(dev, (char *)bank->d + (size_t)victim * db, dsrc + (size_t)e * db, db, pin);
                     upmiss++;
                     upbytes += gb + ub + db;
                     changed = true;
                 }
+                if (cmiss) {
+                    // The host's pairs are exactly the selected pairs whose
+                    // expert has no slot, minus the tail-skipped ones (they
+                    // contribute zero, as they do on the GPU path).
+                    cmiss_pr.reserve((size_t)np);
+                    for (int pr = 0; pr < np; pr++) {
+                        const int e = q4_moe_ids_[pr];
+                        if (e < 0 || e >= E || sm[e] >= 0) {
+                            continue;
+                        }
+                        if (tail_skip > 0 && rank_min[(size_t)e] >= tail_skip) {
+                            cmiss_tail++;
+                            continue;
+                        }
+                        cmiss_pr.push_back(pr);
+                    }
+                }
                 if (changed) {
                     q4_upload(dev, bank->sm, sm, (size_t)E * sizeof(int32_t));
+                    static const bool updma = si::env::flag("PF_Q4_UPDMA");
+                    if (updma) {
+                        // Diagnostic: these copies are the only work between the
+                        // ids wait and the layer's first GEMM, and the queue is
+                        // in order, so this drain is the H2D time those GEMMs
+                        // would have stalled on.  It removes the host's
+                        // run-ahead, so this is an attribution run, not a cell.
+                        const auto t0 = std::chrono::steady_clock::now();
+                        qd.wait();
+                        q4_up_dma_ms_ +=
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    }
                 }
                 if (!q4_hotchk_done_ && si::env::flag("PF_Q4_HOTCHK")) {
                     int bg = 0, bu = 0, bd = 0;
@@ -1608,73 +2350,274 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
             }
             moe_csr_clear_launch(qd, A.off, A.cur, A.active, A.nact, hp.n_expert);
-            moe_csr_count_launch(qd, A.ids, np, A.off);
+            moe_csr_count_launch(qd, ids_out, np, A.off);
             moe_csr_prefix_launch(qd, A.off, A.active, A.nact, hp.n_expert);
-            moe_csr_scatter_launch(qd, A.ids, A.off, A.cur, A.pair, np);
-            moe_actq_launch(qd, b.mixed, n_embd, n_tok, n_embd, A.xq, A.asa, A.xs);
-            if (htt) {
-                qd.wait();
-                const double t = now_ms();
-                fprintf(stderr, " aq=%.1f", t - thl);
-                thl = t;
-            }
+            moe_csr_scatter_launch(qd, ids_out, A.off, A.cur, A.pair, np);
+            // The token-row quantisation and the pair-row one (`quant_h`, for
+            // the down) share A.xq/A.asa/A.xs.  One-pass runs them once each in
+            // that order; a two-pass layer must redo the token rows before
+            // every batch, because the previous batch's down overwrote them.
+            auto quant_x = [&]() {
+                moe_actq_launch(qd, b.mixed, n_embd, n_tok, n_embd, A.xq, A.asa, A.xs);
+            };
             // `active` can never hold more experts than there are pairs: for a
             // decode that is 10, not 512.  The grid is n_act_max * column
             // blocks, so launching n_expert made 502 of 512 workgroups return
-            // immediately on every decode step.
-            const int n_act = std::min(hp.n_expert, np);
+            // immediately on every decode step.  The two-pass path knows the
+            // exact active count on the host; the one-pass path keeps the
+            // decode's shape exactly as it was.
+            const int n_act = two_pass ? std::min(hp.n_expert, (int)act.size()) : std::min(hp.n_expert, np);
             const bool dec = (mode == 0);
-            bool ok = false;
-            if (!si::env::flag("PF_Q4_NOGRP") && !si::env::flag("PF_Q4_NOGRP_UP")) {
-                ok = moe_grp_gate_up_launch(qd, bank->g, bank->u, bank->sm, bank->sg, bank->su, A.off, A.pair,
-                                            A.active, A.nact, n_act, hp.n_expert, np, A.xq, A.asa, A.xs, A.h,
-                                            hp.n_ff_exp, n_embd, hp.n_ff_exp, k, L.moe.gate_exps.type,
-                                            L.moe.up_exps.type, dec);
-            }
-            if (!ok) {
-                moe_gate_up_launch(qd, bank->g, bank->u, bank->sm, bank->sg, bank->su, A.off, A.pair, A.active, A.nact,
-                                   n_act, b.mixed, n_embd, A.h, hp.n_ff_exp, n_embd, hp.n_ff_exp, k,
-                                   L.moe.gate_exps.type, L.moe.up_exps.type);
-            }
-            if (htt) {
-                qd.wait();
-                const double t = now_ms();
-                fprintf(stderr, " gu=%.1f", t - thl);
-                thl = t;
-            }
-            moe_actq_launch(qd, A.h, hp.n_ff_exp, np, hp.n_ff_exp, A.xq, A.asa, A.xs);
-            if (q4_hot_) {
-                // Every pair the layer selects is resident by now (the LRU
-                // uploaded it above); zero so a slot skipped for an inactive
-                // expert cannot carry the previous layer's value.
-                qd.memset(A.acc, 0, (size_t)np * (size_t)n_embd * sizeof(float));
-            }
-            bool okd = false;
             const bool grp_off = si::env::flag("PF_Q4_NOGRP") || si::env::flag("PF_Q4_NOGRP_DOWN");
-            if (L.moe.down_exps.type == 7 && !grp_off) {
-                // Q5_1 is one 32-value group per block, not a 256-value
-                // superblock, so `moe_grp_down_launch` declines the bank's
-                // K = n_ff_exp = 640 and the down used to fall through to the
-                // fp32-lane dequant kernel - the one projection of the bank
-                // that was not on dp4a.  `PF_Q4_NOGRP_DOWN=1` is the A/B back
-                // to that path.
-                moe_down_q5_1_launch(qd, bank->d, bank->sm, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
-                                     hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd, hp.n_ff_exp);
-                okd = true;
-            } else if (!grp_off) {
-                okd = moe_grp_down_launch(qd, bank->d, bank->sm, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
-                                          hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd, hp.n_ff_exp,
-                                          L.moe.down_exps.type, dec);
-            }
-            if (!okd) {
-                moe_down_launch(qd, bank->d, bank->sm, bank->sd, A.off, A.pair, A.active, A.nact, n_act, A.h,
-                                hp.n_ff_exp, A.acc, n_embd, n_embd, hp.n_ff_exp, L.moe.down_exps.type);
-            }
-            if (htt) {
-                qd.wait();
-                const double t = now_ms();
-                fprintf(stderr, " dn=%.1f", t - thl);
-                thl = t;
+            auto gate_up = [&](const int32_t *smap) {
+                bool ok = false;
+                if (!si::env::flag("PF_Q4_NOGRP") && !si::env::flag("PF_Q4_NOGRP_UP")) {
+                    ok = moe_grp_gate_up_launch(qd, bank->g, bank->u, smap, bank->sg, bank->su, A.off, A.pair,
+                                                A.active, A.nact, n_act, hp.n_expert, np, A.xq, A.asa, A.xs, A.h,
+                                                hp.n_ff_exp, n_embd, hp.n_ff_exp, k, L.moe.gate_exps.type,
+                                                L.moe.up_exps.type, dec);
+                }
+                if (!ok) {
+                    moe_gate_up_launch(qd, bank->g, bank->u, smap, bank->sg, bank->su, A.off, A.pair, A.active,
+                                       A.nact, n_act, b.mixed, n_embd, A.h, hp.n_ff_exp, n_embd, hp.n_ff_exp, k,
+                                       L.moe.gate_exps.type, L.moe.up_exps.type);
+                }
+            };
+            auto quant_h = [&]() {
+                moe_actq_launch(qd, A.h, hp.n_ff_exp, np, hp.n_ff_exp, A.xq, A.asa, A.xs);
+            };
+            auto down = [&](const int32_t *smap) {
+                bool okd = false;
+                if (L.moe.down_exps.type == 7 && !grp_off) {
+                    // Q5_1 is one 32-value group per block, not a 256-value
+                    // superblock, so `moe_grp_down_launch` declines the bank's
+                    // K = n_ff_exp = 640 and the down used to fall through to
+                    // the fp32-lane dequant kernel - the one projection of the
+                    // bank that was not on dp4a.  `PF_Q4_NOGRP_DOWN=1` is the
+                    // A/B back to that path.
+                    moe_down_q5_1_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
+                                         hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd, hp.n_ff_exp);
+                    okd = true;
+                } else if (L.moe.down_exps.type == 8 && !grp_off) {
+                    // Q8_0's 34-byte block is one 32-value group, like Q5_1 but
+                    // with signed weights and no minimum; this is the kernel
+                    // that makes layers 4, 30, 46 and 47 bankable.
+                    moe_down_q8_0_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
+                                         hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd, hp.n_ff_exp);
+                    okd = true;
+                } else if (!grp_off) {
+                    okd = moe_grp_down_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
+                                              hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd, hp.n_ff_exp,
+                                              L.moe.down_exps.type, dec);
+                }
+                if (!okd) {
+                    moe_down_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act, A.h,
+                                    hp.n_ff_exp, A.acc, n_embd, n_embd, hp.n_ff_exp, L.moe.down_exps.type);
+                }
+            };
+            if (!two_pass) {
+                const double tcg0 = cmiss_time ? now_ms() : 0.0;
+                quant_x();
+                if (htt) {
+                    qd.wait();
+                    const double t = now_ms();
+                    fprintf(stderr, " aq=%.1f", t - thl);
+                    thl = t;
+                }
+                gate_up(bank->sm);
+                if (htt) {
+                    qd.wait();
+                    const double t = now_ms();
+                    fprintf(stderr, " gu=%.1f", t - thl);
+                    thl = t;
+                }
+                quant_h();
+                if (q4_hot_) {
+                    // Every pair the layer selects is resident by now (the LRU
+                    // uploaded it above); zero so a slot skipped for an inactive
+                    // expert cannot carry the previous layer's value.
+                    qd.memset(A.acc, 0, (size_t)np * (size_t)n_embd * sizeof(float));
+                }
+                down(bank->sm);
+                t_cmiss_submit = cmiss_time ? now_ms() - tcg0 : 0.0;
+                if (cmiss && !cmiss_pr.empty()) {
+                    // The resident chain (CSR, quantize, gate/up, quantize,
+                    // down) is already submitted; the host now computes the
+                    // missing pairs from the pinned source while it runs.  The
+                    // contribution is staged in pinned memory and enqueued
+                    // into A.acc, which the (not yet launched) reduction
+                    // reads - the same rows the grouped kernels wrote for the
+                    // residents, once each.
+                    const bool pin = bank->hg && bank->hu && bank->hd;
+                    cpu_moe CM;
+                    CM.gate_exps = {pin ? (const char *)bank->hg : (const char *)L.moe.gate_exps.data,
+                                    L.moe.gate_exps.type, L.moe.gate_exps.K, L.moe.gate_exps.N,
+                                    pin ? bank->sg : L.moe.gate_exps.plane_bytes};
+                    CM.up_exps = {pin ? (const char *)bank->hu : (const char *)L.moe.up_exps.data,
+                                  L.moe.up_exps.type, L.moe.up_exps.K, L.moe.up_exps.N,
+                                  pin ? bank->su : L.moe.up_exps.plane_bytes};
+                    CM.down_exps = {pin ? (const char *)bank->hd : (const char *)L.moe.down_exps.data,
+                                    L.moe.down_exps.type, L.moe.down_exps.K, L.moe.down_exps.N,
+                                    pin ? bank->sd : L.moe.down_exps.plane_bytes};
+                    CM.n_expert = hp.n_expert;
+                    CM.n_ff_exp = hp.n_ff_exp;
+                    CM.n_embd = n_embd;
+                    CM.down_i8 = L.moe.down_i8;
+                    CM.down_sc = L.moe.down_sc;
+                    CM.down_K = L.moe.down_i8_K;
+                    CM.down_N = L.moe.down_i8_N;
+                    CM.down_E = L.moe.down_i8_E;
+                    // The native down kernel reads `down_raw`; it must be the
+                    // pinned plane, not the mmap (that layer's GGUF pages are
+                    // released after the bank upload, so a host read would
+                    // re-fault every row from disk).
+                    CM.down_raw = pin ? (const void *)bank->hd : L.moe.down_exps.data;
+                    CM.down_row_bytes = quant_row_bytes(L.moe.down_exps.type, L.moe.down_exps.K);
+                    CM.down_type = L.moe.down_exps.type;
+                    const double h0 = cmiss_time ? now_ms() : 0.0;
+                    std::vector<int32_t> mids(cmiss_pr.size());
+                    for (size_t m = 0; m < cmiss_pr.size(); m++) {
+                        mids[m] = q4_moe_ids_[cmiss_pr[m]];
+                    }
+                    if (cmiss_mode == 2) {
+                        // A/B arm: the f32 dequant+dot per-pair path, for the
+                        // quality reference against the int8 host path.
+                        cpu_moe_experts(CM, q4_host_mix_, n_embd, 1, (int)cmiss_pr.size(), mids.data(), nullptr,
+                                        q4_miss_acc_, n_embd, true);
+                    } else {
+                        cpu_moe_experts_i8(CM, q4_host_mix_, n_embd, (int)cmiss_pr.size(), mids.data(), q4_miss_acc_,
+                                           n_embd);
+                    }
+                    t_cmiss_host = cmiss_time ? now_ms() - h0 : 0.0;
+                    for (size_t m = 0; m < cmiss_pr.size(); m++) {
+                        const int pr = cmiss_pr[m];
+                        // Queued after the resident down and before the
+                        // reduction; the source is pinned and is not rewritten
+                        // until this layer's queue has drained (the next
+                        // layer's ids wait).
+                        qd.memcpy(A.acc + (size_t)pr * (size_t)n_embd, q4_miss_acc_ + m * (size_t)n_embd,
+                                  (size_t)n_embd * sizeof(float));
+                    }
+                }
+                if (cmiss_time) {
+                    qd.wait();
+                    fprintf(stderr,
+                            "[q4cm] il=%d np=%d gpu=%d cpu=%zu tail=%d submit=%.3f host=%.3f wall=%.3f\n", il, np,
+                            np - (int)cmiss_pr.size() - cmiss_tail, cmiss_pr.size(), cmiss_tail, t_cmiss_submit,
+                            t_cmiss_host, now_ms() - tcg0);
+                }
+                if (htt) {
+                    qd.wait();
+                    const double t = now_ms();
+                    fprintf(stderr, " dn=%.1f", t - thl);
+                    thl = t;
+                }
+            } else {
+                // Two-pass: the CSR, the token-row activation quantisation and
+                // A.acc are shared, and each batch only rewrites the slot map
+                // and the slots it owns.  A pair's expert is in exactly one
+                // batch, so the down writes each acc row exactly once - zero it
+                // once here, not between batches.
+                qd.memset(A.acc, 0, (size_t)np * (size_t)n_embd * sizeof(float));
+                const int E = hp.n_expert;
+                std::vector<int32_t> row((size_t)E, -1);
+                // PF_Q4_PF_PIPE=0 restores the old serial copies (the A/B for
+                // the copy/compute overlap); the schedule itself stays the
+                // same so the two cells compute identical maps.
+                static const bool pipe = si::env::i32("PF_Q4_PF_PIPE", 1) != 0;
+                sycl::event ev_ws[2];
+                bool ev_ws_live[2] = {false, false};
+                sycl::event ev_last;
+                bool ev_last_live = false;
+                int32_t * last_smap = nullptr;
+                for (size_t bi = 0; bi + 1 < pf_bstart.size(); bi++) {
+                    const int i0 = pf_bstart[bi], i1 = pf_bstart[bi + 1];
+                    const int set = bi < pf_bset.size() ? pf_bset[bi] : -1;
+                    bool has_copy = false;
+                    for (int i = i0; i < i1; i++) {
+                        has_copy = has_copy || pf_copy[(size_t)i];
+                    }
+                    const bool is_last = (bi + 2 == pf_bstart.size());
+                    // Reusing a workspace half requires the batch that last
+                    // read it to have finished.  The kept/final batch has no
+                    // set, but the final fill overwrites the whole workspace,
+                    // so it waits for the last early batch; the kept batch does
+                    // not touch `ws` and may run under the final upload.
+                    if (pipe && set >= 0 && ev_ws_live[set]) {
+                        ev_ws[set].wait();
+                        ev_ws_live[set] = false;
+                    }
+                    if (pipe && set < 0 && has_copy && is_last && ev_last_live) {
+                        ev_last.wait();
+                        ev_last_live = false;
+                    }
+                    // Only this batch's experts are mapped; every other expert
+                    // is -1, which the bank kernels skip without computing it.
+                    // The kept residents keep their old slot, so their planes
+                    // are already there and are not copied.
+                    std::fill(row.begin(), row.end(), -1);
+                    for (int i = i0; i < i1; i++) {
+                        row[(size_t)pf_e[(size_t)i]] = pf_slot[(size_t)i];
+                    }
+                    // Alternate the device map so batch i+1's map copy cannot
+                    // land on the map batch i's kernels are still reading.
+                    int32_t * smap = ((bi & 1) && bank->sm2) ? bank->sm2 : bank->sm;
+                    last_smap = smap;
+                    const bool pin = bank->hg && bank->hu && bank->hd;
+                    const char * gsrc = pin ? (const char *)bank->hg : (const char *)L.moe.gate_exps.data;
+                    const char * usrc = pin ? (const char *)bank->hu : (const char *)L.moe.up_exps.data;
+                    const char * dsrc = pin ? (const char *)bank->hd : (const char *)L.moe.down_exps.data;
+                    for (int i = i0; i < i1; i++) {
+                        if (!pf_copy[(size_t)i]) {
+                            continue;
+                        }
+                        const int e = pf_e[(size_t)i];
+                        const int sl = pf_slot[(size_t)i];
+                        auto up = [&](void * dst, const void * src, size_t n) {
+                            if (pipe) {
+                                q4_upload_async(dev, dst, src, n, pin);
+                            } else {
+                                q4_upload(dev, dst, src, n, pin);
+                            }
+                        };
+                        up((char *)bank->g + (size_t)sl * bank->sg, gsrc + (size_t)e * bank->sg, bank->sg);
+                        up((char *)bank->u + (size_t)sl * bank->su, usrc + (size_t)e * bank->su, bank->su);
+                        up((char *)bank->d + (size_t)sl * bank->sd, dsrc + (size_t)e * bank->sd, bank->sd);
+                    }
+                    std::memcpy(sm, row.data(), (size_t)E * sizeof(int32_t));
+                    if (pipe) {
+                        q4_upload_async(dev, smap, row.data(), (size_t)E * sizeof(int32_t));
+                        if (dev >= 0 && dev < (int)q4_up_last_live_.size() && q4_up_last_live_[(size_t)dev]) {
+                            q4_up_last_ev_[(size_t)dev].wait();
+                            q4_up_last_live_[(size_t)dev] = 0;
+                        }
+                    } else {
+                        q4_upload(dev, smap, row.data(), (size_t)E * sizeof(int32_t));
+                    }
+                    quant_x();
+                    gate_up(smap);
+                    quant_h();
+                    down(smap);
+                    if (pipe && set >= 0) {
+                        ev_ws[set] = qd.ext_oneapi_submit_barrier();
+                        ev_ws_live[set] = true;
+                        ev_last = ev_ws[set];
+                        ev_last_live = true;
+                    }
+                }
+                // The one-pass decode uses bank->sm; the last batch may have
+                // written the alternate map (the prefetch alternates them).
+                // Leave the final map in bank->sm so the next decode's resident
+                // experts are read through the map the prefill ended with.
+                if (two_pass && last_smap && last_smap != bank->sm) {
+                    q4_upload(dev, bank->sm, sm, (size_t)E * sizeof(int32_t));
+                }
+                if (htt) {
+                    qd.wait();
+                    const double t = now_ms();
+                    fprintf(stderr, " 2pass=%.1f act=%zu batches=%zu", t - thl, act.size(), pf_bstart.size() - 1);
+                    thl = t;
+                }
             }
             // moe_reduce ACCUMULATES (`out +=`), and b.block still holds the
             // residual stream's routed slot from the previous layer: zero it
@@ -1683,7 +2626,9 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             qd.memset(b.block, 0, (size_t)n_tok * n_embd * sizeof(float));
             const char * ffs = si::env::str("PF_Q4_FFCMP");
             if (ffs && atoi(ffs) == il) {
-                qd.memcpy(q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
+                if (!ids_host) {
+                    qd.memcpy(q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
+                }
                 std::vector<float> gacc((size_t)np * (size_t)n_embd);
                 qd.memcpy(gacc.data(), A.acc, gacc.size() * sizeof(float)).wait();
                 to_host(dev, q4_host_mix_, b.mixed, (size_t)n_tok * n_embd * sizeof(float));
@@ -1836,7 +2781,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             if (q4time) {
                 t_moe += now_ms() - tm0;
             }
-            hc_combine(dev, inj2);
+            hc_combine(dev, inj2, ph_hf);
             dbg_stats("l_last", dev, b.res, (size_t)n_tok * hc_dim, hc);
             continue;
         }
@@ -1960,7 +2905,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         from_host(dev, b.block, q4_host_out_, (size_t)n_tok * n_embd * sizeof(float));
         if (q4time) { t_cp += now_ms() - tc1; }
         dbg_stats("ffn_out", dev, b.block, (size_t)n_tok * n_embd, 0);
-        hc_combine(dev, inj2);
+        hc_combine(dev, inj2, ph_hf);
         dbg_stats("l_last", dev, b.res, (size_t)n_tok * hc_dim, hc);
         if (q4time) {
             t_moe += now_ms() - tm0;
@@ -1968,13 +2913,44 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     }
 
     q4_hotchk_done_ = true;
+    if (pf_layers && si::env::flag("PF_Q4_PF_STATS")) {
+        fprintf(stderr,
+                "[q4pf] mode=%d n=%d layers=%d act=%d batches=%d upload=%.1f MiB (%.2f s at 2 GB/s)\n", mode, n_tok,
+                pf_layers, pf_act, pf_batches, (double)pf_upb / (1024.0 * 1024.0),
+                (double)pf_upb / (2.0e9));
+    }
     if (q4time) {
         const double total = now_ms() - t_start;
         fprintf(stderr,
                 "[q4] fwd n=%d moe_host=%.1f rest=%.1f | route=%.1f experts=%.1f shared=%.1f copies=%.1f ms\n", n_tok,
                 t_moe, total - t_moe, t_route, t_exp, t_shared, t_cp);
     }
+    auto print_qsa = [&] {
+        if (!qsatime) {
+            return;
+        }
+        fprintf(stderr,
+                "[qsa] fwd mode=%d n=%d total=%.2f wall=%.2f | copy=%.2f gemv=%.2f upd=%.2f sel=%.2f attn=%.2f "
+                "ms (rows=%ld nsel=%ld)\n",
+                mode, n_tok, t_qsa, now_ms() - t_wall0, qsa_copy_ms_, qsa_gemv_ms_, qsa_upd_ms_, qsa_sel_ms_,
+                qsa_attn_ms_, qsa_rows_, qsa_nsel_);
+    };
+    if (upstat) {
+        const double cms = q4_up_copy_ms_ - up_c0;
+        const double mib = (double)(q4_up_bytes_ - up_b0) / (1024.0 * 1024.0);
+        fprintf(stderr, "[q4up] n=%d calls=%zu bytes=%.1f MiB copy=%.2f enq=%.2f wait=%.2f dma=%.2f ms (%.2f GB/s)\n", n_tok,
+                q4_up_calls_ - up_n0, mib, cms, q4_up_enq_ms_ - up_e0, q4_up_wait_ms_ - up_w0, q4_up_dma_ms_ - up_d0,
+                cms > 0.01 ? mib * 1.048576 / cms : 0.0);
+    }
     if (!with_head) {
+        // Apply any deferred QSA update before the chunk's device work is
+        // drained: the copies were enqueued inside the layer loop, so their
+        // event waits return without waiting for the tail of the chunk.
+        if (qsatime) {
+            t_qsa += qsa_flush();
+        } else {
+            qsa_flush();
+        }
         // A partial chunk returns while its kernels and seg-ring copies may
         // still be in flight; the next chunk reuses the host staging ring and
         // the same USM buffers.  Wait, or the driver sees an overwritten copy
@@ -1984,6 +2960,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         } else {
             be_of(0).synchronize();
         }
+        print_qsa();
         return;
     }
     // ---- final hyper-connection mixer + LM head ---------------------------
@@ -1992,6 +2969,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         from_host(d0, buf(d0).res, q4_host_res_, (size_t)n_tok * hc_dim * sizeof(float));
     }
     q4_bufs & b0 = buf(d0);
+    const double thd0 = ph0(d0);
     const hc_wt & H = m.hc_head;
     if (is_cpu(d0)) {
         cpu_q4_hc_norm(b0.res, H.norm, b0.xn, nullptr, n_tok, n_embd, hc, hp.rms_eps);
@@ -2054,10 +3032,60 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             fprintf(stderr, "\n");
         }
     }
+    // The deferred QSA update's copies precede the head in the in-order queue,
+    // so its event wait returns while the head still runs; the indexer
+    // projection and the mirror update then overlap the head.
+    if (qsatime) {
+        t_qsa += qsa_flush();
+    } else {
+        qsa_flush();
+    }
+    ph1(d0, thd0, t_head, true);
     if (multi) {
         sync_all();
     } else {
         BE(0).synchronize();
+    }
+    print_qsa();
+    if (hctime) {
+        double hc_ms[4] = {0, 0, 0, 0};
+        int hc_n[4] = {0, 0, 0, 0};
+        for (auto & p : hc_evs) {
+            hc_ms[p.first] +=
+                (double)(p.second.get_profiling_info<sycl::info::event_profiling::command_end>()
+                         - p.second.get_profiling_info<sycl::info::event_profiling::command_start>())
+                / 1.0e6;
+            hc_n[p.first]++;
+        }
+        fprintf(stderr, "[q4hc] n=%d norm=%.3f(%d) silu=%.3f(%d) mix=%.3f(%d) comb=%.3f(%d) total=%.3f ms\n", n_tok,
+                hc_ms[0], hc_n[0], hc_ms[1], hc_n[1], hc_ms[2], hc_n[2], hc_ms[3], hc_n[3],
+                hc_ms[0] + hc_ms[1] + hc_ms[2] + hc_ms[3]);
+    }
+    if (q4phase) {
+        // The phase sum covers `rest` only; print it next to the independently
+        // measured total - t_moe so a mis-differenced timer cannot look
+        // authoritative (see the DFlash2 devspan note in AGENTS.md).
+        const double total = now_ms() - t_start;
+        const double ha = ph_ha.norm + ph_ha.lo + ph_ha.silu + ph_ha.up + ph_ha.inj + ph_ha.mix + ph_ha.comb;
+        const double hf = ph_hf.norm + ph_hf.lo + ph_hf.silu + ph_hf.up + ph_hf.inj + ph_hf.mix + ph_hf.comb;
+        const double sum = t_emb + t_ple + t_xc + t_head + ha + hf + t_gg + t_gc + t_gn + t_go + t_ag + t_ar + t_ac
+                           + t_ao;
+        const double nl = std::max(1, hp.n_layer);
+        fprintf(stderr,
+                "[q4ph] n=%d total=%.1f rest=%.1f sum=%.1f | emb=%.1f ple=%.1f xc=%.1f head=%.1f cpurest=%.1f"
+                " | hact norm=%.1f(%.2f) gemv=%.1f(%.2f) [lo=%.1f up=%.1f inj=%.1f] silu=%.1f mix=%.1f comb=%.1f"
+                " | hffn norm=%.1f(%.2f) gemv=%.1f(%.2f) [lo=%.1f up=%.1f inj=%.1f] silu=%.1f mix=%.1f comb=%.1f"
+                " | gdn%d g=%.1f(%.2f) core=%.1f(%.2f) gn=%.1f(%.2f) o=%.1f(%.2f)"
+                " | attn%d g=%.1f(%.2f) rope=%.1f(%.2f) core=%.1f(%.2f) o=%.1f(%.2f)"
+                " | gemv%d segcopy=%.1f kern=%.1f ms\n",
+                n_tok, total, total - t_moe, sum, t_emb, t_ple, t_xc, t_head, t_cpu_rest, ph_ha.norm,
+                ph_ha.norm / nl, ph_ha.lo + ph_ha.up + ph_ha.inj, (ph_ha.lo + ph_ha.up + ph_ha.inj) / nl, ph_ha.lo,
+                ph_ha.up, ph_ha.inj, ph_ha.silu, ph_ha.mix, ph_ha.comb, ph_hf.norm, ph_hf.norm / nl,
+                ph_hf.lo + ph_hf.up + ph_hf.inj, (ph_hf.lo + ph_hf.up + ph_hf.inj) / nl, ph_hf.lo, ph_hf.up, ph_hf.inj,
+                ph_hf.silu, ph_hf.mix, ph_hf.comb, n_gdn_l, t_gg, t_gg / std::max(1, n_gdn_l), t_gc,
+                t_gc / std::max(1, n_gdn_l), t_gn, t_gn / std::max(1, n_gdn_l), t_go, t_go / std::max(1, n_gdn_l),
+                n_attn_l, t_ag, t_ag / std::max(1, n_attn_l), t_ar, t_ar / std::max(1, n_attn_l), t_ac,
+                t_ac / std::max(1, n_attn_l), t_ao, t_ao / std::max(1, n_attn_l), n_gemv_calls, t_segc, t_gemvk);
     }
 }
 

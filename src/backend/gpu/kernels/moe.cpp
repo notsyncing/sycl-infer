@@ -34,9 +34,11 @@
 #include "kernel_utils.h"
 #include "gguf.h" // GGML_TYPE_* (the kernel headers only pull the raw type ids)
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 #include "common/env.h"
 
 namespace si {
@@ -232,8 +234,8 @@ inline float moe_dot(const char * wrow, const float * xr, int n_sb, int sb_bytes
 // are n_expert*n_tok floats (8 KB for the 35B), so spilling them to USM costs
 // nothing next to a barrier the scheduler cannot honour.
 template <uint32_t RT>
-static void moe_router_logits(queue & q, const void * gate_inp, int esize, const float * x, int x_stride, int n_tok,
-                              int n_embd, int n_expert, float * logits) {
+static sycl::event moe_router_logits(queue & q, const void * gate_inp, int esize, const float * x, int x_stride,
+                                     int n_tok, int n_embd, int n_expert, float * logits) {
     // ONE SUB-GROUP PER (token, expert), lanes tiling K in the same 32-lane x 8
     // split the expert dot and the dense fp32 GEMV use.
     //
@@ -247,7 +249,7 @@ static void moe_router_logits(queue & q, const void * gate_inp, int esize, const
     // 1.1 s of the same prefill once this is tiled.
     const int n_sb = n_embd / 256;
     const size_t n_work = (size_t) n_tok * (size_t) n_expert;
-    q.parallel_for(nd_range<1>((n_work * 32 + 31) & ~(size_t) 31, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+    return q.parallel_for(nd_range<1>((n_work * 32 + 31) & ~(size_t) 31, 32), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
         const int lane = (int) it.get_local_id(0);
         const sub_group sgg = it.get_sub_group();
         const size_t w = (size_t) it.get_group(0);
@@ -305,8 +307,8 @@ static void moe_router_logits(queue & q, const void * gate_inp, int esize, const
 // the reference" and not acted on, and it was this.
 
 // softmax over the n_expert logits of one token, in place
-static void moe_router_softmax(queue & q, float * logits, int n_tok, int n_expert) {
-    q.parallel_for(range<1>((size_t)n_tok), [=](id<1> i) {
+static sycl::event moe_router_softmax(queue & q, float * logits, int n_tok, int n_expert) {
+    return q.parallel_for(range<1>((size_t)n_tok), [=](id<1> i) {
         float * p = logits + (size_t) i[0] * n_expert;
         float mx = -3.402823466e38f;
         for (int e = 0; e < n_expert; e++) {
@@ -337,10 +339,10 @@ static void moe_router_softmax(queue & q, float * logits, int n_tok, int n_exper
 // one work-item per (token, expert), i.e. n_expert-way parallel, and the weight
 // pass reads the ids back instead of re-deriving them.
 template <bool WANT_IDS>
-static void moe_router_topk(queue & q, const float * probs, int n_tok, int n_expert, int top_k, void * out,
-                            const int32_t * ids_in) {
+static sycl::event moe_router_topk(queue & q, const float * probs, int n_tok, int n_expert, int top_k, void * out,
+                                   const int32_t * ids_in) {
     if (WANT_IDS) {
-        q.parallel_for(range<2>((size_t)n_tok, (size_t)n_expert), [=](id<2> i) {
+        return q.parallel_for(range<2>((size_t)n_tok, (size_t)n_expert), [=](id<2> i) {
             const int t = (int) i[0], e = (int) i[1];
             const float * p = probs + (size_t) t * n_expert;
             const float pe = p[e];
@@ -358,7 +360,7 @@ static void moe_router_topk(queue & q, const float * probs, int n_tok, int n_exp
     } else {
         // the ids are already known, so this is O(top_k) per token: read the
         // selected probabilities, normalise by their clamped sum, and write.
-        q.parallel_for(range<1>((size_t)n_tok), [=](id<1> i) {
+        return q.parallel_for(range<1>((size_t)n_tok), [=](id<1> i) {
             const size_t t = (size_t) i[0];
             const float * p = probs + t * n_expert;
             float * wt = (float *) out + t * top_k;
@@ -377,9 +379,200 @@ static void moe_router_topk(queue & q, const float * probs, int n_tok, int n_exp
     }
 }
 
+// Fused softmax + top-k + router weights: ONE workgroup per token, ONE launch
+// instead of the three kernels above.
+//
+// WHY.  On a decode (n_tok=1) the sequential softmax kernel - a single
+// work-item running 512 exp() in a dependent loop - measures 0.186 ms of a
+// 0.269 ms router, i.e. 69% of it, against 0.019 ms for the 5.24 MB dot
+// (PF_MOE_RT_TIME; the dot reads at 276 GB/s, the softmax at one lane).  Two
+// more launches cost two more command submissions.  The token->expert choice
+// is on every layer's critical path, so a 43-layer decode pays 43 x 0.25 ms.
+//
+// WHAT IS PRESERVED BIT-FOR-BIT (the router feeds the LRU and a one-ulp
+// difference in a logit has already been shown to flip a near-tie):
+//   * the max is fmax, which is exact in any order;
+//   * the exp is the same sycl::exp on the same (logit - max);
+//   * the SUM IS SEQUENTIAL IN INDEX ORDER by lane 0 (512 adds are ~1 us),
+//     so `1/sum` is the old kernel's value to the last bit;
+//   * the normalized p[e] = exp*inv is the same product;
+//   * the top-k rank scan compares the normalized values in the same order
+//     and breaks ties to the lower index;
+//   * the weights sum in the same j order and divide by the same clamped den.
+// Only the *parallel* part (the exp, the rank scan) moved to 256 lanes.
+//
+// The SLM is 2 KB of logits/probs plus the reductions; the barriers are for
+// local-memory visibility only.  The id/weight buffers are the caller's (a
+// pinned host-USM buffer on the decode path), so this does not repeat the
+// one-workgroup-per-token router that never took effect on this backend - that
+// one kept the ids in SLM and had no sub-group width; this one writes through
+// the same global pointers the three kernels did.
+//
+// Measured (qwen4exp, n_expert 512, top_k 10, one A770): the three sequential
+// kernels are 0.269 ms of a 0.292 ms router on device (logits 0.019, softmax
+// 0.186, topk 0.055, wts 0.009) and the fused kernel is 0.040 ms, so the
+// router's device time falls ~4.5x.  Its remaining cost is a fixed ~40 us for
+// the single work-group (a 32/128/256/512-thread group all measure the same),
+// i.e. the work itself, not its organisation.  PF_MOE_RT_CHK proves the ids,
+// weights and normalized logits are bit-identical to the three-kernel form.
+template <int WG>
+static sycl::event moe_router_softmax_topk(queue & q, float * logits, int n_tok, int n_expert, int top_k,
+                                           int32_t * ids, float * wts) {
+    constexpr int NSG = WG / 32;
+    // PF_MOE_RT_RANK=1 keeps the O(n_expert^2) rank scan (a lane per expert,
+    // each counting how many beat it) for the A/B.  Default: k rounds of
+    // (max, ties to the lower index) over the whole row - the same ordering by
+    // construction, but O(k * n_expert / WG + k * log) instead of n_expert
+    // sequential steps on one EU.  On this model (n_expert 512, top_k 10) the
+    // rank scan is 512 steps of 16 warps on a single EU and measures 0.079 ms;
+    // it is 3.4 ms/token across the 43 banked layers.
+    const bool rank_scan = si::env::flag("PF_MOE_RT_RANK");
+    return q.submit([&](handler & h) {
+        local_accessor<float, 1> pl((size_t)n_expert, h);
+        local_accessor<float, 1> red((size_t)NSG + 1, h);
+        local_accessor<float, 1> wl((size_t)top_k, h);
+        h.parallel_for(nd_range<1>((size_t)n_tok * WG, WG), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int t = (int)it.get_group(0);
+            const int tid = (int)it.get_local_id(0);
+            const int lane = tid & 31;
+            const int sg = tid >> 5;
+            const sub_group sgg = it.get_sub_group();
+            float * __restrict__ p = logits + (size_t)t * n_expert;
+            // max over the row: fmax is exact, so the order is free
+            float mx = -3.402823466e38f;
+            for (int e = tid; e < n_expert; e += WG) {
+                mx = sycl::fmax(mx, p[e]);
+            }
+            mx = sg_max(mx, sgg);
+            if (lane == 0) {
+                red[sg] = mx;
+            }
+            it.barrier();
+            mx = red[0];
+            for (int s = 1; s < NSG; s++) {
+                mx = sycl::fmax(mx, red[s]);
+            }
+            // exp in parallel, kept in SLM (and written back for compatibility)
+            for (int e = tid; e < n_expert; e += WG) {
+                pl[e] = sycl::exp(p[e] - mx);
+            }
+            it.barrier();
+            // the reference's sum: sequential, ascending index, on one lane.
+            // Batched 8 loads then 8 dependent adds: the adds keep the
+            // reference's order exactly (so 1/sum is bit-identical) while the
+            // loads overlap instead of stalling the chain every iteration.
+            if (tid == 0) {
+                float sum = 0.f;
+                int e = 0;
+                for (; e + 8 <= n_expert; e += 8) {
+                    const float v0 = pl[e + 0], v1 = pl[e + 1], v2 = pl[e + 2], v3 = pl[e + 3];
+                    const float v4 = pl[e + 4], v5 = pl[e + 5], v6 = pl[e + 6], v7 = pl[e + 7];
+                    sum += v0;
+                    sum += v1;
+                    sum += v2;
+                    sum += v3;
+                    sum += v4;
+                    sum += v5;
+                    sum += v6;
+                    sum += v7;
+                }
+                for (; e < n_expert; e++) {
+                    sum += pl[e];
+                }
+                red[NSG] = sum;
+            }
+            it.barrier();
+            const float inv = 1.f / red[NSG];
+            for (int e = tid; e < n_expert; e += WG) {
+                pl[e] *= inv;
+                p[e] = pl[e];
+            }
+            it.barrier();
+            if (rank_scan) {
+                // top-k by rank, exactly as moe_router_topk<true>
+                for (int e = tid; e < n_expert; e += WG) {
+                    const float pe = pl[e];
+                    int rank = 0;
+                    for (int f = 0; f < n_expert; f++) {
+                        const float pf = pl[f];
+                        if (pf > pe || (pf == pe && f < e)) {
+                            rank++;
+                        }
+                    }
+                    if (rank < top_k) {
+                        ids[(size_t)t * top_k + rank] = e;
+                    }
+                }
+                it.barrier();
+                // weights, exactly as moe_router_topk<false>
+                if (tid < top_k) {
+                    wl[tid] = pl[ids[(size_t)t * top_k + tid]];
+                }
+            } else {
+                // k rounds of (max, ties to the lower index).  The k-th round
+                // writes rank k, so the order is the rank scan's by
+                // construction.  A selected entry is retired with -FLT_MAX,
+                // which no normalized probability can equal.
+                //
+                // The whole selection runs on ONE warp.  The WG-wide form
+                // needs two `it.barrier()`s per round (eight warps of a
+                // 256-thread group, 20 barriers for top_k=10) and measured
+                // 0.057-0.058 ms; a warp's own shuffle reduce needs only a
+                // sub-group fence for the retire and measures 0.040-0.041 ms.
+                if (tid < 32) {
+                    for (int r = 0; r < top_k; r++) {
+                        float best = -3.402823466e38f;
+                        int bi = n_expert;
+                        for (int e = lane; e < n_expert; e += 32) {
+                            const float v = pl[e];
+                            if (v > best || (v == best && e < bi)) {
+                                best = v;
+                                bi = e;
+                            }
+                        }
+                        for (int mask = 16; mask > 0; mask >>= 1) {
+                            const float ov = sycl::permute_group_by_xor(sgg, best, mask);
+                            const int oi = sycl::permute_group_by_xor(sgg, bi, mask);
+                            if (ov > best || (ov == best && oi < bi)) {
+                                best = ov;
+                                bi = oi;
+                            }
+                        }
+                        if (lane == 0) {
+                            ids[(size_t)t * top_k + r] = bi;
+                            wl[r] = best;
+                            pl[bi] = -3.402823466e38f;
+                        }
+                        sycl::group_barrier(sgg);
+                    }
+                }
+            }
+            it.barrier();
+            if (tid == 0) {
+                float sum = 0.f;
+                for (int j = 0; j < top_k; j++) {
+                    sum += wl[j];
+                }
+                red[NSG] = sycl::fmax(sum, 6.103515625e-5f);
+            }
+            it.barrier();
+            if (tid < top_k) {
+                wts[(size_t)t * top_k + tid] = wl[tid] / red[NSG];
+            }
+        });
+    });
+}
+
 void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const float * x, int x_stride, int n_tok,
                        int n_embd, int n_expert, int top_k, float * logits, int32_t * ids, float * wts) {
-#define SI_MOE_R(GP, ESZ) moe_router_logits<GP>(q, gate_inp, ESZ, x, x_stride, n_tok, n_embd, n_expert, logits)
+    // PF_MOE_RT_TIME: the kernels' own device time from event profiling.
+    // Diagnostic only (it adds one wait at the end); the per-kernel spacings
+    // are what tell a logits-bound router from a softmax/top-k or a
+    // launch-overhead one.  It reports the three-kernel form under
+    // PF_MOE_RT_OLD and the logits + fused pair otherwise.
+    const bool rt_time = si::env::flag("PF_MOE_RT_TIME");
+    sycl::event e0;
+#define SI_MOE_R(GP, ESZ) e0 = moe_router_logits<GP>(q, gate_inp, ESZ, x, x_stride, n_tok, n_embd, n_expert, logits)
     switch (gp_type) {
     case GGML_TYPE_F32: SI_MOE_R(GGML_TYPE_F32, 4); break;
     case GGML_TYPE_F16: SI_MOE_R(GGML_TYPE_F16, 2); break;
@@ -388,9 +581,105 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
         throw std::runtime_error("moe: ffn_gate_inp must be f32/f16/bf16 (got " + std::to_string(gp_type) + ")");
     }
 #undef SI_MOE_R
-    moe_router_softmax(q, logits, n_tok, n_expert);
-    moe_router_topk<true>(q, logits, n_tok, n_expert, top_k, ids, nullptr);
-    moe_router_topk<false>(q, logits, n_tok, n_expert, top_k, wts, ids);
+    // PF_MOE_RT_OLD=1 restores the three sequential kernels for the A/B;
+    // PF_MOE_RT_CHK=1 runs both on the caller's real input once and compares
+    // ids/wts/logits bit-for-bit (the router's discrete choice is load-bearing,
+    // so "looks coherent" is not the bar).
+    static const bool rt_old = si::env::flag("PF_MOE_RT_OLD");
+    static const bool rt_chk = si::env::flag("PF_MOE_RT_CHK");
+    // The check waits on the kernels' events, which is illegal while a command
+    // graph is being recorded (the generic path records a decode graph at
+    // startup with n_tok=1).  So it runs on the prefill shapes by default; a
+    // direct-replay engine (qwen4exp) takes PF_MOE_RT_CHK_DEC=1 for n_tok=1.
+    static const bool chk_dec = si::env::flag("PF_MOE_RT_CHK_DEC");
+    static int chk_last_n = -1;
+    const bool do_chk = rt_chk && chk_last_n != n_tok && (n_tok > 1 || chk_dec);
+    // PF_MOE_RT_WG forces the fused kernel's work-group width (A/B knob; the
+    // default splits the row into at most 512 lanes).
+    static const int rt_wg = si::env::i32("PF_MOE_RT_WG", 0);
+    auto fused = [&]() -> sycl::event {
+        if (rt_wg == 32) {
+            return moe_router_softmax_topk<32>(q, logits, n_tok, n_expert, top_k, ids, wts);
+        }
+        if (rt_wg == 128) {
+            return moe_router_softmax_topk<128>(q, logits, n_tok, n_expert, top_k, ids, wts);
+        }
+        if (rt_wg == 256 || (rt_wg != 512 && n_expert <= 256)) {
+            return moe_router_softmax_topk<256>(q, logits, n_tok, n_expert, top_k, ids, wts);
+        }
+        return moe_router_softmax_topk<512>(q, logits, n_tok, n_expert, top_k, ids, wts);
+    };
+    sycl::event e1, e2, e3, ef;
+    if (!rt_old && !do_chk) {
+        ef = fused();
+    } else if (rt_old) {
+        e1 = moe_router_softmax(q, logits, n_tok, n_expert);
+        e2 = moe_router_topk<true>(q, logits, n_tok, n_expert, top_k, ids, nullptr);
+        e3 = moe_router_topk<false>(q, logits, n_tok, n_expert, top_k, wts, ids);
+    }
+    if (do_chk) {
+        chk_last_n = n_tok;
+        std::vector<float> h_log_raw((size_t)n_tok * n_expert);
+        q.memcpy(h_log_raw.data(), logits, h_log_raw.size() * sizeof(float)).wait();
+        e1 = moe_router_softmax(q, logits, n_tok, n_expert);
+        e2 = moe_router_topk<true>(q, logits, n_tok, n_expert, top_k, ids, nullptr);
+        e3 = moe_router_topk<false>(q, logits, n_tok, n_expert, top_k, wts, ids);
+        e3.wait();
+        std::vector<int32_t> h_ids_old((size_t)n_tok * top_k);
+        std::vector<float> h_wts_old((size_t)n_tok * top_k);
+        std::vector<float> h_log_old((size_t)n_tok * n_expert);
+        q.memcpy(h_ids_old.data(), ids, h_ids_old.size() * sizeof(int32_t)).wait();
+        q.memcpy(h_wts_old.data(), wts, h_wts_old.size() * sizeof(float)).wait();
+        q.memcpy(h_log_old.data(), logits, h_log_old.size() * sizeof(float)).wait();
+        // restore the raw logits, then rerun the fused path into the same
+        // buffers and compare
+        q.memcpy(logits, h_log_raw.data(), h_log_raw.size() * sizeof(float)).wait();
+        fused().wait();
+        std::vector<int32_t> h_ids_new((size_t)n_tok * top_k);
+        std::vector<float> h_wts_new((size_t)n_tok * top_k);
+        std::vector<float> h_log_new((size_t)n_tok * n_expert);
+        q.memcpy(h_ids_new.data(), ids, h_ids_new.size() * sizeof(int32_t)).wait();
+        q.memcpy(h_wts_new.data(), wts, h_wts_new.size() * sizeof(float)).wait();
+        q.memcpy(h_log_new.data(), logits, h_log_new.size() * sizeof(float)).wait();
+        int id_bad = 0, w_bad = 0, l_bad = 0;
+        float lmax = 0.f;
+        for (size_t i = 0; i < h_ids_old.size(); i++) {
+            id_bad += h_ids_old[i] != h_ids_new[i];
+        }
+        for (size_t i = 0; i < h_wts_old.size(); i++) {
+            w_bad += !(h_wts_old[i] == h_wts_new[i]);
+        }
+        for (size_t i = 0; i < h_log_old.size(); i++) {
+            const float d = std::fabs(h_log_old[i] - h_log_new[i]);
+            lmax = std::fmax(lmax, d);
+            l_bad += !(h_log_old[i] == h_log_new[i]);
+        }
+        fprintf(stderr, "[moertchk] n=%d ne=%d ids_bad=%d/%zu wts_bad=%d/%zu logits_bad=%d maxdiff=%.3g\n", n_tok,
+                n_expert, id_bad, h_ids_old.size(), w_bad, h_wts_old.size(), l_bad, (double)lmax);
+    }
+    if (rt_time && !rt_old && !do_chk) {
+        ef.wait();
+        const double ts = (double)ef.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
+        const double te = (double)ef.get_profiling_info<sycl::info::event_profiling::command_end>() / 1.0e6;
+        const double t0 = (double)e0.get_profiling_info<sycl::info::event_profiling::command_end>() / 1.0e6;
+        fprintf(stderr, "[moert] n=%d ne=%d wg=%d logits=%.3f fused=%.3f gap=%.3f ms\n", n_tok, n_expert,
+                n_expert <= 256 ? 256 : 512, t0 - (double)e0.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6,
+                te - ts, ts - t0);
+    }
+    if (rt_time && (rt_old || do_chk)) {
+        e3.wait();
+        auto ms = [](const sycl::event & e) {
+            return (double)(e.get_profiling_info<sycl::info::event_profiling::command_end>()
+                            - e.get_profiling_info<sycl::info::event_profiling::command_start>())
+                   / 1.0e6;
+        };
+        auto st = [](const sycl::event & e) {
+            return (double)e.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
+        };
+        fprintf(stderr, "[moert] n=%d ne=%d logits=%.3f softmax=%.3f topk=%.3f wts=%.3f gap01=%.3f gap12=%.3f gap23=%.3f ms\n",
+                n_tok, n_expert, ms(e0), ms(e1), ms(e2), ms(e3), st(e1) - (st(e0) + ms(e0)),
+                st(e2) - (st(e1) + ms(e1)), st(e3) - (st(e2) + ms(e2)));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,6 +1722,134 @@ void moe_down_q5_1_launch(queue & q, const void * dbank, const int32_t * slot_ma
         return;
     }
     moe_down_q5_1_impl<8>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq, asa,
+                          xs, acc, acc_stride, n_embd, n_ff_exp);
+}
+
+// Native Q8_0 down, for the qwen4exp expert bank.
+//
+// The same contract and work decomposition as the Q5_1 down above, but the
+// block is `{f16 d; int8 qs[32]}` (34 B, one 32-value group) and there is no
+// minimum.  A lane's four values are four signed int8 weights, so the dot uses
+// the signed-by-unsigned dp4a with the weights biased into unsigned:
+//
+//     q_u = q_s + 128  =>  sum(q_s x) = sum(q_u x) - 128 * sum(x)
+//
+// and the last term is the activation's group sum `xs[g]`, carried on one lane
+// per group (adding it on every lane would count it eight times - the Q5_1
+// kernel's original +m bug).  `qs` starts at byte 2, so the four bytes are read
+// as two uint16 loads; an unaligned uint32 load is the AOT-widening trap the
+// Q8_0 GEMV already hit.
+//
+// This is what lets the four Q4_K/Q8_0-down layers stop running their routed
+// experts on the host.
+template <int NPB>
+static void moe_down_q8_0_impl(queue & q, const char * dbank, const int32_t * slot_map, size_t slot_db,
+                               const int32_t * off, const int32_t * pair, const int32_t * active,
+                               const int32_t * n_active, int n_act_max, const int8_t * xq, const uint16_t * asa,
+                               const float * xs, float * acc, int acc_stride, int n_embd, int n_ff_exp) {
+    constexpr int SG = 8;
+    constexpr int GSL = 4;
+    constexpr int NGL = 5;
+    const int ng = n_ff_exp / 32;
+    const size_t row_bytes = (size_t)ng * sizeof(block_q8_0);
+    const int nrb = (n_embd + NPB - 1) / NPB;
+    const int nw = n_act_max * nrb;
+    if (nw <= 0) {
+        return;
+    }
+    q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
+                   [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int lid = (int)it.get_local_id(0);
+        const int sg = lid / 32;
+        const int lane = lid % 32;
+        const sub_group sgg = it.get_sub_group();
+        const int w = (int)it.get_group(0) * kMoENW + sg;
+        if (w >= nw) {
+            return;
+        }
+        const int ia = w / nrb;
+        const int nb = w % nrb;
+        if (ia >= n_active[0]) {
+            return;
+        }
+        const int e = active[ia];
+        const int slot = slot_map[e];
+        if (slot < 0) {
+            return;
+        }
+        const int b0 = off[e], b1 = off[e + 1];
+        const int gs = lane / SG;
+        const int ch = lane % SG;
+        const char * base = dbank + (size_t)slot * slot_db;
+        for (int rr = 0; rr < NPB; rr++) {
+            const int n = nb * NPB + rr;
+            if (n >= n_embd) {
+                break;
+            }
+            const char * dr = base + (size_t)n * row_bytes;
+            for (int g0 = 0; g0 < ng; g0 += GSL * NGL) {
+                uint32_t wq[NGL];
+                float wd[NGL];
+#pragma unroll
+                for (int j = 0; j < NGL; j++) {
+                    const int gr = g0 + gs + GSL * j;
+                    wq[j] = 0u;
+                    wd[j] = 0.f;
+                    if (gr < ng) {
+                        const auto * blk = (const block_q8_0 *)(dr + (size_t)gr * sizeof(block_q8_0));
+                        const char * qp = (const char *)blk->qs + (size_t)ch * 4;
+                        const uint16_t lo = *reinterpret_cast<const uint16_t *>(qp);
+                        const uint16_t hi = *reinterpret_cast<const uint16_t *>(qp + 2);
+                        wq[j] = ((uint32_t)lo | ((uint32_t)hi << 16)) ^ 0x80808080u;
+                        wd[j] = fast_h2f(blk->d);
+                    }
+                }
+                for (int i0 = b0; i0 < b1; i0++) {
+                    const int pr = pair[i0];
+                    const int8_t * xr = xq + (size_t)pr * (size_t)n_ff_exp;
+                    const uint16_t * ar = asa + (size_t)pr * (size_t)ng;
+                    const float * sr = xs + (size_t)pr * (size_t)ng;
+                    float a = 0.f;
+#pragma unroll
+                    for (int j = 0; j < NGL; j++) {
+                        const int gr = g0 + gs + GSL * j;
+                        if (gr < ng) {
+                            const uint32_t xa =
+                                *reinterpret_cast<const uint32_t *>(xr + (size_t)gr * 32 + (size_t)ch * 4);
+                            const float A = fast_h2f(ar[gr]);
+                            const int32_t qd = dp4a_s8u8(xa, wq[j], 0);
+                            a = sycl::fma(A * wd[j], (float)qd, a);
+                            // The -128 bias correction is a whole-group sum;
+                            // one lane per group carries it, as in Q5_1.
+                            if (ch == 0) {
+                                a = sycl::fma(A * wd[j], -128.f * sr[gr], a);
+                            }
+                        }
+                    }
+                    const float v = sg_sum(a, sgg);
+                    if (lane == 0) {
+                        if (g0 == 0) {
+                            acc[(size_t)pr * (size_t)acc_stride + n] = v;
+                        } else {
+                            acc[(size_t)pr * (size_t)acc_stride + n] += v;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+void moe_down_q8_0_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                          const int32_t * off, const int32_t * pair, const int32_t * active,
+                          const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
+                          const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                          int n_ff_exp) {
+    (void)n_expert;
+    if (n_pairs <= 0 || n_embd <= 0 || (n_ff_exp % 32) != 0) {
+        return;
+    }
+    moe_down_q8_0_impl<8>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq, asa,
                           xs, acc, acc_stride, n_embd, n_ff_exp);
 }
 

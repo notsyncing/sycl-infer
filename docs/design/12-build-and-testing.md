@@ -149,7 +149,7 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | 记号 | 默认路径 | 参数 |
 |---|---|---|
 | **0.8B** | `/path/to/Qwen3.5-0.8B-Q4_K_M.gguf` | `argv[1]` 可覆盖 |
-| **27B** | `/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` | `argv[1]` 可覆盖 |
+| **27B** | `/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf` | `argv[1]` 可覆盖 |
 | **无** | 不读 GGUF，纯合成数据 | 不接受模型参数 |
 
 27B 档是**唯一**的混合量化模型，所以审计权重表示的测试（IQ*/Q3_K/Q5_K、每种 ggml 类型的 int8 转换损失）
@@ -311,7 +311,7 @@ CPU 分区的 `pc_restore_state` / 主机反量化路径值得单独查。
 ### 3.3 27B（需要分卡，单卡放不下）
 
 ```bash
-M=/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf
+M=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref      # argmax SAME
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill "$M"  # OK
 ```
@@ -364,6 +364,48 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 （不再拒绝，见上一版的记录）。`test_dev_profile` 无需 GPU，用合成设备名覆盖判定逻辑；
 `test_dev_resolve` 需要 GPU，覆盖 per-device 缓存的稳定性、与 `for_name` 的一致性、
 按该设备上限的 clamp，以及查找的每次成本上限（5 µs，留足余量又能抓住"退回每次查驱动"）。
+
+### 3.4.2 qwen4exp（Qwen3.8-Flash-Next）
+
+`qwen4exp` 没有专属 CTest target，验证靠下面四条，**每条一个进程**（模型 104 GiB，
+加载一次 ~1 分钟，且首次 prefill 要校准 bank）：
+
+```bash
+Q4=/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+M27=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf
+```
+
+1. **27B 回归 oracle**（q4 改动不能破坏通用引擎）：
+
+   ```bash
+   TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill "$M27"   # 8/8 OK
+   ```
+
+2. **算术 + 连贯性**：`12 x 9` 必须得到 `108`，TCP/UDP 问题必须连贯：
+
+   ```bash
+   ./build/sycl-infer --model "$Q4" \
+     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 16000 \
+     --ctx 2048 --kv-type f16 gen --raw --temp 0 --max-tokens 16 \
+     --prompt "What is 12 multiplied by 9?"
+   ./build/sycl-infer --model "$Q4" \
+     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 16000 \
+     --ctx 2048 --kv-type f16 gen --raw --temp 0 --max-tokens 48 \
+     --prompt "What is the difference between TCP and UDP?"
+   ```
+
+3. **Prefill 重复性**：同一个 512-token raw prompt 跑两次，第一次 15-16 s（校准），稳定后
+   **~13.9 s = 39 tok/s**；`PF_Q4_PF_STATS=1` 应打印每层的 `act/hot/kept/batches/copies`，
+   且 `batches > 1` 表示两遍路径确实被触发。`dev/bench_pf`（gitignored）是这条的 harness：
+   `PF_MOE_VRAM_MB=16000 ./dev/bench_pf "$Q4" 512 1 "0-23:gpu.0,24-47:gpu.1"`。
+
+4. **Layer map / bank**：推荐 `0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 16000`，启动打印
+   `hot expert bank: 124 slots/layer, 43 layers, 15.3 GiB`；decode 在 ~16 token 后稳定在
+   **~121 ms/token（8.3 tok/s）**。`PF_Q4_FFCMP=<layer>`（例如 `1`）给出 routed GPU FFN
+   对主机参考的 cosine **0.99998**。18000/20000 MB 必须在加载时失败，不要当成回归。
+
+**0.8B 不在 bench 机上**：`test_decode_vs_prefill` 的默认模型和 §3.4 的 tied-embedding 用例
+需要另找一台有 0.8B GGUF 的机器；bench-host 上只跑 27B / 35B / qwen4exp。
 
 ### 3.5 include-cleaner lint（`Diagnostics.UnusedIncludes: Strict` 必须干净）
 

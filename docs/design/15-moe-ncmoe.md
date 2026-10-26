@@ -9,6 +9,9 @@
 3. **三级专家缓存**：disk → RAM → VRAM，VRAM 那级是**实测**频次冻结的 bank，
    不是索引截断（§7–§9）。
 
+§10 单独记录 `qwen4exp`（Qwen3.8-Flash-Next）：它不走这套三级缓存，而是"所有专家常驻主机 +
+每专家 LRU 设备 bank"的另一条路径。
+
 模型几何：35B A3B 为 40 层 trunk + 1 个 NextN 块，`n_expert=256`、
 `n_expert_used=8`、`n_ff_exp=512`、`n_ff_shexp=512`，routed 专家占 18.22 GiB
 （466.5 MiB/层）。
@@ -311,3 +314,30 @@ slot 表按 `n_layer + 1` 行构建（最后一行是 NextN），并 memcpy 到*
 
 测试侧：`TEST_MOE_RESIDENT`（`stage_env::make`）让 stage 测试也走切分路径；
 `test_decode_vs_prefill`/`test_gpu_vs_ref`/`test_multimodal` 都认这个变量。
+
+---
+
+## 10. qwen4exp：主机常驻专家 + 每专家 LRU
+
+Qwen3.8-Flash-Next（`qwen4exp`，104 GiB，512 专家/top-10）走的是**另一条**专家路径，
+和上面的 `moe_cache` 三级缓存不共用：
+
+* **所有 routed 专家始终在主机 mmap 里**（71.7 GiB），没有"哪部分留在设备"的通用切分。
+  `engine.cpp` 对 `m.q4exp` 直接设 `moe_host_only_ = true` 与 `moe_cfg_.host_only = true`，
+  `moe_cache` 因此算出 `total = 0`、启动打印 `bank 0/512 resident per layer`；它的设备路径在
+  `record_forward` 的 `seg_plan` 分支，而 q4exp 在 `q4_forward` 里自己走层。**两条路径不会相遇。**
+* q4 的 GPU bank 是 `engine_q4exp.cpp` 自己分配的**每专家 LRU**：`--moe-vram-mb 16000` 给出
+  每层 124 个槽、43 层（15.3 GiB），其余 5 层（down 为 Q8_0 的 2/4/30/46/47）全部留在主机。
+  slot map 是纯主机侧决定，kernel 仍然 `slot < 0` 就返回。
+* 预填充超过 bank 容量时走**两遍**：512 token 的一层最多选中 328 个不同专家，而 R=124，所以
+  按 `<= R` 分批，每批有自己的 slot map 和上传；每个 `(token, expert)` 只算一次。每批开始时
+  **重新量化 token 行激活**，因为 `moe_actq_launch(A.h, ...)` 会覆盖 gate/up 要读的
+  `A.xq/asa/xs`。
+* 专家上传走**每设备 32 槽 pinned staging ring**（异步 device copy、按事件节流），不走
+  pageable `q.memcpy`；后者会阻塞主机直到 in-order 队列排空，实测只有 ~2 GB/s。
+* 主机常驻页由 `release_host_weight_pages()` 的 keep-set 保住（`moe_resident == 0` 时所有专家
+  张量都进 keep），`q4_prefault` 再逐页 touch 一次，避免每 token 冷缺页。PLE 表同样保留并被
+  engram 缓存覆盖。
+
+实测、死胡同与完整开关见 [design/18-qwen4exp.md](18-qwen4exp.md)；GPU 侧 kernel 细节见
+[design/03-kernels.md §5.11](03-kernels.md)。

@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 
 #include "common.h"
@@ -424,6 +425,135 @@ void cpu_moe_experts(const cpu_moe & M, const float * x, int x_stride, int n_tok
             acc[(size_t)pr * acc_stride + r] = ad;
         }
     });
+}
+
+// ---- one expert for one token: the CPU-miss half of the qwen4exp split -------
+//
+// The device's resident experts go through moe_actq_launch + the grouped dp4a
+// kernels.  A CPU miss has to be the same arithmetic: the activation is
+// quantized with the same per-32 amax/127 rule (f16-rounded scale), gate/up
+// are dotted from the GGUF blocks with the CPU's int8 row kernel, and down
+// reads the native Q5_1/Q8_0 blocks.  The only difference left is the dot order
+// and the per-group fp32 association.
+//
+// The weights must be the PINNED expert source for a banked GPU layer: the
+// engine's page release drops that layer's GGUF pages after the bank upload,
+// so reading the mmap here would re-fault every row from disk.  The caller
+// passes the pinned planes in `cpu_moe`, exactly like the H2D source.
+
+// Quantize one row exactly as cpu_xq does (the f16-rounded per-32 scale and
+// round-half-away codes), but serially: a 640/2560-value row is a few
+// microseconds, while the pool's dispatch for 20-80 tiny tasks measured
+// ~40 us - more than the quantization itself.
+static void quant_row_1(const float * x, int K, int8_t * x8, float * xmeta, int32_t * xsumq) {
+    const int G = K / 32;
+    for (int g = 0; g < G; g++) {
+        const float * v = x + (size_t)g * 32;
+        float mx = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            mx = std::max(mx, std::fabs(v[i]));
+        }
+        const float scale = mx > 0.0f ? mx / 127.0f : 1.0f;
+        const float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+        int32_t s0 = 0, s1 = 0;
+        for (int i = 0; i < 32; i++) {
+            const int32_t q = (int32_t)std::max(-127.0f, std::min(127.0f, std::round(v[i] * inv)));
+            x8[(size_t)g * 32 + i] = (int8_t)q;
+            (i < 16 ? s0 : s1) += q;
+        }
+        xmeta[(size_t)g * 2] = ggml_half_to_float(ggml_float_to_half(mx > 0.0f ? scale : 0.0f));
+        xmeta[(size_t)g * 2 + 1] = 0.0f;
+        xsumq[(size_t)g * 2] = s0;
+        xsumq[(size_t)g * 2 + 1] = s1;
+    }
+}
+
+// All of one layer's missing pairs for ONE token.  The activation is quantized
+// once (every pair of a token shares it), then each pair runs gate/up/down with
+// the CPU's int8 kernels.  `ids[p]` is the expert, `acc[p*acc_stride]` the row.
+void cpu_moe_experts_i8(const cpu_moe & M, const float * x, int x_stride, int n_pairs, const int32_t * ids,
+                        float * acc, int acc_stride) {
+    const int K = M.n_embd;
+    const int n_ff = M.n_ff_exp;
+    const int G = K / 32, Gd = n_ff / 32;
+    const bool cmd = std::getenv("PF_Q4_CMDBG") != nullptr;
+    const auto cm_ms = [] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const double cm0 = cmd ? cm_ms() : 0.0;
+    double cm_xq = 0.0;
+    thread_local std::vector<int8_t> x8, h8;
+    thread_local std::vector<float> xmeta, hmeta, gbuf, ubuf, hbuf;
+    thread_local std::vector<int32_t> xsumq, hsumq;
+    x8.resize((size_t)K);
+    xmeta.resize((size_t)G * 2);
+    xsumq.resize((size_t)G * 2);
+    quant_row_1(x, K, x8.data(), xmeta.data(), xsumq.data());
+    if (cmd) {
+        cm_xq = cm_ms();
+    }
+    // Four chunks per worker: enough to balance the tail, few enough that a
+    // chunk is real work rather than a pool round trip.
+    const int nch = std::max(1, cpu_thread_count() * 4);
+    gbuf.resize((size_t)n_ff);
+    ubuf.resize((size_t)n_ff);
+    hbuf.resize((size_t)n_ff);
+    h8.resize((size_t)n_ff);
+    hmeta.resize((size_t)Gd * 2);
+    hsumq.resize((size_t)Gd * 2);
+    for (int p = 0; p < n_pairs; p++) {
+        const int expert = ids[p];
+        float * out = acc + (size_t)p * acc_stride;
+        if (M.gate_exps.data && M.up_exps.data) {
+            cpu_gemv_seg s{};
+            s.w = (const char *)M.gate_exps.data + (size_t)expert * M.gate_exps.plane_bytes;
+            s.type = M.gate_exps.type;
+            s.K = K;
+            s.n_rows = n_ff;
+            s.x = x;
+            s.x_stride = x_stride;
+            s.x8 = x8.data();
+            s.xmeta = xmeta.data();
+            s.xsumq = xsumq.data();
+            s.out = gbuf.data();
+            s.out_stride = 1;
+            s.alpha = 1.0f;
+            cpu_i8_gemv1_chunked(s, nch);
+            s.w = (const char *)M.up_exps.data + (size_t)expert * M.up_exps.plane_bytes;
+            s.type = M.up_exps.type;
+            s.out = ubuf.data();
+            cpu_i8_gemv1_chunked(s, nch);
+        } else {
+            std::fill(gbuf.begin(), gbuf.end(), 0.f);
+            std::fill(ubuf.begin(), ubuf.end(), 0.f);
+        }
+        for (int i = 0; i < n_ff; i++) {
+            hbuf[(size_t)i] = cpu_silu(gbuf[(size_t)i]) * ubuf[(size_t)i];
+        }
+        quant_row_1(hbuf.data(), n_ff, h8.data(), hmeta.data(), hsumq.data());
+        if (M.down_raw != nullptr && M.down_row_bytes != 0
+            && (M.down_exps.type == GGML_TYPE_Q5_1 || M.down_exps.type == GGML_TYPE_Q8_0)) {
+            const char * w = (const char *)M.down_raw + (size_t)expert * M.down_exps.plane_bytes;
+            if (M.down_exps.type == GGML_TYPE_Q5_1) {
+                cpu_q5_1_down_grouped(w, M.down_row_bytes, h8.data(), hmeta.data(), hsumq.data(), 1, 1, K, n_ff, out,
+                                      acc_stride, nullptr);
+            } else {
+                cpu_q8_0_down_grouped(w, M.down_row_bytes, h8.data(), hmeta.data(), hsumq.data(), 1, 1, K, n_ff, out,
+                                      acc_stride, nullptr);
+            }
+        } else if (M.down_i8 && M.down_sc) {
+            cpu_q4_down_grouped(M.down_i8 + (size_t)expert * (size_t)M.down_N * (size_t)M.down_K,
+                                M.down_sc + (size_t)expert * (size_t)M.down_N * (size_t)(M.down_K / 32), h8.data(),
+                                hmeta.data(), hsumq.data(), 1, 1, K, n_ff, out, acc_stride, nullptr);
+        } else {
+            std::memset(out, 0, (size_t)K * sizeof(float));
+        }
+    }
+    if (cmd) {
+        const double e = cm_ms();
+        fprintf(stderr, "[q4cmd] pairs=%d xq=%.3f per_pair=%.3f tot=%.3f ms\n", n_pairs, cm_xq - cm0,
+                (e - cm_xq) / std::max(1, n_pairs), e - cm0);
+    }
 }
 
 // ---- the weighted reduction -----------------------------------------------------

@@ -1072,8 +1072,8 @@ static void test_audio_encoder(const std::string & audio_path) {
 }
 
 int main(int argc, char ** argv) {
-    const std::string text_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
-    const std::string mmproj_path = argc > 2 ? argv[2] : "/home/sfc/临时/Qwen3.5-0.8B-mmproj-BF16.gguf";
+    const std::string text_path = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const std::string mmproj_path = argc > 2 ? argv[2] : "/path/to/Qwen3.5-0.8B-mmproj-BF16.gguf";
     const std::string audio_path = argc > 3 ? argv[3] : "";
     test_target_size();
     test_vision_width_guard();

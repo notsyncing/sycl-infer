@@ -23,7 +23,7 @@ static void check(const char * name, const std::string & got, const std::string 
 }
 
 int main(int argc, char ** argv) {
-    const char * model = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
     gguf_file f;
     f.load(model);
     const std::string * tmpl = f.get_str("tokenizer.chat_template");

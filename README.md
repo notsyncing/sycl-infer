@@ -73,6 +73,13 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
   GEMV; prefill expands each tensor to int8 in a small reused scratch.  The
   native values are kept exactly.  Worth ~+5% tg128 and 2.5 GB/card of device
   memory; `PF_CB4=0` disables it.
+* **Qwen3.8-Flash-Next (`qwen4exp`)** — a 104 GiB, 4-shard hybrid with
+  hyper-connections, a per-layer n-gram embedding (PLE), QSA sparse attention
+  and 512 routed experts.  The dense trunk is ~5.3 GiB; the 71.7 GiB expert
+  bank and 26.8 GiB PLE table stay in host RAM, with a 16.5 GiB per-expert LRU
+  VRAM bank (121 slots x 47 layers, including the four Q8_0-down layers), a
+  pinned 69.8 GiB expert source (`PF_Q4_PIN_SRC`) and a host-RAM cache for PLE
+  rows (`--engram-ram-mb`).  Written up in [Design 18](docs/design/18-qwen4exp.md).
 * **Device selection** — `--device cpu|gpu|auto`; the CPU backend has its own
   AVX2 / AVX-VNNI / AVX-512 kernels, picks the variant at run time, and keeps
   the paged KV in host RAM.
@@ -134,7 +141,7 @@ to a per-architecture loader; the engine itself is not tied to any model family.
 | Qwen3.5-0.8B (Q4_K_M) | `qwen35` | supported | hybrid Gated DeltaNet + full attention; the reference model for the test suite |
 | Qwen3.8-27B (UD-Q4_K_M) | `qwen35` | supported | dense, 64 layers; 15.4 GiB of weights, so it needs the two-card split |
 | Qwen3.6-35B-A3B (UD-Q4_K_M) | `qwen35moe` | supported | routed MoE, 256 experts / 8 active, 40 layers; 21.1 GiB of weights, so it needs the two-card split too |
-| Qwen3.8-Flash-Next (UD-Q4_K_XL, 4 shards) | `qwen4exp` | **supported** | hyper-connections + n-gram PLE + 512-expert MoE; needs host-RAM experts, so run it with `--device gpu` (dense trunk on both cards, routed bank on the host), a `--layer-map` with a CPU tail, or `--device cpu`.  Dense attention is used above 2 048 keys (the QSA selector is not implemented yet - see the note below) |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL, 4 shards) | `qwen4exp` | **supported** | hyper-connections + n-gram PLE + 512-expert MoE + QSA.  The routed bank and PLE table are host-resident (with a pinned 69.8 GiB source mirror); the dense trunk plus a 16.5 GiB per-expert LRU bank (47 layers, Q8_0-down layers included) run on the GPUs.  Recommended: `--layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 --ctx 2048 --kv-type f16`.  See [Design 18](docs/design/18-qwen4exp.md) |
 
 | | |
 |---|---|
@@ -159,14 +166,15 @@ context depth, every batch size, both speculative paths — are in
 | Qwen3.5-0.8B | 1 card | **6 336 tok/s** | **78.7 tok/s** (12.7 ms/token) | – |
 | Qwen3.8-27B | 2 cards | **507 tok/s** | **13.4 tok/s** (74.6 ms/token) | **76.5 tok/s** |
 | Qwen3.6-35B-A3B | 2 cards | **779 tok/s** | **26.4 tok/s** (37.9 ms/token) | **168 tok/s** |
-| Qwen3.8-Flash-Next | 2 cards + CPU (host experts) | 5.5 tok/s (128 tokens) | **1.8 tok/s** (551 ms/token) | – |
+| Qwen3.8-Flash-Next | 2 cards, LRU expert bank, pinned source | **47-56 tok/s** (~11.4 s cold / 9.6 s warm) | **10.7 tok/s** (~93.3 ms/token) | – |
 
 The first two columns are the *isolated* prefill of a 512-token prompt and a
 single-stream decode, measured in-process; the last column is the aggregate
-throughput of 32 concurrent streams, which is what a server delivers.  Through
-the server the 27B's 512-token prompt takes **1.46 s to its first token**
-(351 tok/s): the difference is the HTTP round trip, the chat template, the
-lazily grown KV pool and the first token's own head — see
+throughput of 32 concurrent streams, which is what a server delivers.  The
+qwen4exp row uses i8 KV for its prefill measurement and f16 for decode; both
+types work.  Through the server the 27B's 512-token prompt takes **1.46 s to
+its first token** (351 tok/s): the difference is the HTTP round trip, the chat
+template, the lazily grown KV pool and the first token's own head — see
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Requirements
@@ -220,6 +228,12 @@ needs neither a GPU nor the oneAPI toolchain.
 # a 27B-class model does not fit on one card: split the layers over two GPUs
 ./build/sycl-infer --model /path/to/Qwen3.8-27B-UD-Q4_K_M.gguf --ctx 4096 \
     --layer-map 0-31:gpu.0,32-63:gpu.1 gen --prompt "Hello"
+
+# Qwen3.8-Flash-Next: all-GPU trunk + per-expert LRU, host-resident experts/PLE
+./build/sycl-infer \
+    --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+    --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+    --ctx 2048 --kv-type f16 gen --prompt "Hello"
 ```
 
 Common flags:
@@ -237,7 +251,11 @@ Common flags:
 | `--kv-type T` \| `K:V` | `i8` | KV storage: `i4` / `i8` / `bf16` / `f16` / `f32`, or K and V sized independently (`i4:i8`) |
 | `--device cpu\|gpu\|auto` | auto (gpu) | compute backend; `auto` reads `PF_DEVICE` |
 | `--cpu-threads N` | physical cores | CPU backend worker threads (`0` = auto) |
-| `--layer-map L:dev,...` | – | pipeline-parallel layer placement, e.g. `0-31:gpu.0,32-63:gpu.1` |
+| `--layer-map L:dev,...` | – | pipeline-parallel layer placement, e.g. `0-31:gpu.0,32-63:gpu.1`; qwen4exp recommends `0-23:gpu.0,24-47:gpu.1` |
+| `--moe-resident N` | 0 | routed-MoE: experts kept on the GPU per layer (`0` = all resident) |
+| `--moe-vram-mb MB` | 0 | routed-MoE: device budget for the expert bank; qwen4exp's per-expert LRU uses **17500** |
+| `--moe-ram-mb MB` | 0 | routed-MoE: host budget for the expert-block tier (`0` = off); qwen4exp keeps its experts host-resident and does not use this |
+| `--engram-ram-mb MB` | 4096 | qwen4exp: PLE row cache in host RAM (`0` disables) |
 | `--spec-type T` | `none` | speculative decoding: `none` / `mtp` / `dflash2` |
 | `--spec-draft-model <gguf>` | – | DFlash2 drafter GGUF (`--spec-type dflash2`); it reads the target's hidden states at the layers its `dflash.target_layers` names and proposes up to `dflash.block_size`-1 tokens |
 | `--spec-draft-n-max N` | 5 | draft tokens per cycle (DFlash2); the measured optimum |
@@ -554,29 +572,45 @@ exact command and the date; this section is the summary and the caveats.
 | Qwen3.5-0.8B | 1 card | **6 336 tok/s** | **78.7 tok/s** (12.7 ms/token) | – |
 | Qwen3.8-27B | 2 cards | **507 tok/s** | **13.4 tok/s** (74.6 ms/token) | **76.5 tok/s** |
 | Qwen3.6-35B-A3B | 2 cards | **779 tok/s** | **26.4 tok/s** (37.9 ms/token) | **168 tok/s** |
-| Qwen3.8-Flash-Next | 2 cards + CPU (host experts) | 5.5 tok/s (128 tokens) | **1.8 tok/s** (551 ms/token) | – |
+| Qwen3.8-Flash-Next | 2 cards, LRU expert bank, pinned source | **47-56 tok/s** (~11.4 s cold / 9.6 s warm) | **10.7 tok/s** (~93.3 ms/token) | – |
 
 **Qwen3.8-Flash-Next is the exception in both columns**: its file is 104 GiB,
 of which the 512-expert routed bank is 71.7 GiB and the n-gram PLE table 26.8
-GiB; neither fits on two 16 GB cards.  The dense trunk (~3.3 + 2.0 GiB) lives
-on the two cards, every routed pair is computed on the host, and the decode step
-is therefore host-RAM bound.  Point the loader at the first shard:
+GiB; neither fits on two 16 GB cards.  The ~5.3 GiB dense trunk and a per-expert
+LRU expert bank (`--moe-vram-mb 17500`) live on the two cards: 121 slots in each
+of 47 layers, including the four Q8_0-down layers 4, 30, 46 and 47.  The expert
+planes are pinned in host RAM once (`PF_Q4_PIN_SRC`, 69.8 GiB) so the uploads
+read them directly.  Only layer 2's routed experts stay on the host (Q5_K
+gate/up + Q8_0 down); its decode-only bank (`PF_Q4_BANK_Q5K=1`, 48 layers,
+17.0 GiB) measured 107.2 ms against 93.3, so the flag stays off.  The
+recommended run points the loader at the first shard:
 
 ```bash
 ./build/sycl-infer \
   --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --layer-map 0-19:gpu.0,20-39:gpu.1,40-47:cpu --ctx 2048 --kv-type f16 \
-  gen --prompt "The capital of France is"
+  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+  --ctx 2048 --kv-type f16 gen --prompt "The capital of France is"
 ```
 
-`--device cpu` and a plain `--device gpu` (trunk on both cards, experts on the
-host) work too.  Use `--kv-type f16` for this model: its residual stream is a
-hyper-connection cancellation, so the i8 KV error costs more than it does on the
-27B/35B.  **Known limits**: above 2 048 keys the reference's QSA indexer selects
-the top 2 048 keys, while this engine falls back to dense attention and prints
-one warning, so output beyond that depth diverges from the reference; the
-separate MTP draft GGUF and multimodal input are not wired for this
-architecture.
+The 512-token prefill is **~11.4 s cold / ~9.6 s warm (47-56 tok/s)**; the
+cold number includes the bank's calibration.  Decode settles at **~93.3
+ms/token (10.7 tok/s)** after ~16 tokens; a 64-token generation is ~15.6 s wall
+including the warm prefill.  17 000 MB gives 118 slots and 94.0 ms; 18 000
+loads (125 slots, 17.0 GiB) but is not faster.  `PF_Q4_PIN_SRC=0` (staging) and
+`PF_Q4_BANK_Q5K=1` (layer 2, 48 layers, 17.0 GiB, 107.2 ms, so off) are the
+A/Bs.
+The prefill numbers were measured with `--ctx 4096 --kv-type i8`; both i8 and
+f16 KV work, and f16 is recommended for decode.  `--device cpu` and a plain
+`--device gpu` also work, but are slower.
+
+**Known limits**: batched q4exp decode is unmeasured (the server's q4
+`prefill_batch` has no recorded variant), and the separate MTP draft GGUF and
+multimodal input are not wired for this architecture.  QSA is implemented: up
+to 2 048 keys it is dense-equivalent, above that the host selector picks the
+top 2 048 pooled keys.  Full attribution and dead ends:
+[Design 18](docs/design/18-qwen4exp.md),
+[PERFORMANCE §4.4](docs/PERFORMANCE.md#44-qwen38-flash-next--the-104-gib-hybrid-with-a-per-expert-lru),
+[`AGENTS.md`](AGENTS.md).
 
 The prefill column is the isolated 512-token chunk, measured in-process; the
 decode columns are the aggregate over N concurrent streams, i.e. what a server

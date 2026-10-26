@@ -48,6 +48,18 @@ inline int32_t dot32_dispatch(const uint8_t * a, const int8_t * b) {
     return isa().qgemv_sb ? dot32_u8s8(a, b) : isa().dot_i8(a, b, 32);
 }
 
+// Q8_0's weights are signed int8; dp4a is u8 x s8, so bias the weights by 128
+// and take the whole-group activation sum back out - exactly what the device
+// kernel does with `q ^ 0x80` and `-128 * sum(xq)`.  (AVX-VNNI-INT8's signed
+// dpbssd would also work but is a different extension than AVX512-VNNI and is
+// not on the reference CPU.)
+__attribute__((target("avx2"))) inline int32_t dot32_s8(const int8_t * a, const int8_t * b, int32_t xsum) {
+    const __m256i qa = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)a), _mm256_set1_epi8((char)0x80));
+    alignas(32) uint8_t qu[32];
+    _mm256_store_si256((__m256i *)qu, qa);
+    return dot32_dispatch(qu, b) - 128 * xsum;
+}
+
 // The stream layout of one token is [hc][n_embd], contiguous.
 inline int tok_row(const int32_t * rows, int i) {
     return rows ? rows[i] : i;
@@ -255,50 +267,126 @@ __attribute__((target("avx2,bmi2"))) static inline void q5_build_fast(const uint
 // (24 B / 32 values = 0.75 B/weight against 1.125) and reconstructs the q5
 // values in a register.  The q build is hoisted out of the pair loop, so its
 // 32 scalar ops are amortised over the tile's tokens.
-void cpu_q5_1_down_grouped_serial(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
-                                  const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
-                                  const int * pairs) {
+//
+// Factored into a per-row body so the serial form (the prefill's `par(expert)`
+// path) and the row-parallel form (a decode CPU miss: one expert, so the
+// parallelism has to be on the output rows) compute the identical arithmetic.
+static void q5_1_down_row(const uint8_t * base, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                          const int32_t * xsumq, int xTB, int P, int K, int row, float * acc, int acc_stride,
+                          const int * pairs, bool fastq) {
     const int G = K / 32;
     const int TT = 64;
-    const uint8_t * base = (const uint8_t *)w;
-    const bool fastq = q5_bmi2();
-    for (int row = 0; row < N; row++) {
-        const uint8_t * wr = base + (size_t)row * row_bytes;
-        for (int t0 = 0; t0 < P; t0 += TT) {
-            const int pn = std::min(TT, P - t0);
-            float a[TT];
-            for (int v = 0; v < pn; v++) {
-                a[v] = 0.f;
-            }
-            for (int g = 0; g < G; g++) {
-                const uint8_t * b = wr + (size_t)g * 24;
-                const float d = ggml_half_to_float((uint16_t)(b[0] | (b[1] << 8)));
-                const float m = ggml_half_to_float((uint16_t)(b[2] | (b[3] << 8)));
-                uint32_t qh;
-                memcpy(&qh, b + 4, 4);
-                uint8_t q[32];
-                if (fastq) {
-                    q5_build_fast(b, q);
-                } else {
-                    for (int i = 0; i < 32; i++) {
-                        const int lo = (b[8 + (i % 16)] >> (4 * (i / 16))) & 0xF;
-                        q[i] = (uint8_t)(lo | (((qh >> i) & 1u) << 4));
-                    }
-                }
-                for (int v = 0; v < pn; v++) {
-                    const int pr = pairs ? pairs[t0 + v] : (t0 + v);
-                    const size_t gi = (size_t)g * xTB + pr;
-                    const int32_t qd = dot32_dispatch(q, x8 + gi * 32);
-                    const int32_t xs = xsumq[gi * 2] + xsumq[gi * 2 + 1];
-                    a[v] += xmeta[gi * 2] * (d * (float)qd + m * (float)xs);
+    const uint8_t * wr = base + (size_t)row * row_bytes;
+    for (int t0 = 0; t0 < P; t0 += TT) {
+        const int pn = std::min(TT, P - t0);
+        float a[TT];
+        for (int v = 0; v < pn; v++) {
+            a[v] = 0.f;
+        }
+        for (int g = 0; g < G; g++) {
+            const uint8_t * b = wr + (size_t)g * 24;
+            const float d = ggml_half_to_float((uint16_t)(b[0] | (b[1] << 8)));
+            const float m = ggml_half_to_float((uint16_t)(b[2] | (b[3] << 8)));
+            uint32_t qh;
+            memcpy(&qh, b + 4, 4);
+            uint8_t q[32];
+            if (fastq) {
+                q5_build_fast(b, q);
+            } else {
+                for (int i = 0; i < 32; i++) {
+                    const int lo = (b[8 + (i % 16)] >> (4 * (i / 16))) & 0xF;
+                    q[i] = (uint8_t)(lo | (((qh >> i) & 1u) << 4));
                 }
             }
             for (int v = 0; v < pn; v++) {
                 const int pr = pairs ? pairs[t0 + v] : (t0 + v);
-                acc[(size_t)pr * acc_stride + row] = a[v];
+                const size_t gi = (size_t)g * xTB + pr;
+                const int32_t qd = dot32_dispatch(q, x8 + gi * 32);
+                const int32_t xs = xsumq[gi * 2] + xsumq[gi * 2 + 1];
+                a[v] += xmeta[gi * 2] * (d * (float)qd + m * (float)xs);
             }
         }
+        for (int v = 0; v < pn; v++) {
+            const int pr = pairs ? pairs[t0 + v] : (t0 + v);
+            acc[(size_t)pr * acc_stride + row] = a[v];
+        }
     }
+}
+
+void cpu_q5_1_down_grouped_serial(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                                  const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                                  const int * pairs) {
+    const uint8_t * base = (const uint8_t *)w;
+    const bool fastq = q5_bmi2();
+    for (int row = 0; row < N; row++) {
+        q5_1_down_row(base, row_bytes, x8, xmeta, xsumq, xTB, P, K, row, acc, acc_stride, pairs, fastq);
+    }
+}
+
+void cpu_q5_1_down_grouped(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                           const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                           const int * pairs) {
+    const uint8_t * base = (const uint8_t *)w;
+    const bool fastq = q5_bmi2();
+    // Row chunks, not rows: one row is 20 groups of work and the pool's
+    // dispatch dominates it.  The arithmetic is per row and unchanged.
+    const int nc = std::max(1, std::min(N, cpu_thread_count() * 4));
+    par(nc, [&](int c) {
+        const int r0 = (int)((long long)N * c / nc);
+        const int r1 = (int)((long long)N * (c + 1) / nc);
+        for (int row = r0; row < r1; row++) {
+            q5_1_down_row(base, row_bytes, x8, xmeta, xsumq, xTB, P, K, row, acc, acc_stride, pairs, fastq);
+        }
+    });
+}
+
+// Native Q8_0 down: `{f16 d; int8 qs[32]}` (34 B per 32 values, no minimum).
+// The device kernel biases the weights by 128 for dp4a and subtracts
+// 128*sum(xq); the host reads the signed bytes directly, so the same value is
+// `xmeta * d * sum(q*xq)` with no correction term.  qwen4exp's layers
+// 4/30/46/47 carry this down type.
+static void q8_0_down_row(const uint8_t * base, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                          const int32_t * xsumq, int xTB, int P, int K, int row, float * acc, int acc_stride,
+                          const int * pairs) {
+    const int G = K / 32;
+    const uint8_t * wr = base + (size_t)row * row_bytes;
+    for (int t0 = 0; t0 < P; t0 += 64) {
+        const int pn = std::min(64, P - t0);
+        float a[64];
+        for (int v = 0; v < pn; v++) {
+            a[v] = 0.f;
+        }
+        for (int g = 0; g < G; g++) {
+            const uint8_t * b = wr + (size_t)g * 34;
+            const float d = ggml_half_to_float((uint16_t)(b[0] | (b[1] << 8)));
+            const int8_t * q = (const int8_t *)(b + 2);
+            for (int v = 0; v < pn; v++) {
+                const int pr = pairs ? pairs[t0 + v] : (t0 + v);
+                const size_t gi = (size_t)g * xTB + pr;
+                const int32_t xs = xsumq[gi * 2] + xsumq[gi * 2 + 1];
+                const int32_t qd = dot32_s8(q, x8 + gi * 32, xs);
+                a[v] += xmeta[gi * 2] * d * (float)qd;
+            }
+        }
+        for (int v = 0; v < pn; v++) {
+            const int pr = pairs ? pairs[t0 + v] : (t0 + v);
+            acc[(size_t)pr * acc_stride + row] = a[v];
+        }
+    }
+}
+
+void cpu_q8_0_down_grouped(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                           const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                           const int * pairs) {
+    const uint8_t * base = (const uint8_t *)w;
+    const int nc = std::max(1, std::min(N, cpu_thread_count() * 4));
+    par(nc, [&](int c) {
+        const int r0 = (int)((long long)N * c / nc);
+        const int r1 = (int)((long long)N * (c + 1) / nc);
+        for (int row = r0; row < r1; row++) {
+            q8_0_down_row(base, row_bytes, x8, xmeta, xsumq, xTB, P, K, row, acc, acc_stride, pairs);
+        }
+    });
 }
 
 void cpu_q4_down_grouped_serial(const uint8_t * w, const float * sc, const int8_t * x8, const float * xmeta,

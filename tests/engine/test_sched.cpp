@@ -66,7 +66,7 @@ static gen_params greedy(int max_tokens, bool logprobs) {
 }
 
 int main(int argc, char ** argv) {
-    const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model_path = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
     const char * lm = si::env::str("TEST_LAYER_MAP");
     // Section 7's oracle only means anything with the decode batch pinned to one
     // row: with several rows the fp accumulation order differs between two

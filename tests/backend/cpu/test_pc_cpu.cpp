@@ -158,7 +158,7 @@ int main(int argc, char ** argv) {
     setenv("PF_DP4A", "0", 1); // deterministic fp32 weight path (CPU default)
     setenv("PF_PC_STATES", "2", 1);
     setenv("PF_PC_RAM_MB", "0", 1); // this test exercises the disk tier directly
-    const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model_path = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
 
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("si_pc_cpu_" + std::to_string((long)getpid()));

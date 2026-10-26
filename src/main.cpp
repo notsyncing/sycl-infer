@@ -43,7 +43,7 @@ static bool read_file(const std::string & path, std::vector<uint8_t> & out) {
 // (16k depth + 512 prefill + 32 decode) out of the box; the KV pool commits
 // memory lazily, so this costs virtual address space, not committed RAM.
 static const int kDefaultCtx = 20480;
-static const char * kDefaultModel = "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+static const char * kDefaultModel = "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
 
 static void usage(const char * prog) {
     fprintf(stderr,
@@ -77,6 +77,14 @@ static void usage(const char * prog) {
             "                               largest non-weight allocation on a 27B\n"
             "                               (1.125 GiB per card at 16 slots); a\n"
             "                               single-stream long-context run needs one.\n"
+            "  --moe-resident N             routed experts kept on the device per\n"
+            "                               layer (0 = all; env PF_MOE_RESIDENT)\n"
+            "  --moe-vram-mb N              device budget for the routed expert bank\n"
+            "                               (env PF_MOE_VRAM_MB)\n"
+            "  --moe-ram-mb N               host-RAM tier for spilled expert blocks\n"
+            "                               (env PF_MOE_RAM_MB)\n"
+            "  --engram-ram-mb N            qwen4exp PLE row cache in host RAM\n"
+            "                               (default 4096; 0 disables)\n"
             "  --yarn                       YaRN context extension, NTK-by-parts\n"
             "                               (default OFF; env PF_YARN).  It stretches\n"
             "                               the low-frequency RoPE pairs so a context\n"

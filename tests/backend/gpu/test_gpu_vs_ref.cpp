@@ -11,7 +11,7 @@ using namespace si;
 int main(int argc, char ** argv) {
     setenv("PF_DP4A", "0", 1); // strict tests validate the fp32 path
 
-    const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model_path = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
     std::vector<int> toks;
     for (int i = 2; i < argc; i++) {
         toks.push_back(atoi(argv[i]));

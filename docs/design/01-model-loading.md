@@ -11,6 +11,8 @@
 * **零转换**：GGUF 直接读，不生成中间权重文件。
 * **零主机拷贝**：权重在主机侧只有 `mmap`，不做堆上副本。
 * **一次设备上传**：整个 GGUF 映射（含元数据）一次 `memcpy` 到设备，之后用“偏移恒等”推导所有设备指针。
+  **split GGUF 例外**：分片文件映射成一段连续虚拟地址，但物理上仍来自多个文件，单块上传会读到分片
+  之间的 `PROT_NONE` 空洞，所以 split 文件走逐张量上传（见 §2.6、§4.2）。
 * **权重上设备后回收主机页**：`madvise(MADV_DONTNEED)` + `posix_fadvise(POSIX_FADV_DONTNEED)` 把 27B 的
   15.7 GB 文件页从进程 RSS 里摘掉（见 §4.3）——映射仍然有效，所以这是纯吞吐优化、不是正确性依赖。
 * **架构无关**：`general.architecture` → 加载器函数指针，注册表分发。
@@ -87,6 +89,39 @@ K-quant 线性层的 `K`（= `dims[0]`）必须是块大小的整数倍。反过
 （`ssm_beta`/`ssm_alpha` 这类窄 int8 行）、IQ4_XS/IQ4_NL（走 `PF_CB4` 的 codebook 4-bit 原生存储，
 见 [02-quantization.md](02-quantization.md)）、BF16/F32（视觉/音频 encoder 的线性层）。
 
+### 2.6 split GGUF（分片文件）
+
+`gguf_file::load` 识别 `...-NNNNN-of-MMMMM.gguf` 形式的文件名：从文件名取出分片数，按索引打开所有
+兄弟文件，并同时校验每个分片元数据里的 `split.no` 与文件序号一致、`split.count` 与文件名数量一致
+（不一致直接抛错）。**元数据不是分片顺序的依据，文件名才是。**
+
+分片不能各自独立 `mmap` 后再拼接指针，否则 `tensor.data - map_base` 会跨文件失效。装载器先按所有
+分片的页对齐大小总和保留一段 **`PROT_NONE | MAP_NORESERVE` 的匿名虚拟地址区间**，再把每个分片用
+`MAP_FIXED` 映射到该区间内自己的页对齐槽位：
+
+```
+map_base
+  +0                    shard 0 (PROT_READ, MAP_FIXED)
+  +ceil(size0, page)    shard 1
+  +...                  ...
+```
+
+因此：
+
+* 任意张量的地址减去 `map_base` 仍是一个**全局稳定偏移**，`model::dev_ptr` 的偏移恒等、逐张量上传和
+  `model::page_out_host` 全部照常工作；
+* 分片之间的 gap 是页对齐 padding，不对应任何文件字节；读取 gap 会命中 `PROT_NONE` 而 fault；
+* `gguf_file::is_split()`（`shards.size() > 1`）是判断入口；析构时对整段区间一次 `munmap` 即可解除
+  所有 `MAP_FIXED` 子映射，随后逐个关闭分片 fd；
+* `gguf_file::drop_cache` 不能把 reservation 偏移直接交给 `posix_fadvise`：它把范围裁剪到每个分片
+  自己的 `[base, base+size)` 内，再换算成该分片的文件偏移（范围可以跨过 padding）。
+
+**单块上传拒绝 split 文件。** `model::upload(q)` 会 `memcpy` 整个 `map_size`，而 split 映射的 gap 是
+`PROT_NONE`，拷贝会 fault；因此它直接抛
+`single-blob upload is not supported for a split GGUF: use --layer-map`。大分片模型走
+`engine::setup_multi_device` 的逐张量（每设备）上传；`qwen4exp` 即使只有一张 GPU 也走这条路径
+（见 [18-qwen4exp.md §2](18-qwen4exp.md)）。
+
 ---
 
 ## 3. 架构注册表
@@ -96,15 +131,19 @@ K-quant 线性层的 `K`（= `dims[0]`）必须是块大小的整数倍。反过
 struct loader { const char *name; void (*load)(model & m); };
 const loader * find(const std::string & name);
 void load_qwen35(model & m);
+void load_qwen35moe(model & m);
+void load_qwen4exp(model & m);
 wt bind_tensor(const gguf_file & f, const std::string & name, uint32_t expect_type = 0xFFFFFFFF);
 const float * bind_f32(const gguf_file & f, const std::string & name);
 ```
 
-`model.cpp:44-48` 中的静态表（**目前只有 qwen35 一行**）：
+`model.cpp` 中的静态表：
 
 ```cpp
 static const loader kLoaders[] = {
-    {"qwen35", &load_qwen35},
+    {"qwen35",     &load_qwen35},
+    {"qwen35moe",  &load_qwen35moe},
+    {"qwen4exp",   &load_qwen4exp},
 };
 ```
 
@@ -188,7 +227,8 @@ const void * dev_ptr(const void * host_ptr) const {
 
 之所以要上传整个映射而不是仅张量数据：所有 `wt.data` / `bind_f32` 返回的都是 `map_base` 内部的
 指针，一次线性拷贝才能保持每个偏移有效。kernel 在录制图时捕获 `dev_ptr` 值，因此只要
-`dev_weights` 存活，录制的图就一直有效。
+`dev_weights` 存活，录制的图就一直有效。**split GGUF 不能走这条路径**：分片之间的 gap 是
+`PROT_NONE`，`model::upload` 直接拒绝（见 §2.6），改走 `setup_multi_device` 的逐张量上传。
 
 `model::upload(q, host)`（`model.h:113-115`）的 `host=true` 分支 **不做拷贝**：`dev_weights = nullptr`，
 `dev_ptr` 退化为恒等（直接返回 mmap 指针），这就是 CPU 后端的模式——权重留在 mmap 里，主机内核

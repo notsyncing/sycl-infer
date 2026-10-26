@@ -302,13 +302,13 @@ void gated_norm_launch(sycl::queue & q, const float * attn, const float * z, con
 // qwen4exp hyper-connections (see src/backend/gpu/kernels/q4exp.cpp).  The
 // buffers are flat [token][hc][n_embd]; `residual` is the stream array and the
 // mixer's output is one n_embd-wide token vector.
-void q4_hc_norm_launch(sycl::queue & q, const float * x, const float * w, float * out, int n_tok, int n_embd, int hc,
-                       float eps);
-void q4_hc_mix_launch(sycl::queue & q, const float * xn, const float * gate, float * mixed, int n_tok, int n_embd,
-                      int hc);
-void q4_hc_combine_launch(sycl::queue & q, float * residual, const float * block_out, const float * inject, int n_tok,
-                          int n_embd, int hc);
-void q4_silu_scale_launch(sycl::queue & q, float * x, int n, float scale);
+sycl::event q4_hc_norm_launch(sycl::queue & q, const float * x, const float * w, float * out, int n_tok, int n_embd,
+                              int hc, float eps);
+sycl::event q4_hc_mix_launch(sycl::queue & q, const float * xn, const float * gate, float * mixed, int n_tok,
+                             int n_embd, int hc);
+sycl::event q4_hc_combine_launch(sycl::queue & q, float * residual, const float * block_out, const float * inject,
+                                 int n_tok, int n_embd, int hc);
+sycl::event q4_silu_scale_launch(sycl::queue & q, float * x, int n, float scale);
 // K is not a multiple of 256 (the HC up projection's 320): the ordinary GEMV
 // works in 256-value superblocks and would drop the tail.
 void q4_up_gemv_launch(sycl::queue & q, const void * w, uint32_t type, const float * x, int xs, float * out, int os,
@@ -530,6 +530,14 @@ bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * sl
 // group with the +m zero point in the group sum.  `xq`/`asa`/`xs` are the
 // pair-row activation tile written by `moe_actq_launch`.
 void moe_down_q5_1_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                          const int32_t * off, const int32_t * pair, const int32_t * active,
+                          const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
+                          const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                          int n_ff_exp);
+// Native Q8_0 down: 34-byte blocks (f16 d + 32 int8), same contract; the
+// signed weights are biased by 128 inside dp4a and the activation group sum
+// removes the bias.  Used by the Q4_K/Q8_0-down layers 4, 30, 46 and 47.
+void moe_down_q8_0_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                           const int32_t * off, const int32_t * pair, const int32_t * active,
                           const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
                           const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,

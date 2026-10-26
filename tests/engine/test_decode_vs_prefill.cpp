@@ -195,7 +195,7 @@ static bool one_case(engine & e, const std::vector<int> & toks, bool split) {
 }
 
 int main(int argc, char ** argv) {
-    const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model_path = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
     const char * lm = si::env::str("TEST_LAYER_MAP");
     const bool split = lm && *lm;
     try {

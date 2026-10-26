@@ -73,7 +73,7 @@ int main(int argc, char ** argv) {
     setenv("PF_DP4A", "0", 1); // deterministic fp32 weight path
     setenv("PF_PC_STATES", "2", 1);
     setenv("PF_PC_RAM_MB", "512", 1);
-    const char * model_path = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model_path = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
 
     const std::string prompt_text = "<|im_start|>user\nThe quick brown fox jumps over the lazy dog.";
     try {

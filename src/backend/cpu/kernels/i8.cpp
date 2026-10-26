@@ -60,6 +60,38 @@ __attribute__((target("avx2,fma"))) float q4k_i8_block(const block_q4_K * blk, c
     return acc;
 }
 
+// The same 32-value group contribution with AVX-512 VNNI's dpbusd.  The
+// integer sum is exact and the float epilogue is the same expression in the
+// same order, so this is bit-identical to q4k_i8_block; it only saves the
+// maddubs -> madd -> horizontal-sum chain per group.  Used by the per-row
+// GEMV that a decode CPU miss calls (PF_Q4_CPU_MISS).
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma"))) float q4k_i8_block_vnni(
+        const block_q4_K * blk, const int8_t * x8, const float * xmeta, const int32_t * xsumq, int TB, int t, int gbase) {
+    const float d = ggml_half_to_float(blk->d);
+    const float dm = ggml_half_to_float(blk->dmin);
+    const uint8_t * qs = blk->qs;
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    float acc = 0.0f;
+    for (int g = 0; g < 8; g++) {
+        uint8_t sc, mm;
+        get_scale_min_k4(g, blk->scales, &sc, &mm);
+        const size_t ai = (size_t)(gbase + g) * TB + t;
+        const __m256i bytes = _mm256_loadu_si256((const __m256i *)(qs + (g / 2) * 32));
+        const __m256i q = (g & 1) ? _mm256_and_si256(_mm256_srli_epi16(bytes, 4), m0f) : _mm256_and_si256(bytes, m0f);
+        const __m256i xv = _mm256_loadu_si256((const __m256i *)(x8 + ai * 32));
+        const __m256i v = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q, xv);
+        __m128i lo = _mm256_castsi256_si128(v);
+        const __m128i hi = _mm256_extracti128_si256(v, 1);
+        lo = _mm_add_epi32(lo, hi);
+        lo = _mm_hadd_epi32(lo, lo);
+        lo = _mm_hadd_epi32(lo, lo);
+        const int32_t wd = _mm_cvtsi128_si32(lo);
+        const int32_t xsum = xsumq[ai * 2] + xsumq[ai * 2 + 1];
+        acc += xmeta[ai * 2] * (d * sc * (float)wd - dm * mm * (float)xsum);
+    }
+    return acc;
+}
+
 // Q5_K: like Q4_K plus the 5th bit; bit g of qh[l] belongs to group g
 __attribute__((target("avx2,fma"))) float q5k_i8_block(const block_q5_K * blk, const int8_t * x8, const float * xmeta,
                                                        const int32_t * xsumq, int TB, int t, int gbase) {
@@ -424,6 +456,43 @@ __attribute__((target("avx2,fma"))) void cpu_i8_expert_gemm(uint32_t type, const
             }
         }
     }
+}
+
+void cpu_i8_gemv1_chunked(const cpu_gemv_seg & seg, int n_chunks) {
+    if (!seg.w || !i8_supported(seg.type)) {
+        cpu_gemv_group(seg.type, &seg, 1, seg.n_rows, 1, seg.K / 256, 0, 0);
+        return;
+    }
+    const int K = seg.K;
+    const uint32_t type = seg.type;
+    const size_t row_bytes = (type == 12) ? sizeof(block_q4_K) : (type == 13) ? sizeof(block_q5_K) : sizeof(block_q6_K);
+    const int nblocks = (K / 256);
+    const int rows = seg.n_rows;
+    const int nc = std::max(1, std::min(rows, n_chunks));
+    // Q4_K gets the AVX-512 VNNI group dot (one dpbusd, bit-identical to the
+    // AVX2 maddubs/madd/hsum chain); Q5_K/Q6_K keep the per-row kernel.
+    static const bool vnni = type == 12 && cpu_features_of().avx512vnni;
+    par(nc, [&](int c) {
+        const int r0 = (int)((long long)rows * c / nc);
+        const int r1 = (int)((long long)rows * (c + 1) / nc);
+        for (int row = r0; row < r1; row++) {
+            const void * wrow = (const char *)seg.w + (size_t)row * nblocks * row_bytes;
+            float v = 0.0f;
+            if (vnni) {
+                const block_q4_K * w = (const block_q4_K *)wrow;
+                for (int b = 0; b < nblocks; b++) {
+                    v += q4k_i8_block_vnni(w + b, seg.x8, seg.xmeta, seg.xsumq, 1, 0, b * 8);
+                }
+            } else {
+                v = i8_row(type, wrow, seg.x8, seg.xmeta, seg.xsumq, 1, 0, K);
+            }
+            v *= seg.alpha;
+            if (seg.residual) {
+                v += seg.residual[row];
+            }
+            seg.out[row] = v;
+        }
+    });
 }
 
 void cpu_i8_gemv(const cpu_gemv_seg & seg, int n_threads) {

@@ -515,7 +515,8 @@ struct engine {
         gemv_seg * segs = nullptr;      // device (or host, for a cpu partition)
         gemv_seg * host_segs = nullptr; // staging ring for the async copy
         int segs_cap = 0;
-        int seg_used = 0;
+        int seg_used = 0;  // next ring slot
+        int seg_alloc = 0; // allocations since the ring last wrapped (drained reset)
         float * router_logits = nullptr;
         int32_t * router_ids = nullptr;
         float * router_wts = nullptr;
@@ -527,6 +528,9 @@ struct engine {
     float * q4_moe_logits_ = nullptr;
     float * q4_moe_wts_ = nullptr;
     float * q4_moe_acc_ = nullptr;
+    // PF_Q4_CPU_MISS: the host-computed miss pair rows, pinned so the H2D into
+    // the device A.acc is an enqueue rather than a pageable blocking copy.
+    float * q4_miss_acc_ = nullptr;
     float * q4_moe_sh_ = nullptr;
     float * q4_moe_shout_ = nullptr;
     int32_t * q4_moe_ids_ = nullptr;
@@ -554,12 +558,32 @@ struct engine {
     std::vector<int> q4_up_next_;        // per device: next ring slot
     size_t q4_up_stride_ = 0;            // bytes per ring slot (max plane)
     int q4_up_slots_ = 0;
-    double q4_up_wait_ms_ = 0.0;         // diagnostic: ring-slot waits
-    void q4_upload(int dev, void * dst, const void * src, size_t n);
+    // PF_Q4_UPSTAT: the upload split.  `copy` is the host memcpy into the ring,
+    // `enq` the device-copy enqueues, `wait` the ring-slot event waits, and
+    // `bytes` what went through the ring, so a `copy` that does not scale with
+    // threads can be told from one that is already at the DMA floor.
+    double q4_up_wait_ms_ = 0.0;
+    double q4_up_copy_ms_ = 0.0;
+    double q4_up_enq_ms_ = 0.0;
+    double q4_up_dma_ms_ = 0.0;          // PF_Q4_UPDMA: the H2D floor, measured
+    size_t q4_up_bytes_ = 0;
+    size_t q4_up_calls_ = 0;
+    void q4_upload(int dev, void * dst, const void * src, size_t n, bool pinned = false);
+    // Prefill-only: enqueue on the per-device copy queue so the H2D rides
+    // alongside the previous batch's expert GEMMs.  The caller waits
+    // q4_up_last_ev_[dev] before enqueuing the kernels that read the bank.
+    void q4_upload_async(int dev, void * dst, const void * src, size_t n, bool pinned = false);
+    void q4_upload_impl(int dev, sycl::queue & q, void * dst, const void * src, size_t n, bool async, bool pinned);
     void q4_upload_init(int nd, size_t max_plane);
+    std::vector<std::unique_ptr<sycl::queue>> q4_up_q_; // per device, in-order copy queue
+    std::vector<sycl::event> q4_up_last_ev_;            // last async copy this batch
+    std::vector<unsigned char> q4_up_last_live_;
     std::vector<uint32_t> q4_lru_age_; // [n_layer][R], the per-slot LRU clock
+    std::vector<float> q4_lru_heat_;    // [n_layer][R], decayed routing heat (PF_Q4_HEAT)
     uint32_t q4_lru_tick_ = 0;
     bool q4_hotchk_done_ = false;
+    // Decode forwards seen by the q4 path (PF_Q4_CPU_MISS's warm-up gate).
+    uint32_t q4_dec_step_ = 0;
     float * q4_spill_acc_ = nullptr;
     void q4_hot_calibrate();
     std::vector<uint64_t> q4_hist_pre_, q4_hist_dec_;
@@ -583,10 +607,15 @@ struct engine {
         void * u = nullptr;
         void * d = nullptr;
         size_t sg = 0, su = 0, sd = 0;
-        int32_t * sm = nullptr; // identity slot map on the layer's device
+        int32_t * sm = nullptr;  // slot map (decode / first prefill batch)
+        int32_t * sm2 = nullptr; // alternate map for the two-pass prefetch
+        void * hg = nullptr;     // pinned host copy of this layer's expert planes
+        void * hu = nullptr;
+        void * hd = nullptr;
     };
     std::vector<q4_bank_t> q4_bank_layer_;
     std::vector<void *> q4_host_usm_; // pinned expert mirrors, freed with sycl::free
+    std::vector<std::pair<void *, int>> q4_pin_src_; // pinned expert source + device, freed with sycl::free
     bool q4_mirror_ = false;
     size_t engram_ram_mb_ = 0;
     size_t engram_cap_ = 0; // power of two
@@ -606,6 +635,38 @@ struct engine {
     std::vector<std::vector<std::unique_ptr<qsa_slot_state>>> qsa_cache_;
     bool qsa_on_ = false;
     int qsa_max_seq_ = 0;
+    // Deferred QSA update (decode while the selector is dense-equivalent).
+    // The D2H copies are enqueued per layer and waited once at the end of the
+    // forward, so the host MoE and the device no longer serialise 12 times per
+    // token; the indexer projection and the mirror/pool update then run while
+    // the LM head is on the device.  Only the per-token update is deferred -
+    // the selector and the sparse attention must stay inline before `wo`.
+    struct qsa_pending {
+        const layer_t * L = nullptr;
+        int a = -1;
+        int n_tok = 0;
+        bool active = false;
+        bool has_ev = false;
+        sycl::event ev;
+        std::vector<int> pos, slot;
+        std::vector<float> mixed, k, v;
+    };
+    std::vector<qsa_pending> qsa_pending_;
+    void qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
+                          const float * mixed_host, const float * kh, const float * vh, float * qpos, bool with_q);
+    double qsa_flush();
+    // PF_QSA_TIME: the host QSA split, accumulated over one forward.  `copy`
+    // is the D2H waits, `gemv` the indexer projections (q is skipped when no
+    // selector runs), `upd` the per-token norm/RoPE/pool/mirror update, `sel`
+    // the selector and `attn` the sparse attention.  `rows`/`nsel` size the
+    // selector and the attention.
+    double qsa_copy_ms_ = 0.0;
+    double qsa_gemv_ms_ = 0.0;
+    double qsa_upd_ms_ = 0.0;
+    double qsa_sel_ms_ = 0.0;
+    double qsa_attn_ms_ = 0.0;
+    long qsa_rows_ = 0;
+    long qsa_nsel_ = 0;
     bool qsa_attention(int a, const layer_t & L, int dev, int n_tok, const step_info * inf, const float * mixed,
                        float * qbuf, const float * kbuf, const float * vbuf, float * attn_out);
     void q4_alloc_banks();

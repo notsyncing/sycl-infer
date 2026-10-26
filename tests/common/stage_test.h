@@ -24,7 +24,7 @@ inline std::vector<int> stage_default_tokens() {
 }
 
 inline const char * stage_arg_model(int argc, char ** argv) {
-    return argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    return argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
 }
 
 inline std::vector<int> stage_arg_tokens(int argc, char ** argv) {

@@ -7,7 +7,7 @@
 #include "tokenizer.h"
 
 int main(int argc, char ** argv) {
-    const char * model = argc > 1 ? argv[1] : "/home/sfc/临时/Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char * model = argc > 1 ? argv[1] : "/path/to/Qwen3.5-0.8B-Q4_K_M.gguf";
     gguf_file f;
     f.load(model);
     tokenizer tk;

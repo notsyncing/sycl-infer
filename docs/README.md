@@ -25,7 +25,8 @@
 | 16 | [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md) | MoE 架构加载（每层混合量化）、路由专家的 grouped dp4a GEMM（以及 **decode 自己的 tile**）、ncmoe 专家切分（GPU 固定部分 / CPU 可变部分）、disk→RAM→VRAM 三级专家缓存 |
 | 17 | [design/16-router.md](design/16-router.md) | 多模型路由进程：JSON-with-comments 配置文件与模型注册表、JSON-RPC 控制面（模型身份/设备显存/优雅停机）、HTTP/SSE 数据面代理、worker 生命周期与显存预算的实测准入、远程 worker、Docker 部署 |
 | 18 | [design/17-onnx-service.md](design/17-onnx-service.md) | 文档流水线的 ONNX 模型服务：自研的 ONNX protobuf 解析、常量折叠与算子融合（BatchNorm/激活融进卷积）、算子库与 SYCL kernel、执行器的内存计划、二进制线协议与 HTTP 端点 |
-| 19 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+| 19 | [design/18-qwen4exp.md](design/18-qwen4exp.md) | Qwen3.8-Flash-Next（`qwen4exp`）：split GGUF 装载、hyper-connections、PLE/engram 缓存、QSA 主机选择器、每专家 LRU + 两遍预填充、K%256 的 down 规则与实测吞吐 |
+| 20 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 ## 快速定位
 
@@ -39,6 +40,7 @@
 * 想动 MTP / 投机解码 → [design/04-engine.md §12](design/04-engine.md)、[design/03-kernels.md §15](design/03-kernels.md)、[design/14-dflash2.md](design/14-dflash2.md)
 * 想动 DFlash2 块草稿器（卷积下标、RoPE 宽度、lattice、top-k）→ [design/14-dflash2.md](design/14-dflash2.md)
 * 想动 MoE / 专家切分 / 三级专家缓存 → [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md)
+* 想跑 Qwen3.8-Flash-Next（104 GiB、split GGUF、HC/PLE/QSA、512 专家）→ [design/18-qwen4exp.md](design/18-qwen4exp.md)
 * 想动 MoE 专家 GEMM 的 tile（prefill 的 M=8 与 decode 的 M=1/M=2）→ [design/15-moe-ncmoe.md §3.4](design/15-moe-ncmoe.md)、[design/03-kernels.md §5.10](design/03-kernels.md)
 * 想动批量 decode 的行数（每个行数一个 plan 桶，精确不取整）→ [design/04-engine.md §6.2](design/04-engine.md)
 * 想让 prefill 更快（batch 形状、oneDNN prefill attention）→ [design/04-engine.md §7](design/04-engine.md)、[design/03-kernels.md §5.8](design/03-kernels.md)、[design/03-kernels.md §7.5](design/03-kernels.md)

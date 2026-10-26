@@ -533,6 +533,106 @@ tile：单 token 用 M=1、批量用 M=2（`PF_MOE_CFG_DEC`，0 = auto）。
 设计讨论、其余 MoE kernel（router / CSR / reduce）、ncmoe 切分与三级专家缓存见
 [design/15-moe-ncmoe.md §3.4](15-moe-ncmoe.md)。
 
+### 5.11 qwen4exp：HC / PLE / 专家 down / Q8_0 / router
+
+qwen4exp 新增的逐层 kernel 很少：GDN、attention 和原生权重 GEMV 全部复用上面的 launcher；
+新代码集中在 `src/backend/gpu/kernels/q4exp.cpp` 与 `src/backend/cpu/kernels/q4exp.cpp`。
+
+**Hyper-connections（`q4exp.cpp`）**
+
+* `q4_hc_norm_launch`：一个 work-group 处理一个 `(token, stream)`，模板 WG = 256 或 512
+  （按设备 profile 的 `wg_clamped_for_queue`），先做 stream 内 RMSNorm，再乘该 stream 的 gate。
+* `q4_hc_mix_launch`：`range<2>(token, n_embd)`，输出
+  `mixed[c] = mean_s(sigmoid(gate[s][c]) * xn[s][c])`。
+* `q4_hc_combine_launch`：对每个 `(token, stream)` 做
+  `residual += block_out * 2*sigmoid(inject[stream]/hc)`。
+* `q4_silu_scale_launch` / `q4_repeat_launch` 是 PLE/HC 的逐元素辅助。
+* `q4_up_gemv_launch` 处理 **K 不是 256 倍数**的 up 投影（HC up 的 K = `hc_low_rank` = 320），
+  按 32 值组直接反量化；`q4_inject_launch` 的 F32 分支是 HC scatter 投影（K = `hc_dim` = 10240，
+  N = `hc` = 4，通用 GEMV 的 tiling 不接受 N=4）。它是**一个 256 线程 work-group 处理一个
+  `(token, stream)`**：每 lane 拥有 strided float4 块、四个独立累加器，先发四对 float4 再 FMA，
+  最后 warp `reduce_over_group` + 每子组一个 SLM 槽。实测 **1.93 ms/token**（96 次调用），
+  取代了原来的单 work-item 串行点积；**求和顺序会变**（L0/L1 相对差 ≤4.4e-6，后面逐层到 ulp），
+  所以它用 token 流和 27B decode-vs-prefill 判据验证，而不是假设位相等。`PF_Q4_INJECT=0` 回退旧
+  kernel。
+
+**PLE（主机，`cpu/kernels/q4exp.cpp`）**
+
+`cpu_q4_ple_gate` 做 key/query 的 RMSNorm 与门控，`cpu_q4_ple_apply` 做 depthwise 卷积并写回 HC
+残差。`ple_conv1d` 的布局是 **`[kernel][channel]`，`nb0 = kernel`**，所以 tap `k` of channel `c`
+是 `w[k + kern*c]`，不是 `w[k*hc_dim + c]`。PLE 表行的 dequantize 走主机；已解量化的行由
+engine 的 engram 缓存（直接映射、`row & (cap-1)`）缓存，见
+[design/18-qwen4exp.md §5](18-qwen4exp.md)。
+
+**Q5_1 down（`moe_down_q5_1_launch`，`moe.cpp`）**
+
+32 值一组、`NPB=8` 的 dp4a down，直接读原始 Q5_1 block。两个 load-bearing 细节：
+
+* 32 值块的 nibble 是**交错的两半**：元素 0..15 取 `qs[0..15]` 的低 nibble，16..31 取高 nibble，
+  第 5 位是 `qh` 的第 *i* 位，即 `lo = qs[i%16] >> 4*(i/16)`；按 `qs[i/2] >> 4*(i%2)` 读统计量
+  对、答案错（routed 输出 cos 0.7）。
+* `m·xs` 项是**每 32 值组**的，不是每 lane 的：只加在 `lane%8 == 0` 上。第一版每个 lane 都加，
+  零点被算了 8 遍（cos 0.08、rms 16x）。
+
+hermetic 测试对 K=32/64/160/640、N=64/2560 与主机参考完全一致（cos 1.0）。
+
+**Q8_0 down（`moe_down_q8_0_launch`，`moe.cpp`）**
+
+同样的契约和 warp 分解，但 Q8_0 block 是 34 字节（f16 d + 32 个 int8），没有 min；lane 的
+4 个值是**有符号** int8。dp4a 只有 signed×unsigned，所以权重按 `q ^ 0x80` 偏置成 unsigned，
+再减去 `-128·sum(xq)`；这个组和修正只加在 `lane%8 == 0` 上（每 lane 都加会重复 8 次）。
+`qs` 从 block 偏移 2 开始，四个字节用两个 uint16 load，不能用未对齐的 uint32（AOT 加宽）。
+它是四个 Q4_K/Q8_0-down 层（4、30、46、47）能 bank 的原因；layer 4 的 `PF_Q4_FFCMP`
+预填 cosine **0.999999**。
+
+**通用 expert down 的 K%256 规则（`moe_down_impl`）**
+
+行 stride 必须是 `ceil(K/256)` 个 superblock 的**真实** `quant_row_bytes`，不是 `n_ff_exp/256`。
+qwen4exp 的 K=640 时后者是 2（384 字节），而一行实际是 480 字节：第 1 行起全部读进下一行，
+最后一个 partial superblock 也越界。修复是 `ceil(K/256)` + 把 K 之后的 block 清零 + down bank
+末尾 256 字节 guard。GPU-vs-host cosine 从 0.00 到 **0.99995**。
+
+**Q8_0 GEMV（`gemv_dec_q8_kernel` / `gemv_dec_q8_split_kernel<WPR=8>`，`gemv.cpp`）**
+
+通用 lane=k 映射每个 8 值要做 8 次 scale、8 次 byte load 和 8 次标量 x load。新 kernel 每 lane
+一次处理 4 个 int8：**两个 uint16 load**（payload 的 2-mod-8 对齐）+ 两个 float4 激活 load；
+窄形状（rows ≤ 512，例如 320 行的 HC down）用 `WPR=8` 的 K-split + SLM reduce。单次调用：
+HC down 0.21-0.32 → **0.042-0.046 ms**，ssm_out/wo 0.27 → **0.099 ms**，LM head 7.89 → **2.6 ms**。
+**不要改成 8 字节 uint2 load**：JIT 下对齐没问题，但 AOT `acm-g10` 会把访问加宽，prefill logits
+去相关（max|diff| 15.4 / 18.6）；四个 uint16 才是正确形式。`PF_Q4_GEMV8=0` 回退通用路径。
+
+**fused router（`moe_router_softmax_topk`，`moe.cpp`）**
+
+原来四趟：logits、softmax（512 个 `sycl::exp()` 在**单 work-item** 上串行）、top-k ids、wts。
+现在一个 work-group 处理一个 token（256 或 512 lane），softmax 的和仍在 lane 0 上按索引顺序串行，
+top-k 的 rank/tie 规则不变，因此与四趟**逐位相同**（`PF_MOE_RT_CHK`；qwen4exp 与 35B A3B 的
+ids/wts/logits 都是 `bad=0`）。实测 router **0.43 → 0.07 ms/layer**；`PF_MOE_RT_OLD=1` 回退四趟。
+
+**QSA 主机 kernel（`cpu/kernels/qsa.cpp`）**
+
+`cpu_qsa_bf16_gemv`（indexer 的 q/k 投影，BF16 权重）、`cpu_qsa_score_pools`（4-key pool 打分）和
+`cpu_qsa_attn_head`（单 query head 的 q·K + softmax + V 累加 + gate）由 `PF_CPU_ISA`/`PF_QSA_ISA`
+选择标量/AVX2/AVX-512。attention 的 AVX-512 形式针对 head_dim=256：16 个 zmm 常驻 q、16 个累加器
+做 V；softmax 的 exp 是 6 次多项式 + `scalef`（|r|≤0.347，相对误差 ~1e-7），V 归约与 gate 同样
+向量化。selector 的 512 个 pool 仍串行（~2.7 us/层，低于一次线程池唤醒）。BF16 GEMV 每 job 处理
+8 行（一行一个 job 是 dispatch-bound：640 行/层 × 12 层）。实测 2 055 token：sparse attention
+39.3 → 19.2（AVX2）→ 16.0 ms/token（AVX-512），选区 512/512 相同、score cosine 1.000000、
+layer-0 `mixed` 逐位相同；96-token decode 的三档 ISA 端到端相同（`[q4]` 和 97.3-97.5，
+真机 wall 约 101 ms，±0.2 的跑间差异），因为主机工作被 LM head 盖住。详见 [18-qwen4exp.md §4](18-qwen4exp.md) 与
+[PERFORMANCE.md §4.4.1](../PERFORMANCE.md)。
+
+**LRU / 两遍 prefill（engine 侧，不新增 kernel）**
+
+qwen4exp 的每专家 LRU、pinned expert source（`PF_Q4_PIN_SRC`，63.0 GiB / 47 层 69.8 GiB）、
+32-slot staging ring 回退和两遍 prefill 调度都在 `engine_q4exp.cpp`，不在 kernel 里：slot map
+是纯主机侧决定，kernel 仍然只判断 `slot < 0` 就返回。推荐 bank 是 121 slots × 47 层
+（16.5 GiB，含四个 Q8_0-down 层；layer 2 的 decode-only bank
+`PF_Q4_BANK_Q5K=1` 实测 107.2 ms，比 host 的 93.3 慢，保持关闭）。两遍的每一批都以
+`<= R` 个专家为界并重新量化 token 行激活（`moe_actq_launch(A.h, ...)` 会覆盖
+`A.xq/asa/xs`），所以 gate/up 读到的是本批的激活。设计和实测见
+[design/18-qwen4exp.md §6](18-qwen4exp.md) 与
+[design/15-moe-ncmoe.md §10](15-moe-ncmoe.md)。
+
 ---
 
 ## 6. `qk_norm_rope_launch`（`qk_norm_rope.cpp:14-224`）

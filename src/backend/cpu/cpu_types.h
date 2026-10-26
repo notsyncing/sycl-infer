@@ -134,6 +134,12 @@ void cpu_dp4a_gemm(const cpu_gemv_seg & seg, int TB, int n_threads);
 // integer GEMV/GEMM from the original GGUF K-quant blocks (no SIn packing)
 void cpu_i8_gemv(const cpu_gemv_seg & seg, int n_threads);
 void cpu_i8_gemm(const cpu_gemv_seg & seg, int TB, int n_threads);
+// Single-token int8 GEMV with the parallelism over row CHUNKS instead of rows.
+// `seg.x8` is the group-major activation of exactly one token.  A row is 80
+// 32-value groups of work, so one task per row is dominated by the pool's
+// dispatch (measured: 640 no-op tasks cost more than the arithmetic); a few
+// chunks per worker keeps the weight stream contiguous per worker.
+void cpu_i8_gemv1_chunked(const cpu_gemv_seg & seg, int n_chunks);
 
 // number of worker threads the CPU backend uses (PF_CPU_THREADS overrides)
 int cpu_thread_count();
@@ -177,6 +183,15 @@ void cpu_moe_route(const float * x, int x_stride, const void * gate_inp, uint32_
                    int n_expert, int top_k, float * logits, int32_t * ids, float * wts, bool fast_f32 = false);
 void cpu_moe_experts(const cpu_moe & M, const float * x, int x_stride, int n_tok, int top_k, const int32_t * ids,
                      const int * slots, float * acc, int acc_stride, bool fast_f32 = false);
+// One routed expert for ONE token on the host, in the same int8 form as the
+// device's grouped expert kernels: the activation uses cpu_xq's per-32 group
+// scale rule (the one moe_actq_launch writes), gate/up/down read the weight
+// blocks directly with the CPU's AVX-512 VNNI dot, and `out` is the unweighted
+// expert vector the reduction expects.  This is the CPU-miss half of the
+// qwen4exp expert split (PF_Q4_CPU_MISS), so a host miss and a device resident
+// differ only in dot order - not in the activation quantization.
+void cpu_moe_experts_i8(const cpu_moe & M, const float * x, int x_stride, int n_pairs, const int32_t * ids,
+                        float * acc, int acc_stride);
 void cpu_moe_reduce(const float * acc, const float * wts, int top_k, int n_tok, int n_embd, int acc_stride, float * out,
                     int out_stride);
 void cpu_moe_epilogue(const float * x, int x_stride, const void * gate, uint32_t gtype, int n_tok, int n_embd,
@@ -204,6 +219,15 @@ void cpu_q4_down_grouped_serial(const uint8_t * w, const float * sc, const int8_
 void cpu_q5_1_down_grouped_serial(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
                                   const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
                                   const int * pairs);
+// Row-parallel twins of the two native down kernels.  The serial forms are
+// called inside `par(expert)` by the prefill's grouped path; a single-token
+// CPU miss has one expert and needs the parallelism on the output rows.
+void cpu_q5_1_down_grouped(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                           const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                           const int * pairs);
+void cpu_q8_0_down_grouped(const void * w, size_t row_bytes, const int8_t * x8, const float * xmeta,
+                           const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
+                           const int * pairs);
 // Batch int8 GEMM straight from GGUF K-quant blocks (gate/up of one expert).
 void cpu_i8_gemm_batch(uint32_t type, const void * w, const int8_t * x8, const float * xmeta, const int32_t * xsumq,
                        int K, int rows, int TB, float * out, int out_stride);
@@ -220,6 +244,15 @@ void cpu_q4_up_gemv(const void * w, uint32_t type, const float * x, int xs, floa
 // expert's down projection has K = 640, also not a 256 multiple
 void cpu_q4_arb_gemv(const void * w, uint32_t type, const float * x, int xs, const float * up, float * out, int os,
                      int n_tok, int K, int N);
+// QSA host kernels (src/backend/cpu/kernels/qsa.cpp): the indexer's BF16
+// projections and the sparse attention over one query head's selected keys.
+// Dispatched on the host ISA by PF_CPU_ISA like the rest of the CPU kernels.
+void cpu_qsa_bf16_gemv(const void * w, const float * x, int xs, float * out, int os, int n_tok, int K, int N);
+void cpu_qsa_score_pools(const float * q, const float * pool, int n_pool, int id, int inh, float inv, float * scores);
+// kbase/vbase point at this kv head's first key row; row j starts at
+// sel[j] * kv_stride floats.  `q` is [2*head_dim] (query then gate).
+void cpu_qsa_attn_head(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
+                       int nsel, int hd, float scale, float * out);
 void cpu_q4_ple_gate(const float * key, const float * hidden, const float * w_key, const float * w_query, float * gate,
                      const int32_t * rows, int n_tok, int n_embd, int hc, float eps);
 void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_conv, const float * conv_w,

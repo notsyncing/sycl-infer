@@ -84,6 +84,12 @@ measurements and gotchas.
   router: one worker process per model, a JSON config, the JSON-RPC control
   plane, the HTTP/SSE data-plane proxy, per-model VRAM budget admission, remote
   workers and Docker deployment.
+* [`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md) — the ONNX
+  model service for the document pipeline: the protobuf reader, the graph
+  transforms, the operator library and executor, and the wire protocol.
+* [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md) — Qwen3.8-Flash-Next:
+  split GGUF loading, hyper-connections, PLE and its engram cache, QSA, and the
+  per-expert LRU with the two-pass prefill.
 * [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **the measured throughput
   table**: prefill and decode by context depth and batch size, per model and
   per speculative path, each with the hardware, the build, the harness and the
@@ -196,9 +202,11 @@ cmake --build build-router-only -j
 Its config is JSON **with comments**; see
 [docs/design/16-router.md](docs/design/16-router.md).
 
-`main.cpp` documents the flags (`--model --ctx --blocks --kv-cap-mb --kv-type
+The CLI takes (`--model --ctx --blocks --kv-cap-mb --kv-type
 --port --host --device --cpu-threads --layer-map --mmproj --mtp --mtp-device
---audio-mmproj`, the three prefix-cache budgets `--pc-vram-mb`/`--pc-mem-mb`
+--audio-mmproj`, the expert placement budgets `--moe-resident`/`--moe-vram-mb`/
+`--moe-ram-mb` and the qwen4exp PLE cache `--engram-ram-mb`, the three
+prefix-cache budgets `--pc-vram-mb`/`--pc-mem-mb`
 (alias) `--pc-ram-mb`/`--pc-dir`+`--pc-disk-mb`, the control plane
 `--control-port`/`--control-host`/`--control-token`/`--control-token-file`, and
 for `gen`:
@@ -264,7 +272,7 @@ GPU + that model.  Strict kernel/end-to-end tests set `PF_DP4A=0` (fp32 path).
 The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 `test_w4_vs_i8`, `test_gemv_stride`, `test_iq_dequant`, `test_w4_vs_cpuref`,
 `test_w4_topk`, `test_27b_prefill`, `test_spec` - default to the 27B at
-`/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` and take it as
+`/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf` and take it as
 `argv[1]`.
 
 ```bash
@@ -353,7 +361,8 @@ src/backend/cpu/kernels/    one .cpp per host kernel (compiled without -fsycl,
                 dispatch + dequant/RMSNorm helpers), rmsnorm, embed, copy_row,
                 gemv, qk_norm_rope, attn, conv, gdn, gated_norm, xq, dp4a,
                 i8 (integer GEMV straight from the GGUF blocks), moe (the host
-                half of a routed MoE layer)
+                half of a routed MoE layer), qsa (the QSA indexer GEMV, pool
+                scoring and sparse attention), q4exp (the qwen4exp host half)
 src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), kernel_utils.h
                 (shared device helpers in namespace si::kd), kv_type.{h,cpp},
                 and one .cpp per kernel: rmsnorm, embed, copy_row, gemv,
@@ -1555,56 +1564,316 @@ limitation should be documented rather than dodged.
 
 ### Qwen3.8-Flash-Next (`qwen4exp`): split files, hyper-connections, PLE
 
-The reference model is `Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf`
-(104 GiB, 4 shards; `general.architecture = qwen4exp`).  It is the Qwen3.5
-hybrid GDN/full-attention trunk with three additions and two placement facts:
+**The model.**  `Qwen3.8-Flash-Next-UD-Q4_K_XL` (4 shards, 104 GiB,
+`general.architecture = qwen4exp`) is the Qwen3.5 hybrid GDN/full-attention
+trunk with four additions.  It has 48 layers, 36 Gated DeltaNet and 12 full
+attention (every 4th), `n_embd` 2560:
 
-* **hyper-connections** replace every layer norm: the residual is `hc = 4`
-  parallel streams `[n_embd = 2560][hc]`; each block mixes them through a
-  grouped RMSNorm, a 320-wide low-rank gate and a per-stream scatter
-  projection (`hc_*_norm/down/up/inject`, the last one is `[10240,4]`).
-* **PLE** on layer 1 gathers 16 n-gram-hash rows of a 160-wide table
+* **hyper-connections** replace every layer norm.  The residual is `hc = 4`
+  parallel streams `[n_embd][hc]`; each block mixes them through a grouped
+  RMSNorm, a 320-wide low-rank gate and a per-stream scatter projection
+  (`hc_*_norm/down/up/inject`; the inject projection is `[hc_dim, hc]`).
+* **PLE on layer 1** gathers 16 n-gram-hash rows of a 160-wide table
   (`per_layer_token_embd`, 26.8 GiB, IQ4_NL) per token, projects them
-  (`ple_key/value`), gates and depthwise-convolves them into the residual.
-* **QSA** on the 12 full-attention layers: a 128-wide indexer key per token,
-  pooled in blocks of 4, and the top 2 048 keys selected per query.
-* **512 routed experts**, top-10, expert FFN 640, plus a shared expert; the
-  routed bank is **71.7 GiB**, the PLE table 26.8 GiB, the dense trunk only
-  ~5 GiB.  The dense trunk goes on the GPUs (`--device gpu` auto-splits it
-  across both cards) and every routed pair plus the PLE module runs on the
-  host.  So the model is host-RAM bound, and `--moe-vram-mb` does **not**
-  apply: the expert cache is configured host-only (`moe_cfg_.host_only`).
-* It is a **split GGUF**.  `gguf_file::load` maps every shard into one
-  contiguous `PROT_NONE` reservation (`MAP_FIXED` per shard) so
-  `tensor.data - map_base` stays a valid offset and `dev_ptr`/page-out keep
-  working.  The single-blob upload refuses a split file; qwen4exp always uses
-  the per-tensor (multi-device) upload, even when the map is one GPU.
+  (`ple_key`/`ple_value`), gates them and applies a depthwise convolution into
+  the residual.
+* **QSA on the 12 full-attention layers**: a 128-wide indexer key per token,
+  pooled in blocks of 4, with the top 2 048 keys selected per query.
+* **512 routed experts**, top-10, FFN width 640, plus a shared expert.  The
+  routed bank is 71.7 GiB and the dense trunk only ~5.3 GiB.
 
-The forward pass lives in `src/engine/engine_q4exp.cpp` and is **not** the
-generic `seg_plan` path: HC/PLE do not fit the per-layer GEMV list, so
-`q4_forward` walks the layers itself.  It reuses the existing GDN/attention/
-GEMV backends; the host parts are `src/backend/cpu/kernels/q4exp.cpp` and the
-GPU HC kernels are in `src/backend/gpu/kernels/q4exp.cpp`.  The plan builders,
-the decode command graphs, the prefix cache, MTP and the multimodal path are
-deliberately skipped (`q4exp` forces `pc_enabled = false`).
+It is a **split GGUF**.  `gguf_file::load` recognises the
+`-NNNNN-of-MMMMM.gguf` naming, validates `split.no`/`split.count`, reserves one
+contiguous `PROT_NONE | MAP_NORESERVE` range and `MAP_FIXED`-maps each shard
+into a page-aligned slot of it.  `tensor.data - map_base` therefore stays a
+valid offset through the whole multi-file model, and `dev_ptr`/page-out keep
+working; the gaps between shards are padding, not file bytes.  `is_split()` is
+the predicate; the single-blob upload **refuses** a split file (its `memcpy`
+would read the PROT_NONE gaps), so qwen4exp always takes the per-tensor
+(multi-device) upload even when the map is one GPU.  `drop_cache` translates a
+reservation-relative range into each shard's own file range before
+`posix_fadvise`.
 
-Measured on the 2x A770 box (AOT Release, f16 KV, ctx 2048, 2026-10-24):
-decode **1.8 tok/s** (551 ms/token) with `0-19:gpu.0,20-39:gpu.1,40-47:cpu`
-(1.7 tok/s with all 48 layers on the two cards, experts still host), prefill
-**5.5 tok/s** for 128 tokens.  The breakdown is ~230 ms host experts, ~150 ms
-of GPU↔host handoff waits, ~40 ms shared expert, ~55 ms dense; the GPU dense
-work is ~1 ms/layer.  Router-on-GPU and the navigable per-layer copies are what
-took the first version from 0.4 to 1.8 tok/s.
+**Placement and forward path.**  The dense trunk goes on the GPUs named by
+`--layer-map`; every routed pair and the PLE module run on the host, so the
+model is host-RAM bound.  The recommended run is all-GPU with a per-expert LRU
+bank:
 
-**Four layout bugs cost almost all of the bring-up time; do not "simplify"
-these away.**
+```bash
+./build/sycl-infer \
+  --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+  --ctx 2048 --kv-type f16 gen --prompt "..."
+```
+
+`q4_forward` (`src/engine/engine_q4exp.cpp`) walks the layers itself; HC/PLE do
+not fit the generic `seg_plan` (one GEMV list per layer plus fixed epilogues).
+It reuses the existing GDN/attention/GEMV launchers and the paged KV pool.  The
+host half is `src/backend/cpu/kernels/q4exp.cpp`; the new device kernels are in
+`src/backend/gpu/kernels/q4exp.cpp` (HC norm/mix/combine, the F32 inject dot,
+the arbitrary-K up GEMV).  The plan builders, decode command graphs, prefix
+cache, MTP and the multimodal path are deliberately skipped (`q4exp` forces
+`pc_enabled = false`); the server's q4 `prefill_batch` has no recorded variant,
+and **batched q4exp decode is unmeasured**.
+
+At startup the routed down bank is converted once to a symmetric int8 store
+(per-32 scale), because Q5_1's 32-value block is not a K-quant superblock and
+K=640 is not a multiple of 256.  The host-resident expert/PLE/indexer pages are
+then prefaulted (`q4_prefault`, one touch per page in parallel;
+`PF_Q4_PREFAULT=0` skips it), because a cold 4 KB fault per page costs hundreds
+of ms/token at this model's expert traffic.
+
+**Expert placement: per-expert LRU, two-pass prefill.**  The generic three-tier
+`moe_cache` is **inactive** on qwen4exp: `engine.cpp` sets `moe_host_only_` and
+`moe_cfg_.host_only = true`, so `moe_cache` computes `total = 0`, and its device
+path lives in `record_forward`'s `seg_plan` branch while q4exp walks its own
+layers.  The q4 path is separate:
+
+* `--moe-vram-mb 17500` gives **121 slots per layer in 47 layers, 16.5 GiB**
+  (the Q4_K/Q5_1 layers plus the four Q4_K/Q8_0-down layers 4, 30, 46 and 47).
+  Only layer 2 stays on the host (Q5_K gate/up + Q8_0 down); its decode-only
+  bank (`PF_Q4_BANK_Q5K=1`, 48 layers, 17.0 GiB) measured **107.2 ms** against
+  93.3, so it stays off.  16000 gives 111 slots/15.1 GiB and 101.2 ms; 17000
+  gives 118/16.1 and 94.0 ms; 18000 gives 125/17.0 and is **not** faster than
+  17500.  The 17 500/121-slot point is the knee.
+* The resident set is calibrated from the first prefill's routing, then
+  maintained by an LRU.  **The LRU eviction used to stop at the first non-active
+  slot** (both loops carried `victim < 0` in their own condition), so slots
+  0..~10 absorbed every miss and the rest kept their first expert.  Fixing it
+  cut misses **95 -> 58** and uploads **280 -> 169 MB/token**.
+  `PF_Q4_LRU_OLD=1` restores the old loops for the A/B; it is not an LRU and
+  must stay off.
+* Expert uploads go through a **32-slot pinned staging ring per device** with
+  asynchronous device copies, event-paced; the pageable `q.memcpy` of the GGUF
+  mmap used to block the host until the queue drained and ran at ~2 GB/s.
+  `PF_Q4_STAGE=0` restores the direct copies.
+* **The prefill is two-pass.**  A 512-token chunk selects up to **328 distinct
+  experts in a layer against R=111**, so the active set is split into batches of
+  `<= R`, each with its own slot-map row and uploads.  Every `(token, expert)`
+  pair is computed exactly once; the old single pass evicted an active expert
+  (slot -1) and the grouped kernels silently skipped its pairs.  The
+  residency-preserving schedule keeps resident experts in place and fills the
+  rest with the most frequently routed newcomers (~32 GiB of uploads per
+  prefill), and the token-row activation is **re-quantized at the start of every
+  batch** because `moe_actq_launch(A.h, ...)` overwrites the `A.xq/asa/xs` the
+  gate/up reads.  Prefill is byte-identical across chunk sizes 64..1024.
+  `PF_Q4_PF_ONEPASS=1` restores the old (incorrect when act > R) path;
+  `PF_Q4_PF_STATS=1` prints act/hot/kept/batches/copies.
+* **The next batch's expert upload is prefetched while the current batch's
+  GEMMs run** (`PF_Q4_PF_PIPE`, default on; `0` A/B).  The workspace is split
+  into two halves and the batches alternate, so the copy target and the compute
+  source never alias; the H2D rides a per-device in-order copy queue, and the
+  kernels wait only on that queue's event.  Moving the staging-ring event off
+  the compute queue is the point: it used to pace the host memcpy behind the
+  GEMMs.  Measured on the 544-token prompt: MoE 13.44 -> 12.85 s in the
+  first A/B (13.39 -> 13.34 s on a repeat, where the box's ~4 % drift exceeds
+  the effect; the staging copy+wait itself is 0.6 s lower), the stream is
+  identical, and the 576-token prompt still answers **108**.  **The exact next layer cannot be
+  prefetched**: its router reads the current layer's output, so only the next
+  expert **batch** of the current layer is known early.  That measurement was
+  before the pinned source and the Q8_0-down bank; together they remove the
+  staging memcpy and four of the five host layers (below).
+* The **banked FFN was wrong because `moe_reduce_launch` accumulates**
+  (`out += a`) and the banked branch passed `b.block` without zeroing it: every
+  banked layer added its routed output onto the previous layer's residual (cos
+  0.27 against the host FFN for one layer, `||```` for seven).  One
+  `qd.memset(b.block, 0, ...)` before the reduce fixes it.
+  `PF_Q4_BANK=0` forces the all-host path; `PF_Q4_BANK_LAYER=1` selects the
+  whole-layer bank for the A/B (45.5 s prefill, not recommended).
+* The bank handles Q4_K/Q5_1 and Q4_K/Q8_0 layers by default.  Layer 2's
+  Q5_K gate/up is a **decode-only** opt-in (`PF_Q4_BANK_Q5K=1`; 48 layers,
+  17.0 GiB): the prefill stays on the host, but the decode is **107.2 ms**
+  against 93.3 for the host layer, so the flag stays off.  `PF_Q4_FFCMP=<layer>`
+  is the oracle: layer 4 0.999999, layer 2 0.99995.
+* **The staging memcpy is gone and the four Q8_0-down layers are on the card**
+  (`PF_Q4_PIN_SRC`, default on).  Each banked layer's expert planes are copied
+  once into pinned host memory at startup (63.0 GiB for the 43 Q5_1-down
+  layers; 69.8 GiB for all 47) and the H2D reads them directly, so the 4.6 s of
+  per-prefill staging memcpy is 0.55 ms of map copies.  `moe_down_q8_0_launch`
+  is the Q8_0 counterpart of the Q5_1 kernel (34-byte blocks; signed weights
+  biased by 128 inside dp4a, with the `-128*sum(xq)` correction on one lane per
+  group), which is what lets layers 4, 30, 46, 47 bank.  Measured on the
+  544-token prompt: 13.44 -> 12.31 s with the pinned source at 43 layers, then
+  10.89 s MoE / 11.99 s prefill with the four extra layers; decode 101.2
+  ms/token (9.9 tok/s) against 103.7 with the staging and 121 on the 43-layer
+  Q5_1 bank.  At 17 500/121 slots the 544 prefill is **11.4 s cold / 9.6 s warm**
+  and the decode **93.3 ms (10.7 tok/s)**.  `PF_Q4_PIN_SRC=0` restores the
+  staging path.
+
+**The engram tier (PLE rows).**  `--engram-ram-mb` (default 4096) is a
+direct-mapped host-RAM cache of PLE table rows: `cap` is a power of two, the
+slot is `row & (cap - 1)`, and the tag is the row id.  A hit copies the already
+dequantized 160-wide f32 row; a miss dequantizes it from the GGUF mmap (the disk
+tier) and replaces the slot.  `--engram-ram-mb 0` disables it.  The hit/miss
+counters are printed with the q4 time report.
+
+**Kernels this model needed** (details in
+[`docs/design/03-kernels.md`](docs/design/03-kernels.md)):
+
+* **Q5_1 down has its own dp4a kernel** (`moe_down_q5_1_launch`, 32-value
+  groups, `NPB=8`).  Its `m·xs` term is **per group, not per lane** - the first
+  version added it on every lane and counted the zero point 8x (cos 0.08, rms
+  16x); carry the group sum on `lane%8 == 0` only.  A hermetic test is exact
+  (cos 1.0) for K=32/64/160/640 and N=64/2560; the GPU-vs-host routed cosine is
+  0.99998.
+* **Q8_0 down has its own dp4a kernel** (`moe_down_q8_0_launch`): 34-byte
+  blocks, signed int8 weights biased by 128 (`q ^ 0x80`) and the
+  `-128*sum(xq)` correction carried on one lane per group.  Layer 4's routed
+  FFN gives cos 0.999999 against the host; the four Q4_K/Q8_0 layers bank with
+  it.
+* **The generic expert down must handle K not a multiple of 256** (qwen4exp's
+  K=640).  `moe_down_impl` used `n_ff_exp / 256` (2) as the row stride, so every
+  output row after the first was read 384 bytes into the plane instead of 480
+  and the last partial superblock read into the next row: the whole GPU down
+  projection used the wrong weights.  The fix is `ceil(K/256)`, the real
+  `quant_row_bytes` stride, zeroing the blocks past K, and a 256-byte guard on
+  the down bank.  GPU-vs-host cosine went 0.00 -> **0.99995**.  Every earlier q4
+  GPU-expert number was measured through this kernel and is **withdrawn**.
+* **The Q8_0 dense GEMV is vectorized**: `gemv_dec_q8_kernel` loads four int8
+  weights per lane (two uint16 loads at the payload's 2-mod-8 alignment, plus
+  two float4 activation loads) and `gemv_dec_q8_split_kernel<WPR=8>` K-splits
+  narrow shapes (rows <= 512, i.e. the 320-row HC down) with an SLM reduce.
+  Per call: HC down 0.21-0.32 -> **0.042-0.046 ms**, ssm_out/wo 0.27 -> **0.099**,
+  the LM head 7.89 -> **2.6**.  `PF_Q4_GEMV8=0` restores the generic path.
+  **Do not use an 8-byte uint2 load**: the payload's 2-mod-8 alignment is fine
+  under JIT but the AOT `acm-g10` lowering widens it and the prefill logits
+  decorrelate (max|diff| 15.4 of 18.6); four uint16 loads are the correct form.
+* **The HC inject F32** is one 256-thread workgroup per `(token, stream)`, each
+  lane owning a strided float4 chunk with four independent accumulators and four
+  float4 pairs loaded before the first FMA, reduced with a warp
+  `reduce_over_group` plus one SLM slot per sub-group: **1.93 ms/token** over the
+  96 calls, against the serial one-lane-per-row dot it replaced (superseded).
+  The sum order changes (inject dumps: L0/L1 <= 4.4e-6 relative, later layers
+  drift at ulp level); `PF_Q4_INJECT=0` restores the old kernel.
+* **The router is one fused softmax+top-k kernel** (one work-group per token,
+  256/512 lanes; the sum is still sequential in index order on lane 0, same
+  rank/tie rule).  It is bit-identical (`PF_MOE_RT_CHK`; qwen4exp and 35B
+  ids/wts/logits `bad=0`) and takes the router **0.43 -> 0.07 ms/layer**;
+  `PF_MOE_RT_OLD=1` restores the four launches.
+* **GDN beta/alpha are F32 and need a split-K GEMV.**  K=2560, N=48 reads
+  0.98 MB at 9.4 GB/s; a `WPR=8` split-K with an SLM reduce takes it
+  **0.104 -> 0.031 ms/call** (byte-identical; `PF_Q4_F32_SPLIT=0` restores the
+  generic shape).
+* **The GEMV segment descriptor is a 4096-slot ring**, not a per-call blocking
+  copy: the host writes the slot, the async H2D rides the same queue, and it
+  drains at wrap.  The old `q.memcpy(d_seg, &seg, 56).wait()` blocked the host
+  on queued device work; the ring is worth **1.3%** steady (md5 identical).
+  `PF_Q4_GEMVSEG=0` keeps the blocking copy.  **A by-value 752-byte `seg_set`
+  kernel argument was rejected**: it changed the shared GEMV kernels' codegen
+  (dynamic array indexing) and made decode 370-400 ms/token even on the
+  device-buffer path; the kernels must stay
+  `const gemv_seg * segs, int n_segs`.
+
+**Measured (2x Arc A770, AOT Release).**  Prefill numbers used
+`--ctx 4096 --kv-type i8`; the recommended decode uses `--ctx 2048 --kv-type f16`
+(both KV types work and both answer `Paris`).  The architecture and the
+placement rationale are in
+[`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md).
+
+| configuration | 512-token prefill | decode |
+|---|---:|---:|
+| host experts, bank off | 48.7 s (10.5 tok/s) | ~500 ms/token (~2 tok/s) |
+| whole-layer bank, 18000 MB | 45.5 s (11.25 tok/s) | ~470 ms/token (~2 tok/s) |
+| per-expert LRU, all-GPU, 16000 MB, pinned source | ~12.0 s (45 tok/s) | ~101 ms/token (9.9 tok/s) |
+| **per-expert LRU, all-GPU, 17500 MB, pinned source** | **~11.4 s cold / 9.6 s warm (47-56 tok/s)** | **~93.3 ms/token (10.7 tok/s)** |
+| per-expert LRU, all-GPU, 18000 MB, pinned source | – | ~93.3 ms/token (10.7 tok/s) |
+
+The per-expert LRU is the default.  The pinned expert source is 69.8 GiB of
+host RAM copied once at startup; a **cold first prefill is 11.4 s** (the bank
+calibrates on it) and the second/steady 512-token prefill is **~9.6 s
+(56 tok/s)**.  Decode reaches **~93.3 ms/token (10.7 tok/s) after ~16 tokens**;
+a 64-token generation is ~15.6 s wall including the warm prefill.
+`PF_Q4_PIN_SRC=0` (staging) and `PF_Q4_BANK_Q5K=1` (layer 2 decode-only,
+107.2 ms, so off) are the A/Bs.  Correctness on this build:
+`12 x 9` -> **108**, the TCP/UDP prompt is coherent, the 27B
+`test_decode_vs_prefill` oracle is **8/8 OK**, and `PF_Q4_FFCMP` gives cosine
+**0.99998** for the routed GPU FFN against the host path.
+
+**QSA is implemented** (`src/engine/engine_qsa.cpp`, with the ISA-dispatched
+host kernels in `src/backend/cpu/kernels/qsa.cpp`).  The selector and the
+attention over the selected keys run on the host; the full-attention layers keep
+a host mirror of their K/V, so no device gather is needed, and the result is
+written back for the existing `wo` GEMV.  The cache stores the **raw** indexer
+key (the reference pools raw keys in blocks of 4 *before* `k_norm`+RoPE), the
+host mirror rounds to f16 like the reference's cache, and the top-2048 selection
+is a `std::partial_sort` with ggml's comparator.  Up to 2 048 keys the
+reference's selection covers every key, so the dense path is exactly equivalent;
+above it the sparse path runs (the incomplete tail is appended).  Measured
+against llama.cpp layer 3 at 2 062 tokens: q/mixed cos **0.9999**, indexer score
+corr **0.9994**; the top-512 sets differ by one boundary pool, which is fp
+accumulation order.  Bit-exactness is not achievable without matching ggml's dot
+order.  The dense fallback prints one warning only when the selector cannot run
+above the budget (missing indexer tensors).  `PF_Q4_QSADBG`, `PF_QSA_Q`,
+`PF_QSA_MIX`, `PF_QSA_SCORE`, `PF_QSA_POOLS` and `PF_QSA_POOLK` are
+diagnostics/dump knobs.
+
+**The recommended `--ctx 2048` decode does not run QSA at all**:
+`qsa_on_` requires `max_seq > idx_top_k` and both are 2 048, so the 93.3 ms/token
+cell has zero QSA cost and the QSA numbers below are measured at `--ctx 4096`
+with the same weights/bank and the same 96-token TCP prompt.
+
+**Where the host QSA time was, and what does not pay.**  With QSA on, the call
+measured **26.8 ms/token** at 96 tokens and **23.7 ms of it was the four blocking
+D2H copies per layer** (`memcpy().wait()` drains the in-order queue while the
+host MoE would otherwise overlap the device), not the dots: the indexer BF16
+projection was 3.0 ms and the mirror/pool update 0.08.  The fixes, in order:
+
+* Enqueue the four copies and wait once: QSA **21.5 ms**, decode sum
+  **100.8** (one wait per layer cannot avoid the first drain).  Those two
+  intermediate rows are `[q4]` sums; the final wall-clock cells below were
+  added because a deferred update moves work past the `[q4]` print.
+* While the selector is dense-equivalent (`pos < top_k`, the common decode),
+  defer the whole update to the end of the forward: enqueue the copies per
+  layer, wait once on the last layer's event **after the LM head has been
+  enqueued**, then run the projection and the mirror update while the head is
+  on the device.  QSA **6.0 ms of measured call time**, decode **97.4 on the
+  `[q4]` sum and 101.1 ms of true forward wall** (QSA off: 93.8 / 97.5).  The
+  remaining +3.6 ms over QSA off is the end-of-forward wait, not the
+  arithmetic, and `PF_QSA_DEFER=0` costs **2.0 ms/token** (wall 103.2).  The
+  same deferral
+  covers a prefill tail of up to `kMaxB` tokens: the 96-token cell's 29-token
+  first prefill goes from a 479 ms QSA call (422 of it the copy waits) to
+  **62-65 ms** (9-10 ms copy); larger prefill chunks stay inline because the
+  copies are bandwidth-bound (1024 tokens x 12.6 MB/layer at ~10.8 GB/s =
+  1.19 s).
+* Batch 8 output rows per job in the BF16 indexer GEMV, and skip the q
+  projection when the selector is not run (q is 512 of the 640 rows and only
+  the selector reads it).  One row per job is dispatch-bound (640 rows/layer x
+  12 layers) and measured ~3 ms even with AVX-512; together these take the
+  dense 1024-token prefill chunk's indexer projection from **560 to 91.5 /
+  55.4 / 44.9 ms** (scalar / AVX2 / AVX-512).
+
+**AVX-512 pays only in the sparse path.**  Above 2 048 keys the selector and
+the attention must stay inline before `wo`, so the copies keep one wait per
+layer (**32.2 ms/token** at 2 055) and the attention is the next item: **39.3
+ms scalar, 19.2 AVX2, 16.0 AVX-512** per token over the 12 full-attention
+layers (2.45x), and the prefill chunk that crosses the budget goes 208.0 ->
+68.2 ms of attention.  The selector (512 pools) is `cpu_qsa_score_pools`,
+serial on purpose: ~2.7 us/layer is below one thread-pool wake.  Against the
+scalar path the AVX-512 run has score cosine **1.000000**, the **same 512
+selected pools**, a **bit-identical** layer-0 `mixed` dump, and indexer q
+max|diff| **1.2e-6**.  In the 96-token cell AVX-512, AVX2 and scalar are
+indistinguishable end to end (within a +-0.2 ms run spread) because the host
+work is hidden under the device tail - so the vector width is **not** the
+win there, the copy restructure is.
+
+**The restructured update is not a numerical shortcut.**  The selector's pool
+tie rule (`std::partial_sort` with `a > b`), the f16 mirror rounding and the
+"raw key pooled before `k_norm`+RoPE" order are unchanged; the deferred form
+only moves the same work later, and the AVX-512 dot/exp approximation was
+checked with `PF_QSA_SCORE`/`PF_QSA_MIX` as above.  The 96-token greedy stream
+is byte-unchanged.  `PF_QSA_TIME=1` prints the split per forward
+(`copy/gemv/upd/sel/attn`), `PF_QSA_ISA=scalar|avx2|avx512` isolates this path
+(`PF_CPU_ISA` also scalarises the MoE/HC/PLE and is not an A/B of it), and
+`PF_QSA_DEFER=0` restores the inline update.
+
+**Bring-up defects that are load-bearing; do not "simplify" them away.**
 
 * **Q5_1's nibbles are interleaved halves, not consecutive pairs.**  In a
-  32-value block, elements 0..15 are the low nibbles of `qs[0..15]` and
-  16..31 the high nibbles; the 5th bit is bit *i* of the 32-bit `qh` word.
-  Reading `qs[i/2] >> 4*(i%2)` produces a value permutation that preserves the
-  statistics (rms matched) but not the answer: the routed expert output had
-  cos 0.7 against the reference.  The correct form is
+  32-value block, elements 0..15 are the low nibbles of `qs[0..15]` and 16..31
+  the high nibbles; the 5th bit is bit *i* of the 32-bit `qh` word.  Reading
+  `qs[i/2] >> 4*(i%2)` preserves the statistics (rms matched) but not the
+  answer: the routed expert output had cos 0.7.  The correct form is
   `qs[i%16] >> 4*(i/16)`.
 * **A GEMV whose K is not a multiple of 256 is truncated by the generic
   kernel** (it works in 256-value superblocks).  The HC up-projection has
@@ -1613,164 +1882,138 @@ these away.**
   `q4_inject_launch`; the inject projection also has N = 4, which the generic
   tiling does not launch correctly (it hung the AOT run).
 * **`ple_conv1d` is `[kernel][channel]` with `nb0 = kernel`**, so tap `k` of
-  channel `c` is `w[k + kern*c]`, not `w[k*hc_dim + c]`.  The wrong form
-  changes only the conv term and leaves the gate correct, which makes it look
-  like a numerical difference.
+  channel `c` is `w[k + kern*c]`, not `w[k*hc_dim + c]`.  The wrong form changes
+  only the conv term and leaves the gate correct, which makes it look like a
+  numerical difference.
 * **The mode-1 prefill tail must take the head from the last token.**  The head
   branch read the last row only for mode 2; a <32-token prompt went through
-  mode 1 and produced token 0's logits (which still looked plausible: it is
-  the "The" distribution).  The same bug made decode-vs-prefill fail at every
-  length even though the layers were right.
+  mode 1 and produced token 0's logits (which still looked plausible: it is the
+  "The" distribution).  The same bug made decode-vs-prefill fail at every length
+  even though the layers were right.
+* **The host activation quantizer rounds its stored scale to f16** (`cpu_xq`,
+  matching the device `asa` which the grouped kernels read through `fast_h2f`).
+  Without it the host and device expert paths differ by one f16 ulp per 32-value
+  group - invisible in an aggregate, but enough to move the next prefill's top-k
+  boundary.
 
 The first three are silent numerical defects; the fourth is a wrong-token
 defect that survives any per-layer RMS check.  `test_decode_vs_prefill` on a
 confident prompt and a direct logits comparison against a llama.cpp oracle are
 the checks that catch them.
 
-**QSA is implemented** (`src/engine/engine_qsa.cpp`): layer-1-style indexer
-cache, 4-key pooling of the *raw* indexer keys before `k_norm`+RoPE, f16
-rounding, and a `std::partial_sort` top-2048 selector matching ggml's
-comparator, followed by sparse attention over the selected keys.  Up to 2 048
-keys the reference's selection covers every key, so the dense path is exactly
-equivalent; above it the sparse path runs (no warning, no O(depth) fallback).
-Measured against llama.cpp layer 3 at 2 062 tokens: q/mixed cos 0.9999, indexer
-score corr 0.9994; the top-512 sets differ by one boundary pool (reference 93,
-ours 259), which is fp accumulation order, not a layout defect.  Bit-exactness
-is not achievable without matching ggml's dot order.
+**Dead ends, each measured.**
 
-**Measured cost model (2×A770 + CPU, f16 KV, 2026-10-24):** 512-token prefill
-**39.0 s = 13.1 tok/s** with the VRAM expert bank at `--moe-vram-mb 18000`
-(12 of 48 layers, i8 KV), 40.0 s (12.8) at 16 000 (10 layers), 41.9 s (12.2) at
-12 000 (8), 48.7 s (10.5) with the bank off; route 0.36, host experts 18.8-28.5,
-shared 1.2, copies 0.7-1.0, rest 13.4.  `--moe-vram-mb 21000` fails to
-allocate (no room for the 13th layer).  Decode ~2 tok/s.  The routed bank is the wall: 71.7 GiB of GGUF blocks
-per full batch at ~3 GB/s from host RAM.
+* **A host-spill split was tried first and rejected.**  A static top-R set with
+  the non-resident pairs computed on the host never converged: even with a
+  native Q5_1 down and an f16 activation scale, **5,498 of 5,957 slots changed
+  on the next calibration**.  Routing is a discrete function of the hidden
+  state, so a one-ulp difference between the GPU-resident and host-spill
+  arithmetic flips the top-10 boundary for many tokens; the all-GPU
+  upload-on-miss path avoids the split by construction.
+* **The whole-layer bank is the baseline, not the answer**: 45.5 s against the
+  LRU's 9.6 s warm, because it covers 12 of 48 layers and only ~25% of the traffic.
+  `PF_Q4_BANK_LAYER=1` keeps it for A/B.
+* **The earlier 39-layer map's prefill was measured through the single-pass
+  overflow bug and is superseded**; so are all GPU-expert numbers taken before
+  the K%256 down fix.  Do not quote either class of measurement.
+* **The bank budget has a knee at 17500 MB / 121 slots.**  16000 gives 111
+  slots and 101.2 ms; 17000 118 and 94.0; 17500 121 and 93.3; 18000 gives 125
+  slots and 17.0 GiB but is **not** faster.  17 500 is the recommended budget;
+  the earlier "18000/20000 fail" note was measured before the four Q8_0 layers
+  were banked.
+* **Tail-skip (`PF_Q4_TAIL_SKIP=7`, Strata CUDA path, opt-in).**  An expert
+  that every token routes at rank >= 7 is not admitted when it is a miss; it
+  keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the down) and
+  is neither copied nor computed.  On the 96-token TCP cell at 17500:
+  **93.6 -> 86.9 ms (-7.2%)**, the last token's upload **56.2 -> 32.2 MiB
+  (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes (the text is
+  coherent, but a KL/top-1 gate against the baseline is still to run), so the
+  default stays 0.  Measured rank distribution: 39-42% of misses are rank >= 7.
+* **Decayed heat (`PF_Q4_HEAT=1`) is a loss on this engine**: 105.7 vs 93.6 ms
+  and 156 vs 56 MiB of upload; the Strata adaptive-swap parameters do not
+  transfer (the LFU prior was already negative).  Leave it off; the code is
+  kept as the A/B.
+* **Parallel staging loses**: it delays the first DMA, and the DMA floor is
+  170.5 MiB at 5.9 GB/s.
+* **The Strata-style full host mirror is slower on this box.**  `PF_Q4_MIRROR=1
+  --moe-vram-mb 0` puts all 71.7 GiB of experts in pinned host memory and the
+  GPU expert kernels read it over PCIe (4.28 GB/s).  Measured on the
+  544-token prompt: **14.1 s prefill** (13.6 s on the second repeat) and
+  **178 ms/token decode**, against the bank's 11.4/9.6 s and 93.3 ms.  The
+  direct stream reads the whole working set every prefill and every token;
+  the bank's H2D (6.9 GB/s) plus VRAM is the right tier.  The useful Strata
+  idea is the **pinned mirror as the H2D source** (`PF_Q4_PIN_SRC`), not as the
+  GPU's weight source.
+* **LFU is neutral at 72 tokens and worse at 200**; a preloaded `PF_Q4_SM_LOAD`
+  set is slightly worse because the prefill churns the map.
+* **Native Q5_1 down on the host** (0.75 vs 1.125 B/weight) is slower - the
+  32-value reconstruction and 24-byte block access cost more than the bytes
+  saved (`PF_Q4_DOWN_NATIVE=1`, default off).  The GPU bank reads native Q5_1
+  and is fine.
+* **Layer 2's Q5_K gate/up banking** (`PF_Q4_BANK_Q5K=1`) is now decode-only
+  (the prefill stays on the host): it measured **107.2 ms** against 93.3, so it
+  is a loss and stays off; the four Q8_0-down layers 4/30/46/47 are banked.
+* **CPU misses with a frozen resident set** (Strata's CUDA `kind = -1` idea)
+  is implemented behind `PF_Q4_CPU_MISS` (default off) and **loses: 148.1 ms
+  last-32 against 99.3** (28 CPU threads; the default 14 is 227.1), and
+  122.2 against 93.2 with tail-7.  A decode miss is not uploaded; the host
+  computes it from the pinned source in the *same* int8 form as the device
+  (the per-32 amax/127 scale `moe_actq_launch` uses, the AVX-512-VNNI Q4_K row
+  dot, native Q5_1/Q8_0 down), stages the rows into a pinned buffer and
+  enqueues them into `A.acc` before `moe_reduce`, while the resident grouped
+  kernels run first.  The arithmetic is right - one-layer probe KL mean
+  **1.2e-4** / max 2.0e-3 / top-1 **40/40**, full cell KL **1.9e-4** / max
+  6.4e-3 / top-1 **96/96**, `PF_Q4_FFCMP` layer 0 cos **0.999988** - so the
+  loss is the cache and the cost of a miss, not the math.  The LRU's value is
+  continuous admission: frozen at decode step 16 (`PF_Q4_CPU_MISS_WARM`), the
+  bank misses **156 of 460 pairs/token against 48.8** for the adaptive LRU
+  (layer 0 alone 5.25 vs 3.03).  And a host miss costs **0.58 ms/pair in situ**
+  at 28 threads (0.25-0.3 isolated, 1.1 at the default 14) against the
+  **0.52 ms H2D it replaces** - the CPU is not cheaper than the copy - while
+  the resident chain it could hide under is only ~0.45 ms/layer.  A 64-step
+  warm-up (`PF_Q4_CPU_MISS_WARM=64`, two thirds of the cell) narrows the loss
+  to **115.3 vs 99.3** (MoE 94.7 vs 80.9 ms) but does not close it.  It cannot pay
+  without keeping admission, and then the upload bytes are back.  `=2` selects
+  the f32 dequant host path as the A/B; `PF_Q4_CPU_MISS_LAYER=<il>` is the
+  one-layer probe, `PF_Q4_CPU_MISS_TIME` prints the layer's host/GPU split.
 
-* **The banked FFN was wrong because `moe_reduce_launch` ACCUMULATES**
-  (`out += a`) and the banked branch passed `b.block` without zeroing it, so
-  every banked layer added its routed output onto the previous layer's
-  residual.  One banked layer measured cos 0.27 against the host FFN, seven
-  emitted `||````.  The fix is one `qd.memset(b.block, 0, ...)` before the
-  reduce; the bank is now enabled by default and the 512 prefill goes 48.7 ->
-  40.7 s.  `PF_Q4_BANK=0` forces the all-host path.
-* **The type filter is load-bearing**: the GPU Q5_K gate/up path (layer 2) and
-  Q8_0 down (layers 4 and 30) are not output-validated, so those layers stay on
-  the host.  Only Q4_K gate/up + Q5_1 down are banked; that is 8 of the 45
-  eligible GPU layers at 12 000 MB and 10 at 16 000.  `PF_Q4_BANK_TYPES=1`
-  prints every layer's expert types, `PF_Q4_BANK_MAX`/`_SKIP` limit/offset the
-  banked set (the bisection that localised the bug), `PF_Q4_BANKCHK=1` reads
-  each bank back and compares it with the host bytes (all `bad=0`).
-* **The routing is extremely skewed, so a per-expert hot set is the right
-  shape, not whole layers.**  `PF_Q4_HIST=1` counts `(layer, expert)` pairs
-  over a 512-token prompt + 28 decode tokens.  Distinct pairs used: 10 787 of
-  24 576 in the prefill, 4 849 in the decode.  Coverage of the hottest
-  `B` pairs (an oracle set, so an upper bound for a learned cache):
-  `B=1000 49.3%`, `2000 68.0%`, `4000 87.5%`, `6200 95.8%`, `8000 98.5%`
-  for the prefill, and 52.6 / 72.7 / 93.7 / **100%** for the decode.
-  The whole-layer bank's 12 of 48 layers cover only **25.0%** of the same
-  traffic.  So 18 GB spent on a per-expert set is worth far more than 18 GB
-  spent on whole layers; the remaining work is to give `q4_forward` that set
-  (calibrated or online) and the host spill path the generic cache already
-  has.  The oracle caveat matters: the set above is chosen after seeing the
-  traffic, so a real cache pays a warm-up, and the set has to be calibrated
-  across prompts rather than one.
+**Flags and diagnostics.**
 
-* **The generic expert down was wrong for K not a multiple of 256, which is
-  qwen4exp's 640.**  `moe_down_impl` used `n_sb = n_ff_exp / 256` (2 for 640)
-  as the row stride, so every output row after the first was read 384 bytes
-  into the plane instead of 480 and the last partial superblock read into the
-  next row: the whole GPU down projection used the wrong weights.  The host
-  path was unaffected, which is why the host answered `108` while the banked
-  layers were coherent-but-wrong.  The fix is `ceil(K/256)`, the real
-  `quant_row_bytes` stride, zeroing the blocks past K, and a 256-byte guard on
-  the down bank.  The GPU-vs-host acc cosine went 0.00 -> **0.99995**.  Every
-  earlier q4 GPU-expert number (the 39.0/31.2 prefill, the 13.1 tok/s, the
-  `Paris`/`TCP TCP` split) was measured through the broken kernel and is
-  withdrawn: the corrected numbers are host 48.7 s, whole-layer bank 45.5 s,
-  per-expert LRU 50.0 s for the 512-token prefill.
-* **The per-expert LRU is the default and correct.**  It allocates 162 slots
-  in each of the 39 eligible GPU layers (18.1 GiB at `--moe-vram-mb 20000`
-  with `--layer-map 0-19:gpu.0,20-39:gpu.1,40-43:cpu,44-47:gpu.1`), uploads
-  every expert a step selects before the kernels run (per-layer LRU, no host
-  spill), and prefill walks in 64-token chunks.  Measured **32.6 s (15.7
-  tok/s)** for a 512-token prefill, first request 35.3 s, decode **372
-  ms/token (2.7 tok/s)**.  A dedicated **Q5_1 dp4a down kernel**
-  (`moe_down_q5_1_launch`, 32-value groups, `NPB=8`) replaced the fp32-lane
-  generic down (GPU-vs-host acc cosine 0.99998); `PF_Q4_BANK_LAYER=1` restores
-  the whole-layer bank, `PF_Q4_NOGRP_DOWN=1` is the generic-down A/B.
-* **The decode's dominant cost was the LRU upload transport, not the expert
-  kernels.**  Pageable `q.memcpy` of the GGUF mmap blocks the host until the
-  in-order queue drains (1 MB behind a kernel = 1.70 ms of host time against
-  0.016 ms from pinned USM) and runs at ~2 GB/s: 112 ms/token for 77 misses /
-  223 MB.  A 32-slot pinned staging ring per device (async device copy, event
-  paced) took it to 39 ms; `PF_Q4_STAGE=0` restores the old path.  The second
-  win was the **looped decode grid**: the flat gate/up grid is sized from a
-  host upper bound, so a 10-expert decode launched 10 440 work-groups against
-  the 200 with work; `PF_MOE_FLAT_DEC=1` restores it.  Together with moving
-  layers 44-47 to the second card, decode went 475 -> 372 ms/token; the 35B
-  A3B improves 41.7 -> 36.1 ms/token with byte-identical output.  Batched
-  q4exp decode is unmeasured (the server's prefill_batch has no q4 variant).
-  The staged uploads also help the prefill (46.7 -> 37.4 s on a 498-token
-  prompt, and 32.6 s at 512 with the 39-layer map).
-* **The Q5_1 down kernel's `m·xs` term is per GROUP, not per lane.**  The
-  first version added it on every lane of a group, so the zero point was
-  counted 8x (cos 0.08, rms 16x); carry the group sum on `lane%8 == 0` only.
-  A hermetic SYCL test against the host reference is exact (cos 1.0) for
-  K=32/64/160/640 and N=64/2560.
-* **The Q5_1 down kernel's `m·xs` term is per GROUP, not per lane.**  The
-  first version added it on every lane of a group, so the zero point was
-  counted 8x (cos 0.08, rms 16x); carry the group sum on `lane%8 == 0` only.
-  A hermetic SYCL test against the host reference is exact (cos 1.0) for
-  K=32/64/160/640 and N=64/2560.
-* **The host-spill split was rejected first, and the reason is the routing.**
-  A static top-R set with non-resident pairs computed on the host gave 39.2 s
-  against the layer bank's 39.0 and never converged: even with a native Q5_1
-  down and an f16 activation scale, **5 498 of 5 957 slots changed on the next
-  calibration**.  Routing is a discrete function of the hidden state, so a
-  one-ulp difference between the GPU-resident and host-spill arithmetic flips
-  the top-10 boundary for many tokens; any split has a different set.  The
-  all-GPU upload-on-miss path avoids it by construction.  (The tail is also
-  the wrong shape for a split: the prefill uses 10 787 distinct experts, the
-  top 6 200 cover 95.8% of pairs, and the remaining 4 587 cover 4.2%.)
-* **Decode is not faster than the host path (~520 ms/token).**  A decode
-  selects 10 experts per layer, and the grouped kernel's grid is
-  `n_act x column-blocks`; passing `n_act = min(n_expert, n_pairs)` instead of
-  `n_expert` is done, but the 37 layers still launch ~30k tiny workgroups
-  (~230 ms), the 8 CPU-tail layers ~50 ms, and the dense/attention/HC ~230 ms.
-  The prefill is where the LRU pays; a decode-specific kernel (one workgroup
-  per selected expert, weights read once) is the next lever.
+| flag / env | default | meaning |
+|---|---|---|
+| `--moe-vram-mb MB` | 0 | per-expert LRU bank budget; **17500** is the measured knee (121 slots), 0 = all experts on the host |
+| `--engram-ram-mb MB` | 4096 | PLE row cache in host RAM; 0 disables it |
+| `--moe-ram-mb MB` | 0 | generic ncmoe host tier; **not used by qwen4exp** (the experts are always host-resident) |
+| `--layer-map` | auto | recommended `0-23:gpu.0,24-47:gpu.1` |
+| `--kv-type` | i8 | f16 and i8 both work; f16 is the recommended decode |
+| `PF_Q4_BANK=0` | on | all-host expert path (A/B) |
+| `PF_Q4_BANK_LAYER=1` | off | whole-layer bank instead of the per-expert LRU |
+| `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
+| `PF_Q4_PIN_SRC=0` | on | stage from the mmap instead of the pinned expert source |
+| `PF_Q4_TAIL_SKIP=N` | 0 | drop a miss whose best rank over the batch is >= N (7 = Strata tail-skip) |
+| `PF_Q4_CPU_MISS=1` | off | decode CPU miss for non-resident experts, int8 host path (`2` = f32 A/B); **measured 1.49x slower, see the dead ends** |
+| `PF_Q4_CPU_MISS_WARM=N` / `_LAYER=il` / `_TIME` | 16 / all / off | decode steps with the LRU before the split freezes / one-layer probe / per-layer host+GPU print |
+| `PF_Q4_CMDBG=1` | off | per-call sub-phase ms inside the host miss expert |
+| `PF_Q4_HEAT=1` | off | decayed-heat victim instead of LRU (measured slower; A/B only) |
+| `PF_Q4_PF_ONEPASS=1` | off | old single-pass prefill (incorrect when act > R) |
+| `PF_Q4_PF_PIPE=0` | on | serial expert copies; A/B for the two-pass prefetch |
+| `PF_Q4_PF_STATS=1` / `PF_Q4_PF_CHUNK` / `PF_Q4_PF_WMIN` | off / auto / 24 | two-pass diagnostics and chunk/workspace overrides |
+| `PF_Q4_LRU_OLD=1` | off | pre-fix eviction (not an LRU; A/B only) |
+| `PF_Q4_STAGE=0` | on | direct pageable expert uploads instead of the pinned ring |
+| `PF_Q4_INJECT=0` | on | old one-lane HC inject dot |
+| `PF_Q4_GEMV8=0` | on | generic Q8_0 GEMV |
+| `PF_Q4_GEMVSEG=0` | on | blocking per-call segment copy |
+| `PF_QSA_TIME=1` | off | QSA host split per forward (`copy/gemv/upd/sel/attn`) |
+| `PF_QSA_ISA=scalar\|avx2\|avx512` | auto | force only the QSA host kernels' ISA |
+| `PF_QSA_DEFER=0` | on | inline update instead of the end-of-forward deferred update |
+| `PF_Q4_F32_SPLIT=0` | on | generic GDN beta/alpha GEMV |
+| `PF_Q4_IDS_HOST=0` / `PF_Q4_HOSTROUTER` | on / off | router ids copy / host router A/B |
+| `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_UPSTAT`, `PF_Q4_HOT_TIME`, `PF_Q4_FFCMP=<layer>` | off | phase attribution and the routed-FFN oracle |
+| `PF_Q4_HIST=1`, `PF_Q4_PREFAULT=0`, `PF_Q4_NOPLE=1` | off / on / off | routing histogram, skip the prefault, skip PLE (diagnostic) |
+| `PF_Q4_DOWN_NATIVE=1`, `PF_Q4_NOGRP_DOWN=1` | off | native host Q5_1 down, generic-down A/B |
+| `PF_Q4_BANK_TYPES=1`, `PF_Q4_BANK_MAX`, `PF_Q4_BANK_SKIP`, `PF_Q4_BANKCHK=1` | off | bank type dump, bisection bounds, byte check |
+| `PF_Q4_SM_LOAD=<path>` / `PF_Q4_CAL_LOAD=<path>` | off | load a static slot map / calibration table |
 
-* **The generic three-tier expert cache is not what accelerates qwen4exp, and
-  on this model it is inactive.**  `engine.cpp` sets `moe_host_only_` and
-  `moe_cfg_.host_only = true` for q4exp, `moe_cache.cpp` then computes
-  `total = 0`, and startup prints `bank 0/512 resident per layer (calibrated
-  0 pairs)`.  All 71.7 GiB of experts are already in host RAM (mmap +
-  prefault), so the RAM tier has no misses to serve and the disk tier never
-  runs.  The cache's device path lives in `record_forward`'s `seg_plan` MoE
-  branch, while q4exp walks its own layers in `q4_forward`; the two never
-  meet.  qwen4exp uses the **whole-layer** VRAM bank (`q4_bank_layer_`)
-  instead: coarser than a per-expert hot set (it cannot keep only the hot
-  experts of every layer), but it needs no calibration and no host/device
-  split.  Wiring the per-expert cache into `q4_forward` is the remaining
-  option if the routing histogram shows enough skew to beat the layer bank.
-* **The host activation quantizer now rounds its stored scale to f16**
-  (`cpu_xq`, matching the device `asa` which the grouped kernels read through
-  `fast_h2f`).  Without it the host and device expert paths differ by one f16
-  ulp per 32-value group - invisible in an aggregate, but enough to move the
-  next prefill's top-k boundary.
-* **Shared expert on the GPU** (oneDNN int8 + gate add): 5.76 -> 1.1 s.
-* **AVX-512 VNNI expert kernels**: ~1-2 s at this run's drift; keep them and
-  compare within one run.
-* **Native Q5_1 down on the host** (0.75 vs 1.125 B/weight) is **slower**
-  (27.8/28.5 vs 25.7-28.4 s experts): the 32-value reconstruction and the
-  24-byte block access cost more than the byte saving.  `PF_Q4_DOWN_NATIVE=1`,
-  default off.  (The GPU bank reads the native Q5_1 blocks and is fine.)
-* **Pinned host mirror** (`PF_Q4_MIRROR=1`): 4.28 GB/s per card, 512 prefill
-  27 s (18.9 tok/s) with the bank off - not output-validated, off by default.
-* **i8 KV is fine, and the earlier "i8 garbage" reading was the bank.**  All
-  of f16/bf16/f32/i8/i4/`i4:i8`/`i8:i4` answer `Paris` at a 17-token prompt,
-  and f16/i8/i4 stay coherent over 32 greedy tokens.  With i8 KV the
-  2 048-token prefill's rest drops from 52.8 s to 47.5 s (`attn_xmx`).
 ### OpenAI-compatible API
 
 `GET /v1/models` lists the model (id from the GGUF `general.name`) and
@@ -2440,11 +2683,13 @@ addresses - an internal media server, and SSRF exposure again),
 wait, so it measures host submission cost - the only way to tell a slow kernel
 from a slow launch; this is what found the `wg_clamped` regression below),
 `PF_Q4_TIME=1` (qwen4exp: one line per forward with the host-MoE / router /
-shared-expert / GPU-handoff split), `PF_Q4_HIST=1` (routing histogram: per-layer
+shared-expert / GPU-handoff split), `PF_QSA_TIME=1` (the host QSA split:
+`copy/gemv/upd/sel/attn`; `PF_QSA_ISA` and `PF_QSA_DEFER` are the A/B knobs),
+`PF_Q4_HIST=1` (routing histogram: per-layer
 expert pair counts, top-B coverage and whole-layer coverage, printed at exit;
 `PF_Q4_BANK_TYPES`/`_MAX`/`_SKIP`/`_BANKCHK` are the bank diagnostics), `PF_Q4_DUMP=1` (per-stage rms/max/first),
 `PF_Q4_BIN=<path>` (dump one stage's full f32 tensor; the layer/tag is chosen in
-`engine_q4exp.cpp`), `PF_Q4_PREFAULT=0` (skip the startup touch of the 72.8 GiB
+`engine_q4exp.cpp`), `PF_Q4_PREFAULT=0` (skip the startup touch of the 71.7 GiB
 host-resident expert bank), `PF_Q4_NOPLE=1` (skip the PLE module - diagnostic
 only, it changes the model),
 `PF_MTP_STEPS=1` (per-depth MTP acceptance: reach[j] = the fraction of cycles
@@ -4135,7 +4380,7 @@ engine that quantised the row count), so it is a verifier and not a decoration.
 For the 27B (needs the layer split - it does not fit on one card), also run:
 
 ```bash
-M=/data/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf
+M=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_w4_vs_cpuref      # argmax SAME
 TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1 ./build/test_decode_vs_prefill "$M"  # OK
 ```

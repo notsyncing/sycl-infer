@@ -525,7 +525,7 @@ worker 能报什么，取决于它手上有什么：
 （`sysexits.h` 的 `EX_CONFIG`，见 `src/common/exit_codes.h`）：
 
 ```
-error: cannot open /data/models/nonexistent.gguf
+error: cannot open /path/to/nonexistent.gguf
 (exit 78: a startup failure - do not retry, the same attempt would fail the same way)
 ```
 

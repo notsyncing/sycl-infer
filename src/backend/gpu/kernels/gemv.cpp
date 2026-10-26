@@ -161,10 +161,10 @@ static void gemv_multi_kernel(queue & q, const gemv_seg * segs, int n_segs, int 
 #define GEMV_DISPATCH_TB(QT, TB_)                                                                                      \
     do {                                                                                                               \
         switch (nsb) {                                                                                                 \
-        case 4: gemv_multi_kernel<QT, TB_, 1, 4, 8>(q, segs, n_segs, total_rows, n_tb); break;                         \
-        case 8: gemv_multi_kernel<QT, TB_, 1, 8, 8>(q, segs, n_segs, total_rows, n_tb); break;                         \
-        case 14: gemv_multi_kernel<QT, TB_, 1, 14, 8>(q, segs, n_segs, total_rows, n_tb); break;                       \
-        default: gemv_multi_kernel<QT, TB_, 1, 0, 8>(q, segs, n_segs, total_rows, n_tb); break;                        \
+        case 4: gemv_multi_kernel<QT, TB_, 1, 4, 8>(q, segs, n_segs, total_rows, n_tb); break;              \
+        case 8: gemv_multi_kernel<QT, TB_, 1, 8, 8>(q, segs, n_segs, total_rows, n_tb); break;              \
+        case 14: gemv_multi_kernel<QT, TB_, 1, 14, 8>(q, segs, n_segs, total_rows, n_tb); break;            \
+        default: gemv_multi_kernel<QT, TB_, 1, 0, 8>(q, segs, n_segs, total_rows, n_tb); break;             \
         }                                                                                                              \
     } while (0)
 
@@ -177,15 +177,15 @@ static int gemv_env_cfg(const char * name) {
 #define GEMV_DISPATCH_CFG(QT, TB_, CFG)                                                                                \
     do {                                                                                                               \
         switch (CFG) {                                                                                                 \
-        case 104: gemv_multi_kernel<QT, TB_, 1, 0, 4>(q, segs, n_segs, total_rows); break;                             \
-        case 204: gemv_multi_kernel<QT, TB_, 2, 0, 4>(q, segs, n_segs, total_rows); break;                             \
-        case 208: gemv_multi_kernel<QT, TB_, 2, 0, 8>(q, segs, n_segs, total_rows); break;                             \
-        case 216: gemv_multi_kernel<QT, TB_, 2, 0, 16>(q, segs, n_segs, total_rows); break;                            \
-        case 404: gemv_multi_kernel<QT, TB_, 4, 0, 4>(q, segs, n_segs, total_rows); break;                             \
-        case 408: gemv_multi_kernel<QT, TB_, 4, 0, 8>(q, segs, n_segs, total_rows); break;                             \
-        case 416: gemv_multi_kernel<QT, TB_, 4, 0, 16>(q, segs, n_segs, total_rows); break;                            \
-        case 808: gemv_multi_kernel<QT, TB_, 8, 0, 8>(q, segs, n_segs, total_rows); break;                             \
-        default: gemv_multi_kernel<QT, TB_, 1, 0, 8>(q, segs, n_segs, total_rows); break;                              \
+        case 104: gemv_multi_kernel<QT, TB_, 1, 0, 4>(q, segs, n_segs, total_rows); break;                   \
+        case 204: gemv_multi_kernel<QT, TB_, 2, 0, 4>(q, segs, n_segs, total_rows); break;                   \
+        case 208: gemv_multi_kernel<QT, TB_, 2, 0, 8>(q, segs, n_segs, total_rows); break;                   \
+        case 216: gemv_multi_kernel<QT, TB_, 2, 0, 16>(q, segs, n_segs, total_rows); break;                  \
+        case 404: gemv_multi_kernel<QT, TB_, 4, 0, 4>(q, segs, n_segs, total_rows); break;                   \
+        case 408: gemv_multi_kernel<QT, TB_, 4, 0, 8>(q, segs, n_segs, total_rows); break;                   \
+        case 416: gemv_multi_kernel<QT, TB_, 4, 0, 16>(q, segs, n_segs, total_rows); break;                  \
+        case 808: gemv_multi_kernel<QT, TB_, 8, 0, 8>(q, segs, n_segs, total_rows); break;                   \
+        default: gemv_multi_kernel<QT, TB_, 1, 0, 8>(q, segs, n_segs, total_rows); break;                    \
         }                                                                                                              \
     } while (0)
 
@@ -312,14 +312,256 @@ static void gemv_dec_vec_kernel(queue & q, const gemv_seg * segs, int n_segs, in
     });
 }
 
-void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
-                       int n_tok_blocks) {
+// ---------------------------------------------------------------------------
+// Q8_0 single-token decode GEMV, 8 consecutive values per lane.
+//
+// Q8_0 stores 32 *contiguous* int8 values plus one f16 scale in a 34-byte
+// block, so lane -> (s = block in the 256-value superblock, m = 8-value chunk)
+// lets one lane cover 8 values of ONE block: one scale load, four uint16 weight
+// loads and two float4 activation loads.  The generic lane = k-position mapping
+// needs 8 of each for the same 8 values (8 different blocks' scales, 8 byte
+// loads, 8 scalar activation loads) - that is the dense-trunk floor described
+// in the Q8_0 note in AGENTS.md (55-60 GB/s for wide shapes).
+//
+// The qs payload starts at offset 2 of a 34-byte block, so a value window is
+// only 2-byte aligned.  An 8-byte (uint2) load at that alignment is accepted by
+// the hardware in a JIT build but the AOT (acm-g10) lowering of this TU widened
+// it: the logits came out uncorrelated with the generic path (max|diff| 15.4 of
+// a 18.6 max) while the same code was exact under JIT.  So the weights are read
+// as four naturally aligned uint16 (two int8 each); the scale and the two
+// float4 activation loads are still 1 and 2 per 8 values instead of 8 and 8.
+//
+// `WPR > 1` is the narrow-shape occupancy fix.  The HC down (K = 10240,
+// N = 320) leaves a one-row-per-warp grid at 320 warps = 0.6 warps/EU;
+// WPR warps split the superblocks of ONE row inside a work-group and reduce
+// through SLM, without a second kernel or a global partial buffer.
+//
+// Both mappings change the order the K elements are summed in (ulp level), so
+// the path is gated by PF_Q4_GEMV8: default on (0 restores the generic GEMV) and
+// checked against the logits and the token stream - see the measurements in the
+// Q8_0 note in AGENTS.md.
+static inline float q8_0_dot_vec(const char * __restrict__ row, int sb0, int sb1, const float * __restrict__ x,
+                                 int lane) {
+    const int s = lane >> 2;          // 32-value block inside the superblock
+    const int m = (lane & 3) << 3;    // 8-value chunk inside that block
+    float acc = 0.f;
+    for (int sb = sb0; sb < sb1; sb++) {
+        const char * blk = row + (size_t)(sb * 8 + s) * 34;
+        const float d = fast_h2f(*(const uint16_t *)blk);
+        const uint16_t * q16 = reinterpret_cast<const uint16_t *>(blk + 2 + m);
+        const uint16_t w0 = q16[0], w1 = q16[1], w2 = q16[2], w3 = q16[3];
+        const float * xp = x + (size_t)sb * 256 + 32 * s + m;
+        const float4 xa = *reinterpret_cast<const float4 *>(xp);
+        const float4 xb = *reinterpret_cast<const float4 *>(xp + 4);
+        acc += d * (float)(int8_t)(uint8_t)(w0 >> 0) * xa.x();
+        acc += d * (float)(int8_t)(uint8_t)(w0 >> 8) * xa.y();
+        acc += d * (float)(int8_t)(uint8_t)(w1 >> 0) * xa.z();
+        acc += d * (float)(int8_t)(uint8_t)(w1 >> 8) * xa.w();
+        acc += d * (float)(int8_t)(uint8_t)(w2 >> 0) * xb.x();
+        acc += d * (float)(int8_t)(uint8_t)(w2 >> 8) * xb.y();
+        acc += d * (float)(int8_t)(uint8_t)(w3 >> 0) * xb.z();
+        acc += d * (float)(int8_t)(uint8_t)(w3 >> 8) * xb.w();
+    }
+    return acc;
+}
+
+// Generic lane = k-position Q8_0 dot, kept for a K that is not a multiple of
+// 256 and for the silu(x)*up epilogue.  The terms and their per-lane order are
+// the generic kernel's (k = lane, lane+32, ...); only the superblock-boundary
+// association differs (one extra rounding per 256 values).
+static inline float q8_0_dot_scalar(const char * __restrict__ row, int K, const float * __restrict__ x,
+                                    const float * __restrict__ up, int lane) {
+    float acc = 0.f;
+    for (int k = lane; k < K; k += 32) {
+        const char * blk = row + (size_t)(k >> 5) * 34;
+        float xv = x[k];
+        if (up) {
+            xv = silu_f(xv) * up[k];
+        }
+        acc += fast_h2f(*(const uint16_t *)blk) * (float)(int8_t)blk[2 + (k & 31)] * xv;
+    }
+    return acc;
+}
+
+static inline void gemv_q8_find_seg(const gemv_seg * segs, int n_segs, int row_base, int & seg_idx,
+                                    int & row_in_seg) {
+    int acc_rows = 0;
+    seg_idx = -1;
+    row_in_seg = 0;
+    for (int s = 0; s < n_segs; s++) {
+        if (row_base < acc_rows + segs[s].n_rows) {
+            seg_idx = s;
+            row_in_seg = row_base - acc_rows;
+            return;
+        }
+        acc_rows += segs[s].n_rows;
+    }
+}
+
+// One warp per output row.
+static void gemv_dec_q8_kernel(queue & q, const gemv_seg * segs, int n_segs, int total_rows, int rows_per_wg,
+                               bool force_scalar) {
+    const int n_wg = (total_rows + rows_per_wg - 1) / rows_per_wg;
+    q.parallel_for(nd_range<1>((size_t)n_wg * rows_per_wg * 32, (size_t)rows_per_wg * 32),
+                   [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                       const int sg = (int)it.get_local_id(0) / 32;
+                       const int lane = (int)it.get_local_id(0) % 32;
+                       const int row_base = (int)it.get_group(0) * rows_per_wg + sg;
+                       if (row_base >= total_rows) {
+                           return;
+                       }
+                       int seg_idx = -1, row_in_seg = 0;
+                       gemv_q8_find_seg(segs, n_segs, row_base, seg_idx, row_in_seg);
+                       if (seg_idx < 0) {
+                           return;
+                       }
+                       const gemv_seg sgd = segs[seg_idx];
+                       const int n_sb = sgd.K / 256;
+                       const char * row = (const char *)sgd.w + (size_t)row_in_seg * (size_t)(sgd.K / 32) * 34;
+                       const bool vec = !force_scalar && !sgd.act_up && n_sb * 256 == sgd.K;
+                       float acc = vec ? q8_0_dot_vec(row, 0, n_sb, sgd.x, lane)
+                                       : q8_0_dot_scalar(row, sgd.K, sgd.x, sgd.act_up, lane);
+                       acc = sg_sum(acc, it.get_sub_group());
+                       if (lane == 0) {
+                           float v = acc * sgd.alpha;
+                           if (sgd.residual) {
+                               v += sgd.residual[row_in_seg];
+                           }
+                           sgd.out[row_in_seg] = v;
+                       }
+                   });
+}
+
+// WPR warps on ONE output row, each taking a contiguous superblock range, with
+// an SLM reduction at the end.  Grid = one work-group per row.
+template <int WPR>
+static void gemv_dec_q8_split_kernel(queue & q, const gemv_seg * segs, int n_segs, int total_rows,
+                                     bool force_scalar) {
+    q.submit([&](handler & h) {
+        local_accessor<float, 1> part(WPR, h);
+        h.parallel_for(nd_range<1>((size_t)total_rows * WPR * 32, (size_t)WPR * 32),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           const int w = (int)it.get_local_id(0) / 32;
+                           const int lane = (int)it.get_local_id(0) % 32;
+                           const int row = (int)it.get_group(0);
+                           int seg_idx = -1, row_in_seg = 0;
+                           gemv_q8_find_seg(segs, n_segs, row, seg_idx, row_in_seg);
+                           if (seg_idx < 0) {
+                               return;
+                           }
+                           const gemv_seg sgd = segs[seg_idx];
+                           const int n_sb = sgd.K / 256;
+                           const char * rp = (const char *)sgd.w + (size_t)row_in_seg * (size_t)(sgd.K / 32) * 34;
+                           const bool vec = !force_scalar && !sgd.act_up && n_sb * 256 == sgd.K;
+                           float acc;
+                           if (vec) {
+                               // whole superblocks per warp, so the 8-value
+                               // lane mapping is unchanged
+                               const int sb0 = (int)((int64_t)n_sb * w / WPR);
+                               const int sb1 = (int)((int64_t)n_sb * (w + 1) / WPR);
+                               acc = q8_0_dot_vec(rp, sb0, sb1, sgd.x, lane);
+                           } else {
+                               // unsupported geometry: one warp does the whole
+                               // row in the generic order, the others add zero
+                               acc = w == 0 ? q8_0_dot_scalar(rp, sgd.K, sgd.x, sgd.act_up, lane) : 0.f;
+                           }
+                           acc = sg_sum(acc, it.get_sub_group());
+                           if (lane == 0) {
+                               part[w] = acc;
+                           }
+                           it.barrier();
+                           if (it.get_local_id(0) == 0) {
+                               float v = 0.f;
+                               for (int i = 0; i < WPR; i++) {
+                                   v += part[i];
+                               }
+                               v *= sgd.alpha;
+                               if (sgd.residual) {
+                                   v += sgd.residual[row_in_seg];
+                               }
+                               sgd.out[row_in_seg] = v;
+                           }
+                       });
+    });
+}
+
+// F32 decode GEMV for a NARROW group: WPR warps split one row's superblocks,
+// reduce through SLM.
+//
+// qwen4exp's ssm_beta/ssm_alpha are [48][2560] f32 each, so the 2-tensor group
+// is 96 rows.  One warp per row leaves 96 warps (0.19/EU) and the kernel
+// measures 0.104 ms for 0.98 MB (9.4 GB/s) - it is latency bound, not byte
+// bound; the same rows spread over WPR warps per row reach the card's rate
+// (the Q8_0 split path takes the 320-row HC down to 0.035 ms for 13.1 MB).
+//
+// It changes the summation order: the generic kernel accumulates all
+// superblocks in one lane chain, this one reduces WPR partial sums.  The
+// per-superblock `w[x] * x[k]` order is the generic kernel's, and `n_sb` is
+// `K / 256` so a tail shorter than a superblock is dropped exactly as the
+// generic path drops it.  Measured on qwen4exp: 0.104 -> 0.031 ms per call at
+// WPR=8 (36 calls/token), a 160-token generation is byte-identical to the
+// generic path, and the 64-token decode wall is 14.36 s against 14.55 s.
+// PF_Q4_F32_SPLIT selects the warp count (0 = generic, 8 = default).
+template <int WPR>
+static void gemv_dec_f32_split_kernel(queue & q, const gemv_seg * segs, int n_segs, int total_rows) {
+    q.submit([&](handler & h) {
+        local_accessor<float, 1> part(WPR, h);
+        h.parallel_for(nd_range<1>((size_t)total_rows * WPR * 32, (size_t)WPR * 32),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           const int w = (int)it.get_local_id(0) / 32;
+                           const int lane = (int)it.get_local_id(0) % 32;
+                           const int row = (int)it.get_group(0);
+                           int seg_idx = -1, row_in_seg = 0;
+                           gemv_q8_find_seg(segs, n_segs, row, seg_idx, row_in_seg);
+                           if (seg_idx < 0) {
+                               return;
+                           }
+                           const gemv_seg sgd = segs[seg_idx];
+                           const int n_sb = sgd.K / 256;
+                           // the generic kernel's row stride (n_sb superblocks),
+                           // so a K that is not a multiple of 256 is covered
+                           // exactly as the generic path covers it
+                           const char * rp =
+                               (const char *)sgd.w + (size_t)row_in_seg * (size_t)n_sb * 1024;
+                           const int sb0 = (int)((int64_t)n_sb * w / WPR);
+                           const int sb1 = (int)((int64_t)n_sb * (w + 1) / WPR);
+                           float acc = 0.f;
+                           for (int sb = sb0; sb < sb1; sb++) {
+                               const char * p = rp + (size_t)sb * 1024;
+                               const float * xrow = sgd.x + (size_t)sb * 256;
+#pragma unroll
+                               for (int b = 0; b < 8; b++) {
+                                   acc += ((const float *)p)[32 * b + lane] * xrow[32 * b + lane];
+                               }
+                           }
+                           acc = sg_sum(acc, it.get_sub_group());
+                           if (lane == 0) {
+                               part[w] = acc;
+                           }
+                           it.barrier();
+                           if (it.get_local_id(0) == 0) {
+                               float v = 0.f;
+                               for (int i = 0; i < WPR; i++) {
+                                   v += part[i];
+                               }
+                               v *= sgd.alpha;
+                               if (sgd.residual) {
+                                   v += sgd.residual[row_in_seg];
+                               }
+                               sgd.out[row_in_seg] = v;
+                           }
+                       });
+    });
+}
+
+static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
+                            int nsb, int n_tok_blocks) {
     const int n_tb = (TB > 1 && n_tok_blocks > 0) ? n_tok_blocks : 1;
     static const bool dbg_g = si::env::flag("PF_DBG_GEMV");
     if (dbg_g) {
         // the segments live on the device, so only log the host side here
-        fprintf(stderr, "[gemv] type=%u n_segs=%d total_rows=%d TB=%d nsb=%d segs=%p\n", type, n_segs, total_rows, TB,
-                nsb, (const void *)segs);
+        fprintf(stderr, "[gemv] type=%u n_segs=%d total_rows=%d TB=%d nsb=%d segs=%p\n", type, n_segs,
+                total_rows, TB, nsb, (const void *)segs);
     }
     static const int cfg1 = gemv_env_cfg("GEMV_CFG1");
     // single-token decode: use the vectorized-dequant kernels for Q4_K/Q5_K
@@ -342,6 +584,42 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
         } else {
             gemv_dec_vec_kernel<13>(q, segs, n_segs, total_rows, nsb);
         }
+        return;
+    }
+    // F32 narrow decode group (qwen4exp's ssm_beta/ssm_alpha): split the row
+    // over WPR warps.  On by default; PF_Q4_F32_SPLIT=0 restores the generic
+    // path (see the kernel comment for the measurement and the reassociation).
+    static const int f32_split = si::env::i32("PF_Q4_F32_SPLIT", 8);
+    if (TB == 1 && !cfg1 && type == 0 && total_rows <= 128 && f32_split > 0) {
+        switch (f32_split) {
+        case 2: gemv_dec_f32_split_kernel<2>(q, segs, n_segs, total_rows); return;
+        case 4: gemv_dec_f32_split_kernel<4>(q, segs, n_segs, total_rows); return;
+        case 16: gemv_dec_f32_split_kernel<16>(q, segs, n_segs, total_rows); return;
+        default: gemv_dec_f32_split_kernel<8>(q, segs, n_segs, total_rows); return;
+        }
+    }
+    // Q8_0 decode: vectorized 8-values-per-lane mapping, with a warp split for
+    // the narrow shapes.  On by default; PF_Q4_GEMV8=0 restores the generic
+    // GEMV (see the Q8_0 note above for the measurement).
+    static const int g8_on = si::env::i32("PF_Q4_GEMV8", 1);
+    // A/B bisection only: PF_Q4_GEMV8_MAX_ROWS leaves the wide shapes (the LM
+    // head) on the generic path.
+    static const int g8_max_rows = si::env::i32("PF_Q4_GEMV8_MAX_ROWS", 1 << 30);
+    if (TB == 1 && g8_on && !cfg1 && type == 8 && total_rows <= g8_max_rows) {
+        static const int g8_wpr = si::env::i32("PF_Q4_GEMV8_WPR", 8);
+        static const int g8_rows = si::env::i32("PF_Q4_GEMV8_SPLIT_ROWS", 512);
+        static const int g8_rpw_env = si::env::i32("PF_Q4_GEMV8_RPW", 0);
+        static const bool g8_scalar = si::env::flag("PF_Q4_GEMV8_SCALAR");
+        if (g8_wpr > 1 && total_rows <= g8_rows) {
+            switch (g8_wpr) {
+            case 2: gemv_dec_q8_split_kernel<2>(q, segs, n_segs, total_rows, g8_scalar); return;
+            case 4: gemv_dec_q8_split_kernel<4>(q, segs, n_segs, total_rows, g8_scalar); return;
+            case 16: gemv_dec_q8_split_kernel<16>(q, segs, n_segs, total_rows, g8_scalar); return;
+            default: gemv_dec_q8_split_kernel<8>(q, segs, n_segs, total_rows, g8_scalar); return;
+            }
+        }
+        const int rpw = g8_rpw_env > 0 ? g8_rpw_env : si::dev::for_queue(q).shape.gemv_rows_per_wg;
+        gemv_dec_q8_kernel(q, segs, n_segs, total_rows, rpw, g8_scalar);
         return;
     }
     static const int cfg8 = gemv_env_cfg("GEMV_CFG8");
@@ -452,6 +730,11 @@ void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_se
         }
         break;
     }
+}
+
+void gemv_group_launch(queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
+                       int n_tok_blocks) {
+    gemv_group_impl(q, type, segs, n_segs, total_rows, TB, nsb, n_tok_blocks);
 }
 #undef GEMV_DISPATCH_TB
 
