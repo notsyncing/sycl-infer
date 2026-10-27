@@ -611,11 +611,21 @@ likely 3/5-row verify above the gate.  The q4 MTP path is **not implemented**
 and is now **no-go** for this build; the draft semantics and state plan are in
 the q4 section of `AGENTS.md` if it is ever revisited.
 
-> **MTP q4 result: PENDING.**  <!-- MTP-Q4-PLACEHOLDER: the parent fills the
-> measured MTP q4 result here after the MTP job.  The table above is the old
-> forward's verify-cost gate, not the speculative path's result. -->
-> Until that row lands, the q4 MTP conclusion in this section is the pre-job
-> one (existing mode-1 forward) and must not be read as the final measurement.
+> **MTP q4 result: NO-GO (2026-10-27).**  The verify gate (`test_q4_verify`,
+> tail7+28, warm) measured n=1/3/5 = **224.5 / 367.7 / 420.6 ms** (reproduced
+> 368.3 / 418.7) against the kill lines 190 / 230; `PF_Q4_TIME` puts
+> **207/331/403 ms** of the 232/368/447 ms forward in the FFN with only
+> 150/436/576 MiB H2D, so the cost is the routed-expert compute/bank, not PCIe.
+> Each extra row is ~35-40 ms, the k+1 forward is 3.5-4.5x a plain token, and
+> k=2/k=4 stay at 0.72x-1.0x even at the best measured/optimistic acceptance;
+> no k pays.  **No MTP code was added**; the draft semantics/state plan above
+> remain design notes.  The gate exposed two real q4 issues: `pos_of()`
+> returned `pos[0]` for a multi-token mode-1 row (PLE positions after the first
+> tail token; fixed to `pos[0]+i`, output byte-identical because PLE uses
+> position differences), and `q4_hot_calibrate()` was dead code (wired at the
+> first prefill behind `PF_Q4_CAL`, default off: +0.9-1.27 s wall, no
+> decode-rate change).  The earlier 202/61 ms cold-bank claim was a load-time
+> subtraction artifact; the actual first-32/steady is **94.4/94.1 ms**.
 
 **Prefill: the 74 tok/s target is structurally out of reach on two cards.**
 The measured 9.6 s warm 544-token prefill splits into ~4.3-4.9 s of expert

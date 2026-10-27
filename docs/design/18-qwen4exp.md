@@ -465,11 +465,21 @@ Full tables and commands are in [`../PERFORMANCE.md`](../PERFORMANCE.md) §4.4.2
   verify shape; MTP is **no-go** for this build without a new one-slot
   k+1-row mode (and the 2-row batch result makes that unlikely to pay).
 
-> **MTP q4 result: PENDING.**  <!-- MTP-Q4-PLACEHOLDER: the parent fills this
-> after the MTP q4 job.  The bullet above is the pre-MTP-job conclusion and
-> must not be read as the final ranking. -->
-> Replace this note with the measured one-slot k+1-row verify result when the
-> MTP job reports; until then the numbers in §7.1 and §9 are the old forward's.
+> **MTP q4 result: NO-GO (2026-10-27).**  The verify gate (`test_q4_verify`,
+> tail7+28, warm) measured n=1/3/5 = **224.5 / 367.7 / 420.6 ms** (reproduced
+> 368.3 / 418.7) against the kill lines 190 / 230; `PF_Q4_TIME` puts
+> **207/331/403 ms** of the 232/368/447 ms forward in the FFN with only
+> 150/436/576 MiB H2D, so the cost is the routed-expert compute/bank, not PCIe.
+> Each extra row is ~35-40 ms, the k+1 forward is 3.5-4.5x a plain token, and
+> k=2/k=4 stay at 0.72x-1.0x even at the best measured/optimistic acceptance;
+> no k pays.  **No MTP code was added**; the draft semantics/state plan above
+> remain design notes.  The gate exposed two real q4 issues: `pos_of()`
+> returned `pos[0]` for a multi-token mode-1 row (PLE positions after the first
+> tail token; fixed to `pos[0]+i`, output byte-identical because PLE uses
+> position differences), and `q4_hot_calibrate()` was dead code (wired at the
+> first prefill behind `PF_Q4_CAL`, default off: +0.9-1.27 s wall, no
+> decode-rate change).  The earlier 202/61 ms cold-bank claim was a load-time
+> subtraction artifact; the actual first-32/steady is **94.4/94.1 ms**.
 
 * **Prefill:** the 9.6 s warm 544-token prefill is ~4.3-4.9 s upload (31-32 GiB
   at 6.9-7.9 GB/s), ~3.5-4.2 s device MoE and ~1.1 s non-MoE.  Host-spilling
