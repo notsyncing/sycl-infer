@@ -720,6 +720,7 @@ void engine::q4_alloc_banks() {
                         }
                     }
                     q4_hot_ready_ = true;
+                    q4_cal_done_ = true; // a static slot map is authoritative
                     fprintf(stderr, "[q4] hot bank: slot map loaded from %s (static calibration)\n", sf);
                 } else {
                     fprintf(stderr, "[q4] slot map %s is short (%zu/%zu); ignored\n", sf, n, q4_sm_host_.size());
@@ -959,6 +960,21 @@ void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int
             done += rem;
         }
     }
+    // The per-expert bank's LRU starts empty and only learns from the decode
+    // steps.  The obvious fix is to seed it from the prefill's routing, which
+    // is what q4_hot_calibrate does; measured, it is a loss on this engine:
+    // the prefill's own two-pass schedule already fills the bank (the first
+    // decode token after a 96-token prefill misses 55-56 pairs and uploads
+    // ~166 MiB, not 470 pairs and an empty bank), so seeding the frequency set
+    // re-copies 46% of the 16.5 GiB bank at the end of the first prefill to save
+    // ~8% of a ~1.6 GiB first-six-token LRU bill: 0.9-1.25 s slower wall on the
+    // 96-token cell, with no decode-rate change beyond the box's +-2.5% drift.
+    // Default off; PF_Q4_CAL=1 is the A/B for a bank that really starts cold
+    // (and PF_Q4_CAL_LOAD still calibrates from a saved table).
+    static const bool cal_on = si::env::i32("PF_Q4_CAL", 0) != 0;
+    if (cal_on && !q4_cal_done_ && q4_cal_pairs_ > 0) {
+        q4_hot_calibrate();
+    }
 }
 
 void engine::q4_hot_calibrate() {
@@ -967,6 +983,10 @@ void engine::q4_hot_calibrate() {
     if (R <= 0 || q4_cal_.empty()) {
         return;
     }
+    // One-shot: the bank is a cache of the first prefill's frequency set and
+    // the LRU owns it from the first decode step on.  Re-running this would
+    // shuffle every slot (one upload per moved expert) for no new information.
+    q4_cal_done_ = true;
     size_t bytes = 0;
     int layers = 0;
     size_t copied = 0;
@@ -991,6 +1011,14 @@ void engine::q4_hot_calibrate() {
         }
         const int dev = multi_dev ? layer_dev_[(size_t)il] : 0;
         sycl::queue & qd = dev_queue(dev);
+        // Read the H2D source from the pinned mirror when it exists: the GGUF
+        // mmap is pageable (a blocking copy) and its expert pages may have
+        // been dropped after the prefill, while the mirror is the same bytes
+        // already resident for the LRU uploads.
+        const bool pin = b.hg && b.hu && b.hd;
+        const char * gsrc = pin ? (const char *)b.hg : (const char *)L.moe.gate_exps.data;
+        const char * usrc = pin ? (const char *)b.hu : (const char *)L.moe.up_exps.data;
+        const char * dsrc = pin ? (const char *)b.hd : (const char *)L.moe.down_exps.data;
         qd.memcpy(b.sm, sm.data(), (size_t)E * sizeof(int32_t));
         int32_t * old = &q4_sm_host_[(size_t)il * (size_t)E];
         for (int i = 0; i < R; i++) {
@@ -998,9 +1026,9 @@ void engine::q4_hot_calibrate() {
             if (old[(size_t)e] == i) {
                 continue; // already in this slot from the previous calibration
             }
-            qd.memcpy((char *)b.g + (size_t)i * b.sg, (const char *)L.moe.gate_exps.data + (size_t)e * b.sg, b.sg);
-            qd.memcpy((char *)b.u + (size_t)i * b.su, (const char *)L.moe.up_exps.data + (size_t)e * b.su, b.su);
-            qd.memcpy((char *)b.d + (size_t)i * b.sd, (const char *)L.moe.down_exps.data + (size_t)e * b.sd, b.sd);
+            qd.memcpy((char *)b.g + (size_t)i * b.sg, gsrc + (size_t)e * b.sg, b.sg);
+            qd.memcpy((char *)b.u + (size_t)i * b.su, usrc + (size_t)e * b.su, b.su);
+            qd.memcpy((char *)b.d + (size_t)i * b.sd, dsrc + (size_t)e * b.sd, b.sd);
             copied++;
         }
         std::memcpy(old, sm.data(), (size_t)E * sizeof(int32_t));
@@ -1117,6 +1145,15 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     auto pos_of = [&](int i) -> int {
         if (mode == 2) {
             return inf->pos[i / kMaxT] + (i % kMaxT);
+        }
+        if (mode == 1) {
+            // Mode 1 is one row of n_tok consecutive tokens and
+            // q4_prefill_text writes only pos[0] (rows 1.. are zeroed for the
+            // unused sequences), so pos[i] made every token after the first
+            // read absolute position 0.  The PLE derives its conv history index
+            // from the token's position (cpu_q4_ple_apply's base_pos/hi), so
+            // the whole <kMaxT tail used token 0's taps.
+            return inf->pos[0] + i;
         }
         return inf->pos[i];
     };
@@ -1545,8 +1582,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     const bool hist_on = si::env::flag("PF_Q4_HIST");
     // A short tail prefill (the scheduler's 12-token chat suffix) is not a
     // calibration sample: its routing is not representative and it would
-    // overwrite the 512-token set.  Only real prefill chunks calibrate.
-    const bool hot_cal = q4_hot_ && mode != 0 && n_tok >= 64;
+    // overwrite the 512-token set.  Only real prefill chunks calibrate, and
+    // only until the hot set is frozen (q4_prefill_text calls
+    // q4_hot_calibrate at the end of the first prefill that produced one).
+    const bool hot_cal = q4_hot_ && !q4_cal_done_ && mode != 0 && n_tok >= 64;
     auto cal_add = [&](int il) {
         if (!hot_cal) {
             return;

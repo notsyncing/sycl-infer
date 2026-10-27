@@ -541,6 +541,7 @@ struct engine {
     // PF_Q4_BANK_LAYER=1 keeps the older whole-layer bank for A/B.
     bool q4_hot_ = false;
     bool q4_hot_ready_ = false;
+    bool q4_cal_done_ = false; // the first prefill's hot set has been frozen
     int q4_hot_r_ = 0;
     std::vector<uint32_t> q4_cal_;
     size_t q4_cal_pairs_ = 0;

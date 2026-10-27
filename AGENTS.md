@@ -1944,16 +1944,16 @@ the checks that catch them.
   slots and 17.0 GiB but is **not** faster.  17 500 is the recommended budget;
   the earlier "18000/20000 fail" note was measured before the four Q8_0 layers
   were banked.
-* **Tail-skip (`PF_Q4_TAIL_SKIP=7`, Strata CUDA path, opt-in).**  An expert
-  that every token routes at rank >= 7 is not admitted when it is a miss; it
-  keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the down) and
-  is neither copied nor computed.  On the 96-token TCP cell at 17500:
+* **Tail-skip (`PF_Q4_TAIL_SKIP=7`, Strata CUDA path, now default 7).**  An
+  expert that every token routes at rank >= 7 is not admitted when it is a
+  miss; it keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the
+  down) and is neither copied nor computed.  On the 96-token TCP cell at 17500:
   **93.6 -> 86.9 ms (-7.2%)**, the last token's upload **56.2 -> 32.2 MiB
   (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes; the KL/top-1 gate
   was run on 2026-10-27 (28/29 and 15/16 step pairs, first divergence always a
-  near-tie, KL 0.029/0.037, text coherent), so it is a usable approximation -
-  but still an expert-drop, so the default stays 0.  Measured rank
-  distribution: 39-42% of misses are rank >= 7.
+  near-tie, KL 0.029/0.037, text coherent), so it is a usable approximation and
+  is now **default 7**; `PF_Q4_TAIL_SKIP=0` restores the exact expert set.
+  Measured rank distribution: 39-42% of misses are rank >= 7.
 * **Decayed heat (`PF_Q4_HEAT=1`) is a loss on this engine**: 105.7 vs 93.6 ms
   and 156 vs 56 MiB of upload; the Strata adaptive-swap parameters do not
   transfer (the LFU prior was already negative).  Leave it off; the code is
