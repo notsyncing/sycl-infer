@@ -225,10 +225,10 @@ void model::load(const std::string & path) {
     // so this catches a registry/profile/loader drift instead of letting the
     // engine take the generic path on a hyper-connection model (or vice versa).
     const bool hc_fwd = prof->fwd == model_profile::fwd_kind::hc_ple_qsa;
-    if (m.q4exp != hc_fwd || hp.q4exp != hc_fwd) {
+    if (q4exp != hc_fwd || hp.q4exp != hc_fwd) {
         throw std::runtime_error("model profile " + std::string(prof->key) +
-                                 ": forward kind disagrees with the loader (m.q4exp=" +
-                                 (m.q4exp ? "true" : "false") + ", hp.q4exp=" + (hp.q4exp ? "true" : "false") + ")");
+                                 ": forward kind disagrees with the loader (q4exp=" +
+                                 (q4exp ? "true" : "false") + ", hp.q4exp=" + (hp.q4exp ? "true" : "false") + ")");
     }
     report(*prof);
 }
