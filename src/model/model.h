@@ -6,6 +6,7 @@
 #include <sycl/sycl.hpp> // IWYU pragma: keep
 
 #include "gguf.h"
+#include "model_profile.h"
 #include "w8.h"
 
 namespace si {
@@ -265,6 +266,10 @@ void validate_hparams(const hparams & hp, const std::string & arch);
 struct model {
     gguf_file gguf;
     hparams hp;
+    // The architecture's declarative profile, set by model::load from the
+    // registry row that matched general.architecture.  Never null after a
+    // successful load; the row's key is asserted against the GGUF's exact key.
+    const model_profile * prof = nullptr;
     // tokenizer.chat_template (Jinja); empty when the GGUF does not carry one
     std::string chat_template;
     std::vector<layer_t> layers;

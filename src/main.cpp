@@ -207,7 +207,7 @@ int main(int argc, char ** argv) {
     int max_slots = 16;       // --max-slots: concurrent sequences (recurrent state)
     int moe_resident = 0;      // --moe-resident: experts kept on the device per layer
     size_t moe_vram_mb = 0;     // --moe-vram-mb: device budget for the expert bank
-    size_t engram_ram_mb = 4096; // --engram-ram-mb: PLE row cache in host RAM
+    size_t engram_ram_mb = engine_config::kEngramRamAuto; // --engram-ram-mb: 0 = off, unset = profile default
     size_t moe_ram_mb = 0;      // --moe-ram-mb: host budget for the decoded-expert tier
     bool yarn = false;          // --yarn: YaRN context extension
     int yarn_orig_ctx = 0;      // 0 = the GGUF's declared context_length

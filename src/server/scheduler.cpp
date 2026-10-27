@@ -14,6 +14,7 @@
 
 #include "chat_util.h"
 #include "kernels.h"
+#include "model_profile.h"
 #include "sampler.h"
 #include "common/env.h"
 
@@ -206,6 +207,11 @@ void scheduler::loop() {
     std::vector<int32_t> toks(kMaxB, 0), poss(kMaxB, 0), slots(kMaxB, 0);
     std::vector<float> logits(e.m.hp.n_vocab);
     std::vector<utf8_stream_buffer> ubs(kMaxB);
+    // The model profile decides the prefill granularity and the decode row cap
+    // (qwen4exp: whole prompt, one row).  Reading it once per loop is safe: the
+    // engine is constructed before the scheduler starts and never changes model.
+    const model_profile & mp = *e.mp_;
+    const bool whole_prompt = mp.policy.prefill == model_profile::prefill_kind::whole_prompt;
 
     while (true) {
         {
@@ -263,13 +269,11 @@ void scheduler::loop() {
                     // ~0.7 s of a 553-token prefill).
                     int n = 0;
                     bool batch_pf = false;
-                    if (e.m.q4exp) {
-                        // qwen4exp prefills the whole remaining prompt in one
-                        // public call below: its forward path is q4_forward
-                        // (there is no generic mode-2 prefill_batch for it),
-                        // and prefill_text() routes to q4_prefill_text(),
-                        // which chunks internally at kMaxB*kMaxT and writes
-                        // the last token's logits.  One scheduler chunk.
+                    if (whole_prompt) {
+                        // The model's forward has no generic mode-2
+                        // prefill_batch and prefill_text() chunks internally at
+                        // kMaxB*kMaxT and writes the last token's logits.
+                        // One scheduler chunk.
                         n = rem;
                     } else {
                         for (int cand = e.batched_prefill_fit(rem); cand >= kMaxT; cand -= kMaxT) {
@@ -292,11 +296,12 @@ void scheduler::loop() {
                         }
                     }
                     if (!batch_pf) {
-                        if (!e.m.q4exp) {
+                        if (!whole_prompt) {
                             n = std::min<int>(kMaxT, rem);
                         }
-                        // ensure blocks for this chunk (the whole prompt for
-                        // q4exp, whose prefill_text call below prefills it)
+                        // ensure blocks for this chunk (the whole prompt for a
+                        // whole_prompt profile, whose prefill_text call below
+                        // prefills it)
                         const int end = s->prompt_pos + n;
                         const int need = (end + kBlockSize - 1) / kBlockSize;
                         while ((int)s->blocks.size() < need) {
@@ -321,7 +326,7 @@ void scheduler::loop() {
                     if (tdbg && s->n_chunks == 0) {
                         s->wait_ms = dms(s->t_submit, t_pf0);
                     }
-                    if (e.m.q4exp) {
+                    if (whole_prompt) {
                         lk2.unlock();
                         e.prefill_text(s->prompt, s->slot, n, s->prompt_pos);
                         lk2.lock();
@@ -396,7 +401,8 @@ void scheduler::loop() {
             int nb = 0;
             std::vector<std::shared_ptr<sequence>> batch;
             // PF_SCHED_MAX_DECODE overrides the cap for tests and A/B runs.
-            // qwen4exp defaults to one row per decode forward: two rows select
+            // The profile's policy.max_decode_rows supplies the default (0 =
+            // the engine ceiling, kMaxB).  qwen4exp declares 1: two rows select
             // ~20 distinct experts per layer against ~10 each, so the routed-
             // expert weight read doubles.  Measured on 2x A770, 17500 MB bank,
             // f16 KV: 2 rows 208.1 ms/step (9.61 tok/s) against 176.5 ms/step
@@ -408,7 +414,8 @@ void scheduler::loop() {
             // 4.33 tok/s aggregate against 5.79 for one request at a time,
             // because two live sequences thrash the shared expert bank.
             static const int dbg_cap = si::env::i32("PF_SCHED_MAX_DECODE", 0);
-            const int dec_cap = dbg_cap > 0 ? dbg_cap : (e.m.q4exp ? 1 : kMaxB);
+            const int row_cap = mp.policy.max_decode_rows > 0 ? mp.policy.max_decode_rows : kMaxB;
+            const int dec_cap = dbg_cap > 0 ? dbg_cap : row_cap;
             for (auto & s : active) {
                 if (s->finished) {
                     continue;

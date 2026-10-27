@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -18,6 +19,7 @@
 #include "kernels.h"
 #include "moe_cache.h"
 #include "model.h"
+#include "model_profile.h"
 #include "multimodal.h"
 #include "pc_disk.h"
 #include "pc_ram.h"
@@ -187,8 +189,11 @@ struct engine_config {
     size_t moe_vram_mb = 0;
     size_t moe_ram_mb = 0;
     // qwen4exp PLE ("engram") row cache in host RAM.  Misses fall through to
-    // the 26.8 GiB mmap, i.e. the OS page cache / disk tier.
-    size_t engram_ram_mb = 4096;
+    // the 26.8 GiB mmap, i.e. the OS page cache / disk tier.  kEngramRamAuto
+    // means "the model profile's policy.engram_ram_mb_default" (qwen4exp 4096);
+    // an explicit --engram-ram-mb / engine_config value still wins.
+    static constexpr size_t kEngramRamAuto = (size_t)-1;
+    size_t engram_ram_mb = kEngramRamAuto;
 
     // YaRN context extension (src/common/yarn.h).  `yarn` off by default: it is
     // a scaling method whose gains in the paper come from long-context
@@ -246,6 +251,10 @@ struct engine_config {
 
 struct engine {
     model m;
+    // The model's declarative profile (== m.prof), set once the engine has
+    // loaded the model.  Policy branches read this instead of m.q4exp; it is
+    // never null after construction.
+    const model_profile * mp_ = nullptr;
     tokenizer tk;
     int device_req = -1; // resolved device request (0 = gpu, 1 = cpu)
     // A pipeline-parallel run over several GPUs shares one SYCL context: USM

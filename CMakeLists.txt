@@ -149,6 +149,8 @@ add_library(sycl_infer_core STATIC
     src/model/qwen35.cpp
     src/model/qwen35moe.cpp
     src/model/qwen4exp.cpp
+    src/model/profiles/generic.cpp
+    src/model/profiles/qwen4exp.cpp
     src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
@@ -434,6 +436,7 @@ si_add_test(test_gemv_stride tests/backend/gpu/kernels/test_gemv_stride.cpp)
 si_add_test(test_quant_audit tests/backend/gpu/kernels/test_quant_audit.cpp)
 si_add_test(test_w4          tests/model/test_w4.cpp)
 si_add_test(test_hparams     tests/model/test_hparams.cpp)
+si_add_test(test_model_profile tests/model/test_model_profile.cpp)
 si_add_test(test_f16conv     tests/model/test_f16conv.cpp)
 si_add_test(test_yarn        tests/common/test_yarn.cpp)
 si_add_test(test_w4_gemm     tests/backend/gpu/kernels/test_w4_gemm.cpp)
@@ -470,7 +473,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_f16conv test_yarn test_dev_profile)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_dev_profile)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()

@@ -8,7 +8,9 @@
 #include <stdexcept>
 #include <string>
 
+#include "common/env.h"
 #include "model_arch.h"
+#include "model_profile.h"
 
 namespace si {
 
@@ -42,11 +44,14 @@ const float * bind_f32(const gguf_file & f, const std::string & name) {
 }
 
 // Supported architectures.  Add one loader per model type; the loaders live in
-// their own translation units (e.g. qwen35.cpp).
+// their own translation units (e.g. qwen35.cpp).  Every row carries its
+// declarative profile, and model::load asserts the profile's key is the row's
+// exact general.architecture value: a row without a matching profile is a load
+// error, not a silent fallback to another architecture's policy.
 static const loader kLoaders[] = {
-    {"qwen35", &load_qwen35},
-    {"qwen35moe", &load_qwen35moe},
-    {"qwen4exp", &load_qwen4exp},
+    {"qwen35", &load_qwen35, &kQwen35Profile},
+    {"qwen35moe", &load_qwen35moe, &kQwen35MoeProfile},
+    {"qwen4exp", &load_qwen4exp, &kQwen4ExpProfile},
 };
 
 const loader * find(const std::string & name) {
@@ -58,7 +63,66 @@ const loader * find(const std::string & name) {
     return nullptr;
 }
 
+const loader * registry(size_t & n) {
+    n = sizeof(kLoaders) / sizeof(kLoaders[0]);
+    return kLoaders;
+}
+
 } // namespace arch
+
+namespace {
+
+const char * fwd_kind_name(model_profile::fwd_kind k) {
+    return k == model_profile::fwd_kind::hc_ple_qsa ? "hc_ple_qsa" : "generic_plan";
+}
+
+const char * prefill_kind_name(model_profile::prefill_kind k) {
+    return k == model_profile::prefill_kind::whole_prompt ? "whole_prompt" : "chunk32";
+}
+
+const char * moe_owner_name(model_profile::moe_owner m) {
+    switch (m) {
+    case model_profile::moe_owner::runtime_bank:
+        return "runtime_bank";
+    case model_profile::moe_owner::host_only:
+        return "host_only";
+    default:
+        return "engine_cache";
+    }
+}
+
+const char * yn(bool v) {
+    return v ? "yes" : "no";
+}
+
+// PF_MODEL_INFO: the resolved profile and its provenance, in the same spirit as
+// PF_DEVICE_INFO.  Printed by model::load, so it reports what the loader really
+// selected rather than what a name suggests.
+void report(const model_profile & p) {
+    if (!si::env::flag("PF_MODEL_INFO")) {
+        return;
+    }
+    fprintf(stderr,
+            "[model] profile: %s (%s)\n"
+            "[model]   forward: %s, moe owner: %s\n"
+            "[model]   residual: hyper-connections %s (%d streams, low rank %d)\n"
+            "[model]   extras: ple %s, qsa %s (top_k %d, pool %d, idx %dx%d)\n"
+            "[model]   policy: max_decode_rows %d, prefill %s, prefix_cache %s, auto_layer_map %s, "
+            "md_splits %s, engram %zu MiB\n"
+            "[model]   weights: sin_w8 %s, dnnl_int8 %s, raw_gemv_decode %s, split_per_tensor_upload %s\n"
+            "[model]   capabilities: mtp %s, dflash %s, multimodal %s%s%s\n"
+            "[model]   provenance: %s\n",
+            p.key, p.name, fwd_kind_name(p.fwd), moe_owner_name(p.moe), yn(p.residual.hyper),
+            p.residual.streams, p.residual.low_rank, yn(p.extras.ple), yn(p.extras.qsa), p.extras.qsa_top_k,
+            p.extras.qsa_pool, p.extras.idx_heads, p.extras.idx_head_dim, p.policy.max_decode_rows,
+            prefill_kind_name(p.policy.prefill), yn(p.policy.prefix_cache), yn(p.policy.auto_layer_map),
+            yn(p.policy.md_splits), p.policy.engram_ram_mb_default, yn(p.rep.sin_w8), yn(p.rep.dnnl_int8),
+            yn(p.rep.raw_gemv_decode), yn(p.rep.split_per_tensor_upload), yn(p.spec.mtp), yn(p.spec.dflash),
+            yn(p.spec.multimodal), (p.spec.why && *p.spec.why) ? " (" : "", (p.spec.why && *p.spec.why) ? p.spec.why : "",
+            (p.spec.why && *p.spec.why) ? ")" : "", p.provenance);
+}
+
+} // namespace
 
 // Geometry the kernels hardcode.  A model that does not match these is not
 // "slower" or "approximate" - several kernels would read or write out of
@@ -144,8 +208,29 @@ void model::load(const std::string & path) {
     if (!a) {
         throw std::runtime_error("unsupported architecture: " + name);
     }
+    if (!a->prof) {
+        throw std::runtime_error("architecture " + name + " has no model profile");
+    }
+    if (name != a->prof->key) {
+        // Exact-key selection, no fuzzy match: a profile is a policy, and the
+        // wrong one would silently enable/disable engine mechanisms.
+        throw std::runtime_error("model profile key mismatch: registry row " + name + " carries profile \"" +
+                                 a->prof->key + "\"");
+    }
+    prof = a->prof;
     a->load(*this);
     validate_hparams(hp, name);
+    // M0: m.q4exp (and hparams::q4exp) must agree with the declarative forward
+    // kind.  The field stays until the forward is delegated to a runtime object,
+    // so this catches a registry/profile/loader drift instead of letting the
+    // engine take the generic path on a hyper-connection model (or vice versa).
+    const bool hc_fwd = prof->fwd == model_profile::fwd_kind::hc_ple_qsa;
+    if (m.q4exp != hc_fwd || hp.q4exp != hc_fwd) {
+        throw std::runtime_error("model profile " + std::string(prof->key) +
+                                 ": forward kind disagrees with the loader (m.q4exp=" +
+                                 (m.q4exp ? "true" : "false") + ", hp.q4exp=" + (hp.q4exp ? "true" : "false") + ")");
+    }
+    report(*prof);
 }
 
 int model_context_length(const std::string & path) {

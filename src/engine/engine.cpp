@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "device/device_profile.h"
+#include "model_profile.h"
 #include "quant.h"
 
 #include <algorithm>
@@ -109,7 +110,6 @@ engine::engine(const engine_config & cfg)
     {
         moe_cache_cfg mc = moe_cache_cfg::from_env(cfg.moe_resident);
         mc.vram_mb = cfg.moe_vram_mb ? cfg.moe_vram_mb : mc.vram_mb;
-        engram_ram_mb_ = cfg.engram_ram_mb;
         mc.ram_mb = cfg.moe_ram_mb ? cfg.moe_ram_mb : mc.ram_mb;
         mc.ram_tier = mc.ram_tier || mc.ram_mb > 0;
         moe_cfg_ = mc;
@@ -130,17 +130,23 @@ engine::engine(const engine_config & cfg)
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
+    mp_ = m.prof;
+    if (!mp_) {
+        throw std::runtime_error("model loaded without a model profile");
+    }
+    // The PLE engram budget is a model-profile default (qwen4exp 4096 MB); an
+    // explicit --engram-ram-mb / engine_config value still wins.  Resolved after
+    // the load, because the profile is selected by the GGUF's architecture.
+    engram_ram_mb_ =
+        cfg.engram_ram_mb == engine_config::kEngramRamAuto ? mp_->policy.engram_ram_mb_default : cfg.engram_ram_mb;
     tk.load(m.gguf);
-    // qwen4exp: the routed expert bank is 70 GiB in the reference file, so it
-    // stays in host RAM and every routed pair is computed by the host half.
-    // Compact drafting (the separate MTP file) and the prefix cache are not
-    // wired for the hyper-connection/PLE state yet; leave them off rather than
-    // snapshot a state the cache does not understand.
-    if (m.q4exp) {
+    // The model profile owns the expert placement.  qwen4exp's per-expert LRU
+    // bank is not the generic three-tier moe_cache, so that cache must stay
+    // inactive (host_only computes total = 0 and the forward's own bank decides
+    // every slot); a future host_only model uses the same switch.
+    if (mp_->moe != model_profile::moe_owner::engine_cache) {
         moe_host_only_ = true;
         moe_cfg_.host_only = true;
-        mtp.mtp_k = 0;
-        mtp.mtp_on = false;
     }
     // YaRN: build the per-pair frequency table here, before *anything* allocates a
     // buffer that embeds it.  alloc_act_set() (reached from setup_multi_device)
@@ -156,6 +162,14 @@ engine::engine(const engine_config & cfg)
         if (v >= 0) {
             mtp.mtp_k = v;
         }
+    }
+    if (mtp.mtp_k > 0 && !mp_->spec.mtp) {
+        // A declared capability, not a fallback: say why once and stay off.
+        // The has_mtp check below would also catch this file, but the profile
+        // gate is what keeps a model without the verify state from being
+        // enabled by a future file that happens to bundle a NextN block.
+        fprintf(stderr, "[mtp] %s: %s - MTP disabled\n", mp_->key, mp_->spec.why ? mp_->spec.why : "unsupported");
+        mtp.mtp_k = 0;
     }
     if (mtp.mtp_k > 0 && !m.has_mtp) {
         fprintf(stderr, "[mtp] model has no NextN (blk.%d.nextn.*) layer - MTP disabled\n", m.hp.n_layer);
@@ -198,7 +212,7 @@ engine::engine(const engine_config & cfg)
     if (const char * ed = si::env::str("PF_MTP_DEV")) {
         mtp.mtp_dev = atoi(ed);
     }
-    if (m.q4exp && layer_map.empty() && !cpu_mode) {
+    if (mp_->policy.auto_layer_map && layer_map.empty() && !cpu_mode) {
         // A split GGUF cannot use the single-blob upload, so even one GPU goes
         // through the per-tensor (multi-device) path.  With two cards, split the
         // trunk evenly; --layer-map overrides this and may place layers on cpu.
@@ -302,9 +316,12 @@ engine::engine(const engine_config & cfg)
         // ~10% prefill, but it stays opt-in until it is measured end to end).
         // The MTP draft does not depend on this gate: it has its own mtp.mtp_splits
         // cap (PF_MTP_SPLITS), because a single-token attention over a long KV
-        // is the worst case for a fixed 1-split grid (13x at 128k).
+        // is the worst case for a fixed 1-split grid (13x at 128k).  A model
+        // whose forward is not the generic plan declares policy.md_splits (the
+        // qwen4exp walk derives its own split count), which keeps the split on
+        // exactly as PF_MD_SPLITS=1 used to for it.
         const char * emd = si::env::str("PF_MD_SPLITS");
-        if (!(emd && atoi(emd) != 0) && !m.q4exp) {
+        if (!(emd && atoi(emd) != 0) && !mp_->policy.md_splits) {
             n_splits = 1;
             dec_splits = 1;
         }
@@ -398,10 +415,10 @@ engine::engine(const engine_config & cfg)
             dec_splits = kMaxDecSplits;
         }
         const char * ep = si::env::str("PF_PREFIX_CACHE");
-        pc_enabled = !(ep && atoi(ep) == 0);
-        if (m.q4exp) {
-            pc_enabled = false; // the q4 state (PLE history) is not in a checkpoint
-        }
+        // The profile declares whether the checkpoint blob can represent this
+        // model's per-slot state (qwen4exp's PLE history and QSA mirror are not
+        // in it, so it must stay off rather than resume without them).
+        pc_enabled = mp_->policy.prefix_cache && !(ep && atoi(ep) == 0);
         // multi-device note: block ids and recurrent-state checkpoints are global
         // (host-USM shared buffers), so the three-tier cache works here too; only
         // the block serialize/deserialize must resolve each attention layer to its
@@ -2374,9 +2391,11 @@ void engine::setup_multi_device(const std::string & layer_map) {
         const bool dp4a_env_off = env && atoi(env) == 0;
         // qwen4exp keeps the raw GGUF weights: its file mixes Q8_0/Q5_1/BF16,
         // which neither the oneDNN grouped-scale converter nor the SIn packer
-        // accepts, and the fp32 dequant GEMV handles them all.
+        // accepts, and the fp32 dequant GEMV handles them all.  The profile says
+        // whether the file can take the SIn store at all (rep.sin_w8); oneDNN
+        // eligibility is decided by setup_md_dnnl() itself.
         md_xmx = has_gpu && !dp4a_env_off && setup_md_dnnl();
-        md_int8 = has_gpu && !dp4a_env_off && !m.q4exp && !md_xmx;
+        md_int8 = has_gpu && !dp4a_env_off && mp_->rep.sin_w8 && !md_xmx;
         // md_xmx means "oneDNN int8 weights are available", not that the XMX
         // arrays are used: for the grouped-scale shapes here oneDNN selects
         // jit:gemm:any (and ocl:ref:any with a blocked layout), so name the
