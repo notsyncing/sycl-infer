@@ -171,6 +171,9 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_pc_disk` | 无 | CPU | 磁盘层记录格式往返、token 校验、LRU 预算、重开持久化、损坏/未知记录 |
 | `test_pc_ram` | 无 | CPU | RAM 层 LRU 记录存储 |
 | `test_yarn` | 无 | CPU | YaRN 每对维度频率表（`src/common/yarn.h`）：factor=1 逐位等于原表、ramp 两个锚点按位、单调性、mscale 与 clamp、退化输入 |
+| `test_model_profile` | 无 | CPU | loader registry 每一行都带 profile，且 `prof->key` 逐字节等于 `general.architecture`；qwen4exp 的 policy/几何/权重表示/能力值被钉住；qwen35/qwen35moe 除身份与 MoE 说明外逐字段一致 |
+| `test_mm_step` | 无 | CPU | `mm_write_step` 的逐 token M-RoPE/`img_row` 切片（含 chunk 边界落在图像块中间）、越界切片/过小 section stride 必须抛错、`has_encoded_embd` 的缺编码器判据 |
+| `test_dev_profile` | 无 | CPU | 设备 profile 的判定与回退（A770 / Iris / 混合 / 未知），`moe.*`、`shape.*` 的取值，以及 `unknown` 行必须是 A770 的完整拷贝且硬件事实清零 |
 | `test_multimodal` | 0.8B + mmproj | CPU+GPU | 图像预处理几何、host/device 视觉编码器、位置与 prompt 布局、逐 kernel 对照；音频解码/mel、AuT 塔 |
 | `test_gpu_stages` | 0.8B | GPU | 每个 kernel vs CPU 参考（强制 `PF_DP4A=0`）；调用 rmsnorm/embed/qk_norm_rope/attn/conv/gdn/gated_norm |
 | `test_gemv` | 0.8B | GPU | 每个真实 GGUF 张量的 GEMV vs CPU 反量化参考，多 TB（强制 `PF_DP4A=0`） |
@@ -208,7 +211,8 @@ decode 路径上**唯一**的覆盖——decode 是每 token 全量重读 KV 的
 ### 2.1 CTest 分层注册
 
 默认 `ctest --test-dir build -L hermetic --output-on-failure` 仅运行不依赖
-GGUF 的五个 CPU 测试及 `test_multimodal --video-only` 的合成视频/视觉宽度
+GGUF 的 hermetic CPU 测试（含 `test_model_profile`、`test_mm_step`、
+`test_dev_profile`）及 `test_multimodal --video-only` 的合成视频/视觉宽度
 测试（ffmpeg 可缺席，AVI 测试仍运行）；它们必须已构建。模型测试必须显式配置
 `-DSI_REGISTER_GPU_TESTS=ON -DSI_TEST_08B_MODEL=/path/to/0.8b.gguf`；
 另外给 `SI_TEST_27B_MODEL`（可再给 `SI_TEST_DFLASH_MODEL`）才注册双卡 27B
@@ -348,12 +352,30 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 
 `test_dev_resolve` 实测每次 launch 的查找 **0.039 µs**，比旧路径的 3200 µs 便宜约 8 万倍。
 
-**代价与核对。** 有四处原本是**进程级 static**、把每设备的形状固化了，它们必须改成按调用决定：
-`rmsnorm` 的工作组宽度、`attn_xmx` 的 gather 工作组数（它还决定 scratch 大小，而 scratch 是按 queue
-分配的）、`gdn` 的 `gdn_cols`/`gdn_warps_per_wg`、`attn` 的 `attn.vec`/`dec_group` 与
-`attn_xmx`/`gemm_dnnl` 的开关。为此加了 `si::dev::profile_int` / `profile_flag`：env 部分在所有卡上
-相同、读一次缓存，profile 默认值按调用从该卡的 queue 读——**不要**再写回 `static const = []{ active()... }()`，
-那正是把整个进程钉在第一张卡上的写法。
+**代价与核对。** 原来把每设备形状固化成**进程级 static** 的读点，现在都必须按调用决定。
+已转换的列表：
+
+1. `rmsnorm` 的工作组宽度；
+2. `attn_xmx` 的 gather 工作组数（它还决定 scratch 大小，而 scratch 是按 queue 分配的）；
+3. `gdn` 的 `gdn_cols`/`gdn_warps_per_wg`；
+4. `attn` 的 `attn.vec`/`dec_group` 与 `attn_xmx`/`gemm_dnnl` 的开关；
+5. `moe.cpp` 的 tile case 与 grid 门（`PF_MOE_CFG`/`_DOWN`/`_DEC`、`PF_MOE_FLAT`/
+   `_DEC`）——`moe_cfg_for(q, down, dec)` 读本队列的 `profile.moe.*`；
+6. `engine_graph.cpp` 的 dp4a 门（`PF_MOE_DP4A`/`_DEC`）与 `PF_MOE_HIST` 的 tile
+   （`moe_grp_tile_rows(q, ...)`，不再是 "cfg 43 => 8，否则 16" 的猜测）；
+7. `gemv.cpp` 的 F32 / Q8_0 窄形状 split 行门槛与 WPR（`shape.f32_rows`/`q8_rows`、
+   `split.max`）；
+8. `w4_gemv.cpp` 的原生权重 GEMV 每工作组行数（`shape.w4_rows_per_wg`，u4 /
+   i8-grouped / cb4 共用）；
+9. `engine_q4exp.cpp` 的 `moe.upload_ring` / `moe.pf_wmin`。
+
+为此加了 `si::dev::profile_int` / `profile_flag`：env 部分在所有卡上相同、读一次缓存，
+profile 默认值按调用从该卡的 queue 读——**不要**再写回 `static const = []{ active()... }()`，
+那正是把整个进程钉在第一张卡上的写法。两个容易写错的细节：`profile_int` 会把 env 的
+0 当成"未设置"，所以 `moe.cfg_dec`（0 = auto）、`PF_Q4_F32_SPLIT`（0 = off）、
+`PF_Q4_GEMV8_WPR`/`_SPLIT_ROWS` 这些 0 有意义的字段要读原始 env 并用 `-1` 哨兵；
+布尔门用 `profile_flag`。`shape.w4_rows_per_wg` 只有 8/16/32 三个模板实例，卡文件写了
+别的值会被夹到最近的一档，而不是去找一个不存在的 kernel。
 
 `rmsnorm` 那处尤其要实测而不是假设：`AGENTS.md` 记录过 DFlash2 draft block 前向的 20.5 ms 里有
 16.4 ms 花在五次 attn_norm launch（那正是当初把它改成 static 的原因）。同机 A/B：
@@ -361,14 +383,21 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 且 `sum == devspan`、`hostwall - sum = 0.09 ms`，说明前向仍是 device-bound、没有把主机时间挪进来。
 
 **报告混合分卡。** 引擎构造时若在用 GPU 的 profile 不一致，会打一条 WARNING 点名两张卡与各自 profile
-（不再拒绝，见上一版的记录）。`test_dev_profile` 无需 GPU，用合成设备名覆盖判定逻辑；
-`test_dev_resolve` 需要 GPU，覆盖 per-device 缓存的稳定性、与 `for_name` 的一致性、
+（不再拒绝，见上一版的记录）。`test_dev_profile` 无需 GPU，用合成设备名覆盖判定逻辑、
+`moe.*`/`shape.*` 的取值和 `key=unknown` 的回退（它必须是 A770 行的一份完整拷贝，含新字段，
+硬件事实清零）；`test_dev_resolve` 需要 GPU，覆盖 per-device 缓存的稳定性、与 `for_name` 的一致性、
 按该设备上限的 clamp，以及查找的每次成本上限（5 µs，留足余量又能抓住"退回每次查驱动"）。
 
 ### 3.4.2 qwen4exp（Qwen3.8-Flash-Next）
 
-`qwen4exp` 没有专属 CTest target，验证靠下面四条，**每条一个进程**（模型 104 GiB，
-加载一次 ~1 分钟，且首次 prefill 要校准 bank）：
+`qwen4exp` 没有专属 CTest target，验证靠下面四条**模型步骤**，**每条一个进程**（模型 104 GiB，
+加载一次 ~1 分钟，且首次 prefill 要校准 bank）。跑模型之前先跑三个不需要模型的：
+
+```bash
+./build/test_model_profile   # registry x profile key, qwen4exp policy values
+./build/test_mm_step         # M-RoPE / img_row slice, chunk boundary inside an image
+./build/test_dev_profile     # moe.*/shape.* values and the unknown-card fallback
+```
 
 ```bash
 Q4=/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
@@ -385,24 +414,25 @@ M27=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf
 
    ```bash
    ./build/sycl-infer --model "$Q4" \
-     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 16000 \
+     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
      --ctx 2048 --kv-type f16 gen --raw --temp 0 --max-tokens 16 \
      --prompt "What is 12 multiplied by 9?"
    ./build/sycl-infer --model "$Q4" \
-     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 16000 \
+     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
      --ctx 2048 --kv-type f16 gen --raw --temp 0 --max-tokens 48 \
      --prompt "What is the difference between TCP and UDP?"
    ```
 
-3. **Prefill 重复性**：同一个 512-token raw prompt 跑两次，第一次 15-16 s（校准），稳定后
-   **~13.9 s = 39 tok/s**；`PF_Q4_PF_STATS=1` 应打印每层的 `act/hot/kept/batches/copies`，
+3. **Prefill 重复性**：同一个 512-token raw prompt 跑两次，第一次约 11.4 s（校准），稳定后
+   **~9.6 s = 56 tok/s**；`PF_Q4_PF_STATS=1` 应打印每层的 `act/hot/kept/batches/copies`，
    且 `batches > 1` 表示两遍路径确实被触发。`dev/bench_pf`（gitignored）是这条的 harness：
-   `PF_MOE_VRAM_MB=16000 ./dev/bench_pf "$Q4" 512 1 "0-23:gpu.0,24-47:gpu.1"`。
+   `PF_MOE_VRAM_MB=17500 ./dev/bench_pf "$Q4" 512 1 "0-23:gpu.0,24-47:gpu.1"`。
 
-4. **Layer map / bank**：推荐 `0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 16000`，启动打印
-   `hot expert bank: 124 slots/layer, 43 layers, 15.3 GiB`；decode 在 ~16 token 后稳定在
-   **~121 ms/token（8.3 tok/s）**。`PF_Q4_FFCMP=<layer>`（例如 `1`）给出 routed GPU FFN
-   对主机参考的 cosine **0.99998**。18000/20000 MB 必须在加载时失败，不要当成回归。
+4. **Layer map / bank**：推荐 `0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500`，启动打印
+   `hot expert bank: 121 slots/layer, 47 layers, 16.5 GiB`；decode 在 ~16 token 后稳定在
+   **~93.3 ms/token（10.7 tok/s）**。`PF_Q4_FFCMP=<layer>`（例如 `1`）给出 routed GPU FFN
+   对主机参考的 cosine **0.99998**。20000 MB 必须在加载时失败；18000 MB 能加载
+   （125 slots，17.0 GiB）但**不比 17500 快**，不要当成回归。
 
 **0.8B 不在 bench 机上**：`test_decode_vs_prefill` 的默认模型和 §3.4 的 tied-embedding 用例
 需要另找一台有 0.8B GGUF 的机器；bench-host 上只跑 27B / 35B / qwen4exp。
@@ -451,7 +481,7 @@ src/backend/    → docs/design/02-quantization.md
 src/backend/gpu/kernels/    → docs/design/03-kernels.md §1-13
 src/backend/cpu/kernels/    → docs/design/03-kernels.md §14, docs/architecture.md §11
 src/backend/cpu/    → docs/design/03-kernels.md §14, docs/architecture.md §11（设备选择与多设备执行）
-src/model/      → docs/design/01-model-loading.md, 08-tokenizer.md, 11-qwen35-model.md
+src/model/      → docs/design/01-model-loading.md（含 model_profile / profiles/）, 08-tokenizer.md, 11-qwen35-model.md
 src/mm/         → docs/design/10-multimodal.md, 13-audio-video.md
 src/engine/     → docs/design/04-engine.md, 05-kv-cache.md, 06-prefix-cache.md, 07-sampler.md
 src/server/     → docs/design/09-server.md

@@ -16,7 +16,7 @@ the model is host-RAM bound, not VRAM bound.
 | hyper-connections | `hc = 4` streams, low-rank gate 320 |
 | routed experts | 512, top-10, FFN width 640, plus a shared expert |
 | PLE | one layer, 16 n-gram-hash rows of a 160-wide table (IQ4_NL) |
-| QSA | 128-wide indexer key, pools of 4, top 2 048 keys |
+| QSA | 128-wide indexer key, `compress_ratios = 4` pools (the code reads `hp.idx_kpool`, not a literal 4), top 2 048 keys |
 | GGUF | 4 shards, UD-Q4_K_XL, `general.architecture = qwen4exp` |
 
 Hyper-connections replace every layer norm.  The residual is `hc` parallel
@@ -46,8 +46,12 @@ shard's own file range before `posix_fadvise`.
 `q4_forward` walks the 48 layers itself.  HC/PLE do not fit the generic
 `seg_plan` (one GEMV list per layer plus fixed epilogues), but the forward
 reuses the existing GDN, attention, GEMV and paged-KV machinery.  The plan
-builders, recorded decode graphs, prefix cache, MTP and the multimodal path
-are deliberately skipped; `q4exp` forces `pc_enabled = false`.  The server's
+builders, recorded decode graphs and the prefix cache are deliberately skipped;
+`q4exp` forces `pc_enabled = false` while the policy still reads `m.q4exp`
+(the model profile below is M0+M1; M2 delegates the walk to a runtime object).
+MTP is declared unsupported and gated with a printed reason; DFlash has no q4
+draft/verify path in this build; multimodal is routed through the model's own
+chunker (§3.1).  The server's
 q4 `prefill_batch` has no recorded variant, and batched q4exp decode is now
 **measured and rejected**: two rows select ~20 distinct experts per layer
 against ~10 each, so the routed-expert weight read doubles and the pair is
@@ -63,8 +67,10 @@ ids matching the CLI; `PF_PFB_MAX_M=16` is no longer needed.  The 32-token vs
 0.9999945, max 0.0699, a few boundary pools), the known prefill accumulation
 order; generated content matched.
 
-The dense trunk is uploaded to the GPUs named by `--layer-map`; every routed
-pair and the PLE module run on the host.  A `--layer-map` is synthesised when
+The dense trunk is uploaded to the GPUs named by `--layer-map`; the PLE module
+and the non-resident expert source stay in host RAM, and a routed pair with a
+bank slot is computed on the card that owns it (a miss is uploaded from the
+pinned source).  A `--layer-map` is synthesised when
 none is given (two GPUs split the trunk evenly), but the recommended run is
 explicit:
 
@@ -83,6 +89,83 @@ not a multiple of 256.  The host-resident expert, PLE and indexer pages are
 then prefaulted (`PF_Q4_PREFAULT=0` skips it); a cold 4 KB fault per page
 costs hundreds of ms/token at this model's expert traffic.
 
+### 3.1 Model profile (M0+M1)
+
+The architecture's policy is declarative: `src/model/model_profile.h` plus
+`src/model/profiles/qwen4exp.cpp` (the registry rows in `model.cpp` point at the
+const, and `model::load` requires the profile's key to be the GGUF's exact
+`general.architecture`).  For qwen4exp:
+
+| field | value |
+|---|---|
+| `fwd` | `hc_ple_qsa` (the model-owned walk; `generic_plan` is the shared `seg_plan`) |
+| `residual` | hyper-connections, 4 streams, low rank 320 |
+| `extras` | PLE on; QSA on, top_k 2048, pool 4, indexer 4 heads x 128 |
+| `policy` | `max_decode_rows = 1`, prefill `whole_prompt`, prefix cache **no**, auto layer map **yes**, md_splits **yes**, engram default 4096 MiB |
+| `rep` | `sin_w8 = false`, `dnnl_int8 = false`, `raw_gemv_decode = true`, `split_per_tensor_upload = true` |
+| `spec` | `mtp`/`dflash` declared false with one `why` (no NextN block in the trunk, and the walk does not produce the per-token GDN/conv snapshots the verify needs); multimodal is a *capability* of the model-owned chunker (the loader's `mm_model_prefill`), while the `spec.multimodal` field is the declarative report |
+| `moe` | `runtime_bank` (not the generic three-tier cache) |
+
+The engine stores `mp_ = m.prof` and every policy branch reads it:
+`moe != engine_cache` turns the generic cache off (qwen4exp's bank owns every
+slot), `policy.prefix_cache` is a capability (`PF_PREFIX_CACHE=1` cannot enable
+it - the checkpoint cannot represent PLE/QSA state), `policy.auto_layer_map`
+synthesises a map when none is given, `policy.md_splits` keeps the multi-device
+K-split on, `policy.engram_ram_mb_default` is the unset `--engram-ram-mb`
+default, `rep.sin_w8` gates the `md_int8` path, `spec.mtp` prints the declared
+reason and disables MTP before the `has_mtp` check, and the scheduler reads
+`policy.max_decode_rows`/`prefill` (one row, whole prompt).  The generic
+qwen35/qwen35moe profiles are `generic_plan`, engine-cache, chunk32 prefill,
+prefix cache on, so their behaviour is unchanged.  `PF_MODEL_INFO=1` prints the
+profile, policy, weights, capabilities and provenance; `test_model_profile`
+pins the values.  The forward dispatch still reads `m.q4exp` (asserted equal to
+`fwd == hc_ple_qsa`), which is the M0+M1 line: the policy is declarative, the
+walk is not yet a runtime object.
+
+The profile is not a tuning store: per-card constants remain in the device
+profile, and per-file/run values (expert plane strides, bank budget, KV type,
+layer map, `TB` buckets, prefill chunk) stay arguments.  A model profile and a
+device profile answer different questions: "what is this model and what may it
+use" versus "how does this card run it".
+
+### 3.2 Multimodal and the shared chunker
+
+The text GGUF has no vision/audio tensors (the towers are separate mmproj
+GGUFs, as for every architecture).  `load_qwen4exp` sets
+`arch_profile.mm_model_prefill`, and `generate_impl` then calls `q4_prefill_mm`
+for the whole expanded prompt instead of one `kMaxT` row per `prefill_chunk`
+(the generic loop would re-upload experts every 32 tokens and bypass the
+HC/PLE/QSA state).  `q4_prefill_common` is the shared chunker: full `kMaxT` rows
+use mode 2, the tail uses mode 1, and each chunk slices
+`mm->mrope`/`mm->img_row` with `mm_write_step`, so an image block may span rows
+without shifting a position or an embedding row.  With `mm == nullptr` it is the
+old text path (same layout/positions), so text output is bit-identical.  The
+decode loop sets `mm_decode_rope_` so `q4_forward`'s `step_info` reset does not
+clear the per-step M-RoPE row; text-only runs and `reset_state` clear it.
+`generate_mm` throws on media rows with no encoder output
+(`has_encoded_embd`), which is the usual missing `--mmproj`/`--audio-mmproj`.
+At startup the engine prints one `[mm]` line when the tokenizer has none of
+`<|image_pad|>`/`<|video_pad|>`/`<|audio_pad|>`, so a media request fails at
+prompt expansion with a clear message instead of a forward on an impossible
+prompt.  `test_mm_step` (hermetic) pins the slice, a chunk boundary inside an
+image block, and the error paths.
+
+### 3.3 Device-profile provenance (M0)
+
+The qwen4exp-specific per-card numbers no longer live at the call sites:
+`moe.cfg_gate`/`cfg_down`/`cfg_dec`, `moe.flat`/`flat_dec`,
+`moe.dp4a`/`dp4a_dec`, `moe.upload_ring`, `moe.pf_wmin` and
+`shape.w4_rows_per_wg`/`q8_rows`/`f32_rows` are fields in
+`src/device/profiles/arc_a770.cpp`.  The A770 values are 43/43/0 (0 = decode
+auto), 1/0, 1/1, 32, 24, 16, 512 and 128; the Iris Xe file carries the same
+values but marks the whole `moe` group and the three shape fields **INHERITED /
+UNMEASURED** - the expert tile's register constraint is shared, but the
+bandwidth/occupancy balance that picked M=8 and the row thresholds that scale
+with the EU count were swept only on the 512-EU card.  `PF_DEVICE_INFO=1`
+prints the resolved groups.  The env remains the A/B; a field whose 0 is a
+measured value (`cfg_dec` auto, `PF_Q4_F32_SPLIT=0`) reads the raw env with a
+`-1` sentinel because `profile_int` folds env 0 into "unset".
+
 ## 4. QSA
 
 The selector and the attention over the selected keys run on the host
@@ -98,6 +181,17 @@ incomplete tail.  Measured against llama.cpp layer 3 at 2 062 tokens: q/mixed
 cos 0.9999, indexer score corr 0.9994.  The top-512 sets differ by one
 boundary pool (fp accumulation order), so bit-exactness is not claimed.
 `PF_Q4_QSADBG` and the `PF_QSA_*` dump knobs are diagnostics.
+
+**The pool width is `hp.idx_kpool`, not a literal 4.**  `qsa_pool_div()` returns
+`idx_kpool > 1 ? idx_kpool : 4` and every pool expression uses it: the pool
+array and per-slot ring, `pos / kp`, `pos % kp`, the pooled key's RoPE position
+`pos - (kp - 1)`, `n_pool_max = idx_top_k / kp`, the selected range `p*kp + j`,
+and the incomplete tail.  The old `/4` arithmetic was invisible on this file
+(its `compress_ratios` is 4) but a model that pools 8 would have selected the
+wrong key set while still running.  `kp = 4` is bit-identical to the old code:
+`1/4` is exact and the four-term sum keeps its order.  The guard is
+`assert(kp >= 2)` plus a grep guard - no `/ 4`, `% 4` or `* 4 +` pool
+arithmetic may remain in `engine_qsa.cpp`.
 
 **The recommended `--ctx 2048` decode does not run QSA**: `qsa_on_` requires
 `max_seq > idx_top_k` and both are 2 048, so the 93.3 ms/token cell has no QSA
@@ -205,18 +299,19 @@ depthwise convolution into the residual.  The host module is
 `cpu_q4_ple_gate` + `cpu_q4_ple_apply`; `ple_conv1d` is `[kernel][channel]`
 with `nb0 = kernel`, so tap `k` of channel `c` is `w[k + kern*c]`.
 
-`--engram-ram-mb` (default 4096) is a direct-mapped host-RAM cache of already
+`--engram-ram-mb` (unset = the model profile's `policy.engram_ram_mb_default`,
+4096 MiB; `0` disables) is a direct-mapped host-RAM cache of already
 dequantized PLE rows.  The capacity is a power of two, the slot is
 `row & (cap - 1)`, and the tag is the row id; a miss dequantizes from the GGUF
-mmap, which is the disk tier.  `--engram-ram-mb 0` disables it.
+mmap, which is the disk tier.
 
 ## 6. Expert bank: per-expert LRU and two-pass prefill
 
-The generic three-tier `moe_cache` is **inactive** on qwen4exp:
-`engine.cpp` sets `moe_host_only_` and `host_only = true`, so the cache
-computes `total = 0`, and its device path lives in `record_forward`'s
-`seg_plan` branch while q4exp uses its own layer walk.  The q4 path allocates
-its own banks:
+The generic three-tier `moe_cache` is **inactive** on qwen4exp: the model
+profile says `moe = runtime_bank`, so `engine.cpp` sets `moe_host_only_` and
+`host_only = true`, the cache computes `total = 0`, and its device path lives
+in `record_forward`'s `seg_plan` branch while q4exp uses its own layer walk.
+The q4 path allocates its own banks:
 
 * `--moe-vram-mb 17500` gives **121 slots per layer in 47 layers, 16.5 GiB**,
   including the four Q8_0-down layers 4, 30, 46 and 47 (the dedicated
@@ -254,6 +349,14 @@ its own banks:
   layers, then 10.89 s MoE / 11.99 s prefill at 47 layers; the decode is 101.2
   ms/token against 103.7 with the staging and 121 on the 43-layer Q5_1 bank.
   `PF_Q4_PIN_SRC=0` is the A/B.
+
+The bank is the shipped default and it is output-correct: `PF_Q4_FFCMP` gives
+cosine 0.999999 for a banked layer.  The earlier "do not ship it enabled"
+reading came from the stale `b.block` accumulator (the reduce accumulates) and
+the K%256 down-row stride, both fixed above, not from the bank; `PF_Q4_BANK=0`
+is the all-host A/B.  The bank's per-card knobs are the device profile's
+`moe.*` fields (§3.3); `--moe-vram-mb` remains a run argument, not a profile
+value.
 
 Three kernels carry the bank's arithmetic:
 
@@ -326,7 +429,11 @@ prefill is **~9.6 s (56 tok/s)**.  Decode reaches **~93.3 ms/token
 `12 x 9` -> 108, the TCP/UDP prompt is coherent, the 27B
 `test_decode_vs_prefill` oracle is 8/8 OK, and `PF_Q4_FFCMP` gives cosine
 0.99998 against the host routed FFN (layer 4's Q8_0 down 0.999999, layer 2's
-Q5_K/Q8_0 0.99995).
+Q5_K/Q8_0 0.99995).  The profile/device/chunker changes add three hermetic
+checks: `test_model_profile` (registry x exact profile keys and the qwen4exp
+values), `test_mm_step` (the shared M-RoPE/image-row slice) and the extended
+`test_dev_profile` (`moe.*`/`shape.*` on the A770, the Iris inheritance and the
+unknown fallback).
 
 ### 7.1 Batching, tail-skip, MTP and the prefill ceiling (2026-10-27)
 
@@ -357,6 +464,13 @@ Full tables and commands are in [`../PERFORMANCE.md`](../PERFORMANCE.md) §4.4.2
   190/230.  Even n=1 is 2.7x a plain token, so the existing forward is not the
   verify shape; MTP is **no-go** for this build without a new one-slot
   k+1-row mode (and the 2-row batch result makes that unlikely to pay).
+
+> **MTP q4 result: PENDING.**  <!-- MTP-Q4-PLACEHOLDER: the parent fills this
+> after the MTP q4 job.  The bullet above is the pre-MTP-job conclusion and
+> must not be read as the final ranking. -->
+> Replace this note with the measured one-slot k+1-row verify result when the
+> MTP job reports; until then the numbers in §7.1 and §9 are the old forward's.
+
 * **Prefill:** the 9.6 s warm 544-token prefill is ~4.3-4.9 s upload (31-32 GiB
   at 6.9-7.9 GB/s), ~3.5-4.2 s device MoE and ~1.1 s non-MoE.  Host-spilling
   the overflow experts has a ~0.25 ms/expert break-even against the existing
@@ -371,8 +485,9 @@ Full tables and commands are in [`../PERFORMANCE.md`](../PERFORMANCE.md) §4.4.2
 
 | flag / env | default | meaning |
 |---|---|---|
+| `PF_MODEL_INFO=1` | off | print the resolved model profile (policy/weights/capabilities) and its provenance at load |
 | `--moe-vram-mb MB` | 0 | per-expert LRU budget; 0 = all experts on the host |
-| `--engram-ram-mb MB` | 4096 | PLE row cache in host RAM; 0 disables |
+| `--engram-ram-mb MB` | profile (4096) | PLE row cache in host RAM; unset = `policy.engram_ram_mb_default`, 0 disables |
 | `--moe-ram-mb MB` | 0 | generic ncmoe host tier; not used by qwen4exp |
 | `PF_Q4_BANK=0` / `PF_Q4_BANK_LAYER=1` | on / off | all-host path / whole-layer bank (A/B) |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
@@ -384,10 +499,14 @@ Full tables and commands are in [`../PERFORMANCE.md`](../PERFORMANCE.md) §4.4.2
 | `PF_Q4_HEAT=1` | off | decayed-heat victim (105.7 ms / 156 MiB; slower, A/B only) |
 | `PF_Q4_PF_ONEPASS=1` / `PF_Q4_PF_STATS=1` | off | old single pass / two-pass stats |
 | `PF_Q4_PF_PIPE=0` | on | serial copies (A/B for the two-pass prefetch) |
+| `PF_Q4_PF_WMIN` | profile `moe.pf_wmin` (24) | minimum two-pass workspace; `-1` = profile |
 | `PF_Q4_LRU_OLD=1` | off | pre-fix eviction (A/B only, not an LRU) |
-| `PF_Q4_STAGE=0` | on | pageable expert uploads instead of the pinned ring |
+| `PF_Q4_STAGE=0` | on | pageable expert uploads instead of the pinned ring (ring = profile `moe.upload_ring`, 32) |
 | `PF_Q4_INJECT=0` / `PF_Q4_GEMV8=0` / `PF_Q4_GEMVSEG=0` | on | generic HC inject / Q8_0 GEMV / blocking segment copy |
-| `PF_Q4_F32_SPLIT=0` | on | generic GDN beta/alpha GEMV |
+| `PF_Q4_F32_SPLIT=0` | profile `split.max` (8) | F32 GDN beta/alpha GEMV; `-1` = profile, 0 = off |
+| `PF_MOE_CFG` / `_DOWN` / `_DEC` | profile `moe.cfg_*` (43/43/0) | grouped expert GEMM tile case; `_DEC` 0 = auto |
+| `PF_MOE_FLAT` / `_DEC` | profile `moe.flat`/`flat_dec` (1/0) | row tile in the grid |
+| `PF_MOE_DP4A` / `_DEC` | profile `moe.dp4a`/`dp4a_dec` (1/1) | grouped dp4a expert GEMM |
 | `PF_QSA_TIME=1` | off | QSA host split per forward (`copy/gemv/upd/sel/attn`) |
 | `PF_QSA_ISA=scalar\|avx2\|avx512` | auto | force only the QSA host kernels' ISA |
 | `PF_QSA_DEFER=0` | on | inline update instead of the end-of-forward deferred update |
@@ -415,14 +534,17 @@ The full knob list (including the `PF_QSA_*` dumps) is in
   flips the top-10 boundary; the all-GPU upload-on-miss path avoids the split.
 * **Whole-layer bank.**  45.5 s, because 12 of 48 layers cover only ~25% of
   the traffic.  It is the A/B baseline (`PF_Q4_BANK_LAYER=1`).
-* **Bigger banks and other transports.**  18000/20000 MB fail to load;
-  16500-17500 give no decode win.  Parallel staging delays the first DMA (the
-  floor is 170.5 MiB at 5.9 GB/s), a pinned mirror cannot beat the same H2D,
-  LFU is neutral at 72 tokens and worse at 200, and a preloaded slot map is
-  churned by the prefill.  Native Q5_1 down on the host is slower than the
-  generic path.
-* **Layer 2 Q5_K banking** (`PF_Q4_BANK_Q5K=1`) is a 6% prefill loss and
-  decode-neutral; the Q8_0-down layers stay on the host.
+* **Bigger banks and other transports.**  20000 MB fails to load; 18000 loads
+  (125 slots, 17.0 GiB) but is **not** faster than 17500, and 16000 gives 111
+  slots / 101.2 ms against 17500's 121 / 93.3 ms - the 17 500/121-slot point is
+  the knee.  Parallel staging delays the first DMA (the floor is 170.5 MiB at
+  5.9 GB/s), a pinned mirror cannot beat the same H2D, LFU is neutral at 72
+  tokens and worse at 200, and a preloaded slot map is churned by the prefill.
+  Native Q5_1 down on the host is slower than the generic path.
+* **Layer 2 Q5_K banking** (`PF_Q4_BANK_Q5K=1`) is a decode loss (107.2 vs
+  93.3 ms) and stays off; the four Q8_0-down layers 4/30/46/47 **are** banked
+  through `moe_down_q8_0_launch`, and the native Q5_1/Q8_0 kernels mean those
+  layers do not use the generic int8 conversion.
 * **2-row batched decode** is 0.85-0.88x (208.1 vs 176.5 ms/step) because the
   routed-expert weight read doubles; the scheduler caps q4 at one row and
   serialises its sequences.  Round-robin (the first attempt at fairness) is

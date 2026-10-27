@@ -256,11 +256,13 @@ struct mm_prompt {
     const float * d_embd;           // device 路径：调用者拥有
     int n_img, pos_after;
     bool has_images() const { return n_img > 0; }
+    bool has_encoded_embd() const { return n_img == 0 || d_embd || !embd.empty(); }
 };
 ```
 
-`n_img` 就是 block 数（三种媒体都算），`engine::generate_mm` 用 `has_images()` 决定是否走多模态分支
-（`engine.cpp:2354-2358`）。
+`n_img` 就是 block 数（三种媒体都算），`engine::generate_mm` 用 `has_images()` 决定是否走多模态分支。
+`has_encoded_embd()` 是 phase 2 的完成判据：有媒体行但没有 `d_embd`/`embd` 时 `generate_mm`
+抛错（通常是缺 mmproj），而不是读未初始化行。
 
 ### 4.2 块几何与预算
 
@@ -322,40 +324,66 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
 `vm` 必须活到调用返回之后（device 路径的 `encode_device` 在调用内完成，但 `p.d_embd` 指向调用者的
 `d_out`）；`d_out` 由调用者拥有（引擎传 `e.d_img_embd`）。
 
+### 4.5 逐块切片（`mm_write_step`）
+
+`mm_write_step(p, pos, n, section_stride, mrope_out, img_row_out)` 把扩展后 prompt 的
+`[pos, pos+n)` 逐 token 拷贝到 prefill kernel 读的扁平布局：`mrope_out[s*section_stride + i]`
+和 `img_row_out[i]`。`section_stride` 在引擎里是 `kMaxB*kMaxT`；`pos` 是 **prompt-token
+索引**，不是 RoPE 位置。通用 `generate_impl` 循环和 qwen4exp 的 `q4_prefill_common` 都用它，
+所以 chunk 边界不会静默移动一个位置或一个嵌入行。切片越界、或 `section_stride < n`，抛
+`std::runtime_error`——这是调用错误，不是读越界。`test_mm_step`（无模型、无 GPU）用一个
+2x2 合并图像（4 个 token 只消耗 `max(2,2)=2` 个位置）钉住整块切片、切成两半的块中间切片、
+以及两个错误路径。
+
 ---
 
 ## 5. 引擎集成
 
-* `d_img_embd`：`kMaxImgTokens * n_embd` f32，启动时分配一次（`engine.cpp:1705`，
-  `engine.h:218`）。host 路径（`mm->embd` 非空且 `d_embd` 为空）会在 `generate_impl` 开头拷进去
-  （`engine.cpp:2387-2389`）；device 路径本来就是它。
-* `step_info` 多模态字段（`kernels.h:109-118`）：`mrope_on`、`mrope_sections[4]`、
+* `d_img_embd`：`kMaxImgTokens * n_embd` f32，启动时分配一次（`engine.cpp`，
+  `engine.h`）。host 路径（`mm->embd` 非空且 `d_embd` 为空）会在 `generate_impl` 开头拷进去；
+  device 路径本来就是它。**`mm_prompt::has_encoded_embd()` 是必需的检查**：prompt 有媒体行但
+  phase 2 没跑（最常见的原因是缺 `--mmproj`/`--audio-mmproj`）时 `generate_mm` 直接抛错，
+  而不是把未初始化的行喂给前向。`arch_profile.mm_model_prefill` 为真（qwen4exp）时
+  `generate_impl` 不再拷 host 行——`q4_prefill_mm` 自己上传一次，避免拷两遍。
+* `step_info` 多模态字段（`kernels.h`）：`mrope_on`、`mrope_sections[4]`、
   `mrope[4*kMaxB*kMaxT]`（section-major）、`img_embd`、`img_row[kMaxB*kMaxT]`。它们全部在
-  **kernel 体内**读取，所以 prefill 走的记录命令图（`prefill_chunk` 提交 `e_pf8`/`e_pf`，
-  `engine.cpp:2039`）每一步都能拿到当前值。
-* `mrope_sections` 在 `reset_state` 里从 `hp.rope_sections` 恢复（`engine.cpp:1958-1960`）。
-* **prefill 走 mode-1 分块**：多模态分支按 `kMaxT` 逐块调用 `prefill_chunk` 并逐块刷新
-  `mrope`/`img_row`（`engine.cpp:2403-2419`），**不走** `prefill_text` 的 mode-2 批量 prefill。结构性原因：
-  `step_info::mrope` / `img_row` 是定长 `4*kMaxB*kMaxT` / `kMaxB*kMaxT`（`kernels.h:116-118`），
-  一个图像块可以连续占掉多行，放不进 mode-2 的多行布局。
+  **kernel 体内**读取，所以 prefill 走的记录命令图（`prefill_chunk` 提交 `e_pf8`/`e_pf`）每一步都能拿到当前值。
+* `mrope_sections` 在 `reset_state` 里从 `hp.rope_sections` 恢复。
+* **prefill 有两条路径，共用 `mm_write_step` 的逐 token 切片**：
+  * **通用路径**：按 `kMaxT` 逐块 `prefill_chunk`，每块用
+    `mm_write_step(mm, pos, n, kMaxB*kMaxT, d_info->mrope, d_info->img_row)` 填位置/行映射，
+    然后置 `mrope_on` 与 `img_embd`。这是所有架构的默认。
+  * **模型自有 forward**（`arch_profile.mm_model_prefill`，qwen4exp 的 loader 置位）：
+    `q4_prefill_mm(*mm, 0)` 把整个扩展后的 prompt 交给 `q4_prefill_common`；完整 `kMaxT`
+    行走 mode 2，`< kMaxT` 尾行走 mode 1，每块同样用 `mm_write_step` 切 M-RoPE/`img_row`
+    （mode-1 的 kernel flat 索引从 0 开始，切片也按这个布局写）。这样图像块可以跨 chunk row，
+    专家 bank/PLE/QSA 与文本 prefill 走同一条路，而不是每 32 token 重新上传专家。
+    `mm == nullptr` 时 `q4_prefill_common` 就是原来的文本路径（相同的行布局/位置），
+    **文本提示词的输出逐位不变**。
+  结构性原因：`step_info::mrope` / `img_row` 是定长 `4*kMaxB*kMaxT` / `kMaxB*kMaxT`，
+  一个图像块可以连续占掉多行；切片按 token 做，因此块边界与 prefill chunk 边界可以独立。
+  `mm_write_step` 抛错而不是越界读：切片越界、或 section stride 小于块长，都是调用错误。
 * **embed kernel**：`img_embd && img_row[t] >= 0` 时直接拷贝对应行，图像 token 不经过 `tok_embd`
-  （`embed.cpp:30-36`；CPU 后端同逻辑，`src/backend/cpu/kernels/embed.cpp:12-16`）。
-* **qk_norm_rope kernel**：`mrope_on` 时按交错 sector 模式从 `mrope` 选 `rpos`（`qk_norm_rope.cpp:49-66`
-  在 Q/K 分支之前算一次，Q 用 `:82`、K 用 `:103`）；频率指数仍是全局 pair 索引。CPU 侧对应
-  `src/backend/cpu/kernels/common.h:115-122` 的 `mrope_section`。
+  （`embed.cpp`；CPU 后端同逻辑，`src/backend/cpu/kernels/embed.cpp`）。
+* **qk_norm_rope kernel**：`mrope_on` 时按交错 sector 模式从 `mrope` 选 `rpos`（`qk_norm_rope.cpp`
+  在 Q/K 分支之前算一次）；频率指数仍是全局 pair 索引。CPU 侧对应
+  `src/backend/cpu/kernels/common.h` 的 `mrope_section`。
 * **decode 阶段**：KV slot 序号是 **token 计数**（`pos_buf[0] = pos`），RoPE 位置单独在
-  `next_pos` 里携带（初值 `mm->pos_after`，`engine.cpp:2430-2435`），每步把 4 段都写成 `next_pos` 并置
-  `mrope_on`（`engine.cpp:2484-2490`），然后 `next_pos++`。二者因图像而分离——一张图用
-  `max(nx,ny)` 个位置换 `4*nx*ny` 个 token，这个分叉是必须的。prefill 结束后 `img_embd` 被置回
-  `nullptr`（`engine.cpp:2435`），避免 decode 步误抄。
+  `next_pos` 里携带（初值 `mm->pos_after`），每步把 4 段都写成 `next_pos` 并置
+  `mrope_on`，然后 `next_pos++`。二者因图像而分离——一张图用
+  `max(nx,ny)` 个位置换 `4*nx*ny` 个 token，这个分叉是必须的。模型自有的 decode 入口
+  （qwen4exp 的 `q4_forward` 会 reset `step_info`）用 `engine::mm_decode_rope_` 保留这一行；
+  纯文本调用、`reset_state` 和 `generate_impl` 结束时都清掉，避免调度器的下一条序列继承它。
+  prefill 结束后 `img_embd` 被置回 `nullptr`，避免 decode 步误抄。
 * **绕过的东西**：
   * *前缀缓存*：`generate_impl` 从不调 `pc_admit`/`pc_commit`，且 `reset_single()` → `reset_state()`
-    会清空 `pc_slot_[].tracking`（`engine.cpp:1961-1965`），于是 `prefill_chunk` 里的
-    `pc_capture_begin` 在 `!ps.tracking` 处直接返回（`engine_prefix_cache.cpp:797-800`），既不匹配也不
-    快照。
-  * *MTP*：`generate_impl` 的分派条件带 `mm == nullptr`（`engine::generate_impl`），多模态提示词永远走普通
+    会清空 `pc_slot_[].tracking`，于是 `prefill_chunk` 里的
+    `pc_capture_begin` 在 `!ps.tracking` 处直接返回，既不匹配也不快照。
+  * *MTP*：`generate_impl` 的分派条件带 `mm == nullptr`，多模态提示词永远走普通
     decode。
-  * *连续批处理*：走的是单序列入口 `generate_mm`（`engine.h` 的 `engine::generate_mm`），不进调度器。
+  * *连续批处理*：走的是单序列入口 `generate_mm`，不进调度器。
+  * *模型的通用 prefill chunker*：`mm_model_prefill` 为真时走 `q4_prefill_mm`，不经过
+    `prefill_chunk`（见上）；前缀缓存/MTP 的绕过来自同一条“单序列、整段 prompt”约束。
 
 ---
 
@@ -394,6 +422,7 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
 | `test_kernels` | 每个视觉 kernel vs host 参考：gemm 1e-5、layernorm 1e-4、rope 1e-5、attn 1e-4 |
 | `bench_kernels` | 真实 Qwen3.5 形状（T=256,E=768,ff=3072,NH=12,HD=64）的 kernel 计时 |
 | `test_prompt_video` / `test_audio_*` | 见 [13-audio-video.md §7](13-audio-video.md) |
+| `test_mm_step` | 无模型：`mm_write_step` 的逐 token M-RoPE/`img_row` 切片，图像块跨 chunk，越界/过小 stride 抛错，`has_encoded_embd` |
 
 模型缺失、tokenizer 无对应 pad token、或没给音频 mmproj 时对应子测试优雅跳过。
 注意本测试只守住集成逻辑：视觉编码器本身是对着 llama.cpp 的参考**带外**校验的（文件头注释，

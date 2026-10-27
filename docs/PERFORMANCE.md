@@ -208,6 +208,12 @@ experts are on the cards.  Prefill numbers used
 The per-expert LRU is the default.  The recommended map is **all-GPU**
 (`0-23:gpu.0,24-47:gpu.1`) with `--moe-vram-mb 17500`: 121 slots per layer in
 47 layers (16.5 GiB), including the four Q8_0-down layers 4, 30, 46 and 47.
+These cells were taken with the policy values that are now the qwen4exp model
+profile (one decode row, whole-prompt prefill, no prefix cache, 4096 MiB engram
+default) and the A770 device profile (`moe.cfg_gate`/`cfg_down`/`cfg_dec`
+43/43/0, `flat`/`flat_dec` 1/0, `dp4a`/`dp4a_dec` 1/1, `upload_ring` 32,
+`pf_wmin` 24, `w4_rows_per_wg` 16, `q8_rows` 512, `f32_rows` 128); moving
+those values out of literals did not change the conditions.
 The expert planes are pinned in host RAM (`PF_Q4_PIN_SRC`, 69.8 GiB, one-time
 copy) so the uploads read them directly.  Only layer 2 stays on the host
 (Q5_K gate/up + Q8_0 down); a decode-only bank for it
@@ -236,8 +242,9 @@ What produced the row, in the order the costs appeared:
   the KL/top-1 gate was run on 2026-10-27 (two prompts, §4.4.2): top-1 agreed
   for 28/29 and 15/16 step pairs, the first divergence was always a near-tie,
   the divergence-step KL was 0.029/0.037 and the text stayed coherent.  That
-  makes it a usable *approximation*, not a free kernel change, so the default
-  stays **off**; enabling it is a product decision, not a measurement one.
+  makes it a usable *approximation*, not a free kernel change; it is **default
+  7** (`PF_Q4_TAIL_SKIP=0` restores the exact expert set), a performance-first
+  product decision that accepts the near-tie token flips.
 * **CPU misses with GPU-first overlap** (`PF_Q4_CPU_MISS`, Strata's CUDA
   `kind = -1` idea) was implemented and **rejected** (2026-10-27, the same
   96-token TCP cell, `--ctx 2048 --kv-type f16`, one process per cell; the
@@ -603,6 +610,12 @@ k+1-row mode, and the 2-row batch result (208 ms for 2 rows) already puts the
 likely 3/5-row verify above the gate.  The q4 MTP path is **not implemented**
 and is now **no-go** for this build; the draft semantics and state plan are in
 the q4 section of `AGENTS.md` if it is ever revisited.
+
+> **MTP q4 result: PENDING.**  <!-- MTP-Q4-PLACEHOLDER: the parent fills the
+> measured MTP q4 result here after the MTP job.  The table above is the old
+> forward's verify-cost gate, not the speculative path's result. -->
+> Until that row lands, the q4 MTP conclusion in this section is the pre-job
+> one (existing mode-1 forward) and must not be read as the final measurement.
 
 **Prefill: the 74 tok/s target is structurally out of reach on two cards.**
 The measured 9.6 s warm 544-token prefill splits into ~4.3-4.9 s of expert

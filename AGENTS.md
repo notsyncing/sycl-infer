@@ -283,6 +283,12 @@ from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
 ./build/test_sse_cancel     # SSE client-disconnect cancels generation (real socket,
                               # real httplib, no model needed)
 ./build/test_sampler       # logit_bias + logprob reporting (CPU only)
+./build/test_model_profile # loader registry x model profiles: exact keys, pinned
+                           # qwen4exp policy, qwen35/qwen35moe agree (CPU only)
+./build/test_mm_step       # per-token M-RoPE / img_row slicing, a chunk boundary
+                           # inside an image block, bad slices (CPU only)
+./build/test_dev_profile   # device-profile selection, the moe.*/shape.* values,
+                           # and the unknown-card fallback (CPU only)
 ./build/test_sched         # scheduler streaming path: greedy, logprobs, max_tokens,
                            # ignore_eos=>"length", cancel, empty prompt,
                            # concurrent sequences, and a twenty-row batched
@@ -391,8 +397,11 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                   below; PF_ATTN_XMX below), qsa (the Stage 2 device gather +
                   scratch step_info for QSA; src/backend/gpu/kernels/qsa.cpp)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
-                model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
-                tokenizer.{h,cpp}
+                model_arch.h (architecture registry), model_profile.h (the
+                declarative per-architecture policy), profiles/<arch>.cpp (one
+                architecture's complete profile: key, values, provenance),
+                qwen35.cpp, model_w8.cpp, tokenizer.{h,cpp} — see "Model
+                profiles" below
 src/mm/         image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
                 vision.{h,cpp} (mmproj loader + host vision encoder),
                 video.{h,cpp} (video decode + uniform frame sampling),
@@ -444,13 +453,15 @@ tests/backend/cpu/  test_cpuref.cpp, test_pc_cpu.cpp (paged attention + disk
                 CPU-partition prefix-cache warm resume gives argmax
                 248046/198, max|diff| 3.2-3.8; do not call it passing),
                 test_pc_disk.cpp / test_pc_ram.cpp
-                (tier stores)
+                (tier stores), test_dev_profile.cpp (profile selection and the
+                moe.*/shape.* field values, no GPU)
 tests/backend/cpu/kernels/  test_cpu_gemv.cpp (dequant GEMV + RMSNorm vs the
                 host reference; run PF_CPU_ISA=scalar|avx2|avx512 to pin a variant),
                 test_cpu_gdn.cpp (cpu_gdn with an asymmetric head count),
                 test_dflash_kernels.cpp (DFlash2 top-k + conv vs host references)
 tests/model/    test_tokenizer.cpp, test_compare.cpp, test_chat_template.cpp,
-                test_w4.cpp (u4 packing round-trip)
+                test_w4.cpp (u4 packing round-trip),
+                test_model_profile.cpp (registry x profile keys, qwen4exp policy)
 tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter),
                 test_sse_cancel.cpp (SSE disconnect cancellation: real httplib +
                 real socket reset, no model)
@@ -467,7 +478,9 @@ tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
                 2-row decode comparison and the MTP verify-cost gate; AOT
                 build, model as argv[1])
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
-                prompts, audio kernels, positions)
+                prompts, audio kernels, positions), test_mm_step.cpp (the
+                per-token M-RoPE / image-row slice the generic and model-owned
+                prefill chunkers share)
 src/router/     the multi-model front end (a SEPARATE binary, `sycl-infer-router`:
                 config.cpp (JSON with comments), registry.cpp (the model table and
                 its state machine), rpc_client.cpp (the control-plane client),
@@ -1604,9 +1617,10 @@ reservation-relative range into each shard's own file range before
 `posix_fadvise`.
 
 **Placement and forward path.**  The dense trunk goes on the GPUs named by
-`--layer-map`; every routed pair and the PLE module run on the host, so the
-model is host-RAM bound.  The recommended run is all-GPU with a per-expert LRU
-bank:
+`--layer-map`.  The PLE module and the non-resident expert source stay in host
+RAM, and an expert with a bank slot is computed on the card that owns it
+(a miss is uploaded from the pinned source), so the model is still host-RAM
+bound.  The recommended run is all-GPU with a per-expert LRU bank:
 
 ```bash
 ./build/sycl-infer \
@@ -1620,9 +1634,12 @@ not fit the generic `seg_plan` (one GEMV list per layer plus fixed epilogues).
 It reuses the existing GDN/attention/GEMV launchers and the paged KV pool.  The
 host half is `src/backend/cpu/kernels/q4exp.cpp`; the new device kernels are in
 `src/backend/gpu/kernels/q4exp.cpp` (HC norm/mix/combine, the F32 inject dot,
-the arbitrary-K up GEMV).  The plan builders, decode command graphs, prefix
-cache, MTP and the multimodal path are deliberately skipped (`q4exp` forces
-`pc_enabled = false`); the server's q4 `prefill_batch` has no recorded variant,
+the arbitrary-K up GEMV).  The plan builders, recorded decode graphs and the
+prefix cache are deliberately skipped; the forward still reads `m.q4exp` (M2
+will delegate the walk to a runtime object), while the *policy* branches read
+the model profile.  MTP is gated with a printed reason; DFlash has no q4
+draft/verify path in this build; multimodal is routed through the model's own
+chunker (see below).  The server's q4 `prefill_batch` has no recorded variant,
 and **batched q4exp decode is measured and rejected** (2 rows 0.85x; the
 scheduler now caps qwen4exp at one row and serialises its sequences - see
 *Decode batching, tail-skip and the MTP gate* below).  The scheduler's generic
@@ -1638,6 +1655,80 @@ boundary pools) - the known prefill accumulation-order sensitivity, not stale
 slot state; the generated content matched.  `PF_PFB_MAX_M` no longer affects q4
 (it remains a non-q4 A/B knob).
 
+**The engine policy is the model profile (M0+M1).**  `src/model/model_profile.h`
+and `src/model/profiles/qwen4exp.cpp` declare what this architecture is and
+what it may use; `engine` stores `mp_ = m.prof` and the policy branches read it
+instead of scattering `m.q4exp` tests.  The resolved qwen4exp values are:
+`fwd = hc_ple_qsa`; `policy.max_decode_rows = 1`;
+`policy.prefill = whole_prompt`; `policy.prefix_cache = false`;
+`policy.auto_layer_map = true`; `policy.md_splits = true`;
+`policy.engram_ram_mb_default = 4096`; `rep = {sin_w8 false, dnnl_int8 false,
+raw_gemv_decode true, split_per_tensor_upload true}`; `moe = runtime_bank`;
+`spec = {mtp false, dflash false, why = ...}` (multimodal is declared by the
+loader's `mm_model_prefill` below; the `spec.multimodal` field is the
+declarative report, not the routing gate; the `why` names the missing NextN
+block and the per-token GDN/conv snapshots the walk does not produce); and the
+geometry is HC 4 streams / low rank 320, PLE on, QSA top_k 2048 over pools of 4
+with a 4x128 indexer.  Consequences: the prefix cache cannot be enabled by
+`PF_PREFIX_CACHE=1` (the checkpoint cannot represent PLE/QSA state); a split
+GGUF gets its layer map synthesised when none is given; the multi-device
+attention K-split stays on; `--mtp` takes the profile's declared reason and
+disables MTP (before the `has_mtp` check, so a future file that happens to
+bundle a NextN block cannot enable a verify path this forward does not
+produce); the engram default is 4096; and the scheduler's one-row cap and
+whole-prompt prefill come from the policy rather than from a model-name test.
+The generic `qwen35`/`qwen35moe` profiles are `generic_plan`,
+`engine_cache`, chunk32 prefill, prefix cache on, so their behaviour is
+unchanged.  `PF_MODEL_INFO=1` prints the resolved profile, policy, weights,
+capabilities and provenance; `test_model_profile` pins the registry/keys and the
+qwen4exp values.
+
+**Multimodal goes through the model's own forward.**  The text GGUF carries no
+vision/audio tensors - the towers are separate mmproj GGUFs, as for every
+architecture.  The qwen4exp loader sets `arch_profile.mm_model_prefill`, and
+`engine::generate_impl` then hands the whole expanded prompt to
+`q4_prefill_mm` instead of the generic one-`kMaxT`-row loop, which would
+re-upload experts at every 32-token boundary and bypass the HC/PLE/QSA state.
+`q4_prefill_common` is the shared chunker: with `mm == nullptr` it is the old
+text path (same mode-2 full rows, same mode-1 `< kMaxT` tail), so a text prompt
+is bit-identical; with a media prompt it slices `mm->mrope` and `mm->img_row`
+per chunk through `mm_write_step`, so an image block may span chunk rows
+without shifting a position or an embedding row.  The decode loop sets
+`mm_decode_rope_` so qwen4exp's decode entry point does not clear
+`step_info::mrope_on` (an image's RoPE position is not the token index); a
+text-only run and `reset_state` clear it, and the end of `generate_impl` clears
+`mrope_on`/`img_embd` so a scheduler sequence cannot inherit them.
+`mm_prompt::has_encoded_embd()` makes `generate_mm` throw on media rows with no
+encoder output (the usual missing `--mmproj`/`--audio-mmproj`) instead of
+forwarding uninitialised rows.  At startup one `[mm]` line reports a tokenizer
+with none of the three pad tokens, so the failure is named before the first
+request.  `test_mm_step` (hermetic) pins the slice
+mapping, a chunk boundary inside an image block, and the out-of-range /
+too-small-stride errors.  The model profile's `spec.multimodal` is the
+declarative report field; the *routing* capability is the loader's
+`mm_model_prefill`, so a model can only take the model-owned path when its
+loader says it has one.
+
+**The card-specific q4 numbers are in the device profile (M0).**  The expert
+GEMM's tile case and grid gates (`moe.cfg_gate`/`cfg_down`/`cfg_dec`),
+`moe.flat`/`flat_dec`, `moe.dp4a`/`dp4a_dec`, the expert-upload ring
+(`moe.upload_ring`), the two-pass workspace (`moe.pf_wmin`), and the narrow GEMV
+row gates (`shape.w4_rows_per_wg`, `shape.q8_rows`, `shape.f32_rows`) moved out
+of literals / process statics and into `src/device/profiles/arc_a770.cpp`.  The
+A770 values are cfg 43/43/0 (0 = decode auto), flat 1/0, dp4a 1/1, ring 32,
+workspace 24, 16 rows per native-weight GEMV work-group, Q8_0 K-split below 512
+output rows and F32 below 128.  The Iris Xe profile carries the same values
+marked **INHERITED / UNMEASURED**; the fields are present (a missing field is a
+zero tile, not "unmeasured") but the sweep was done on the 512-EU card.
+`PF_*` remains the A/B.  A field whose `0` is a measured value (`cfg_dec` auto,
+`PF_Q4_F32_SPLIT=0`) reads the raw env with a `-1` sentinel, because
+`profile_int` folds an env 0 into "unset"; `PF_Q4_PF_WMIN` behaves the same way
+so an explicit 0 still means the smallest workspace.  `engine_graph`'s schedule
+model now asks `moe_grp_tile_rows()` for the tile the dispatch will actually
+use, instead of guessing "cfg 43 means 8, otherwise 16" (the guess mis-priced
+every makespan it printed).  `PF_DEVICE_INFO=1` prints the `moe`/`shape` groups;
+`test_dev_profile` pins them for the A770, the Iris Xe and the unknown fallback.
+
 At startup the routed down bank is converted once to a symmetric int8 store
 (per-32 scale), because Q5_1's 32-value block is not a K-quant superblock and
 K=640 is not a multiple of 256.  The host-resident expert/PLE/indexer pages are
@@ -1646,8 +1737,9 @@ then prefaulted (`q4_prefault`, one touch per page in parallel;
 of ms/token at this model's expert traffic.
 
 **Expert placement: per-expert LRU, two-pass prefill.**  The generic three-tier
-`moe_cache` is **inactive** on qwen4exp: `engine.cpp` sets `moe_host_only_` and
-`moe_cfg_.host_only = true`, so `moe_cache` computes `total = 0`, and its device
+`moe_cache` is **inactive** on qwen4exp: its model profile says
+`moe = runtime_bank`, so `engine.cpp` sets `moe_host_only_` and
+`moe_cfg_.host_only = true`, `moe_cache` computes `total = 0`, and its device
 path lives in `record_forward`'s `seg_plan` branch while q4exp walks its own
 layers.  The q4 path is separate:
 
@@ -1700,8 +1792,12 @@ layers.  The q4 path is separate:
   banked layer added its routed output onto the previous layer's residual (cos
   0.27 against the host FFN for one layer, `||```` for seven).  One
   `qd.memset(b.block, 0, ...)` before the reduce fixes it.
-  `PF_Q4_BANK=0` forces the all-host path; `PF_Q4_BANK_LAYER=1` selects the
-  whole-layer bank for the A/B (45.5 s prefill, not recommended).
+  **The bank is the shipped default and it is output-correct**: `PF_Q4_FFCMP`
+  gives cosine 0.999999 for a banked layer, and the earlier "do not ship it
+  enabled" reading came from this stale accumulator plus the K%256 down-stride
+  bug, not from the bank.  `PF_Q4_BANK=0` forces the all-host path;
+  `PF_Q4_BANK_LAYER=1` selects the whole-layer bank for the A/B (45.5 s prefill,
+  not recommended).
 * The bank handles Q4_K/Q5_1 and Q4_K/Q8_0 layers by default.  Layer 2's
   Q5_K gate/up is a **decode-only** opt-in (`PF_Q4_BANK_Q5K=1`; 48 layers,
   17.0 GiB): the prefill stays on the host, but the decode is **107.2 ms**
@@ -1722,7 +1818,8 @@ layers.  The q4 path is separate:
   and the decode **93.3 ms (10.7 tok/s)**.  `PF_Q4_PIN_SRC=0` restores the
   staging path.
 
-**The engram tier (PLE rows).**  `--engram-ram-mb` (default 4096) is a
+**The engram tier (PLE rows).**  `--engram-ram-mb` (unset = the model profile's
+`policy.engram_ram_mb_default`, 4096 for qwen4exp) is a
 direct-mapped host-RAM cache of PLE table rows: `cap` is a power of two, the
 slot is `row & (cap - 1)`, and the tag is the row id.  A hit copies the already
 dequantized 160-wide f32 row; a miss dequantizes it from the GGUF mmap (the disk
@@ -1828,6 +1925,17 @@ order.  The dense fallback prints one warning only when the selector cannot run
 above the budget (missing indexer tensors).  `PF_Q4_QSADBG`, `PF_QSA_Q`,
 `PF_QSA_MIX`, `PF_QSA_SCORE`, `PF_QSA_POOLS` and `PF_QSA_POOLK` are
 diagnostics/dump knobs.
+
+**The selector's pool width comes from `hp.idx_kpool`, not a literal 4.**
+`qsa_pool_div()` returns `idx_kpool > 1 ? idx_kpool : 4`, and every pool
+expression uses it: the pool array and ring sizes, `pos / kp`, `pos % kp`, the
+pooled key's RoPE position `pos - (kp - 1)`, `n_pool_max = idx_top_k / kp`, the
+selected range `p*kp + j`, and the incomplete tail.  The old `/4` arithmetic
+was invisible on the shipped model (its `compress_ratios` is 4) but a model that
+pools 8 would have selected the wrong key set while still running.  `kp = 4` is
+bit-identical to the old code: `1/4` is exact and the four-term sum keeps its
+order.  The guard is an `assert(kp >= 2)` plus the comment; a grep for
+`/ 4`, `% 4`, `* 4 +` in `engine_qsa.cpp` must find no pool arithmetic.
 
 **The recommended `--ctx 2048` decode does not run QSA at all**:
 `qsa_on_` requires `max_seq > idx_top_k` and both are 2 048, so the 93.3 ms/token
@@ -1943,11 +2051,12 @@ the checks that catch them.
   slots and 101.2 ms; 17000 118 and 94.0; 17500 121 and 93.3; 18000 gives 125
   slots and 17.0 GiB but is **not** faster.  17 500 is the recommended budget;
   the earlier "18000/20000 fail" note was measured before the four Q8_0 layers
-  were banked.
-* **Tail-skip (`PF_Q4_TAIL_SKIP=7`, Strata CUDA path, now default 7).**  An
-  expert that every token routes at rank >= 7 is not admitted when it is a
-  miss; it keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the
-  down) and is neither copied nor computed.  On the 96-token TCP cell at 17500:
+  were banked: 20000 now fails, and 18000 loads (125 slots, 17.0 GiB) but is
+  **not** faster than 17500.
+* **Tail-skip (`PF_Q4_TAIL_SKIP=7`, Strata CUDA path, default 7).**  An expert
+  that every token routes at rank >= 7 is not admitted when it is a miss; it
+  keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the down) and
+  is neither copied nor computed.  On the 96-token TCP cell at 17500:
   **93.6 -> 86.9 ms (-7.2%)**, the last token's upload **56.2 -> 32.2 MiB
   (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes; the KL/top-1 gate
   was run on 2026-10-27 (28/29 and 15/16 step pairs, first divergence always a
@@ -2007,9 +2116,9 @@ the checks that catch them.
 | flag / env | default | meaning |
 |---|---|---|
 | `--moe-vram-mb MB` | 0 | per-expert LRU bank budget; **17500** is the measured knee (121 slots), 0 = all experts on the host |
-| `--engram-ram-mb MB` | 4096 | PLE row cache in host RAM; 0 disables it |
+| `--engram-ram-mb MB` | profile (4096) | PLE row cache in host RAM; unset = the model profile's `policy.engram_ram_mb_default`, 0 = off |
 | `--moe-ram-mb MB` | 0 | generic ncmoe host tier; **not used by qwen4exp** (the experts are always host-resident) |
-| `--layer-map` | auto | recommended `0-23:gpu.0,24-47:gpu.1` |
+| `--layer-map` | auto | recommended `0-23:gpu.0,24-47:gpu.1`; the profile synthesises one when absent |
 | `--kv-type` | i8 | f16 and i8 both work; f16 is the recommended decode |
 | `PF_Q4_BANK=0` | on | all-host expert path (A/B) |
 | `PF_Q4_BANK_LAYER=1` | off | whole-layer bank instead of the per-expert LRU |
@@ -2022,19 +2131,23 @@ the checks that catch them.
 | `PF_Q4_HEAT=1` | off | decayed-heat victim instead of LRU (measured slower; A/B only) |
 | `PF_Q4_PF_ONEPASS=1` | off | old single-pass prefill (incorrect when act > R) |
 | `PF_Q4_PF_PIPE=0` | on | serial expert copies; A/B for the two-pass prefetch |
-| `PF_Q4_PF_STATS=1` / `PF_Q4_PF_CHUNK` / `PF_Q4_PF_WMIN` | off / auto / 24 | two-pass diagnostics and chunk/workspace overrides |
+| `PF_Q4_PF_STATS=1` / `PF_Q4_PF_CHUNK` / `PF_Q4_PF_WMIN` | off / auto / profile (24) | two-pass diagnostics and chunk/workspace overrides |
 | `PF_Q4_LRU_OLD=1` | off | pre-fix eviction (not an LRU; A/B only) |
-| `PF_Q4_STAGE=0` | on | direct pageable expert uploads instead of the pinned ring |
+| `PF_Q4_STAGE=0` | on | direct pageable expert uploads instead of the pinned ring (ring size = profile `moe.upload_ring`, 32) |
 | `PF_Q4_INJECT=0` | on | old one-lane HC inject dot |
 | `PF_Q4_GEMV8=0` | on | generic Q8_0 GEMV |
+| `PF_Q4_GEMV8_SPLIT_ROWS` / `PF_Q4_GEMV8_WPR` | profile `shape.q8_rows` (512) / `split.max` (8) | K-split row gate / warps per row for the Q8_0 decode GEMV; `-1` = profile |
 | `PF_Q4_GEMVSEG=0` | on | blocking per-call segment copy |
+| `PF_Q4_F32_SPLIT=0` | profile `split.max` (8) | generic GDN beta/alpha GEMV; `-1` = profile, `0` = off |
+| `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` / `PF_MOE_CFG_DEC` | profile `moe.cfg_*` (43/43/0) | grouped expert GEMM tile case; `_DEC` 0 = auto (one row per expert, two when batched) |
+| `PF_MOE_FLAT` / `PF_MOE_FLAT_DEC` | profile `moe.flat`/`flat_dec` (1/0) | put the row tile in the grid (prefill / decode) |
+| `PF_MOE_DP4A` / `PF_MOE_DP4A_DEC` | profile `moe.dp4a`/`dp4a_dec` (1/1) | grouped dp4a experts (prefill / decode) |
 | `PF_QSA_TIME=1` | off | QSA host split per forward (`copy/gemv/upd/sel/attn`) |
 | `PF_QSA_ISA=scalar\|avx2\|avx512` | auto | force only the QSA host kernels' ISA |
 | `PF_QSA_DEFER=0` | on | inline update instead of the end-of-forward deferred update |
 | `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
 | `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see §4.4.2 |
-| `PF_Q4_F32_SPLIT=0` | on | generic GDN beta/alpha GEMV |
 | `PF_Q4_IDS_HOST=0` / `PF_Q4_HOSTROUTER` | on / off | router ids copy / host router A/B |
 | `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_UPSTAT`, `PF_Q4_HOT_TIME`, `PF_Q4_FFCMP=<layer>` | off | phase attribution and the routed-FFN oracle |
 | `PF_Q4_HIST=1`, `PF_Q4_PREFAULT=0`, `PF_Q4_NOPLE=1` | off / on / off | routing histogram, skip the prefault, skip PLE (diagnostic) |
@@ -2084,6 +2197,13 @@ Full tables and commands in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.4.2
   independent rows), with GDN/conv snapshots slot-strided by `state_slots_`,
   PLE append suppressed, QSA dense-only, and per-row heads.  No MTP code is
   added.
+
+> **MTP q4 result: PENDING.**  <!-- MTP-Q4-PLACEHOLDER: the parent fills this
+> after the MTP q4 job.  Leave the conclusion above unchanged until then. -->
+> The paragraph above is the pre-MTP-job conclusion (the existing mode-1 forward
+> is not the verify shape).  It is not the final ranking; the placeholder is
+> replaced with the measured one-slot k+1-row verify result.
+
 * **The 74 tok/s prefill target is not reachable on two cards.**  The 9.6 s
   warm 544-token prefill is ~4.3-4.9 s expert upload + ~3.5-4.2 s device MoE +
   ~1.1 s non-MoE.  Host-spilling the overflow experts has a ~0.25 ms/expert
@@ -2528,9 +2648,34 @@ name.
 * **What belongs there**: occupancy (`occ.warps_per_eu_x2`, which sets the decode
   K-split), the SLM budget the staging GEMVs size against, the split heuristics
   that fill the machine (`split.gemv_rows`, `split.gemm_rows`, `split.max`),
-  per-kernel shapes (`shape.*`, `attn.xmx_gather_red`), and the *default* for any
-  on/off feature whose value was chosen by measurement (`wt.w4`, `wt.k5`,
-  `wt.cb4`, `attn.xmx`, `attn.dec_group`, ...).
+  per-kernel shapes (`shape.*`, `attn.xmx_gather_red`), the routed-expert GEMM's
+  tile case and grid gates (`moe.cfg_gate`/`cfg_down`/`cfg_dec`, `moe.flat`/
+  `flat_dec`, `moe.dp4a`/`dp4a_dec`), the qwen4exp expert-upload ring and
+  two-pass workspace (`moe.upload_ring`, `moe.pf_wmin`), the narrow-GEMV row
+  gates (`shape.w4_rows_per_wg`, `shape.q8_rows`, `shape.f32_rows`), and the
+  *default* for any on/off feature whose value was chosen by measurement
+  (`wt.w4`, `wt.k5`, `wt.cb4`, `attn.xmx`, `attn.dec_group`, ...).
+* **What deliberately does not belong**: a number that is a property of the
+  model file, the run, or the host rather than the card.  `PF_Q4_TAIL_SKIP`
+  (a quality/algorithm trade, one value for every card), `--moe-vram-mb` (a run
+  budget), `--cpu-threads` (the host CPU's core count), the qwen4exp decode row
+  cap (model policy - it lives in the model profile), the token-batch (`TB`)
+  buckets and the prefill chunk size (compile-time capacity / model policy, like
+  `kMaxB` and `kMaxT`: a profile field would make the same binary's memory
+  footprint change with the card), and the QSA host-path flags (measured only on
+  the A770 so far; they stay out of a card profile until the Iris Xe has its own
+  measurement).  Putting any of these here makes the value look measured on a
+  card it never was.
+* **The A770's values for those groups, as measured**: `moe.cfg_gate` /
+  `cfg_down` / `cfg_dec` = **43 / 43 / 0** (0 = decode auto: one row per expert,
+  two when batched), `moe.flat` / `flat_dec` = **1 / 0**, `moe.dp4a` /
+  `dp4a_dec` = **1 / 1**, `moe.upload_ring` = **32**, `moe.pf_wmin` = **24**;
+  `shape.w4_rows_per_wg` = **16**, `shape.q8_rows` = **512**,
+  `shape.f32_rows` = **128**.  `moe_grp_tile_rows(q, down, dec)` reports the
+  resolved M from the same resolver the dispatch uses, which is what the
+  `PF_MOE_HIST` schedule model prices; the old "cfg 43 means 8, else 16" guess
+  mis-priced every makespan.  The Iris Xe row copies all of them and marks them
+  inherited.
 * **What stays a literal**: hardware facts SYCL already reports and that cannot
   change with tuning — they are queried, with the profile as the fallback.  And
   anything a *model* dictates rather than a card (`kBlockSize`, `kI8Q`,
@@ -2566,6 +2711,14 @@ name.
   the decode-split microbenchmark on an integrated part returned 2.1-4.4 ms for
   one configuration across three repeats, i.e. the noise exceeded the effect, so
   the sweep has to be redone on an idle box before those values are trusted.
+  **The entire `moe.*` group and `shape.w4_rows_per_wg` / `q8_rows` / `f32_rows`
+  are also INHERITED and unmeasured on the Iris Xe.**  The expert tile's binding
+  constraint (registers per lane) is the same Xe-LP file, so M=8 plausibly
+  transfers, but the bandwidth-vs-occupancy balance that chose it is not the
+  same on an integrated part; the K-split row thresholds scale with the EU count.
+  `test_dev_profile` requires the fields to be *present* and identical (a missing
+  field is a zero tile, not "unmeasured"), and the card file's comment is what
+  says they were not swept.
 * **The registry holds no knowledge of any card.**  Detection is a function
   pointer: each `<card>.cpp` owns its own `arc_a770_matches(name)` /
   `iris_xe_matches(name)`, and `for_name()` just asks each registered card in
@@ -2618,16 +2771,102 @@ name.
   profile read behind `static const = []{ ... active() ... }()`: that pins the
   whole process to whichever card resolved first.  Use `si::dev::profile_int` /
   `profile_flag`, which cache the (device-independent) env once and read the
-  default per call.  Four such statics existed and had to be converted - see
+  default per call.  The statics that had to be converted are: `rmsnorm`'s
+  work-group width, `attn_xmx`'s gather count (it also sizes scratch allocated
+  per queue), `gdn`'s `gdn_cols`/`gdn_warps_per_wg`, `attn`'s `vec`/`dec_group`
+  plus the `attn_xmx`/`gemm_dnnl` switches, the routed-expert tile cases and
+  flat gates (`moe.cpp`'s `moe_cfg_for`, `engine_graph.cpp`'s per-queue dp4a
+  gates), the GEMV row thresholds and split widths in `gemv.cpp`, the native
+  weight GEMV's rows per work-group in `w4_gemv.cpp`, and qwen4exp's
+  `upload_ring`/`pf_wmin`.  Two details are load-bearing: `profile_int` folds an
+  env `0` into "unset", so a field whose `0` is a real value (`moe.cfg_dec`'s
+  auto, a split count of 0) must read the raw env with a `-1` sentinel; and a
+  field that is a boolean use `profile_flag`.  See
   `docs/design/12-build-and-testing.md` §3.4.1 for the list and for the A/B that
   keeps `rmsnorm`'s per-call lookup honest (the DFlash2 draft block forward had
   16.4 of its 20.5 ms inside five attn_norm launches, which is why that one was
   a static in the first place; `PF_DFLASH_SEGTIME` shows `anorm` unchanged at
   0.30 ms).  `test_dev_profile` covers the homogeneity *reporting* with synthetic
-  names and no GPU; `test_dev_resolve` covers the cache itself.
+  names and no GPU, plus every `moe.*`/`shape.*` value and the unknown-card
+  fallback; `test_dev_resolve` covers the cache itself.
 * `CMakeLists.txt`'s `SYCL_INFER_AOT_DEVICE` is the ocloc target and is
   device-specific for the same reason: it must agree with the profile the binary
   will select at runtime.
+
+## Model profiles: where an architecture's policy belongs
+
+**Rule: a property of the model file or its architecture lives in that
+architecture's model profile, not in an `m.q4exp` ternary at its use site.**
+The use site asks for it by name.
+
+    src/model/model_profile.h       the `model_profile` struct: the declaration
+    src/model/profiles/<arch>.cpp   one architecture's COMPLETE profile: its key,
+                                    values and provenance
+    src/model/model.cpp             the kLoaders[] rows that point at the
+                                    profiles, the exact-key check, the
+                                    PF_MODEL_INFO report
+    src/model/model.h               `model::prof` (set by load) and the loader's
+                                    `arch_profile` capability flags
+
+* **What belongs there**: how the forward is executed (`generic_plan` for the
+  shared `seg_plan`/`record_forward`, `hc_ple_qsa` for qwen4exp's own walk), the
+  HC/PLE/QSA geometry, the policy the architecture wants unasked
+  (`policy.max_decode_rows`, `policy.prefill`, `policy.prefix_cache`,
+  `policy.auto_layer_map`, `policy.md_splits`, `policy.engram_ram_mb_default`),
+  which weight representations the file can use (`rep.sin_w8`, `rep.dnnl_int8`,
+  `rep.raw_gemv_decode`, `rep.split_per_tensor_upload`), which mechanisms it is
+  wired for (`spec.mtp`/`dflash`/`multimodal` plus one `why`), and which owner
+  runs its routed experts (`moe`: the generic three-tier cache, a forward-owned
+  runtime bank, or host-only).
+* **What does not belong here**: anything measured per card - splits, work-group
+  widths, tiles, the u4/k5/cb4 defaults, occupancy - which is the device profile
+  above.  And anything that is a property of a *specific file or run* rather than
+  the architecture: per-layer expert plane sizes (`sg/su/sd`), the expert bank
+  budget, the KV type, the layer map, the token-batch (`TB`) buckets and the
+  prefill chunk size.  A profile that carried those would silently serve the
+  wrong strides for another file.
+* **Exact-key detection, no fuzzy match.**  Every `kLoaders[]` row carries a
+  `const model_profile *`, and `model::load` (a) refuses a row without a
+  profile, (b) refuses a profile whose `key` is not *exactly* the GGUF's
+  `general.architecture`, and only then (c) calls the loader.  `arch::registry()`
+  exposes the same table, so the report and the test cannot read a second list.
+  While `hparams::q4exp` / `model::q4exp` still exist, `model::load` also
+  asserts they agree with `fwd_kind::hc_ple_qsa`; the forward dispatch still
+  reads `m.q4exp` until the walk is delegated to a runtime object, but every
+  *policy* branch reads the profile.
+* **Provenance.**  Each profile carries a `provenance` string, the same contract
+  as a card file: quote the GGUF metadata a geometry came from and the measured
+  document for a policy value.  `PF_MODEL_INFO=1` prints the resolved profile,
+  the policy, the weight representation, the capabilities (with `why`) and that
+  provenance at load, so a run says which policy it actually selected.
+* **An env var or CLI flag overrides a profile *default*, not a capability.**
+  Keep the ordering "explicit value, else profile": `--engram-ram-mb` (unset =
+  the profile's MiB default, `0` = off), `--layer-map` (overrides
+  `auto_layer_map`), `PF_SCHED_MAX_DECODE` (overrides `max_decode_rows` for
+  tests).  A false *capability* is a ceiling: `policy.prefix_cache == false`
+  cannot be turned on by `PF_PREFIX_CACHE=1` (the checkpoint cannot represent
+  the state); `spec.mtp == false` prints `[mtp] <key>: <why> - MTP disabled` and
+  stays off even if the file happens to bundle a NextN block; and
+  `policy.md_splits == true` keeps the multi-device K-split on, so
+  `PF_MD_SPLITS=0` does not turn it back off.
+* **There is no `PF_MODEL_PROFILE` pin**, deliberately: a card's name is
+  reported by a driver and may be renamed, but a GGUF states its own
+  `general.architecture`.  Pinning a model policy would let a run execute a
+  different architecture's assumptions while the loader still binds this file's
+  tensors.
+* **The model/device boundary in one line**: a model profile says what the model
+  is and may use; a device profile says how this card runs it.  The *forward
+  entry point* is model policy; the work-group, tile and split constants inside
+  every kernel are device tuning.  The one capability the generic driver reads
+  from `arch_profile` directly is `mm_model_prefill` (set by the qwen4exp
+  loader): it says an mm prompt must go through the model's own chunker instead
+  of the generic one-row-at-a-time loop, so it is a property of the forward, not
+  a model-name test.
+* **Test.**  `test_model_profile` is hermetic (no GGUF, no GPU): it asserts every
+  registry row has a profile, the key is exact, the qwen4exp policy/geometry/
+  weight/capability values are pinned, and `qwen35`/`qwen35moe` agree field by
+  field (they are separate consts because the exact-key check forbids a shared
+  "generic" key).
 
 ## Conventions
 
@@ -2640,10 +2879,12 @@ name.
   MoE cache, the plan/record/forward hooks, the prefill chunker, the device
   kernels and the host kernels already exist; a new subsystem has to justify
   itself with a measured improvement over them.  The q4exp per-expert bank is
-  the cautionary example: a parallel allocation/calibration path that
-  duplicated what the generic `moe_cache` and the prefill chunker already do,
-  and never beat the whole-layer bank.  When a new path is still warranted,
-  record the A/B in `docs/PERFORMANCE.md` with the numbers.
+  the example that did: it is forward-owned because the generic `moe_cache` is
+  inactive for a model-owned walk, and it beats the whole-layer bank (9.6 s vs
+  45.5 s cold prefill).  The cautionary example is the q4 CPU-miss path
+  (`PF_Q4_CPU_MISS`): it duplicated the bank's arithmetic, measured 1.49x
+  slower, and stays off.  When a new path is still warranted, record the A/B in
+  `docs/PERFORMANCE.md` with the numbers.
 * Keep CMake source lists updated; there is no globbing.
 * Do not edit `third_party/`; suppress warnings from vendored code via
   `set_source_files_properties(... COMPILE_OPTIONS ...)` in CMake.  One
@@ -2781,7 +3022,9 @@ addresses - an internal media server, and SSRF exposure again),
 `PF_AV_FFMPEG` (audio/video decode CLI path, default `ffmpeg`).
 
 **Diagnostics**
-`PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
+`PF_MODEL_INFO=1` (print the resolved model profile, its policy/weight/
+capability fields and its provenance at load; the model-side counterpart of
+`PF_DEVICE_INFO`), `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
 `PF_TIME`, `PF_DBG_MID` (stop after embedding/norm/attn/ffn), `PF_DBG_GEMV`,
 `PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`,
 `PF_HOSTPROF=1` (the `PF_PROF` block breakdown *without* the per-stamp device
@@ -2796,8 +3039,8 @@ expert pair counts, top-B coverage and whole-layer coverage, printed at exit;
 `PF_Q4_BANK_TYPES`/`_MAX`/`_SKIP`/`_BANKCHK` are the bank diagnostics), `PF_Q4_DUMP=1` (per-stage rms/max/first),
 `PF_Q4_BIN=<path>` (dump one stage's full f32 tensor; the layer/tag is chosen in
 `engine_q4exp.cpp`), `PF_Q4_PREFAULT=0` (skip the startup touch of the 71.7 GiB
-host-resident expert bank), `PF_Q4_NOPLE=1` (skip the PLE module - diagnostic
-only, it changes the model),
+host-resident expert/PLE/indexer pages that feed the bank), `PF_Q4_NOPLE=1`
+(skip the PLE module - diagnostic only, it changes the model),
 `PF_MTP_STEPS=1` (per-depth MTP acceptance: reach[j] = the fraction of cycles
 that accepted >= j drafts, which is how one tells a geometric decay from a
 draft-state bug), `PF_MTP_DSTEP=1` (per-stage time of one draft step),
@@ -2955,33 +3198,41 @@ whose quantization type differs), `PF_MOE_REFDUMP_LAYER=<L>`,
 how many experts fit one row tile - see "The routed-pair histogram" below),
 `TEST_MOE_RESIDENT` runs the stage tests through the split.
 
-**Expert GEMM selection** (routed-MoE models only): `PF_MOE_DP4A` (**default
-on** - the grouped dp4a expert GEMM; `=0` restores the fp32 dequant experts,
-measured 248.2 vs 851.8 t/s pp512 on the 35B A3B with an identical argmax, see
-*Measured results*), `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` (tile shape `M x C x NSG` of
-`moe_grp_impl`, plus the `HOIST` A/B in cases 16-21, selected **per projection** -
-gate+up is `FUSE==2` and reads `PF_MOE_CFG`, down is `FUSE==1` and reads
-`PF_MOE_CFG_DOWN`; the defaults are `M=8 C=2 NSG=16` for both, and
-`dev/bench_grp` is the sweep - cases 40-57 are the register-budget sweep).  Note that
-`dev/grp_min` drives the **down** path, so exactness runs must set
-`PF_MOE_CFG_DOWN` - that is how a staged kernel under test once read as exact.
-`PF_MOE_FLAT` / `PF_MOE_FLAT_DOWN` (put the row tile in the grid - one
+**Expert GEMM selection** (routed-MoE models only): `PF_MOE_DP4A` (**default:
+the queue's device profile `moe.dp4a`, on** - the grouped dp4a expert GEMM;
+`=0` restores the fp32 dequant experts, measured 248.2 vs 851.8 t/s pp512 on
+the 35B A3B with an identical argmax, see *Measured results*), `PF_MOE_CFG` /
+`PF_MOE_CFG_DOWN` (tile shape `M x C x NSG` of `moe_grp_impl`, plus the `HOIST`
+A/B in cases 16-21, selected **per projection** - gate+up is `FUSE==2` and
+reads `PF_MOE_CFG`, down is `FUSE==1` and reads `PF_MOE_CFG_DOWN`; the default
+is the queue's device profile `moe.cfg_gate`/`cfg_down`, **case 43 =
+`M=8 C=2 NSG=16`** on the A770, and `dev/bench_grp` is the sweep - cases 40-57
+are the register-budget sweep).  Note that `dev/grp_min` drives the **down**
+path, so exactness runs must set `PF_MOE_CFG_DOWN` - that is how a staged
+kernel under test once read as exact.
+`PF_MOE_FLAT` / `PF_MOE_FLAT_DEC` (put the row tile in the grid - one
 work-group = one tile - instead of looping it inside an (expert, column block)
-work-group; the trade is not uniform, see *Measured results*),
+work-group; defaults are the profile's `moe.flat`/`flat_dec`: 1 for prefill, 0
+for decode, where the preset upper bound would launch surplus work-groups; the
+trade is not uniform, see *Measured results*),
 `PF_MOE_PERSIST` (replace the grid with `2 * compute_units` work-groups that
 work-steal `(expert, row tile, column block)` triples off an atomic cursor, with the
 item total summed on the device; **exact at every configuration, and 3% SLOWER -
 refuted, see *Measured results*, so leave it off**), `PF_MOE_PERSIST_WG` (its grid,
 default `2 * compute_units`), `PF_MOE_GRPDBG` prints the resolved tile and grid and is the assertion on the
-tile selection path; `PF_DNNL_FPMATH` (widen the oneDNN int8/u4 matmul's accumulation to `fpmath_mode::any,true`; a guard against the K >= 5376 NaN the A770 library records, **default off** because no model here reaches it and it measures neutral), `PF_MOE_DP4A_DEC` (run the grouped dp4a expert GEMM on a DECODE step too;
-**default ON**, because the decode now has its own tile - the old "decode is the
-wrong shape for it" verdict was measured with the PREFILL's M=8 tile and a
-batched decode was never even on the decode branch, see *Decode: the grouped
-expert GEMM had the PREFILL's tile* section under *Measured results*; `=0`
-restores the fp32 dequant experts),
-`PF_MOE_CFG_DEC` (the DECODE's tile, 0 = auto: one row per expert for a
-single-token decode and two for a batched one, because the weight re-read factor
-is `ceil(p_e/M)`; a non-zero value forces that tile for both projections),
+tile selection path (`moe_grp_tile_rows()` is the same resolver the
+`PF_MOE_HIST` schedule model calls, so a diagnostic and the dispatch cannot
+disagree about M); `PF_DNNL_FPMATH` (widen the oneDNN int8/u4 matmul's accumulation to `fpmath_mode::any,true`; a guard against the K >= 5376 NaN the A770 library records, **default off** because no model here reaches it and it measures neutral), `PF_MOE_DP4A_DEC` (run the grouped dp4a expert GEMM on a DECODE step too;
+**default: the profile's `moe.dp4a_dec`, on**, because the decode now has its
+own tile - the old "decode is the wrong shape for it" verdict was measured with
+the PREFILL's M=8 tile and a batched decode was never even on the decode
+branch, see *Decode: the grouped expert GEMM had the PREFILL's tile* section
+under *Measured results*; `=0` restores the fp32 dequant experts),
+`PF_MOE_CFG_DEC` (the DECODE's tile, profile `moe.cfg_dec`, 0 = auto: one row
+per expert for a single-token decode and two for a batched one, because the
+weight re-read factor is `ceil(p_e/M)`; a non-zero value forces that tile for
+both projections; the env is read with a `-1` sentinel because 0 is itself a
+measured value),
 `PF_MOE_GRP_MIN_TOK` (prefill chunk size below which the
 grouped kernel declines, default 8), `PF_MOE_DQ2` (halves the dequant
 arithmetic with every load unchanged - **wrong results by design**, and the

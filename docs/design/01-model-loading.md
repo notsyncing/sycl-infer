@@ -124,12 +124,17 @@ map_base
 
 ---
 
-## 3. 架构注册表
+## 3. 架构注册表与模型 profile
 
 ```cpp
-// model_arch.h:17-30
-struct loader { const char *name; void (*load)(model & m); };
-const loader * find(const std::string & name);
+// model_arch.h
+struct loader {
+    const char *name;              // general.architecture 的精确值
+    void (*load)(model & m);       // 填 hparams + 绑定该架构的张量
+    const model_profile *prof;     // 声明式策略；key 必须等于 name
+};
+const loader * find(const std::string & name);   // 未知返回 nullptr
+const loader * registry(size_t & n);             // 整张表，给 PF_MODEL_INFO / 测试用
 void load_qwen35(model & m);
 void load_qwen35moe(model & m);
 void load_qwen4exp(model & m);
@@ -137,24 +142,65 @@ wt bind_tensor(const gguf_file & f, const std::string & name, uint32_t expect_ty
 const float * bind_f32(const gguf_file & f, const std::string & name);
 ```
 
-`model.cpp` 中的静态表：
+`model.cpp` 中的静态表（每一行同时给出 loader 和它的 profile）：
 
 ```cpp
 static const loader kLoaders[] = {
-    {"qwen35",     &load_qwen35},
-    {"qwen35moe",  &load_qwen35moe},
-    {"qwen4exp",   &load_qwen4exp},
+    {"qwen35",     &load_qwen35,     &kQwen35Profile},
+    {"qwen35moe",  &load_qwen35moe,  &kQwen35MoeProfile},
+    {"qwen4exp",   &load_qwen4exp,   &kQwen4ExpProfile},
 };
 ```
 
-`arch::find`（`model.cpp:50-57`）线性扫这张表，返回 `nullptr` 表示未知架构。
+`arch::find` 线性扫这张表；`model::load` 从命中的行拿到 `model::prof`。
 
-`model::load(path)`（`model.cpp` 的 `model::load`）：
+### 3.1 模型 profile（`src/model/model_profile.h`）
+
+每个架构一个完整的 const，放在 `src/model/profiles/<arch>.cpp`（`generic.cpp`
+同时定义 `kQwen35Profile` / `kQwen35MoeProfile`，`qwen4exp.cpp` 定义
+`kQwen4ExpProfile`），字段分五组：
+
+| 组 | 内容 |
+|---|---|
+| 身份 | `key`（精确的 `general.architecture`）、`name`、`provenance` |
+| `fwd` | `generic_plan`（共享 `seg_plan`/`record_forward`）或 `hc_ple_qsa`（qwen4exp 自己的 `q4_forward`） |
+| `residual` / `extras` | hyper-connection 的 streams/low rank；PLE、QSA 的 top_k/pool/indexer 几何 |
+| `policy` | decode 行数上限、prefill 方式（chunk32/whole_prompt）、prefix cache 能否表示该 state、auto layer map、多设备 K-split、engram 默认值 |
+| `rep` / `spec` / `moe` | 权重表示能力（SIn/oneDNN/raw GGUF/逐张量上传）、机制能力（MTP/DFlash/MM + 一个 `why`）、routed expert owner（engine cache / runtime bank / host only） |
+
+**边界**：按卡实测的 tuning 属于 device profile（[03-kernels.md §1.3](03-kernels.md)），
+不属于这里。某个**文件或运行**的属性也不属于这里：per-layer expert plane 大小、
+bank/VRAM budget、KV 类型、layer map、`TB` 桶和 prefill chunk 大小。profile 里放
+这些会让同一个架构的另一个文件拿到错误的 stride。
+
+`model.h` 另有一个 `arch_profile`（目前只有 `mm_model_prefill`），由 loader 设置：
+它不是策略表，而是“这个 forward 要求通用驱动怎么调用它”的能力位（qwen4exp 的媒体
+prompt 必须走模型自己的 chunker）。`model::prof` 是策略，`model::profile` 是前向能力，
+两者都由 `model::load` 在 loader 之后可见。
+
+**精确 key，不做模糊匹配。** `model::load` 在调用 loader 前要求注册行、profile
+指针存在，且 `prof->key` 与 GGUF 的 `general.architecture` 逐字节相同；不满足就抛
+`architecture ... has no model profile` / `model profile key mismatch: ...`，而不是
+退回别的架构的策略。`arch::registry(n)` 暴露同一张表，`PF_MODEL_INFO=1` 用它打印
+解析出的 profile、policy、权重表示、能力（含 `why`）和 provenance。
+**没有 `PF_MODEL_PROFILE` pin**：卡名由驱动报告，GGUF 的架构键由文件自己声明；钉住
+模型策略会让一个文件按另一个架构的假设执行。env/CLI 覆盖的是 profile 的**默认值**
+（`--engram-ram-mb`、`--layer-map`、`PF_SCHED_MAX_DECODE`），不是能力：
+`policy.prefix_cache == false` 不能被 `PF_PREFIX_CACHE=1` 打开，
+`spec.mtp == false` 会打印 `[mtp] <key>: <why> - MTP disabled` 并保持关闭，
+`policy.md_splits == true` 时 `PF_MD_SPLITS=0` 也不会关掉 split。
+
+`model::load(path)`：
 
 1. `gguf.load(path)`；
 2. 若存在 `tokenizer.chat_template` 则拷进 `model::chat_template`（空表示 GGUF 未携带）；
 3. 读 `general.architecture`（缺失按空串处理），`arch::find`；未知抛 `unsupported architecture: <name>`；
-4. 调用加载器填充 `hp`、绑定张量、构建 `layers`。
+4. 校验 profile 存在且 key 精确匹配，设 `model::prof`；
+5. 调用加载器填充 `hp`、绑定张量、构建 `layers`；
+6. `validate_hparams(hp, name)`；
+7. 在 `hparams::q4exp` / `model::q4exp` 仍存在期间，断言它们与
+   `prof->fwd == hc_ple_qsa` 一致（前向派发仍用这个 bool；M2 才把 walk 交给 runtime
+   对象），然后按 `PF_MODEL_INFO` 打印 profile。
 
 `model_context_length(path)`（`model.cpp` 的 `model_context_length`）是加载器之外唯一独立读 GGUF 的入口：它自己 `load()`
 一遍，只取 `<arch>.context_length`，**不构造 `model`**，因此可以在引擎之前用来给 `--ctx full` 定大小
@@ -162,7 +208,7 @@ static const loader kLoaders[] = {
 
 ### 3.2 加载期的几何校验（`validate_hparams`）
 
-`model::load` 在架构 loader 填完 `hp` 之后调用 `validate_hparams(hp, arch)`（`model.cpp:62-105`）。
+`model::load` 在架构 loader 填完 `hp` 之后调用 `validate_hparams(hp, arch)`（`model.cpp`）。
 **几何不满足 kernel 硬编码假设的 GGUF 在加载期被拒绝**，而不是"算错"或"算零"。
 
 原因不是精度而是内存安全：`attn.cpp` 的通用（非特化）注意力 kernel 用**字面量**
@@ -185,10 +231,16 @@ recurrent 层时 `d_state/n_group/dt_rank/conv_k > 0`。消息带架构名。
 
 1. 新建 `src/model/<arch>.cpp`，定义 `si::arch::load_<arch>(model & m)`（照抄 `qwen35.cpp` 结构），
    用 `arch::bind_tensor` / `arch::bind_f32` 绑定张量。
-2. 在 `model_arch.h` 声明，在 `model.cpp` 的 `kLoaders[]` 注册。
-3. 在 `CMakeLists.txt` 加入该 `.cpp`。`model::load` 自动分发；未知架构仍抛异常。
-4. 若该架构的几何超出 §3.2 的约束，先扩展 `validate_hparams` 并放宽对应 kernel——**不要**让一个
+2. 在 `src/model/profiles/<arch>.cpp` 定义该架构的 `model_profile`（§3.1），在
+   `model_profile.h` 里 `extern`；**`key` 必须逐字节等于注册名**。`qwen35`/`qwen35moe`
+   是两个 const，因为它们各自的 key 不同（精确匹配不允许共用一个 "generic" key）；
+   两个 rows 的 policy 由 `test_model_profile` 逐字段比较。
+3. 在 `model_arch.h` 声明 loader，在 `model.cpp` 的 `kLoaders[]` 注册（loader + profile）。
+4. 在 `CMakeLists.txt` 加入 loader 和 profile 两个 `.cpp`。`model::load` 自动分发；
+   未知架构仍抛异常，缺 profile 或 key 不匹配同样在加载期抛异常。
+5. 若该架构的几何超出 §3.2 的约束，先扩展 `validate_hparams` 并放宽对应 kernel——**不要**让一个
    不受支持的 head_dim 走到 kernel 里越界写内存。
+6. 新的 profile/值由 `tests/model/test_model_profile.cpp` 钉住；它不需要 GGUF 或 GPU。
 
 ---
 

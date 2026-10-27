@@ -78,37 +78,46 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
 
 ### 1.3 设备 profile：launcher 的形状从哪里来
 
-**规则：在一张卡上实测出来的常量不进使用点，进那张卡的 profile；使用点按名字问 `si::dev::active()`。**
-`profile` 结构在 `src/device/device_profile.h:52-138`，一张卡一个文件（`src/device/profiles/<card>.cpp`）
-加注册表一行（`src/device/device_registry.cpp:22-26`）——注册、选择与 fallback 机制见
+**规则：在一张卡上实测出来的常量不进使用点，进那张卡的 profile；使用点在 launcher 里按
+它即将提交的队列问 `si::dev::for_queue(q)`（进程级诊断/启动路径才用 `si::dev::active()`）。**
+`profile` 结构在 `src/device/device_profile.h`，一张卡一个文件（`src/device/profiles/<card>.cpp`）
+加注册表一行（`src/device/device_registry.cpp` 的 `kDevices[]`）——注册、选择与 fallback 机制见
 [architecture.md](../architecture.md)，这里只讲 kernel 这一侧怎么取值。
 
 | 组 | 字段 | 读点 | 作用 |
 |---|---|---|---|
 | `shape.*` | `rmsnorm_wg` | `rmsnorm_launch`（`gpu/kernels/rmsnorm.cpp`） | 每行一个工作组；选 1024/512/256/128 哪个实例化 |
-| | `gemv_rows_per_wg` | `gpu/kernels/gemv.cpp:219` | 向量化 decode GEMV 每组的行数 |
+| | `gemv_rows_per_wg` | `gpu/kernels/gemv.cpp`（向量化 decode GEMV） | 向量化 decode GEMV 每组的行数 |
+| | `w4_rows_per_wg` | `w4_gemv.cpp` 的 `w4_rb_for(q)` | u4 / i8-grouped / cb4 decode GEMV 的 `RB`（每工作组行数）；只有 8/16/32 实例化，其他值夹到最近的一档 |
+| | `q8_rows` / `f32_rows` | `gemv.cpp` 的 Q8_0 / F32 窄形状 split 判据 | 输出行数低于该值才 K-split；高于它通用（不切）kernel 更快 |
 | | `gdn_cols` / `gdn_warps_per_wg` / `gdn_vec_max_rows` | `gdn_launch` 里读 `gdn_cols`/`gdn_warps_per_wg`/`gdn_vec_max_rows` 处（`gpu/kernels/gdn.cpp`） | GDN 每 warp 的状态行数、每组 warp 数、float4 变体的 `n_real` 门槛 |
-| `occ.*` | `warps_per_eu_x2` | `engine.cpp:245` | decode attention 的 K-split：`dec_splits = (wpe/2)*EUs/n_head`，向下取 8 的倍数、下限 8、上限 `kMaxDecSplits` |
-| `split.*` | `gemv_rows` / `max` | `dp4a_gemv_launch` 读 `split.gemv_rows`/`split.max` 处 | decode GEMV：`N <= 2*gemv_rows` 时切 K，`S = ceil(gemv_rows/N)`，上限 `max` |
+| `occ.*` | `warps_per_eu_x2` | `engine.cpp`（decode split 推导处） | decode attention 的 K-split：`dec_splits = (wpe/2)*EUs/n_head`，向下取 8 的倍数、下限 8、上限 `kMaxDecSplits` |
+| `split.*` | `gemv_rows` / `max` | `dp4a_gemv_launch` 读 `split.gemv_rows`/`split.max` 处 | decode GEMV：`N <= 2*gemv_rows` 时切 K，`S = ceil(gemv_rows/N)`，上限 `max`；`max` 同时是 Q8_0/F32 窄形状 split 的 WPR |
 | | `gemm_rows` / `max` | `dp4a_gemm_launch` 读 `split.gemm_rows`/`split.max` 处 | 同上，prefill row GEMM（仅 `TB==32 && N<=8192`） |
-| `slm.*` | `budget_bytes` | `w4_gemv.cpp:153/277/509/625/788` | staging tile 的 `fits(RB)` 判据；48 KB 是在 64 KB 硬件上限下的**主动预留** |
-| `attn.*` | `vec` / `dec_group` | `gpu/kernels/attn.cpp` / `gpu/kernels/attn.cpp` 的 `dec_group_env` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
-| | `xmx` / `xmx_min_keys` | `attn_xmx.cpp` / `attn_xmx.cpp` 的 `xmx_min_keys` | oneDNN prefill attention 开关与键数门槛 |
-| | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp` 里读 `xmx_gather_red`/`xmx_gather_red_max` 处 | gather 一级 max 归约的工作组数与上限 |
-| | `split_keys` | `engine_graph.cpp:1096-1101`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
-| `wt.*` | `w4` / `k5` / `cb4` | `engine.cpp:1132` / `1138` / `1143` | 原生 u4 / 5-bit / codebook 存储的默认 |
-| `hw.*` | `compute_units` | `engine.cpp:241` | SYCL 查不到 EU 数时的兜底 |
+| `slm.*` | `budget_bytes` | `w4_gemv.cpp` 的 `fits(RB)` 判据 | staging tile 的 `fits(RB)` 判据；48 KB 是在 64 KB 硬件上限下的**主动预留** |
+| `moe.*` | `cfg_gate` / `cfg_down` / `cfg_dec` | `moe.cpp` 的 `moe_cfg_for(q, down, dec)` | 分组 expert GEMM 的 tile case（寄存器预算 sweep 的编号）；`cfg_dec = 0` 是 auto（单 token 一行、批式两行） |
+| | `flat` / `flat_dec` | `moe_grp_gate_up_launch` 的 `profile_flag` | 行 tile 放进 grid（prefill / decode） |
+| | `dp4a` / `dp4a_dec` | `engine_graph.cpp` 的 `moe_call`（按本层队列解析） | 分组 dp4a expert GEMM（prefill / decode） |
+| | `upload_ring` / `pf_wmin` | `engine_q4exp.cpp` 的 `q4_upload_init` / 两遍 prefill | qwen4exp 的 pinned expert-upload ring 槽数、两遍 prefill 的最小 workspace |
+| `attn.*` | `vec` / `dec_group` | `gpu/kernels/attn.cpp` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
+| | `xmx` / `xmx_min_keys` | `attn_xmx.cpp` | oneDNN prefill attention 开关与键数门槛 |
+| | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp` | gather 一级 max 归约的工作组数与上限 |
+| | `split_keys` | `engine_graph.cpp`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
+| `wt.*` | `w4` / `k5` / `cb4` | `engine.cpp` | 原生 u4 / 5-bit / codebook 存储的默认 |
+| `hw.*` | `compute_units` | `engine.cpp` | SYCL 查不到 EU 数时的兜底 |
 | | `max_work_group_size` | `device_registry.cpp` 的 `max_wg` 兜底 | `wg_clamped()` 的兜底 |
 
 四条规矩：
 
 1. **env 覆盖 profile，profile 值才是实测的那个**：一律写成 `e ? atoi(e) : dp.<field>`（如
-   `attn.cpp:20`），顺序不要反——一个从未被实测过的 env 默认值就是 bug。
+   `attn.cpp`），顺序不要反——一个从未被实测过的 env 默认值就是 bug。注意 `profile_int()`
+   会把 env 的 `0` 当成"未设置"；`moe.cfg_dec`（0 = auto）和 `PF_Q4_F32_SPLIT`（0 = off）
+   这类字段要读原始 env 并用 `-1` 哨兵，否则显式的 0 永远无法表达。
 2. **`shape.rmsnorm_wg` 是硬件差异，不是调优**。A770 接受 1024 线程的工作组，Iris Xe 只接受 512，
    无条件 1024 的 kernel 在后者上**根本 launch 不了**。`si::dev::wg_clamped()`
    （`device_registry.cpp` 的 `wg_clamped_for_queue`）把 profile 想要的宽度减去设备真实上限再取整到 32 的倍数，于是未知卡
    拿到的是更小的 kernel 而不是一次 launch 失败。
-3. **work-group 宽度必须是模板参数**（`rmsnorm_impl<WG>`，`rmsnorm.cpp:26-65`）：SYCL kernel 不能捕获
+3. **work-group 宽度必须是模板参数**（`rmsnorm_impl<WG>`）：SYCL kernel 不能捕获
    运行时初始化的全局量，而宽度本来就是**每卡编译期**的量；模板化还让 strided 载入循环能被展开
    （`n_embd=5120` 时 1024 线程把串行载入从 20 次降到 5 次）。
 4. **永远不要在 kernel launcher 里查设备。** `rmsnorm_launch` 每次 launch 都调 `wg_clamped()`，而
@@ -117,13 +126,20 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
    所以它在 decode 数字里隐形、在推测 cycle 里主导。查询只做一次（函数内 static，
    `device_registry.cpp` 的 `for_queue`），修好后 verify 221 → 85 ms、cycle 255 → 107 ms。
 
-**每张卡必须自己写全，包括 provenance。** `arc_a770.cpp` 的 `.provenance` 串（19-26 行）与逐字段注释给出
+**`moe_grp_tile_rows(q, down, dec)` 是 tile 的公共解析器。** `moe_grp_go` 的 dispatch 和
+`engine_graph` 的 `PF_MOE_HIST` 调度模型都调它，因此诊断打印的 M 与实际 kernel 用的 M 不会
+分叉。它只用于诊断/代价模型，不改变 dispatch 本身。
+
+**每张卡必须自己写全，包括 provenance。** `arc_a770.cpp` 的 `.provenance` 串与逐字段注释给出
 了测量条件（1-2x A770 16 GB、512 EU、`--layer-map 0-31:gpu.0,32-63:gpu.1`、attn+combine 在 64k 深度下
 nsp 64/128/144/160/168/176 → 3.05/2.18/1.75/1.70/1.74/2.68 ms 等）。`iris_xe.cpp` 里绝大多数字段标
 **INHERITED**：两卡同属 Xe-LP，所以 8-warp/EU 的子组格子相同，但**最优点没有重扫**——原因写在
-`iris_xe.cpp:24-32`，这类集成卡与 host 共享内存，本地未跟踪的压测工具（`dev/` 在 `.gitignore` 中）
-`bench_attn27 --dec-only` 在有负载的机器上同一配置三次重复给出 2.1-4.4 ms，噪声大于效应。未测量要写出来，
-不要假装测过。同一个值、两份相反的证据，正是这个拆分存在的理由（`attn.dec_group` 见 §7.4）。
+`iris_xe.cpp`，这类集成卡与 host 共享内存，本地未跟踪的压测工具（`dev/` 在 `.gitignore` 中）
+`bench_attn27 --dec-only` 在有负载的机器上同一配置三次重复给出 2.1-4.4 ms，噪声大于效应。
+**`moe.*` 全组和 `shape.w4_rows_per_wg` / `q8_rows` / `f32_rows` 也是 INHERITED 且未在 Iris Xe
+上测量**：expert tile 的约束（每 lane 寄存器）同属 Xe-LP，但选 M=8 的带宽/占用平衡在集显上不
+一样，K-split 的行门槛还随 EU 数缩放。未测量要写出来，不要假装测过。同一个值、两份相反的证据，
+正是这个拆分存在的理由（`attn.dec_group` 见 §7.4）。
 
 ### 1.4 kernel 相关环境变量（`AGENTS.md#environment-variables` 的子集）
 
@@ -141,7 +157,13 @@ nsp 64/128/144/160/168/176 → 3.05/2.18/1.75/1.70/1.74/2.68 ms 等）。`iris_x
 | `PF_GEMM_SPLIT` / `PF_GEMM_WG` / `PF_GEMM_SG` / `PF_GEMM_XSLM` | 0（自动）/ 128 / 16 / off | K-split row 路径（§5.3） |
 | `PF_MT_R` / `PF_MT_R2` / `PF_MT_TB` / `PF_MT_WG` / `PF_MT_WG2` / `PF_MT_PF` / `PF_MT_SLM` | 2 / - / 16 / 128 / 128 / off / off | M-tiled 变体（§5.3） |
 | `PF_DEC_R` | 1 | oneDNN int8 权重解码 GEMV 每子组行数（§5.2） |
-| `PF_W4_RB` | 0（自动 16） | u4 / w2 / i8 各 GEMV 的 `RB` 覆盖（k5、cb4 只按 `fits()` 选） |
+| `PF_W4_RB` | 0（= profile 的 `shape.w4_rows_per_wg`，16） | u4 / i8-grouped / cb4 GEMV 的 `RB` 覆盖；只有 8/16/32 可用 |
+| `PF_Q4_GEMV8_SPLIT_ROWS` / `PF_Q4_GEMV8_WPR` | profile `shape.q8_rows` (512) / `split.max` (8)；`-1` = profile | Q8_0 窄形状 K-split 的行门槛与 WPR |
+| `PF_Q4_F32_SPLIT` | profile `split.max` (8)；`-1` = profile，`0` = off | F32 窄形状 K-split 的 WPR |
+| `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` / `PF_MOE_CFG_DEC` | profile `moe.cfg_gate`/`cfg_down`/`cfg_dec` (43/43/0) | 分组 expert GEMM 的 tile case；`_DEC` 的 0 = auto |
+| `PF_MOE_FLAT` / `PF_MOE_FLAT_DEC` | profile `moe.flat`/`flat_dec` (1/0) | 行 tile 放进 grid（prefill / decode） |
+| `PF_MOE_DP4A` / `PF_MOE_DP4A_DEC` | profile `moe.dp4a`/`dp4a_dec` (1/1) | 分组 dp4a expert GEMM（prefill / decode） |
+| `PF_Q4_PF_WMIN` | profile `moe.pf_wmin` (24)；`-1` = profile | qwen4exp 两遍 prefill 的最小 workspace |
 | `PF_W4_GEMM_MAXM` / `PF_W4_GEMM_U` / `PF_W4_GEMM_TN` | 1 / 1 / 0 | 旧版 `w4_gemm_launch` 的 A/B（§5.8 末尾） |
 | `PF_NAT` | on | 关掉 `nat_gemm_launch`（§5.8） |
 | `PF_ATTN_VEC` / `PF_ATTN_FUSE` / `PF_ATTN_FLASH` / `PF_ATTN_WAIT` | on / on / off / off | attention 变体（§7） |

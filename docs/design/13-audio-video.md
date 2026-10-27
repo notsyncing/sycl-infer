@@ -197,6 +197,23 @@ max_video_frames)`（`mm_build_prompt_mixed_device`，声明在 `multimodal.h`�
 `346-382`）用于单媒体测试与主机参考路径；device 版本 `..._video_device` /
 `..._audio_device`（`multimodal.cpp:301-316`、`384-420`）与混合版等价，只是媒体种类单一。
 
+### 4.3 引擎侧：共用切片与模型自有 prefill
+
+三种媒体在引擎侧完全同构：`mm_write_step(mm, pos, n, section_stride, mrope, img_row)` 把
+扩展后 prompt 的 `[pos,pos+n)` 逐 token 切进 `step_info`（section-major；`pos` 是
+prompt-token 索引，不是 RoPE 位置），所以一个视频/图像块跨 prefill chunk 时不会移动位置或
+嵌入行。通用 `generate_impl` 按 `kMaxT` 逐块调用 `prefill_chunk` 并使用这个切片。
+
+`arch_profile.mm_model_prefill` 为真时（qwen4exp 的 loader 置位），引擎改走
+`q4_prefill_mm(*mm, 0)`：整个扩展后的 prompt 进入 `q4_prefill_common`，full `kMaxT` 行
+走 mode 2、尾行走 mode 1，每块仍用 `mm_write_step` 切片。对文本 prompt（`mm == nullptr`）
+这个函数就是原来的 `q4_prefill_text` 路径，**文本输出逐位不变**；媒体 prompt 则让专家
+bank/PLE/QSA 与文本 prefill 共用同一条 forward，而不是每 32 token 重新上传专家。
+`generate_mm` 用 `mm_prompt::has_encoded_embd()` 拒绝“有媒体行但没有编码器输出”的
+prompt；decode 侧 `engine::mm_decode_rope_` 让模型自有的 decode 入口保留每步 M-RoPE 行
+（qwen4exp 的 `q4_forward` 会 reset `step_info`），纯文本/`reset_state` 清掉。
+切片本身由 `tests/mm/test_mm_step.cpp` 覆盖（无模型、无 GPU）。
+
 ## 5. 新增 GPU kernel（`at.cpp`）
 
 只有两块与视觉塔不同，其余全部复用 `vit_*`（文件头注释 `at.cpp:1-7`）：
@@ -238,6 +255,7 @@ max_video_frames)`（`mm_build_prompt_mixed_device`，声明在 `multimodal.h`�
 | `test_audio_prep` | 合成 1 kHz 正弦的 16-bit WAV → `mm_audio_decode_wav` round-trip → 样本数/采样率、mel 帧数与有限非零、截断 buffer 必须被拒（`test_multimodal.cpp:592-645`） |
 | `test_audio_kernels` | `at_conv1d`（stride 2 无 bias / stride 1 带 bias）与 `at_rope1d` 对照宿主参考，阈值 1e-5（`test_multimodal.cpp:647-753`） |
 | `test_audio_encoder` | 合成 mel + `argv[3]` 的音频 mmproj：host 输出形状 `n_out * audio_out_width`、host 嵌入有限非零、host vs device 最大差 `<= 5e-3 * max(1, max\|host\|)`；未给路径则 skip（`test_multimodal.cpp:758-812`） |
+| `test_mm_step` | 无模型：逐 token M-RoPE/`img_row` 切片、图像块跨 chunk、越界/过小 stride 抛错、`has_encoded_embd`（`tests/mm/test_mm_step.cpp`） |
 
 没有真实的音频 mmproj 权重时，音频端到端（真实语音）不能本地验证，测试以合成权重/skip 覆盖。
 视频解码已有 `test_multimodal --video-only`：内存合成 AVI 验证 chunk 边界、流选择、BGR/行填充和采样；

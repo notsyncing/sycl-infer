@@ -37,6 +37,12 @@
    自己的 matcher），`src/device/device_registry.cpp` 只按 SYCL 报告的设备名挑一份并缓存。
    没被认领的卡拿到 `key=unknown` 的 profile 并打印 WARNING，而不是静默继承上一张卡的调优。
    见 §11.3。
+9. **模型文件的架构策略属于 model profile，不属于散落的 `m.q4exp` 三元表达式**。forward 类型、
+   HC/PLE/QSA 几何、decode 行数、prefill 粒度、prefix cache 能否表示该 state、权重表示能力、
+   MTP/DFlash/MM 能力（含 `why`）和 routed expert 的 owner 都在
+   `src/model/profiles/<arch>.cpp`，由 loader registry 的精确 `general.architecture` key 选中。
+   按卡实测的 tuning 仍在 device profile；某个文件的 per-layer stride、budget、KV 类型和
+   layer map 不进任何 profile。见 §11.4。
 
 ---
 
@@ -126,6 +132,8 @@ src/backend/gpu/kernels/    kernels.h      公开启动 API + step_info + gemv_s
 src/model/      gguf.{h,cpp}       GGUF 解析 + mmap
                 model.{h,cpp}      通用加载/上传 + 绑定辅助
                 model_arch.h       架构注册表接口
+                model_profile.h    声明式模型策略（fwd/policy/rep/spec/moe）
+                profiles/<arch>.cpp 每个架构一份完整 profile（key/值/provenance）
                 qwen35.cpp         Qwen3.5 混合架构加载器
                 model_w8.cpp       SIn int8 权重副本的构建/释放
                 tokenizer.{h,cpp}  BPE 分词器
@@ -170,6 +178,7 @@ third_party/    httplib.h, json.hpp, minja/, unicode 表, stb_image.h
 classDiagram
     class engine {
         +model m
+        +const model_profile* mp_
         +tokenizer tk
         +sycl::queue q
         +step_info* d_info
@@ -181,11 +190,23 @@ classDiagram
     class model {
         +gguf_file gguf
         +hparams hp
+        +const model_profile* prof
+        +arch_profile profile
         +layer_t[] layers
         +mtp_layer_t mtp
         +bool has_mtp
         +void* dev_weights
         +load() upload() build_w8() page_out_host()
+    }
+    class model_profile {
+        +const char* key
+        +fwd_kind fwd
+        +residual_t residual
+        +extras_t extras
+        +policy_t policy
+        +rep_t rep
+        +spec_t spec
+        +moe_owner moe
     }
     class profile {
         +const char* key
@@ -196,6 +217,7 @@ classDiagram
         +shape_t shape
         +attn_t attn
         +wt_t wt
+        +moe_t moe
     }
     class scheduler {
         +sequence[] waiting active
@@ -205,8 +227,9 @@ classDiagram
         +serve(engine, config)
     }
     engine --> model
+    model --> model_profile : load 时按精确 key 选中
     engine --> tokenizer
-    engine --> profile : 启动时解析一次
+    engine --> profile : 每队列 for_queue(q)
     scheduler --> engine
     server --> scheduler
     server --> engine
@@ -214,9 +237,13 @@ classDiagram
 
 ### `si::model`
 静态权重：GGUF 的内存映射、解析出的超参数 `hparams`、每层 `layer_t`（张量视图）、整个 GGUF 的
-设备副本 `dev_weights`，以及可选的 SIn int8 权重副本。GGUF 若随模型附带一个 NextN 块
+设备副本 `dev_weights`，以及可选的 SIn int8 权重副本。`model::prof` 是 `model::load` 从
+`kLoaders[]` 行拿到的架构策略（`model_profile`，key 必须逐字节等于 `general.architecture`）；
+`model::profile`（`arch_profile`）是 loader 声明的、通用驱动要读的能力位，目前是
+`mm_model_prefill`（媒体 prompt 必须走模型自己的 chunker）。GGUF 若随模型附带一个 NextN 块
 （`qwen35.nextn_predict_layers`），它被绑成独立的 `mtp_layer_t mtp` 并置 `has_mtp = true`；
-没有它时 `--mtp` 会被引擎门控掉（§12）。见 [design/01-model-loading.md](design/01-model-loading.md)。
+没有它时 `--mtp` 会被引擎门控掉（§12）。见 [design/01-model-loading.md](design/01-model-loading.md)
+与 §11.4。
 
 ### `si::tokenizer`
 从同一个 GGUF 构建的 GPT-2 byte-level BPE 词表，含特殊 token id（`eos`/`eot`/`pad`/`im_start` 等）。
@@ -224,7 +251,9 @@ classDiagram
 
 ### `si::engine`
 系统的核心。持有 `sycl::queue`（**in_order**）、所有激活缓冲区、paged KV 池、递归状态、录制好的
-command graph、前缀缓存三层，以及可选的 MTP 草稿层与它自己的 KV 切片。对外提供两类 API：
+command graph、前缀缓存三层，以及可选的 MTP 草稿层与它自己的 KV 切片。`mp_`（`= m.prof`）是
+它读取策略的入口：prefix cache、auto layer map、`md_splits`、`md_int8`、MTP 能力、engram 默认和
+scheduler 的 decode 行数/prefill 粒度都从这里来；前向派发仍读 `m.q4exp`（M0+M1）。对外提供两类 API：
 
 * **批处理 API**（调度器使用）：`prefill_chunk`、`prefill_batch`、`decode_batch`、`fetch_logits`，
   调用者必须持有 `engine::mtx`。
@@ -236,8 +265,9 @@ HTTP 层与连续批处理层。一个 `engine` + 一个 `scheduler` 线程；ht
 等待输出队列。见 [design/09-server.md](design/09-server.md)。
 
 ### `si::dev::profile`
-进程内按 GPU 型号解析一次（`si::dev::active()`），把“在这张卡上量出来”的常量集中在一处，
-供 kernel launcher 与引擎读取（`si::dev::active().<group>.<field>`）。见 §11.3。
+把“在这张卡上量出来”的常量集中在一处，供 kernel launcher 与引擎读取。
+**launcher 里按它即将提交的队列问 `si::dev::for_queue(q)`**（多卡异构时每张卡拿自己的
+profile）；`si::dev::active()` 只用于进程级/启动路径（报告、默认值推导）。见 §11.3。
 
 ---
 
@@ -562,7 +592,8 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
   仍直放。`PF_MD_GRAPH_DEV=N` 可只录某一段做 A/B。`vf_graph_usable()`
   在上下文超出 `xmx_min_keys` 时放弃录制好的 verify 图（那时记录的 attention split 数已过期）。
 * 注意力 K-split 在层分裂路径上默认关闭（`n_splits = dec_splits = 1`，`PF_MD_SPLITS=1` 可 opt-in 回去做 A/B）；
-  **MTP draft 有自己独立的 split 上限** `mtp_splits`（`PF_MTP_SPLITS`，默认 `kMaxDecSplits`），
+  模型 profile 的 `policy.md_splits = true`（qwen4exp，它的 forward 自己推导 split）会保持开启，
+  此时 `PF_MD_SPLITS=0` 也关不掉；**MTP draft 有自己独立的 split 上限** `mtp_splits`（`PF_MTP_SPLITS`，默认 `kMaxDecSplits`），
   它按 KV 长度自行推导，单 token 在长 KV 上是固定 1-split 网格的最坏情况。
 
 这满足"dense 模型跨设备流水"的需求：混合模型（GDN + attention）同样可用，因为 GDN 层序号是**全局**的，
@@ -574,38 +605,75 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 
 | 文件 | 职责 |
 |---|---|
-| `src/device/device_profile.h` | `si::dev::profile` 结构体（`key`/`name`/`provenance` + `hw`/`occ`/`slm`/`split`/`shape`/`attn`/`wt` 六组取值）与注册表 API |
+| `src/device/device_profile.h` | `si::dev::profile` 结构体（`key`/`name`/`provenance` + `hw`/`occ`/`slm`/`split`/`shape`/`attn`/`wt`/`moe` 各组的取值）与注册表 API |
 | `src/device/profiles/<card>.cpp` | **一张卡的完整实现**：自己的 key、自己的取值、自己的 matcher。`arc_a770.cpp` / `iris_xe.cpp` |
-| `src/device/device_registry.cpp` | `kDevices[]`（匹配顺序）、`for_name()`、`unknown_profile()`、`active()`（进程内缓存一次）、`report()`、`wg_clamped()` |
+| `src/device/device_registry.cpp` | `kDevices[]`（匹配顺序）、`for_name()`、`unknown_profile()`、`active()`（进程内缓存一次）、`for_queue()`（每队列）、`report()`、`wg_clamped()` |
 
 规则（与 [AGENTS.md](../AGENTS.md) 的 "Device profiles" 一节一致）：
 
 * **属于 profile 的**：占用（`occ.warps_per_eu_x2`，决定 decode K-split）、SLM 预算（`slm`，原生
   权重 GEMV 的 `fits()` 与 `nat_gemm` 的 `M*KT*APAD` tile 都按它 sizing）、填机器的 split 阈值
-  （`split`）、每 kernel 形状（`shape`，含 gather 归约 work-group 数与 `attn.xmx_gather_red`）、
-  以及任何**开关的默认值**（`wt.w4` / `wt.k5` / `wt.cb4` / `attn.xmx` / `attn.dec_group` …）。
+  （`split`）、每 kernel 形状（`shape`，含 gather 归约 work-group 数、原生 GEMV 的
+  `w4_rows_per_wg` 与 Q8_0/F32 窄形状行门槛）、routed expert GEMM 的 tile case 与 grid/dp4a 门
+  （`moe.*`，含 qwen4exp 的 upload ring 与两遍 workspace）、`attn.xmx_gather_red`，以及任何
+  **开关的默认值**（`wt.w4` / `wt.k5` / `wt.cb4` / `attn.xmx` / `attn.dec_group` …）。
 * **留在代码里的字面量**：SYCL 本身就能报告、且不会因调优而改变的硬件事实（query 不可用时以 profile
   为 fallback），以及模型决定的量（`kBlockSize`、`kI8Q`、`kMaxT`/`kMaxB`、`head_dim`）。
+  **不属于 device profile 的**：`PF_Q4_TAIL_SKIP`（算法/质量取舍，每张卡同一个值）、
+  `--moe-vram-mb`（运行 budget）、`--cpu-threads`（主机 CPU 属性）、qwen4exp 的 decode 行数上限
+  （模型策略，在 model profile）、`TB` 桶与 prefill chunk（编译期容量/模型策略，像 `kMaxB` 和
+  `kMaxT`；放进按卡 profile 会让同一个二进制的内存足迹随卡变化），以及 QSA 的主机路径开关
+  （目前只在 A770 上量过，Iris Xe 没有测量前不进卡 profile）。
 * **env 覆盖 profile**：`env ? atoi(env) : profile` 的顺序要保留，profile 里放**被测量过**的那个值；
-  一个从没量过的 env 默认值就是 bug。
+  一个从没量过的 env 默认值就是 bug。`profile_int()` 把 env 的 0 当成“未设置”，所以 0 本身是
+  有效值的字段（`moe.cfg_dec` 的 auto、`PF_Q4_F32_SPLIT=0`）要用原始 env + `-1` 哨兵。
 * **`shape.rmsnorm_wg` 是硬件边界而不是调优**：A770 接受 1024 线程的 work-group，Iris Xe 只有 512，
   一颗无条件的 1024 线程 kernel 在后者上根本起不来。`wg_clamped(want)` 就是这个保护：profile 给出
-  **想要**的宽度，它减去硬件上限，未登记的卡拿到更小的 kernel 而不是启动失败。
+  **想要**的宽度，它减去硬件上限，未登记的卡拿到更小的 kernel 而不是启动失败。`shape.w4_rows_per_wg`
+  只有 8/16/32 三个实例，卡文件写别的值会夹到最近一档。
 
 选择与回退：
 
-* `si::dev::active()` 在进程内只解析一次（`device_registry.cpp` 的 `active()`）。
+* `si::dev::active()` 在进程内只解析一次（`device_registry.cpp` 的 `active()`）；
+  **每次 launch 取形状必须用 `si::dev::for_queue(q)`**，它按 `sycl::device` 句柄查缓存（0.039 µs，
+  `test_dev_resolve`），不会把整个进程钉在第一张卡上。
   `PF_DEVICE_PROFILE=<key>` 可以钉住某张卡的取值；CMake 的 `-DSYCL_INFER_AOT_PROFILE=<key>` 把它
   烘进 AOT 二进制的 `SI_FORCE_DEVICE_PROFILE`，运行期 env 仍然优先（这样烘好的二进制还能改指做 A/B）。
 * 没有 matcher 命中时回落到 `key = "unknown"` 的 profile：它是 `kDevices[0]` 的一份 struct 拷贝
-  （构建期拷贝，不会随被拷贝的那一行漂移），硬件事实清零，并打印一条 WARNING 说明应该去
-  `src/device/profiles/` 加文件（`device_registry.cpp` 的 `kDevices[]` 与 `for_name()`）。`PF_DEVICE_INFO=1`
-  在启动时把解析结果与 provenance 打出来。
+  （构建期拷贝，不会随被拷贝的那一行漂移，新字段也一样），硬件事实清零，并打印一条 WARNING 说明应该去
+  `src/device/profiles/` 加文件。`PF_DEVICE_INFO=1` 在启动时把解析结果、`moe`/`shape` 组与
+  provenance 打出来。
 * **每个值都必须写指定初始化器**（`.key = ...`、`.shape = {.rmsnorm_wg = ...}`），构建用
   `-Wall -Wextra`，漏写会告警而不是静默取默认值。
 * Iris Xe 的 profile 里大部分取值标了 `INHERITED`：两张卡都是 Xe-LP（8 warp/EU 的子组晶格相同），
   但最优点没有重扫——原因是集显与主机共享内存，而 decode split 微基准在机器负载下同一配置三次重复
-  返回 2.1-4.4 ms，噪声超过了效应本身。**未测量就要写出来**，不要暗示验过。
+  返回 2.1-4.4 ms，噪声超过了效应本身。**`moe.*` 全组和 `shape.w4_rows_per_wg` / `q8_rows` /
+  `f32_rows` 也是 INHERITED 且未在 Iris Xe 上测量**：expert tile 的寄存器约束同属 Xe-LP，但选 M=8
+  的带宽/占用平衡不同，K-split 行门槛还随 EU 数缩放。**未测量就要写出来**，不要暗示验过。
+
+### 11.4 模型 profile（架构策略）
+
+`src/model/model_profile.h` 声明结构，`src/model/profiles/<arch>.cpp` 给每个架构一个完整 const：
+
+| 字段组 | 内容 |
+|---|---|
+| 身份 | `key`（精确的 `general.architecture`）、`name`、`provenance` |
+| `fwd` | `generic_plan`（共享 `seg_plan`/`record_forward`）或 `hc_ple_qsa`（qwen4exp 自己的 walk） |
+| `residual`/`extras` | HC streams/low rank；PLE、QSA 的 top_k/pool/indexer 几何 |
+| `policy` | decode 行数上限、prefill 粒度、prefix cache 能否表示 state、auto layer map、多设备 K-split、engram 默认 |
+| `rep`/`spec`/`moe` | 权重表示能力、机制能力（MTP/DFlash/MM + `why`）、routed expert owner |
+
+选择是**精确 key**：`kLoaders[]` 每行带 `const model_profile *`，`model::load` 要求它非空且
+`prof->key` 与 GGUF 的 `general.architecture` 逐字节相同，否则在加载期抛错；没有
+`PF_MODEL_PROFILE` pin（模型文件自己声明架构）。`PF_MODEL_INFO=1` 打印解析结果与 provenance；
+`test_model_profile` 是无需模型/GPU 的注册表与取值测试。
+
+引擎的 policy 分支读 `engine::mp_`（`= m.prof`），不再用 `m.q4exp`：prefix cache、auto layer map、
+`md_splits`、`md_int8`、MTP 能力、engram 默认和 scheduler 的 decode 行数/prefill 粒度都从
+profile 来；前向派发仍读 `m.q4exp`（在 M0+M1 中与 `fwd == hc_ple_qsa` 断言一致），M2 才把 walk
+交给 runtime 对象。**model profile 与 device profile 的边界**：前者说“这是什么模型、允许用什么”，
+后者说“这张卡怎么跑它”；per-layer stride、budget、KV 类型、layer map、`TB` 桶和 prefill chunk
+属于文件/运行，不属于任何一个 profile。
 
 ---
 
