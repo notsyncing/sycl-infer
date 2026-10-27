@@ -698,7 +698,9 @@ static const bool moe_time_on = si::env::flag("PF_MOE_TIME");
 // moe_grp_impl and both are register-locality bugs rather than tuning - see the
 // "runtime-indexed arrays" note there, and AGENTS.md.
 // PF_MOE_DP4A=0 restores the fp32 dequant expert GEMMs.
-static const bool moe_grp_on = si::env::i32("PF_MOE_DP4A", 1) != 0;
+// The two gates are resolved per queue at the call site below (the default lives
+// in the card's device profile), not cached in a process-wide static: a
+// --layer-map may span two cards and each must run its own path.
 // Decode takes the fp32 dequant expert path by default.  The grouped dp4a kernel
 // is built for prefill's shape and decode is the wrong shape for it: a decode
 // step is n_tok = 1 with top_k = 8, so each selected expert contributes exactly
@@ -723,7 +725,6 @@ static const bool moe_grp_on = si::env::i32("PF_MOE_DP4A", 1) != 0;
 // size for work-group count and net zero.  What limits this shape is 16384 threads =
 // 512 warps = one warp per EU, and no tile shape reaches past it - which is also
 // why a split-K rewrite is not obviously the answer either.
-static const bool moe_grp_dec = si::env::i32("PF_MOE_DP4A_DEC", 1) != 0;
 // Prefill side: the kernel needs enough row tiles to fill the machine, which is a
 // function of the chunk's token count, not of the model.
 static const int moe_grp_min_tok = si::env::i32("PF_MOE_GRP_MIN_TOK", 8);
@@ -942,7 +943,13 @@ auto moe_call = [&](size_t idx) {
             // tile, N=16 137.43 against **130.50**, N=32 193.32 against
             // **191.64**, and N=1 53.95 against **37.69** with a one-row tile.
             const bool dec_step = (mode == 0);
-            const bool grp_want = dec_step ? moe_grp_dec : moe_grp_on;
+            // Per queue (this layer's device), env first then the card profile:
+            // a heterogeneous --layer-map must not run card 0's dp4a choice on
+            // card 1.  PF_MOE_DP4A / PF_MOE_DP4A_DEC remain the A/B overrides.
+            const si::dev::profile & mdp = si::dev::for_queue(qq);
+            const bool grp_want = dec_step
+                                      ? si::dev::profile_flag(qq, "PF_MOE_DP4A_DEC", mdp.moe.dp4a_dec != 0)
+                                      : si::dev::profile_flag(qq, "PF_MOE_DP4A", mdp.moe.dp4a != 0);
             bool grp_ok = grp_want && A.xq && !moe_host_split() && !on_cpu && (dec_step || n_tok >= moe_grp_min_tok);
             if (grp_ok) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
@@ -1024,9 +1031,15 @@ auto moe_call = [&](size_t idx) {
                     w32 += (i <= 32) ? h[i] : 0;
                     mx = std::max(mx, i);
                 }
+                // The tile the gate/up prefill GEMM actually resolves for this
+                // queue (env -> card profile), not the "cfg 43 means 8, anything
+                // else 16" guess this used to make: the schedule model below
+                // prices ceil(p/M) row tiles, so a wrong M mis-prices every
+                // makespan it reports.
+                const int tile_m = moe_grp_tile_rows(qq, /*down=*/false, /*dec=*/false);
                 double wtile = 0;
                 for (int i = 0; i <= hp.n_expert; i++) {
-                    if (h[i]) wtile += (double)h[i] * ((i + 15) / 16);
+                    if (h[i]) wtile += (double)h[i] * ((i + tile_m - 1) / tile_m);
                 }
                 // What the dispatched ORDER costs.  moe_grp_impl's grid is one
                 // work-group per (expert, column block) in the order `active[]`
@@ -1037,7 +1050,6 @@ auto moe_call = [&](size_t idx) {
                 // last as first.  Greedy list-schedule both orders over 512 slots
                 // (one per EU) and report the two makespans: that is the ceiling
                 // on fixing this, measured before writing the fix.
-                const int tiles_m8 = si::dev::profile_int(qq, "PF_MOE_CFG", 43) == 43 ? 8 : 16;
                 // NB: one work-group per (expert, COLUMN BLOCK), not per expert -
                 // nwg = N/RB, and every column block of an expert walks the same
                 // ceil(p/M) row tiles.  Getting that wrong makes the schedule look
@@ -1048,7 +1060,7 @@ auto moe_call = [&](size_t idx) {
                     std::vector<int> cost;
                     for (int i = 0; i < hn[0]; i++) {
                         const int p = hoff[hact[i] + 1] - hoff[hact[i]];
-                        const int t = (p + tiles_m8 - 1) / tiles_m8;
+                        const int t = (p + tile_m - 1) / tile_m;
                         for (int b = 0; b < nwg; b++) cost.push_back(t);
                     }
                     if (lpt) std::sort(cost.begin(), cost.end(), std::greater<int>());
@@ -1072,13 +1084,13 @@ auto moe_call = [&](size_t idx) {
                 const long perfect = (in_order.second + 511) / 512;
                 fprintf(stderr,
                         "[moe hist] n_tok=%d top_k=%d n_active=%d/%d mean=%.1f max=%d  <=8:%d <=16:%d <=24:%d "
-                        "<=32:%d  tiles16=%.0f (weight re-read x%.2f)\n",
+                        "<=32:%d  tiles=%.0f (weight re-read x%.2f)\n",
                         n_tok, k, hn[0], hp.n_expert, (double)wsum / std::max(1, tot), mx, w8, w16, w24, w32, wtile,
                         wtile / std::max(1, tot));
                 fprintf(stderr,
                         "[moe sched] M=%d nwg=%d  in-order makespan %ld tile-units, LPT %ld, perfect %ld  ->  LPT is "
                         "worth %.0f%% of the expert-GEMM time\n",
-                        tiles_m8, nwg, in_order.first, lpt.first, perfect,
+                        tile_m, nwg, in_order.first, lpt.first, perfect,
                         100.0 * (in_order.first - lpt.first) / std::max(1L, in_order.first));
                 for (int i = 0; i <= hp.n_expert; i++) {
                     if (h[i]) fprintf(stderr, "[moe hist]   pairs=%3d experts=%d\n", i, h[i]);

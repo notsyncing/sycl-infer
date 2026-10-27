@@ -20,6 +20,7 @@
 #include <stdexcept>
 
 #include "engine.h"
+#include "device/device_profile.h"
 #include "common/quant.h"
 #include "backend/cpu/cpu_types.h"
 
@@ -320,8 +321,14 @@ void engine::q4_upload_init(int nd, size_t max_plane) {
     }
     // 32 slots is ~5 decode layers of misses at the measured 6.3 copies/layer,
     // so the host can stay that far ahead of the device without ever stalling
-    // on a copy it issued for a layer that is still queued.
-    q4_up_slots_ = 32;
+    // on a copy it issued for a layer that is still queued.  The count is the
+    // card's measured default (profile.moe.upload_ring); a profile that says 0
+    // disables the ring and leaves the direct pageable copies.
+    const int ring = si::dev::for_queue(dev_queue(0)).moe.upload_ring;
+    if (ring <= 0) {
+        return;
+    }
+    q4_up_slots_ = ring;
     q4_up_stride_ = ((max_plane + 4095) / 4096) * 4096;
     const size_t bytes = (size_t)q4_up_slots_ * q4_up_stride_;
     q4_up_stage_.assign((size_t)nd, nullptr);
@@ -519,26 +526,29 @@ void engine::q4_alloc_banks() {
     if (budget == 0) {
         return;
     }
-    // The banked GPU MoE path is not output-correct for qwen4exp: with 7-10
-    // layers resident the model emits garbage while the all-host path answers
-    // correctly, and it reproduces with the host router, with either expert GEMM
-    // replaced by its generic fallback, and with both.  Do not ship it enabled
-    // until the banked path is diffed against the host one; PF_Q4_BANK=1 keeps
-    // the old allocation for that bisection.
+    // The banked GPU MoE path IS the default and it is output-correct.  The
+    // early "the model emits garbage with 7-10 layers resident" reading was
+    // two bugs, both fixed and both recorded in AGENTS.md: the banked branch
+    // fed moe_reduce_launch an accumulator (b.block) that still held the
+    // previous layer (the reduce accumulates, so it must be zeroed first), and
+    // the generic expert down read its rows at n_ff/256 instead of ceil(K/256),
+    // so every row after the first used the wrong weights.  PF_Q4_FFCMP gives
+    // cosine 0.999999 against the host FFN for a banked layer.  PF_Q4_BANK=0
+    // disables the bank and PF_Q4_BANK_LAYER=1 restores the old whole-layer
+    // allocation, both for the A/B.
     const char * bk = si::env::str("PF_Q4_BANK");
     if (bk && bk[0] == '0') {
         fprintf(stderr, "[q4] VRAM expert bank disabled by PF_Q4_BANK=0\n");
         return;
     }
     const int nd = multi_dev ? (int)backends_.size() : 1;
-    // The per-expert hot bank is experimental (PF_Q4_HOT=1): its host spill
-    // changes the arithmetic, which changes the next prefill's routing, so the
-    // calibrated set does not converge (see AGENTS.md).  The whole-layer bank is
-    // the default.
     // The per-expert LRU is the default: with the dedicated Q5_1 dp4a down it
     // is correct (GPU-vs-host acc cosine 0.99998) and faster than the
     // whole-layer bank (39.6 s against 45.5 on the 512-token prefill).
     // PF_Q4_BANK_LAYER=1 selects the whole-layer bank for A/B.
+    // (The *CPU-miss* spill, PF_Q4_CPU_MISS, is the experimental path that does
+    // not converge: it changes the arithmetic, which changes the next prefill's
+    // routing, so the calibrated set never settles - see AGENTS.md.)
     const bool layer_mode = si::env::flag("PF_Q4_BANK_LAYER");
     if (!layer_mode) {
         // Per-expert hot bank: R slots in every eligible GPU layer, chosen from
@@ -2201,7 +2211,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         // A minimum workspace keeps the number of rounds
                         // bounded when the bank is nearly all resident; giving
                         // up k residents costs k copies and saves a batch.
-                        const int wmin = std::max(1, std::min(R - 1, si::env::i32("PF_Q4_PF_WMIN", 24)));
+                        // The default is the card's measured value; the env is
+                        // a -1 sentinel so an explicit 0 still means "the
+                        // smallest workspace" (clamped to 1), the way the
+                        // plain env read this replaced behaved.
+                        static const int wmin_env = si::env::i32("PF_Q4_PF_WMIN", -1);
+                        const int wmin_cfg = wmin_env >= 0 ? wmin_env
+                                                          : si::dev::for_queue(DQ(dev)).moe.pf_wmin;
+                        const int wmin = std::max(1, std::min(R - 1, wmin_cfg));
                         const int k = (R - h < wmin) ? std::min(h, wmin - (R - h)) : 0;
                         const int kept_n = h - k;
                         std::vector<char> keep_e((size_t)E, 0);

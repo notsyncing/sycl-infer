@@ -24,6 +24,7 @@
 // GEMV reuses the buffers.  The sparse path (> top_k keys) still runs the
 // selector and the attention inline, before the layer's `wo`.
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -76,6 +77,26 @@ inline float f16r(float x) {
 int qsa_dump_layer() {
     static const int l = si::env::i32("PF_QSA_ATTN_LAYER", 0);
     return l;
+}
+
+// The QSA pool width: the reference pools `qsa.compress_ratio`
+// (`hp.idx_kpool`) raw keys per selector entry, so a model that pools 8 must
+// score one entry per 8-token block.  This file used to hardcode 4, which is
+// the shipped model's ratio and therefore invisible until another model
+// arrives: the wrong width still runs, it just selects the wrong key set.
+//
+// GREP GUARD: the pool geometry in this file is `kp` and nothing else - there
+// must be no `pos / 4`, `pos % 4`, `p * 4` or `4 * id` pool arithmetic left.
+// qsa_on_ already requires idx_kpool > 1; the 4 is the fallback for a
+// configuration that has no QSA metadata, where the selector is never reached.
+int qsa_pool_div(const hparams & hp) {
+    const int kp = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+    // A divisor below 2 pools nothing and makes `pos % kp` meaningless.  The
+    // fallback is 4, so this can only fire on a hand-built hparams - which is
+    // exactly the case an assert is for, and it keeps a future edit from
+    // quietly reintroducing a literal that disagrees with the metadata.
+    assert(kp >= 2 && "QSA pool divisor must come from hp.idx_kpool");
+    return kp;
 }
 
 } // namespace
@@ -183,6 +204,7 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
     const int id = hp.idx_head_dim, inh = hp.idx_n_head;
     const int kvd = hp.n_head_kv * hp.head_dim;
     const int n_embd = hp.n_embd;
+    const int kp = qsa_pool_div(hp);
     static const bool qtime = si::env::flag("PF_QSA_TIME");
     double q_t0 = qtime ? qsa_now_ms() : 0.0;
 
@@ -243,27 +265,34 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
                 sp->k.assign((size_t)qsa_max_seq_ * kvd, 0.f);
                 sp->v.assign((size_t)qsa_max_seq_ * kvd, 0.f);
             }
-            sp->pool.assign(((size_t)qsa_max_seq_ / 4 + 1) * id, 0.f);
-            sp->ring.assign((size_t)4 * id, 0.f);
+            sp->pool.assign(((size_t)qsa_max_seq_ / (size_t)kp + 1) * id, 0.f);
+            sp->ring.assign((size_t)kp * id, 0.f);
             sp->n_pool = 0;
         }
-        sp->n_pool = std::max(sp->n_pool, pos / 4); // complete groups before pos
-        float * ring = sp->ring.data() + (size_t)(pos % 4) * id;
+        sp->n_pool = std::max(sp->n_pool, pos / kp); // complete groups before pos
+        float * ring = sp->ring.data() + (size_t)(pos % kp) * id;
         for (int d = 0; d < id; d++) {
             ring[d] = f16r(kr[d]);
         }
-        if (pos % 4 == 3) {
-            float * pl = sp->pool.data() + (size_t)(pos / 4) * id;
+        if (pos % kp == kp - 1) {
+            float * pl = sp->pool.data() + (size_t)(pos / kp) * id;
+            // kp = 4 is the shipped model: the loop below accumulates in the
+            // same order and 1/4 is exact, so this is bit-identical to the
+            // old four-term sum.
+            const float inv_kp = 1.0f / (float)kp;
             for (int d = 0; d < id; d++) {
-                pl[d] = 0.25f * (sp->ring[(size_t)0 * id + d] + sp->ring[(size_t)1 * id + d]
-                                 + sp->ring[(size_t)2 * id + d] + sp->ring[(size_t)3 * id + d]);
+                float acc = sp->ring[(size_t)0 * id + d];
+                for (int j = 1; j < kp; j++) {
+                    acc += sp->ring[(size_t)j * id + d];
+                }
+                pl[d] = inv_kp * acc;
             }
             head_norm(pl, L.idx.k_norm, id, hp.rms_eps);
-            head_rope(pl, hp.n_rot, hp.rope_base, pos - 3);
+            head_rope(pl, hp.n_rot, hp.rope_base, pos - (kp - 1));
             for (int d = 0; d < id; d++) {
                 pl[d] = f16r(pl[d]);
             }
-            sp->n_pool = std::max(sp->n_pool, pos / 4 + 1);
+            sp->n_pool = std::max(sp->n_pool, pos / kp + 1);
         }
         if (update_mirror) {
             const float * ks = kh + (size_t)i * kvd;
@@ -392,8 +421,8 @@ void engine::qsa_devattn_ensure(int dev) {
     if (d.dev == dev && d.cap_keys > 0) {
         return;
     }
-    const int per = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
-    const int need_keys = hp.idx_top_k + per + 1; // selected pools' 4 keys + the incomplete tail
+    const int per = qsa_pool_div(hp);
+    const int need_keys = hp.idx_top_k + per + 1; // selected pools' `per` keys + the incomplete tail
     const int cap = ((need_keys + kBlockSize - 1) / kBlockSize) * kBlockSize;
     const int blocks = cap / kBlockSize;
     const int kvd = hp.n_head_kv * hp.head_dim;
@@ -493,7 +522,8 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     const int id = hp.idx_head_dim, inh = hp.idx_n_head;
     const int kvd = nkv * hd;
     const int gqa = nh / nkv;
-    const int n_pool_max = hp.idx_top_k / (hp.idx_kpool > 0 ? hp.idx_kpool : 4);
+    const int kp = qsa_pool_div(hp);
+    const int n_pool_max = hp.idx_top_k / kp;
     const int stride = hd * 2;
 
     auto is_cpu = [&](int d) { return multi_dev ? (dev_kind_[(size_t)d] == 1) : cpu_mode; };
@@ -692,7 +722,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         const double q_row0 = qtime ? qsa_now_ms() : 0.0;
         const qsa_slot_state & sp = *qsa_cache_[(size_t)a][(size_t)slot];
         const int n_vis = pos + 1;
-        const int n_pool_vis = n_vis / 4;
+        const int n_pool_vis = n_vis / kp;
         std::vector<int> sel;
         if (n_pool_vis <= n_pool_max) {
             sel.resize((size_t)n_vis);
@@ -734,13 +764,13 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                 }
             }
             std::sort(pools.begin(), pools.end());
-            sel.reserve(pools.size() * 4 + 3);
+            sel.reserve(pools.size() * (size_t)kp + (size_t)(kp - 1));
             for (int p : pools) {
-                for (int j = 0; j < 4; j++) {
-                    sel.push_back(p * 4 + j);
+                for (int j = 0; j < kp; j++) {
+                    sel.push_back(p * kp + j);
                 }
             }
-            for (int p = n_pool_vis * 4; p <= pos; p++) {
+            for (int p = n_pool_vis * kp; p <= pos; p++) {
                 sel.push_back(p);
             }
         }

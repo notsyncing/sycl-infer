@@ -56,19 +56,21 @@ void w4_split_act_launch(queue & q, const int8_t * axg, int8_t * axe, int8_t * a
 }
 
 namespace {
-// rows per workgroup for the u4 kernel; two f16 planes must fit in SLM.
-// PF_W4_RB overrides it for A/B (the SLM tile size trades staging coalescing
-// against occupancy: 2*RB*ng*2 bytes must fit the 48 KB budget).
-constexpr int kW4RB = 16;
-} // namespace
-
-static int w4_rb_override() {
-    static const int rb = [] {
-        const char * e = si::env::str("PF_W4_RB");
-        return e ? atoi(e) : 0;
-    }();
-    return rb;
+// Rows per workgroup for the native-weight decode GEMVs (u4, and the i8-grouped
+// and cb4 kernels that share the tile); two f16 planes must fit in SLM.  The
+// default is this queue's card profile (shape.w4_rows_per_wg); PF_W4_RB
+// overrides it for A/B (the tile trades staging coalescing against occupancy:
+// 2*RB*ng*2 bytes must fit the 48 KB budget).
+//
+// Only 8/16/32 are instantiated - the fit check picks between them - so a
+// profile that asks for another value is clamped to the nearest of the three
+// rather than reaching a template the kernel library cannot launch.
+int w4_rb_for(const queue & q) {
+    static const int env_rb = si::env::i32("PF_W4_RB", 0);
+    const int want = env_rb > 0 ? env_rb : si::dev::for_queue(q).shape.w4_rows_per_wg;
+    return want <= 8 ? 8 : (want <= 16 ? 16 : 32);
 }
+} // namespace
 
 template <int RB>
 static void w4_gemv_impl(queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
@@ -150,16 +152,14 @@ void w4_gemv_launch(queue & q, const uint8_t * vals, const uint16_t * scale, con
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int K, int N) {
     const int ng = K / 32;
-    const int ov = w4_rb_override();
-    const auto fits = [&](int rb) { return (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
-    if (ov == 8 && fits(8)) {
+    const int rb = w4_rb_for(q);
+    const auto fits = [&](int n) { return (size_t)2 * (size_t)n * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
+    if (rb == 8 && fits(8)) {
         w4_gemv_impl<8>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
-    } else if (ov == 32 && fits(32)) {
+    } else if (rb == 32 && fits(32)) {
         w4_gemv_impl<32>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
-    } else if (ov == 16 && fits(16)) {
+    } else if (fits(16)) {
         w4_gemv_impl<16>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
-    } else if (fits(kW4RB)) {
-        w4_gemv_impl<kW4RB>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
     } else {
         w4_gemv_impl<8>(q, vals, scale, off, axe, axo, asa, xs, out, out_stride, residual, alpha, K, N);
     }
@@ -506,16 +506,14 @@ void i8_grp_gemv_launch(queue & q, const int8_t * w8, const uint16_t * wsc, cons
                         const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha,
                         int K, int N) {
     const int ng = K / 32;
-    const int ov = w4_rb_override();
-    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
-    if (ov == 8 && fits(8)) {
+    const int rb = w4_rb_for(q);
+    const auto fits = [&](int n) { return (size_t)n * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
+    if (rb == 8 && fits(8)) {
         i8_grp_gemv_impl<8>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
-    } else if (ov == 32 && fits(32)) {
+    } else if (rb == 32 && fits(32)) {
         i8_grp_gemv_impl<32>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
-    } else if (ov == 16 && fits(16)) {
+    } else if (fits(16)) {
         i8_grp_gemv_impl<16>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
-    } else if (fits(kW4RB)) {
-        i8_grp_gemv_impl<kW4RB>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
     } else {
         i8_grp_gemv_impl<8>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
     }
@@ -786,9 +784,16 @@ void cb4_gemv_launch(queue & q, const uint8_t * idx, const uint16_t * lut16, con
                      const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha, int K,
                      int N) {
     const int ng = K / 32;
-    const auto fits = [&](int rb) { return (size_t)rb * (size_t)ng * sizeof(uint16_t) + 256 * 2 <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
-    if (fits(kW4RB)) {
-        cb4_gemv_impl<kW4RB>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
+    const int rb = w4_rb_for(q);
+    const auto fits = [&](int n) { return (size_t)n * (size_t)ng * sizeof(uint16_t) + 256 * 2 <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
+    if (fits(rb)) {
+        if (rb == 32) {
+            cb4_gemv_impl<32>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
+        } else if (rb == 8) {
+            cb4_gemv_impl<8>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
+        } else {
+            cb4_gemv_impl<16>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
+        }
     } else {
         cb4_gemv_impl<8>(q, idx, lut16, scale, xq, asa, xs, out, residual, alpha, K, N);
     }

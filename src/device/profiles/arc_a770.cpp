@@ -67,6 +67,15 @@ static const profile arc_a770 = {
         .gdn_cols = 2,
         .gdn_warps_per_wg = 8,
         .gdn_vec_max_rows = 2,
+        // MEASURED: 16 rows per work-group is the native-weight GEMV's default
+        // (the two f16 planes fit the 48 KB reserve at 16; PF_W4_RB 8/32 was
+        // swept as the A/B and both lose).
+        .w4_rows_per_wg = 16,
+        // MEASURED (qwen4exp): a Q8_0 GEMV splits K only below 512 output rows
+        // (the LM head's wide shape is faster unsplit) and an F32 GEMV below
+        // 128 (ssm_alpha/beta's 48 rows is the shape it exists for).
+        .q8_rows = 512,
+        .f32_rows = 128,
     },
 
     // MEASURED: a single work-group over the whole key block cost 18.1 ms of the
@@ -92,6 +101,25 @@ static const profile arc_a770 = {
         .dp4a = 1,
         .gemm_dnnl = 1,
         .dpas_in_gemm = 0, // measured 37x slower than dp4a in a real GEMM
+    },
+
+    // MEASURED (35B A3B / qwen4exp on 2x A770): cfg 43 is moe_grp_go's M=8
+    // C=2 NSG=16 tile, the best of the register-budget sweep and the best for
+    // both projections; the decode uses its own one/two-row tile (0 = auto).
+    // flat is the prefill grid (one work-group per row tile) and is off on a
+    // decode, where its host-side upper bound launches surplus work-groups.
+    // The upload ring (32 slots, ~5 layers of misses) and pf_wmin (24) are the
+    // measured qwen4exp defaults.
+    .moe = {
+        .cfg_gate = 43,
+        .cfg_down = 43,
+        .cfg_dec = 0,
+        .flat = 1,
+        .flat_dec = 0,
+        .dp4a = 1,
+        .dp4a_dec = 1,
+        .upload_ring = 32,
+        .pf_wmin = 24,
     },
 };
 

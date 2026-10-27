@@ -589,8 +589,14 @@ static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int
     // F32 narrow decode group (qwen4exp's ssm_beta/ssm_alpha): split the row
     // over WPR warps.  On by default; PF_Q4_F32_SPLIT=0 restores the generic
     // path (see the kernel comment for the measurement and the reassociation).
-    static const int f32_split = si::env::i32("PF_Q4_F32_SPLIT", 8);
-    if (TB == 1 && !cfg1 && type == 0 && total_rows <= 128 && f32_split > 0) {
+    // The row gate and the warp count are per-card tuning (profile.shape.
+    // f32_rows / split.max).  The env is read with a -1 sentinel rather than
+    // through profile_int: 0 is a real value here (off), and profile_int folds
+    // an env 0 into "unset".
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    static const int f32_split_env = si::env::i32("PF_Q4_F32_SPLIT", -1);
+    const int f32_split = f32_split_env >= 0 ? f32_split_env : dp.split.max;
+    if (TB == 1 && !cfg1 && type == 0 && total_rows <= dp.shape.f32_rows && f32_split > 0) {
         switch (f32_split) {
         case 2: gemv_dec_f32_split_kernel<2>(q, segs, n_segs, total_rows); return;
         case 4: gemv_dec_f32_split_kernel<4>(q, segs, n_segs, total_rows); return;
@@ -606,8 +612,13 @@ static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int
     // head) on the generic path.
     static const int g8_max_rows = si::env::i32("PF_Q4_GEMV8_MAX_ROWS", 1 << 30);
     if (TB == 1 && g8_on && !cfg1 && type == 8 && total_rows <= g8_max_rows) {
-        static const int g8_wpr = si::env::i32("PF_Q4_GEMV8_WPR", 8);
-        static const int g8_rows = si::env::i32("PF_Q4_GEMV8_SPLIT_ROWS", 512);
+        // Same rule as the F32 gate: the env is a -1-sentinel override so that
+        // 0 (never split) and 1 (one warp, i.e. the unsplit kernel) stay
+        // expressible; the default is this card's profile.
+        static const int g8_wpr_env = si::env::i32("PF_Q4_GEMV8_WPR", -1);
+        static const int g8_rows_env = si::env::i32("PF_Q4_GEMV8_SPLIT_ROWS", -1);
+        const int g8_wpr = g8_wpr_env >= 0 ? g8_wpr_env : dp.split.max;
+        const int g8_rows = g8_rows_env >= 0 ? g8_rows_env : dp.shape.q8_rows;
         static const int g8_rpw_env = si::env::i32("PF_Q4_GEMV8_RPW", 0);
         static const bool g8_scalar = si::env::flag("PF_Q4_GEMV8_SCALAR");
         if (g8_wpr > 1 && total_rows <= g8_rows) {

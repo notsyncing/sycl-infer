@@ -132,6 +132,20 @@ struct profile {
         int gdn_warps_per_wg;
         int gdn_vec_max_rows; // float4 state slice only wins below this many
                               // real rows per pass (it costs 4x the registers)
+
+        // Rows per work-group for the native-weight decode GEMVs (u4, and the
+        // i8-grouped / cb4 kernels that share the same SLM tile).  Only 8, 16
+        // and 32 are instantiated - the fit check decides between them and
+        // anything else is clamped to the nearest - so this is a tuning, not a
+        // free parameter.  16 is the measured A770 value.
+        int w4_rows_per_wg;
+
+        // Narrow-shape thresholds for the two K-split decode GEMVs.  Above
+        // these output-row counts the generic (unsplit) kernel wins; below
+        // them the split pays because the row count cannot fill the machine.
+        // Both are per-card hardware thresholds, not model shapes.
+        int q8_rows;  // Q8_0 decode GEMV (PF_Q4_GEMV8_SPLIT_ROWS)
+        int f32_rows; // F32 decode GEMV (PF_Q4_F32_SPLIT's row gate)
     } shape;
 
     // The gather's stage-1 max reduction is a latency fix for running ONE
@@ -163,6 +177,33 @@ struct profile {
                           // at M=5), so nothing depends on it; kept for a part
                           // where it wins
     } wt;
+
+    // Routed-expert GEMM and qwen4exp expert-bank tuning.
+    //
+    // The tile cases (cfg_*) name moe_grp_go's dispatch: the winner is a
+    // register-budget / occupancy trade measured per card (M*FUSE*C has to stay
+    // in registers, and the weight re-read factor is ceil(p_e/M)), so the
+    // default case number is a profile value, not a literal at the launch site.
+    // cfg_dec = 0 means "auto": one row per expert for a single-token decode
+    // and two for a batched one.  That 0 is a *measured value*, which is why
+    // the resolver must not treat an env 0 as "unset" here (see
+    // moe_cfg_for() in moe.cpp).
+    //
+    // upload_ring / pf_wmin are qwen4exp's: the pinned expert-upload staging
+    // ring (slots per device) and the two-pass prefill's minimum workspace.
+    // Both trade pinned host memory against stalls that depend on the card's
+    // H2D behaviour.
+    struct moe_t {
+        int cfg_gate;    // PF_MOE_CFG: gate+up tile case
+        int cfg_down;    // PF_MOE_CFG_DOWN: down tile case
+        int cfg_dec;     // PF_MOE_CFG_DEC: decode tile case, 0 = auto
+        int flat;        // PF_MOE_FLAT: row tile in the grid (prefill)
+        int flat_dec;    // PF_MOE_FLAT_DEC: the same on a decode step
+        int dp4a;        // PF_MOE_DP4A: grouped dp4a expert GEMM (prefill)
+        int dp4a_dec;    // PF_MOE_DP4A_DEC: the same on a decode step
+        int upload_ring; // qwen4exp expert-upload staging ring, slots/device
+        int pf_wmin;     // qwen4exp two-pass prefill minimum workspace
+    } moe;
 };
 
 // ---------------------------------------------------------------------------

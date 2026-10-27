@@ -514,11 +514,11 @@ void moe_actq_launch(sycl::queue & q, const float * x, int x_stride, int n_rows,
 // geometry or a quant type is outside what the dp4a path implements, and the
 // caller must then use moe_gate_up_launch.
 //
-// `dec` selects the DECODE-shaped tile (PF_MOE_CFG_DEC / PF_MOE_CFG_DOWN_DEC)
-// instead of the prefill one.  The two are different shapes, not different
-// tunings: a prefill routes ~54 (token, expert) pairs per expert and a decode
-// step routes one, so the prefill's M=8 row tile is seven eighths empty on a
-// decode step and the decode's own tile is one or two rows.
+// `dec` selects the DECODE-shaped tile (PF_MOE_CFG_DEC) instead of the prefill
+// one.  The two are different shapes, not different tunings: a prefill routes
+// ~54 (token, expert) pairs per expert and a decode step routes one, so the
+// prefill's M=8 row tile is seven eighths empty on a decode step and the
+// decode's own tile is one or two rows.
 bool moe_grp_gate_up_launch(sycl::queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
                             size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
                             const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
@@ -529,6 +529,11 @@ bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * sl
                          const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
                          int n_act_max, int n_expert, int n_pairs, const int8_t * xq, const uint16_t * asa,
                          const float * xs, float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype, bool dec);
+// The row tile (M) the grouped expert GEMM resolves for this queue and mode,
+// from PF_MOE_CFG / PF_MOE_CFG_DOWN / PF_MOE_CFG_DEC and the device profile.
+// Diagnostics only: the kernel dispatch itself owns the choice.  A decode's
+// "auto" (cfg 0) is reported as its single-token tile (1 row).
+int moe_grp_tile_rows(sycl::queue & q, bool down, bool dec);
 // Native Q5_1 down: the same grouped [pairs][n_ff_exp] x [n_ff_exp][n_embd]
 // contract as the grouped path, but straight off the Q5_1 blocks (24 B per
 // 32-value group, no superblock).  The grouped kernel works in 256-value

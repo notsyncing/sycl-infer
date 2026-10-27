@@ -1317,7 +1317,76 @@ namespace {
 //   M    rows per tile, i.e. weight re-read factor ceil(p_e/M) (PF_MOE_HIST)
 // The accumulator is M*FUSE*C floats and it has to stay in REGISTERS, so the
 // product is the binding constraint - an M*C*FUSE that spills costs 350x.
-// PF_MOE_CFG picks it; the default is the measured best of the sweep.
+// PF_MOE_CFG picks it; the default is the measured best of the sweep and lives
+// in the card's device profile (the sweep was measured per card).
+//
+// Resolve the case: env override, else this queue's card profile.  cfg_dec is
+// special because 0 is a *measured value* there ("auto"), and profile_int()
+// folds an env 0 into "unset" - so that one reads the raw env with a -1
+// sentinel, or an explicit PF_MOE_CFG_DEC=0 could never restore auto on a card
+// whose profile pins a decode tile.
+static int moe_cfg_for(const queue & q, bool down, bool dec) {
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    if (dec) {
+        static const int e = si::env::i32("PF_MOE_CFG_DEC", -1);
+        return e >= 0 ? e : dp.moe.cfg_dec;
+    }
+    return down ? si::dev::profile_int(q, "PF_MOE_CFG_DOWN", dp.moe.cfg_down)
+                : si::dev::profile_int(q, "PF_MOE_CFG", dp.moe.cfg_gate);
+}
+
+// The row tile M a case selects.  It is the first argument of every
+// SI_MOE_TILE* below and it is kept next to the dispatch on purpose: the
+// PF_MOE_HIST schedule model needs the tile before the kernel runs, and it used
+// to guess "cfg 43 => 8, otherwise 16", which is wrong for every other case.
+// `default:` is the 128-thread M=16 tile.
+static int moe_cfg_tile_m(int cfg) {
+    switch (cfg) {
+    case 1: return 32;
+    case 2: return 16;
+    case 3: return 8;
+    case 4: return 32;
+    case 7: return 64;
+    case 8: return 64;
+    case 9: return 32;
+    case 10: return 64;
+    case 11: return 32;
+    case 12: return 64;
+    case 13: return 24;
+    case 14: return 48;
+    case 15: return 32;
+    case 16: return 32;
+    case 17: return 24;
+    case 18: return 48;
+    case 19: return 64;
+    case 20: return 32;
+    case 21: return 16;
+    case 30: return 32;
+    case 32: return 32;
+    case 40:
+    case 41: return 8;
+    case 42: return 4;
+    case 43: return 8;
+    case 44: return 16;
+    case 45: return 4;
+    case 46: return 8;
+    case 47: return 4;
+    case 48: return 8;
+    case 49: return 4;
+    case 50: return 32;
+    case 51: return 16;
+    case 52: return 12;
+    case 53: return 8;
+    case 54: return 8;
+    case 55: return 16;
+    case 56: return 24;
+    case 57: return 8;
+    case 58: return 1;
+    case 59: return 2;
+    default: return 16;
+    }
+}
+
 template <int FUSE, uint32_t QT>
 static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane0, size_t plane1, const int32_t * slot_map,
                        const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,
@@ -1347,8 +1416,6 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
     // 7.0-7.3 and P=128 to 20-51.  (An earlier note here claimed the binding
     // constraint was the dp4a-per-load ratio M*FUSE*C/(M+FUSE*C); the sweep
     // refutes it - the optimum has ratio 2.67, BELOW the M=16 tile's 3.20.)
-    static const int cfg_gate = si::env::i32("PF_MOE_CFG", 43);
-    static const int cfg_down = si::env::i32("PF_MOE_CFG_DOWN", 43);
     // The DECODE tile.  0 = auto: ONE row per expert for a single-token decode
     // (every selected expert gets exactly one pair, so a wider tile is pure
     // waste) and TWO rows for a batched one (some experts get two or three
@@ -1365,9 +1432,8 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
     //   N=32   M=1 212.77  M=2 191.64
     //
     // (cases 58 and 59 are those two tiles)
-    static const int cfg_dec = si::env::i32("PF_MOE_CFG_DEC", 0);
-    const int cfg = dec ? (cfg_dec ? cfg_dec : ((n_pairs <= top_k) ? 58 : 59))
-                         : ((FUSE == 2) ? cfg_gate : cfg_down);
+    const int cfg_resolved = moe_cfg_for(q, FUSE == 1, dec);
+    const int cfg = dec ? (cfg_resolved ? cfg_resolved : ((n_pairs <= top_k) ? 58 : 59)) : cfg_resolved;
 #define SI_MOE_TILE5(MV, NSGV, CV, HV)                                                                                       \
     do {                                                                                                                 \
         constexpr int NSG = NSGV, C = CV, RB = NSG * C;                                                                  \
@@ -1488,6 +1554,16 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
 
 } // namespace
 
+int moe_grp_tile_rows(queue & q, bool down, bool dec) {
+    const int cfg = moe_cfg_for(q, down, dec);
+    if (cfg <= 0) {
+        // A decode's "auto" is one row per expert; the non-decode dispatch has
+        // no 0 case and lands on its M=16 default.
+        return dec ? 1 : 16;
+    }
+    return moe_cfg_tile_m(cfg);
+}
+
 bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
                             size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
                             const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
@@ -1515,8 +1591,9 @@ bool moe_grp_gate_up_launch(queue & q, const void * gbank, const void * ubank, c
     // the surplus is ~1/3 and lifting the tile out of the work-group is what
     // makes every work-group exactly one tile.
     // PF_MOE_FLAT_DEC=1 restores the flat grid on a decode for the A/B.
-    static const int flat_dec = si::env::i32("PF_MOE_FLAT_DEC", 0);
-    const bool flat = dec ? (flat_dec != 0) : (si::env::i32("PF_MOE_FLAT", 1) != 0);
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    const bool flat_dec = si::dev::profile_flag(q, "PF_MOE_FLAT_DEC", dp.moe.flat_dec != 0);
+    const bool flat = dec ? flat_dec : si::dev::profile_flag(q, "PF_MOE_FLAT", dp.moe.flat != 0);
     static const int persist_env = si::env::i32("PF_MOE_PERSIST", 0);
     const char * g = (const char *)gbank, * u = (const char *)ubank;
 #define SI_MOE_GRP_GU(QT)                                                                                                   \

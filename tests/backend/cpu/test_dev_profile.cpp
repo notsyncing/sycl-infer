@@ -56,6 +56,49 @@ static void heterogeneous(const char * what, const std::vector<std::string> & na
     printf("  SPLIT      %-38s -> '%s' vs '%s'\n", what, s.first_key.c_str(), s.other_key.c_str());
 }
 
+static void expect_int(const char * what, int got, int want) {
+    if (got != want) {
+        fprintf(stderr, "FAIL %s: expected %d, got %d\n", what, want, got);
+        g_fail++;
+        return;
+    }
+    printf("  value      %-38s -> %d\n", what, got);
+}
+
+// The narrowed device-profile fields (moe.* and the three GEMV shape gates).
+// They are pinned here for the same reason the split/shape groups are pinned in
+// the card files: a field that silently keeps a literal at its use site reads
+// as "the profile decided", and a card that omits one gets the compiler's zero.
+static void profile_values(const char * who, const dev::profile & p) {
+    expect_int((std::string(who) + " moe.cfg_gate").c_str(), p.moe.cfg_gate, 43);
+    expect_int((std::string(who) + " moe.cfg_down").c_str(), p.moe.cfg_down, 43);
+    // 0 is the measured value: "auto" picks one row per expert for a
+    // single-token decode and two for a batched one.
+    expect_int((std::string(who) + " moe.cfg_dec").c_str(), p.moe.cfg_dec, 0);
+    expect_int((std::string(who) + " moe.flat").c_str(), p.moe.flat, 1);
+    expect_int((std::string(who) + " moe.flat_dec").c_str(), p.moe.flat_dec, 0);
+    expect_int((std::string(who) + " moe.dp4a").c_str(), p.moe.dp4a, 1);
+    expect_int((std::string(who) + " moe.dp4a_dec").c_str(), p.moe.dp4a_dec, 1);
+    expect_int((std::string(who) + " moe.upload_ring").c_str(), p.moe.upload_ring, 32);
+    expect_int((std::string(who) + " moe.pf_wmin").c_str(), p.moe.pf_wmin, 24);
+    expect_int((std::string(who) + " shape.w4_rows_per_wg").c_str(), p.shape.w4_rows_per_wg, 16);
+    expect_int((std::string(who) + " shape.q8_rows").c_str(), p.shape.q8_rows, 512);
+    expect_int((std::string(who) + " shape.f32_rows").c_str(), p.shape.f32_rows, 128);
+    // Invariants a card file cannot express: only 8/16/32 are instantiated for
+    // the native-weight GEMV, and a ring/workspace of 0 would disable a path
+    // rather than tune it.
+    if (p.shape.w4_rows_per_wg != 8 && p.shape.w4_rows_per_wg != 16 && p.shape.w4_rows_per_wg != 32) {
+        fprintf(stderr, "FAIL %s shape.w4_rows_per_wg=%d is not an instantiated tile\n", who,
+                p.shape.w4_rows_per_wg);
+        g_fail++;
+    }
+    if (p.moe.upload_ring <= 0 || p.moe.pf_wmin < 1) {
+        fprintf(stderr, "FAIL %s moe ring/workspace must be positive (ring=%d wmin=%d)\n", who,
+                p.moe.upload_ring, p.moe.pf_wmin);
+        g_fail++;
+    }
+}
+
 int main() {
     printf("check_profiles_homogeneous\n");
     // The names the two shipped profiles match.
@@ -79,6 +122,21 @@ int main() {
     // (same wrong-but-consistent tuning), and they differ from a real card.
     heterogeneous("A770 + unknown card", {a770, "Some Future GPU"}, "arc_a770", "unknown");
     homogeneous("two unknown cards", {"Future GPU A", "Future GPU B"}, "unknown");
+
+    printf("profile values (moe.* and the GEMV shape gates)\n");
+    profile_values("arc_a770", dev::for_name(a770));
+    // The Iris profile inherits these from the A770 and SAYS SO in its
+    // provenance; the values still have to be present and identical, because a
+    // missing field is a zero tile, not "unmeasured".
+    profile_values("iris_xe", dev::for_name(iris));
+    // The unclaimed card is a copy of the A770 row, new fields included.
+    profile_values("unknown", dev::unknown_profile());
+    // ...with its hardware facts zeroed, so a derived quantity cannot look
+    // plausibly right on a card nobody profiled.
+    if (dev::unknown_profile().hw.compute_units != 0 || dev::unknown_profile().hw.has_dpas != -1) {
+        fprintf(stderr, "FAIL unknown profile must zero its hardware facts and leave DPAS unasked\n");
+        g_fail++;
+    }
 
     if (g_fail) {
         fprintf(stderr, "test_dev_profile: %d check(s) failed\n", g_fail);

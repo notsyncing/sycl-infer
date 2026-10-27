@@ -322,6 +322,9 @@ void report(const profile & p, const char * how) {
                 "      slm_budget=%d B\n"
                 "      split rows: gemv=%d gemm=%d max=%d\n"
                 "      shapes: gemv_rows_per_wg=%d rmsnorm_wg=%d gdn(cols=%d warps=%d vec_max=%d)\n"
+                "      gemv: w4_rows_per_wg=%d q8_split_rows=%d f32_split_rows=%d\n"
+                "      moe: cfg gate=%d down=%d dec=%d flat=%d/%d dp4a=%d/%d "
+                "ring=%d pf_wmin=%d\n"
                 "      attn: gather_red=%d (max %d) vec=%d xmx=%d xmx_min_keys=%d "
                 "split_keys=%d dec_group=%d\n"
                 "      weights: w4=%d k5=%d cb4=%d dp4a=%d gemm_dnnl=%d dpas=%d\n",
@@ -329,7 +332,11 @@ void report(const profile & p, const char * how) {
                 p.hw.local_mem_size, p.hw.has_dpas, p.occ.warps_per_eu_x2 / 2.0, p.occ.warps_per_eu_x2,
                 p.slm.budget_bytes, p.split.gemv_rows, p.split.gemm_rows, p.split.max,
                 p.shape.gemv_rows_per_wg, p.shape.rmsnorm_wg, p.shape.gdn_cols,
-                p.shape.gdn_warps_per_wg, p.shape.gdn_vec_max_rows, p.attn.xmx_gather_red,
+                p.shape.gdn_warps_per_wg, p.shape.gdn_vec_max_rows,
+                p.shape.w4_rows_per_wg, p.shape.q8_rows, p.shape.f32_rows,
+                p.moe.cfg_gate, p.moe.cfg_down, p.moe.cfg_dec, p.moe.flat, p.moe.flat_dec,
+                p.moe.dp4a, p.moe.dp4a_dec, p.moe.upload_ring, p.moe.pf_wmin,
+                p.attn.xmx_gather_red,
                 p.attn.xmx_gather_red_max, p.attn.vec, p.attn.xmx, p.attn.xmx_min_keys,
                 p.attn.split_keys, p.attn.dec_group, p.wt.w4, p.wt.k5, p.wt.cb4, p.wt.dp4a,
                 p.wt.gemm_dnnl, p.wt.dpas_in_gemm);

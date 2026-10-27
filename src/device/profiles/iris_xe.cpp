@@ -29,7 +29,10 @@ static const profile iris_xe = {
         "memory with the host, and dev/bench_attn27 --dec-only on an otherwise loaded "
         "machine returned 2.1-4.4 ms for one configuration across three repeats, i.e. "
         "the noise exceeded the effect.  Re-run the sweeps on an idle box before "
-        "trusting these for bandwidth-sensitive work.",
+        "trusting these for bandwidth-sensitive work.  THE moe.* GROUP AND THE "
+        "shape.w4_rows_per_wg / q8_rows / f32_rows FIELDS ARE ALSO INHERITED AND "
+        "UNMEASURED HERE; the expert tile and the K-split thresholds were picked on a "
+        "512-EU card.",
 
     // measured (sycl): 96 EUs is 1/5.3 of an A770, and the max work-group is HALF
     // it -- 512, not 1024, which is load-bearing (see shape.rmsnorm_wg).
@@ -78,6 +81,15 @@ static const profile iris_xe = {
         .gdn_cols = 2,
         .gdn_warps_per_wg = 8,
         .gdn_vec_max_rows = 2,
+        // INHERITED, not re-measured: the SLM budget is the same so the same
+        // tile *fits*, and 16 is the conservative value (8/32 both measured
+        // worse on the A770, but this part's read bandwidth is the unknown).
+        .w4_rows_per_wg = 16,
+        // INHERITED: both thresholds scale with the row count needed to fill
+        // the machine, i.e. with the EU count, so these are suspect on a part
+        // with 96 EUs.  No sweep has been run here.
+        .q8_rows = 512,
+        .f32_rows = 128,
     },
 
     // gather_red INHERITED: a one-work-group version would be worse still at 96
@@ -106,6 +118,25 @@ static const profile iris_xe = {
         .dp4a = 1,
         .gemm_dnnl = 1,
         .dpas_in_gemm = 0, // same Xe-LP DPAS, same 37x-slower measurement
+    },
+
+    // INHERITED, ALL OF IT: the tile cases, the flat grid, the dp4a gates and
+    // the qwen4exp ring/workspace were chosen on a 512-EU discrete card.  The
+    // expert GEMM's binding constraint is registers-per-lane, which is the same
+    // Xe-LP register file, so the tile *plausibly* transfers -- but the
+    // bandwidth-vs-occupancy balance that picked M=8 is not the same on an
+    // integrated part, and none of these has been swept here.  Do not read
+    // "same as the A770" as "measured".
+    .moe = {
+        .cfg_gate = 43,
+        .cfg_down = 43,
+        .cfg_dec = 0,
+        .flat = 1,
+        .flat_dec = 0,
+        .dp4a = 1,
+        .dp4a_dec = 1,
+        .upload_ring = 32,
+        .pf_wmin = 24,
     },
 };
 
