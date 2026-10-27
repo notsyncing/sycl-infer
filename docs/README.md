@@ -26,7 +26,14 @@
 | 17 | [design/16-router.md](design/16-router.md) | 多模型路由进程：JSON-with-comments 配置文件与模型注册表、JSON-RPC 控制面（模型身份/设备显存/优雅停机）、HTTP/SSE 数据面代理、worker 生命周期与显存预算的实测准入、远程 worker、Docker 部署 |
 | 18 | [design/17-onnx-service.md](design/17-onnx-service.md) | 文档流水线的 ONNX 模型服务：自研的 ONNX protobuf 解析、常量折叠与算子融合（BatchNorm/激活融进卷积）、算子库与 SYCL kernel、执行器的内存计划、二进制线协议与 HTTP 端点 |
 | 19 | [design/18-qwen4exp.md](design/18-qwen4exp.md) | Qwen3.8-Flash-Next（`qwen4exp`）：split GGUF 装载、hyper-connections、PLE/engram 缓存、QSA 主机选择器、每专家 LRU + 两遍预填充、K%256 的 down 规则与实测吞吐 |
-| 20 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+| 20 | [design/19-c-api.md](design/19-c-api.md) | 嵌入式 C ABI：句柄/生命周期、批量窗口与 FIFO 排队、多线程提交、请求隔离、停止串/超时/取消、ABI 版本与错误模型、与现有 `engine`/`scheduler` 的映射 |
+| 21 | [design/20-python-binding.md](design/20-python-binding.md) | Python binding 与 wheel：pybind11、GIL、流式/批量 API、scikit-build-core、SYCL/oneDNN/oneAPI runtime 打包、RPATH、JIT/AOT wheel、doctor |
+| 22 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+
+面向使用者的说明：
+
+* [guides/c-api.md](guides/c-api.md) — 如何构建/链接 C 库，单请求、流式、批量、多线程示例，调参与排查。
+* [guides/python.md](guides/python.md) — 如何安装/构建 wheel，Python 快速开始、批量、线程、chat、doctor 与故障排查。
 
 ## 快速定位
 
@@ -41,6 +48,8 @@
 * 想动 DFlash2 块草稿器（卷积下标、RoPE 宽度、lattice、top-k）→ [design/14-dflash2.md](design/14-dflash2.md)
 * 想动 MoE / 专家切分 / 三级专家缓存 → [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md)
 * 想跑 Qwen3.8-Flash-Next（104 GiB、split GGUF、HC/PLE/QSA、512 专家）→ [design/18-qwen4exp.md](design/18-qwen4exp.md)
+* 想把引擎嵌进自己的 C/C++ 程序、做自动 batching 的批量推理 → [design/19-c-api.md](design/19-c-api.md)、[guides/c-api.md](guides/c-api.md)
+* 想用 Python/wheel，或需要把 SYCL runtime 一起分发 → [design/20-python-binding.md](design/20-python-binding.md)、[guides/python.md](guides/python.md)
 * 想动 MoE 专家 GEMM 的 tile（prefill 的 M=8 与 decode 的 M=1/M=2）→ [design/15-moe-ncmoe.md §3.4](design/15-moe-ncmoe.md)、[design/03-kernels.md §5.10](design/03-kernels.md)
 * 想动批量 decode 的行数（每个行数一个 plan 桶，精确不取整）→ [design/04-engine.md §6.2](design/04-engine.md)
 * 想让 prefill 更快（batch 形状、oneDNN prefill attention）→ [design/04-engine.md §7](design/04-engine.md)、[design/03-kernels.md §5.8](design/03-kernels.md)、[design/03-kernels.md §7.5](design/03-kernels.md)

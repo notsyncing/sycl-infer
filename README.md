@@ -296,6 +296,28 @@ HTTP endpoints:
   `stream_options.include_usage`)
 * `GET /v1/models` + `GET /v1/models/{id}`, `GET /health`
 
+### Embedding the engine: C API and Python
+
+The engine can also be linked directly into a product, without HTTP or a
+subprocess:
+
+* **C ABI** (`libsycl_infer`) — opaque model/request handles, async submit +
+  pull streaming, automatic batching with a configurable admission window and
+  a FIFO queue, per-request cancellation/timeout, and thread-safe submission
+  from many host threads.  See the design in
+  [`docs/design/19-c-api.md`](docs/design/19-c-api.md) and the usage guide in
+  [`docs/guides/c-api.md`](docs/guides/c-api.md).
+* **Python** (`sycl_infer`) — a pybind11 binding with blocking, streaming and
+  batch APIs, GIL release for threaded workloads, and a wheel that vendors the
+  SYCL/oneDNN/oneAPI runtime.  See
+  [`docs/design/20-python-binding.md`](docs/design/20-python-binding.md) and
+  [`docs/guides/python.md`](docs/guides/python.md).
+
+Both are a thin layer over the same `engine`/`scheduler`: the C API uses the
+existing continuous-batching scheduler, so concurrent requests share one weight
+pass while keeping separate KV slots, sampler state, stop strings and
+cancellation.
+
 ### Prefix cache
 
 The cross-request prompt prefix cache has three LRU tiers:

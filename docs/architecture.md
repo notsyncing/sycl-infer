@@ -53,12 +53,18 @@ flowchart LR
     subgraph Clients
         CLI["CLI\nsycl-infer gen"]
         HTTP["HTTP client\n(OpenAI API)"]
+        CHOST["C/C++ host\nlibsycl_infer"]
+        PY["Python\nsycl_infer"]
     end
     CLI --> MAIN[src/main.cpp]
     HTTP --> SRV[src/server/server.cpp]
+    CHOST --> CAPI[src/capi]
+    PY --> PYBIND[python/ + src/capi]
     MAIN --> ENG[src/engine/engine]
     SRV --> SCHED[src/server/scheduler]
     SCHED --> ENG
+    CAPI --> SCHED
+    PYBIND --> CAPI
     MAIN --> MM[src/mm vision / video / audio]
     SRV --> MM
     ENG --> KERN[src/backend/gpu/kernels]
@@ -69,12 +75,16 @@ flowchart LR
     MODEL --> GGUF[(GGUF mmap)]
 ```
 
-两个入口共用同一个 `si::engine` 实例：
+这些入口共用同一个 `si::engine`/`si::scheduler` 实现：
 
 * **CLI**（`main.cpp`）：`gen` 单序列生成，`serve` 启动 HTTP 服务。多模态走
   `mm_build_prompt_device` / `mm_build_prompt_mixed_device` + `engine::generate_mm`。
 * **HTTP 服务**（`server.cpp`）：OpenAI 兼容 API。文本请求经 `scheduler` 做连续批处理；多模态请求
   绕开调度器，单序列串行执行。
+* **C ABI**（`src/capi/`，`libsycl_infer`）：进程内嵌的模型/请求句柄，复用同一
+  `scheduler` 做自动 batching；见 [design/19-c-api.md](design/19-c-api.md)。
+* **Python**（`python/` + `src/capi/`）：pybind11 绑定，建立在 C ABI 上；见
+  [design/20-python-binding.md](design/20-python-binding.md)。
 * **MTP 投机解码**（`--mtp N`，`src/engine/engine_mtp.cpp`）：贪心（`temperature <= 0` 或
   `top_k == 1`）且非多模态的请求在 `engine::generate_impl` 内部改走 draft/verify 循环
   （`engine::generate_impl` 的 MTP/DFlash 分派条件）。服务端**默认**仍把贪心请求交给调度器，只有 `PF_MTP_SERVER=1`
@@ -162,6 +172,10 @@ src/server/     server.{h,cpp}         httplib 服务、JSON、SSE、多模态�
                 chat_template.{h,cpp}  minja Jinja 封装
                 chat_util.h            UTF-8 边界安全的流式缓冲
                 response_parser.{h,cpp} 流式 reasoning_content / content / tool_calls 拆分
+
+src/capi/       嵌入式 C ABI：句柄、批量窗口/FIFO、请求状态机、错误/统计
+include/sycl_infer/  C 头文件 + 可选 C++ RAII 包装
+python/         pybind11 扩展、Python 包、wheel 构建
 
 src/main.cpp    CLI
 
