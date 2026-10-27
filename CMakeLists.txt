@@ -126,6 +126,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/w4_gemv.cpp
     src/backend/gpu/kernels/qk_norm_rope.cpp
     src/backend/gpu/kernels/attn.cpp
+    src/backend/gpu/kernels/qsa.cpp
     src/backend/gpu/kernels/attn_xmx.cpp
     src/backend/gpu/kernels/conv.cpp
     src/backend/gpu/kernels/gdn.cpp
@@ -409,6 +410,8 @@ si_add_test(test_control         tests/server/test_control.cpp)
 si_add_test(test_url_fetch     tests/server/test_url_fetch.cpp)
 si_add_test(test_sampler tests/engine/test_sampler.cpp)
 si_add_test(test_sched   tests/engine/test_sched.cpp)
+si_add_test(test_q4_batch tests/engine/test_q4_batch.cpp)
+si_add_test(test_q4_verify tests/engine/test_q4_verify.cpp)
 si_add_test(test_27b_prefill tests/engine/test_27b_prefill.cpp)
 si_add_test(test_multimodal  tests/mm/test_multimodal.cpp)
 si_add_test(test_compare     tests/model/test_compare.cpp)

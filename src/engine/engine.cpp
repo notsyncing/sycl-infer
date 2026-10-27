@@ -678,6 +678,49 @@ engine::~engine() {
         sycl::free(pr.first, dev_queue(pr.second));
     }
     q4_pin_src_.clear();
+    for (auto & st : qsa_stage_) {
+        sycl::queue & qd = dev_queue(st.dev < 0 ? 0 : st.dev);
+        auto fq = [&](float * p) {
+            if (p) {
+                sycl::free(p, qd);
+            }
+        };
+        fq(st.mixed);
+        fq(st.q);
+        fq(st.k);
+        fq(st.v);
+        fq(st.out);
+    }
+    qsa_stage_.clear();
+    for (auto & d : qsa_dev_) {
+        sycl::queue & qd = dev_queue(d.dev < 0 ? 0 : d.dev);
+        if (d.ck) {
+            sycl::free(d.ck, qd);
+        }
+        if (d.cv) {
+            sycl::free(d.cv, qd);
+        }
+        if (d.dsel) {
+            sycl::free(d.dsel, qd);
+        }
+        if (d.tab) {
+            sycl::free(d.tab, qd);
+        }
+        if (d.htab) {
+            sycl::free(d.htab, qd);
+        }
+    }
+    qsa_dev_.clear();
+    for (auto & x : qsa_aux_) {
+        sycl::queue & qd = dev_queue(x.dev < 0 ? 0 : x.dev);
+        if (x.hsel) {
+            sycl::free(x.hsel, qd);
+        }
+        if (x.sinfo) {
+            sycl::free(x.sinfo, qd);
+        }
+    }
+    qsa_aux_.clear();
     if (moe_cache_.active()) {
         // The three tiers in one line, so a run says what it used rather than
         // only what it was configured with: the VRAM bank's size is a *measured*
@@ -2747,6 +2790,10 @@ void engine::zero_slot(int slot) {
         return;
     }
     q4_zero_state(slot);
+    // The QSA host mirror is per (attention layer, slot) and is not part of the
+    // device recurrent state below; clear it before the next sequence uses the
+    // slot (no-op for non-q4exp and when QSA is off).
+    qsa_reset_slot(slot);
     for (int il = 0; il < hp.n_layer; il++) {
         if (!hp.is_recr(il)) {
             continue;
@@ -2801,6 +2848,9 @@ void engine::reset_state() {
             }
         }
     }
+    // the QSA host mirror/pool is per slot too: a full engine reset clears all
+    // of it (no-op when QSA is off)
+    qsa_reset_slot(-1);
     reset_step_info(d_info);
     // the single-sequence entry points (eval/generate) do not run the prefix
     // cache: never let a stale tracking flag capture snapshots for them

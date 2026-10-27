@@ -229,10 +229,15 @@ What produced the row, in the order the costs appeared:
   re-quantized at the start of every batch because `moe_actq_launch(A.h, ...)`
   overwrites the `A.xq/asa/xs` that gate/up reads.  Prefill is byte-identical
   across chunk sizes 64..1024.
-* **Tail-skip** (`PF_Q4_TAIL_SKIP=7`, Strata's CUDA-path idea, opt-in).  On
+* **Tail-skip** (`PF_Q4_TAIL_SKIP=7`, Strata's CUDA-path idea, now default 7;
+  `PF_Q4_TAIL_SKIP=0` restores the exact expert set).  On
   the 96-token TCP cell at 17500: **93.6 -> 86.9 ms** (-7.2%), last-token
-  upload **56.2 -> 32.2 MiB** (-43%); rank 8 is 90.0 ms.  The output changes
-  and still needs a KL/top-1 gate, so the default is off.
+  upload **56.2 -> 32.2 MiB** (-43%); rank 8 is 90.0 ms.  The output changes;
+  the KL/top-1 gate was run on 2026-10-27 (two prompts, §4.4.2): top-1 agreed
+  for 28/29 and 15/16 step pairs, the first divergence was always a near-tie,
+  the divergence-step KL was 0.029/0.037 and the text stayed coherent.  That
+  makes it a usable *approximation*, not a free kernel change, so the default
+  stays **off**; enabling it is a product decision, not a measurement one.
 * **CPU misses with GPU-first overlap** (`PF_Q4_CPU_MISS`, Strata's CUDA
   `kind = -1` idea) was implemented and **rejected** (2026-10-27, the same
   96-token TCP cell, `--ctx 2048 --kv-type f16`, one process per cell; the
@@ -413,14 +418,216 @@ than the generic path.  **Layer 2's Q5_K gate/up banking**
 (`PF_Q4_BANK_Q5K=1`) costs 6 % prefill and is decode-neutral.  The generic
 three-tier `moe_cache` is inactive on qwen4exp (`host_only`, resident=0); the
 q4 per-expert LRU is a separate path.  The server's q4 `prefill_batch` has no
-recorded variant, and **batched q4exp decode is unmeasured**.
+recorded variant, and **batched q4exp decode is measured and rejected** (2 rows
+0.85x; the scheduler caps qwen4exp at one row and serialises its sequences -
+see §4.4.2).  The scheduler's generic `prefill_batch` is not q4 either; the
+scheduler now routes qwen4exp prefill through `prefill_text` for the whole
+remaining prompt (one scheduler chunk; `q4_prefill_text` chunks internally), so
+a long server prompt no longer needs `PF_PFB_MAX_M=16`.  Measured on a
+2412-token prompt: **41.7 / 36.8 / 40.9 s** (57.8-59.5 tok/s) against
+**92.6 / 83.0 / 90.3 s** for the old 32-token path (**2.2x**), one chunk, output
+md5 and sampled ids matching the CLI.  The 32-token vs 1024-token chunking
+shifts the QSA selector pools slightly (score cosine 0.9999945, max 0.0699, a
+few boundary pools) - the known prefill accumulation order; the generated
+content matched.  `PF_PFB_MAX_M` remains a non-q4 A/B knob.
 
 ```bash
 ./build/sycl-infer \
   --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 --cpu-threads 28 \
   --ctx 2048 --kv-type f16 gen --prompt "The capital of France is" --max-tokens 64 --temp 0
 ```
+
+**Stage 1 (2026-10-27): pinned staging, f16 K/V mirror, deferred dense-prefill copy queue.**
+Conditions: `--ctx 4096 --kv-type f16 --moe-vram-mb 17500 --cpu-threads 28`,
+AOT Release, 2x A770, `PF_QSA_ISA=avx512`, one process per cell.  `PF_QSA_F16MIR`
+defaults on where the resolved QSA attention is AVX2/AVX-512 and off on the
+scalar fallback (`=1` forces it; scalar f16 is 4.6x slower than scalar f32).
+`PF_QSA_COPYQ` defaults on; `=0` restores the old inline dense-big-chunk wait.
+The short/dense/sparse output md5 and the `PF_QSA_POOLS`/`PF_QSA_SCORE` files are
+**byte-identical** to the pre-change build.
+
+| cell | pre-change | Stage 1 |
+|---|---:|---:|
+| 96-token short, QSA call mean | 7.17 ms | **1.67 ms** |
+| 96-token short, true wall median | 111.7 ms | **103.0 ms** |
+| 1024-token dense chunk, QSA first (alloc) / steady | 1434 / 1434 ms | **279-322 / 56.5 ms** |
+| crossing 128-token chunk, QSA (attention) | 1258 (842) ms | **961 (552) ms** |
+| sparse decode, attention | 13.0-13.6 ms | **8.0-8.4 ms** |
+| 1132-token prefill, QSA n=1024 | 1434.8 ms | **322.0 ms** |
+
+The big item is the pinned per-layer staging: a pageable `std::vector` D2H is
+synchronous, so even the "deferred" copies blocked the host (5.5 ms/token
+removed).  The f16 mirror is the next (`F16MIR=0` gives 334.8/71.5 on the dense
+chunk); the copy queue turns the 1024-token dense-chunk QSA from ~1.43 s to
+~56 ms steady, i.e. **~1.38 s saved per 1024-token chunk**.  `COPYQ=0` restores
+~1.55 s; the 1132 chunk's forward wall is dominated by host MoE, so the QSA
+call saving is 1.24 s there.  The crossing chunk's attention is 842 -> 552 ms
+with AVX-512 f16; the 2188 prompt's crossing chunk is 128 tokens, not the old
+7-token tail, so compare the dense and decode rows directly.
+
+A pre-existing lifecycle bug was found and fixed on 2026-10-27: `qsa_cache_`
+was not cleared by `engine::zero_slot`, so at `--ctx > idx_top_k` a server that
+reuses a slot for a new sequence could read the previous sequence's mirror/pool.
+`engine::qsa_reset_slot` (flush, clear pending entries, destroy the per-slot
+mirror/pool) now runs from `zero_slot` and `reset_state`; QSA-off is a no-op.
+Verified on the q4 server with three sequential slot-0 requests (B1, A, B2):
+B1 == B2 exactly, A differs, the reset cleared 12 layers, and B1/B2 selector
+dumps are byte-identical.  The `--ctx 2048` QSA-off and `--ctx 4096` short QSA-on
+md5s are unchanged.  A prefix-cache resume at position > 0 would need saved QSA
+state; qwen4exp has the prefix cache off.  The q4 server now uses the whole-prompt
+q4 prefill (no `PF_PFB_MAX_M`; 2.2x; §4.4.2).
+
+**Stage 2 (`PF_QSA_DEVATTN=1`, default on).**  The host indexer/pool/selector
+stays unchanged; for sparse decode (`need`, n_tok==1, GPU, f16 KV, head_dim 256)
+the selected rows are gathered from the paged pool into a compact f16 pool and
+the existing device `be.attn`/`attn_combine` runs with a device scratch
+`step_info`; `attn_combine` applies the QBUF sigmoid gate once and `wo` follows.
+On a 2412-token sparse prompt: QSA call **42.31 -> 35.29 ms** mean, decode wall
+**164.97 -> 154.01 ms** (-6.6%; median 162.42 -> 153.32), QSA `attn`
+**7.99 -> 3.04 ms**, `copy` unchanged 26.7.  The 32-token stream is **identical**
+(md5 `1b3ee79e...`), the 16-token logits agree **16/16** top-1 (max KL 0.00391),
+the selector score/pools are **byte-identical**, and the one-layer probe gives
+ATTN_OUT cos 0.999999919 / `wo` cos 0.999999788.  `--ctx 2048` QSA-off and
+`--ctx 4096` short md5s are unchanged, as is the flag-off sparse stream.  The
+device tokens skip the main K/V mirror update, so a *post-decode* sparse prefill
+on the same slot would need a mirror rebuild (the q4 prompt->decode flows never
+do; `zero_slot` clears); `head_dim != 256`, i8, CPU and prefill use the host
+Stage 1 path; the first device token allocates ~17 MB/device (~9.8 ms).  Default
+**on** for f16 GPU sparse decode on prompt->decode flows; `PF_QSA_DEVATTN=0`
+keeps the host Stage 1 path.
+
+#### 4.4.2 Decode batching, tail-skip, the MTP gate and the prefill ceiling (2026-10-27)
+
+Conditions: 2x Arc A770, AOT Release, `--layer-map 0-23:gpu.0,24-47:gpu.1`,
+`--moe-vram-mb 17500`, `--ctx 2048`, `--kv-type f16`, `PF_PREFIX_CACHE=0`,
+one process per cell.  The two new model-backed tests are `test_q4_batch` (the
+2-row comparison) and `test_q4_verify` (the MTP verify-cost gate); both take the
+GGUF as `argv[1]`.
+
+**2-row batched decode: correct, but 0.85-0.88x.**  The q4 branch of
+`engine::decode_batch` already existed; it sets one `step_info` row per
+sequence and calls `q4_forward(0, n_rows, true)`.  The test feeds both rows the
+same teacher-forced token stream, once decoded alone and once in one 2-row
+forward:
+
+| | ms/step | tok/s | MoE | rest | upload |
+|---|---:|---:|---:|---:|---:|
+| row 0 alone | 95.96 | - | 80.08 | 12.51 | 132.5 MiB/step |
+| row 1 alone | 80.55 | - | 63.88 | 11.36 | 61.3 MiB/step |
+| **two alone (combined)** | **176.50** | **11.33** | - | - | 193.8 MiB/2 tok |
+| **2-row batch** | **208.06** | **9.61** | 172.16 | 16.79 | **44.8 MiB/2 tok** |
+
+The batch's MoE is **1.196x** the sum of the two singles: two prompts select
+~20 distinct experts per layer against ~10 each, so the routed-expert weight
+read doubles.  The dense trunk does amortise (batch `rest` 0.703x), but it saves
+only ~7 ms against ~28 ms lost in the experts.  The batch uploads **2.7x fewer
+MiB/token** and is still slower, so it is weight-read bound, not H2D.  The LM
+head runs at `TB=8` for two rows (the `q4_gemv_tb` bucket), so ~19 ms of the
+residual is dead head work; removing it still leaves 0.91-0.94x.  Both rows are
+numerically real and matched to their own baseline: top-1 **12/12** each, KL
+mean **0.026** / **0.008**, max|Δlogit| 2.28 / 1.16, no NaN, both rows moved in
+11/11 step pairs.  The q4 default is therefore **one row per forward**; the
+scheduler serially runs qwen4exp's sequences rather than interleaving them.
+
+| q4 server, two concurrent 32-token requests | aggregate | notes |
+|---|---:|---|
+| serialized one-row cap (shipped) | **5.40 tok/s** | req0 8.61 s, req1 11.84 s |
+| serialized one-row cap + 28 threads | 5.57 tok/s | req0 8.31 s, req1 11.50 s; single 6.19 tok/s |
+| round-robin one-row cap (tried, removed) | 4.33 tok/s | 14.79 s wall; two live sequences thrash the shared expert bank |
+| one request at a time | 6.09 tok/s | 5.25 s for 32 tokens |
+
+The absolute server rate is lower than the CLI because the scheduler pays the
+per-request prefill and HTTP/sample path; the ratio is the policy result.
+`PF_SCHED_MAX_DECODE` still overrides the cap for tests.
+
+**Server prefill is now the CLI's whole-prompt path.**  The scheduler routes
+qwen4exp prefill through `prefill_text` for the whole remaining prompt (one
+scheduler chunk; `q4_prefill_text` chunks internally at `kMaxB*kMaxT`), so the
+generic `prefill_batch` is never taken.  A 2412-token request: **41.7 / 36.8 /
+40.9 s** (57.8-59.5 tok/s) against **92.6 / 83.0 / 90.3 s** for the old 32-token
+`prefill_chunk` workaround (**2.2x**), one chunk, output md5 and sampled ids
+matching the CLI, and no `PF_PFB_MAX_M=16`.  The 32-token vs 1024-token
+chunking shifts the QSA selector pools slightly (score cosine 0.9999945, max
+0.0699, a few boundary pools) - the known prefill accumulation-order
+sensitivity; the generated content matched.  `PF_PFB_MAX_M` now affects only the
+non-q4 path.
+
+**CPU threads: the host half wants the logical count.**  The default
+`PF_CPU_THREADS` is the physical-core count (14 on this 28-thread box), but the
+q4 decode's host-side MoE/PLE/HC work scales with the logical count.  On the
+96-token TCP prompt, `PF_CPU_THREADS=28` against the default 14: decode mean
+**120.7 -> 109.6 ms**, wall **20.95 -> 18.08 s**, output md5 **identical**; the
+`[q4] fwd` split moves `rest` 23.22 -> 13.67 ms (the GPU `moe_host` is
+unchanged at ~97).  With tail7 the same change takes **100.1 -> 93.3 ms** and
+**16.49 -> 15.52 s**.  The q4 recommended run therefore sets `--cpu-threads 28`.
+The server gains much less (two concurrent serialized 5.40 -> 5.57 tok/s; a
+single request 6.09 -> 6.19) because its q4 path is dominated by the prefill
+and HTTP/sample path, and it still pays the one-row schedule.  The archive
+93.3 ms/token cell above is the default-14 measurement; the 28-thread relative
+applies to it.
+
+**Tail-skip (`PF_Q4_TAIL_SKIP=7`): a real approximation, with a gate.**  Two
+greedy prompts, `PF_DUMP_DEC_LOGITS`, base vs tail7:
+
+| prompt | top-1 agreement | first diff | KL at first diff | decode mean | wall |
+|---|---:|---:|---:|---:|---:|
+| short `The TCP/IP protocol is` | 28/29 steps | 28 | 0.029 | - | 14.35 -> **11.99 s** |
+| 96-token TCP | 15/16 steps | 15 | 0.037 | 120.7 -> **100.1 ms** | 20.95 -> **16.49 s** |
+| 96-token TCP, 28 threads, tail0 | - | - | - | 109.6 | 18.08 s |
+| 96-token TCP, 28 threads, tail7 | same stream as the 14-thread tail7 row | - | - | **93.3** | **15.52 s** |
+
+The first divergence was a near-tie in both (e.g. base 21.58 vs 21.07 with the
+other candidate at 21.0), step-0 prefill logits had KL 0.019-0.021 with the
+same top-1, and both outputs remained coherent.  That is enough to call it a
+usable approximation; it is **default 7** (`PF_Q4_TAIL_SKIP=0` restores the
+exact expert set).  It changes the token stream at near-ties; the
+performance-first decision accepts that.  The archive's 96-token cell measured
+93.6 -> 86.9 ms (-7.2%); the larger wall changes above include the prefill and
+a different prompt.
+
+**MTP verify-cost gate: no-go for the existing q4 forward.**  `test_q4_verify`
+prefills a 96-token warm prompt (bank calibration 6.17 s), then times a
+one-slot, n-consecutive-token `prefill_text` suffix (the existing mode-1
+verify shape, LM head included) for n=1..6:
+
+| n | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| cold ms | 421.2 | 407.4 | 442.9 | 491.2 | 563.5 | 538.2 |
+| **warm ms** | **257.8** | **318.0** | **416.4** | **427.7** | **496.8** | **496.9** |
+
+The kill thresholds were warm n=3 < 190 ms and n=5 < 230 ms; the measured
+values are 2.2-2.7x over.  Even n=1 is 2.7x a plain token (93.3 ms), so the
+existing mode-1 forward is not the verify shape; MTP would need a new one-slot
+k+1-row mode, and the 2-row batch result (208 ms for 2 rows) already puts the
+likely 3/5-row verify above the gate.  The q4 MTP path is **not implemented**
+and is now **no-go** for this build; the draft semantics and state plan are in
+the q4 section of `AGENTS.md` if it is ever revisited.
+
+**Prefill: the 74 tok/s target is structurally out of reach on two cards.**
+The measured 9.6 s warm 544-token prefill splits into ~4.3-4.9 s of expert
+upload (31-32 GiB at 6.9-7.9 GB/s), ~3.5-4.2 s of device MoE and ~1.1 s of
+non-MoE.  Two evaluated routes do not pay: spilling the overflow experts to the
+host has a break-even of ~0.25 ms/expert against the existing 0.32-2.4 ms/expert
+host path (no-go as a default), and a 2-chunk layer pipeline adds ~45% expert
+copies (+14.5 GiB, +1.9-2.4 s), which cancels the overlap (likely ~9.7 s, not
+7.35 s).  A layer-map rebalance to the faster card drops the uniform bank size
+from R=121 to ~103 and costs ~10% decode for ~0.2 s prefill.  The warm prefill
+therefore stays ~56 tok/s.
+
+**QSA correction and Stage 1.**  The 32.2 ms in §4.4.1 is mostly a drain of the
+layer's own producers, not copy bandwidth: the four D2H copies are 63,488 B/layer,
+i.e. **744 KiB per token** over 12 full-attention layers.  The low-risk wins were
+implemented on 2026-10-27 (§4.4.1): pinned per-layer staging, the f16 host K/V
+mirror, and the deferred dense-prefill K/V copy queue.  They take the short
+dense QSA call 7.17 -> **1.67 ms**, the 1024-token dense chunk 1434 -> **56 ms
+steady** (~1.38 s saved per chunk), and the sparse decode attention 13.0 ->
+**8.0 ms**, with output md5 and selector pools byte-identical.  Stage 2 is
+implemented behind `PF_QSA_DEVATTN` (default on for f16 GPU sparse decode): on a 2412-token sparse prompt
+it takes the QSA call 42.31 -> **35.29 ms**, the decode wall 164.97 -> **154.01
+ms** (-6.6%) and the attention 7.99 -> **3.04 ms**, with the 32-token stream
+identical and the selector byte-identical; the caveats are in §4.4.1.  At the
+recommended `--ctx 2048` QSA is off entirely.
 
 ## 5. Qwen3.8-27B — the dense model
 

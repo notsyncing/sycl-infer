@@ -253,6 +253,14 @@ void cpu_qsa_score_pools(const float * q, const float * pool, int n_pool, int id
 // sel[j] * kv_stride floats.  `q` is [2*head_dim] (query then gate).
 void cpu_qsa_attn_head(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
                        int nsel, int hd, float scale, float * out);
+// PF_QSA_F16MIR: the mirror is stored as f16 (the value the reference cache
+// holds), so the kernel converts at read.  The arithmetic is the f32 form's:
+// every f16 converts back to exactly the float the old f32 mirror held.
+void cpu_qsa_attn_head_h(const float * q, const uint16_t * kbase, const uint16_t * vbase, int kv_stride,
+                         const int * sel, int nsel, int hd, float scale, float * out);
+// True when the resolved QSA attention is an AVX2/AVX-512 form, i.e. the f16
+// read is a hardware conversion.  The scalar fallback defaults F16MIR off.
+bool cpu_qsa_f16_ok();
 void cpu_q4_ple_gate(const float * key, const float * hidden, const float * w_key, const float * w_query, float * gate,
                      const int32_t * rows, int n_tok, int n_embd, int hc, float eps);
 void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_conv, const float * conv_w,

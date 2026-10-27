@@ -273,7 +273,8 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
 `test_w4_vs_i8`, `test_gemv_stride`, `test_iq_dequant`, `test_w4_vs_cpuref`,
 `test_w4_topk`, `test_27b_prefill`, `test_spec` - default to the 27B at
 `/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf` and take it as
-`argv[1]`.
+`argv[1]`.  `test_q4_batch` and `test_q4_verify` are qwen4exp-only: build them
+from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
 
 ```bash
 ./build/test_tokenizer     # tokenizer round-trips (CPU only, no GPU work)
@@ -320,6 +321,10 @@ The exceptions - `test_k5_gemv`, `test_quant_audit`, `test_w4_gemm`,
                               # fails.  TEST_DVP_LENS=... overrides the list.
 ./build/test_dflash_kernels # DFlash2 top-k + conv vs host references (GPU)
 ./build/test_spec          # MTP + DFlash2 stream == the plain greedy decode (27B)
+./build/test_q4_batch      # qwen4exp 2-row decode: correct but 0.85x; asserts
+                              # both rows are real (q4 model; AOT build, argv[1])
+./build/test_q4_verify     # qwen4exp MTP verify-cost gate: warm n=3/n=5
+                              # (q4 model; AOT build, argv[1])
 ```
 
 **Five of these are mandatory after touching a kernel or the engine**:
@@ -383,7 +388,8 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                   bidirectional attention), at (audio tower helpers: at_conv1d,
                   at_rope1d), attn_xmx (oneDNN int8 *matmul* prefill attention -
                   NOT the XMX unit, see the "XMX is a name, not a unit" note
-                  below; PF_ATTN_XMX below)
+                  below; PF_ATTN_XMX below), qsa (the Stage 2 device gather +
+                  scratch step_info for QSA; src/backend/gpu/kernels/qsa.cpp)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
                 model_arch.h (architecture registry), qwen35.cpp, model_w8.cpp,
                 tokenizer.{h,cpp}
@@ -456,7 +462,10 @@ tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
                 one engine per process, re-execing itself per configuration),
                 test_w4_vs_cpuref.cpp / test_w4_topk.cpp (u4 logits vs the fp32
                 reference; TEST_LAYER_MAP runs the 27B split across devices),
-                test_27b_prefill.cpp (27B prefill bring-up probe)
+                test_27b_prefill.cpp (27B prefill bring-up probe),
+                test_q4_batch.cpp / test_q4_verify.cpp (qwen4exp-only: the
+                2-row decode comparison and the MTP verify-cost gate; AOT
+                build, model as argv[1])
 tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
                 prompts, audio kernels, positions)
 src/router/     the multi-model front end (a SEPARATE binary, `sycl-infer-router`:
@@ -1602,7 +1611,7 @@ bank:
 ```bash
 ./build/sycl-infer \
   --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 --cpu-threads 28 \
   --ctx 2048 --kv-type f16 gen --prompt "..."
 ```
 
@@ -1614,7 +1623,20 @@ host half is `src/backend/cpu/kernels/q4exp.cpp`; the new device kernels are in
 the arbitrary-K up GEMV).  The plan builders, decode command graphs, prefix
 cache, MTP and the multimodal path are deliberately skipped (`q4exp` forces
 `pc_enabled = false`); the server's q4 `prefill_batch` has no recorded variant,
-and **batched q4exp decode is unmeasured**.
+and **batched q4exp decode is measured and rejected** (2 rows 0.85x; the
+scheduler now caps qwen4exp at one row and serialises its sequences - see
+*Decode batching, tail-skip and the MTP gate* below).  The scheduler's generic
+`prefill_batch` is also not q4; the scheduler now routes qwen4exp prefill through
+`prefill_text` for the whole remaining prompt (one scheduler chunk;
+`q4_prefill_text` chunks internally at `kMaxB*kMaxT`), so a long server prompt
+no longer needs `PF_PFB_MAX_M=16`.  Measured on a 2412-token prompt:
+**41.7 / 36.8 / 40.9 s** (57.8-59.5 tok/s) against **92.6 / 83.0 / 90.3 s** for
+the old 32-token `prefill_chunk` path (**2.2x**), one chunk, output md5 and
+sampled ids matching the CLI.  The 32-token vs 1024-token chunking shifts the
+QSA selector pools slightly (score cosine 0.9999945, max abs 0.0699, a few
+boundary pools) - the known prefill accumulation-order sensitivity, not stale
+slot state; the generated content matched.  `PF_PFB_MAX_M` no longer affects q4
+(it remains a non-q4 A/B knob).
 
 At startup the routed down bank is converted once to a symmetric int8 store
 (per-32 scale), because Q5_1's 32-value block is not a K-quant superblock and
@@ -1814,9 +1836,10 @@ with the same weights/bank and the same 96-token TCP prompt.
 
 **Where the host QSA time was, and what does not pay.**  With QSA on, the call
 measured **26.8 ms/token** at 96 tokens and **23.7 ms of it was the four blocking
-D2H copies per layer** (`memcpy().wait()` drains the in-order queue while the
+D2H waits per layer** (`memcpy().wait()` drains the in-order queue while the
 host MoE would otherwise overlap the device), not the dots: the indexer BF16
-projection was 3.0 ms and the mirror/pool update 0.08.  The fixes, in order:
+projection was 3.0 ms and the mirror/pool update 0.08.  The copy payload is only
+744 KiB/token; the wait is mostly the layer's own producers, not PCIe bandwidth.  The fixes, in order:
 
 * Enqueue the four copies and wait once: QSA **21.5 ms**, decode sum
   **100.8** (one wait per layer cannot avoid the first drain).  Those two
@@ -1926,9 +1949,11 @@ the checks that catch them.
   keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the down) and
   is neither copied nor computed.  On the 96-token TCP cell at 17500:
   **93.6 -> 86.9 ms (-7.2%)**, the last token's upload **56.2 -> 32.2 MiB
-  (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes (the text is
-  coherent, but a KL/top-1 gate against the baseline is still to run), so the
-  default stays 0.  Measured rank distribution: 39-42% of misses are rank >= 7.
+  (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes; the KL/top-1 gate
+  was run on 2026-10-27 (28/29 and 15/16 step pairs, first divergence always a
+  near-tie, KL 0.029/0.037, text coherent), so it is a usable approximation -
+  but still an expert-drop, so the default stays 0.  Measured rank
+  distribution: 39-42% of misses are rank >= 7.
 * **Decayed heat (`PF_Q4_HEAT=1`) is a loss on this engine**: 105.7 vs 93.6 ms
   and 156 vs 56 MiB of upload; the Strata adaptive-swap parameters do not
   transfer (the LFU prior was already negative).  Leave it off; the code is
@@ -1990,7 +2015,7 @@ the checks that catch them.
 | `PF_Q4_BANK_LAYER=1` | off | whole-layer bank instead of the per-expert LRU |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
 | `PF_Q4_PIN_SRC=0` | on | stage from the mmap instead of the pinned expert source |
-| `PF_Q4_TAIL_SKIP=N` | 0 | drop a miss whose best rank over the batch is >= N (7 = Strata tail-skip) |
+| `PF_Q4_TAIL_SKIP=N` | 7 | drop a miss whose best rank over the batch is >= N (Strata tail-skip; default 7, `0` = exact; gate 2026-10-27: KL 0.029/0.037 at near-tie divergences) |
 | `PF_Q4_CPU_MISS=1` | off | decode CPU miss for non-resident experts, int8 host path (`2` = f32 A/B); **measured 1.49x slower, see the dead ends** |
 | `PF_Q4_CPU_MISS_WARM=N` / `_LAYER=il` / `_TIME` | 16 / all / off | decode steps with the LRU before the split freezes / one-layer probe / per-layer host+GPU print |
 | `PF_Q4_CMDBG=1` | off | per-call sub-phase ms inside the host miss expert |
@@ -2006,6 +2031,9 @@ the checks that catch them.
 | `PF_QSA_TIME=1` | off | QSA host split per forward (`copy/gemv/upd/sel/attn`) |
 | `PF_QSA_ISA=scalar\|avx2\|avx512` | auto | force only the QSA host kernels' ISA |
 | `PF_QSA_DEFER=0` | on | inline update instead of the end-of-forward deferred update |
+| `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
+| `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
+| `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see §4.4.2 |
 | `PF_Q4_F32_SPLIT=0` | on | generic GDN beta/alpha GEMV |
 | `PF_Q4_IDS_HOST=0` / `PF_Q4_HOSTROUTER` | on / off | router ids copy / host router A/B |
 | `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_UPSTAT`, `PF_Q4_HOT_TIME`, `PF_Q4_FFCMP=<layer>` | off | phase attribution and the routed-FFN oracle |
@@ -2013,6 +2041,83 @@ the checks that catch them.
 | `PF_Q4_DOWN_NATIVE=1`, `PF_Q4_NOGRP_DOWN=1` | off | native host Q5_1 down, generic-down A/B |
 | `PF_Q4_BANK_TYPES=1`, `PF_Q4_BANK_MAX`, `PF_Q4_BANK_SKIP`, `PF_Q4_BANKCHK=1` | off | bank type dump, bisection bounds, byte check |
 | `PF_Q4_SM_LOAD=<path>` / `PF_Q4_CAL_LOAD=<path>` | off | load a static slot map / calibration table |
+
+**Decode batching, tail-skip, the MTP gate and the prefill ceiling (2026-10-27).**
+Full tables and commands in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.4.2.
+
+* **2-row batched decode is correct but 0.85-0.88x.**  Two prompts select ~20
+  distinct experts per layer against ~10 each, so the routed-expert weight read
+  doubles: 208.1 ms/step (9.61 tok/s) against 176.5 ms/step (11.33) for the same
+  two sequences one at a time.  The batch uploads 2.7x fewer MiB/token and is
+  still slower, so it is weight-read bound, not H2D; the dense part amortises
+  (0.703x) but saves only ~7 ms against ~28 ms lost in the experts.  Both rows
+  are numerically real (top-1 12/12, KL 0.026/0.008, no NaN).  qwen4exp's decode
+  is therefore **one row per forward**, and the scheduler caps it at one row and
+  **serialises** its sequences; round-robin was measured at 4.33 tok/s aggregate
+  against 5.40 serialized (two live sequences thrash the shared bank) and is
+  removed.  `test_q4_batch` is the regression test.
+* **28 CPU threads is a free win.**  The default is the physical-core count
+  (14 on the 28-thread box), but the host-side MoE/PLE/HC work scales with the
+  logical count.  On the 96-token TCP prompt: decode mean **120.7 -> 109.6 ms**,
+  wall **20.95 -> 18.08 s**, output **md5 identical** (the `[q4] fwd` split
+  moves `rest` 23.22 -> 13.67 ms).  With tail7: **100.1 -> 93.3 ms** and
+  **16.49 -> 15.52 s**.  The recommended q4 run sets `--cpu-threads 28`; the
+  server gains much less (5.40 -> 5.57 tok/s aggregate) because it is
+  prefill/HTTP-bound.  The archive 93.3 ms cell was measured at the default 14.
+* **Tail-skip has a quality gate now.**  Base vs `PF_Q4_TAIL_SKIP=7` on two
+  prompts: top-1 agreed for 28/29 and 15/16 steps, the first divergence was a
+  near-tie, the divergence-step KL was 0.029/0.037, and both outputs stayed
+  coherent.  Decode mean 120.7 -> 100.1 ms on the 96-token TCP prompt (wall
+  20.95 -> 16.49 s; a short prompt 14.35 -> 11.99 s).  It is **default 7**;
+  `PF_Q4_TAIL_SKIP=0` restores the exact expert set.  It changes the token
+  stream at near-ties; the performance-first decision accepts that.
+* **MTP is no-go for this build.**  `test_q4_verify` (one slot, n consecutive
+  tokens, LM head included) measures warm n=1/3/5 at **257.8 / 416.4 / 496.8
+  ms** against the kill thresholds 190/230; even n=1 is 2.7x a plain token
+  (93.3 ms), so the existing mode-1 forward is not the verify shape.  A new
+  one-slot k+1-row forward would be needed, and the 2-row batch result already
+  makes the likely 3/5-row verify too expensive.  If it is revisited: the
+  draft GGUF is the 49th block (`nextn_predict_layers=1`,
+  `eh_proj[5120,2560]`, `enorm`, per-stream `hnorm`, `hc_head_*`); the input is
+  the target's 10240-wide HC residual and `eh_proj` is applied per HC stream;
+  the verify must be one slot's k+1 consecutive tokens (not `decode_batch`'s
+  independent rows), with GDN/conv snapshots slot-strided by `state_slots_`,
+  PLE append suppressed, QSA dense-only, and per-row heads.  No MTP code is
+  added.
+* **The 74 tok/s prefill target is not reachable on two cards.**  The 9.6 s
+  warm 544-token prefill is ~4.3-4.9 s expert upload + ~3.5-4.2 s device MoE +
+  ~1.1 s non-MoE.  Host-spilling the overflow experts has a ~0.25 ms/expert
+  break-even against the existing 0.32-2.4 ms/expert path (no-go), and a 2-chunk
+  layer pipeline adds ~45% expert copies (+14.5 GiB) so its likely makespan is
+  ~9.7 s, not 7.35.  A layer-map rebalance drops R from 121 to ~103 and costs
+  ~10% decode.  The warm prefill stays ~56 tok/s.
+* **QSA's 32.2 ms is a producer drain, not copy bandwidth, and Stage 1 is
+  implemented.**  The four D2H copies are 744 KiB/token; the low-risk items are
+  pinned per-layer staging, an f16 host K/V mirror (`PF_QSA_F16MIR`, default
+  on for AVX2/AVX-512, off for scalar) and the deferred dense big-chunk copy
+  queue (`PF_QSA_COPYQ`).  Measured at `--ctx 4096`: short dense QSA call
+  7.17 -> **1.67 ms**, 1024-token dense chunk 1434 -> **56 ms steady** (~1.38 s
+  per chunk), sparse decode attention 13.0 -> **8.0 ms**, output md5 and
+  selector pools byte-identical.  **Stage 2 is implemented behind
+  `PF_QSA_DEVATTN` (default on for f16 GPU sparse decode; `=0` keeps host):**
+  the host selector is unchanged; for sparse
+  decode the selected rows are gathered into a compact f16 pool and the existing
+  device `attn` runs, with `attn_combine` applying the gate once.  On a
+  2412-token sparse prompt: QSA call **42.31 -> 35.29 ms**, decode wall
+  **164.97 -> 154.01 ms** (-6.6%), `attn` **7.99 -> 3.04 ms**; the 32-token
+  stream is identical, the selector score/pools byte-identical, the 16-token
+  logits agree 16/16 top-1 (max KL 0.00391), and the one-layer cos is
+  0.9999999.  Caveats: device tokens skip the main K/V mirror update, so a
+  post-decode sparse prefill on the same slot would need a rebuild (the q4
+  prompt->decode flows never do; `zero_slot` clears); `head_dim != 256`, i8,
+  CPU and prefill use the host path; the first device token allocates ~17 MB
+  per device (~9.8 ms).  A pre-existing `qsa_cache_`/`zero_slot` slot-reuse bug
+  was fixed with `engine::qsa_reset_slot` (flush, clear pending, destroy the
+  per-slot mirror/pool) from `zero_slot` and `reset_state`; three sequential
+  server requests on slot 0 gave B1 == B2, A differs, 12 layers cleared and
+  byte-identical B1/B2 selector dumps, with the QSA-off/short md5s unchanged.
+  At `--ctx 2048` QSA is off entirely.  The q4 server's long-prompt prefill now
+  uses the whole-prompt q4 path (no `PF_PFB_MAX_M`; 2.2x; see §4.4.2).
 
 ### OpenAI-compatible API
 
@@ -2684,7 +2789,8 @@ wait, so it measures host submission cost - the only way to tell a slow kernel
 from a slow launch; this is what found the `wg_clamped` regression below),
 `PF_Q4_TIME=1` (qwen4exp: one line per forward with the host-MoE / router /
 shared-expert / GPU-handoff split), `PF_QSA_TIME=1` (the host QSA split:
-`copy/gemv/upd/sel/attn`; `PF_QSA_ISA` and `PF_QSA_DEFER` are the A/B knobs),
+`copy/gemv/upd/sel/attn`; `PF_QSA_ISA`, `PF_QSA_DEFER`, `PF_QSA_F16MIR`,
+`PF_QSA_COPYQ` and `PF_QSA_DEVATTN` are the A/B knobs),
 `PF_Q4_HIST=1` (routing histogram: per-layer
 expert pair counts, top-B coverage and whole-layer coverage, printed at exit;
 `PF_Q4_BANK_TYPES`/`_MAX`/`_SKIP`/`_BANKCHK` are the bank diagnostics), `PF_Q4_DUMP=1` (per-stage rms/max/first),

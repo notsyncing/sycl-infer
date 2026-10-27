@@ -263,27 +263,40 @@ void scheduler::loop() {
                     // ~0.7 s of a 553-token prefill).
                     int n = 0;
                     bool batch_pf = false;
-                    for (int cand = e.batched_prefill_fit(rem); cand >= kMaxT; cand -= kMaxT) {
-                        const int need = (s->prompt_pos + cand + kBlockSize - 1) / kBlockSize;
-                        bool ok = true;
-                        while ((int)s->blocks.size() < need) {
-                            int b = e.alloc_block();
-                            if (b < 0) {
-                                ok = false;
+                    if (e.m.q4exp) {
+                        // qwen4exp prefills the whole remaining prompt in one
+                        // public call below: its forward path is q4_forward
+                        // (there is no generic mode-2 prefill_batch for it),
+                        // and prefill_text() routes to q4_prefill_text(),
+                        // which chunks internally at kMaxB*kMaxT and writes
+                        // the last token's logits.  One scheduler chunk.
+                        n = rem;
+                    } else {
+                        for (int cand = e.batched_prefill_fit(rem); cand >= kMaxT; cand -= kMaxT) {
+                            const int need = (s->prompt_pos + cand + kBlockSize - 1) / kBlockSize;
+                            bool ok = true;
+                            while ((int)s->blocks.size() < need) {
+                                int b = e.alloc_block();
+                                if (b < 0) {
+                                    ok = false;
+                                    break;
+                                }
+                                s->blocks.push_back(b);
+                                e.set_table(s->slot, s->blocks);
+                            }
+                            if (ok) {
+                                n = cand;
+                                batch_pf = true;
                                 break;
                             }
-                            s->blocks.push_back(b);
-                            e.set_table(s->slot, s->blocks);
-                        }
-                        if (ok) {
-                            n = cand;
-                            batch_pf = true;
-                            break;
                         }
                     }
                     if (!batch_pf) {
-                        n = std::min<int>(kMaxT, rem);
-                        // ensure blocks for this chunk
+                        if (!e.m.q4exp) {
+                            n = std::min<int>(kMaxT, rem);
+                        }
+                        // ensure blocks for this chunk (the whole prompt for
+                        // q4exp, whose prefill_text call below prefills it)
                         const int end = s->prompt_pos + n;
                         const int need = (end + kBlockSize - 1) / kBlockSize;
                         while ((int)s->blocks.size() < need) {
@@ -308,7 +321,11 @@ void scheduler::loop() {
                     if (tdbg && s->n_chunks == 0) {
                         s->wait_ms = dms(s->t_submit, t_pf0);
                     }
-                    if (batch_pf) {
+                    if (e.m.q4exp) {
+                        lk2.unlock();
+                        e.prefill_text(s->prompt, s->slot, n, s->prompt_pos);
+                        lk2.lock();
+                    } else if (batch_pf) {
                         lk2.unlock();
                         e.prefill_batch(s->prompt, s->prompt_pos, n, s->slot, s->prompt_pos);
                         lk2.lock();
@@ -378,6 +395,20 @@ void scheduler::loop() {
             std::unique_lock<std::mutex> lk2(m);
             int nb = 0;
             std::vector<std::shared_ptr<sequence>> batch;
+            // PF_SCHED_MAX_DECODE overrides the cap for tests and A/B runs.
+            // qwen4exp defaults to one row per decode forward: two rows select
+            // ~20 distinct experts per layer against ~10 each, so the routed-
+            // expert weight read doubles.  Measured on 2x A770, 17500 MB bank,
+            // f16 KV: 2 rows 208.1 ms/step (9.61 tok/s) against 176.5 ms/step
+            // (11.33 tok/s) for the same two sequences decoded one at a time,
+            // i.e. 0.85x.  The batch uploads 2.7x fewer MiB/token and is still
+            // slower, so this is weight-read bound, not H2D.  The one-row cap
+            // serialises qwen4exp's sequences (the scheduler deliberately does
+            // not interleave them): round-robin was measured on the server at
+            // 4.33 tok/s aggregate against 5.79 for one request at a time,
+            // because two live sequences thrash the shared expert bank.
+            static const int dbg_cap = si::env::i32("PF_SCHED_MAX_DECODE", 0);
+            const int dec_cap = dbg_cap > 0 ? dbg_cap : (e.m.q4exp ? 1 : kMaxB);
             for (auto & s : active) {
                 if (s->finished) {
                     continue;
@@ -407,13 +438,7 @@ void scheduler::loop() {
                 if (s->recent.empty()) {
                     continue;
                 }
-                // PF_SCHED_MAX_DECODE caps the rows per decode forward.  It exists so a test can
-                // pin batching off and isolate what differs between two concurrent
-                // requests: with one row the decode path is bit-for-bit the
-                // single-request path, so any divergence is admission or prefill.
-                // Default 0 = no cap (kMaxB), the shipped behaviour.
-                static const int dbg_cap = si::env::i32("PF_SCHED_MAX_DECODE", 0);
-                if (nb >= (dbg_cap > 0 ? dbg_cap : kMaxB)) {
+                if (nb >= dec_cap) {
                     break;
                 }
                 // grow the block table if needed

@@ -124,6 +124,14 @@ void engine::q4_alloc() {
     qsa_on_ = hp.idx_kpool > 1 && hp.idx_top_k > 0 && max_seq > hp.idx_top_k && hp.idx_n_head > 0;
     if (qsa_on_) {
         qsa_max_seq_ = max_seq;
+        // Default on where the f16 read is a hardware conversion; the scalar
+        // fallback keeps the f32 mirror unless F16MIR is set explicitly.
+        qsa_f16mir_ = si::env::str("PF_QSA_F16MIR") ? (si::env::i32("PF_QSA_F16MIR", 1) != 0) : cpu_qsa_f16_ok();
+        qsa_copyq_ = SI_ENV_I32("PF_QSA_COPYQ", 1) != 0;
+        // Stage 2: on by default for the f16 GPU sparse path; it is 6.6%
+        // faster on the 2412-token cell with the same 32-token stream and
+        // byte-identical selector.  PF_QSA_DEVATTN=0 keeps the host Stage 1.
+        qsa_devattn_ = SI_ENV_I32("PF_QSA_DEVATTN", 1) != 0;
         qsa_cache_.resize((size_t)attn_layers());
         for (auto & v : qsa_cache_) {
             v.resize((size_t)state_slots_);
@@ -1747,6 +1755,11 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             ph1(dev, ph_t, t_go, true);
         } else {
             n_attn_l++;
+            // A dense prefill chunk's K/V copies ride a separate queue; put the
+            // dependency back before the qkv GEMV overwrites KBUF/VBUF.
+            if (qsa_on_) {
+                qsa_copy_guard(attn_idx, dev);
+            }
             float * QBUF = multi ? as_[(size_t)dev].qbuf : d_qbuf;
             float * KBUF = multi ? as_[(size_t)dev].kbuf : d_kbuf;
             float * VBUF = multi ? as_[(size_t)dev].vbuf : d_vbuf;
@@ -1820,6 +1833,21 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             ph_t = ph0(dev);
             gemv(dev, L.wo, ATTN_OUT, hp.n_head * hp.head_dim, b.block, n_embd, tb, nblocks);
             ph1(dev, ph_t, t_ao, true);
+            if (const char * dp = si::env::str("PF_QSA_ATTN_DUMP")) {
+                static const int dl = si::env::i32("PF_QSA_ATTN_LAYER", 0);
+                if (n_tok == 1 && attn_idx == dl) {
+                    std::vector<float> h((size_t)n_embd);
+                    sycl::queue & qd = dev_queue(dev);
+                    qd.memcpy(h.data(), b.block, h.size() * sizeof(float));
+                    qd.wait();
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s.wo.%d.%d.bin", dp, attn_idx, inf->pos[0]);
+                    if (FILE * fp = fopen(path, "wb")) {
+                        fwrite(h.data(), sizeof(float), h.size(), fp);
+                        fclose(fp);
+                    }
+                }
+            }
             attn_idx++;
         }
         dbg_stats("block_attn", dev, b.block, (size_t)n_tok * n_embd, 0);
@@ -1985,7 +2013,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             // a miss.  It is declared here because both the two-pass schedule
             // and the single-pass decode need it; rank_min is filled after the
             // ids are available.
-            static const int tail_skip = si::env::i32("PF_Q4_TAIL_SKIP", 0);
+            // Default 7: the quality gate showed the first divergence at a
+            // near-tie (top-1 28/29 and 15/16, KL 0.029/0.037) and the speedup
+            // is real; PF_Q4_TAIL_SKIP=0 restores the exact expert set.
+            static const int tail_skip = si::env::i32("PF_Q4_TAIL_SKIP", 7);
             std::vector<int> rank_min;
             if (q4_hot_ && q4_hot_ready_) {
                 // All-GPU LRU: every expert the step selects is uploaded into a

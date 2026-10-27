@@ -627,9 +627,12 @@ struct engine {
     // own K/V so the selected keys can be attended on the CPU without a gather
     // kernel.  Allocated lazily per (attention layer, slot).
     struct qsa_slot_state {
-        std::vector<float> k, v; // [max_seq][n_head_kv*head_dim]
-        std::vector<float> pool; // [(max_seq/4+1)][idx_head_dim]
-        std::vector<float> ring; // [4][idx_head_dim]
+        // PF_QSA_F16MIR (default on) keeps the mirror as the f16 the reference
+        // cache holds; the f32 vectors are the A/B and are not allocated then.
+        std::vector<uint16_t> k16, v16; // [max_seq][n_head_kv*head_dim]
+        std::vector<float> k, v;        // the PF_QSA_F16MIR=0 mirror
+        std::vector<float> pool;        // [(max_seq/4+1)][idx_head_dim]
+        std::vector<float> ring;        // [4][idx_head_dim]
         int n_pool = 0;
     };
     std::vector<std::vector<std::unique_ptr<qsa_slot_state>>> qsa_cache_;
@@ -645,16 +648,79 @@ struct engine {
         const layer_t * L = nullptr;
         int a = -1;
         int n_tok = 0;
+        int dev = -1;
         bool active = false;
         bool has_ev = false;
+        bool copyq = false; // the K/V copies ride the per-device copy queue
         sycl::event ev;
         std::vector<int> pos, slot;
-        std::vector<float> mixed, k, v;
+        float * mixed = nullptr; // per-layer pinned staging
+        float * k = nullptr;
+        float * v = nullptr;
     };
     std::vector<qsa_pending> qsa_pending_;
+    // Per-attention-layer pinned staging for the D2H inputs (mixed/q/k/v) and
+    // the sparse attention's H2D output.  Allocated lazily and grown to the
+    // largest chunk seen; a pageable std::vector makes the copy synchronous
+    // and the q4 box's in-order queue drain was the cost.
+    struct qsa_stage {
+        float * mixed = nullptr;
+        float * q = nullptr;
+        float * k = nullptr;
+        float * v = nullptr;
+        float * out = nullptr;
+        size_t cap = 0;     // tokens: mixed/k/v
+        size_t cap_q = 0;   // tokens: q
+        size_t cap_out = 0; // tokens: out
+        int dev = -1;
+    };
+    std::vector<qsa_stage> qsa_stage_;
+    void qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int dev);
+    // Per-device in-order copy queue for the deferred dense-prefill K/V D2H.
+    // It rides beside the compute queue, so the copy overlaps the next layers
+    // instead of being ordered into the queue; qsa_copy_guard() puts the
+    // dependency back before the buffers it reads are rewritten.
+    std::vector<std::unique_ptr<sycl::queue>> qsa_copy_q_;
+    sycl::queue & qsa_copy_queue(int dev);
+    void qsa_copy_guard(int a, int dev);
+    bool qsa_f16mir_ = false;  // PF_QSA_F16MIR (default on)
+    bool qsa_copyq_ = false;   // PF_QSA_COPYQ (default on)
+    bool qsa_devattn_ = true; // PF_QSA_DEVATTN (default on, Stage 2; =0 keeps host)
+    // PF_QSA_DEVATTN scratch.  Per device: the compact f16 K/V pool (the same
+    // [block][kv head][kBlockSize token][head_dim] layout as the paged pool)
+    // and its sequential table + selected-index buffer.  Per attention layer:
+    // a device step_info (filled by qsa_sinfo_launch) and the pinned host
+    // `sel` staging, which is per layer so a later layer's selector cannot
+    // overwrite it before its H2D copy has completed.
+    struct qsa_dev_buf {
+        int dev = -1;
+        sycl::half * ck = nullptr;
+        sycl::half * cv = nullptr;
+        int32_t * dsel = nullptr;
+        int32_t * tab = nullptr; // sequential compact block table (device)
+        int32_t * htab = nullptr; // pinned staging for the one-time table copy
+        int cap_keys = 0;
+        int cap_blocks = 0;
+    };
+    std::vector<qsa_dev_buf> qsa_dev_;
+    struct qsa_dev_aux {
+        int dev = -1;
+        int32_t * hsel = nullptr; // pinned staging, [cap_keys]
+        step_info * sinfo = nullptr; // device, one row
+    };
+    std::vector<qsa_dev_aux> qsa_aux_;
+    void qsa_devattn_ensure(int dev);
+    void qsa_devattn_aux(int a, int dev);
+    void qsa_devattn_run(int a, int dev, int slot, int pos, const std::vector<int> & sel, const float * qbuf,
+                         float * attn_out);
     void qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
-                          const float * mixed_host, const float * kh, const float * vh, float * qpos, bool with_q);
+                          const float * mixed_host, const float * kh, const float * vh, float * qpos, bool with_q,
+                          bool update_mirror);
     double qsa_flush();
+    // A slot is about to be handed to a new sequence (or the engine is being
+    // reset): drop its host mirror/pool/ring and any deferred update that names
+    // it.  `slot < 0` resets every slot.  No-op when QSA is off.
+    void qsa_reset_slot(int slot);
     // PF_QSA_TIME: the host QSA split, accumulated over one forward.  `copy`
     // is the D2H waits, `gemv` the indexer projections (q is skipped when no
     // selector runs), `upd` the per-token norm/RoPE/pool/mirror update, `sel`

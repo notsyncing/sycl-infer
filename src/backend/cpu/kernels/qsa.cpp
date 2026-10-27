@@ -31,6 +31,22 @@ namespace {
 
 #ifdef SI_QSA_X86
 
+// A 16-value f16 load is exactly the f32 value the f32 mirror held: ggml's
+// f16 round-trip is exact, so the arithmetic below is unchanged.  Templating
+// the attention on the element type keeps one instruction sequence for both
+// PF_QSA_F16MIR settings.
+template <typename T> struct qsa_ld512;
+template <> struct qsa_ld512<float> {
+    __attribute__((target("avx512f,avx512bw,avx512vl"))) static __m512 load(const float * p) {
+        return _mm512_loadu_ps(p);
+    }
+};
+template <> struct qsa_ld512<uint16_t> {
+    __attribute__((target("avx512f,avx512bw,avx512vl"))) static __m512 load(const uint16_t * p) {
+        return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(const void *)p));
+    }
+};
+
 // ---------------------------------------------------------------- AVX-512
 __attribute__((target("avx512f,avx512bw,avx512vl"))) inline __m512 bf16x16(const uint16_t * p) {
     const __m256i h = _mm256_loadu_si256((const __m256i *)(const void *)p);
@@ -96,8 +112,9 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) float dot_avx512(const floa
     return s;
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl"))) void attn_head_avx512(
-    const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel, int nsel, int hd,
+template <typename T>
+__attribute__((target("avx512f,avx512bw,avx512vl"))) void attn_head_avx512_t(
+    const float * q, const T * kbase, const T * vbase, int kv_stride, const int * sel, int nsel, int hd,
     float scale, float * out) {
     if (hd != 256) { // the model's geometry; the generic scalar form otherwise
         return;
@@ -112,23 +129,23 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) void attn_head_avx512(
                 q15 = _mm512_loadu_ps(q + 240);
     __m512 vmax = _mm512_set1_ps(-3.402823466e38f);
     for (int j = 0; j < nsel; j++) {
-        const float * kp = kbase + (size_t)sel[j] * kv_stride;
-        __m512 a0 = _mm512_mul_ps(q0, _mm512_loadu_ps(kp + 0));
-        __m512 a1 = _mm512_mul_ps(q1, _mm512_loadu_ps(kp + 16));
-        __m512 a2 = _mm512_mul_ps(q2, _mm512_loadu_ps(kp + 32));
-        __m512 a3 = _mm512_mul_ps(q3, _mm512_loadu_ps(kp + 48));
-        a0 = _mm512_fmadd_ps(q4, _mm512_loadu_ps(kp + 64), a0);
-        a1 = _mm512_fmadd_ps(q5, _mm512_loadu_ps(kp + 80), a1);
-        a2 = _mm512_fmadd_ps(q6, _mm512_loadu_ps(kp + 96), a2);
-        a3 = _mm512_fmadd_ps(q7, _mm512_loadu_ps(kp + 112), a3);
-        a0 = _mm512_fmadd_ps(q8, _mm512_loadu_ps(kp + 128), a0);
-        a1 = _mm512_fmadd_ps(q9, _mm512_loadu_ps(kp + 144), a1);
-        a2 = _mm512_fmadd_ps(q10, _mm512_loadu_ps(kp + 160), a2);
-        a3 = _mm512_fmadd_ps(q11, _mm512_loadu_ps(kp + 176), a3);
-        a0 = _mm512_fmadd_ps(q12, _mm512_loadu_ps(kp + 192), a0);
-        a1 = _mm512_fmadd_ps(q13, _mm512_loadu_ps(kp + 208), a1);
-        a2 = _mm512_fmadd_ps(q14, _mm512_loadu_ps(kp + 224), a2);
-        a3 = _mm512_fmadd_ps(q15, _mm512_loadu_ps(kp + 240), a3);
+        const T * kp = kbase + (size_t)sel[j] * kv_stride;
+        __m512 a0 = _mm512_mul_ps(q0, qsa_ld512<T>::load(kp + 0));
+        __m512 a1 = _mm512_mul_ps(q1, qsa_ld512<T>::load(kp + 16));
+        __m512 a2 = _mm512_mul_ps(q2, qsa_ld512<T>::load(kp + 32));
+        __m512 a3 = _mm512_mul_ps(q3, qsa_ld512<T>::load(kp + 48));
+        a0 = _mm512_fmadd_ps(q4, qsa_ld512<T>::load(kp + 64), a0);
+        a1 = _mm512_fmadd_ps(q5, qsa_ld512<T>::load(kp + 80), a1);
+        a2 = _mm512_fmadd_ps(q6, qsa_ld512<T>::load(kp + 96), a2);
+        a3 = _mm512_fmadd_ps(q7, qsa_ld512<T>::load(kp + 112), a3);
+        a0 = _mm512_fmadd_ps(q8, qsa_ld512<T>::load(kp + 128), a0);
+        a1 = _mm512_fmadd_ps(q9, qsa_ld512<T>::load(kp + 144), a1);
+        a2 = _mm512_fmadd_ps(q10, qsa_ld512<T>::load(kp + 160), a2);
+        a3 = _mm512_fmadd_ps(q11, qsa_ld512<T>::load(kp + 176), a3);
+        a0 = _mm512_fmadd_ps(q12, qsa_ld512<T>::load(kp + 192), a0);
+        a1 = _mm512_fmadd_ps(q13, qsa_ld512<T>::load(kp + 208), a1);
+        a2 = _mm512_fmadd_ps(q14, qsa_ld512<T>::load(kp + 224), a2);
+        a3 = _mm512_fmadd_ps(q15, qsa_ld512<T>::load(kp + 240), a3);
         const float s = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3))) * scale;
         sc[(size_t)j] = s;
         vmax = _mm512_max_ps(vmax, _mm512_set1_ps(s));
@@ -155,23 +172,23 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) void attn_head_avx512(
            o15 = _mm512_setzero_ps();
     for (int j = 0; j < nsel; j++) {
         const __m512 w = _mm512_set1_ps(sc[(size_t)j] * inv);
-        const float * vp = vbase + (size_t)sel[j] * kv_stride;
-        o0 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 0), o0);
-        o1 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 16), o1);
-        o2 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 32), o2);
-        o3 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 48), o3);
-        o4 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 64), o4);
-        o5 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 80), o5);
-        o6 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 96), o6);
-        o7 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 112), o7);
-        o8 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 128), o8);
-        o9 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 144), o9);
-        o10 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 160), o10);
-        o11 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 176), o11);
-        o12 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 192), o12);
-        o13 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 208), o13);
-        o14 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 224), o14);
-        o15 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vp + 240), o15);
+        const T * vp = vbase + (size_t)sel[j] * kv_stride;
+        o0 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 0), o0);
+        o1 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 16), o1);
+        o2 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 32), o2);
+        o3 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 48), o3);
+        o4 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 64), o4);
+        o5 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 80), o5);
+        o6 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 96), o6);
+        o7 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 112), o7);
+        o8 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 128), o8);
+        o9 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 144), o9);
+        o10 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 160), o10);
+        o11 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 176), o11);
+        o12 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 192), o12);
+        o13 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 208), o13);
+        o14 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 224), o14);
+        o15 = _mm512_fmadd_ps(w, qsa_ld512<T>::load(vp + 240), o15);
     }
     const float * gate = q + 256;
 #define SI_GATE(B, O)                                                                                                  \
@@ -200,6 +217,16 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) void attn_head_avx512(
 #undef SI_GATE
 }
 
+void attn_head_avx512(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
+                      int nsel, int hd, float scale, float * out) {
+    attn_head_avx512_t<float>(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
+}
+
+void attn_head_avx512_h(const float * q, const uint16_t * kbase, const uint16_t * vbase, int kv_stride,
+                        const int * sel, int nsel, int hd, float scale, float * out) {
+    attn_head_avx512_t<uint16_t>(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
+}
+
 // Serial on purpose: 512 pools x 4 heads x 128 values is ~2.7 us for a layer
 // with AVX-512, below the cost of waking the thread pool once per layer.
 __attribute__((target("avx512f,avx512bw,avx512vl"))) void score_pools_avx512(
@@ -215,6 +242,18 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) void score_pools_avx512(
 }
 
 // ------------------------------------------------------------------ AVX2
+template <typename T> struct qsa_ld256;
+template <> struct qsa_ld256<float> {
+    __attribute__((target("avx2,fma"))) static __m256 load(const float * p) {
+        return _mm256_loadu_ps(p);
+    }
+};
+template <> struct qsa_ld256<uint16_t> {
+    __attribute__((target("avx2,fma,f16c"))) static __m256 load(const uint16_t * p) {
+        return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)p));
+    }
+};
+
 __attribute__((target("avx2,fma"))) inline __m256 bf16x8(const uint16_t * p) {
     const __m128i h = _mm_loadu_si128((const __m128i *)(const void *)p);
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
@@ -288,9 +327,10 @@ __attribute__((target("avx2,fma"))) float dot_avx2(const float * __restrict a, c
     return s;
 }
 
-__attribute__((target("avx2,fma"))) void attn_head_avx2(const float * q, const float * kbase, const float * vbase,
-                                                        int kv_stride, const int * sel, int nsel, int hd, float scale,
-                                                        float * out) {
+template <typename T>
+__attribute__((target("avx2,fma,f16c"))) void attn_head_avx2_t(const float * q, const T * kbase, const T * vbase,
+                                                              int kv_stride, const int * sel, int nsel, int hd,
+                                                              float scale, float * out) {
     if (hd != 256) {
         return;
     }
@@ -302,14 +342,14 @@ __attribute__((target("avx2,fma"))) void attn_head_avx2(const float * q, const f
     }
     __m256 vmax = _mm256_set1_ps(-3.402823466e38f);
     for (int j = 0; j < nsel; j++) {
-        const float * kp = kbase + (size_t)sel[j] * kv_stride;
+        const T * kp = kbase + (size_t)sel[j] * kv_stride;
         __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(),
                a3 = _mm256_setzero_ps();
         for (int b = 0; b < 32; b += 4) {
-            a0 = _mm256_fmadd_ps(qv[b], _mm256_loadu_ps(kp + b * 8), a0);
-            a1 = _mm256_fmadd_ps(qv[b + 1], _mm256_loadu_ps(kp + (b + 1) * 8), a1);
-            a2 = _mm256_fmadd_ps(qv[b + 2], _mm256_loadu_ps(kp + (b + 2) * 8), a2);
-            a3 = _mm256_fmadd_ps(qv[b + 3], _mm256_loadu_ps(kp + (b + 3) * 8), a3);
+            a0 = _mm256_fmadd_ps(qv[b], qsa_ld256<T>::load(kp + b * 8), a0);
+            a1 = _mm256_fmadd_ps(qv[b + 1], qsa_ld256<T>::load(kp + (b + 1) * 8), a1);
+            a2 = _mm256_fmadd_ps(qv[b + 2], qsa_ld256<T>::load(kp + (b + 2) * 8), a2);
+            a3 = _mm256_fmadd_ps(qv[b + 3], qsa_ld256<T>::load(kp + (b + 3) * 8), a3);
         }
         __m256 a = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
         __m128 lo = _mm256_castps256_ps128(a);
@@ -346,9 +386,9 @@ __attribute__((target("avx2,fma"))) void attn_head_avx2(const float * q, const f
     }
     for (int j = 0; j < nsel; j++) {
         const __m256 w = _mm256_set1_ps(sc[(size_t)j] * inv);
-        const float * vp = vbase + (size_t)sel[j] * kv_stride;
+        const T * vp = vbase + (size_t)sel[j] * kv_stride;
         for (int b = 0; b < 32; b++) {
-            o[b] = _mm256_fmadd_ps(w, _mm256_loadu_ps(vp + b * 8), o[b]);
+            o[b] = _mm256_fmadd_ps(w, qsa_ld256<T>::load(vp + b * 8), o[b]);
         }
     }
     const float * gate = q + 256;
@@ -358,6 +398,16 @@ __attribute__((target("avx2,fma"))) void attn_head_avx2(const float * q, const f
                                         _mm256_add_ps(_mm256_set1_ps(1.0f), exp256(_mm256_sub_ps(_mm256_setzero_ps(), g))));
         _mm256_storeu_ps(out + b * 8, _mm256_mul_ps(o[b], sg));
     }
+}
+
+void attn_head_avx2(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
+                    int nsel, int hd, float scale, float * out) {
+    attn_head_avx2_t<float>(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
+}
+
+void attn_head_avx2_h(const float * q, const uint16_t * kbase, const uint16_t * vbase, int kv_stride,
+                      const int * sel, int nsel, int hd, float scale, float * out) {
+    attn_head_avx2_t<uint16_t>(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
 }
 
 __attribute__((target("avx2,fma"))) void score_pools_avx2(const float * q, const float * pool, int n_pool, int id,
@@ -383,16 +433,25 @@ float bf16_dot_scalar(const uint16_t * w, const float * __restrict x, int K) {
     return acc;
 }
 
-void attn_head_scalar(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
-                      int nsel, int hd, float scale, float * out) {
+template <typename T> inline float qsa_load_scalar(T v);
+template <> inline float qsa_load_scalar<float>(float v) {
+    return v;
+}
+template <> inline float qsa_load_scalar<uint16_t>(uint16_t v) {
+    return ggml_half_to_float(v);
+}
+
+template <typename T>
+void attn_head_scalar_t(const float * q, const T * kbase, const T * vbase, int kv_stride, const int * sel,
+                        int nsel, int hd, float scale, float * out) {
     thread_local std::vector<float> sc;
     sc.resize((size_t)nsel);
     float mx = -3.402823466e38f;
     for (int j = 0; j < nsel; j++) {
-        const float * kp = kbase + (size_t)sel[j] * kv_stride;
+        const T * kp = kbase + (size_t)sel[j] * kv_stride;
         float d = 0.f;
         for (int b = 0; b < hd; b++) {
-            d += q[b] * kp[b];
+            d += q[b] * qsa_load_scalar<T>(kp[b]);
         }
         const float s = d * scale;
         sc[(size_t)j] = s;
@@ -409,15 +468,25 @@ void attn_head_scalar(const float * q, const float * kbase, const float * vbase,
     }
     for (int j = 0; j < nsel; j++) {
         const float w = sc[(size_t)j] * inv;
-        const float * vp = vbase + (size_t)sel[j] * kv_stride;
+        const T * vp = vbase + (size_t)sel[j] * kv_stride;
         for (int d = 0; d < hd; d++) {
-            out[d] += w * vp[d];
+            out[d] += w * qsa_load_scalar<T>(vp[d]);
         }
     }
     const float * gate = q + hd;
     for (int d = 0; d < hd; d++) {
         out[d] *= 1.f / (1.f + std::exp(-gate[d]));
     }
+}
+
+void attn_head_scalar(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
+                      int nsel, int hd, float scale, float * out) {
+    attn_head_scalar_t<float>(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
+}
+
+void attn_head_scalar_h(const float * q, const uint16_t * kbase, const uint16_t * vbase, int kv_stride,
+                        const int * sel, int nsel, int hd, float scale, float * out) {
+    attn_head_scalar_t<uint16_t>(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
 }
 
 void score_pools_scalar(const float * q, const float * pool, int n_pool, int id, int inh, float inv, float * scores) {
@@ -437,6 +506,7 @@ void score_pools_scalar(const float * q, const float * pool, int n_pool, int id,
 struct qsa_dispatch {
     float (*bf16_dot)(const uint16_t *, const float *, int);
     void (*attn_head)(const float *, const float *, const float *, int, const int *, int, int, float, float *);
+    void (*attn_head_h)(const float *, const uint16_t *, const uint16_t *, int, const int *, int, int, float, float *);
     void (*score_pools)(const float *, const float *, int, int, int, float, float *);
 };
 
@@ -457,13 +527,13 @@ const qsa_dispatch & qsa_isa() {
         // A forced variant still has to be runnable: PF_QSA_ISA=avx512 on an
         // AVX2-only host falls back rather than executing a SIGILL.
         if ((force_avx512 && can512) || (!f && best == cpu_isa::avx512)) {
-            return qsa_dispatch{bf16_dot_avx512, attn_head_avx512, score_pools_avx512};
+            return qsa_dispatch{bf16_dot_avx512, attn_head_avx512, attn_head_avx512_h, score_pools_avx512};
         }
         if ((force_avx2 && can256) || (force_avx512 && can256) || (!f && best == cpu_isa::avx2)) {
-            return qsa_dispatch{bf16_dot_avx2, attn_head_avx2, score_pools_avx2};
+            return qsa_dispatch{bf16_dot_avx2, attn_head_avx2, attn_head_avx2_h, score_pools_avx2};
         }
 #endif
-        return qsa_dispatch{bf16_dot_scalar, attn_head_scalar, score_pools_scalar};
+        return qsa_dispatch{bf16_dot_scalar, attn_head_scalar, attn_head_scalar_h, score_pools_scalar};
     }();
     return d;
 }
@@ -494,6 +564,15 @@ void cpu_qsa_score_pools(const float * q, const float * pool, int n_pool, int id
     qsa_isa().score_pools(q, pool, n_pool, id, inh, inv, scores);
 }
 
+bool cpu_qsa_f16_ok() {
+    // The f16 read is an F16C cvtph in the AVX2/AVX-512 forms.  The scalar form
+    // has to call ggml_half_to_float per element, which stops the compiler
+    // auto-vectorising the loops: measured 4.6x slower on the 128-token sparse
+    // prefill (12 477 vs 2 721 ms), so PF_QSA_F16MIR defaults off there and an
+    // explicit =1 still forces it.
+    return qsa_isa().attn_head != attn_head_scalar;
+}
+
 void cpu_qsa_attn_head(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
                        int nsel, int hd, float scale, float * out) {
     if (hd != 256) { // the vector forms are specialised for the model's head
@@ -501,6 +580,15 @@ void cpu_qsa_attn_head(const float * q, const float * kbase, const float * vbase
         return;
     }
     qsa_isa().attn_head(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
+}
+
+void cpu_qsa_attn_head_h(const float * q, const uint16_t * kbase, const uint16_t * vbase, int kv_stride,
+                         const int * sel, int nsel, int hd, float scale, float * out) {
+    if (hd != 256) {
+        attn_head_scalar_h(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
+        return;
+    }
+    qsa_isa().attn_head_h(q, kbase, vbase, kv_stride, sel, nsel, hd, scale, out);
 }
 
 } // namespace si
