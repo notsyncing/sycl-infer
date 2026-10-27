@@ -1903,7 +1903,19 @@ calibrates on it) and the second/steady 512-token prefill is **~9.6 s
 (56 tok/s)**.  Decode reaches **~93.3 ms/token (10.7 tok/s) after ~16 tokens**;
 a 64-token generation is ~15.6 s wall including the warm prefill.
 `PF_Q4_PIN_SRC=0` (staging) and `PF_Q4_BANK_Q5K=1` (layer 2 decode-only,
-107.2 ms, so off) are the A/Bs.  Correctness on this build:
+107.2 ms, so off) are the A/Bs.
+
+**Deep context (2026-10-27, f16 KV, 28 threads, tail7).**  At 16 445 tokens the
+prefill is **41.3 tok/s** and the decode **121.3 ms** (8.24 tok/s); at 48 139 it
+is **35.8 tok/s** and **153.6 ms** (6.51 tok/s), the latter with a 16 000 MB
+bank because 17 500 MB does not allocate at 65k context.  The 2 426-token
+first-sparse cell measures 53.4 tok/s / 134.7-137.3 ms.  **The sparse QSA
+selector scores every pooled key before choosing the top 2 048**, so its host
+cost grows with the key count: the decode is not depth-flat (93.3 ms at 512
+with QSA off/dense, 121 ms at 16k, 154 ms at 48k).  Raw runs and conditions:
+[`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md) §7.1.5.
+
+Correctness on this build:
 `12 x 9` -> **108**, the TCP/UDP prompt is coherent, the 27B
 `test_decode_vs_prefill` oracle is **8/8 OK**, and `PF_Q4_FFCMP` gives cosine
 **0.99998** for the routed GPU FFN against the host path.
@@ -2147,7 +2159,7 @@ the checks that catch them.
 | `PF_QSA_DEFER=0` | on | inline update instead of the end-of-forward deferred update |
 | `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
 | `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
-| `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see §4.4.2 |
+| `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see design 18 §4 |
 | `PF_Q4_IDS_HOST=0` / `PF_Q4_HOSTROUTER` | on / off | router ids copy / host router A/B |
 | `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_UPSTAT`, `PF_Q4_HOT_TIME`, `PF_Q4_FFCMP=<layer>` | off | phase attribution and the routed-FFN oracle |
 | `PF_Q4_HIST=1`, `PF_Q4_PREFAULT=0`, `PF_Q4_NOPLE=1` | off / on / off | routing histogram, skip the prefault, skip PLE (diagnostic) |
@@ -2156,7 +2168,7 @@ the checks that catch them.
 | `PF_Q4_SM_LOAD=<path>` / `PF_Q4_CAL_LOAD=<path>` | off | load a static slot map / calibration table |
 
 **Decode batching, tail-skip, the MTP gate and the prefill ceiling (2026-10-27).**
-Full tables and commands in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.4.2.
+Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md#71-measurement-log-batching-tail-skip-mtp-and-the-prefill-ceiling) §7.1; the summary is [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.4.
 
 * **2-row batched decode is correct but 0.85-0.88x.**  Two prompts select ~20
   distinct experts per layer against ~10 each, so the routed-expert weight read
@@ -2176,7 +2188,8 @@ Full tables and commands in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.4.2
   moves `rest` 23.22 -> 13.67 ms).  With tail7: **100.1 -> 93.3 ms** and
   **16.49 -> 15.52 s**.  The recommended q4 run sets `--cpu-threads 28`; the
   server gains much less (5.40 -> 5.57 tok/s aggregate) because it is
-  prefill/HTTP-bound.  The archive 93.3 ms cell was measured at the default 14.
+  prefill/HTTP-bound.  The 93.3 ms cell is 28 threads + tail7; the default-14
+  tail7 cell is 100.1 ms.
 * **Tail-skip has a quality gate now.**  Base vs `PF_Q4_TAIL_SKIP=7` on two
   prompts: top-1 agreed for 28/29 and 15/16 steps, the first divergence was a
   near-tie, the divergence-step KL was 0.029/0.037, and both outputs stayed
@@ -2247,7 +2260,7 @@ Full tables and commands in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.4.2
   server requests on slot 0 gave B1 == B2, A differs, 12 layers cleared and
   byte-identical B1/B2 selector dumps, with the QSA-off/short md5s unchanged.
   At `--ctx 2048` QSA is off entirely.  The q4 server's long-prompt prefill now
-  uses the whole-prompt q4 path (no `PF_PFB_MAX_M`; 2.2x; see §4.4.2).
+  uses the whole-prompt q4 path (no `PF_PFB_MAX_M`; 2.2x; see design 18 §7.1).
 
 ### OpenAI-compatible API
 

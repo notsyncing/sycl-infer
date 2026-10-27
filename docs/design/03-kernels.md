@@ -641,7 +641,7 @@ ids/wts/logits 都是 `bad=0`）。实测 router **0.43 → 0.07 ms/layer**；`P
 39.3 → 19.2（AVX2）→ 16.0 ms/token（AVX-512），选区 512/512 相同、score cosine 1.000000、
 layer-0 `mixed` 逐位相同；96-token decode 的三档 ISA 端到端相同（`[q4]` 和 97.3-97.5，
 真机 wall 约 101 ms，±0.2 的跑间差异），因为主机工作被 LM head 盖住。详见 [18-qwen4exp.md §4](18-qwen4exp.md) 与
-[PERFORMANCE.md §4.4.1](../PERFORMANCE.md)。
+[PERFORMANCE.md §4.4](../PERFORMANCE.md)。
 
 **LRU / 两遍 prefill（engine 侧，不新增 kernel）**
 

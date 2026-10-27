@@ -599,18 +599,19 @@ including the warm prefill.  17 000 MB gives 118 slots and 94.0 ms; 18 000
 loads (125 slots, 17.0 GiB) but is not faster.  `PF_Q4_PIN_SRC=0` (staging) and
 `PF_Q4_BANK_Q5K=1` (layer 2, 48 layers, 17.0 GiB, 107.2 ms, so off) are the
 A/Bs.
-The prefill numbers were measured with `--ctx 4096 --kv-type i8`; both i8 and
-f16 KV work, and f16 is recommended for decode.  `--device cpu` and a plain
+The 512-token prefill is the archive i8 cell and the decode is f16; the
+deep-context cells are f16 (both KV types work).  `--device cpu` and a plain
 `--device gpu` also work, but are slower.
 
-**Known limits**: batched q4exp decode is unmeasured (the server's q4
-`prefill_batch` has no recorded variant), and the separate MTP draft GGUF and
-multimodal input are not wired for this architecture.  QSA is implemented: up
-to 2 048 keys it is dense-equivalent, above that the host selector picks the
-top 2 048 pooled keys.  Full attribution and dead ends:
-[Design 18](docs/design/18-qwen4exp.md),
-[PERFORMANCE §4.4](docs/PERFORMANCE.md#44-qwen38-flash-next--the-104-gib-hybrid-with-a-per-expert-lru),
-[`AGENTS.md`](AGENTS.md).
+**Known limits**: batched q4exp decode is **correct but 0.85x** (a 2-row forward
+touches ~20 distinct experts per layer instead of ~10), so the scheduler caps it
+at one row and serialises sequences; MTP is **no-go** for this build
+(`test_q4_verify` puts the k+1 verify at 1.9-2.2x the kill line), and the separate
+draft GGUF is not wired.  QSA is implemented: up to 2 048 keys it is
+dense-equivalent, above that the host selector picks the top 2 048 pooled keys
+and the device attends to those.  Full attribution, deep-context numbers and
+dead ends: [Design 18](docs/design/18-qwen4exp.md),
+[PERFORMANCE §4.4](docs/PERFORMANCE.md#44-qwen38-flash-next), [`AGENTS.md`](AGENTS.md).
 
 The prefill column is the isolated 512-token chunk, measured in-process; the
 decode columns are the aggregate over N concurrent streams, i.e. what a server
@@ -790,7 +791,7 @@ to the 27B instead.
 
 ## Credits
 
-sycl-infer is an independent implementation, but it stands on four shoulders:
+sycl-infer is an independent implementation, but it stands on five shoulders:
 
 * **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT) — the GGUF
   container format and the K-quant block layouts that `src/common/quant.h`
@@ -814,6 +815,10 @@ sycl-infer is an independent implementation, but it stands on four shoulders:
   time to the first streamed SSE chunk, which the server sends *before* the
   prefill runs) and is not quoted here — see
   [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md#what-the-server-actually-delivers).
+* **[Strata](https://github.com/Niko1221/Strata)** (MIT) — the reference
+  CUDA-path engine for Qwen3.8-Flash-Next; its tail-skip, per-expert cache, MTP
+  and batched-decode ideas informed the qwen4exp work.  The comparisons and the
+  dead ends are in [Design 18](docs/design/18-qwen4exp.md).
 
 ## License
 
