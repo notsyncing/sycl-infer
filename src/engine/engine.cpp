@@ -147,6 +147,20 @@ engine::engine(const engine_config & cfg)
     if (mp_->moe != model_profile::moe_owner::engine_cache) {
         moe_host_only_ = true;
         moe_cfg_.host_only = true;
+        mtp.mtp_k = 0;
+        mtp.mtp_on = false;
+        // The qwen4exp text GGUF carries no vision/audio tensors: the towers are
+        // separate mmproj GGUFs, exactly as for every other architecture.  If the
+        // tokenizer has no pad token at all, say so here rather than letting the
+        // first media request fail at prompt expansion with a tokenizer message.
+        const bool has_img_pad = tk.token_to_id.count("<|image_pad|>") != 0;
+        const bool has_vid_pad = tk.token_to_id.count("<|video_pad|>") != 0;
+        const bool has_aud_pad = tk.token_to_id.count("<|audio_pad|>") != 0;
+        if (!has_img_pad && !has_vid_pad && !has_aud_pad) {
+            fprintf(stderr,
+                    "[mm] qwen4exp: this GGUF has no image/video/audio pad token, so multimodal input is "
+                    "unavailable (the text path is unaffected)\n");
+        }
     }
     // YaRN: build the per-pair frequency table here, before *anything* allocates a
     // buffer that embeds it.  alloc_act_set() (reached from setup_multi_device)
@@ -2871,6 +2885,8 @@ void engine::reset_state() {
     // of it (no-op when QSA is off)
     qsa_reset_slot(-1);
     reset_step_info(d_info);
+    // a fresh sequence never inherits a multimodal decode's M-RoPE state
+    mm_decode_rope_ = false;
     // the single-sequence entry points (eval/generate) do not run the prefix
     // cache: never let a stale tracking flag capture snapshots for them
     for (auto & s : pc_slot_) {
@@ -3135,7 +3151,11 @@ void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const in
         d_info->n_rows = n_rows;
         d_info->tpb = 1;
         d_info->n_real = 1;
-        d_info->mrope_on = 0;
+        // generate_mm writes the single decode row's M-RoPE position just before
+        // this call (an image's RoPE position is not the token index).  Keep it
+        // for that loop; every text-only caller resets step_info or prefills
+        // through q4_prefill_text, which clears mrope_on.
+        d_info->mrope_on = mm_decode_rope_ ? 1 : 0;
         d_info->img_embd = nullptr;
         for (int r = 0; r < kMaxB; r++) {
             d_info->pos[r] = (r < n_rows) ? poss[r] : 0;
@@ -3373,12 +3393,22 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     }
 
     if (mm) {
+        // A prompt with media rows must carry the rows the tower produced.  The
+        // planners hand out row offsets before anything is encoded, so a caller
+        // that skipped phase 2 (the usual cause: no --mmproj / --audio-mmproj)
+        // would otherwise run the forward on uninitialised embeddings.
+        if (!mm->has_encoded_embd()) {
+            throw std::runtime_error("multimodal: the prompt has media rows but no encoder output "
+                                     "(image/video need --mmproj, audio needs --audio-mmproj)");
+        }
         const size_t rows = (size_t)mm->embd.size() / std::max(1, hp.n_embd);
         if (rows > (size_t)kMaxImgTokens) {
             throw std::runtime_error("multimodal: too many image tokens");
         }
-        // the device path already produced the embeddings in the caller's buffer
-        if (!mm->d_embd && !mm->embd.empty()) {
+        // The device path already produced the embeddings in the caller's
+        // buffer.  A model-owned prefill uploads a host-built prompt itself
+        // (q4_prefill_mm), so do not copy it twice.
+        if (!mm->d_embd && !mm->embd.empty() && !m.profile.mm_model_prefill) {
             q.memcpy(d_img_embd, mm->embd.data(), mm->embd.size() * sizeof(float)).wait();
         }
     }
@@ -3395,21 +3425,25 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     set_table(0, blocks);
 
     if (mm) {
-        while (pos < nprompt) {
-            const int n = std::min<int>(kMaxT, nprompt - pos);
-            // per-chunk M-RoPE positions (section-major) and image row mapping
-            d_info->mrope_on = 1;
-            d_info->img_embd = mm->d_embd ? mm->d_embd : (mm->embd.empty() ? nullptr : d_img_embd);
-            for (int s = 0; s < 4; s++) {
-                for (int i = 0; i < n; i++) {
-                    d_info->mrope[s * (kMaxB * kMaxT) + i] = mm->mrope[(size_t)s * nprompt + pos + i];
-                }
+        if (m.profile.mm_model_prefill) {
+            // The model owns its forward (qwen4exp): feed the whole expanded
+            // prompt to its chunker, which carries the M-RoPE/image-row slices
+            // per chunk and keeps the expert bank, PLE history and QSA on the
+            // same path as a text prefill.  The generic loop below would call
+            // prefill_chunk one kMaxT row at a time and re-upload experts at
+            // every 32-token boundary.
+            q4_prefill_mm(*mm, 0);
+            pos = nprompt;
+        } else {
+            while (pos < nprompt) {
+                const int n = std::min<int>(kMaxT, nprompt - pos);
+                // per-chunk M-RoPE positions (section-major) and image row mapping
+                d_info->mrope_on = 1;
+                d_info->img_embd = mm->d_embd ? mm->d_embd : (mm->embd.empty() ? nullptr : d_img_embd);
+                mm_write_step(*mm, pos, n, kMaxB * kMaxT, d_info->mrope, d_info->img_row);
+                prefill_chunk(prompt, pos, n, 0);
+                pos += n;
             }
-            for (int i = 0; i < n; i++) {
-                d_info->img_row[i] = mm->img_row[pos + i];
-            }
-            prefill_chunk(prompt, pos, n, 0);
-            pos += n;
         }
     } else {
         // text-only: use the fastest path (mode 2 for the bulk, mode 1 tail)
@@ -3437,6 +3471,9 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // step (prefix.0.bin = the prompt prefill, prefix.1.bin = the first decode)
     // so a decode step can be diffed against a prefill of the same sequence.
     const char * dbg_lg = si::env::str("PF_DUMP_DEC_LOGITS");
+    // a model-owned decode entry point (qwen4exp) resets step_info; tell it the
+    // per-step M-RoPE row below is live for this loop
+    mm_decode_rope_ = (mm != nullptr);
     for (int step = 0; step < gp.max_tokens; step++) {
         if (dbg_lg) {
             char path[512];
@@ -3482,6 +3519,11 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
         next_pos++;
         fetch_logits(0, logits.data());
     }
+    mm_decode_rope_ = false;
+    // Do not leave a multimodal prompt's M-RoPE state live for whatever runs
+    // next on this engine (a scheduler sequence resumes through decode_batch).
+    d_info->mrope_on = 0;
+    d_info->img_embd = nullptr;
     for (int b : blocks) {
         free_block(b);
     }

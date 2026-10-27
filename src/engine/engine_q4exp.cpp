@@ -869,11 +869,24 @@ void engine::q4_zero_state(int slot) {
     }
 }
 
-void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
+void engine::q4_prefill_common(const std::vector<int> & toks, int slot, int n, int start, const mm_prompt * mm) {
     // The CPU kernels do not bound their loops by row_nr, so a partial last row
     // in the mode-2 layout would process padding tokens (and pollute the KV and
     // the GDN state).  Full kMaxT rows go through mode 2; the < kMaxT tail goes
     // through mode 1, which is a single row of exactly `rem` tokens.
+    //
+    // Multimodal: the M-RoPE / image-row arrays are flat per token (`row*kMaxT
+    // + t` is the token index within the chunk), so the same row layout carries
+    // an image block that spans rows.  The position budget is already baked
+    // into mm->mrope by mm_expand_prompt; this only slices it per chunk.
+    const float * mm_embd = nullptr;
+    if (mm) {
+        mm_embd = mm->d_embd ? mm->d_embd : (mm->embd.empty() ? nullptr : d_img_embd);
+        if (!mm_embd && mm->n_img > 0) {
+            throw std::runtime_error("multimodal: prompt has media rows but no encoder output "
+                                     "(image/video need --mmproj, audio needs --audio-mmproj)");
+        }
+    }
     const char * pfc = si::env::str("PF_Q4_PF_CHUNK");
     // The per-expert bank used to need small chunks because a chunk's active
     // set had to fit its slots; the two-pass batching in q4_forward removes
@@ -903,8 +916,8 @@ void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int
             inf->pc_active = 0;
             inf->mtp_dt = 0;
             inf->mtp_dry = 0;
-            inf->mrope_on = 0;
-            inf->img_embd = nullptr;
+            inf->mrope_on = mm ? 1 : 0;
+            inf->img_embd = mm ? mm_embd : nullptr;
             for (int r = 0; r < NCH; r++) {
                 inf->n_real_row[r] = kMaxT;
                 inf->pos[r] = start + done + r * kMaxT;
@@ -913,6 +926,10 @@ void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int
                 for (int t = 0; t < kMaxT; t++) {
                     inf->tokens[r * kMaxT + t] = toks[(size_t)start + done + r * kMaxT + t];
                 }
+            }
+            if (mm) {
+                // flat token order: [0, full) maps one-to-one onto the rows above
+                mm_write_step(*mm, start + done, full, kMaxB * kMaxT, inf->mrope, inf->img_row);
             }
             for (int r = NCH; r < kMaxB; r++) {
                 inf->n_real_row[r] = 0;
@@ -938,14 +955,19 @@ void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int
             inf->pc_active = 0;
             inf->mtp_dt = 0;
             inf->mtp_dry = 0;
-            inf->mrope_on = 0;
-            inf->img_embd = nullptr;
+            inf->mrope_on = mm ? 1 : 0;
+            inf->img_embd = mm ? mm_embd : nullptr;
             inf->n_real_row[0] = rem;
             inf->pos[0] = start + done;
             inf->slot[0] = slot;
             inf->active[0] = 1;
             for (int t = 0; t < rem; t++) {
                 inf->tokens[t] = toks[(size_t)start + done + t];
+            }
+            if (mm) {
+                // mode-1 row 0: the kernel's flat index is `t`, so this slice
+                // starts at 0 even though the chunk starts mid-prompt.
+                mm_write_step(*mm, start + done, rem, kMaxB * kMaxT, inf->mrope, inf->img_row);
             }
             for (int t = rem; t < kMaxT; t++) {
                 inf->tokens[t] = 0;
@@ -975,6 +997,20 @@ void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int
     if (cal_on && !q4_cal_done_ && q4_cal_pairs_ > 0) {
         q4_hot_calibrate();
     }
+}
+
+void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
+    q4_prefill_common(toks, slot, n, start, nullptr);
+}
+
+void engine::q4_prefill_mm(const mm_prompt & p, int slot) {
+    // A host-built prompt (mm_build_prompt / mm_build_prompt_audio) carries its
+    // rows in `embd`; upload them once, exactly as generate_impl does for the
+    // generic path.  A device-built prompt already points at d_img_embd.
+    if (!p.d_embd && !p.embd.empty()) {
+        q.memcpy(d_img_embd, p.embd.data(), p.embd.size() * sizeof(float)).wait();
+    }
+    q4_prefill_common(p.tokens, slot, (int)p.tokens.size(), 0, &p);
 }
 
 void engine::q4_hot_calibrate() {

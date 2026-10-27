@@ -404,6 +404,10 @@ struct engine {
     float * d_logits = nullptr;       // [kMaxB][vocab]
     float * d_last_hidden = nullptr;
     float * d_img_embd = nullptr; // [kMaxImgTokens][n_embd] vision embeddings
+    // generate_mm's decode loop sets the per-step M-RoPE row itself; a model
+    // whose decode entry point resets step_info (qwen4exp) has to keep it for
+    // that loop instead of clearing mrope_on.  False for every text-only run.
+    bool mm_decode_rope_ = false;
 
     // ---- Mixture of Experts ------------------------------------------------
     // Per-device scratch for the routed half of a MoE FFN.  `ids`/`wts` are the
@@ -751,7 +755,17 @@ struct engine {
     // mode 0 = decode (n_rows sequences, one token each), mode 2 = prefill
     // (one sequence, n_tok tokens laid out in kMaxT-wide rows)
     void q4_forward(int mode, int n_tok, bool with_head);
+    // Shared chunker: text-only when `mm == nullptr`, otherwise each chunk
+    // carries the prompt's M-RoPE positions and image-row mapping, so an image
+    // block can span chunk rows without shifting either.  `start` is the
+    // prompt-token index, not a RoPE position.
+    void q4_prefill_common(const std::vector<int> & toks, int slot, int n, int start, const mm_prompt * mm);
     void q4_prefill_text(const std::vector<int> & toks, int slot, int n, int start);
+    // Multimodal prefill: runs the whole expanded prompt through the model's
+    // own chunker (mode 2 for full kMaxT rows, mode 1 for the tail), keeping
+    // the expert bank calibration and the PLE history on the same path as a
+    // text prefill.  Bypasses the prefix cache, like every mm prompt.
+    void q4_prefill_mm(const mm_prompt & p, int slot);
     void q4_zero_state(int slot);
 
     // paged KV cache + tables.  The pools are raw byte storage whose element

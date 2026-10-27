@@ -131,6 +131,28 @@ mm_prompt mm_expand_prompt(const tokenizer & tk, const std::string & rendered, c
     return p;
 }
 
+void mm_write_step(const mm_prompt & p, int pos, int n, int section_stride, int32_t * mrope_out,
+                   int32_t * img_row_out) {
+    const int np = (int)p.tokens.size();
+    if (pos < 0 || n < 0 || pos + n > np) {
+        throw std::runtime_error("mm: prefill slice out of range");
+    }
+    if (n > 0 && section_stride < n) {
+        throw std::runtime_error("mm: step_info section stride is smaller than the chunk");
+    }
+    if ((int)p.mrope.size() < 4 * np || (int)p.img_row.size() < np) {
+        throw std::runtime_error("mm: prompt position/row arrays are short");
+    }
+    for (int s = 0; s < 4; s++) {
+        for (int i = 0; i < n; i++) {
+            mrope_out[(size_t)s * section_stride + i] = p.mrope[(size_t)s * np + pos + i];
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        img_row_out[i] = p.img_row[pos + i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Images.
 // ---------------------------------------------------------------------------

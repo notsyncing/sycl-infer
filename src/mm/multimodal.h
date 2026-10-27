@@ -60,6 +60,12 @@ struct mm_prompt {
     bool has_images() const {
         return n_img > 0;
     }
+    // True once phase 2 has run: a prompt with media rows but no embeddings
+    // would otherwise let the forward read uninitialised rows (the usual cause
+    // is a missing --mmproj/--audio-mmproj, not a bad prompt).
+    bool has_encoded_embd() const {
+        return n_img == 0 || d_embd != nullptr || !embd.empty();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +130,15 @@ mm_audio_plan mm_plan_audios(const tokenizer & tk, const std::vector<mm_audio> &
 // above have already checked it against kMaxImgTokens.
 mm_prompt mm_expand_prompt(const tokenizer & tk, const std::string & rendered, const std::vector<mm_block> & blocks,
                            int total_rows);
+
+// Copy the n-token slice [pos, pos+n) of an expanded prompt into the flat
+// per-token layout the prefill kernels read from step_info: `mrope_out` is
+// section-major with `section_stride` entries per section, and `img_row_out`
+// has one entry per token.  The generic chunk loop and a model-owned prefill
+// (qwen4exp) both use this mapping, so a chunk boundary cannot silently shift
+// a position or an embedding row.  Throws on an out-of-range slice.
+void mm_write_step(const mm_prompt & p, int pos, int n, int section_stride, int32_t * mrope_out,
+                   int32_t * img_row_out);
 
 // Image prompt (kept for reference): `rendered` must contain exactly one
 // `<|image_pad|>` per entry of `images`.  `n_embd` is the text model width

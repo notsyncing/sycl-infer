@@ -152,6 +152,7 @@ void load_qwen4exp(model & m) {
     hp.n_vocab = toks ? (int)toks->arr.size() : 0;
 
     m.q4exp = true;
+    m.profile.mm_model_prefill = true;
     m.tok_embd = bind_tensor(f, "token_embd.weight");
     if (f.find("output.weight")) {
         m.output = bind_tensor(f, "output.weight");

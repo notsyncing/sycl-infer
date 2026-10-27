@@ -255,6 +255,18 @@ struct mtp_layer_t {
     w8t wq8, wk8, wv8, wo8, ffn_gate8, ffn_up8, ffn_down8, eh_proj8;
 };
 
+// Capabilities of an architecture's own forward that the generic driver has to
+// know about.  Set by the loader, read by the engine - a capability rather than
+// a model-name test, so a second model with the same geometry inherits it.
+struct arch_profile {
+    // A multimodal prompt must go through the model's own forward chunker.  The
+    // generic mm driver feeds one kMaxT row per prefill_chunk, which is exactly
+    // the path a model-owned forward (qwen4exp: hyper-connections, PLE, QSA and
+    // the per-expert bank) bypasses; its whole-prompt batching is where those
+    // live.
+    bool mm_model_prefill = false;
+};
+
 // Reject a model whose geometry the kernels do not implement, before anything
 // is uploaded or allocated.  Several kernels hardcode a head_dim (the generic
 // attention partial stride is literally 256) and would otherwise overrun their
@@ -270,6 +282,8 @@ struct model {
     // registry row that matched general.architecture.  Never null after a
     // successful load; the row's key is asserted against the GGUF's exact key.
     const model_profile * prof = nullptr;
+    // what this architecture's own forward can do (see arch_profile)
+    arch_profile profile;
     // tokenizer.chat_template (Jinja); empty when the GGUF does not carry one
     std::string chat_template;
     std::vector<layer_t> layers;
