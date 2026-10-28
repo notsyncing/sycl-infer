@@ -1,0 +1,6 @@
+SYCL_INFER_0.1 {
+    global:
+        syi_*;
+    local:
+        *;
+};

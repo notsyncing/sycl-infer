@@ -1010,6 +1010,7 @@ void engine::q4_prefill_common(const std::vector<int> & toks, int slot, int n, i
 }
 
 void engine::q4_prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     q4_prefill_common(toks, slot, n, start, nullptr);
 }
 
@@ -1099,6 +1100,7 @@ void engine::q4_hot_calibrate() {
 }
 
 void engine::q4_forward(int mode, int n_tok, bool with_head) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     if (mode == 0) {
         q4_dec_step_++;
     }

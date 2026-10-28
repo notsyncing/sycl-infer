@@ -1,12 +1,15 @@
 # C API 设计（`libsycl_infer`）
 
+> 状态：**v0.1 已实现**（`include/sycl_infer/sycl_infer.h`、`src/capi/`、
+> CMake `sycl_infer_c`）。实现与本文的差异见下面的“实现备注”。
+
 本文定义 `sycl-infer` 的嵌入式 C ABI：一个可以静态/动态链接进宿主程序、在进程内加载
 GGUF 模型并执行批量推理的稳定接口。它是 C++ 引擎的**薄封装**，不是第二套推理实现：
 模型加载、分页 KV、连续批处理、采样、前缀缓存全部复用现有组件。Python binding
 （[20-python-binding.md](20-python-binding.md)）只建立在这一层之上。
 
-> 状态：设计稿（v1）。本文先冻结 ABI 形状与语义，再进入实现。实现阶段按 §13 的
-> 里程碑拆成独立改动，每个里程碑都有可运行的测试，不一次性重写引擎。
+> 下文保留冻结 ABI 形状与语义的设计说明；实现进度与差异见文末“实现备注”。
+> 实现按 §13 的里程碑拆成独立改动，每个里程碑有可运行测试。
 
 ---
 
@@ -82,20 +85,20 @@ GGUF 模型并执行批量推理的稳定接口。它是 C++ 引擎的**薄封�
 1. **KV 类型是进程级的**。`src/backend/gpu/kernels/kv_type.h` 的
    `kv_dtype_set_kv()` 在引擎构造前全局设置，36 处调用点读全局。C API 需要把
    K/V 类型变成 `engine_config` 的一部分，由每个引擎持有并显式传给 kernel
-   launcher（`kv_layout {k, v}`）。v1 实现时先做这个重构；否则两个不同 KV 类型的
-   模型在同一进程会互相污染。
+   launcher（`kv_layout {k, v}`）。v0.1 用 `si::kv_scope`（线程局部）实现同样的
+   隔离，见文末；不需要改 36 处调用点。
 2. **CPU 线程池是进程单例**。`cpu_thread_count()` 读
-   `src/backend/cpu/kernels/common.cpp` 的全局 override。v1 的 `cpu_threads`
-   是进程级设置：第一个 CPU 模型生效，后续模型若给不同的值，`syi_model_create`
-   返回 `SYI_UNSUPPORTED` 并说明原因（或者按里程碑 M2 把池改为每 backend 一份）。
+   `src/backend/cpu/kernels/common.cpp` 的全局 override。v0.1 的 `cpu_threads`
+   仍是进程级设置：第一个 CPU 模型固定池大小，后续模型给不同的值不会重建
+   （文档保留这个限制；M2 可把池改为每 backend 一份）。
 3. **调度器没有停止串/全量收集**。`sequence` 已经带 `stops` 字段但调度器不读；
-   `out_q` 固定 256/512 上限，不适合“先 submit 再统一 wait”的批量用法。v1 给
-   `sequence` 增加 `collect_all` 模式和停止串过滤，见 §9。
+   `out_q` 固定 256/512 上限，不适合“先 submit 再统一 wait”的批量用法。v0.1 已给
+   `sequence` 增加 `collect_all` 模式和停止串过滤，见 §9 和文末。
 4. **调度器线程没有异常边界**。`prefill_batch`/`decode_batch` 内的 `throw`
-   会直接终止进程。v1 在每个请求的调度步骤外包 `try/catch`，把异常变成该请求的
+   会直接终止进程。v0.1 已在每个请求的调度步骤外包 `try/catch`，把异常变成该请求的
    `finish_reason=ERROR`，并把消息放进 `syi_request_error()`。
 5. **`engine_config` 缺若干进程级/调优字段**：`cpu_threads`、KV 类型
-   （`kv_k`/`kv_v`）、`dec_splits`、`prefix_cache` 开关。v1 补上；CLI 仍可用
+   （`kv_k`/`kv_v`）、`dec_splits`、`prefix_cache` 开关。v0.1 已补上；CLI 仍可用
    `--cpu-threads` / `--kv-type` / `PF_PREFIX_CACHE` 覆盖，行为不变。`n_splits`
    已经在 `engine_config` 里，`dec_splits` 目前由 device profile/env 决定，需要
    变成显式字段。
@@ -1280,3 +1283,34 @@ cc -std=c11 app.c -I/path/to/sycl-infer/include \
    -L/path/to/sycl-infer/lib -lsycl_infer -o app
 export LD_LIBRARY_PATH=/path/to/sycl-infer/lib:$LD_LIBRARY_PATH
 ```
+
+
+---
+
+## 实现备注（v0.1）
+
+* **KV 类型的 per-engine 实现用了线程局部作用域，而不是把 `kv_layout` 穿到
+  每个 launcher。** `kv_type.h` 增加 `si::kv_scope`：engine 在构造和每个
+  forward 入口安装自己的 K/V 类型，scheduler 线程在 loop 生命周期内安装同一
+  组值；`kv_k_dtype()` / `kv_v_dtype()` 先读线程局部值，再回退到进程级
+  `PF_KV_TYPE`。因此两个不同 KV 类型的模型可以在不同 scheduler 线程共存，
+  而无需改动 36 处调用点。限制：同一线程不能同时服务两个不同引擎（C API 的
+  每模型 dispatcher/scheduler 线程满足这一点）。
+* **CPU 线程池仍是进程级。** `engine_config::cpu_threads` 在构造时调用
+  `cpu_set_thread_count()`；第一个 CPU 模型固定池大小，后续模型给不同值时
+  不会重建（文档保留这个限制）。
+* **`PF_PREFIX_CACHE` 可被 `engine_config::prefix_cache` 覆盖**（-1 = 环境/
+  profile，0 = 关，1 = 开），`dec_splits` 同理。
+* **C API 的停止串和全量收集在 scheduler 内完成**：`sequence::api_mode` +
+  `collect_all`，scheduler 追加 `text`/`tokens`（不经过有限的 `out_q`），
+  `apply_stops` 用跨 token 的 stop filter。HTTP 路径保持不变。
+* **`syi_model_options.max_batch_rows` 现在生效**：`scheduler::decode_row_cap`
+  与模型 profile 的上限取 min。
+* **请求级超时**：`scheduler::submit` 接收 `timeout_ms`，loop 在 admit 和
+  decode 前检查 deadline，retire 为 `"timeout"`。
+* **异常边界**：admit、prefill、fetch/sample、decode 的引擎调用都包在
+  try/catch 里，失败时设置 `sequence::error` 并 retire 为 `"error"`，不会让
+  异常穿过 scheduler 线程。
+* **`syi_request_get_result` 只在 `sequence::finished` 后成功**；终态请求的
+  `text`/`token_ids` 视图在请求销毁前有效。
+* 未实现/仍按 v1.1：多模态请求、MTP/DFlash、跨模型权重共享、Windows/macOS。

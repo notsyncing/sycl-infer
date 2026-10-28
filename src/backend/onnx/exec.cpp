@@ -284,6 +284,20 @@ void * executor::acquire(size_t bytes) {
     return p;
 }
 
+void executor::trim_pool() {
+    q_.wait();
+    for (auto & kv : free_) {
+        for (void * p : kv.second) {
+            auto it = alloc_size_.find(p);
+            if (it != alloc_size_.end()) {
+                sycl::free(p, q_);
+                alloc_size_.erase(it);
+            }
+        }
+    }
+    free_.clear();
+}
+
 void executor::release(void * p, size_t bytes) {
     (void)bytes;
     if (!p) return;

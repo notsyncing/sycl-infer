@@ -1456,9 +1456,15 @@ void exec_transpose(op_ctx & c) {
             dst[i] = s;
             s *= os[i];
         }
+        // Row-major: the *last* output axis is the fastest-varying, so the
+        // coordinates have to be peeled from the back.  Peeling from the
+        // front (d = 0..rank-1) is column-major and is an identity only when
+        // every leading extent is 1 - i.e. exactly batch=1, which is how
+        // this read as correct for the layout model's [B,300] `order`
+        // transpose at B=1 and mixed the pages at B>1.
         for (int64_t o = 0; o < (int64_t)c.out[0]->count; ++o) {
             int64_t rem = o, si = 0;
-            for (int64_t d = 0; d < rank; ++d) {
+            for (int64_t d = rank - 1; d >= 0; --d) {
                 const int64_t co = rem % os[d];
                 rem /= os[d];
                 si += co * src[perm[d]];

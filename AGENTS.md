@@ -439,6 +439,13 @@ src/common/     ... plus onnx_wire.{h,cpp} (the binary protocol, shared with
                 the router), onnx_activation.h and onnx_types.h (host-only
                 ONNX semantics shared by the graph and the executor)
 src/main.cpp    CLI
+include/sycl_infer/sycl_infer.h  the C ABI header (opaque model/request handles)
+include/sycl_infer/onnx.h       the in-process ONNX ABI (no HTTP/subprocess)
+src/capi/       the C ABI implementation + the thread-local kv_scope and the
+                scheduler's api_mode/collect_all path
+src/onnx_api/   libsycl_infer_onnx: graph/executor + onnxwire, one shared
+                queue per device
+python/         ctypes binding (v0.1), wheel packaging, vendor_runtime.py
 tests/common/   cpu_ref.h (CPU reference forward), stage_test.h (stage harness)
 tests/backend/gpu/kernels/  test_gemv.cpp, test_dp4a_gemm.cpp, test_gpu_stages.cpp
                 + <kernel>_stage.cpp (one per GPU kernel), plus the weight-path
@@ -4730,6 +4737,10 @@ cmake --build build -j$(nproc)          # must be warning-free (except the linke
 ./build/test_forward                    # default prompt predicted_argmax=248068
 ./build/test_decode_vs_prefill          # decode == re-prefill (any single-token change)
 ./build/test_sched                      # the batched decode, incl. the 20-row case
+./build/test_capi <model.gguf>          # C ABI: create/info/tokenize/submit/stream/
+                                        # result + a two-request batch (CPU, low memory)
+./build/test_onnx_api <model.onnx> GPU  # in-process ONNX ABI: load + ports
+python3 -m sycl_infer.doctor            # wheel/runtime self-check (no model)
 clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include -checks='-*,misc-include-cleaner' <changed files>
 ```
 

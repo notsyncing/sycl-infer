@@ -1,0 +1,6 @@
+SYCL_INFER_ONNX_0.1 {
+    global:
+        syi_onnx_*;
+    local:
+        *;
+};

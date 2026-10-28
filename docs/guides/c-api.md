@@ -3,9 +3,9 @@
 本指南面向把 `sycl-infer` 直接链接进成品程序的 C/C++ 开发者。ABI 的完整语义、
 设计取舍见 [design/19-c-api.md](../design/19-c-api.md)；本文只讲怎么用。
 
-> 状态：v1 目标用法。C API 的实现里程碑见
-> [design/19-c-api.md §13](../design/19-c-api.md#13-实现里程碑)。在 M1/M2 落地前，
-> 下列构建目标尚不存在；接口形状已经冻结。
+> 状态：v0.1 已实现（`SI_C_API=ON` 默认开）。`test_capi` 用 CPU 0.8B 验证了
+> 创建/信息/tokenize/提交/流式/结果；`test_sched` 继续覆盖调度器。实现差异见
+> [design/19-c-api.md 的“实现备注”](../design/19-c-api.md#实现备注v01)。
 
 ---
 
@@ -27,6 +27,7 @@ cmake --build build --target sycl_infer_c -j"$(nproc)"
 ```
 build/libsycl_infer.so.1
 build/libsycl_infer.so
+build/test_capi
 ```
 
 安装到自定义前缀：

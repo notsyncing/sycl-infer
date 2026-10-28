@@ -232,6 +232,20 @@ struct engine_config {
     int pc_ram_mb = -1;
     int pc_vram_mb = -1;
 
+    // Per-engine KV storage types (kv_dtype_t; -1 = the process-wide
+    // PF_KV_TYPE / --kv-type value).  The engine installs them as a
+    // thread-local kv_scope for construction and every forward, so two models
+    // with different KV types can coexist in one process.
+    int kv_k = -1;
+    int kv_v = -1;
+    // CPU backend worker count (0 = auto / PF_CPU_THREADS).  The pool is
+    // process-wide: the first CPU engine fixes it.
+    int cpu_threads = 0;
+    // Prefix cache policy: -1 = profile/PF_PREFIX_CACHE, 0 = off, 1 = on.
+    int prefix_cache = -1;
+    // Decode attention K-split (0 = device profile / PF_DEC_SPLIT).
+    int dec_splits = 0;
+
     // -1 = not set (PF_DEVICE, then auto); 0 = gpu, 1 = cpu.
     int device = -1;
     // "begin-end:gpu.N[,begin-end:...]" closed layer ranges; empty puts every
@@ -375,6 +389,11 @@ struct engine {
     void free_rope_freqs();
     int max_seq;                 // max tokens per sequence (limited by the block pool)
     int max_slots = kMaxB;       // max concurrent sequences (engine_config::max_slots)
+    // This engine's KV storage types, installed as a thread-local scope while
+    // it constructs and forwards.  Public so the scheduler thread can install
+    // the same scope for the lifetime of its loop.
+    kv_dtype_t kv_k_ = kv_dtype_t::i8;
+    kv_dtype_t kv_v_ = kv_dtype_t::i8;
     int n_splits;                // prefill K-split ceiling (PF_ATTN_SPLIT overrides)
     int dec_splits = kMaxSplits; // decode K-split (PF_DEC_SPLIT overrides)
     int ffn_stride;              // 2 * n_ff

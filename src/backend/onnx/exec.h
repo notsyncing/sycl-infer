@@ -45,6 +45,10 @@ public:
     // of them fit.
     size_t live_bytes() const { return live_bytes_calc(); }
     size_t pooled_bytes() const { return pooled_bytes_calc(); }
+    // Drop the free device buffers (and wait for the queue first).  Long
+    // multi-model sessions accumulate one pool entry per input shape; a
+    // document pipeline calls this at a document boundary.
+    void trim_pool();
 
     const exec_graph & graph() const { return g_; }
 

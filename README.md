@@ -307,11 +307,16 @@ subprocess:
   from many host threads.  See the design in
   [`docs/design/19-c-api.md`](docs/design/19-c-api.md) and the usage guide in
   [`docs/guides/c-api.md`](docs/guides/c-api.md).
-* **Python** (`sycl_infer`) — a pybind11 binding with blocking, streaming and
-  batch APIs, GIL release for threaded workloads, and a wheel that vendors the
-  SYCL/oneDNN/oneAPI runtime.  See
+* **Python** (`sycl_infer`) — a ctypes binding over the C ABI (v0.1; no
+  build-time pybind11 dependency) with blocking, streaming and batch APIs and
+  a wheel that vendors the SYCL/oneDNN/oneAPI runtime.  See
   [`docs/design/20-python-binding.md`](docs/design/20-python-binding.md) and
   [`docs/guides/python.md`](docs/guides/python.md).
+* **ONNX** (`libsycl_infer_onnx`) — the document pipeline's executor exposed
+  in-process (`syi_onnx_create` / `syi_onnx_run_wire`, one shared in-order
+  queue per device).  RapidDoc uses it for layout, OCR, formula and table
+  models on the GPU without an HTTP service.  See
+  [`docs/guides/onnx-inprocess.md`](docs/guides/onnx-inprocess.md).
 
 Both are a thin layer over the same `engine`/`scheduler`: the C API uses the
 existing continuous-batching scheduler, so concurrent requests share one weight

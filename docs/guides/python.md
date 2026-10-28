@@ -7,8 +7,10 @@
 设计细节与 wheel 打包方案见
 [design/20-python-binding.md](../design/20-python-binding.md)。
 
-> 状态：v1 目标用法。wheel 和绑定的实现里程碑见
-> [design/20-python-binding.md §7](../design/20-python-binding.md#7-实现里程碑)。
+> 状态：v0.1 已实现并通过本地验证（CPU 0.8B、流式/停止串/取消/2 请求批处理）。
+> v0.1 使用 ctypes 而不是 pybind11；wheel 由 setuptools 构建，内置 C 库和
+> SYCL/oneDNN/oneAPI runtime 闭包。设计差异见
+> [design/20-python-binding.md §4.1](../design/20-python-binding.md#41-pybind11-还是-cpython-c-api)。
 
 ---
 
@@ -17,7 +19,7 @@
 ### 1.1 从 wheel 安装（推荐）
 
 ```bash
-python -m pip install sycl_infer-0.1.0-cp312-cp312-manylinux_2_28_x86_64.whl
+python -m pip install sycl_infer-0.1.0-py3-none-linux_x86_64.whl
 ```
 
 或者（发布到索引后）：
@@ -60,39 +62,44 @@ python -m sycl_infer.doctor --model /path/to/Qwen3.5-0.8B-Q4_K_M.gguf
 
 ### 1.3 从源码构建 wheel
 
-完整打包设计见
+v0.1 的 wheel 由 setuptools 打包，不含扩展模块；C ABI 共享库和运行时闭包
+由 `python/vendor_runtime.py` 复制进 `python/sycl_infer/_lib`。完整打包设计见
 [design/20-python-binding.md §5](../design/20-python-binding.md#5-wheel-打包)。
-最短路径：
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
 
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip build auditwheel pytest numpy
-python -m pip install "scikit-build-core>=0.10" "pybind11>=2.13"
+# 1. 构建 C ABI（首次或改了 src/ 后）
+cmake -S . -B build-rel2 -DCMAKE_BUILD_TYPE=Release -DSI_C_API=ON
+cmake --build build-rel2 -j2 --target sycl_infer_c
 
-# 构建（CMake 会被 scikit-build-core 调用）
-python -m build --wheel
+# 2. 把 libsycl_infer + libsycl/oneDNN/oneAPI 运行时复制进包
+python3 python/vendor_runtime.py --build build-rel2
 
-# 审计并修复 manylinux 标签
-auditwheel repair dist/sycl_infer-*.whl \
-  -w dist/fixed --plat manylinux_2_28_x86_64
-auditwheel show dist/fixed/sycl_infer-*.whl
+# 3. 构建 wheel（不需要 pybind11/build/scikit-build-core）
+cd python
+python3 -m pip wheel . --no-deps --no-build-isolation -w dist
+cd ..
 
-# 安装并验证
-python -m pip install --force-reinstall dist/fixed/sycl_infer-*.whl
-python -m sycl_infer.doctor
+# 4. 安装并验证（不设置 LD_LIBRARY_PATH）
+python3 -m pip install --force-reinstall python/dist/sycl_infer-*.whl
+python3 -m sycl_infer.doctor
 ```
 
-开发模式（改代码后不必每次打包）：
+wheel 的标签由构建机的 glibc 决定：本机（glibc 2.43）得到
+`py3-none-linux_x86_64`；发布 `manylinux_2_28` 需要在对应容器里构建。
+`vendor_runtime.py` 复制的是构建机的 SYCL/oneDNN 版本，发布时固定该版本即可。
+
+开发模式（不打包，直接指向构建目录）：
 
 ```bash
-python -m pip install -e . --no-build-isolation
+export PYTHONPATH="$PWD/python"
+export SYCL_INFER_LIB="$PWD/build-rel2/libsycl_infer.so.1.0.0"
+python3 -m sycl_infer.doctor
 ```
 
-`--no-build-isolation` 复用当前环境的 `scikit-build-core`/`pybind11`；仍需先
-`source /opt/intel/oneapi/setvars.sh`，否则 `-fsycl` 不可用。
+`LD_LIBRARY_PATH` 仍需包含 oneAPI 运行时；用 wheel 时不需要，因为包内
+`_lib` 已被 `_capi._preload()` 加载。
 
 ---
 

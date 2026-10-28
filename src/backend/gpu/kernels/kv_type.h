@@ -46,6 +46,26 @@ bool kv_dtype_parse_pair(const char * spec, kv_dtype_t & k, kv_dtype_t & v);
 // engine (and thus kv_setup) is constructed.
 void kv_dtype_set(kv_dtype_t t);
 void kv_dtype_set_kv(kv_dtype_t k, kv_dtype_t v);
+
+// Per-engine KV type without threading a `kv_layout` through every launcher.
+// A scoped override is thread-local: an engine installs its own K/V types for
+// the duration of its forward (and its scheduler thread installs them for the
+// loop's lifetime), so two engines with different KV types can coexist in one
+// process.  The process-wide value from PF_KV_TYPE / --kv-type remains the
+// fallback for callers outside any scope and for the CLI.  Nested scopes
+// restore the previous value, so a scope around the constructor also covers
+// every helper it calls.
+struct kv_scope {
+    kv_scope(kv_dtype_t k, kv_dtype_t v);
+    ~kv_scope();
+    kv_scope(const kv_scope &) = delete;
+    kv_scope & operator=(const kv_scope &) = delete;
+
+private:
+    bool had_prev_ = false;
+    kv_dtype_t prev_k_ = kv_dtype_t::i8;
+    kv_dtype_t prev_v_ = kv_dtype_t::i8;
+};
 // True when K and V may use `k`/`v`: the scale-carrying i4/i8 pair, or equal.
 bool kv_dtype_mix_ok(kv_dtype_t k, kv_dtype_t v);
 

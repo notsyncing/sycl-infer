@@ -3,6 +3,9 @@ project(sycl-infer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# libsycl_infer links the engine core into a shared object, so every core
+# translation unit must be PIC (the CLI pays a negligible cost for it).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(CTest) # opt-in model/GPU registrations below; default ctest stays hermetic
@@ -368,6 +371,120 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
 
     add_executable(sycl-infer-onnx src/server/onnx/main.cpp)
     target_link_libraries(sycl-infer-onnx PRIVATE si_onnx_core)
+
+    # In-process access to the same executor (no HTTP).  RapidDoc loads this
+    # shared library through ctypes; the ONNX service remains a separate
+    # binary for callers that want a process boundary.
+    add_library(sycl_infer_onnx_c SHARED src/onnx_api/onnx_api.cpp)
+    target_include_directories(sycl_infer_onnx_c
+        PUBLIC include
+        PRIVATE
+            src
+            src/model/onnx
+            src/backend/onnx
+            src/common
+            third_party)
+    target_compile_definitions(sycl_infer_onnx_c PRIVATE SYI_BUILD)
+    target_link_libraries(sycl_infer_onnx_c PRIVATE si_onnx_core Threads::Threads)
+    set_target_properties(sycl_infer_onnx_c PROPERTIES
+        OUTPUT_NAME sycl_infer_onnx
+        VERSION 1.0.0
+        SOVERSION 1
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        POSITION_INDEPENDENT_CODE ON
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN")
+    if(UNIX AND NOT APPLE)
+        target_link_options(sycl_infer_onnx_c PRIVATE
+            -Wl,--as-needed
+            -Wl,--version-script=${CMAKE_SOURCE_DIR}/cmake/sycl_infer_onnx.map)
+    endif()
+    install(TARGETS sycl_infer_onnx_c
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
+    install(FILES include/sycl_infer/onnx.h
+        DESTINATION include/sycl_infer)
+
+    add_executable(test_onnx_api tests/onnx/test_onnx_api.cpp)
+    target_link_libraries(test_onnx_api PRIVATE sycl_infer_onnx_c)
+    set_target_properties(test_onnx_api PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}")
+    if(UNIX AND NOT APPLE)
+        target_link_options(test_onnx_api PRIVATE
+            "-Wl,-rpath-link,/opt/intel/oneapi/compiler/2026.2/lib"
+            "-Wl,-rpath-link,/opt/intel/oneapi/dnnl/2026.1/lib")
+    endif()
+
+    # A batch-invariance regression for the ONNX executor: the int64
+    # Transpose that produces the layout model's `orders` used to index its
+    # output in column-major order, which is an identity only at B=1 and
+    # scrambled every later page of a batch.  The tiny fixture is checked in
+    # (307 bytes), so this needs no model.
+    add_executable(test_onnx_batch tests/onnx/test_onnx_batch.cpp)
+    target_link_libraries(test_onnx_batch PRIVATE sycl_infer_onnx_c)
+    target_compile_definitions(test_onnx_batch PRIVATE
+        SI_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/onnx/data")
+    set_target_properties(test_onnx_batch PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}")
+    if(UNIX AND NOT APPLE)
+        target_link_options(test_onnx_batch PRIVATE
+            "-Wl,-rpath-link,/opt/intel/oneapi/compiler/2026.2/lib"
+            "-Wl,-rpath-link,/opt/intel/oneapi/dnnl/2026.1/lib")
+    endif()
+endif()
+
+# ------------------------------------------------------------------- C API
+# libsycl_infer is the embeddable C ABI (docs/design/19-c-api.md).  It links the
+# same engine core as the CLI but exports only syi_*; the version script keeps
+# every C++ symbol hidden.  It is built as a shared library by default because
+# that is what the Python binding and the SDK consume.
+option(SI_C_API "build libsycl_infer (C ABI)" ON)
+if(NOT SI_ROUTER_ONLY AND SI_C_API)
+    add_library(sycl_infer_c SHARED
+        src/capi/capi.cpp
+        src/capi/errors.cpp
+    )
+    target_include_directories(sycl_infer_c
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_compile_definitions(sycl_infer_c PRIVATE SYI_BUILD)
+    target_link_libraries(sycl_infer_c PRIVATE sycl_infer_core Threads::Threads)
+    set_target_properties(sycl_infer_c PROPERTIES
+        OUTPUT_NAME sycl_infer
+        VERSION 1.0.0
+        SOVERSION 1
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        POSITION_INDEPENDENT_CODE ON
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN")
+    if(UNIX AND NOT APPLE)
+        target_link_options(sycl_infer_c PRIVATE
+            -Wl,--as-needed
+            -Wl,--version-script=${CMAKE_SOURCE_DIR}/cmake/sycl_infer.map)
+    endif()
+    install(TARGETS sycl_infer_c
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
+    install(FILES include/sycl_infer/sycl_infer.h
+        DESTINATION include/sycl_infer)
+endif()
+
+if(NOT SI_ROUTER_ONLY AND SI_C_API)
+    add_executable(test_capi tests/capi/test_capi.cpp)
+    target_link_libraries(test_capi PRIVATE sycl_infer_c)
+    set_target_properties(test_capi PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}")
+    if(UNIX AND NOT APPLE)
+        # libdnnl's NEEDED libsvml/imf/intlc/irng live in the oneAPI compiler
+        # tree; the test links the shared engine, so give ld their directories.
+        target_link_options(test_capi PRIVATE
+            "-Wl,-rpath-link,/opt/intel/oneapi/compiler/2026.2/lib"
+            "-Wl,-rpath-link,/opt/intel/oneapi/dnnl/2026.1/lib")
+    endif()
 endif()
 
 # ------------------------------------------------------------------- tests

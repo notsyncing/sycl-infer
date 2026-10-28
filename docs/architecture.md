@@ -83,7 +83,7 @@ flowchart LR
   绕开调度器，单序列串行执行。
 * **C ABI**（`src/capi/`，`libsycl_infer`）：进程内嵌的模型/请求句柄，复用同一
   `scheduler` 做自动 batching；见 [design/19-c-api.md](design/19-c-api.md)。
-* **Python**（`python/` + `src/capi/`）：pybind11 绑定，建立在 C ABI 上；见
+* **Python**（`python/` + `src/capi/`）：ctypes 绑定，建立在 C ABI 上；见
   [design/20-python-binding.md](design/20-python-binding.md)。
 * **MTP 投机解码**（`--mtp N`，`src/engine/engine_mtp.cpp`）：贪心（`temperature <= 0` 或
   `top_k == 1`）且非多模态的请求在 `engine::generate_impl` 内部改走 draft/verify 循环
@@ -174,8 +174,8 @@ src/server/     server.{h,cpp}         httplib 服务、JSON、SSE、多模态�
                 response_parser.{h,cpp} 流式 reasoning_content / content / tool_calls 拆分
 
 src/capi/       嵌入式 C ABI：句柄、批量窗口/FIFO、请求状态机、错误/统计
-include/sycl_infer/  C 头文件 + 可选 C++ RAII 包装
-python/         pybind11 扩展、Python 包、wheel 构建
+include/sycl_infer/  C 头文件
+python/         ctypes 绑定、Python 包、wheel 构建（vendor_runtime.py）
 
 src/main.cpp    CLI
 

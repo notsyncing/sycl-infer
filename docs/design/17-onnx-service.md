@@ -29,6 +29,18 @@ them.
                           the executor
         onnx_types.h      the boolean representation at the boundary
 
+## 进程内 API（`libsycl_infer_onnx`）
+
+同一个 graph/executor 也通过 `include/sycl_infer/onnx.h` 暴露给宿主进程
+（`src/onnx_api/onnx_api.cpp`，CMake 目标 `sycl_infer_onnx_c`）。它不是
+HTTP 的替代协议：宿主直接调用 `syi_onnx_create` / `syi_onnx_run_wire`，
+请求/响应仍用 `src/common/onnx_wire.h` 的二进制帧，只是缓冲区留在本进程。
+RapidDoc 用这个库在 GPU 上跑版面/OCR/公式/表格，不再启动
+`sycl-infer-onnx` 服务；设备字符串和 `drop_outputs`/`dnnl` 参数与 service
+的模型配置相同。同一个设备上的所有模型共享一个 in-order queue，和
+service 的 `queue_for(device)` 一致。
+
+
 ## The three measurements that shaped the design
 
 All three are from the target machine (an Arc A770) and are the reason the
@@ -359,6 +371,17 @@ Three things follow from that, and each of them was a bug:
   was never written, so keeping it makes the next operator read
   uninitialised memory - a device fault on a discrete GPU and a heap
   corruption on an integrated one.
+* **An index into a row-major tensor has to be peeled from the *last*
+  axis.**  The integer `Transpose` computed its source offset as
+  `o % os[0]`, `o / os[0] % os[1]`, ... - column-major order.  At
+  batch=1 every leading extent is 1, so the loop is an identity and the
+  defect was invisible; at batch>1 the layout detector's
+  `Transpose([B,300], perm=[0,1])` duplicated and interleaved the values.
+  The first six box columns were still correct, so the symptom read as a
+  mask/postprocess bug: the model's seventh column (the `orders` reading-
+  order rank) was attached to the wrong detections and every page after
+  the first had a scrambled reading order.  `test_onnx_batch` runs the
+  same int64 and f32 transposes at B=1,2,3,8 without a model.
 
 ## The shape of an operator's output
 
@@ -963,6 +986,15 @@ its per-image time is flat), table_slanet 8-16 (5.6x per image), seal_det
 4-8, orientation 16, formula 8-16.  The pipeline already batches rec at up
 to 128 and the classifiers at 32; the layout's `batch_num` and the table
 det/unet batching are the two places with room.
+
+In the **in-process RapidDoc** path (masks retained for polygon extraction,
+all twelve models resident) the layout's full-pipeline safe maximum is
+**16**, not 24: a 24-page group fits the layout model alone but OOR'd with
+`UR_RESULT_ERROR_OUT_OF_RESOURCES` on a 138-page report once OCR and the
+table models were loaded.  Measured with `syi_onnx_run_direct` at 16 pages:
+batch 1 **192 ms/page**, 16 **180 ms/page** (steady state; the pipeline's
+first call at a new page count pays 1-2 s of oneDNN primitive creation), so
+layout batching saves ~6% and is not the end-to-end lever.
 
 The remaining floor is the table stage: the UNET's forward is 31-100 ms per
 table (it scales with the table's aspect, and its input shape changes with

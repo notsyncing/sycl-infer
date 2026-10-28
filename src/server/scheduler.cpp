@@ -50,7 +50,8 @@ int scheduler::inflight() {
 }
 
 std::shared_ptr<sequence> scheduler::submit(std::vector<int> prompt, const gen_params & gp,
-                                            std::vector<std::string> stops) {
+                                            std::vector<std::string> stops, int64_t timeout_ms,
+                                            bool api_mode) {
     auto s = std::make_shared<sequence>();
     {
         std::lock_guard<std::mutex> lk(m);
@@ -58,15 +59,41 @@ std::shared_ptr<sequence> scheduler::submit(std::vector<int> prompt, const gen_p
         s->prompt = std::move(prompt);
         s->gp = gp;
         s->stops = std::move(stops);
+        s->api_mode = api_mode;
+        s->collect_all = api_mode;
+        s->apply_stops = !s->stops.empty();
+        if (s->apply_stops) {
+            s->sf.init(s->stops);
+        }
+        s->timeout_ms = timeout_ms;
+        s->t_submit = std::chrono::steady_clock::now();
+        if (timeout_ms > 0) {
+            s->deadline = s->t_submit + std::chrono::milliseconds(timeout_ms);
+        }
         s->prompt_tokens = (int)s->prompt.size();
         s->ss.seed(gp.seed ? gp.seed : (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
-        if (srv_time()) {
-            s->t_submit = std::chrono::steady_clock::now();
-        }
         waiting.push_back(s);
     }
     cv.notify_all();
     return s;
+}
+
+int scheduler::waiting_count() {
+    std::lock_guard<std::mutex> lk(m);
+    return (int)waiting.size();
+}
+
+void scheduler::cancel_all() {
+    std::vector<std::shared_ptr<sequence>> all;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        all.insert(all.end(), waiting.begin(), waiting.end());
+        all.insert(all.end(), active.begin(), active.end());
+    }
+    for (auto & s : all) {
+        s->cancel();
+    }
+    cv.notify_all();
 }
 
 bool scheduler::admit(std::shared_ptr<sequence> & s) {
@@ -139,12 +166,19 @@ void scheduler::retire(std::shared_ptr<sequence> & s, const char * reason) {
     s->finish_reason = reason;
     // a pending pipelined prefill chunk (device 1 not yet run) must complete
     // before its blocks are freed
-    e.prefill_flush();
-    e.pc_retire(s->slot, s->blocks);
+    try {
+        e.prefill_flush();
+        e.pc_retire(s->slot, s->blocks);
+    } catch (...) {
+        // The sequence must still reach a terminal state: a failure to flush
+        // the pipeline or release the blocks is already being reported on the
+        // request, and the engine is torn down with the model.
+    }
     s->blocks.clear();
     {
         std::lock_guard<std::mutex> lk(s->m);
         s->finished = true;
+        s->t_done = std::chrono::steady_clock::now();
     }
     s->cv.notify_all();
 }
@@ -169,7 +203,8 @@ static bool dbg() {
 // turns that into "stop".
 struct sample_outcome {
     bool eos = false;  // the sampled token was EOS/EOT (never streamed)
-    bool done = false; // eos, or max_tokens reached
+    bool done = false; // eos, stop string, or max_tokens reached
+    bool stop_hit = false;
 };
 
 static sample_outcome sample_and_emit(engine & e, std::shared_ptr<sequence> & s, utf8_stream_buffer & ub,
@@ -184,26 +219,69 @@ static sample_outcome sample_and_emit(engine & e, std::shared_ptr<sequence> & s,
     s->n_generated++;
     // don't stream the EOS token itself: it is a control token, not content
     const bool eos = !s->gp.ignore_eos && (tok == e.tk.eos_id || tok == e.tk.eot_id);
+    std::string piece;
     if (!eos) {
-        std::string piece = ub.push(e.tk.token_piece(tok));
+        piece = ub.push(e.tk.token_piece(tok));
+    }
+
+    // Stop-string filtering.  The server filters after out_q (its stop_filter
+    // sees the stream); the C API asks the scheduler to do it here so a
+    // collect-all request does not need a consumer to make progress.
+    std::string out = piece;
+    bool stop_hit = false;
+    if (s->apply_stops && !eos) {
+        out = s->sf.feed(piece);
+        stop_hit = s->sf.stopped;
+    }
+    bool done = eos || s->n_generated >= s->gp.max_tokens || stop_hit;
+    if (done && s->apply_stops && !stop_hit && !s->sf.stopped) {
+        // End of stream: release the bytes held back for a possible stop
+        // string.  They belong to the last sampled token's event.
+        out += s->sf.flush();
+    }
+
+    if (s->api_mode) {
+        sequence::token_out t;
+        t.text = std::move(out);
+        t.id = tok;
+        t.logprob = want_lp ? lp.logprob : 0.f;
         if (want_lp) {
-            sequence::token_out t;
-            t.text = std::move(piece);
-            t.id = tok;
+            t.top = std::move(lp.top);
+        }
+        if (s->collect_all) {
+            std::lock_guard<std::mutex> lk(s->m);
+            if (s->t_first.time_since_epoch().count() == 0) {
+                s->t_first = std::chrono::steady_clock::now();
+            }
+            s->text += t.text;
+            s->tokens.push_back(std::move(t));
+            s->cv.notify_all();
+        } else {
+            s->push_token(std::move(t));
+        }
+    } else if (!eos) {
+        // HTTP path: exactly the previous streaming rule.  With logprobs the
+        // event is emitted even when the UTF-8 buffer has no new bytes yet.
+        sequence::token_out t;
+        t.text = std::move(out);
+        t.id = tok;
+        if (want_lp) {
             t.logprob = lp.logprob;
             t.top = std::move(lp.top);
             s->push_token(std::move(t));
-        } else if (!piece.empty()) {
-            s->push(piece);
+        } else if (!t.text.empty()) {
+            s->push(std::move(t.text));
         }
     }
     sample_outcome o;
     o.eos = eos;
-    o.done = eos || s->n_generated >= s->gp.max_tokens;
+    o.done = done;
+    o.stop_hit = stop_hit;
     return o;
 }
 
 void scheduler::loop() {
+    kv_scope kv_scope_(e.kv_k_, e.kv_v_);
     std::vector<int32_t> toks(kMaxB, 0), poss(kMaxB, 0), slots(kMaxB, 0);
     std::vector<float> logits(e.m.hp.n_vocab);
     std::vector<utf8_stream_buffer> ubs(kMaxB);
@@ -234,9 +312,30 @@ void scheduler::loop() {
             std::unique_lock<std::mutex> lk2(m);
             while (!waiting.empty()) {
                 auto s = waiting.front();
+                const auto now = std::chrono::steady_clock::now();
+                if (s->timeout_ms > 0 && now >= s->deadline) {
+                    s->timed_out = true;
+                    retire(s, "timeout");
+                    waiting.erase(waiting.begin());
+                    continue;
+                }
                 const auto t_a0 = std::chrono::steady_clock::now();
-                if (!admit(s)) {
-                    break;
+                try {
+                    if (!admit(s)) {
+                        break;
+                    }
+                } catch (const std::exception & ex) {
+                    s->error = ex.what();
+                    s->failed = true;
+                    retire(s, "error");
+                    waiting.erase(waiting.begin());
+                    continue;
+                } catch (...) {
+                    s->error = "engine failure while admitting the request";
+                    s->failed = true;
+                    retire(s, "error");
+                    waiting.erase(waiting.begin());
+                    continue;
                 }
                 if (srv_time()) {
                     s->admit_ms = dms(t_a0, std::chrono::steady_clock::now());
@@ -254,6 +353,11 @@ void scheduler::loop() {
                 // runs pc_retire)
                 if (s->cancelled) {
                     retire(s, "stop");
+                    continue;
+                }
+                if (s->timeout_ms > 0 && std::chrono::steady_clock::now() >= s->deadline) {
+                    s->timed_out = true;
+                    retire(s, "timeout");
                     continue;
                 }
                 if (s->prompt_pos < (int)s->prompt.size()) {
@@ -326,19 +430,29 @@ void scheduler::loop() {
                     if (tdbg && s->n_chunks == 0) {
                         s->wait_ms = dms(s->t_submit, t_pf0);
                     }
-                    if (whole_prompt) {
-                        lk2.unlock();
-                        e.prefill_text(s->prompt, s->slot, n, s->prompt_pos);
+                    lk2.unlock();
+                    try {
+                        if (whole_prompt) {
+                            e.prefill_text(s->prompt, s->slot, n, s->prompt_pos);
+                        } else if (batch_pf) {
+                            e.prefill_batch(s->prompt, s->prompt_pos, n, s->slot, s->prompt_pos);
+                        } else {
+                            e.prefill_chunk(s->prompt, s->prompt_pos, n, s->slot, last_chunk);
+                        }
+                    } catch (const std::exception & ex) {
+                        s->error = ex.what();
+                        s->failed = true;
                         lk2.lock();
-                    } else if (batch_pf) {
-                        lk2.unlock();
-                        e.prefill_batch(s->prompt, s->prompt_pos, n, s->slot, s->prompt_pos);
+                        retire(s, "error");
+                        break;
+                    } catch (...) {
+                        s->error = "engine failure during prefill";
+                        s->failed = true;
                         lk2.lock();
-                    } else {
-                        lk2.unlock();
-                        e.prefill_chunk(s->prompt, s->prompt_pos, n, s->slot, last_chunk);
-                        lk2.lock();
+                        retire(s, "error");
+                        break;
                     }
+                    lk2.lock();
                     const auto t_pf1 = std::chrono::steady_clock::now();
                     if (tdbg) {
                         s->pf_ms += dms(t_pf0, t_pf1);
@@ -363,10 +477,22 @@ void scheduler::loop() {
                         // the prefill graph produced logits into d_logits row 0;
                         // the pipelined multi-device prefill still owes the last
                         // chunk's device-1 phase (and the head)
-                        e.prefill_flush();
                         const auto t_fl0 = std::chrono::steady_clock::now();
-                        e.fetch_logits(0, logits.data());
-                        s->recent = s->prompt;
+                        try {
+                            e.prefill_flush();
+                            e.fetch_logits(0, logits.data());
+                            s->recent = s->prompt;
+                        } catch (const std::exception & ex) {
+                            s->error = ex.what();
+                            s->failed = true;
+                            retire(s, "error");
+                            break;
+                        } catch (...) {
+                            s->error = "engine failure while reading the prefill head";
+                            s->failed = true;
+                            retire(s, "error");
+                            break;
+                        }
                         const auto t_sm0 = std::chrono::steady_clock::now();
                         if (tdbg) {
                             const auto t_now = std::chrono::steady_clock::now();
@@ -385,8 +511,23 @@ void scheduler::loop() {
                         // NB: this path's reason string differs from the decode one
                         // below on purpose (no `&& !eos`), as it did before both used
                         // their own copy of the rule.
-                        if (sample_and_emit(e, s, ubs[0], logits.data(), e.m.hp.n_vocab).done) {
-                            retire(s, s->n_generated >= s->gp.max_tokens ? "length" : "stop");
+                        sample_outcome o;
+                        try {
+                            o = sample_and_emit(e, s, ubs[0], logits.data(), e.m.hp.n_vocab);
+                        } catch (const std::exception & ex) {
+                            s->error = ex.what();
+                            s->failed = true;
+                            retire(s, "error");
+                            break;
+                        } catch (...) {
+                            s->error = "engine failure while sampling";
+                            s->failed = true;
+                            retire(s, "error");
+                            break;
+                        }
+                        if (o.done) {
+                            retire(s, o.stop_hit ? "stop"
+                                                 : (s->n_generated >= s->gp.max_tokens && !o.eos ? "length" : "stop"));
                         }
                     }
                     break; // one prefill chunk per iteration
@@ -414,7 +555,10 @@ void scheduler::loop() {
             // 4.33 tok/s aggregate against 5.79 for one request at a time,
             // because two live sequences thrash the shared expert bank.
             static const int dbg_cap = si::env::i32("PF_SCHED_MAX_DECODE", 0);
-            const int row_cap = mp.policy.max_decode_rows > 0 ? mp.policy.max_decode_rows : kMaxB;
+            int row_cap = mp.policy.max_decode_rows > 0 ? mp.policy.max_decode_rows : kMaxB;
+            if (decode_row_cap > 0) {
+                row_cap = std::min(row_cap, decode_row_cap);
+            }
             const int dec_cap = dbg_cap > 0 ? dbg_cap : row_cap;
             for (auto & s : active) {
                 if (s->finished) {
@@ -424,6 +568,11 @@ void scheduler::loop() {
                 // run for a client that is not listening
                 if (s->cancelled) {
                     retire(s, "stop");
+                    continue;
+                }
+                if (s->timeout_ms > 0 && std::chrono::steady_clock::now() >= s->deadline) {
+                    s->timed_out = true;
+                    retire(s, "timeout");
                     continue;
                 }
                 // Backpressure, not a stall: a consumer that cannot keep up
@@ -474,7 +623,31 @@ void scheduler::loop() {
             }
             if (nb > 0) {
                 lk2.unlock();
-                e.decode_batch(toks.data(), poss.data(), slots.data(), nb);
+                try {
+                    e.decode_batch(toks.data(), poss.data(), slots.data(), nb);
+                } catch (const std::exception & ex) {
+                    lk2.lock();
+                    for (auto & s : batch) {
+                        s->error = ex.what();
+                        s->failed = true;
+                        retire(s, "error");
+                    }
+                    active.erase(std::remove_if(active.begin(), active.end(),
+                                                [](const std::shared_ptr<sequence> & s) { return s->finished.load(); }),
+                                 active.end());
+                    continue;
+                } catch (...) {
+                    lk2.lock();
+                    for (auto & s : batch) {
+                        s->error = "engine failure during decode";
+                        s->failed = true;
+                        retire(s, "error");
+                    }
+                    active.erase(std::remove_if(active.begin(), active.end(),
+                                                [](const std::shared_ptr<sequence> & s) { return s->finished.load(); }),
+                                 active.end());
+                    continue;
+                }
                 lk2.lock();
                 if (dbg()) {
                     fprintf(stderr, "[sched] decode nb=%d:", nb);
@@ -486,17 +659,28 @@ void scheduler::loop() {
                 did_work = true;
                 for (int r = 0; r < nb; r++) {
                     auto & s = batch[r];
-                    e.fetch_logits(r, logits.data());
-                    // the same helper the prefill's first token uses
-                    const sample_outcome o = sample_and_emit(e, s, ubs[r], logits.data(), e.m.hp.n_vocab);
-                    if (o.done) {
-                        retire(s, s->n_generated >= s->gp.max_tokens && !o.eos ? "length" : "stop");
+                    try {
+                        e.fetch_logits(r, logits.data());
+                        // the same helper the prefill's first token uses
+                        const sample_outcome o = sample_and_emit(e, s, ubs[r], logits.data(), e.m.hp.n_vocab);
+                        if (o.done) {
+                            retire(s, o.stop_hit ? "stop"
+                                                 : (s->n_generated >= s->gp.max_tokens && !o.eos ? "length" : "stop"));
+                        }
+                    } catch (const std::exception & ex) {
+                        s->error = ex.what();
+                        s->failed = true;
+                        retire(s, "error");
+                    } catch (...) {
+                        s->error = "engine failure while sampling a decode row";
+                        s->failed = true;
+                        retire(s, "error");
                     }
                 }
             }
             // remove finished
             active.erase(std::remove_if(active.begin(), active.end(),
-                                        [](const std::shared_ptr<sequence> & s) { return s->finished; }),
+                                        [](const std::shared_ptr<sequence> & s) { return s->finished.load(); }),
                          active.end());
         }
 

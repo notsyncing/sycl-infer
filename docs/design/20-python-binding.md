@@ -1,5 +1,11 @@
 # Python binding 与 wheel 打包设计
 
+> 实现状态（v0.1）：设计目标不变，但当前实现使用 **ctypes** 直接调用 C ABI，
+> 因为构建机没有 pybind11 且无法联网；公开 API 与本文一致，wheel 用 setuptools
+> 打包并内置 C 库与运行时闭包。pybind11 仍是后续的性能路径（见 §4.1）。
+> 已验证：CPU 0.8B 生成、流式、停止串、取消、2 请求批处理、wheel 在无
+> `LD_LIBRARY_PATH` 的环境下自加载。
+
 本文定义 `sycl_infer` Python 包：构建在 [C API](19-c-api.md) 之上的 pybind11
 扩展、Python 风格的异步/流式/批量接口，以及把 SYCL/oneDNN/oneAPI 运行时和本项目
 一起打进 wheel 的构建方案。

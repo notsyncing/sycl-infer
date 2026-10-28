@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include "common/env.h"
 #include "common/yarn.h"
+#include "cpu_types.h"
 
 namespace si {
 
@@ -107,6 +108,27 @@ engine::engine(const engine_config & cfg)
       md_ctx_(make_md_context(cfg.layer_map)),
       q(make_queue(device_req, md_ctx_.get())),
       max_seq(cfg.max_seq), max_slots(cfg.max_slots), n_splits(cfg.n_splits), n_blocks(cfg.n_blocks) {
+    // Resolve this engine's KV storage types before any buffer is sized, and
+    // install them as a thread-local scope for the constructor's duration.
+    // The process-wide value stays the fallback for the CLI and for code that
+    // is not inside an engine.
+    {
+        const int kk = cfg.kv_k >= 0 ? cfg.kv_k : (int)kv_k_dtype();
+        const int vv = cfg.kv_v >= 0 ? cfg.kv_v : (cfg.kv_k >= 0 ? cfg.kv_k : (int)kv_v_dtype());
+        if (kk < (int)kv_dtype_t::f32 || kk > (int)kv_dtype_t::i4 || vv < (int)kv_dtype_t::f32 ||
+            vv > (int)kv_dtype_t::i4) {
+            throw std::runtime_error("engine: invalid KV type");
+        }
+        kv_k_ = (kv_dtype_t)kk;
+        kv_v_ = (kv_dtype_t)vv;
+        if (!kv_dtype_mix_ok(kv_k_, kv_v_)) {
+            throw std::runtime_error("engine: the K/V storage types cannot be mixed");
+        }
+    }
+    kv_scope kv_scope_(kv_k_, kv_v_);
+    if (cfg.cpu_threads > 0) {
+        cpu_set_thread_count(cfg.cpu_threads);
+    }
     {
         moe_cache_cfg mc = moe_cache_cfg::from_env(cfg.moe_resident);
         mc.vram_mb = cfg.moe_vram_mb ? cfg.moe_vram_mb : mc.vram_mb;
@@ -408,7 +430,9 @@ engine::engine(const engine_config & cfg)
         // (an earlier change) measured 2.177 ms at 64k depth against 160's
         // 1.699.
         const char * e = si::env::str("PF_DEC_SPLIT");
-        if (e) {
+        if (cfg.dec_splits > 0) {
+            dec_splits = cfg.dec_splits;
+        } else if (e) {
             dec_splits = atoi(e);
         } else {
             const dev::profile & dp = dev::for_queue(q);
@@ -431,8 +455,10 @@ engine::engine(const engine_config & cfg)
         const char * ep = si::env::str("PF_PREFIX_CACHE");
         // The profile declares whether the checkpoint blob can represent this
         // model's per-slot state (qwen4exp's PLE history and QSA mirror are not
-        // in it, so it must stay off rather than resume without them).
-        pc_enabled = mp_->policy.prefix_cache && !(ep && atoi(ep) == 0);
+        // in it, so it must stay off rather than resume without them).  An
+        // explicit engine_config value (C API) wins over the environment.
+        const bool pc_requested = cfg.prefix_cache >= 0 ? cfg.prefix_cache != 0 : !(ep && atoi(ep) == 0);
+        pc_enabled = mp_->policy.prefix_cache && pc_requested;
         // multi-device note: block ids and recurrent-state checkpoints are global
         // (host-USM shared buffers), so the three-tier cache works here too; only
         // the block serialize/deserialize must resolve each attention layer to its
@@ -2913,6 +2939,7 @@ void engine::reset_single() {
 }
 // ---------------------------------------------------------------------------
 void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     if (m.q4exp) {
         q4_prefill_text(toks, slot, n, start);
         return;
@@ -2985,6 +3012,7 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // (chunked) only for the tail: mode 2 reads each weight once per forward, so it
 // is ~2x the chunked throughput for the same tokens
 void engine::prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     if (m.q4exp) {
         q4_prefill_text(toks, slot, n, start);
         return;
@@ -3063,6 +3091,7 @@ void engine::prefill_flush() {
 }
 
 void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int slot, int pos0) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     // ceil: the last row may be partial (any n up to kMaxB*kMaxT), encoded in
     // n_real_row so the kernels process only its real tokens
     const int NCH = (n + kMaxT - 1) / kMaxT;
@@ -3144,6 +3173,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
 }
 
 void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     if (m.q4exp) {
         prefill_flush();
         pf_info_ = nullptr;
@@ -3370,6 +3400,7 @@ std::vector<int> engine::generate_mm(const mm_prompt & p, const gen_params & gp,
 std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm_prompt * mm, const gen_params & gp,
                                        const std::function<bool(int)> & cb, std::vector<float> * first_logits,
                                        bool allow_spec) {
+    kv_scope kv_scope_(kv_k_, kv_v_);
     // MTP speculative decoding: greedy requests only (the acceptance test is an
     // equality against the target's own next token; a sampled target would need
     // rejection sampling to stay exact).  Multimodal prompts bypass it too.

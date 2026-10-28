@@ -7,3 +7,10 @@ dev/
 reports/
 .vscode/
 logs/
+
+# Python wheel: vendored runtime DSOs and build products are produced locally
+python/sycl_infer/_lib/*
+!python/sycl_infer/_lib/.gitkeep
+python/dist/
+python/build/
+python/*.egg-info/

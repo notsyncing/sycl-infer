@@ -83,6 +83,9 @@ namespace {
 // the resolved value directly before the engine (and its worker threads) exist.
 std::atomic<int> g_kv_k{-1};
 std::atomic<int> g_kv_v{-1};
+// Thread-local per-engine override (-1 = not set).  See kv_scope.
+thread_local int t_kv_k = -1;
+thread_local int t_kv_v = -1;
 
 void from_env(kv_dtype_t & k, kv_dtype_t & v) {
     const char * e = si::env::str("PF_KV_TYPE");
@@ -104,6 +107,9 @@ void from_env(kv_dtype_t & k, kv_dtype_t & v) {
 } // namespace
 
 kv_dtype_t kv_k_dtype() {
+    if (t_kv_k >= 0) {
+        return (kv_dtype_t)t_kv_k;
+    }
     int v = g_kv_k.load(std::memory_order_acquire);
     if (v < 0) {
         kv_dtype_t k, vv;
@@ -116,6 +122,9 @@ kv_dtype_t kv_k_dtype() {
 }
 
 kv_dtype_t kv_v_dtype() {
+    if (t_kv_v >= 0) {
+        return (kv_dtype_t)t_kv_v;
+    }
     int v = g_kv_v.load(std::memory_order_acquire);
     if (v < 0) {
         kv_dtype_t k, vv;
@@ -138,6 +147,19 @@ void kv_dtype_set(kv_dtype_t t) {
 void kv_dtype_set_kv(kv_dtype_t k, kv_dtype_t v) {
     g_kv_k.store((int)k, std::memory_order_release);
     g_kv_v.store((int)v, std::memory_order_release);
+}
+
+kv_scope::kv_scope(kv_dtype_t k, kv_dtype_t v) {
+    had_prev_ = t_kv_k >= 0 || t_kv_v >= 0;
+    prev_k_ = t_kv_k >= 0 ? (kv_dtype_t)t_kv_k : kv_dtype_t::i8;
+    prev_v_ = t_kv_v >= 0 ? (kv_dtype_t)t_kv_v : kv_dtype_t::i8;
+    t_kv_k = (int)k;
+    t_kv_v = (int)v;
+}
+
+kv_scope::~kv_scope() {
+    t_kv_k = had_prev_ ? (int)prev_k_ : -1;
+    t_kv_v = had_prev_ ? (int)prev_v_ : -1;
 }
 
 const char * kv_dtype_name(kv_dtype_t t) {
