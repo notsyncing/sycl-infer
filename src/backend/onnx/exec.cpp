@@ -96,6 +96,8 @@ executor::executor(exec_graph g, sycl::queue & q) : g_(std::move(g)), q_(q) {
     dump_file_dir_ = dump_file_dbg_ ? getenv("SI_ONNX_DUMP_FILE") : nullptr;
     if (const char * g = getenv("SI_ONNX_GUARD")) guard_ = (size_t)atoi(g);
     opstat_ = getenv("SI_ONNX_OPSTAT") != nullptr;
+    ophost_dbg_ = getenv("SI_ONNX_OPHOST") != nullptr;
+    intdev_dbg_ = getenv("SI_ONNX_INTDEV") != nullptr;
     if (upload_dbg_) {
         upload_by_slot_.assign(g_.tensors.size(), 0);
         upload_bytes_by_slot_.assign(g_.tensors.size(), 0);
@@ -442,6 +444,78 @@ void executor::set_output_reduce(const std::string & name, int kind) {
                                  "' (the output reduction)");
     }
     out_reduce_[name] = kind;
+}
+
+// The integer values and the operators that can consume them on the device.
+//
+// An integer used to be host-authoritative by construction: every integer
+// output was downloaded at its write-back, because the shape functions read
+// their parameters there.  That is true for a *parameter* (a reshape target,
+// the slice bounds, the split sizes) and false for *data* (the TopK indices
+// and the index arithmetic built from them) - and the download waited for
+// the whole in-order queue, so a 38 KB index array blocked on every
+// convolution submitted before it.
+//
+// The rule now: an integer output stays on the device when the operator
+// wrote it there, and the two lists below decide where a consumer reads it.
+namespace {
+
+bool int_dtype(int32_t d) { return d == onnxpb::INT64 || d == onnxpb::INT32; }
+
+// An operator with a device path for an integer tensor.
+bool int_dev_capable(const std::string & ty) {
+    return ty == "Concat" || ty == "Slice" || ty == "Reshape" || ty == "Flatten" ||
+           ty == "Squeeze" || ty == "Unsqueeze" || ty == "Identity" || ty == "Transpose" ||
+           ty == "GatherND" || ty == "ScatterND" || ty == "Tile" || ty == "Expand" ||
+           ty == "Cast" || ty == "Mod" || ty == "Max" || ty == "Min" || ty == "Add" ||
+           ty == "Sub" || ty == "Mul" || ty == "ReduceMax" || ty == "ReduceMin" ||
+           ty == "ReduceSum" || ty == "ReduceMean";
+}
+
+// An operator that reads the *values* of this input before it runs (its
+// shape function does).  These are the parameters, and they are small - a
+// reshape target, the bounds of a Slice, the repeats of a Tile, a TopK's k.
+bool int_shape_param(const std::string & ty, size_t pos) {
+    if (ty == "Reshape" || ty == "Expand" || ty == "Tile" || ty == "Split" || ty == "Squeeze" ||
+        ty == "Unsqueeze" || ty == "TopK" || ty == "OneHot" || ty == "Shape") {
+        return pos == 1;
+    }
+    if (ty == "Slice") return pos >= 1 && pos <= 4;
+    if (ty == "ReduceMax" || ty == "ReduceMin" || ty == "ReduceSum" || ty == "ReduceMean" ||
+        ty == "CumSum") {
+        return pos == 1;
+    }
+    if (ty == "Range") return pos <= 2;
+    if (ty == "ConstantOfShape") return pos == 0;
+    if (ty == "Pad") return pos == 1;
+    if (ty == "Resize") return pos >= 1 && pos <= 3;
+    return false;
+}
+
+// An operator whose execution reads only the *shape* of an integer input (a
+// Shape never reads its input's values, and downloading a whole index tensor
+// for it was 38 KB and a full queue drain).
+bool int_shape_only(const std::string & ty) { return ty == "Shape"; }
+
+} // namespace
+
+void executor::materialize_int(int slot) {
+    if (slot < 0 || slot >= (int)state_.size()) return;
+    slot_state & st = state_[slot];
+    tensor & t = g_.tensors[slot];
+    if (!t.host.empty()) return;
+    if (!st.dev || !st.bytes) return;
+    if (intdev_dbg_) {
+        fprintf(stderr, "[onnx] intdev: '%s' comes back to the host (%zu bytes, the dtype %d)\n",
+                t.name.c_str(), st.bytes, (int)t.dtype);
+    }
+    t.host.resize(st.bytes);
+    q_download(q_, st.dev, t.host.data(), t.host.size());
+    t.on_host = true;
+    // The device buffer is still the same value, so its mirror generation
+    // stays current: a consumer that reads it on the device must not
+    // re-upload it.
+    st.dev_gen = st.host_gen;
 }
 
 size_t executor::reduced_count(size_t out_index) const {
@@ -1646,6 +1720,19 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 host_inputs_only = ti.on_host && !ti.host.empty() && ti.count > 0 &&
                                    (int_target ? ti.count <= (size_t)65536 : ti.count <= (size_t)8192);
             }
+            // A device-authoritative integer input turns the host-only fast
+            // path off: the operator's device path reads it through its
+            // device pointer, and the host inputs alongside it have to be
+            // uploaded for that path.
+            if (host_inputs_only && int_dev_capable(op.node->op_type)) {
+                for (int si : op.in) {
+                    if (si < 0) continue;
+                    if (int_dtype(g_.tensors[si].dtype) && state_[si].dev && host_of(si).empty()) {
+                        host_inputs_only = false;
+                        break;
+                    }
+                }
+            }
         }
         const auto tu0 = hosttime ? std::chrono::steady_clock::now() : tp{};
         try {
@@ -1683,6 +1770,26 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         // int64).
         for (tensor * t : ctx.out) {
             if (!ctx.in.empty()) t->dtype = ctx.in[0]->dtype;
+        }
+        // The parameters the shape functions read are the exception to the
+        // device residency: a reshape target, a Slice's bounds, a Tile's
+        // repeats, a TopK's k.  They are small, and they are the *only*
+        // integer values whose content is needed before the operator runs.
+        // Materialising them here (and nothing else) keeps a device-only
+        // index tensor from being pulled back just because an operator's
+        // shape function happens to sit between the two.
+        {
+            const std::string & ty = op.node->op_type;
+            for (size_t pos = 0; pos < op.in.size(); ++pos) {
+                const int s = op.in[pos];
+                if (s < 0) continue;
+                const tensor & t = g_.tensors[s];
+                if (t.host.empty() == false) continue;
+                if (!int_shape_param(ty, pos)) continue;
+                const bool int_param = int_dtype(t.dtype) || ty == "Resize";
+                if (!int_param) continue;
+                materialize_int(s);
+            }
         }
         std::vector<std::vector<int64_t>> shapes;
         bool have_shape = false;
@@ -1850,7 +1957,8 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         // elementwise case (it reads and writes the same element).
         int borrow_slot = -1;
         bool skip_exec = false;
-        if (kGuard == 0 && ctx.out.size() == 1 && ctx.out[0]->dtype == onnxpb::FLOAT &&
+        if (kGuard == 0 && ctx.out.size() == 1 &&
+            (ctx.out[0]->dtype == onnxpb::FLOAT || int_dtype(ctx.out[0]->dtype)) &&
             (op.kind == op_kind::alias || op.kind == op_kind::elementwise)) {
             const size_t out_bytes = ctx.out[0]->bytes();
             const size_t n_in = op.kind == op_kind::alias ? 1 : op.in.size();
@@ -1862,6 +1970,13 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                     cs.last_use != (int)i) continue;
                 if (cs.bytes != out_bytes) continue;
                 if (g_.tensors[s].dtype != ctx.out[0]->dtype) continue;
+                // An integer may only be borrowed when the device owns it:
+                // the host copy would not move with the buffer, and a value
+                // the device does not own would lose its bytes.
+                if (int_dtype(ctx.out[0]->dtype) &&
+                    (op.kind != op_kind::alias || !g_.tensors[s].host.empty())) {
+                    continue;
+                }
                 if (op.kind == op_kind::elementwise &&
                     g_.tensors[s].shape != ctx.out[0]->shape) {
                     continue;
@@ -1914,8 +2029,38 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             }
             th1 = timed ? std::chrono::steady_clock::now() : tp{};
             const auto t_op = time_dbg_ ? std::chrono::steady_clock::now() : tp{};
+            const auto t_sub = ophost_dbg_ ? std::chrono::steady_clock::now() : tp{};
+            // The safety net: an operator with no device path for an integer
+            // gets the host bytes its code expects.  The alternative is an
+            // empty vector, which is not an error - every index comes out as
+            // zero and the model still produces plausible text.  A Shape is
+            // exempt (it reads only the shape), and a capable operator took
+            // the device path above.
+            if (!skip_exec && !int_dev_capable(op.node->op_type) &&
+                !int_shape_only(op.node->op_type)) {
+                for (int s : op.in) {
+                    if (s < 0) continue;
+                    if (int_dtype(g_.tensors[s].dtype) && state_[s].dev && host_of(s).empty()) {
+                        if (intdev_dbg_) {
+                            fprintf(stderr, "[onnx] intdev: the host path of %zu (%s) reads '%s'\n", i,
+                                    op.node->op_type.c_str(), g_.tensors[s].name.c_str());
+                        }
+                        materialize_int(s);
+                    }
+                }
+            }
             if (!skip_exec) e->exec(ctx);
             th2 = timed ? std::chrono::steady_clock::now() : tp{};
+            if (ophost_dbg_) {
+                // The time spent *submitting* the operator, with no wait: a
+                // host operator that downloads a tensor shows up here, and
+                // that is the only way to see the queue drains that hide
+                // inside e->exec.
+                fprintf(stderr, "[onnx] ophost: %zu %s %.3f\n", i,
+                        op.node->op_type.c_str(),
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_sub).count());
+            }
             // The wait: only the diagnostics need the operator's result (the
             // timing, the dump and the guard band's check).  The queue is in
             // order, so the next operator's kernels see this one's writes -
@@ -2092,7 +2237,16 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // download all 48 MB/page before the readback ever sees it.
             const bool reduced_out =
                 is_output(s) && out_reduce_.count(g_.tensors[s].name) != 0;
-            const bool on_host = (ctx.out[k]->on_host || int_out) && !reduced_out;
+            // An integer output whose operator wrote it on the device stays
+            // there: the value is device-authoritative and `host` is empty.
+            // The old rule made every integer host-authoritative and
+            // downloaded it here, and the download waits for the whole
+            // in-order queue - the layout model's three TopK outputs alone
+            // blocked 1.3 s per batch-16 call behind convolutions the host
+            // could have submitted past.  A consumer that needs the bytes
+            // (a shape parameter, or an operator with no device path)
+            // materialises them at its own point of use.
+            const bool on_host = ctx.out[k]->on_host && !reduced_out;
             // A value is written once per run.  The check used to be in the
             // device-resident branch only, so a host value written twice
             // silently kept the last writer's bytes and the first writer's
@@ -2108,13 +2262,12 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             producer_[s] = (int)i;
             if (ctx.out[k]->on_host) {
                 g_.tensors[s].host = ctx.out[k]->host;
-            } else if (int_out && !reduced_out) {
-                g_.tensors[s].host.resize(ctx.out[k]->bytes());
-                if (!g_.tensors[s].host.empty()) {
-                    q_download(q_, ctx.out[k]->dev, g_.tensors[s].host.data(), g_.tensors[s].host.size());
-                }
             } else {
                 g_.tensors[s].host.clear();
+            }
+            if (intdev_dbg_ && int_out) {
+                fprintf(stderr, "[onnx] intout: %s %s %s\n", on_host ? "host" : "dev",
+                        op.node->op_type.c_str(), g_.tensors[s].name.c_str());
             }
             st.is_const = false;
             st.bytes = ctx.out[k]->bytes();

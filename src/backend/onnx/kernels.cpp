@@ -1626,5 +1626,336 @@ void scatter_elements_launch(sycl::queue & q, const void * data, const void * id
     }
 }
 
+// ------------------------------------------------- the integer tensors' moves
+//
+// An integer value that stays on the device (the layout model's TopK indices
+// and the index arithmetic after them) is moved by these, in its own width.
+// They are the same walks as the float kernels above: a 4-byte arm covers
+// int32 as well as float (the copy is a bit copy), and an 8-byte arm covers
+// int64.
+
+namespace {
+
+template <typename T>
+void concat_typed_impl(sycl::queue & q, const std::vector<const void *> & in,
+                       const std::vector<std::vector<int64_t>> & in_shapes, void * y, int axis,
+                       int64_t outer) {
+    (void)outer;
+    constexpr int kMaxRank = 8;
+    constexpr int kMaxIn = 16;
+    const int64_t rank = (int64_t)in_shapes[0].size();
+    const int n = rank > kMaxRank ? kMaxRank : (int)rank;
+    const int nin = (int)std::min<size_t>(in.size(), kMaxIn);
+    int64_t out_shape[kMaxRank] = {0};
+    for (int d = 0; d < n; ++d) out_shape[d] = in_shapes[0][d];
+    int64_t out_axis = 0;
+    for (int i = 0; i < nin; ++i) {
+        out_axis += in_shapes[i][axis];
+        for (int d = 0; d < n; ++d) {
+            if (d == axis) continue;
+            if (in_shapes[i][d] != 1 && out_shape[d] == 1) out_shape[d] = in_shapes[i][d];
+        }
+    }
+    out_shape[axis] = out_axis;
+    int64_t total = 1;
+    for (int d = 0; d < n; ++d) total *= out_shape[d];
+    if (total == 0) return;
+    int64_t ostride[kMaxRank] = {0};
+    ostride[n - 1] = 1;
+    for (int d = n - 2; d >= 0; --d) ostride[d] = ostride[d + 1] * out_shape[d + 1];
+    int64_t offs[kMaxIn] = {0};
+    int64_t ishape[kMaxIn][kMaxRank] = {{0}};
+    const T * ptrs[kMaxIn] = {nullptr};
+    int64_t acc = 0;
+    for (int i = 0; i < nin; ++i) {
+        offs[i] = acc;
+        acc += in_shapes[i][axis];
+        ptrs[i] = (const T *)in[i];
+        for (int d = 0; d < n; ++d) ishape[i][d] = in_shapes[i][d];
+    }
+    for (int k = 0; k < nin; ++k) {
+        const T * src_ptr = ptrs[k];
+        const int64_t base = offs[k] * ostride[axis];
+        int64_t count = 1;
+        for (int d = 0; d < n; ++d) count *= ishape[k][d];
+        if (count == 0) continue;
+        q.submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>(count), [=](sycl::item<1> it) {
+                const int64_t idx = it.get_id(0);
+                int64_t rest = idx;
+                int64_t dp = base;
+                for (int d = n - 1; d >= 0; --d) {
+                    const int64_t dim = ishape[k][d];
+                    const int64_t c = dim > 0 ? rest % dim : 0;
+                    rest /= dim > 0 ? dim : 1;
+                    dp += c * ostride[d];
+                }
+                ((T *)y)[dp] = src_ptr[idx];
+            });
+        });
+    }
+}
+
+template <typename T>
+void strided_copy_typed_impl(sycl::queue & q, const void * xv, void * yv,
+                             const int64_t * src_stride, const int64_t * dst_stride,
+                             const int64_t * out_shape, int rank, int64_t total) {
+    if (total == 0) return;
+    int64_t ss[8] = {0}, ds[8] = {0}, os[8] = {0};
+    const int n = rank > 8 ? 8 : rank;
+    for (int d = 0; d < n; ++d) {
+        ss[d] = src_stride[d];
+        ds[d] = dst_stride[d];
+        os[d] = out_shape[d];
+    }
+    const T * x = (const T *)xv;
+    T * y = (T *)yv;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
+            const int64_t idx = it.get_id(0);
+            int64_t rest = idx, src = 0, dst = 0;
+            for (int d = n - 1; d >= 0; --d) {
+                const int64_t dim = rest % os[d];
+                rest /= os[d];
+                src += dim * ss[d];
+                dst += dim * ds[d];
+            }
+            y[dst] = x[src];
+        });
+    });
+}
+
+template <typename T>
+void gather_nd_typed_impl(sycl::queue & q, const void * data, const void * indices, void * out,
+                          int64_t n_out, int64_t inner, int64_t r, bool indices_are_32,
+                          const int64_t * data_stride, const int64_t * data_dim, int n_stride) {
+    constexpr int kMax = 8;
+    int64_t ds[kMax] = {0};
+    int64_t dm[kMax] = {0};
+    const int n = n_stride > kMax ? kMax : n_stride;
+    for (int i = 0; i < n; ++i) {
+        ds[i] = data_stride[i];
+        dm[i] = data_dim[i];
+    }
+    const T * dp = (const T *)data;
+    T * y = (T *)out;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(n_out), [=](sycl::item<1> it) {
+            const int64_t o = it.get_id(0);
+            const int64_t b = o / inner;
+            const int64_t t = o - b * inner;
+            int64_t off = t;
+            bool bad = false;
+            for (int64_t c = 0; c < r; ++c) {
+                int64_t v = indices_are_32 ? (int64_t)((const int32_t *)indices)[b * r + c]
+                                           : ((const int64_t *)indices)[b * r + c];
+                if (v < 0) v += dm[c];
+                if (v < 0 || v >= dm[c]) {
+                    bad = true;
+                    break;
+                }
+                off += v * ds[c];
+            }
+            y[o] = bad ? (T)0 : dp[off];
+        });
+    });
+}
+
+template <typename T>
+void scatter_nd_typed_impl(sycl::queue & q, const void * data, const void * indices,
+                           const void * upd, void * out, int64_t n_data, int64_t n_upd,
+                           int64_t inner, int64_t r, bool indices_are_32,
+                           const int64_t * data_stride, const int64_t * data_dim, int n_stride) {
+    constexpr int kMax = 8;
+    int64_t ds[kMax] = {0};
+    int64_t dm[kMax] = {0};
+    const int n = n_stride > kMax ? kMax : n_stride;
+    for (int i = 0; i < n; ++i) {
+        ds[i] = data_stride[i];
+        dm[i] = data_dim[i];
+    }
+    const T * up = (const T *)upd;
+    T * y = (T *)out;
+    // The copy of the data is the operator's other half; the caller issues it
+    // (q_copy_dev) so this stays one kernel, exactly as the ScatterElements.
+    (void)data;
+    (void)n_data;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(std::max<int64_t>(n_upd, 1)), [=](sycl::item<1> it) {
+            const int64_t o = it.get_id(0);
+            if (o >= n_upd) return;
+            const int64_t b = o / inner;
+            const int64_t t = o - b * inner;
+            int64_t off = t;
+            for (int64_t c = 0; c < r; ++c) {
+                int64_t v = indices_are_32 ? (int64_t)((const int32_t *)indices)[b * r + c]
+                                           : ((const int64_t *)indices)[b * r + c];
+                if (v < 0) v += dm[c];
+                if (v < 0 || v >= dm[c]) return;
+                off += v * ds[c];
+            }
+            y[off] = up[o];
+        });
+    });
+}
+
+template <typename T>
+void tile_typed_impl(sycl::queue & q, const void * xv, void * yv, const int64_t * src_stride,
+                     const int64_t * dst_stride, const int64_t * out_shape,
+                     const int64_t * in_shape, int rank, int64_t total) {
+    int64_t ss[8] = {0}, ds[8] = {0}, os[8] = {0}, xs[8] = {0};
+    const int n = rank > 8 ? 8 : rank;
+    for (int d = 0; d < n; ++d) {
+        ss[d] = src_stride[d];
+        ds[d] = dst_stride[d];
+        os[d] = out_shape[d];
+        xs[d] = in_shape[d];
+    }
+    const T * x = (const T *)xv;
+    T * y = (T *)yv;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
+            const int64_t idx = it.get_id(0);
+            int64_t rest = idx;
+            int64_t sp = 0, dp = 0;
+            for (int d = n - 1; d >= 0; --d) {
+                const int64_t dim = rest % os[d];
+                rest /= os[d];
+                sp += (dim % xs[d]) * ss[d];
+                dp += dim * ds[d];
+            }
+            y[dp] = x[sp];
+        });
+    });
+}
+
+template <typename T>
+void expand_typed_impl(sycl::queue & q, const void * xv, void * yv, const int64_t * strides,
+                       const int64_t * out_shape, int rank, int64_t total) {
+    int64_t st[8] = {0}, os[8] = {0};
+    const int n = rank > 8 ? 8 : rank;
+    for (int d = 0; d < n; ++d) {
+        st[d] = strides[d];
+        os[d] = out_shape[d] > 0 ? out_shape[d] : 1;
+    }
+    const T * x = (const T *)xv;
+    T * y = (T *)yv;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
+            const int64_t idx = it.get_id(0);
+            int64_t rest = idx, sp = 0;
+            for (int d = n - 1; d >= 0; --d) {
+                const int64_t co = rest % os[d];
+                rest /= os[d];
+                sp += co * st[d];
+            }
+            y[idx] = x[sp];
+        });
+    });
+}
+
+} // namespace
+
+void concat_typed_launch(sycl::queue & q, const std::vector<const void *> & in,
+                         const std::vector<std::vector<int64_t>> & in_shapes, void * y, int axis,
+                         int64_t outer, int elem_size) {
+    if (in.empty() || in_shapes.empty()) return;
+    if (elem_size == 8) {
+        concat_typed_impl<int64_t>(q, in, in_shapes, y, axis, outer);
+    } else if (elem_size == 4) {
+        concat_typed_impl<int32_t>(q, in, in_shapes, y, axis, outer);
+    } else {
+        throw std::runtime_error("the concat's element size is not 4 or 8");
+    }
+}
+
+void strided_copy_typed_launch(sycl::queue & q, const void * x, void * y,
+                               const int64_t * src_stride, const int64_t * dst_stride,
+                               const int64_t * out_shape, int rank, int64_t total, int elem_size) {
+    if (elem_size == 8) {
+        strided_copy_typed_impl<int64_t>(q, x, y, src_stride, dst_stride, out_shape, rank, total);
+    } else if (elem_size == 4) {
+        strided_copy_typed_impl<int32_t>(q, x, y, src_stride, dst_stride, out_shape, rank, total);
+    } else {
+        throw std::runtime_error("the strided copy's element size is not 4 or 8");
+    }
+}
+
+void gather_nd_typed_launch(sycl::queue & q, const void * data, const void * indices, void * out,
+                            int64_t n_out, int64_t inner, int64_t r, bool indices_are_32,
+                            const int64_t * data_stride, const int64_t * data_dim, int n_stride,
+                            int elem_size) {
+    if (elem_size == 8) {
+        gather_nd_typed_impl<int64_t>(q, data, indices, out, n_out, inner, r, indices_are_32,
+                                      data_stride, data_dim, n_stride);
+    } else if (elem_size == 4) {
+        gather_nd_typed_impl<int32_t>(q, data, indices, out, n_out, inner, r, indices_are_32,
+                                      data_stride, data_dim, n_stride);
+    } else {
+        throw std::runtime_error("the gather's element size is not 4 or 8");
+    }
+}
+
+void scatter_nd_typed_launch(sycl::queue & q, const void * data, const void * indices,
+                             const void * upd, void * out, int64_t n_data, int64_t n_upd,
+                             int64_t inner, int64_t r, bool indices_are_32,
+                             const int64_t * data_stride, const int64_t * data_dim, int n_stride,
+                             int elem_size) {
+    if (elem_size == 8) {
+        scatter_nd_typed_impl<int64_t>(q, data, indices, upd, out, n_data, n_upd, inner, r,
+                                       indices_are_32, data_stride, data_dim, n_stride);
+    } else if (elem_size == 4) {
+        scatter_nd_typed_impl<int32_t>(q, data, indices, upd, out, n_data, n_upd, inner, r,
+                                       indices_are_32, data_stride, data_dim, n_stride);
+    } else {
+        throw std::runtime_error("the scatter's element size is not 4 or 8");
+    }
+}
+
+void tile_typed_launch(sycl::queue & q, const void * x, void * y, const int64_t * src_stride,
+                       const int64_t * dst_stride, const int64_t * out_shape,
+                       const int64_t * in_shape, int rank, int64_t total, int elem_size) {
+    if (elem_size == 8) {
+        tile_typed_impl<int64_t>(q, x, y, src_stride, dst_stride, out_shape, in_shape, rank, total);
+    } else if (elem_size == 4) {
+        tile_typed_impl<int32_t>(q, x, y, src_stride, dst_stride, out_shape, in_shape, rank, total);
+    } else {
+        throw std::runtime_error("the tile's element size is not 4 or 8");
+    }
+}
+
+void expand_typed_launch(sycl::queue & q, const void * x, void * y, const int64_t * strides,
+                         const int64_t * out_shape, int rank, int64_t total, int elem_size) {
+    if (elem_size == 8) {
+        expand_typed_impl<int64_t>(q, x, y, strides, out_shape, rank, total);
+    } else if (elem_size == 4) {
+        expand_typed_impl<int32_t>(q, x, y, strides, out_shape, rank, total);
+    } else {
+        throw std::runtime_error("the expand's element size is not 4 or 8");
+    }
+}
+
+void ew_i64_launch(sycl::queue & q, const int64_t * a, const int64_t * b, int64_t * y, size_t n,
+                   ew_op op, int scalar_op) {
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(n), [=](sycl::item<1> it) {
+            const size_t i = it.get_id(0);
+            const int64_t x = a[scalar_op == 0 ? 0 : i];
+            const int64_t z = b ? b[scalar_op == 1 ? 0 : i] : 0;
+            int64_t r = 0;
+            switch (op) {
+            case ew_op::mod_: r = z != 0 ? x % z : 0; break;
+            case ew_op::max_: r = x > z ? x : z; break;
+            case ew_op::min_: r = x < z ? x : z; break;
+            case ew_op::add: r = x + z; break;
+            case ew_op::sub: r = x - z; break;
+            case ew_op::mul: r = x * z; break;
+            default: r = x; break;
+            }
+            y[i] = r;
+        });
+    });
+}
+
 } // namespace onnx
 } // namespace si

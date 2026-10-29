@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -62,6 +63,19 @@ std::vector<std::unique_ptr<conv_entry>> g_cache;
 // A parallel key list: the entry index is the cache index, and the key says
 // which call it belongs to.
 std::vector<std::string> g_keys;
+// The keys that have been *seen* once but have no primitive yet.
+//
+// A shape that appears once is a model whose input shape changes per request
+// (the table UNET presents a new shape per table), and building a oneDNN
+// primitive for it costs more than the SYCL kernel it replaces - 73
+// primitives per shape, tens of milliseconds, and a growing cache.  A shape
+// that appears again is a fixed-shape model (the layout detector's 800x800
+// batches, the detector's page tiles) and the primitive is amortised.  So a
+// miss is a promotion opportunity, not a build: the first use runs the SYCL
+// kernel and the second builds.  `PF_ONNX_CONV_DNNL=2` restores "build on the
+// first use", which is what made every variable-shape model slower.
+std::set<std::string> g_seen;
+constexpr size_t kSeenCap = 4096;
 // The reordered weights, keyed by the weight pointer and the *destination*
 // layout: the primitive's weight layout does not depend on the batch, so the
 // same reorder serves every input shape (and every batch size).
@@ -213,6 +227,32 @@ bool conv_dnnl_launch(sycl::queue & q, const float * x, const float * w, float *
             break;
         }
     }
+    if (!e) {
+        // The policy, once per unseen key.  A key seen for the first time
+        // runs the SYCL kernel; a second sighting builds the primitive.
+        // Default off.  The primitive is *not* the problem - with it the
+        // layout detector runs 22% faster - but enabling it flips one OCR
+        // cell in 600552 on the second and later runs of one process (the
+        // first run matches, the repeats do not: 92fd5b97 against 115a5b4a),
+        // and the SYCL convolution is stable across repeats.  A benchmark
+        // whose Markdown depends on how many times the process has run the
+        // document is not a benchmark, so the A/B stays opt-in.
+        static const int policy = [] {
+            const char * p = getenv("PF_ONNX_CONV_DNNL");
+            return p ? atoi(p) : 0;
+        }();
+        if (policy <= 0) return false;
+        // A batch-1 call is a table crop or a single page: oneDNN's
+        // convolution is 4.4x slower there than the SYCL kernel on the UNET's
+        // shapes (49.5 s against 11.3 s for one document's 292 calls), and
+        // there is no reused shape to amortise a primitive against.  The
+        // fixed-shape models that do benefit (the layout detector, the
+        // detector's page tiles) run at N >= 8.
+        if (policy == 1 && N < 8) return false;
+        if (policy == 1 && g_seen.size() < kSeenCap) {
+            if (g_seen.insert(key).second) return false;
+        }
+    }
     dev_ctx * ctx = nullptr;
     try {
         ctx = ctx_for(q);
@@ -233,9 +273,18 @@ bool conv_dnnl_launch(sycl::queue & q, const float * x, const float * w, float *
             primitive_attr pattr;
             const char * bf = getenv("PF_ONNX_DNNL_BF16");
             if (bf && atoi(bf) != 0) pattr.set_fpmath_mode(fpmath_mode::bf16);
+            // oneDNN's C API counts *extra* dilation: zero means none.  ONNX
+            // counts the factor (one means none).  Passing ONNX's 1 straight
+            // through asks oneDNN for a dilation of two, which makes every
+            // 1-dilated convolution's output geometry inconsistent and sends
+            // it to the SYCL fallback - silently, because a refused primitive
+            // is a fallback rather than an error.  Measured: with 1 passed
+            // through, no convolution in any model reached oneDNN at all.
+            const int ddh = dh > 0 ? dh - 1 : 0;
+            const int ddw = dw > 0 ? dw - 1 : 0;
             convolution_forward::primitive_desc pd(
                 ctx->eng, prop_kind::forward_inference, algorithm::convolution_direct, src_md,
-                w_any, dst_md, memory::dims{sh, sw}, memory::dims{dh, dw},
+                w_any, dst_md, memory::dims{sh, sw}, memory::dims{ddh, ddw},
                 memory::dims{ph, pw}, memory::dims{ph, pw}, pattr);
 
             auto entry = std::make_unique<conv_entry>(conv_entry{pd, nullptr});

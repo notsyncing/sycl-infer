@@ -102,6 +102,15 @@ std::vector<int64_t> host_i64(const tensor * t) {
     return v;
 }
 
+void ensure_host(sycl::queue & q, tensor * t) {
+    if (!t || !t->host.empty()) return;
+    if (!t->dev || t->count == 0) return;
+    const size_t esz = t->dtype == onnxpb::INT32 ? 4u : t->dtype == onnxpb::INT64 ? 8u : 4u;
+    t->host.resize(t->count * esz);
+    q_download(q, t->dev, t->host.data(), t->host.size());
+    t->on_host = true;
+}
+
 // The host's values of a tensor, whatever its type.
 //
 // A *float* value lives on the device (the executor keeps the host copy only

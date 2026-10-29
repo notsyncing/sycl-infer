@@ -280,6 +280,13 @@ inline size_t int_elem_size(const tensor * t) {
 // The host's values of an int64 tensor.
 std::vector<int64_t> host_i64(const tensor * t);
 
+// Fill an integer tensor's host copy from its device buffer when the value
+// is device-authoritative (a TopK's indices, the index arithmetic built from
+// them).  A host path that is reached with such an input would otherwise see
+// an empty `host` vector and compute with zeros - which is an index of 0 for
+// every element, not an error.
+void ensure_host(sycl::queue & q, tensor * t);
+
 // The host's values of a tensor, whatever its type.
 //
 // The comparison and the logical operators mix the types: a loop's

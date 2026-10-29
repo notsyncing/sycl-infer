@@ -40,6 +40,15 @@ bool conv_dnnl_on() {
     }();
     return on;
 }
+// The convolution primitive's own A/B, separate from the matmul path:
+// PF_ONNX_CONV_DNNL=0 keeps the SYCL kernel for the non-1x1 convolutions.
+bool conv_dnnl_conv_on() {
+    static const bool on = [] {
+        const char * e = getenv("PF_ONNX_CONV_DNNL");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
 bool conv_1x1_matmul_on() {
     static const bool on = [] {
         const char * e = getenv("PF_ONNX_MATMUL1X1");
@@ -224,6 +233,15 @@ std::vector<float> act_params(const op_ctx & c, const std::string & name) {
 // shape functions read it there (they run before the operator does).
 bool copy_i64(op_ctx & c) {
     if (c.out.empty() || !is_int(c.out[0])) return false;
+    // The device's own copy: a metadata operator (reshape / squeeze /
+    // unsqueeze / flatten / identity) on a device-resident integer is a
+    // copy, not a value conversion, and the TopK index chain must not come
+    // back to the host for it.
+    if (c.in[0]->dev && c.in[0]->host.empty() && c.out[0]->dev && c.out[0]->count > 0) {
+        const size_t bytes = c.out[0]->count * (is_int(c.in[0]) ? int_elem_size(c.in[0]) : 4);
+        q_copy_dev(c.q, c.in[0]->dev, c.out[0]->dev, bytes);
+        return true;
+    }
     const std::vector<int64_t> v = host_i64(c.in[0]);
     const size_t esz = int_elem_size(c.out[0]);
     c.out[0]->host.assign(v.size() * esz, 0);
@@ -333,6 +351,29 @@ void exec_elementwise(op_ctx & c) {
     const bool a_int = !c.in.empty() && c.in[0]->dtype != onnxpb::FLOAT;
     const bool b_int = c.in.size() > 1 && c.in[1]->dtype != onnxpb::FLOAT;
     const bool int_in = a_int || b_int;
+    // An int64 arithmetic operator on a device-resident index tensor runs on
+    // the device.  The layout model's decoder takes a TopK index modulo the
+    // grid size (int64 % int64 scalar) before it builds the box coordinates;
+    // the host path below reads `host_i64`, which is empty for a value the
+    // device owns, and every index would come out as 0.
+    if (c.out[0]->dtype == onnxpb::INT64 && (op == ew_op::mod_ || op == ew_op::max_ ||
+                                             op == ew_op::min_ || op == ew_op::add ||
+                                             op == ew_op::sub || op == ew_op::mul)) {
+        const tensor * A = c.in[0];
+        const tensor * B = c.in.size() > 1 ? c.in[1] : nullptr;
+        const bool a_dev = A->dev && A->host.empty();
+        const bool b_dev = B && B->dev && B->host.empty();
+        const bool shape_ok = !B || A->count == B->count || A->count == 1 || B->count == 1;
+        if ((a_dev || b_dev) && shape_ok && (A->dtype == onnxpb::INT64) &&
+            (!B || B->dtype == onnxpb::INT64)) {
+            int scalar = -1;
+            if (B && B->count == 1 && A->count != 1) scalar = 1;
+            else if (B && A->count == 1 && B->count != 1) scalar = 0;
+            ew_i64_launch(c.q, (const int64_t *)A->dev, B ? (const int64_t *)B->dev : nullptr,
+                          (int64_t *)c.out[0]->dev, c.out[0]->count, op, scalar);
+            return;
+        }
+    }
     // A *small* elementwise whose inputs are all already on the host stays
     // there, whatever the output's type.
     //
@@ -402,6 +443,7 @@ void exec_elementwise(op_ctx & c) {
         const tensor * it = a_int ? c.in[0] : c.in[1];
         const size_t n = it->count;
         if (n * 4 <= c.scratch_bytes) {
+            if (it->dtype != onnxpb::FLOAT) ensure_host(c.q, const_cast<tensor *>(it));
             const std::vector<double> v = host_values_any(c.q, it);
             // The conversion to float32 is exact only up to 2^24: a bigger
             // integer would come back changed, so the host does that one.
@@ -457,7 +499,12 @@ void exec_elementwise(op_ctx & c) {
     if (is_int(c.out[0]) || int_in) {
         // The host path: an integer value lives on the host, so the
         // arithmetic is done there.  (The inputs may be of different shapes,
-        // so the broadcast is the same one the device path does.)
+        // so the broadcast is the same one the device path does.)  A value
+        // the device owns is read back first.
+        for (const tensor * t : c.in) {
+            if (t && t->dtype != onnxpb::FLOAT && t->host.empty())
+                ensure_host(c.q, const_cast<tensor *>(t));
+        }
         const std::vector<double> av = host_values_any(c.q, c.in[0]);
         const std::vector<double> bv =
             c.in.size() > 1 ? host_values_any(c.q, c.in[1]) : std::vector<double>();
@@ -588,7 +635,7 @@ void exec_conv(op_ctx & c) {
     // A grouped/depthwise convolution, a probe run or a primitive oneDNN
     // refuses falls back to the SYCL kernel (which stays the only path for
     // those shapes).
-    const bool try_dnnl = conv_dnnl_on();
+    const bool try_dnnl = conv_dnnl_on() && conv_dnnl_conv_on();
     // A 1x1 stride-1 group-1 convolution is a batch of matmuls; it is 61 of
     // the detector's 83 convolutions and the biggest single block of its
     // time.  PF_ONNX_MATMUL1X1=0 restores the direct kernel.
@@ -833,6 +880,7 @@ void exec_reduce(op_ctx & c) {
         // The axes are not contiguous: the host does it, over the axes the
         // operator names.  (The values are few - a mask of a few hundred
         // elements - so the host is fine.)
+        ensure_host(c.q, const_cast<tensor *>(x));
         const std::vector<int64_t> v = host_i64(x);
         const std::vector<int64_t> & is = x->shape;
         const std::vector<int64_t> & os = c.out[0]->shape;
@@ -1081,12 +1129,24 @@ void exec_gather_nd(op_ctx & c) {
     const bool ints = is_int(c.out[0]);
     // The device path: the gather is a strided copy, and the host's walk
     // over the layout model's twelve million mask elements is 166
-    // milliseconds.
-    if (!ints && x->dev && idx->dev && inner > 0 && k > 0) {
-        gather_nd_launch(c.q, (const float *)x->dev, idx->dev, (float *)c.out[0]->dev,
-                         (int64_t)c.out[0]->count, inner, k, idx->dtype == onnxpb::INT32,
-                         stride.data(), x->shape.data(), (int)rank);
+    // milliseconds.  An integer data tensor (the box-order chain gathers one
+    // int64 index vector with another) is gathered in its own width.
+    if (x->dev && idx->dev && inner > 0 && k > 0) {
+        if (ints) {
+            gather_nd_typed_launch(c.q, x->dev, idx->dev, c.out[0]->dev,
+                                   (int64_t)c.out[0]->count, inner, k,
+                                   idx->dtype == onnxpb::INT32, stride.data(), x->shape.data(),
+                                   (int)rank, (int)int_elem_size(c.out[0]));
+        } else {
+            gather_nd_launch(c.q, (const float *)x->dev, idx->dev, (float *)c.out[0]->dev,
+                             (int64_t)c.out[0]->count, inner, k, idx->dtype == onnxpb::INT32,
+                             stride.data(), x->shape.data(), (int)rank);
+        }
         return;
+    }
+    if (ints) {
+        ensure_host(c.q, const_cast<tensor *>(x));
+        ensure_host(c.q, const_cast<tensor *>(idx));
     }
     const std::vector<double> data = read_host_values(c.q, x, ints);
     std::vector<double> res((size_t)c.out[0]->count, 0.0);
@@ -1118,15 +1178,33 @@ void exec_scatter_nd(op_ctx & c) {
     const tensor * upd = c.in[2];
     // The output is a copy of the data with the updates scattered in.
     const bool ints = is_int(c.out[0]);
-    std::vector<double> res = read_host_values(c.q, data, ints);
-    const std::vector<int64_t> ids = host_i64(idx);
-    const std::vector<double> u = read_host_values(c.q, upd, ints);
     const int64_t k = idx->shape.empty() ? 0 : idx->shape.back();
     const int64_t rank = (int64_t)data->shape.size();
     std::vector<int64_t> stride(rank, 1);
     for (int64_t i = rank - 2; i >= 0; --i) stride[i] = stride[i + 1] * data->shape[i + 1];
     int64_t inner = 1;
     for (int64_t i = k; i < rank; ++i) inner *= data->shape[i];
+    // The device path: an integer scatter over device tensors (the layout
+    // model's `index_put` of the box order).  The copy of the data is the
+    // other half of the operator, and the queue is in order, so it is issued
+    // just before the scatter kernel.
+    if (ints && data->dev && idx->dev && upd->dev && inner > 0 && k > 0 && upd->count > 0) {
+        const int esz = (int)int_elem_size(c.out[0]);
+        q_copy_dev(c.q, data->dev, c.out[0]->dev, data->count * (size_t)esz);
+        scatter_nd_typed_launch(c.q, data->dev, idx->dev, upd->dev, c.out[0]->dev,
+                                (int64_t)data->count, (int64_t)upd->count, inner, k,
+                                idx->dtype == onnxpb::INT32, stride.data(), data->shape.data(),
+                                (int)rank, esz);
+        return;
+    }
+    if (ints) {
+        ensure_host(c.q, const_cast<tensor *>(data));
+        ensure_host(c.q, const_cast<tensor *>(idx));
+        ensure_host(c.q, const_cast<tensor *>(upd));
+    }
+    std::vector<double> res = read_host_values(c.q, data, ints);
+    const std::vector<int64_t> ids = host_i64(idx);
+    const std::vector<double> u = read_host_values(c.q, upd, ints);
     const int64_t n_idx = k > 0 ? (int64_t)ids.size() / k : 0;
     if (trace_on()) {
         fprintf(stderr, "[onnx] the scatter: the data '%s' [%lld] %zu elements, the indices '%s' "
@@ -1317,8 +1395,31 @@ void exec_concat(op_ctx & c) {
     int64_t outer = 1;
     for (int64_t i = 0; i < axis; ++i) outer *= c.in[0]->shape[i];
     if (is_int(c.out[0])) {
+        // A concatenation that consumes a device-resident integer (a TopK's
+        // indices, the index arithmetic built from them) runs on the device
+        // in the element's own width.  A concatenation of *host* values - the
+        // shape arithmetic, which is most of the model's 136 concats - keeps
+        // its host path: its inputs are small and never had a device copy.
+        bool dev_in = false;
+        bool all_dev = true;
+        for (const tensor * t : c.in) {
+            if (t->dtype != onnxpb::FLOAT && t->dev && t->host.empty()) dev_in = true;
+            if (!t->dev) all_dev = false;
+        }
+        if (dev_in && all_dev && c.out[0]->count > 0) {
+            std::vector<const void *> ptrs;
+            std::vector<std::vector<int64_t>> shp;
+            for (size_t k = 0; k < c.in.size(); ++k) {
+                ptrs.push_back(c.in[k]->dev);
+                shp.push_back(g.padded[k]);
+            }
+            concat_typed_launch(c.q, ptrs, shp, c.out[0]->dev, (int)axis, outer,
+                                (int)int_elem_size(c.out[0]));
+            return;
+        }
         // The output holds int64 (the dimensions, most of the time): it
-        // stays on the host.
+        // stays on the host.  An input the device owns is read back first.
+        for (const tensor * t : c.in) ensure_host(c.q, const_cast<tensor *>(t));
         const int64_t out_axis =
             c.out[0]->shape.empty() || axis >= (int64_t)c.out[0]->shape.size() ? 0 : c.out[0]->shape[axis];
         int64_t inner = 1;
@@ -1598,7 +1699,39 @@ void exec_reshape(op_ctx & c) {
 void exec_transpose(op_ctx & c) {
     const tensor * x = c.in[0];
     if (is_int(c.out[0])) {
+        // An integer that lives on the device is permuted there, in its own
+        // width.  (The layout model transposes the `index_put` result, an
+        // int64 [B, N] tensor in the middle of the box-order chain.)
+        if (x->dev && x->host.empty() && c.out[0]->count > 0) {
+            std::vector<int64_t> p = c.attr_ints("perm");
+            const int64_t rk = (int64_t)x->shape.size();
+            if (p.empty()) {
+                for (int64_t i = 0; i < rk; ++i) p.push_back(rk - 1 - i);
+            }
+            std::vector<int64_t> src((size_t)rk), dst((size_t)rk), os((size_t)rk);
+            int64_t s = 1;
+            for (int64_t i = rk - 1; i >= 0; --i) {
+                src[(size_t)i] = s;
+                s *= x->shape[(size_t)i];
+            }
+            for (int64_t i = 0; i < rk; ++i) os[(size_t)i] = x->shape[(size_t)p[(size_t)i]];
+            s = 1;
+            for (int64_t i = rk - 1; i >= 0; --i) {
+                dst[(size_t)i] = s;
+                s *= os[(size_t)i];
+            }
+            std::vector<int64_t> ss((size_t)rk), ds((size_t)rk);
+            for (int64_t i = 0; i < rk; ++i) {
+                ss[(size_t)i] = src[(size_t)p[(size_t)i]];
+                ds[(size_t)i] = dst[(size_t)i];
+            }
+            strided_copy_typed_launch(c.q, x->dev, c.out[0]->dev, ss.data(), ds.data(), os.data(),
+                                      (int)rk, (int64_t)c.out[0]->count,
+                                      (int)int_elem_size(c.out[0]));
+            return;
+        }
         // The values stay on the host: the permutation of the axes.
+        ensure_host(c.q, const_cast<tensor *>(x));
         const std::vector<int64_t> p = c.attr_ints("perm");
         const int64_t rank = (int64_t)x->shape.size();
         std::vector<int64_t> perm = p;
@@ -1680,6 +1813,7 @@ void exec_transpose(op_ctx & c) {
 }
 
 void exec_flatten(op_ctx & c) {
+    if (copy_i64(c)) return;
     q_copy_dev(c.q, (const float *)c.in[0]->dev, (float *)c.out[0]->dev, c.in[0]->count * 4);
 }
 
@@ -1833,9 +1967,40 @@ void exec_slice(op_ctx & c) {
         if (out_shape[(size_t)d] < 0) out_shape[(size_t)d] = 0;
     }
     if (is_int(c.out[0])) {
+        // A slice of a device-resident integer is a strided copy in its own
+        // width.  The host walk below reads `host_i64(x)`, which is *empty*
+        // for a device-authoritative int (the TopK chain never came back to
+        // the host) - and an empty gather silently writes zeros, which is an
+        // index of 0 for every box.
+        bool negative_step = false;
+        for (int64_t d = 0; d < rank; ++d) {
+            if (sliced[(size_t)d] && step_of[(size_t)d] < 0) negative_step = true;
+        }
+        if (!negative_step && x->dev && x->host.empty() && c.out[0]->count > 0) {
+            std::vector<int64_t> src(rank), dst(rank), out(rank);
+            int64_t base = 0;
+            for (int64_t d = 0; d < rank; ++d) {
+                src[(size_t)d] = in_stride[(size_t)d];
+                out[(size_t)d] = x->shape[(size_t)d];
+                if (!sliced[(size_t)d]) continue;
+                out[(size_t)d] = out_shape[(size_t)d];
+                src[(size_t)d] = in_stride[(size_t)d] * step_of[(size_t)d];
+                base += st_of[(size_t)d] * in_stride[(size_t)d];
+            }
+            int64_t s = 1;
+            for (int64_t i = rank - 1; i >= 0; --i) {
+                dst[(size_t)i] = s;
+                s *= out[(size_t)i];
+            }
+            strided_copy_typed_launch(c.q, (const uint8_t *)x->dev + base * (int64_t)int_elem_size(c.out[0]),
+                                      c.out[0]->dev, src.data(), dst.data(), out.data(), (int)rank,
+                                      c.out[0]->count, (int)int_elem_size(c.out[0]));
+            return;
+        }
         // The values are walked on the host: the int64 ones have to be
         // there (the shape functions read them), and the gather is a
         // strided read of a handful of elements.
+        ensure_host(c.q, const_cast<tensor *>(x));
         const std::vector<int64_t> iv = host_i64(x);
         const int64_t n_out = c.out[0]->count;
         const size_t esz = int_elem_size(c.out[0]);
@@ -1969,24 +2134,25 @@ void exec_topk(op_ctx & c) {
     // written by the kernel *on the device* (a host array would be freed
     // before the kernel runs).
     const size_t n = (size_t)(rows * k);
-    // The only workspace the top-k needs is the index output the caller
-    // reads back: the values go straight to the model's output, and the
-    // radix selection keeps its histogram and its running prefix in local
-    // memory.  No per-row candidate list.
-    int64_t * idx_out = (int64_t *)c.workspace;
-    if (!idx_out || (size_t)(rows * k) * 8 > c.workspace_bytes) {
-        throw std::runtime_error("the top-k needs a workspace");
-    }
+    // The indices go straight into the output's device buffer.  The old form
+    // wrote them into a workspace and downloaded the workspace here, and the
+    // download waits for the whole (in-order) queue - so a 38 KB index array
+    // blocked the host behind every convolution that had been submitted
+    // before it.  On the layout model that drain was 1.08 s per batch-16
+    // call, the largest single item in the call, and the host had nothing to
+    // do with the bytes.  The downstream index chain is device-side now, so
+    // the value never needs a host copy here; a consumer that does need one
+    // (a shape parameter, or an operator with no device path) materialises
+    // it at its own point of use.
+    if (!c.out[1]->dev) throw std::runtime_error("the top-k has no device buffer for its indices");
     // The `largest` attribute: 0 picks the smallest k (the layout model's
     // anchor selection), and picking the largest instead reorders every
     // anchor - the boxes come out in the wrong places.
     const bool largest = c.attr_i("largest", 1) != 0;
-    topk_launch(c.q, (const float *)x->dev, (float *)c.out[0]->dev, idx_out, rows, cols, (int)k,
-                largest);
-    c.out[1]->host.assign(n * 8, 0);
-    q_download(c.q, idx_out, c.out[1]->host.data(), n * 8);
-    c.out[1]->on_host = true;
+    topk_launch(c.q, (const float *)x->dev, (float *)c.out[0]->dev, (int64_t *)c.out[1]->dev,
+                rows, cols, (int)k, largest);
     c.out[1]->count = n;
+    c.out[1]->on_host = false;
 }
 
 // The host's copy of a float value, read back from the device when the
@@ -2400,11 +2566,18 @@ void exec_expand(op_ctx & c) {
         for (int d = 0; d < rank; ++d) osz[d] = os[d] > 0 ? os[d] : 1;
     }
     if (is_int(c.out[0])) {
+        // A device-resident integer expands on the device, in its own width.
+        if (x->dev && x->host.empty() && n > 0) {
+            expand_typed_launch(c.q, x->dev, c.out[0]->dev, str, osz, rank, (int64_t)n,
+                                (int)int_elem_size(c.out[0]));
+            return;
+        }
         // An *integer* value lives on the host: the Expand of an integer (the
         // layout model's decoder expands the arange into the box indices)
         // reads a host-only buffer through the device pointer, and the values
         // come out as garbage - which the scatter then scatters, and the
         // boxes come out wrong.
+        ensure_host(c.q, const_cast<tensor *>(x));
         const std::vector<int64_t> v = host_i64(x);
         const size_t esz = int_elem_size(c.out[0]);
         std::vector<uint8_t> raw(n * esz, 0);
@@ -2684,12 +2857,34 @@ void exec_tile(op_ctx & c) {
         if (d < out_shape.size()) out_shape[d] *= rep[i];
     }
     if (is_int(c.out[0])) {
+        // A tile of a device-resident integer stays on the device.  The
+        // float kernel below writes four bytes per element, so an int64
+        // output would come back half written; the typed kernel writes the
+        // element's own width.
+        if (x->dev && x->host.empty() && c.out[0]->count > 0) {
+            std::vector<int64_t> ss((size_t)rank, 1), ds((size_t)rank, 1);
+            int64_t s = 1;
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                ss[(size_t)d] = s;
+                s *= x->shape[(size_t)d];
+            }
+            s = 1;
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                ds[(size_t)d] = s;
+                s *= out_shape[(size_t)d];
+            }
+            tile_typed_launch(c.q, x->dev, c.out[0]->dev, ss.data(), ds.data(), out_shape.data(),
+                              x->shape.data(), (int)rank, (int64_t)c.out[0]->count,
+                              (int)int_elem_size(c.out[0]));
+            return;
+        }
         // An integer value lives on the host, and the tile of one is a
         // strided copy of a handful of elements.
         //
         // (The device kernel writes float32, so an integer output would
         // come back half written - and the layout model's anchor indices
         // are exactly that: an int64 tile of an arange.)
+        ensure_host(c.q, const_cast<tensor *>(x));
         const std::vector<int64_t> src = host_i64(x);
         std::vector<int64_t> ss((size_t)rank, 1), ds((size_t)rank, 1);
         int64_t s = 1;

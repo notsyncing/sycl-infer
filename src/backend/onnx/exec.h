@@ -155,6 +155,10 @@ private:
     size_t free_mem_bytes() const;
     // Make sure the value is on the device, uploading it if needed.
     const float * device_value(int slot);
+    // Materialise a device-authoritative integer as the host copy an
+    // operator's host path needs.  The device buffer stays valid: the value
+    // is read back once and both copies then agree.
+    void materialize_int(int slot);
     // The Loop's body: built on demand (the constructor builds it eagerly,
     // so the outer scope's liveness can be extended before the run).
     executor * loop_body(size_t op_index);
@@ -229,6 +233,10 @@ private:
     // question there is what the host dispatch costs, and a per-op wait (as
     // SI_ONNX_TIME does) cannot answer it.
     bool opstat_ = false;
+    bool ophost_dbg_ = false;
+    // SI_ONNX_INTDEV: report every integer value that has to come back to
+    // the host, with the operator that asked for it.
+    bool intdev_dbg_ = false;
     std::map<std::string, double> op_ms_;
     std::map<std::string, int> op_n_;
     std::map<std::string, long> op_dl_;

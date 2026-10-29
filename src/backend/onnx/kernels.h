@@ -232,11 +232,58 @@ void gather_nd_launch(sycl::queue & q, const float * data, const void * indices,
                       int64_t n_out, int64_t inner, int64_t r, bool indices_are_32,
                       const int64_t * data_stride, const int64_t * data_dim, int n_stride);
 
+// The GatherND over an integer data tensor (the layout model gathers one
+// int64 index tensor with another), in the element's own width.
+void gather_nd_typed_launch(sycl::queue & q, const void * data, const void * indices, void * out,
+                            int64_t n_out, int64_t inner, int64_t r, bool indices_are_32,
+                            const int64_t * data_stride, const int64_t * data_dim, int n_stride,
+                            int elem_size);
+
+// The ScatterND over an integer tensor: the output is a copy of the data
+// with `updates` written at the coordinates the indices name.  The host
+// version walks the data and the updates element by element; the index chain
+// the layout model builds is int64 and lives on the device.
+void scatter_nd_typed_launch(sycl::queue & q, const void * data, const void * indices,
+                             const void * upd, void * out, int64_t n_data, int64_t n_upd,
+                             int64_t inner, int64_t r, bool indices_are_32,
+                             const int64_t * data_stride, const int64_t * data_dim, int n_stride,
+                             int elem_size);
+
+// The Tile over an integer tensor: the output's coordinate is taken modulo
+// the input's extent.  `src_stride`/`dst_stride` are the input's and the
+// output's row-major strides, `in_shape` the input's extents.
+void tile_typed_launch(sycl::queue & q, const void * x, void * y, const int64_t * src_stride,
+                       const int64_t * dst_stride, const int64_t * out_shape,
+                       const int64_t * in_shape, int rank, int64_t total, int elem_size);
+
+// The Expand over an integer tensor: `strides` has 0 on the broadcast axes
+// and the input's stride elsewhere (see broadcast_strides).
+void expand_typed_launch(sycl::queue & q, const void * x, void * y, const int64_t * strides,
+                         const int64_t * out_shape, int rank, int64_t total, int elem_size);
+
+// The integer elementwise operators the index chains use (Mod, Max, Min,
+// Add, Sub, Mul).  `scalar_op` says which operand is a single broadcast
+// value: -1 for none, 0 for `a`, 1 for `b`.
+void ew_i64_launch(sycl::queue & q, const int64_t * a, const int64_t * b, int64_t * y, size_t n,
+                   ew_op op, int scalar_op);
+
 // A concatenation along an axis: the inputs are copied into the output at
 // their offsets.
 void concat_launch(sycl::queue & q, const std::vector<const float *> & in,
                    const std::vector<std::vector<int64_t>> & in_shapes, float * y, int axis,
                    int64_t outer);
+
+// The same, over elements of `elem_size` bytes (4, or 8 for int64).
+//
+// An integer tensor that stays on the device (the TopK indices and the index
+// arithmetic that follows them) needs the movement operators in its own
+// width: the float kernels write four bytes per element, which leaves half of
+// an int64 output unwritten and makes the next operator read the previous
+// value's low half as an index.  A 4-byte copy is a bit copy, so int32 and
+// float share the arm.
+void concat_typed_launch(sycl::queue & q, const std::vector<const void *> & in,
+                         const std::vector<std::vector<int64_t>> & in_shapes, void * y, int axis,
+                         int64_t outer, int elem_size);
 
 // A strided copy: the source is read with a per-axis stride and written
 // contiguously.  It is the workhorse of the shape operators (reshape,
@@ -244,6 +291,15 @@ void concat_launch(sycl::queue & q, const std::vector<const float *> & in,
 void strided_copy_launch(sycl::queue & q, const float * x, float * y, const int64_t * src_stride,
                          const int64_t * dst_stride, const int64_t * out_shape, int rank,
                          int64_t total);
+
+// The same strided copy in an integer's own width.  It is the shape
+// operators' (transpose, slice, the tiled copy) device path for an integer
+// tensor: the TopK indices, the anchor indices and the box order are int64,
+// and a float strided copy would write four bytes per element into an
+// eight-byte output.
+void strided_copy_typed_launch(sycl::queue & q, const void * x, void * y,
+                               const int64_t * src_stride, const int64_t * dst_stride,
+                               const int64_t * out_shape, int rank, int64_t total, int elem_size);
 
 // A gather along an axis with a list of indices.
 void gather_launch(sycl::queue & q, const float * x, const int64_t * idx, float * y,
