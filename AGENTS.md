@@ -2663,6 +2663,165 @@ goes wrong.  The tooling is in `dev/` (`onnx_oracle.py`, `full_diff.py`,
 is the only way to tell a wrong number from a different accumulation
 order.
 
+**The in-process document pipeline: 2.44 -> 0.996 s/page.**  The pipeline runs
+the models in-process through `libsycl_infer_onnx`; measured on 957 pages
+(12 PDFs, one process, one A770, layout 16 / det 32 / table 64) it was
+2 335.1 s = **2.44 s/page** at 7 306 MiB peak RSS, 1 262.4 s =
+**1.319 s/page** at 4 270 MiB after the first pass, 1 067.2 s =
+**1.115 s/page** after the second, **961.8 s = 1.005 s/page** after the
+third, and is now **952.7 s = 0.996 s/page** at 4 272 MiB (a repeat of the
+same build measured **946.8 s = 0.989 s/page**), with every document's
+Markdown md5 unchanged throughout.  The first pass's five changes (details and per-stage numbers
+in
+[`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md#the-in-process-pipeline-the-2026-10-29-optimization-pass)):
+
+* **an output's transfer is the cost, not its arithmetic.**  The recogniser's
+  `[B,T,18710]` f32 output is 115 MB at batch 32 and the CTC decoder needs
+  only its argmax and the value there; the layout mask is `[N,200,200]` int32
+  and the client truncates it to a byte.  `syi_onnx_set_output_mode`
+  (`argmax` / `u8`) reduces them on the device at readback: rec 278 -> 61 ms
+  per call, layout batch 4 748 -> 407.  The host path copied such an output
+  four times (download, buffer copy, `ctypes`, numpy).
+* **a wide softmax needs a work-group per row.**  `[1536, 18710]` was one
+  work-item per row - 1 536 threads - and measured 25.7 ms, three times the
+  convolution time it follows; a 256-lane work-group per row with SLM
+  reductions is ~1 ms.
+* **a 1x1 stride-1 group-1 convolution is a matmul.**  61 of the detector's
+  83 convolutions are 1x1, evaluated one pixel at a time: 183 of its 431 ms.
+  Transpose the weight once (cached by pointer) and run one oneDNN matmul per
+  image, with the same separate epilogue (`PF_ONNX_MATMUL1X1=0` restores the
+  direct kernel).
+* **the convolution's index order is a shape decision.**  Channel-block-fastest
+  is right for group-1 (every lane reads the same input pixel - one cache line
+  per warp) and wrong for depthwise (the block *is* the channel, so lanes read
+  planes `H*W` apart).  Picking per shape: detector 676 -> 573 ms.  One order
+  for both was 4.6x slower on the SLANet decoder.
+* **a `Loop` re-feeds its weights every iteration.**  The table structurer's
+  body carries 31 values over 27 iterations; each iteration uploaded the
+  weights again and drained the queue once per output.  Skipping an input
+  whose bytes are unchanged and enqueuing all output copies with one wait
+  took SLANet batch 1 646 -> 596 ms.  (The second pass then made the carried
+  values device-resident; see below.)
+
+**The second pass (2026-10-29) took the pipeline to 1.115 s/page and is a
+`Loop`/operator-execution change, not a pipeline one.**  Five items, all
+bit-identical (the same `md5`), details in the same design doc:
+
+* **the loop's carried values are device-resident.**  A pass-through carried
+  value is neither re-fed nor read back (18 of the 30 are the decoder's
+  weights), its body input slot is *pinned* (the pool released it after its
+  last use inside iteration 0), and a produced carried value is chained from
+  its body output into a dedicated device buffer (never a pooled one - a
+  queued copy into a buffer the pool hands out is a corruption waiting to
+  happen).  Integers keep the host route.  `PF_ONNX_LOOP_NODEV=1` is the A/B.
+  Pinned slots are excluded from in-place borrowing, because a borrow moves
+  the buffer's ownership to the output.
+* **`q_copy_dev` no longer waits.**  It is the copy behind every
+  `Squeeze`/`Unsqueeze`/`Reshape`, ~40 per iteration; each wait was a full
+  queue drain, so the host never got ahead of the device.
+* **`ScatterElements` is on the device.**  It was a host download-walk-upload
+  of `[B,501,50]` three times per iteration: 2.34 ms per call at a batch of
+  31, 37 % of the model.  `scatter_elements_launch` reproduces the host
+  index arithmetic (value and slice forms, the out-of-range drop) for
+  f32/i32/i64.
+* **`release`'s double-release check is O(1)** (`live_` is the authoritative
+  set); the old scan over every pooled buffer ran hundreds of times per
+  iteration.
+
+**The third pass (2026-10-29) is two safe changes and took the pipeline from
+1.115 to 1.005 s/page**, again with every Markdown md5 unchanged:
+
+* **a body input is pinned, so the body's metadata copies are skipped.**  The
+  in-place borrow was disabled for a subgraph because a carried value is read
+  again on the next iteration and the body's liveness cannot see that.
+  `run_loop` now pins *every* body input (iteration, condition, carried
+  values, outer-scope copies), so no borrow can take one and everything else
+  dies inside one iteration.  `Reshape`/`Squeeze`/`Unsqueeze`/`Identity`
+  become zero-copy aliases for the 40 metadata operators per iteration:
+  batch-1 SLANet 260 -> 250 ms, output bit-identical.  `SI_ONNX_LOOP_ALIAS=0`
+  is the A/B.  It is only ~2 % of the body because the loop is also
+  device-bound.
+* **the sparse retry runs one model, and only when it can change the
+  answer.**  The wired (UNET) model is per-image on every path, so the
+  first-pass result *is* its batch-1 result - re-running it was the same
+  inference twice (60 of 255 UNET calls on a 101-page document).  The retry
+  now reuses it and re-runs only the wireless (SLANet) model.  And when the
+  first pass *selected the wired grid*, the only new candidate is wireless:
+  on the three instrumented table-heavy documents, 119 such retries changed
+  the final HTML **0** times (2 of 12 wireless-selected retries did, and
+  those still retry).  The pipeline keeps the first-pass grid in that case.
+  The table structurer's model time went **183 -> 100 s** (191 -> 105
+  ms/page) and the UNET **86 -> 72 s**.  Skipping the retry *unconditionally*
+  is rejected: md5 changes on `002474` and `300408`.
+
+**The fourth pass (2026-10-29) is the executor's per-operator host path; it
+took the pipeline from 1.005 to 0.996 s/page** (952.7 s; 946.8 s on a
+repeat), all 12 md5s unchanged, peak RSS 4 272 MiB.  The table structurer
+went **100.1 -> 88.8 s** (-11 %) and the UNET 71.6 -> 69.6 s; the rec, det
+and layout models are unchanged.  Three changes, all content-neutral:
+
+* **the diagnostics were part of the hot path.**  `getenv` was called about
+  ten times per operator and `steady_clock::now()` about eight, whether or
+  not a diagnostic was enabled.  The table decoder's Loop body is 157
+  operators per iteration; the flags are now read once in the constructor
+  and the timestamps are taken only under `SI_ONNX_HOSTTIME` /
+  `SI_ONNX_OPSTAT` (a new switch that reports host time, blocking downloads
+  and uploads by operator type *without* waiting per operator - the
+  per-op-wait `SI_ONNX_TIME` cannot answer "what does the host dispatch
+  cost").
+* **the integer control flow is computed on the host.**  A comparison or a
+  boolean op produces a float (a BOOL is a float 0/1 here), so a scalar
+  compare -> device kernel -> int Cast -> blocking download was one drain
+  per step.  A small (<= 8192 element) elementwise op whose inputs are all
+  host-resident now stays on the host and keeps its result there; an int
+  Cast from host bytes (up to 64 K elements, plus small float targets) is a
+  host conversion; a small int Reduce and a small int ScatterElements are
+  host; `write_host_values` keeps a small float result on the host.  The
+  Loop body's blocking downloads went **20 -> 3-6 per iteration**.
+* **host-only operators do not upload their inputs.**  `Shape`, `Range`,
+  the all-integer `Concat`/`Slice`/`Tile`/`Expand`/`Gather`/`Split`/
+  `Transpose`/`GatherND`/`ScatterND`/`OneHot`, the all-integer elementwise
+  ops, the small int Reduce and the host Cast cases read the host bytes
+  directly.  This removed about 47 of the ~86 device uploads one Loop
+  iteration was paying; the remaining ~40 are mostly the metadata aliases
+  (`Reshape`/`Squeeze`/`Unsqueeze`), which borrow their input's device
+  buffer and therefore need it resident.
+
+**What is left in the body, and why it is not pipelined.**  One iteration is
+157 operators (about 1.9-3.4 ms of host dispatch after the changes) plus
+~1.4 ms of device tail that the output readback waits for.  The body's
+*iteration* and *condition* inputs are unused, but the Slice/Range bounds
+and the loop condition are host values recomputed every iteration (the step
+counter drives the scatter row), so one host round-trip per iteration is
+structural.  Running iterations ahead and discarding the overshoot was
+prototyped on paper and rejected: the body writes the carried arrays at the
+step-derived row, so an iteration past the true end corrupts row 0 unless
+every chained carried value is predicated on the condition - and the int
+step counter would still have to come back to the host for the next
+iteration's Slice bounds.  Recording the body is blocked by the same values
+plus the oneDNN matmuls.  Three measured dead ends: growing the upload
+staging buffer (`SI_ONNX_UPSTAGE_MB`, reverted - neutral to slightly
+worse), moving the recogniser's matmuls off oneDNN (`PF_ONNX_MM_DNNL_MIN`;
+rec 2 582 -> 2 715 ms, so the default 0 keeps them on oneDNN), and a table
+structure batch of 1 (24.4 ms/table at 64 against 60.3 at 1, so batching
+stays).
+
+Batching the retry is still rejected (the decoder's argmax is batch-size
+sensitive at ties).  Batching the main table group is safe and was already
+there - but one table whose OCR found nothing used to raise inside
+`format_ocr_results` and abort the **whole** batch, falling back to one
+`predict` per table (94 decoder loops instead of two batched calls).  Routing
+only the malformed entries to the per-table path is content-identical and
+took SLANet's share of the 12-document run from 460 s to 372 s.
+
+SLANet's model time is now **88.8 s** (92.7 ms/page) after the fourth pass
+(it was 100 s before it); one body iteration is now ~1.9-3.4 ms of host
+dispatch for 157 operators plus ~1.4 ms of device tail.  Earlier numbers on
+this path: 372 -> 184 s (389 -> 192 ms/page; batch-1 single call 382 ->
+260 ms, batch-31 6 661 -> 2 296 ms).  Recording the body is blocked by the
+host-side Slice/Range bounds and the loop condition (the step counter), and
+by the oneDNN matmuls; fusing the remaining operators is the open lever.
+
 ## Device profiles: where a GPU-specific number belongs
 
 **Rule: a constant that was measured on a particular GPU lives in that GPU's

@@ -280,6 +280,11 @@ int syi_onnx_run_wire(const syi_onnx_model *model, const uint8_t *request, size_
         std::vector<si::onnxwire::tensor> feeds = inputs;
         std::vector<std::string> out_names;
         for (int s : model->graph.output_slots) out_names.push_back(model->graph.tensors[s].name);
+        if (model->ex->has_output_reductions()) {
+            si::set_error("this model has output reductions configured, and the wire API "
+                          "returns whole tensors; use the direct API");
+            return reply(2, "this model has output reductions configured; use the direct API");
+        }
         std::vector<std::vector<uint8_t>> bufs(out_names.size());
         std::vector<bool> keep(out_names.size(), true);
         std::vector<std::pair<std::string, std::vector<uint8_t> &>> outs;
@@ -387,10 +392,38 @@ int syi_onnx_run_direct(const syi_onnx_model *model, const syi_onnx_input *input
         m.last_dtype.clear();
         for (size_t i = 0; i < names.size(); ++i) {
             if (!keep[i]) continue;
+            // A reduced output: the executor computed the reduction on the
+            // device and holds only its result.  An argmax exposes two
+            // values (the index and the value at it), a byte cast one.
+            const size_t nred = m.ex->reduced_count(i);
+            if (nred) {
+                for (size_t k = 0; k < nred; ++k) {
+                    const auto & r = m.ex->reduced(i, k);
+                    std::string nm = names[i];
+                    if (nred > 1) nm += (k == 0 ? ":argmax" : ":max");
+                    m.last_names.push_back(nm);
+                    m.last_shapes.push_back(r.shape);
+                    m.last_dtype.push_back((int32_t)si::wire_type(r.dtype));
+                    // A copy, because the reduced buffers are the executor's
+                    // and the returned view must not alias the graph's host
+                    // tensors.  They are small: 16 bytes per row for an
+                    // argmax, one byte per mask element.
+                    //
+                    // `wire_type` and the reduced dtype are the same
+                    // numbering (both are the ONNX tensor types), so the
+                    // Python side reads it with the code it already uses.
+                    m.last_data.push_back(r.host);
+                }
+                continue;
+            }
             const si::onnx::tensor & gt = m.ex->output(i);
             m.last_names.push_back(names[i]);
             m.last_shapes.emplace_back(gt.shape.begin(), gt.shape.end());
             m.last_dtype.push_back((int32_t)si::wire_type(gt.dtype));
+            // The host bytes are copied into the executor's graph tensor by
+            // the readback; hand that buffer over instead of copying it a
+            // second time (a recogniser output is 115 MB and the layout
+            // detector's masks are 768 MB a call).
             m.last_data.push_back(std::move(bufs[i]));
         }
         const size_t n = m.last_data.size();
@@ -412,6 +445,29 @@ int syi_onnx_run_direct(const syi_onnx_model *model, const syi_onnx_input *input
     } catch (const std::bad_alloc &) {
         si::set_error("out of memory in the direct ONNX run");
         return -1;
+    } catch (const std::exception & e) {
+        si::set_error(e.what());
+        return -1;
+    }
+}
+
+int syi_onnx_set_output_mode(syi_onnx_model *model, const char *output, const char *mode) {
+    if (!model || !model->ex || !output || !*output) {
+        si::set_error("invalid output-mode arguments");
+        return -1;
+    }
+    try {
+        const std::string m = si::lower(mode ? mode : "none");
+        int kind = si::onnx::executor::kReduceNone;
+        if (m == "argmax" || m == "argmax_last") kind = si::onnx::executor::kReduceArgmax;
+        else if (m == "u8" || m == "uint8") kind = si::onnx::executor::kReduceU8;
+        else if (!m.empty() && m != "none") {
+            si::set_error("unknown output mode '" + m + "' (argmax, u8 or none)");
+            return -1;
+        }
+        std::lock_guard<std::mutex> lk(model->m);
+        model->ex->set_output_reduce(output, kind);
+        return 0;
     } catch (const std::exception & e) {
         si::set_error(e.what());
         return -1;

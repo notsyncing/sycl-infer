@@ -11,6 +11,7 @@
 // The conventions follow src/backend/gpu/kernels: a launcher per kernel, the
 // queue passed in, the device profile consulted through si::dev::for_queue.
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -23,6 +24,8 @@ namespace onnx {
 // The copies between the host and the device.
 void q_upload(sycl::queue & q, const void * src, void * dst, size_t bytes);
 void q_download(sycl::queue & q, const void * src, void * dst, size_t bytes);
+// A diagnostic tally of the blocking device->host copies (SI_ONNX_OPSTAT).
+extern std::atomic<long> g_q_downloads;
 void q_copy_dev(sycl::queue & q, const void * src, void * dst, size_t bytes);
 
 // The elementwise operators, as one kernel with a runtime switch.  The
@@ -76,11 +79,13 @@ void ew_launch(sycl::queue & q, const float * a, const float * b, float * y, siz
 //   kCastI64    an int64
 //   kCastBool   a boolean: ONE BYTE per element
 //   kCastToBool the output is a float32 that holds 0 or 1
+//   kCastU8     the output is a uint8 (an output transfer's narrowing cast)
 //
 // The boolean is a byte and not a float because the models carry real
 // booleans (a loop's condition, a mask), and reading a one-byte buffer as
 // floats reads three bytes of whatever is next in memory.
-enum cast_kind { kCastF32 = 0, kCastI32 = 1, kCastI64 = 2, kCastBool = 3, kCastToBool = 4 };
+enum cast_kind { kCastF32 = 0, kCastI32 = 1, kCastI64 = 2, kCastBool = 3, kCastToBool = 4,
+                 kCastU8 = 5 };
 
 // A cast.  The device does the conversion (a host loop over millions of
 // elements is 40 milliseconds per call), and the value is written in the
@@ -179,6 +184,17 @@ void global_avg_pool_launch(sycl::queue & q, const float * x, float * y, int N, 
 void argmax_launch(sycl::queue & q, const float * x, int64_t * y, int64_t outer, int64_t n,
                    int64_t inner);
 
+// The argmax over the last axis of a contiguous [outer][n] tensor, *and* the
+// value at that index, in one pass.
+//
+// The recogniser's output is [B, T, 18710] of float32 - 115 MB for a batch of
+// 32 - and the client needs the CTC argmax and its score.  Downloading the
+// tensor and reducing it on the host costs four copies of those bytes per
+// call; this kernel reads it once and the transfer is 16 bytes per row.
+// Ties break to the lowest index, as `argmax_launch` and numpy do.
+void argmax_max_launch(sycl::queue & q, const float * x, int64_t * y_idx, float * y_max,
+                       int64_t outer, int64_t n);
+
 // A reduction over the trailing axes (mean, max, min, sum).
 // The reduction's element types: 0 = float32, 1 = int32, 2 = int64.
 void reduce_launch_typed(sycl::queue & q, const void * x, void * y, int64_t outer, int64_t axis,
@@ -252,6 +268,29 @@ void topk_launch(sycl::queue & q, const float * x, float * values, int64_t * ind
 // 2 = reflection.
 void grid_sample_launch(sycl::queue & q, const float * x, const float * grid, float * y, int N,
                         int C, int H, int W, int Ho, int Wo, int mode, int padding);
+
+// The ScatterElements, on the device.
+//
+// The operator is a copy of `data` with the updates written along one axis.
+// The host version downloads the whole data tensor, walks it and uploads it
+// again - and the table structurer's decoder does that three times *per
+// iteration* into a [B, 501, 50] map: at batch 31 that is 4.6 M elements of
+// round trip per iteration and it was 37% of the model's time.  The value it
+// writes is one row per token, which a kernel does without touching the
+// host.
+//
+// The geometry: the axis is `dim` long, `L` is the product of the dims
+// before it and `T` of the dims after it, so the destination of
+// (l, axis position p, t) is `(l*dim + p)*T + t`.  The indices have the
+// data's shape with the axis dim replaced by 1, i.e. one index per (l, t).
+// `slice_form` selects the updates' form: a whole axis slice (the updates
+// have the data's shape) or one value per index (the updates have the
+// indices' shape).
+enum scatter_kind { kScatterF32 = 0, kScatterI32 = 1, kScatterI64 = 2 };
+enum scatter_idx_kind { kScatterIdxI32 = 0, kScatterIdxI64 = 1 };
+void scatter_elements_launch(sycl::queue & q, const void * data, const void * idx, int idx_kind,
+                             int64_t n_idx, const void * upd, int64_t n_upd, void * out, int64_t L,
+                             int64_t T, int64_t dim, bool slice_form, int kind);
 
 } // namespace onnx
 } // namespace si

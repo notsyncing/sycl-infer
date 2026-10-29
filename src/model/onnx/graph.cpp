@@ -345,8 +345,20 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
         // runs many times, and its carried values are read again on the
         // next iteration: the body's last-use liveness knows nothing about
         // that, so borrowing a carried value's buffer writes the *next*
-        // iteration's input.  Subgraphs therefore keep the copy.
-        const bool inplace = scope == nullptr && getenv("SI_ONNX_NOINPLACE") == nullptr;
+        // iteration's input.  `run_loop` therefore **pins every body input**
+        // (the iteration number, the condition, the carried values and the
+        // outer-scope copies) for the body's lifetime, and the borrow search
+        // refuses a pinned slot.  Everything else in the body dies inside
+        // one iteration, so its liveness is exact and the metadata copy can
+        // be skipped: the table structurer's decoder spends 40 of its ~157
+        // per-iteration operators on `Reshape`/`Squeeze`/`Unsqueeze`, each
+        // a tiny device-to-device copy plus its launch.  The pinning is what
+        // makes this safe, so the two changes ship together.
+        // `SI_ONNX_LOOP_ALIAS=0` restores the copy-only body, for the A/B.
+        static const bool loop_alias =
+            getenv("SI_ONNX_LOOP_ALIAS") == nullptr || atoi(getenv("SI_ONNX_LOOP_ALIAS")) != 0;
+        const bool inplace =
+            (scope == nullptr || loop_alias) && getenv("SI_ONNX_NOINPLACE") == nullptr;
         if (inplace && (n.op_type == "Reshape" || n.op_type == "Flatten" ||
                         n.op_type == "Squeeze" || n.op_type == "Unsqueeze" ||
                         n.op_type == "Identity")) {

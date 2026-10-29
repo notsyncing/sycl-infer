@@ -79,6 +79,31 @@ public:
     // per page, and the pipeline's rect mode never looks at it.
     void skip_outputs(const std::vector<std::string> & names);
     bool output_skipped(size_t i) const;
+
+    // Output reductions.
+    //
+    // A model's last tensor is often huge while the client only needs a small
+    // function of it.  The recogniser's CTC output is [B, T, 18710] float32
+    // (115 MB for a batch of 32) and the pipeline needs its argmax and the
+    // score at that index; the layout detector's instance masks are [N, 200,
+    // 200] int32 and the client immediately truncates them to a byte.  The
+    // transfer - not the arithmetic - is the cost: the host path copies those
+    // bytes four times (download, buffer copy, ctypes copy, numpy copy).
+    //
+    // The reduction runs on the device at readback, and the API exposes the
+    // small result instead of the tensor.  `kind` is one of the kReduce*
+    // values below.
+    enum : int { kReduceNone = 0, kReduceArgmax = 1, kReduceU8 = 2 };
+    void set_output_reduce(const std::string & name, int kind);
+    // A reduced result: bytes, shape and dtype (onnxpb constants).
+    struct reduced_output {
+        std::vector<int64_t> shape;
+        int dtype = 0;
+        std::vector<uint8_t> host;
+    };
+    size_t reduced_count(size_t out_index) const;
+    const reduced_output & reduced(size_t out_index, size_t k) const;
+    bool has_output_reductions() const { return !out_reduce_.empty(); }
     // Whether this model's convolutions may use oneDNN.  A model whose
     // input shape changes per request turns it off: the primitive cache is
     // per shape, and the table pipeline presents dozens of them.
@@ -94,6 +119,10 @@ private:
         // The last operator that reads the value.
         int last_use = -1;
         bool live = false;
+        // A value the caller keeps on the device for the whole of a Loop's
+        // body execution (a loop-carried input): the pool must not release
+        // it at its last use inside one iteration.  See exec.cpp's run_loop.
+        bool pinned = false;
         // The device copy of a host-resident value, and whether it is
         // current.
         //
@@ -178,6 +207,39 @@ private:
     // invariant is checked on demand rather than assumed.
     bool mirror_chk_ = false;
     bool dnnl_ = true;
+    // The diagnostics are read once, not per operator.  `getenv` walks the
+    // whole environment, and the executor's op loop called it ten times for
+    // every operator: 157 operators per iteration of the table structurer's
+    // Loop is 1570 environment scans, which measured ~1 ms of one ~5 ms
+    // iteration - more than several of the kernels it dispatched.  A
+    // diagnostic that is off still costs a call.
+    bool trace_ = false;        // SI_ONNX_TRACE
+    bool loop_dbg_ = false;     // SI_ONNX_LOOPDBG
+    bool shape_dbg_ = false;    // SI_ONNX_SHAPE
+    bool dump_dbg_ = false;     // SI_ONNX_DUMP
+    bool time_dbg_ = false;     // SI_ONNX_TIME
+    bool dump_file_dbg_ = false; // SI_ONNX_DUMP_FILE
+    bool const_chk_ = false;    // SI_ONNX_CONSTCHK
+    int dump_nvals_ = 0;
+    const char * dump_file_dir_ = nullptr;
+    // SI_ONNX_GUARD: a guard band behind every output (0 = off).
+    size_t guard_ = 0;
+    // SI_ONNX_OPSTAT: the host wall time of each operator *without* waiting
+    // for the device, by op type.  A Loop body is where this matters - the
+    // question there is what the host dispatch costs, and a per-op wait (as
+    // SI_ONNX_TIME does) cannot answer it.
+    bool opstat_ = false;
+    std::map<std::string, double> op_ms_;
+    std::map<std::string, int> op_n_;
+    std::map<std::string, long> op_dl_;
+    std::map<std::string, long> op_up_;
+    // The blocking waits inside one run (SI_ONNX_OPSTAT): the start-of-run
+    // upload drain and the end-of-run output drain.  The difference between
+    // the loop's host time and its device time is exactly these.
+    double wait_ms_ = 0.0;
+    double wait0_ms_ = 0.0;
+    double feed_ms_ = 0.0;   // the input feeds of a run
+    double rb_ms_ = 0.0;     // the output readback enqueue
     // The live device bytes and their high-water mark, maintained on
     // acquire/release (the pool's own total is the set of distinct buffers,
     // which is not the same thing as the peak concurrent need).
@@ -217,6 +279,11 @@ private:
     std::vector<int> producer_;
     // The graph's output slots the client asked not to receive.
     std::set<int> skip_out_;
+    // The configured output reductions, by the output tensor's name, and the
+    // last run's reduced results (one entry per graph output, empty when the
+    // output is not reduced).
+    std::map<std::string, int> out_reduce_;
+    std::vector<std::vector<reduced_output>> reduced_;
     // The operators a kept output needs, for the backward mark in
     // skip_outputs().  Empty when nothing is dropped (every op runs).
     std::vector<bool> live_ops_;

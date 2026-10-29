@@ -73,6 +73,18 @@ SYI_ONNX_API int syi_onnx_run_direct(const syi_onnx_model *model,
                                      const syi_onnx_input *inputs, size_t n_inputs,
                                      syi_onnx_output *outputs, size_t max_outputs,
                                      size_t *out_count);
+/* Reduce an output on the device at readback and return only the small
+   result.  `output` is the graph output's tensor name; `mode` is "argmax"
+   (a float [.., V] output becomes two outputs, "<name>:argmax" int64 and
+   "<name>:max" f32, both [..]), "u8" (the output is cast to a uint8 of the
+   same shape) or "none".
+   The reduction is exact: the argmax breaks ties to the lowest index, as
+   numpy and the host decoder do, and the byte cast truncates toward zero.
+   It exists for the two large outputs of the document pipeline - the
+   recogniser's [B,T,V] probabilities and the layout detector's instance
+   masks - whose transfer, not their arithmetic, dominates the call. */
+SYI_ONNX_API int syi_onnx_set_output_mode(syi_onnx_model *model, const char *output,
+                                          const char *mode);
 /* Release pooled device buffers not used by the current values.  A long
    sequence of documents/shapes otherwise accumulates one pool entry per
    shape; syi_onnx_run_* also calls this automatically above a threshold. */

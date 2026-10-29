@@ -15,6 +15,40 @@
 namespace si {
 namespace onnx {
 
+namespace {
+// The diagnostics and the on/off switches are read once.  `getenv` walks the
+// whole environment, and every operator executor called it: the table
+// structurer's Loop body runs 157 operators per iteration, and one
+// environment scan per operator is a measurable part of an iteration.
+bool trace_on() {
+    static const bool on = getenv("SI_ONNX_TRACE") != nullptr;
+    return on;
+}
+bool probe_on() {
+    static const bool on = getenv("SI_ONNX_PROBE") != nullptr;
+    return on;
+}
+bool echo_on() {
+    static const bool on = getenv("SI_ONNX_ECHO") != nullptr;
+    return on;
+}
+// PF_ONNX_DNNL / PF_ONNX_MATMUL1X1: on unless set to 0.
+bool conv_dnnl_on() {
+    static const bool on = [] {
+        const char * e = getenv("PF_ONNX_DNNL");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+bool conv_1x1_matmul_on() {
+    static const bool on = [] {
+        const char * e = getenv("PF_ONNX_MATMUL1X1");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+} // namespace
+
 // The shape functions live in ops_shape.cpp; they are declared here so the
 // registry can refer to them.
 bool shape_elementwise(const op_ctx &, std::vector<std::vector<int64_t>> &);
@@ -157,7 +191,7 @@ std::vector<float> act_params(const op_ctx & c, const std::string & name) {
         const float beta = b.empty() ? 0.5f : b[0];
         float p[2] = {0.0f, 0.0f};
         hardsigmoid_params(c.opset, alpha, beta, p);
-        if (getenv("SI_ONNX_TRACE")) {
+        if (trace_on()) {
             fprintf(stderr, "[onnx] the %s: opset %lld alpha %g beta %g -> %g %g\n", name.c_str(),
                     (long long)c.opset, alpha, beta, p[0], p[1]);
         }
@@ -167,7 +201,7 @@ std::vector<float> act_params(const op_ctx & c, const std::string & name) {
         // The form is fixed: x * max(0, min(1, (x + 3) / 6)).
         float p[2] = {0.0f, 0.0f};
         hardswish_params(p);
-        if (getenv("SI_ONNX_TRACE")) {
+        if (trace_on()) {
             fprintf(stderr, "[onnx] the %s: opset %lld -> %g %g\n", name.c_str(), (long long)c.opset,
                     p[0], p[1]);
         }
@@ -246,6 +280,38 @@ float ew_host(ew_op op, float a, float b, const std::vector<float> & params) {
     return 0.0f;
 }
 
+// Whether ew_host implements the operator.  It returns 0 for the ones it does
+// not, so a host path must not take those: a sigmoid of a host value would
+// come out as a tensor of zeros.
+bool ew_host_ok(ew_op op) {
+    switch (op) {
+    case ew_op::add:
+    case ew_op::sub:
+    case ew_op::mul:
+    case ew_op::div:
+    case ew_op::pow:
+    case ew_op::neg:
+    case ew_op::abs:
+    case ew_op::floor:
+    case ew_op::ceil:
+    case ew_op::sign:
+    case ew_op::greater:
+    case ew_op::less:
+    case ew_op::equal:
+    case ew_op::greater_equal:
+    case ew_op::less_equal:
+    case ew_op::logical_and:
+    case ew_op::logical_or:
+    case ew_op::logical_not:
+    case ew_op::max_:
+    case ew_op::min_:
+    case ew_op::mod_:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void exec_elementwise(op_ctx & c) {
     const std::string & name = c.node.op_type;
     const ew_op op = ew_from_name(name);
@@ -267,6 +333,67 @@ void exec_elementwise(op_ctx & c) {
     const bool a_int = !c.in.empty() && c.in[0]->dtype != onnxpb::FLOAT;
     const bool b_int = c.in.size() > 1 && c.in[1]->dtype != onnxpb::FLOAT;
     const bool int_in = a_int || b_int;
+    // A *small* elementwise whose inputs are all already on the host stays
+    // there, whatever the output's type.
+    //
+    // The control flow of a decoded table is built out of scalar and
+    // few-hundred-element comparisons, boolean ops and integer adds.  Their
+    // inputs are the host-resident integer values, but the *comparisons*
+    // produce a float (a BOOL is a float 0/1 here), so the generic rule sent
+    // the result to the device - and the integer cast that follows it came
+    // back with a blocking download.  That chain was several of the twenty
+    // queue drains one table-decoder iteration paid.  A few thousand
+    // elements is far below the point where the device is the faster side
+    // (the comment on the branch below is about twelve million).
+    {
+        const size_t n = c.out[0]->count;
+        bool all_host = n > 0 && n <= (size_t)8192 && act == ew_op::none && ew_host_ok(op);
+        if (all_host) {
+            for (const tensor * t : c.in) {
+                if (!t || !t->on_host || t->host.empty()) {
+                    all_host = false;
+                    break;
+                }
+            }
+        }
+        if (all_host) {
+            std::vector<double> av, bv;
+            if (!c.in.empty()) av = host_values_any(c.q, c.in[0]);
+            if (c.in.size() > 1) bv = host_values_any(c.q, c.in[1]);
+            const std::vector<int64_t> & sa = c.in[0]->shape;
+            const std::vector<int64_t> & sb = c.in.size() > 1 ? c.in[1]->shape
+                                                              : std::vector<int64_t>();
+            const std::vector<int64_t> & so = c.out[0]->shape;
+            std::vector<int64_t> as, bs;
+            broadcast_strides(sa, so, as);
+            broadcast_strides(sb, so, bs);
+            const std::vector<float> params = act_params(c, name);
+            std::vector<double> res(n, 0.0);
+            for (size_t i = 0; i < n; ++i) {
+                const int64_t ai = broadcast_index(i, so, as);
+                const int64_t bi = broadcast_index(i, so, bs);
+                const float x = (ai >= 0 && ai < (int64_t)av.size()) ? (float)av[(size_t)ai] : 0.0f;
+                const float y = !bv.empty() && bi >= 0 && bi < (int64_t)bv.size()
+                                    ? (float)bv[(size_t)bi] : 0.0f;
+                res[i] = (double)ew_host(op, x, y, params);
+            }
+            if (is_int(c.out[0])) {
+                write_host_values(c, res);
+            } else {
+                // A float result of the control flow stays on the host too:
+                // the next operator is another comparison, a cast to an
+                // integer, or the branch condition, and all of them read it
+                // there.  A device consumer uploads it (a few bytes).
+                c.out[0]->host.assign(n * 4, 0);
+                for (size_t i = 0; i < n; ++i) {
+                    const float f = (float)res[i];
+                    std::memcpy(c.out[0]->host.data() + i * 4, &f, 4);
+                }
+                c.out[0]->on_host = true;
+            }
+            return;
+        }
+    }
     // A float output with one *integer* operand: the operand is converted on
     // the host, uploaded into the small scratch, and the arithmetic stays on
     // the device.  (The host would take three seconds for the layout model's
@@ -358,7 +485,7 @@ void exec_elementwise(op_ctx & c) {
     }
     if (c.in.size() == 1) {
         ew_launch(c.q, (const float *)c.in[0]->dev, nullptr, (float *)c.out[0]->dev, c.out[0]->count,
-                  op, act_params(c, name), getenv("SI_ONNX_ECHO") != nullptr, -1, act, ap);
+                  op, act_params(c, name), echo_on(), -1, act, ap);
         return;
     }
     // Two inputs: they may need broadcasting.
@@ -447,7 +574,7 @@ void exec_conv(op_ctx & c) {
     // The output channels per work-item: a divisor of the group's channels.
     int tm = 8;
     while (tm > 1 && (mg % tm != 0)) tm /= 2;
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr,
                 "[onnx] the conv: N %d C %d H %d W %d M %d Ho %d Wo %d kh %d kw %d sh %d sw %d ph %d pw %d "
                 "dh %d dw %d group %d tm %d act %d params",
@@ -461,9 +588,26 @@ void exec_conv(op_ctx & c) {
     // A grouped/depthwise convolution, a probe run or a primitive oneDNN
     // refuses falls back to the SYCL kernel (which stays the only path for
     // those shapes).
-    const char * dnnl_env = getenv("PF_ONNX_DNNL");
-    const bool try_dnnl = !dnnl_env || atoi(dnnl_env) != 0;
-    if (try_dnnl && group == 1 && getenv("SI_ONNX_PROBE") == nullptr) {
+    const bool try_dnnl = conv_dnnl_on();
+    // A 1x1 stride-1 group-1 convolution is a batch of matmuls; it is 61 of
+    // the detector's 83 convolutions and the biggest single block of its
+    // time.  PF_ONNX_MATMUL1X1=0 restores the direct kernel.
+    if (group == 1 && kh == 1 && kw == 1 && sh == 1 && sw == 1 && dh == 1 && dw == 1 &&
+        eph == 0 && epw == 0 && !probe_on()) {
+        if (conv_1x1_matmul_on()) {
+            if (conv1x1_matmul_launch(c.q, (const float *)w->dev, (const float *)x->dev,
+                                      (float *)c.out[0]->dev, N, M, C, Ho * Wo)) {
+                if (bias || scale || add || act != ew_op::none) {
+                    conv_epilogue_launch(c.q, (float *)c.out[0]->dev, N, M, Ho, Wo,
+                                         bias ? (const float *)bias->dev : nullptr,
+                                         scale ? (const float *)scale->dev : nullptr,
+                                         add ? (const float *)add->dev : nullptr, act, ap);
+                }
+                return;
+            }
+        }
+    }
+    if (try_dnnl && group == 1 && !probe_on()) {
         if (conv_dnnl_launch(c.q, (const float *)x->dev, (const float *)w->dev,
                              (float *)c.out[0]->dev, N, C, H, W, M, Ho, Wo, kh, kw, sh, sw,
                              eph, epw, dh, dw)) {
@@ -484,7 +628,7 @@ void exec_conv(op_ctx & c) {
                   bias ? (const float *)bias->dev : nullptr, scale ? (const float *)scale->dev : nullptr,
                   add ? (const float *)add->dev : nullptr, (float *)c.out[0]->dev, N, C, H, W, M, Ho,
                   Wo, kh, kw, sh, sw, eph, epw, dh, dw, (int)group, tm, act, ap,
-                  getenv("SI_ONNX_PROBE") != nullptr);
+                  probe_on());
 }
 
 void exec_conv_transpose(op_ctx & c) {
@@ -565,7 +709,7 @@ bool size_resize(op_ctx & c, std::vector<std::vector<int64_t>> & out) {
     const tensor * sizes = c.in.size() > 3 && c.in[3] >= 0 ? c.in[3] : nullptr;
     std::vector<int64_t> s;
     std::vector<float> sc;
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr, "[onnx] the resize's size: the input's rank %zu, the sizes %zu (host %zu, dtype %d), the scales %zu (host %zu)\n",
                 x->shape.size(), sizes ? sizes->count : 0, sizes ? sizes->host.size() : 0,
                 sizes ? (int)sizes->dtype : -1, scales ? scales->count : 0,
@@ -602,7 +746,7 @@ bool size_resize(op_ctx & c, std::vector<std::vector<int64_t>> & out) {
 
 void exec_resize(op_ctx & c) {
     const tensor * x = c.in[0];
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr, "[onnx] the resize: the input");
         for (int64_t d : x->shape) fprintf(stderr, " %lld", (long long)d);
         fprintf(stderr, "  the output");
@@ -669,6 +813,11 @@ void exec_reduce(op_ctx & c) {
             }
         }
         if (axes.empty()) contiguous = true;
+        // A few hundred elements on the host are cheaper there than a kernel
+        // plus the integer output's blocking download.
+        if (contiguous && x->count <= (size_t)8192 && x->on_host && !x->host.empty()) {
+            contiguous = false;
+        }
         if (contiguous) {
             int64_t axis = 1, inner = 1, outer = 1;
             for (int64_t d = first; d <= last; ++d) axis *= x->shape[d];
@@ -891,6 +1040,21 @@ void write_host_values(op_ctx & c, const std::vector<double> & v) {
         c.out[0]->on_host = true;
         return;
     }
+    if (n <= (size_t)8192) {
+        // A small float result of a host computation stays on the host too.
+        // The comparisons and the boolean ops of a decoded table produce
+        // floats (a BOOL is a float 0/1 here) and feed each other and the
+        // integer casts; uploading each one just made the next operator read
+        // it back off the device, and the integer cast after that paid a
+        // blocking download.  A device consumer uploads it (a few bytes).
+        c.out[0]->host.assign(n * 4, 0);
+        for (size_t i = 0; i < n; ++i) {
+            const float f = i < v.size() ? (float)v[i] : 0.0f;
+            std::memcpy(c.out[0]->host.data() + i * 4, &f, 4);
+        }
+        c.out[0]->on_host = true;
+        return;
+    }
     std::vector<float> f(n, 0.0f);
     for (size_t i = 0; i < n && i < v.size(); ++i) f[i] = (float)v[i];
     if (n) q_upload(c.q, f.data(), (float *)c.out[0]->dev, n * 4);
@@ -964,7 +1128,7 @@ void exec_scatter_nd(op_ctx & c) {
     int64_t inner = 1;
     for (int64_t i = k; i < rank; ++i) inner *= data->shape[i];
     const int64_t n_idx = k > 0 ? (int64_t)ids.size() / k : 0;
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr, "[onnx] the scatter: the data '%s' [%lld] %zu elements, the indices '%s' "
                         "%zu elements (k %lld), the updates '%s' %zu elements, the output %zu\n",
                 data->name.c_str(), (long long)rank, data->count, idx->name.c_str(), ids.size(),
@@ -1330,7 +1494,7 @@ void exec_matmul(op_ctx & c) {
         as[i] = pa < lead.size() ? a_str[pa] : 0;
         bs[i] = pb < blead.size() ? b_str[pb] : 0;
     }
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr, "[onnx] the batched MatMul: a");
         for (int64_t d : a->shape) fprintf(stderr, " %lld", (long long)d);
         fprintf(stderr, "  b");
@@ -1586,7 +1750,7 @@ void exec_slice(op_ctx & c) {
     const std::vector<int64_t> ends = read_i64(c.in[2]);
     const std::vector<int64_t> axes = c.in.size() > 3 ? read_i64(c.in[3]) : std::vector<int64_t>();
     const std::vector<int64_t> steps = c.in.size() > 4 ? read_i64(c.in[4]) : std::vector<int64_t>();
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr, "[onnx] the slice '%s': the input [", x->name.c_str());
         for (int64_t d : x->shape) fprintf(stderr, " %lld", (long long)d);
         fprintf(stderr, "] the starts");
@@ -1696,7 +1860,7 @@ void exec_slice(op_ctx & c) {
         }
         c.out[0]->host = raw;
         c.out[0]->on_host = true;
-        if (getenv("SI_ONNX_TRACE")) {
+        if (trace_on()) {
             fprintf(stderr, "    the slice's int output '%s': %zu bytes, the dtype %d\n",
                     c.out[0]->name.c_str(), c.out[0]->host.size(), (int)c.out[0]->dtype);
         }
@@ -1774,7 +1938,7 @@ void exec_slice(op_ctx & c) {
         src[(size_t)d] = in_stride[(size_t)d] * step_of[(size_t)d];
         base += st_of[(size_t)d] * in_stride[(size_t)d];
     }
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr, "[onnx] the slice's copy: the rank %lld the out", (long long)rank);
         for (int64_t d = 0; d < rank; ++d) fprintf(stderr, " %lld", (long long)out[(size_t)d]);
         fprintf(stderr, " the src");
@@ -1981,10 +2145,38 @@ void exec_scatter_elements(op_ctx & c) {
     for (int64_t d = axis + 1; d < rank; ++d) T *= data->shape[d];
     std::vector<int64_t> stride((size_t)rank, 1);
     for (int64_t d = rank - 2; d >= 0; --d) stride[(size_t)d] = stride[(size_t)d + 1] * data->shape[(size_t)d + 1];
+    // The device path.  The value form and the slice form are both a copy of
+    // the data plus one kernel; the host path below stays for the types and
+    // the layouts a kernel cannot serve (a zero-length axis, a tensor with
+    // no device buffer).
+    const int okind = data->dtype == onnxpb::FLOAT     ? kScatterF32
+                      : data->dtype == onnxpb::INT32   ? kScatterI32
+                      : data->dtype == onnxpb::INT64   ? kScatterI64
+                                                       : -1;
+    const int ikind = idx->dtype == onnxpb::INT32   ? kScatterIdxI32
+                      : idx->dtype == onnxpb::INT64 ? kScatterIdxI64
+                                                    : -1;
+    const bool slice_form = upd->count >= data->count && data->count > 0;
+    // A small integer scatter whose inputs are host values stays on the
+    // host: its output is an integer, so the device path would download it
+    // with a blocking wait, and the inputs are already here.
+    const bool small_int_host = ints && data->count <= (size_t)8192 && data->on_host &&
+                                idx->on_host && upd->on_host;
+    if (!small_int_host && okind >= 0 && ikind >= 0 && L > 0 && T > 0 && dim > 0 && data->dev &&
+        idx->dev && upd->dev && c.out[0]->dev) {
+        q_copy_dev(c.q, data->dev, c.out[0]->dev, data->count * runtime_elem_size(data->dtype));
+        scatter_elements_launch(c.q, data->dev, idx->dev, ikind, (int64_t)idx->count, upd->dev,
+                                (int64_t)upd->count, c.out[0]->dev, L, T, dim, slice_form, okind);
+        // The device buffer is the value.  An integer output is still
+        // downloaded by the executor's write-back (and only once, at the end
+        // of the run), so this is not a host/device disagreement.
+        c.out[0]->on_host = false;
+        return;
+    }
     const std::vector<int64_t> ids = host_i64(idx);
     const std::vector<double> u = read_host_values(c.q, upd, ints);
     std::vector<double> res = read_host_values(c.q, data, ints);
-    if (getenv("SI_ONNX_TRACE")) {
+    if (trace_on()) {
         fprintf(stderr,
                 "[onnx] the scatter elements: the data '%s' [%lld] %zu elements (the dtype %d), the "
                 "indices '%s' %zu elements (the dtype %d), the updates '%s' %zu elements (the dtype %d), "
@@ -2001,7 +2193,7 @@ void exec_scatter_elements(op_ctx & c) {
         fprintf(stderr, "\n");
     }
     // The updates carry a slice of the axis dim, or one value per index.
-    const bool slice_form = u.size() >= (size_t)(data->count) && data->count > 0;
+    const bool host_slice_form = u.size() >= (size_t)(data->count) && data->count > 0;
     for (int64_t l = 0; l < L; ++l) {
         // The leading coordinates, in the data's dims.
         int64_t base = 0, rem = l;
@@ -2014,7 +2206,7 @@ void exec_scatter_elements(op_ctx & c) {
             int64_t id = (l * T + t) < (int64_t)ids.size() ? ids[(size_t)(l * T + t)] : 0;
             if (id < 0) id += dim;
             if (id < 0 || id >= dim) continue;
-            if (slice_form) {
+            if (host_slice_form) {
                 for (int64_t cc = 0; cc < dim; ++cc) {
                     const int64_t dst = base + (id + cc) * stride[(size_t)axis] + t;
                     const int64_t src = ((l * dim) + cc) * T + t;
@@ -2288,6 +2480,47 @@ void exec_cast(op_ctx & c) {
                                                 : kCastF32;
     int out_kind = to == onnxpb::INT64 ? kCastI64 : to == onnxpb::INT32 ? kCastI32 : kCastF32;
     if (to_bool) out_kind = kCastToBool;
+    // An integer target whose input is already on the host is converted
+    // *there*.  An integer output has to reach the host whatever produced it
+    // (the shape arithmetic and the Slice bounds read it), and the executor's
+    // write-back used to download it with a blocking queue wait.  A device
+    // cast of a scalar or a few hundred elements is then a kernel launch plus
+    // a full drain; the table structurer's Loop body has fourteen such casts
+    // per iteration, and they were thirty per cent of its blocking downloads.
+    // The conversion is by value and in the target's width, exactly as the
+    // kernel's.
+    const bool int_target = to == onnxpb::INT64 || to == onnxpb::INT32;
+    if (n > 0 && c.in[0]->on_host && !c.in[0]->host.empty() &&
+        (int_target ? n <= (size_t)65536 : n <= (size_t)8192)) {
+        const std::vector<double> v = host_values_any(c.q, c.in[0]);
+        if (int_target) {
+            const size_t esz = to == onnxpb::INT64 ? 8 : 4;
+            c.out[0]->host.assign(n * esz, 0);
+            for (size_t i = 0; i < n; ++i) {
+                const int64_t x = (int64_t)(i < v.size() ? v[i] : 0.0);
+                if (esz == 8) {
+                    std::memcpy(c.out[0]->host.data() + i * 8, &x, 8);
+                } else {
+                    const int32_t y = (int32_t)x;
+                    std::memcpy(c.out[0]->host.data() + i * 4, &y, 4);
+                }
+            }
+        } else {
+            // A small float target stays on the host too: the next operator
+            // is usually another cast, a comparison or a boolean op, and all
+            // of them read it there.  (The int-to-float casts of the
+            // decoder's counters used to upload and come back.)  A cast to a
+            // BOOL is a test, so the value is 0 or 1.
+            c.out[0]->host.assign(n * 4, 0);
+            for (size_t i = 0; i < n; ++i) {
+                const double d = i < v.size() ? v[i] : 0.0;
+                const float f = to_bool ? (d != 0.0 ? 1.0f : 0.0f) : (float)d;
+                std::memcpy(c.out[0]->host.data() + i * 4, &f, 4);
+            }
+        }
+        c.out[0]->on_host = true;
+        return;
+    }
     if (n) cast_launch(c.q, c.in[0]->dev, c.out[0]->dev, n, in_kind, out_kind);
 }
 

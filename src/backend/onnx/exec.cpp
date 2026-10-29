@@ -83,6 +83,19 @@ executor::executor(exec_graph g, sycl::queue & q) : g_(std::move(g)), q_(q) {
     producer_.assign(g_.tensors.size(), -1);
     upload_dbg_ = getenv("SI_ONNX_UPLOADDBG") != nullptr;
     mirror_chk_ = getenv("SI_ONNX_MIRRORCHK") != nullptr;
+    // The per-operator diagnostics, read once: see exec.h's note on why a
+    // `getenv` inside the op loop was a measurable cost of the Loop body.
+    trace_ = getenv("SI_ONNX_TRACE") != nullptr;
+    loop_dbg_ = getenv("SI_ONNX_LOOPDBG") != nullptr;
+    shape_dbg_ = getenv("SI_ONNX_SHAPE") != nullptr;
+    dump_dbg_ = getenv("SI_ONNX_DUMP") != nullptr;
+    time_dbg_ = getenv("SI_ONNX_TIME") != nullptr;
+    dump_file_dbg_ = getenv("SI_ONNX_DUMP_FILE") != nullptr;
+    const_chk_ = getenv("SI_ONNX_CONSTCHK") != nullptr;
+    if (dump_dbg_) dump_nvals_ = atoi(getenv("SI_ONNX_DUMP"));
+    dump_file_dir_ = dump_file_dbg_ ? getenv("SI_ONNX_DUMP_FILE") : nullptr;
+    if (const char * g = getenv("SI_ONNX_GUARD")) guard_ = (size_t)atoi(g);
+    opstat_ = getenv("SI_ONNX_OPSTAT") != nullptr;
     if (upload_dbg_) {
         upload_by_slot_.assign(g_.tensors.size(), 0);
         upload_bytes_by_slot_.assign(g_.tensors.size(), 0);
@@ -301,7 +314,7 @@ void executor::trim_pool() {
 void executor::release(void * p, size_t bytes) {
     (void)bytes;
     if (!p) return;
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    if (loop_dbg_) {
         fprintf(stderr, "[onnx] the release: %p (%zu bytes)\n", p, bytes);
     }
     // The buffer goes back under its *real* size, not the size this caller
@@ -311,16 +324,16 @@ void executor::release(void * p, size_t bytes) {
     // It must not be in the pool already.  A double release hands the same
     // buffer to two different values, and the second one overwrites the
     // first - which is how a constant's value became another constant's.
-    for (const auto & kv : free_) {
-        for (void * q : kv.second) {
-            if (q == p) {
-                throw std::runtime_error("a device buffer was released twice");
-            }
-        }
+    //
+    // `live_` is exactly the set of allocated, not-yet-released buffers
+    // (`acquire` and the constant path insert into it), so one erase decides
+    // it.  The old check scanned every free buffer, and a body iteration
+    // releases hundreds of intermediates: the scan was a measurable part of
+    // the loop's write-back.
+    if (!live_.erase(p)) {
+        throw std::runtime_error("a device buffer was released twice");
     }
-    if (live_.erase(p)) {
-        live_now_ = live_now_ > alloc_size_[p] ? live_now_ - alloc_size_[p] : 0;
-    }
+    live_now_ = live_now_ > alloc_size_[p] ? live_now_ - alloc_size_[p] : 0;
     free_[real].push_back(p);
 }
 
@@ -412,6 +425,36 @@ bool executor::output_skipped(size_t i) const {
     return i < g_.output_slots.size() && skip_out_.count(g_.output_slots[i]) != 0;
 }
 
+void executor::set_output_reduce(const std::string & name, int kind) {
+    if (kind == kReduceNone) {
+        out_reduce_.erase(name);
+        return;
+    }
+    bool found = false;
+    for (int s : g_.output_slots) {
+        if (g_.tensors[s].name == name) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        throw std::runtime_error("the graph has no output called '" + name +
+                                 "' (the output reduction)");
+    }
+    out_reduce_[name] = kind;
+}
+
+size_t executor::reduced_count(size_t out_index) const {
+    if (out_index >= reduced_.size()) return 0;
+    return reduced_[out_index].size();
+}
+
+const executor::reduced_output & executor::reduced(size_t out_index, size_t k) const {
+    static const reduced_output empty;
+    if (out_index >= reduced_.size() || k >= reduced_[out_index].size()) return empty;
+    return reduced_[out_index][k];
+}
+
 const float * executor::device_value(int slot) {
     slot_state & s = state_[slot];
     // A value with no host bytes is device-authoritative: the device buffer
@@ -450,7 +493,11 @@ const float * executor::device_value(int slot) {
 // once per call - 3508 copies of 707 MB on one layout call.  For a constant
 // the mirror survives the call as well: it never changes.
 void executor::prepare_inputs(exec_op & op) {
-    const auto tp0 = std::chrono::steady_clock::now();
+    // The timers belong to SI_ONNX_UPLOADDBG: an unconditional clock pair
+    // per allocation and per upload is real time on a model that does
+    // thousands of small uploads (the table decoder's Loop body).
+    using tp = std::chrono::steady_clock::time_point;
+    const auto tp0 = upload_dbg_ ? std::chrono::steady_clock::now() : tp{};
     size_t copies = 0;
     double t_alloc = 0.0, t_copy = 0.0;
     size_t copy_bytes = 0;
@@ -509,7 +556,7 @@ void executor::prepare_inputs(exec_op & op) {
             st.dev = nullptr;
         }
         if (!st.dev) {
-            const auto a0 = std::chrono::steady_clock::now();
+            const auto a0 = upload_dbg_ ? std::chrono::steady_clock::now() : tp{};
             if (st.is_const) {
                 // A constant stays on the device for the process.  Taking it
                 // from the pool means the best-fit can hand it a buffer far
@@ -529,8 +576,10 @@ void executor::prepare_inputs(exec_op & op) {
             } else {
                 st.dev = acquire(h.size());
             }
-            t_alloc += std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - a0).count();
+            if (upload_dbg_) {
+                t_alloc += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - a0).count();
+            }
             if (!st.dev) throw std::runtime_error("device allocation failed");
         }
         // The copy is *not* waited for.  The queue is in order, so the
@@ -541,7 +590,7 @@ void executor::prepare_inputs(exec_op & op) {
         // and unmodified until the next run (a value is written once), and
         // `run()` waits for the previous run's copies before it overwrites
         // an input's host bytes.
-        const auto c0 = std::chrono::steady_clock::now();
+        const auto c0 = upload_dbg_ ? std::chrono::steady_clock::now() : tp{};
         // A copy out of *pageable* host memory is synchronous on this backend:
         // it blocks until the queue drains, which is what made a 0-byte
         // upload take 82 ms in the middle of the layout model (the queue was
@@ -570,8 +619,10 @@ void executor::prepare_inputs(exec_op & op) {
             }
         }
         if (!staged) q_.memcpy(st.dev, h.data(), h.size());
-        t_copy += std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - c0).count();
+        if (upload_dbg_) {
+            t_copy += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - c0).count();
+        }
         copy_bytes += h.size();
         uploads_pending_ = true;
         st.dev_gen = st.host_gen;
@@ -664,7 +715,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     // convolution weights, which is the work of a whole model.
     executor * bexec = loop_body(op_index);
     const exec_graph & bg = bexec->graph();
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    if (loop_dbg_) {
         fprintf(stderr, "[onnx] the loop: the body is built (%zu ops, %zu tensors)\n", bg.ops.size(),
                 bg.tensors.size());
     }
@@ -714,7 +765,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             q_download(q_, state_[in[1]].dev, h.data(), bytes);
         }
         cond = value_is_true(h, g_.tensors[in[1]].dtype);
-        if (getenv("SI_ONNX_LOOPDBG")) {
+        if (loop_dbg_) {
             fprintf(stderr, "[onnx] the loop: the condition '%s': %zu bytes, the dtype %d, the value %d\n",
                     g_.tensors[in[1]].name.c_str(), h.size(), (int)g_.tensors[in[1]].dtype, (int)cond);
         }
@@ -763,7 +814,125 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     std::vector<std::vector<std::vector<uint8_t>>> scans;
     std::vector<std::vector<int64_t>> scan_shape;
 
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    // Which carried values the body actually *produces*, and which it only
+    // passes through.
+    //
+    // A body output that no node writes is the body's input of the same name
+    // returned unchanged (ONNX's pass-through).  Most of the table
+    // structurer's 30 carried values are its decoder's weights: the body
+    // reports them so they can be carried, but they never change.  Feeding
+    // them again every iteration re-uploads 2.3 MB of weights and empties
+    // their host copy on the read-back, which is why the "unchanged feed"
+    // check in `run()` could never fire - the value it compares against had
+    // been moved out.  A pass-through is therefore neither re-fed nor
+    // downloaded: the body's input slot keeps the value (it is a graph
+    // output, so the pool does not release it).
+    std::vector<char> carried_produced(carried.size(), 1);
+    for (size_t i = 0; i < carried.size() && i + 1 < bg.output_produced.size(); ++i) {
+        carried_produced[i] = bg.output_produced[i + 1] ? 1 : 0;
+    }
+    // A produced carried value whose body output lives on the device is
+    // chained to the next iteration by a device-to-device copy into the
+    // body's input slot: the value never crosses the bus.  (The host route
+    // reads it back and re-uploads it, which at a batch of 31 is 3.7 MB in
+    // each direction, per iteration.)  `via_dev` says which carried values
+    // take that route; a value whose output has no device buffer falls back
+    // to the host route and is requested/read back as before.
+    std::vector<char> via_dev(carried.size(), 0);
+    // One dedicated device buffer per chained carried value.  It is *not*
+    // from the executor's pool: the pool hands a released buffer straight
+    // back out, and the copy into it is queued, so a pooled buffer can be
+    // given to another value before the copy runs.
+    std::vector<void *> chain_buf(carried.size(), nullptr);
+    // Every body *input* is read on every iteration: the iteration number,
+    // the condition, the carried values and the outer-scope copies.  The
+    // pool would hand their buffers back after their last use inside
+    // iteration 0 (a body input slot is a different tensor from the body
+    // output that names it), so the value would be re-uploaded each time -
+    // and the in-place borrow (which is enabled for a body, see
+    // `build_graph_from_graph`) would take the buffer of a value the next
+    // iteration still reads.  Pin all of them for the body's lifetime.
+    for (int is : bg.input_slots) {
+        if (is >= 0 && is < (int)bexec->state_.size()) bexec->state_[is].pinned = true;
+    }
+    // The body outputs the loop needs back after one iteration: the
+    // condition, the carried values still on the host route, and the scans.
+    // The pass-throughs are left in their slots, which is also what keeps
+    // their host bytes for the next iteration's comparison.
+    std::vector<size_t> want_out;
+    auto build_want = [&]() {
+        want_out.clear();
+        want_out.push_back(0);
+        for (size_t i = 0; i < carried.size(); ++i) {
+            if (carried_produced[i] && !via_dev[i]) want_out.push_back(i + 1);
+        }
+        for (size_t i = 1 + carried.size(); i < bg.output_slots.size(); ++i) want_out.push_back(i);
+    };
+    build_want();
+    // Chain one produced carried value from its body output to the body
+    // input, on the device.  Returns false when the value has to take the
+    // host route (no output buffer, or an input buffer that cannot be
+    // allocated).  `PF_ONNX_LOOP_NODEV=1` restores the host route, for the
+    // A/B.
+    static const bool chain_on = getenv("PF_ONNX_LOOP_NODEV") == nullptr;
+    auto chain_device = [&](size_t i) -> bool {
+        if (!chain_on) return false;
+        // An *integer* carried value stays on the host route: the integer
+        // values are what the shape functions and some operators read on the
+        // host, and they are a few bytes anyway.
+        if (carried[i].dtype == onnxpb::INT32 || carried[i].dtype == onnxpb::INT64) return false;
+        const size_t oi = i + 1;
+        if (oi >= bg.output_slots.size() || 2 + i >= bg.input_slots.size()) return false;
+        const int os = bg.output_slots[oi];
+        const int is = bg.input_slots[2 + i];
+        slot_state & ss = bexec->state_[os];
+        // The output's device buffer must *be* the value.  A value the body
+        // computed on the host has a stale device mirror (its generation is
+        // one behind), and copying that would chain the previous iteration's
+        // bytes; those values keep the host route.
+        if (!ss.dev || ss.bytes == 0 || ss.dev_gen != ss.host_gen) return false;
+        slot_state & ds = bexec->state_[is];
+        const size_t bytes = ss.bytes;
+        // The buffer is recorded in the executor's size map so the
+        // destructor frees it; it is never put in the pool's free list.
+        void * &cb = chain_buf[i];
+        if (!cb) {
+            cb = sycl::malloc_device(bytes, bexec->q_);
+            if (!cb) return false;
+            bexec->alloc_size_[cb] = bytes;
+            bexec->live_.insert(cb);
+        } else if (bexec->alloc_size_[cb] < bytes) {
+            // The carried value grew: replace the chain buffer.  The run has
+            // waited, so nothing is still reading the old one.
+            if (ds.dev == cb) ds.dev = nullptr;
+            bexec->live_.erase(cb);
+            bexec->alloc_size_.erase(cb);
+            sycl::free(cb, bexec->q_);
+            cb = sycl::malloc_device(bytes, bexec->q_);
+            if (!cb) return false;
+            bexec->alloc_size_[cb] = bytes;
+            bexec->live_.insert(cb);
+        }
+        if (ds.dev != cb) {
+            // The slot's old buffer (a pool buffer) goes back *after* the
+            // run has waited, so nothing is still reading it.  The chain
+            // buffer itself is never returned to the pool: the pool would
+            // hand it to another value while a queued copy still writes it.
+            if (ds.dev && bexec->alloc_size_.count(ds.dev)) bexec->release(ds.dev, ds.bytes);
+            ds.dev = cb;
+        }
+        // Queued, not waited: the body's first kernel for the next
+        // iteration is on the same in-order queue.
+        bexec->q_.memcpy(cb, ss.dev, bytes);
+        ds.bytes = bytes;
+        ds.dev_gen = ds.host_gen;
+        bexec->g_.tensors[is].dev = ds.dev;
+        bexec->g_.tensors[is].on_host = false;
+        bexec->g_.tensors[is].host.clear();
+        return true;
+    };
+
+    if (loop_dbg_) {
         fprintf(stderr, "[onnx] the loop: %zu carried values\n", carried.size());
         fprintf(stderr, "[onnx] the loop: the trip count %lld, the condition %d\n", (long long)M,
                 (int)cond);
@@ -809,7 +978,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     for (const auto & r : bg.outer_refs) {
         state_[r.second].last_use = std::max(state_[r.second].last_use, (int)op_index);
     }
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    if (loop_dbg_) {
         fprintf(stderr, "[onnx] the loop: %zu outer refs\n", bg.outer_refs.size());
         for (const auto & r : bg.outer_refs) {
             const tensor & src = g_.tensors[r.second];
@@ -824,8 +993,14 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     }
     for (const auto & r : bg.outer_refs) {
         copy_into(*bexec, r.first, r.second);
+        // An outer-scope copy is read by the body on every iteration, so it
+        // is a body input in everything but name: pin it too (see the input
+        // pinning above - the borrow must not take it).
+        if (r.first >= 0 && r.first < (int)bexec->state_.size()) {
+            bexec->state_[r.first].pinned = true;
+        }
     }
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    if (loop_dbg_) {
         for (const auto & r : bg.outer_refs) {
             const tensor & d = bexec->graph().tensors[r.first];
             float hv = -1.0f;
@@ -842,8 +1017,22 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         const int64_t v = atoll(lm);
         if (v > 0 && v < max_iter) max_iter = v;
     }
+    std::map<std::string, double> op_ms0;
+    std::map<std::string, int> op_n0;
+    std::map<std::string, long> op_dl_base, op_up_base;
+    long dl0 = g_q_downloads.load();
+    double w0 = bexec->wait_ms_, w00 = bexec->wait0_ms_;
+    double f0 = bexec->feed_ms_, r0 = bexec->rb_ms_;
+    if (opstat_) {
+        op_ms0 = bexec->op_ms_;
+        op_n0 = bexec->op_n_;
+        op_dl_base = bexec->op_dl_;
+        op_up_base = bexec->op_up_;
+    }
+    int64_t iters_run = 0;
     for (int64_t iter = 0; iter < max_iter; ++iter) {
         if (!cond) break;
+        ++iters_run;
         // The body's inputs.
         std::vector<onnxwire::tensor> feeds;
         {
@@ -869,6 +1058,15 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             feeds.push_back(t);
         }
         for (size_t i = 0; i < carried.size(); ++i) {
+            // A pass-through only needs its value on the first iteration:
+            // after that the body's input slot still holds it (it is a
+            // graph output, so it is never released), and re-feeding it
+            // would re-upload the weights and empty the host copy the
+            // executor's own unchanged-feed check compares against.
+            if (iter > 0 && !carried_produced[i]) continue;
+            // A produced value on the device route is already in the input
+            // slot when this iteration starts.
+            if (iter > 0 && via_dev[i]) continue;
             onnxwire::tensor t;
             t.name = body_in[2 + i];
             t.type = carried[i].dtype == onnxpb::INT64 ? onnxwire::dtype::i64
@@ -881,46 +1079,93 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         // The body's outputs.  The buffers have to be built *before* the run:
         // the executor fills the buffers the caller asks for, by name, and an
         // empty list means the body's outputs are never collected - and the
-        // code below then reads past the end of an empty vector.
-        std::vector<std::vector<uint8_t>> out_bufs(bg.output_slots.size());
+        // code below then reads past the end of an empty vector.  Only the
+        // condition, the produced carried values and the scans are asked
+        // for; a pass-through stays in its slot (and keeps its host bytes).
+        std::vector<std::vector<uint8_t>> out_bufs(want_out.size());
         std::vector<std::pair<std::string, std::vector<uint8_t> &>> outs;
-        for (size_t i = 0; i < bg.output_slots.size(); ++i) {
-            outs.emplace_back(bg.tensors[bg.output_slots[i]].name, out_bufs[i]);
+        for (size_t j = 0; j < want_out.size(); ++j) {
+            outs.emplace_back(bg.tensors[bg.output_slots[want_out[j]]].name, out_bufs[j]);
         }
         bexec->run(feeds, outs);
         // The condition.
-        if (!outs.empty()) {
+        if (!out_bufs.empty()) {
             const int cs = bg.output_slots.empty() ? -1 : bg.output_slots[0];
-            cond = value_is_true(outs[0].second, cs >= 0 ? bg.tensors[cs].dtype : onnxpb::FLOAT);
-            if (getenv("SI_ONNX_LOOPDBG") && (iter < 3 || iter % 64 == 0)) {
+            cond = value_is_true(out_bufs[0], cs >= 0 ? bg.tensors[cs].dtype : onnxpb::FLOAT);
+            if (loop_dbg_ && (iter < 3 || iter % 64 == 0)) {
                 fprintf(stderr, "[onnx] the loop: the iteration %lld, the condition %d\n",
                         (long long)iter, (int)cond);
             }
         }
-        // The carried values.
-        for (size_t i = 0; i < carried.size() && i + 1 < outs.size(); ++i) {
-            // A body output that no node produces is a pass-through of the
-            // body's input of the same name: the value is unchanged.  (The
-            // wireless table structurer's body carries an "assigned" counter
-            // that it only reads, and ONNXRuntime returns it unchanged.)
-            const size_t oi = i + 1;
-            if (oi < bg.output_produced.size() && !bg.output_produced[oi]) continue;
-            carried[i].data = outs[oi].second;
+        // The produced carried values and the scans, through the same
+        // body-output indices.
+        size_t j = 1;
+        for (size_t i = 0; i < carried.size(); ++i) {
+            if (!carried_produced[i]) continue;
+            if (!via_dev[i]) {
+                if (j >= out_bufs.size()) break;
+                carried[i].data = out_bufs[j];
+                ++j;
+            }
             // The shape comes from the body: it is the only place where the
             // value's shape is known (the outer graph's shape for a carried
             // value is the shape of the *initial* value, which a loop that
             // changes it invalidates).
             const int s = bg.output_slots.size() > i + 1 ? bg.output_slots[i + 1] : -1;
             if (s >= 0) carried[i].shape = bexec->output(i + 1).shape;
+            // Chain it to the next iteration on the device.  The copy runs
+            // on every iteration; `via_dev` only records that this value no
+            // longer needs the host read-back and the host feed.
+            if (chain_device(i)) {
+                if (!via_dev[i]) {
+                    via_dev[i] = 1;
+                    build_want();
+                }
+            }
         }
         // The scans.
-        for (size_t i = 1 + carried.size(); i < outs.size(); ++i) {
-            const size_t s = i - 1 - carried.size();
+        for (size_t si = 1 + carried.size(); si < bg.output_slots.size(); ++si) {
+            if (j >= out_bufs.size()) break;
+            const size_t s = si - 1 - carried.size();
             if (scans.size() <= s) scans.resize(s + 1);
-            scans[s].push_back(outs[i].second);
+            scans[s].push_back(out_bufs[j]);
             if (s >= scan_shape.size()) scan_shape.resize(s + 1);
-            const int os = bg.output_slots.size() > i ? bg.output_slots[i] : -1;
-            if (os >= 0) scan_shape[s] = bexec->output(i).shape;
+            const int os = bg.output_slots.size() > si ? bg.output_slots[si] : -1;
+            if (os >= 0) scan_shape[s] = bexec->output(si).shape;
+            ++j;
+        }
+    }
+    if (opstat_) {
+        struct row { double ms; int n; long dl; long up; std::string name; };
+        std::vector<row> rows;
+        double total = 0.0;
+        int n_ops = 0;
+        for (const auto & kv : bexec->op_ms_) {
+            const double dt = kv.second - (op_ms0.count(kv.first) ? op_ms0[kv.first] : 0.0);
+            const int n = bexec->op_n_[kv.first] - (op_n0.count(kv.first) ? op_n0[kv.first] : 0);
+            if (n <= 0) continue;
+            const long dl = bexec->op_dl_[kv.first] -
+                            (op_dl_base.count(kv.first) ? op_dl_base[kv.first] : 0L);
+            const long up = bexec->op_up_[kv.first] -
+                            (op_up_base.count(kv.first) ? op_up_base[kv.first] : 0L);
+            rows.push_back({dt, n, dl, up, kv.first});
+            total += dt;
+            n_ops += n;
+        }
+        std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) { return a.ms > b.ms; });
+        fprintf(stderr,
+                "[onnx] loop opstat: %lld iterations, %d ops, %.1f ms (%.3f ms/iteration), "
+                "%ld blocking downloads, the final wait %.1f ms (%.3f/iteration), "
+                "the feed-upload wait %.1f ms, the feeds %.1f ms, the readback enqueue %.1f ms\n",
+                (long long)iters_run, n_ops, total, iters_run ? total / iters_run : 0.0,
+                g_q_downloads.load() - dl0, bexec->wait_ms_ - w0,
+                iters_run ? (bexec->wait_ms_ - w0) / iters_run : 0.0,
+                bexec->wait0_ms_ - w00, bexec->feed_ms_ - f0, bexec->rb_ms_ - r0);
+        for (size_t i = 0; i < rows.size() && i < 24; ++i) {
+            fprintf(stderr, "   %-18s %8.2f ms total %7.3f ms/iteration x%d, %ld dl, %ld up\n",
+                    rows[i].name.c_str(), rows[i].ms,
+                    iters_run ? rows[i].ms / iters_run : 0.0, rows[i].n,
+                    rows[i].dl, rows[i].up);
         }
     }
     // The outer scope's values are dead now: the body has its own copies.
@@ -932,7 +1177,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             g_.tensors[r.second].dev = nullptr;
         }
     }
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    if (loop_dbg_) {
         fprintf(stderr, "[onnx] the loop: after the run, the body's outputs:");
         for (int s2 : bg.output_slots) {
             fprintf(stderr, " %s[", bg.tensors[s2].name.c_str());
@@ -977,6 +1222,16 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             // A loop-carried value.
             const carried_value & cv = carried[k];
             raw = cv.data;
+            // A value the body chained on the device never came back to the
+            // host; its last iteration's output is read back once, here.
+            if (k < via_dev.size() && via_dev[k] && k + 1 < bg.output_slots.size()) {
+                const int os = bg.output_slots[k + 1];
+                slot_state & ss = bexec->state_[os];
+                if (ss.dev && ss.bytes) {
+                    raw.resize(ss.bytes);
+                    q_download(q_, ss.dev, raw.data(), raw.size());
+                }
+            }
             shape = cv.shape;
             dtype = cv.dtype;
         } else {
@@ -1008,7 +1263,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             if (os >= 0) dtype = bg.tensors[os].dtype;
         }
         g_.tensors[s].host = raw;
-        if (getenv("SI_ONNX_LOOPDBG")) {
+        if (loop_dbg_) {
             fprintf(stderr, "[onnx] the loop: the output %zu '%s': %zu bytes, the shape [", k,
                     g_.tensors[s].name.c_str(), raw.size());
             for (int64_t d : shape) fprintf(stderr, " %lld", (long long)d);
@@ -1093,7 +1348,10 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
     // and the input assignments below overwrite them.  One wait here is what
     // lets `prepare_inputs` enqueue its copies without waiting at each one.
     if (uploads_pending_) {
+        const auto w0 = std::chrono::steady_clock::now();
         q_.wait();
+        wait0_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - w0).count();
         uploads_pending_ = false;
         up_stage_off_ = 0;
     }
@@ -1116,12 +1374,13 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
     double ht_prepare = 0.0, ht_submit = 0.0, ht_writeback = 0.0;
     double ht_upload = 0.0, ht_alloc = 0.0, ht_ctx = 0.0;
     size_t ht_n = 0, ht_n_upload = 0;
-    if (getenv("SI_ONNX_LOOPDBG")) {
+    if (loop_dbg_) {
         fprintf(stderr, "[onnx] the run: %zu inputs, %zu ops\n", inputs.size(), g_.ops.size());
     }
     // The inputs.  Their shape comes with them: the graph's own input shape
     // is often dynamic (a text crop, a page), and the buffers are sized
     // from what the client sent.
+    const auto tf0 = std::chrono::steady_clock::now();
     for (const onnxwire::tensor & in : inputs) {
         auto it = std::find_if(g_.input_slots.begin(), g_.input_slots.end(),
                                [&](int s) { return g_.tensors[s].name == in.name; });
@@ -1129,6 +1388,38 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             throw std::runtime_error("the graph has no input called " + in.name);
         }
         slot_state & s = state_[*it];
+        // A feed whose bytes are the ones already there does not need a new
+        // upload.  A Loop re-feeds its carried values every iteration, and
+        // most of them are the decoder's weights (the table structurer's
+        // body carries 31 values across 27 iterations): re-uploading 3 MB of
+        // weights per iteration is 80 MB of host-to-device traffic for a
+        // graph whose actual work is a handful of small matmuls.  The device
+        // mirror is only reused when it is current (`dev_gen == host_gen`),
+        // which `device_value` checks.
+        {
+            std::vector<uint8_t> & th = g_.tensors[*it].host;
+            if (in.type != onnxwire::dtype::boolean && th.size() == in.data.size() &&
+                (th.empty() || std::memcmp(th.data(), in.data.data(), th.size()) == 0)) {
+                auto & gt0 = g_.tensors[*it];
+                gt0.on_host = true;
+                s.is_const = false;
+                s.bytes = th.size();
+                gt0.shape.assign(in.shape.begin(), in.shape.end());
+                const int32_t dt0 = in.type == onnxwire::dtype::f32      ? onnxpb::FLOAT
+                                    : in.type == onnxwire::dtype::i64   ? onnxpb::INT64
+                                    : in.type == onnxwire::dtype::i32   ? onnxpb::INT32
+                                    : in.type == onnxwire::dtype::i8    ? onnxpb::INT8
+                                    : in.type == onnxwire::dtype::u8    ? onnxpb::UINT8
+                                    : in.type == onnxwire::dtype::boolean ? onnxpb::BOOL
+                                                                          : onnxpb::FLOAT;
+                gt0.dtype = dt0;
+                int64_t n0 = 1;
+                for (uint64_t d : in.shape) n0 *= (int64_t)d;
+                const size_t esz0 = runtime_elem_size(dt0);
+                gt0.count = in.shape.empty() ? in.data.size() / esz0 : (size_t)n0;
+                continue;
+            }
+        }
         if (in.type == onnxwire::dtype::boolean) {
             // The wire's boolean is one byte per element; the runtime's is a
             // float 0/1 (the device holds float32, and a one-byte boolean on
@@ -1167,6 +1458,8 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         const size_t esz = runtime_elem_size(dt);
         g_.tensors[*it].count = in.shape.empty() ? in.data.size() / esz : (size_t)n;
     }
+    feed_ms_ += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tf0).count();
     // The producer of each slot, for this run: a value written twice in one
     // run is a bug, but a Loop's body runs once per iteration and writes the
     // same slots every time.
@@ -1225,7 +1518,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 skip_begin_ = op.if_then_begin;
                 skip_end_ = op.if_then_end;
             }
-            if (getenv("SI_ONNX_LOOPDBG")) {
+            if (loop_dbg_) {
                 fprintf(stderr, "[onnx] the if: the condition %d, the then [%d, %d), the else [%d, %d)\n",
                         (int)cond, op.if_then_begin, op.if_then_end, op.if_else_begin, op.if_else_end);
             }
@@ -1251,7 +1544,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             }
         }
         if (all_const) {
-            if (getenv("SI_ONNX_LOOPDBG")) {
+            if (loop_dbg_) {
                 fprintf(stderr, "[onnx] the op %zu %s is const (skipped)\n", i,
                         op.node->op_type.c_str());
             }
@@ -1272,10 +1565,17 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         if (trace_on()) {
             fprintf(stderr, "[onnx] op %zu %s\n", i, op.node->op_type.c_str());
         }
-        if (getenv("SI_ONNX_LOOPDBG")) {
+        if (loop_dbg_) {
             fprintf(stderr, "[onnx] the op %zu %s runs\n", i, op.node->op_type.c_str());
         }
-        const auto th0 = std::chrono::steady_clock::now();
+        // The timestamps are taken only when a diagnostic needs them: six
+        // clock reads per operator is ~1 us, and the table structurer's Loop
+        // runs 157 operators per iteration.
+        using tp = std::chrono::steady_clock::time_point;
+        const bool timed = hosttime || opstat_;
+        const auto th0 = timed ? std::chrono::steady_clock::now() : tp{};
+        const long dl_op0 = opstat_ ? g_q_downloads.load() : 0;
+        const size_t up_op0 = opstat_ ? upload_count_ : 0;
         auto th1 = th0, th2 = th0;
         op_ctx ctx(q_, *op.node);
         ctx.activation = op.activation;
@@ -1293,15 +1593,69 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         // error, and it has to name the operator like every other one.  (The
         // upload was outside, and a device lost by the *previous* operator
         // surfaced here, without a name.)
-        const auto tu0 = std::chrono::steady_clock::now();
+        // Operators whose *inputs* the host reads directly do not need their
+        // device mirrors refreshed.  The integer control flow of the table
+        // decoder is built from such operators (Shape, Range, the int
+        // Concat/Slice/Tile, the int elementwise ops), and each of their
+        // inputs was copied to the device and then never read there - 47 of
+        // the ~86 uploads one Loop iteration was paying.
+        bool host_inputs_only = false;
+        if (!mirror_chk_) {
+            const std::string & ty = op.node->op_type;
+            if (ty == "Shape" || ty == "Range") {
+                host_inputs_only = true;
+            } else if (ty == "Concat" || ty == "Slice" || ty == "Tile" || ty == "Expand" ||
+                       ty == "Gather" || ty == "Split" || ty == "Transpose" ||
+                       ty == "GatherND" || ty == "ScatterND" || ty == "OneHot") {
+                host_inputs_only = true;
+                for (int si : op.in) {
+                    if (si < 0) continue;
+                    if (g_.tensors[si].dtype == onnxpb::FLOAT) {
+                        host_inputs_only = false;
+                        break;
+                    }
+                }
+            } else if (op.kind == op_kind::elementwise) {
+                // The host path is taken for an integer operand or an
+                // integer result; all-integer inputs are always that path.
+                host_inputs_only = true;
+                for (int si : op.in) {
+                    if (si < 0) continue;
+                    if (g_.tensors[si].dtype == onnxpb::FLOAT) {
+                        host_inputs_only = false;
+                        break;
+                    }
+                }
+            } else if (ty == "ReduceMax" || ty == "ReduceMin" || ty == "ReduceSum" ||
+                       ty == "ReduceMean") {
+                const int si = op.in.empty() ? -1 : op.in[0];
+                host_inputs_only = si >= 0 && si < (int)state_.size() && state_[si].bytes > 0 &&
+                                   state_[si].bytes <= (size_t)8192 && g_.tensors[si].on_host &&
+                                   (g_.tensors[si].dtype == onnxpb::INT32 ||
+                                    g_.tensors[si].dtype == onnxpb::INT64 ||
+                                    g_.tensors[si].dtype == onnxpb::BOOL);
+            } else if (ty == "Cast" && !op.in.empty() && op.in[0] >= 0) {
+                // The host cast path (see exec_cast): an integer target up to
+                // 64K elements, or a small float target, from host bytes.
+                const tensor & ti = g_.tensors[op.in[0]];
+                int32_t to = onnxpb::FLOAT;
+                for (const onnxpb::attribute & a : op.node->attribute) {
+                    if (a.name == "to") to = (int32_t)a.i;
+                }
+                const bool int_target = to == onnxpb::INT64 || to == onnxpb::INT32;
+                host_inputs_only = ti.on_host && !ti.host.empty() && ti.count > 0 &&
+                                   (int_target ? ti.count <= (size_t)65536 : ti.count <= (size_t)8192);
+            }
+        }
+        const auto tu0 = hosttime ? std::chrono::steady_clock::now() : tp{};
         try {
-            prepare_inputs(op);
+            if (!host_inputs_only) prepare_inputs(op);
         } catch (const std::exception & ex) {
             throw std::runtime_error("the operator " + std::to_string(i) + " (" +
                                      op.node->op_type + ") failed while preparing its inputs: " +
                                      ex.what());
         }
-        const auto tu1 = std::chrono::steady_clock::now();
+        const auto tu1 = hosttime ? std::chrono::steady_clock::now() : tp{};
         for (int s : op.in) {
             if (s < 0) continue;
             ctx.in.push_back(&g_.tensors[s]);
@@ -1355,7 +1709,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             }
             throw std::runtime_error(what);
         }
-        if (getenv("SI_ONNX_TRACE") && op.node->op_type == "Reshape") {
+        if (trace_ && op.node->op_type == "Reshape") {
             fprintf(stderr, "[onnx] the reshape's shape: %d", (int)have_shape);
             for (const auto & sh : shapes) {
                 fprintf(stderr, " [");
@@ -1377,7 +1731,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                                          "' does not know the shape of its output");
             }
             if (ctx.out[k]->count == 0) ctx.out[k]->count = 1;
-            if (getenv("SI_ONNX_TRACE")) {
+            if (trace_) {
                 for (int64_t d : ctx.out[k]->shape) {
                     if (d == 0) {
                         fprintf(stderr, "[onnx] op %zu %s: the output '%s' has a zero dim:", i,
@@ -1389,7 +1743,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 }
             }
         }
-        if (getenv("SI_ONNX_SHAPE")) {
+        if (shape_dbg_) {
             // The shapes of every operator's inputs and outputs.  This is
             // the trace that finds a wrong shape: a value whose shape does
             // not match the operator that produced it.
@@ -1408,12 +1762,12 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         // The dump of the inputs happens *before* the operator runs: after it,
         // the input's buffer may have been overwritten (an alias), and the
         // dump would then show the new values and hide the fault.
-        if (getenv("SI_ONNX_DUMP")) {
+        if (dump_dbg_) {
             // A diagnostic: the first elements of the inputs and the outputs,
             // so the host's view of a buffer can be compared with the
             // device's.  The format is parseable, so a script can compare
             // the runtime's intermediates with ONNXRuntime's.
-            const size_t nvals = (size_t)atoi(getenv("SI_ONNX_DUMP"));
+            const size_t nvals = (size_t)dump_nvals_;
             for (size_t c = 0; c < ctx.in.size(); ++c) {
                 const tensor * t = ctx.in[c];
                 const size_t n = std::min<size_t>(t->count, std::min<size_t>(nvals, 64));
@@ -1483,8 +1837,8 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         // the formula recogniser (thousands of small operators) the waits
         // were most of the runtime.  A debug run turns it on:
         // `SI_ONNX_GUARD=256`.
-        static const size_t kGuard = (size_t)atoi(getenv("SI_ONNX_GUARD") ? getenv("SI_ONNX_GUARD") : "0");
-        const auto ta0 = std::chrono::steady_clock::now();
+        const size_t kGuard = guard_;
+        const auto ta0 = hosttime ? std::chrono::steady_clock::now() : tp{};
         std::vector<void *> out_dev(ctx.out.size(), nullptr);
         const size_t miss0 = malloc_count_;
         // In-place reuse.  A value-preserving metadata op (Reshape/Flatten/
@@ -1504,7 +1858,8 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 const int s = op.in[k];
                 if (s < 0 || s >= (int)state_.size()) continue;
                 slot_state & cs = state_[s];
-                if (!cs.dev || cs.is_const || is_output(s) || cs.last_use != (int)i) continue;
+                if (!cs.dev || cs.is_const || cs.pinned || is_output(s) ||
+                    cs.last_use != (int)i) continue;
                 if (cs.bytes != out_bytes) continue;
                 if (g_.tensors[s].dtype != ctx.out[0]->dtype) continue;
                 if (op.kind == op_kind::elementwise &&
@@ -1550,17 +1905,17 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 if (kGuard) q_.memset((uint8_t *)out_dev[k] + bytes, 0xAB, kGuard);
                 ctx.out[k]->dev = out_dev[k];
             }
-            const auto ta1 = std::chrono::steady_clock::now();
+            const auto ta1 = hosttime ? std::chrono::steady_clock::now() : tp{};
             if (hosttime) {
                 ht_upload += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
                 ht_alloc += std::chrono::duration<double, std::milli>(ta1 - ta0).count();
                 ht_ctx += std::chrono::duration<double, std::milli>(tu0 - th0).count();
                 ht_n_upload += (malloc_count_ - miss0);
             }
-            th1 = std::chrono::steady_clock::now();
-            const auto t_op = std::chrono::steady_clock::now();
+            th1 = timed ? std::chrono::steady_clock::now() : tp{};
+            const auto t_op = time_dbg_ ? std::chrono::steady_clock::now() : tp{};
             if (!skip_exec) e->exec(ctx);
-            th2 = std::chrono::steady_clock::now();
+            th2 = timed ? std::chrono::steady_clock::now() : tp{};
             // The wait: only the diagnostics need the operator's result (the
             // timing, the dump and the guard band's check).  The queue is in
             // order, so the next operator's kernels see this one's writes -
@@ -1568,20 +1923,20 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // on a model with thousands of small operators is most of the
             // time.  (The host operators read the device themselves, and
             // `q_download` waits.)
-            if (kGuard || getenv("SI_ONNX_TIME") || getenv("SI_ONNX_DUMP") ||
-                getenv("SI_ONNX_DUMP_FILE")) {
+            if (guard_ || time_dbg_ || dump_dbg_ || dump_file_dbg_) {
                 q_.wait();
             }
-            if (getenv("SI_ONNX_TIME")) {
+            if (time_dbg_) {
                 const double ms = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - t_op).count();
-                fprintf(stderr, "[onnx] time: op %zu %s %.3f ms\n", i, op.node->op_type.c_str(), ms);
+                fprintf(stderr, "[onnx] time: op %zu %s %s %.3f ms\n", i,
+                        op.node->op_type.c_str(), op.node->name.c_str(), ms);
             }
-            if (getenv("SI_ONNX_DUMP")) {
+            if (dump_dbg_) {
                 // The outputs are dumped *after* the operator: the input's
                 // buffer may have been overwritten by it, and the output's
                 // buffer does not exist before it.
-                const size_t nvals = (size_t)atoi(getenv("SI_ONNX_DUMP"));
+                const size_t nvals = (size_t)dump_nvals_;
                 for (size_t k = 0; k < ctx.out.size(); ++k) {
                     const size_t n = std::min<size_t>(ctx.out[k]->count, std::min<size_t>(nvals, 64));
                     // An operator that computes on the host (an integer
@@ -1637,12 +1992,12 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                     fprintf(stderr, "\n");
                 }
             }
-            if (getenv("SI_ONNX_DUMP_FILE")) {
+            if (dump_file_dbg_) {
                 // The *whole* output, so the values can be compared with
                 // ONNXRuntime's element by element.  The first few values
                 // are not enough: a divergence past them is invisible.
                 for (size_t k = 0; k < ctx.out.size(); ++k) {
-                    const std::string p = std::string(getenv("SI_ONNX_DUMP_FILE")) + "/" +
+                    const std::string p = std::string(dump_file_dir_) + "/" +
                                           dump_tag_ + std::to_string(i) + "_" +
                                           ctx.out[k]->name + ".bin";
                     const size_t n = ctx.out[k]->count;
@@ -1730,7 +2085,14 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // intermediate would be a round trip per operator.
             const bool int_out = ctx.out[k]->dtype == onnxpb::INT64 ||
                                  ctx.out[k]->dtype == onnxpb::INT32;
-            const bool on_host = ctx.out[k]->on_host || int_out;
+            // A graph output with a configured reduction keeps its value on
+            // the device: the readback reduces it there and transfers only
+            // the result.  The layout detector's instance mask is an int32
+            // output, and the generic integer rule below would otherwise
+            // download all 48 MB/page before the readback ever sees it.
+            const bool reduced_out =
+                is_output(s) && out_reduce_.count(g_.tensors[s].name) != 0;
+            const bool on_host = (ctx.out[k]->on_host || int_out) && !reduced_out;
             // A value is written once per run.  The check used to be in the
             // device-resident branch only, so a host value written twice
             // silently kept the last writer's bytes and the first writer's
@@ -1746,7 +2108,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             producer_[s] = (int)i;
             if (ctx.out[k]->on_host) {
                 g_.tensors[s].host = ctx.out[k]->host;
-            } else if (int_out) {
+            } else if (int_out && !reduced_out) {
                 g_.tensors[s].host.resize(ctx.out[k]->bytes());
                 if (!g_.tensors[s].host.empty()) {
                     q_download(q_, ctx.out[k]->dev, g_.tensors[s].host.data(), g_.tensors[s].host.size());
@@ -1807,7 +2169,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 // The device buffer *is* the value, and there are no host
                 // bytes for a mirror to disagree with.
                 st.dev_gen = st.host_gen;
-                if (getenv("SI_ONNX_TRACE")) {
+                if (trace_) {
                     fprintf(stderr, "[onnx] the op %zu %s writes the slot %d ('%s')\n", i,
                             op.node->op_type.c_str(), s, g_.tensors[s].name.c_str());
                 }
@@ -1826,6 +2188,21 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             ht_writeback += std::chrono::duration<double, std::milli>(th3 - th2).count();
             ht_n++;
         }
+        if (opstat_) {
+            const double dt = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - th0).count();
+            std::string key = op.node->op_type;
+            if (key == "Cast" && !op.in.empty() && op.in[0] >= 0) {
+                const tensor & ti = g_.tensors[op.in[0]];
+                key += "_" + std::to_string((int)ti.dtype) + "_" + std::to_string((int)ctx.out[0]->dtype) +
+                       "_n" + std::to_string(ti.count) + (ti.on_host ? "_h" : "_d");
+                if (ti.count <= 4) key += "(" + ti.name.substr(0, 18) + ")";
+            }
+            op_ms_[key] += dt;
+            ++op_n_[key];
+            op_dl_[key] += g_q_downloads.load() - dl_op0;
+            op_up_[key] += (long)(upload_count_ - up_op0);
+        }
         // The input buffers that are dead.  The graph's outputs are not:
         // they are what the client asked for, and they are read back at the
         // end of the run.
@@ -1835,8 +2212,8 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // process instead of being released and uploaded again on the
             // next operator (or the next call).
             if (state_[s].last_use == (int)i && state_[s].dev && !is_output(s) &&
-                !state_[s].is_const) {
-                if (getenv("SI_ONNX_TRACE")) {
+                !state_[s].is_const && !state_[s].pinned) {
+                if (trace_) {
                     fprintf(stderr, "[onnx] the release: op %zu releases '%s' (%zu bytes)\n", i,
                             g_.tensors[s].name.c_str(), state_[s].bytes);
                 }
@@ -1844,7 +2221,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 state_[s].dev = nullptr;
             }
         }
-        if (getenv("SI_ONNX_CONSTCHK")) {
+        if (const_chk_) {
             // The constants' device copies are checked after every operator:
             // one of them was overwritten (by a kernel that wrote past its
             // output, or by a buffer that two values shared), and the
@@ -1864,18 +2241,91 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
     }
 
     // The graph's outputs are read back to the host: they are what the
-    // client asked for.
-    for (int s : g_.output_slots) {
+    // client asked for.  A reduced output transfers only its reduction (see
+    // set_output_reduce): the tensor itself never crosses the bus.
+    reduced_.assign(g_.output_slots.size(), {});
+    const auto tr0 = std::chrono::steady_clock::now();
+    for (size_t oi = 0; oi < g_.output_slots.size(); ++oi) {
+        const int s = g_.output_slots[oi];
         if (s < 0 || s >= (int)state_.size()) continue;
         // An output the client asked not to receive is not read back: the
         // device buffer stays where the last operator left it, and the
         // 48 MB mask of the layout model never crosses the bus.
         if (skip_out_.count(s)) continue;
         slot_state & st = state_[s];
+        const auto rit = out_reduce_.find(g_.tensors[s].name);
+        if (rit != out_reduce_.end() && st.dev && !g_.tensors[s].on_host && st.bytes) {
+            const std::vector<int64_t> & shp = g_.tensors[s].shape;
+            const int64_t dt = g_.tensors[s].dtype;
+            if (rit->second == kReduceArgmax && dt == onnxpb::FLOAT) {
+                const int64_t V = shp.empty() ? 1 : shp.back();
+                const size_t outer = V > 0 ? g_.tensors[s].count / (size_t)V : 0;
+                if (V > 0 && outer > 0) {
+                    void * d_idx = acquire(outer * 8);
+                    void * d_max = acquire(outer * 4);
+                    if (!d_idx || !d_max) {
+                        if (d_idx) release(d_idx, outer * 8);
+                        if (d_max) release(d_max, outer * 4);
+                        throw std::runtime_error("the device allocation for the argmax of '" +
+                                                 g_.tensors[s].name + "' failed");
+                    }
+                    argmax_max_launch(q_, (const float *)st.dev, (int64_t *)d_idx,
+                                      (float *)d_max, (int64_t)outer, V);
+                    reduced_output ri, rv;
+                    ri.shape.assign(shp.begin(), shp.end() - 1);
+                    ri.dtype = onnxpb::INT64;
+                    ri.host.resize(outer * 8);
+                    rv.shape = ri.shape;
+                    rv.dtype = onnxpb::FLOAT;
+                    rv.host.resize(outer * 4);
+                    q_download(q_, d_idx, ri.host.data(), ri.host.size());
+                    q_download(q_, d_max, rv.host.data(), rv.host.size());
+                    release(d_idx, outer * 8);
+                    release(d_max, outer * 4);
+                    reduced_[oi].push_back(std::move(ri));
+                    reduced_[oi].push_back(std::move(rv));
+                    continue;
+                }
+            } else if (rit->second == kReduceU8) {
+                const size_t n = g_.tensors[s].count;
+                void * d = acquire(n ? n : 1);
+                if (!d) {
+                    throw std::runtime_error("the device allocation for the byte cast of '" +
+                                             g_.tensors[s].name + "' failed");
+                }
+                const int in_kind = dt == onnxpb::INT64  ? kCastI64
+                                    : dt == onnxpb::INT32 ? kCastI32
+                                    : dt == onnxpb::BOOL ? kCastBool
+                                                          : kCastF32;
+                cast_launch(q_, st.dev, d, n, in_kind, kCastU8);
+                reduced_output r;
+                r.shape = shp;
+                r.dtype = onnxpb::UINT8;
+                r.host.resize(n);
+                q_download(q_, d, r.host.data(), r.host.size());
+                release(d, n ? n : 1);
+                reduced_[oi].push_back(std::move(r));
+                continue;
+            }
+        }
         if (st.dev && g_.tensors[s].host.empty()) {
             g_.tensors[s].host.resize(st.bytes);
-            q_download(q_, st.dev, g_.tensors[s].host.data(), g_.tensors[s].host.size());
+            // Enqueue every output copy and wait once.  `q_download` waits on
+            // the whole (in-order) queue per call, and a Loop-body run reads
+            // back 31 carried values every iteration: 31 full drains for one
+            // iteration's work, 27 times over, was most of the table
+            // structurer's decoder.  The copies are ordered against the
+            // producers by the queue itself, so one wait at the end is enough.
+            q_.memcpy(g_.tensors[s].host.data(), st.dev, g_.tensors[s].host.size());
         }
+    }
+    rb_ms_ += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - tr0).count();
+    {
+        const auto w0 = std::chrono::steady_clock::now();
+        q_.wait();
+        wait_ms_ += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - w0).count();
     }
 
     report_leak();
@@ -1887,7 +2337,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         if (it == g_.output_slots.end()) {
             throw std::runtime_error("the graph has no output called " + o.first);
         }
-        o.second = g_.tensors[*it].host;
+        o.second = std::move(g_.tensors[*it].host);
     }
     calls_++;
     if (upload_dbg_) {

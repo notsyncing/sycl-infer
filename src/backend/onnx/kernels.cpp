@@ -1,5 +1,6 @@
 #include "kernels.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -145,12 +146,37 @@ void conv2d_kernel(sycl::queue & q, const float * x, const float * w, const floa
     q.submit([&](sycl::handler & h) {
         h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
             const int64_t idx = it.get_id(0);
-            const int blk = (int)(idx % nblocks);
-            const int64_t t1 = idx / nblocks;
-            const int wo = (int)(t1 % Wo);
-            const int64_t t2 = t1 / Wo;
-            const int ho = (int)(t2 % Ho);
-            const int n = (int)(t2 / Ho);
+            // The index order is picked for the shape:
+            //
+            //   * a depthwise convolution (one channel per group, TM = 1)
+            //     wants the output *column* fastest: lanes then read adjacent
+            //     input pixels, while the channel-fastest order made every
+            //     lane of a warp read a plane H*W floats from its neighbour.
+            //     The detector and the table models are mostly depthwise;
+            //   * a group-1 convolution wants the channel block fastest:
+            //     every lane of a warp then reads the *same* input pixel (one
+            //     cache line for the whole warp, a 32x cut in input traffic)
+            //     and its own 8-float weight block (contiguous across lanes).
+            //     The recogniser and the layout detector are mostly these.
+            //
+            // One ordering for both measured 4.6x slower on the SLANet
+            // decoder once the depthwise case was fixed.
+            int wo, ho, blk, n;
+            if (mg > 1) {
+                blk = (int)(idx % nblocks);
+                const int64_t b1 = idx / nblocks;
+                wo = (int)(b1 % Wo);
+                const int64_t b2 = b1 / Wo;
+                ho = (int)(b2 % Ho);
+                n = (int)(b2 / Ho);
+            } else {
+                wo = (int)(idx % Wo);
+                const int64_t b1 = idx / Wo;
+                ho = (int)(b1 % Ho);
+                const int64_t b2 = b1 / Ho;
+                blk = (int)(b2 % nblocks);
+                n = (int)(b2 / nblocks);
+            }
             const int g = blk / per_group;          // the group
             const int mloc = (blk % per_group) * TM;  // the channel inside it
             const int m0 = g * mg + mloc;             // the first output channel
@@ -198,23 +224,34 @@ void conv2d_kernel(sycl::queue & q, const float * x, const float * w, const floa
 
 } // namespace
 
-// The copies are *synchronous*.  A queued copy reads its source buffer
+// The host copies are *synchronous*.  A queued copy reads its source buffer
 // later, and the host buffers here are temporaries (a vector in the
 // operator's frame): an asynchronous copy would read them after they are
 // destroyed, which is a use-after-free the heap notices much later.
+// (A device-to-device copy has no host buffer - see `q_copy_dev` below.)
 void q_upload(sycl::queue & q, const void * src, void * dst, size_t bytes) {
     if (bytes == 0) return;
     q.memcpy(dst, src, bytes).wait();
 }
 
+std::atomic<long> g_q_downloads{0};
+
 void q_download(sycl::queue & q, const void * src, void * dst, size_t bytes) {
     if (bytes == 0) return;
+    ++g_q_downloads;
     q.memcpy(dst, src, bytes).wait();
 }
 
 void q_copy_dev(sycl::queue & q, const void * src, void * dst, size_t bytes) {
     if (bytes == 0) return;
-    q.memcpy(dst, src, bytes).wait();
+    // **Not waited.**  A device-to-device copy is a queued command like any
+    // other, and the executor's queue is in order: the next operator's
+    // kernels see this copy's writes without a host round trip.  The wait
+    // was 40 queue drains per table-decoder iteration (one per
+    // Squeeze/Unsqueeze/Reshape, which are all this copy), and a drain waits
+    // for *every* kernel ahead of it - so the host never got ahead of the
+    // device and each iteration cost a full submit-plus-drain cycle.
+    q.memcpy(dst, src, bytes);
 }
 
 // The elementwise kernel.
@@ -275,7 +312,10 @@ void cast_launch(sycl::queue & q, const void * x, void * y, size_t n, int in_kin
             // boolean is its truth, and the models use the cast to turn a
             // counter into a flag: the loop's condition is a cast of a
             // comparison to a boolean.)
-            if (out_kind == kCastToBool) {
+            if (out_kind == kCastU8) {
+                const int64_t v = in_kind == kCastF32 ? (int64_t)dv : iv;
+                ((uint8_t *)y)[i] = (uint8_t)v;
+            } else if (out_kind == kCastToBool) {
                 const int64_t v = in_kind == kCastF32 ? (dv != 0.0f ? 1 : 0) : (iv != 0 ? 1 : 0);
                 ((float *)y)[i] = (float)v;
             } else if (out_kind == kCastF32) {
@@ -685,6 +725,75 @@ void argmax_launch(sycl::queue & q, const float * x, int64_t * y, int64_t outer,
     });
 }
 
+// One work-group per row, each lane walking a strided slice: the recogniser's
+// probability tensor is read with coalesced 32-bit accesses and the whole
+// row is reduced in shared memory.  The combine takes the larger value and,
+// on a tie, the *lower* index - which is the order numpy's argmax reports
+// and what the host decoder assumed.
+void argmax_max_launch(sycl::queue & q, const float * x, int64_t * y_idx, float * y_max,
+                       int64_t outer, int64_t n) {
+    if (outer <= 0 || n <= 0) return;
+    constexpr int WG = 256;
+    if (n < 2 * WG) {
+        q.submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>((size_t)outer), [=](sycl::item<1> it) {
+                const int64_t row = it.get_id(0);
+                const float * p = x + row * n;
+                float best = p[0];
+                int64_t bi = 0;
+                for (int64_t k = 1; k < n; ++k) {
+                    const float v = p[k];
+                    if (v > best) {
+                        best = v;
+                        bi = k;
+                    }
+                }
+                y_idx[row] = bi;
+                y_max[row] = best;
+            });
+        });
+        return;
+    }
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(WG), h);
+        sycl::local_accessor<int64_t, 1> si(sycl::range<1>(WG), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)outer * WG),
+                                         sycl::range<1>(WG)),
+                       [=](sycl::nd_item<1> it) {
+                           const int64_t row = it.get_group(0);
+                           const int64_t lid = (int64_t)it.get_local_id(0);
+                           const float * p = x + row * n;
+                           float best = -3.0e38f;
+                           int64_t bi = 0;
+                           for (int64_t k = lid; k < n; k += WG) {
+                               const float v = p[k];
+                               if (v > best) {
+                                   best = v;
+                                   bi = k;
+                               }
+                           }
+                           sv[lid] = best;
+                           si[lid] = bi;
+                           it.barrier();
+                           for (int s = WG / 2; s > 0; s >>= 1) {
+                               if (lid < s) {
+                                   const float ov = sv[lid + s];
+                                   const int64_t oi = si[lid + s];
+                                   if (ov > sv[lid] || (ov == sv[lid] && oi < si[lid])) {
+                                       sv[lid] = ov;
+                                       si[lid] = oi;
+                                   }
+                               }
+                               it.barrier();
+                           }
+                           if (lid == 0) {
+                               y_idx[row] = si[0];
+                               y_max[row] = sv[0];
+                           }
+                       });
+    });
+}
+
 // The reduction over an *integer* input.
 //
 // The layout model's decoder reduces a mask of twelve million int32
@@ -826,22 +935,72 @@ void reduce_launch(sycl::queue & q, const float * x, float * y, int64_t outer, i
 }
 
 void softmax_launch(sycl::queue & q, const float * x, float * y, size_t rows, int64_t cols) {
-    q.submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::range<1>(rows), [=](sycl::item<1> it) {
-            const size_t r = it.get_id(0);
-            const float * xp = x + (int64_t)r * cols;
-            float * yp = y + (int64_t)r * cols;
-            float mx = xp[0];
-            for (int64_t i = 1; i < cols; ++i) mx = xp[i] > mx ? xp[i] : mx;
-            float sum = 0.0f;
-            for (int64_t i = 0; i < cols; ++i) {
-                const float e = std::exp(xp[i] - mx);
-                yp[i] = e;
-                sum += e;
-            }
-            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-            for (int64_t i = 0; i < cols; ++i) yp[i] *= inv;
+    constexpr int WG = 256;
+    // A wide row is reduced by a whole work-group: one work-item per row
+    // leaves the device idle.  The recogniser's softmax is [1536, 18710] -
+    // 1536 work-items is three per EU - and it measured 25.7 ms, three times
+    // the conv time it follows.
+    if (cols < 2 * WG || rows == 0) {
+        q.submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>(rows ? rows : 1), [=](sycl::item<1> it) {
+                if (!rows) return;
+                const size_t r = it.get_id(0);
+                if (r >= rows) return;
+                const float * xp = x + (int64_t)r * cols;
+                float * yp = y + (int64_t)r * cols;
+                float mx = xp[0];
+                for (int64_t i = 1; i < cols; ++i) mx = xp[i] > mx ? xp[i] : mx;
+                float sum = 0.0f;
+                for (int64_t i = 0; i < cols; ++i) {
+                    const float e = std::exp(xp[i] - mx);
+                    yp[i] = e;
+                    sum += e;
+                }
+                const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (int64_t i = 0; i < cols; ++i) yp[i] *= inv;
+            });
         });
+        return;
+    }
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(WG), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * WG), sycl::range<1>(WG)),
+                       [=](sycl::nd_item<1> it) {
+                           const int64_t r = it.get_group(0);
+                           const int64_t lane = it.get_local_id(0);
+                           const float * xp = x + r * cols;
+                           float * yp = y + r * cols;
+                           // The maximum, in a private accumulator and then
+                           // a shared tree.
+                           float mx = -3.0e38f;
+                           for (int64_t i = lane; i < cols; i += WG) {
+                               const float v = xp[i];
+                               if (v > mx) mx = v;
+                           }
+                           red[lane] = mx;
+                           it.barrier();
+                           for (int s = WG / 2; s > 0; s >>= 1) {
+                               if (lane < s && red[lane + s] > red[lane]) red[lane] = red[lane + s];
+                               it.barrier();
+                           }
+                           mx = red[0];
+                           it.barrier();
+                           // exp and the sum, each lane over its own slice.
+                           float sum = 0.0f;
+                           for (int64_t i = lane; i < cols; i += WG) {
+                               const float e = sycl::exp(xp[i] - mx);
+                               yp[i] = e;
+                               sum += e;
+                           }
+                           red[lane] = sum;
+                           it.barrier();
+                           for (int s = WG / 2; s > 0; s >>= 1) {
+                               if (lane < s) red[lane] += red[lane + s];
+                               it.barrier();
+                           }
+                           const float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+                           for (int64_t i = lane; i < cols; i += WG) yp[i] *= inv;
+                       });
     });
 }
 
@@ -1383,6 +1542,88 @@ void grid_sample_launch(sycl::queue & q, const float * x, const float * grid, fl
             }
         });
     });
+}
+
+} // namespace onnx
+} // namespace si
+
+namespace si {
+namespace onnx {
+
+// The ScatterElements: the destination of (l, p, t) is (l*dim + p)*T + t,
+// where p is the axis position.  The indices give p for every (l, t).
+namespace {
+
+template <typename VT>
+void scatter_elements_typed(sycl::queue & q, const void * idx, int idx_kind, int64_t n_idx,
+                            const void * upd, int64_t n_upd, void * out, int64_t L, int64_t T,
+                            int64_t dim, bool slice_form) {
+    if (L <= 0 || T <= 0 || dim <= 0) return;
+    const int64_t total = L * dim * T;
+    if (slice_form) {
+        // One work-item per update element (the updates have the data's
+        // shape).  (l, cc, t) writes at axis position id + cc, which is the
+        // host loop's order; a destination past the end is dropped, exactly
+        // as the host code's bounds check does.
+        q.submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>((size_t)total), [=](sycl::item<1> it) {
+                const int64_t i = (int64_t)it.get_id(0);
+                const int64_t l = i / (dim * T);
+                const int64_t rem = i - l * (dim * T);
+                const int64_t cc = rem / T;
+                const int64_t t = rem - cc * T;
+                const int64_t k = l * T + t;
+                if (k >= n_upd) return;
+                const int64_t id0 = k >= n_idx ? 0
+                                    : idx_kind == kScatterIdxI32
+                                        ? (int64_t)((const int32_t *)idx)[k]
+                                        : ((const int64_t *)idx)[k];
+                const int64_t id = id0 < 0 ? id0 + dim : id0;
+                const int64_t dst = (l * dim + (id + cc)) * T + t;
+                if (dst >= 0 && dst < total) ((VT *)out)[dst] = ((const VT *)upd)[i];
+            });
+        });
+        return;
+    }
+    // One work-item per index (one value per (l, t)).
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>((size_t)(L * T)), [=](sycl::item<1> it) {
+            const int64_t i = (int64_t)it.get_id(0);
+            const int64_t l = i / T;
+            const int64_t t = i - l * T;
+            // The host loop reads one index per (l, t) and one update per
+            // index; a short list defaults the index to 0 and drops the
+            // update, which are mirrored here.
+            if (i >= n_upd) return;
+            const int64_t id0 = i >= n_idx ? 0
+                                : idx_kind == kScatterIdxI32
+                                    ? (int64_t)((const int32_t *)idx)[i]
+                                    : ((const int64_t *)idx)[i];
+            const int64_t id = id0 < 0 ? id0 + dim : id0;
+            if (id < 0 || id >= dim) return;
+            ((VT *)out)[(l * dim + id) * T + t] = ((const VT *)upd)[i];
+        });
+    });
+}
+
+} // namespace
+
+void scatter_elements_launch(sycl::queue & q, const void * data, const void * idx, int idx_kind,
+                             int64_t n_idx, const void * upd, int64_t n_upd, void * out, int64_t L,
+                             int64_t T, int64_t dim, bool slice_form, int kind) {
+    // The copy of the data is the operator's other half; the caller issues it
+    // (q_copy_dev) so this stays one kernel.
+    (void)data;
+    if (kind == kScatterI32) {
+        scatter_elements_typed<int32_t>(q, idx, idx_kind, n_idx, upd, n_upd, out, L, T, dim,
+                                        slice_form);
+    } else if (kind == kScatterI64) {
+        scatter_elements_typed<int64_t>(q, idx, idx_kind, n_idx, upd, n_upd, out, L, T, dim,
+                                        slice_form);
+    } else {
+        scatter_elements_typed<float>(q, idx, idx_kind, n_idx, upd, n_upd, out, L, T, dim,
+                                      slice_form);
+    }
 }
 
 } // namespace onnx

@@ -38,5 +38,18 @@ bool conv_dnnl_launch(sycl::queue & q, const float * x, const float * w, float *
 bool matmul_dnnl_launch(sycl::queue & q, const float * a, const float * b, float * y, int64_t M,
                         int64_t K, int64_t N);
 
+// A 1x1, stride-1, group-1 convolution as a batched matmul.
+//
+// The recogniser, the detector, the layout detector and the table models are
+// all full of 1x1 convolutions (61 of the detector's 83), and the direct
+// convolution evaluates them one output pixel at a time: 183 of the
+// detector's 431 ms.  A 1x1 convolution is `W^T (M,C) x X (C,HW)` per image,
+// so the weights are transposed once (cached by pointer) and each image is
+// an (M,K)x(K,N) matmul on oneDNN.
+//
+// `w` is the runtime's (C,1,1,M) weight; `x` and `y` are NCHW.
+bool conv1x1_matmul_launch(sycl::queue & q, const float * w, const float * x, float * y, int N,
+                           int M, int C, int HW);
+
 } // namespace onnx
 } // namespace si

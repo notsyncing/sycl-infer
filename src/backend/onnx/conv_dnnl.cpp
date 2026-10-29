@@ -103,6 +103,16 @@ bool matmul_dnnl_launch(sycl::queue & q, const float * a, const float * b, float
                         int64_t K, int64_t N) {
     if (!g_enabled) return false;
     if (M <= 0 || K <= 0 || N <= 0) return false;
+    // oneDNN's per-call cost (a mutex, three memory descriptors and a stream
+    // submission) is ~30 us on these cards; for the table decoder's tiny
+    // matrices the plain SYCL kernel is cheaper.  The layout model's 384M
+    // MAC bmm and the convolutions are far above any threshold.  A minimum
+    // op count of 0 keeps every matmul on oneDNN (the old behaviour).
+    static const long long mm_min = [] {
+        const char * e = getenv("PF_ONNX_MM_DNNL_MIN");
+        return e ? atoll(e) : 0;
+    }();
+    if (M * K * N < mm_min) return false;
     std::lock_guard<std::mutex> lock(g_mtx);
     try {
         dev_ctx * ctx = ctx_for(q);
@@ -133,6 +143,51 @@ bool matmul_dnnl_launch(sycl::queue & q, const float * a, const float * b, float
             said = true;
         }
         return false;
+    }
+    return true;
+}
+
+namespace {
+// The transposed 1x1 weights, keyed by the weight pointer.  A weight lives
+// for the process, so the entry does too (and the buffer is device memory
+// owned by this cache, not by the executor's pool).
+std::map<const void *, void *> g_wt;
+} // namespace
+
+bool conv1x1_matmul_launch(sycl::queue & q, const float * w, const float * x, float * y, int N,
+                           int M, int C, int HW) {
+    if (!g_enabled) return false;
+    if (N <= 0 || M <= 0 || C <= 0 || HW <= 0) return false;
+    // Only when the matmul is worth its per-image call: a few large images
+    // amortise the primitive and the transposition, a batch of one does not.
+    const float * wt = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        auto it = g_wt.find(w);
+        if (it == g_wt.end()) {
+            const size_t bytes = (size_t)M * C * sizeof(float);
+            void * wt = sycl::malloc_device(bytes, q);
+            if (!wt) return false;
+            const float * src = w;
+            float * dst = (float *)wt;
+            const int mm = M, cc = C;
+            q.submit([&](sycl::handler & h) {
+                h.parallel_for(sycl::range<1>((size_t)M * C), [=](sycl::item<1> it2) {
+                    const size_t i = it2.get_id(0);
+                    const int m = (int)(i / cc);
+                    const int c = (int)(i % cc);
+                    dst[i] = src[(size_t)c * mm + m];
+                });
+            });
+            it = g_wt.emplace(w, wt).first;
+            g_wbytes += bytes;
+        }
+        wt = (const float *)it->second;
+    }
+    for (int n = 0; n < N; ++n) {
+        if (!matmul_dnnl_launch(q, wt, x + (size_t)n * C * HW, y + (size_t)n * M * HW, M, C, HW)) {
+            return false;
+        }
     }
     return true;
 }
