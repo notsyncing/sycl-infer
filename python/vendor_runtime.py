@@ -18,14 +18,14 @@ DEST = ROOT / "sycl_infer" / "_lib"
 
 # SONAME -> candidate directories (first existing wins)
 LIBS = {
-    "libsycl.so.9": ["/opt/intel/oneapi/2026.2/lib", "/opt/intel/oneapi/compiler/2026.2/lib"],
-    "libsvml.so": ["/opt/intel/oneapi/compiler/2026.2/lib"],
-    "libimf.so": ["/opt/intel/oneapi/compiler/2026.2/lib"],
-    "libintlc.so.5": ["/opt/intel/oneapi/compiler/2026.2/lib"],
-    "libirng.so": ["/opt/intel/oneapi/compiler/2026.2/lib"],
+    "libsycl.so.9": ["/opt/intel/oneapi/2026.2/lib", "/opt/intel/oneapi/compiler/2026.2/lib", "/opt/intel/oneapi/2026.1/lib", "/opt/intel/oneapi/compiler/2026.1/lib"],
+    "libsvml.so": ["/opt/intel/oneapi/compiler/2026.2/lib", "/opt/intel/oneapi/compiler/2026.1/lib", "/opt/intel/oneapi/2026.1/lib"],
+    "libimf.so": ["/opt/intel/oneapi/compiler/2026.2/lib", "/opt/intel/oneapi/compiler/2026.1/lib", "/opt/intel/oneapi/2026.1/lib"],
+    "libintlc.so.5": ["/opt/intel/oneapi/compiler/2026.2/lib", "/opt/intel/oneapi/compiler/2026.1/lib", "/opt/intel/oneapi/2026.1/lib"],
+    "libirng.so": ["/opt/intel/oneapi/compiler/2026.2/lib", "/opt/intel/oneapi/compiler/2026.1/lib", "/opt/intel/oneapi/2026.1/lib"],
     "libdnnl.so.3": ["/opt/intel/oneapi/dnnl/2026.1/lib", "/opt/intel/oneapi/dnnl/2026.0/lib"],
-    "libtbb.so.12": ["/usr/lib/x86_64-linux-gnu", "/usr/lib64"],
-    "libOpenCL.so.1": ["/usr/lib/x86_64-linux-gnu", "/usr/lib64"],
+    "libtbb.so.12": ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/opt/intel/oneapi/2026.1/lib", "/opt/intel/oneapi/tbb/2023.1/lib"],
+    "libOpenCL.so.1": ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/opt/intel/oneapi/2026.1/lib", "/opt/intel/oneapi/tbb/2023.1/lib"],
     "libze_loader.so.1": ["/usr/lib/x86_64-linux-gnu", "/usr/lib64",
                            "/opt/intel/oneapi/2026.2/lib"],
 }
@@ -55,6 +55,12 @@ def main() -> int:
     if not src.exists():
         print(f"engine library not found under {build}", file=sys.stderr)
         return 1
+    onnx_src = build / "libsycl_infer_onnx.so.1.0.0"
+    if not onnx_src.exists():
+        onnx_src = build / "libsycl_infer_onnx.so.1"
+    if not onnx_src.exists():
+        print(f"ONNX library not found under {build}", file=sys.stderr)
+        return 1
     DEST.mkdir(parents=True, exist_ok=True)
     for old in DEST.glob("*.so*"):
         old.unlink()
@@ -63,6 +69,10 @@ def main() -> int:
     shutil.copy2(real, DEST / "libsycl_infer.so.1.0.0")
     shutil.copy2(real, DEST / "libsycl_infer.so.1")
     print(f"  {'libsycl_infer.so':24s} <- {real}")
+    onnx_real = onnx_src.resolve()
+    shutil.copy2(onnx_real, DEST / "libsycl_infer_onnx.so.1.0.0")
+    shutil.copy2(onnx_real, DEST / "libsycl_infer_onnx.so.1")
+    print(f"  {'libsycl_infer_onnx.so':24s} <- {onnx_real}")
     ok = True
     for name, dirs in LIBS.items():
         ok = copy_one(name, dirs, DEST) and ok
