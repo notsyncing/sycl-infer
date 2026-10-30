@@ -2715,7 +2715,16 @@ bit-identical (the same `md5`), details in the same design doc:
   queued copy into a buffer the pool hands out is a corruption waiting to
   happen).  Integers keep the host route.  `PF_ONNX_LOOP_NODEV=1` is the A/B.
   Pinned slots are excluded from in-place borrowing, because a borrow moves
-  the buffer's ownership to the output.
+  the buffer's ownership to the output.  The chained value's **shape, count
+  and dtype** must be copied into the body input with the bytes: the host
+  route carries the shape in the feed, the device route feeds nothing.  Without
+  it the formula recogniser's KV caches were copied but every `Concat` still
+  saw the initial `[1,16,0,32]` shape, the cache never grew, and a later
+  reshape asked for a target the growing mask could not fit (it surfaced as
+  `OUT_OF_DEVICE_MEMORY`).  The body's pool is also trimmed **during** the
+  loop (`PF_ONNX_LOOP_TRIM_MB`, default 256 MiB; `0` = unbounded) because
+  growing shapes leave ~28 MiB per iteration in it and a single formula run
+  reaches 12 GB before the end-of-run trim.
 * **`q_copy_dev` no longer waits.**  It is the copy behind every
   `Squeeze`/`Unsqueeze`/`Reshape`, ~40 per iteration; each wait was a full
   queue drain, so the host never got ahead of the device.

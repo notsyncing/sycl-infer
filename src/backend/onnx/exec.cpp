@@ -234,12 +234,28 @@ size_t executor::live_bytes_calc() const {
         auto it = alloc_size_.find(p);
         if (it != alloc_size_.end()) n += it->second;
     }
+    // A Loop body is a separate executor with its own live set.  Its buffers
+    // are just as much this graph's device memory, and `pool_debug` /
+    // syi_onnx_info must report them; otherwise the memory report says a
+    // formula run holds nothing while its body holds gigabytes.
+    for (const auto & b : loop_bodies_) {
+        if (b.second) n += b.second->live_bytes_calc();
+    }
     return n;
 }
 
 size_t executor::pooled_bytes_calc() const {
     size_t n = 0;
     for (const auto & kv : free_) n += kv.first * kv.second.size();
+    // The formula recogniser's Loop body is where the free pool actually
+    // grows: one entry per distinct tensor size in a 1 700-operator body.
+    // The size-based trim decision must see it, or a caller that only looks
+    // at this graph's own (small) pool never trims the body at all - which
+    // is exactly how the 12-document run reached OUT_OF_DEVICE_MEMORY while
+    // `pooled_bytes()` reported a few megabytes.
+    for (const auto & b : loop_bodies_) {
+        if (b.second) n += b.second->pooled_bytes_calc();
+    }
     return n;
 }
 
@@ -250,6 +266,10 @@ size_t executor::free_mem_bytes() const {
     // number still says whether *this* graph is the one that ran out.
     size_t live = 0;
     for (const auto & kv : alloc_size_) live += kv.second;
+    for (const auto & b : loop_bodies_) {
+        if (!b.second) continue;
+        for (const auto & kv : b.second->alloc_size_) live += kv.second;
+    }
     size_t total = 0;
     try {
         total = q_.get_device().get_info<sycl::info::device::global_mem_size>();
@@ -287,6 +307,26 @@ void * executor::acquire(size_t bytes) {
         }
     }
     void * p = sycl::malloc_device(bytes, q_);
+    if (!p) {
+        // The card refused an allocation.  The pooled buffers are free by
+        // construction (nothing holds them), so dropping them - including
+        // the ones a Loop body parked in its own pool - is always safe and
+        // is the difference between a 500 and a slow iteration.  Wait first:
+        // the queue is in order and a released buffer may still be read by
+        // an already-submitted kernel.
+        trim_pool();
+        p = sycl::malloc_device(bytes, q_);
+        if (p) {
+            fprintf(stderr,
+                    "[onnx] device allocation of %zu bytes failed; trimmed the pool (including "
+                    "Loop bodies) and retried\n", bytes);
+        } else {
+            fprintf(stderr,
+                    "[onnx] device allocation of %zu bytes failed after trimming: live=%zu "
+                    "pooled=%zu free=%zu\n",
+                    bytes, live_bytes_calc(), pooled_bytes_calc(), free_mem_bytes());
+        }
+    }
     if (p) {
         ++malloc_count_;
         alloc_size_[p] = bytes;
@@ -301,6 +341,13 @@ void * executor::acquire(size_t bytes) {
 
 void executor::trim_pool() {
     q_.wait();
+    // A Loop body is a separate executor with its own pool.  The formula
+    // recogniser's body runs hundreds of iterations; trimming only the outer
+    // graph leaves that pool alive and it eventually exhausts the card.  Trim
+    // nested bodies first, then this graph's own free list.
+    for (auto & body : loop_bodies_) {
+        if (body.second) body.second->trim_pool();
+    }
     for (auto & kv : free_) {
         for (void * p : kv.second) {
             auto it = alloc_size_.find(p);
@@ -639,6 +686,10 @@ void executor::prepare_inputs(exec_op & op) {
                 // block is lost to the activations for ever - 1.9 GB of the
                 // layout model's steady footprint was exactly this.
                 st.dev = sycl::malloc_device(h.size(), q_);
+                if (!st.dev) {
+                    trim_pool();
+                    st.dev = sycl::malloc_device(h.size(), q_);
+                }
                 if (st.dev) {
                     alloc_size_[st.dev] = h.size();
                     if (!live_.insert(st.dev).second) {
@@ -1000,9 +1051,24 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         bexec->q_.memcpy(cb, ss.dev, bytes);
         ds.bytes = bytes;
         ds.dev_gen = ds.host_gen;
-        bexec->g_.tensors[is].dev = ds.dev;
-        bexec->g_.tensors[is].on_host = false;
-        bexec->g_.tensors[is].host.clear();
+        // The body input is the body *output* now, and its shape has to move
+        // with the bytes.  A cached value grows every iteration (the formula
+        // recogniser's KV caches go [1,16,0,32] -> [1,16,n,32]); the host
+        // route carries the shape in the feed, but this route feeds nothing,
+        // so leaving the input tensor's shape at the initial one made every
+        // Concat see an empty cache.  The values were copied but the shape
+        // said zero, so the model's KV cache never accumulated and its
+        // reshape target stayed at the first iteration's shape - the
+        // `[1,16,1,560] -> [16,1,1]` allocation that reported
+        // OUT_OF_DEVICE_MEMORY.
+        const tensor & ot = bexec->g_.tensors[os];
+        tensor & it = bexec->g_.tensors[is];
+        it.shape = ot.shape;
+        it.count = ot.count;
+        it.dtype = ot.dtype;
+        it.dev = ds.dev;
+        it.on_host = false;
+        it.host.clear();
         return true;
     };
 
@@ -1107,6 +1173,17 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     for (int64_t iter = 0; iter < max_iter; ++iter) {
         if (!cond) break;
         ++iters_run;
+        static const bool loopmem = getenv("SI_ONNX_LOOPMEM") != nullptr;
+        if (loopmem) {
+            size_t dw = 0, ds = 0;
+            conv_dnnl_mem(&dw, &ds);
+            fprintf(stderr,
+                    "[onnx] loop iter=%lld body_live=%.1f MiB body_pooled=%.1f MiB "
+                    "body_allocs=%zu dnnl_w=%.1f MiB dnnl_s=%.1f MiB\n",
+                    (long long)iters_run, bexec->live_bytes_calc() / 1048576.0,
+                    bexec->pooled_bytes_calc() / 1048576.0, bexec->alloc_size_.size(),
+                    dw / 1048576.0, ds / 1048576.0);
+        }
         // The body's inputs.
         std::vector<onnxwire::tensor> feeds;
         {
@@ -1207,6 +1284,23 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             const int os = bg.output_slots.size() > si ? bg.output_slots[si] : -1;
             if (os >= 0) scan_shape[s] = bexec->output(si).shape;
             ++j;
+        }
+        // A growing shape leaves one buffer per past size in the body's free
+        // pool: the formula recogniser's KV caches go [1,16,n,32] and every
+        // iteration allocates a slightly larger tile than the last, so the
+        // free list grows by ~28 MB per iteration.  The whole model's pool
+        // is trimmed at the end of a run, but this loop can run 2 500
+        // iterations in one run and reaches 12 GB long before it ends - the
+        // OUT_OF_DEVICE_MEMORY that killed the formula model on the long
+        // report corpus.  Trim at a bound, not every iteration: the pool's
+        // recent sizes are still reused, and the wait is free because the
+        // body's own run has already waited.
+        static const size_t loop_trim_mb = [] {
+            const char * e = getenv("PF_ONNX_LOOP_TRIM_MB");
+            return e && *e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)256;
+        }();
+        if (loop_trim_mb && bexec->pooled_bytes_calc() > loop_trim_mb * 1024ull * 1024ull) {
+            bexec->trim_pool();
         }
     }
     if (opstat_) {

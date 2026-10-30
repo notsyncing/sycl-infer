@@ -428,6 +428,23 @@ sub-graph rules live:
   enclosing graph computes (ONNX's outer scope).  The trip count is
   optional: an empty one means "no limit".
 
+  Two things about the loop's state are load-bearing.  A **device-chained
+  carried value** (a produced carried value whose body output lives on the
+  device) is copied into the body input slot, and the input tensor's shape,
+  count and dtype must be updated from the output with it: the host route
+  carries the shape in the feed, but the device route feeds nothing.  Without
+  that, the formula recogniser's KV caches were copied but every `Concat`
+  still saw the *initial* `[1,16,0,32]` shape, so the cache never accumulated
+  (and a later reshape asked for a target the growing mask could not fit -
+  the `OUT_OF_DEVICE_MEMORY` that looked like a device bug).  And the body's
+  free pool has to be **bounded during the loop**: growing shapes leave one
+  buffer per past size, ~28 MiB per iteration on the formula recogniser, so
+  a 2 500-iteration run reaches 12 GB inside a single `run()`.  The loop
+  trims its body pool at `PF_ONNX_LOOP_TRIM_MB` (default 256 MiB; `0` keeps
+  the old unbounded behaviour); trimming only after the model finishes is
+  too late.  The sycl formula output is now element-for-element identical to
+  ONNXRuntime's on the same input.
+
 ### The oracle, and what it says
 
 The right way to find a divergence is to compare the *intermediates*, not
