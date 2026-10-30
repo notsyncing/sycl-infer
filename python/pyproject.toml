@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sycl-infer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "In-process SYCL LLM inference engine (C ABI + Python binding)"
 readme = "README.md"
 requires-python = ">=3.10"

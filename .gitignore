@@ -14,3 +14,7 @@ python/sycl_infer/_lib/*
 python/dist/
 python/build/
 python/*.egg-info/
+dist/
+
+# Jenkins wheel version stamp
+.wheel-version

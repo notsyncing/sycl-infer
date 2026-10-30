@@ -1,0 +1,188 @@
+// Build the sycl-infer Python wheel inside a pinned Intel oneAPI image.
+//
+// The Jenkins agent only supplies Docker.  The whole toolchain (icpx, SYCL,
+// oneDNN, CMake, Python) comes from the image selected by ONEAPI_IMAGE; the
+// only things installed in the container are the build dependencies the
+// toolkit image does not ship (python3-venv, cmake, the Level Zero/OpenCL
+// loaders).
+//
+// The wheel carries:
+//   * libsycl_infer        - the LLM C ABI (include/sycl_infer/sycl_infer.h)
+//   * libsycl_infer_onnx   - RapidDoc's in-process ONNX executor
+//   * the SYCL / oneDNN / oneAPI runtime closure those two link against
+//
+// The device image is JIT-compiled by IGC at run time by default.  Set AOT
+// when the wheel targets one known GPU SKU.
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        string(name: 'ONEAPI_IMAGE',
+               defaultValue: 'intel/oneapi-toolkit:2026.2.0-devel-ubuntu26.04',
+               description: 'Version-pinned oneAPI toolkit image used for the build')
+        string(name: 'DNNL_VERSION', defaultValue: '2026.2',
+               description: 'oneDNN version used only when the image does not ship one')
+        string(name: 'BUILD_JOBS', defaultValue: '4',
+               description: 'parallel compile jobs; keep low on a memory-constrained agent')
+        booleanParam(name: 'AOT', defaultValue: false,
+               description: 'AOT-compile the device image instead of runtime JIT')
+        string(name: 'AOT_DEVICE', defaultValue: 'acm-g10',
+               description: 'ocloc target when AOT=true (acm-g10 = Arc A770, adl-p = Iris Xe)')
+        string(name: 'HTTP_PROXY', defaultValue: '',
+               description: 'optional proxy for apt/pip inside the build container')
+        string(name: 'HTTPS_PROXY', defaultValue: '',
+               description: 'optional HTTPS proxy for apt/pip inside the build container')
+    }
+
+    environment {
+        DNNL_VERSION = "${params.DNNL_VERSION}"
+        BUILD_JOBS   = "${params.BUILD_JOBS}"
+        AOT          = "${params.AOT ? 'ON' : 'OFF'}"
+        AOT_DEVICE   = "${params.AOT_DEVICE}"
+        HTTP_PROXY   = "${params.HTTP_PROXY}"
+        HTTPS_PROXY  = "${params.HTTPS_PROXY}"
+        NO_PROXY     = "localhost,127.0.0.1,::1"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    // Put the commit in the wheel filename as a PEP 440 local
+                    // version: sycl_infer-0.1.0+<short hash>-py3-none-....whl
+                    // An AOT wheel also names the ocloc target it was built
+                    // for, because it cannot run on another GPU SKU.
+                    def base = readFile('python/VERSION').trim()
+                    def hash = sh(returnStdout: true,
+                                  script: 'git rev-parse --short=7 HEAD').trim()
+                    def version = "${base}+${hash}"
+                    if (params.AOT) {
+                        def device = params.AOT_DEVICE?.trim() ? params.AOT_DEVICE.trim() : 'unknown'
+                        version += ".aot.${device.replaceAll('[^A-Za-z0-9]+', '.')}"
+                    }
+                    env.SYCL_INFER_VERSION = version
+                    writeFile file: ".wheel-version", text: version
+                    echo "Wheel version: ${env.SYCL_INFER_VERSION}"
+                }
+            }
+        }
+
+        stage('Build wheel') {
+            agent {
+                docker {
+                    image "${params.ONEAPI_IMAGE}"
+                    // root is needed only for apt-get; the stage's post block
+                    // gives the workspace back to the Jenkins user.  Host
+                    // networking lets a local proxy on 127.0.0.1:7890 work.
+                    args '-u 0 --network=host'
+                    reuseNode true
+                }
+            }
+
+            stages {
+                stage('Install build dependencies') {
+                    steps {
+                        sh '''
+                            set -e
+                            export DEBIAN_FRONTEND=noninteractive
+                            . /etc/os-release
+                            UBUNTU_TAG="ubuntu${VERSION_ID}"
+
+                            apt-get update
+                            apt-get install -y --no-install-recommends python3 python3-venv python3-pip cmake make wget gnupg ca-certificates libssl-dev libtbb12 libze1 ocl-icd-libopencl1
+
+                            # The full toolkit image ships oneDNN; use it.  Only
+                            # a base/slim image needs the Intel apt package.
+                            DNNL_ROOT="$(ls -d /opt/intel/oneapi/dnnl/*/ 2>/dev/null | sort -V | tail -1 || true)"
+                            DNNL_ROOT="${DNNL_ROOT%/}"
+                            if [ -z "$DNNL_ROOT" ] || [ ! -d "$DNNL_ROOT/include" ] || [ ! -e "$DNNL_ROOT/lib/libdnnl.so" ]; then
+                                wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list"
+                                wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg
+                                echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list
+                                apt-get update
+                                apt-get install -y --no-install-recommends "dnnl-${DNNL_VERSION}--devel"
+                                DNNL_ROOT="/opt/intel/oneapi/dnnl/${DNNL_VERSION}"
+                            fi
+                            echo "$DNNL_ROOT" > /tmp/dnnl_root
+                            echo "oneDNN: $DNNL_ROOT"
+
+                            python3 -m venv /tmp/wheel-venv
+                            . /tmp/wheel-venv/bin/activate
+                            pip install --upgrade pip
+                            pip install build wheel
+                        '''
+                    }
+                }
+
+                stage('Build native libraries') {
+                    steps {
+                        sh '''
+                            bash -c '
+                            set -e
+                            set +u
+                            . /opt/intel/oneapi/setvars.sh
+                            set -u
+                            . /tmp/wheel-venv/bin/activate
+                            DNNL_ROOT="$(cat /tmp/dnnl_root)"
+                            BUILD_DIR="$WORKSPACE/build-wheel"
+                            rm -rf "$BUILD_DIR"
+                            cmake -S "$WORKSPACE" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DDNNL_ROOT="$DNNL_ROOT" -DSI_C_API=ON -DSI_ONNX=ON -DSYCL_INFER_AOT="$AOT" -DSYCL_INFER_AOT_DEVICE="$AOT_DEVICE"
+                            cmake --build "$BUILD_DIR" -j"$BUILD_JOBS" --target sycl_infer_c sycl_infer_onnx_c
+                            '
+                        '''
+                    }
+                }
+
+                stage('Build wheel') {
+                    steps {
+                        sh '''
+                            set -e
+                            . /tmp/wheel-venv/bin/activate
+                            DNNL_ROOT="$(cat /tmp/dnnl_root)"
+                            export SYCL_INFER_VERSION="$(cat "$WORKSPACE/.wheel-version")"
+                            BUILD_DIR="$WORKSPACE/build-wheel"
+                            WHEEL_DIR="$WORKSPACE/dist"
+
+                            python "$WORKSPACE/python/vendor_runtime.py" --build "$BUILD_DIR" --dnnl-root "$DNNL_ROOT"
+                            test -f "$WORKSPACE/python/sycl_infer/_lib/libsycl_infer.so.1.0.0"
+                            test -f "$WORKSPACE/python/sycl_infer/_lib/libsycl_infer_onnx.so.1.0.0"
+
+                            rm -rf "$WHEEL_DIR"
+                            cd "$WORKSPACE/python"
+                            python -m build --wheel --outdir "$WHEEL_DIR"
+                            wheel="$(ls "$WHEEL_DIR"/*.whl | head -1)"
+                            echo "Built: $wheel"
+                            python -m zipfile -l "$wheel" | grep -E 'sycl_infer/_lib/(libsycl_infer|libsycl_infer_onnx|libsycl[.]so|libdnnl)'
+                            pip install --force-reinstall --no-deps "$wheel"
+                            python -c 'import sycl_infer; print("sycl_infer", sycl_infer.__version__)'
+                            python -c 'import pathlib, sycl_infer; p = pathlib.Path(sycl_infer.__file__).parent / "_lib"; print(p); print(sorted(x.name for x in p.iterdir()))'
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    // The container ran as root; hand the generated files back
+                    // to the workspace owner so archiving and cleanup work.
+                    sh '''
+                        chown -R --reference="$WORKSPACE" "$WORKSPACE/build-wheel" "$WORKSPACE/dist" "$WORKSPACE/python/build" "$WORKSPACE/python/sycl_infer/_lib" 2>/dev/null || true
+                        chown --reference="$WORKSPACE" "$WORKSPACE"/python/*.egg-info 2>/dev/null || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            archiveArtifacts artifacts: 'dist/*.whl', fingerprint: true
+        }
+    }
+}
