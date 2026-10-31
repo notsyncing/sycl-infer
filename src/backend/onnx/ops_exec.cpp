@@ -257,6 +257,22 @@ bool copy_i64(op_ctx & c) {
     return true;
 }
 
+// A metadata operator (Reshape / Squeeze / Unsqueeze / Flatten / Identity)
+// does not change the bytes, only the shape.  A value that is already on the
+// host therefore stays there: the device copy would send it across the bus
+// only for the next operator to pull it back.  The formula recogniser's
+// shape chain is exactly that (`Reshape -> Cast -> ...` on a scalar), and the
+// round trip was a queue drain per link.
+bool copy_host_small(op_ctx & c) {
+    if (c.out.empty() || c.in.empty()) return false;
+    const tensor * x = c.in[0];
+    if (!x->on_host || x->host.empty()) return false;
+    if (x->count > (size_t)65536) return false;
+    c.out[0]->host = x->host;
+    c.out[0]->on_host = true;
+    return true;
+}
+
 // The elementwise operator, applied on the host.
 //
 // It is the same arithmetic as the device kernel (see ew_functor in
@@ -356,9 +372,9 @@ void exec_elementwise(op_ctx & c) {
     // grid size (int64 % int64 scalar) before it builds the box coordinates;
     // the host path below reads `host_i64`, which is empty for a value the
     // device owns, and every index would come out as 0.
-    if (c.out[0]->dtype == onnxpb::INT64 && (op == ew_op::mod_ || op == ew_op::max_ ||
-                                             op == ew_op::min_ || op == ew_op::add ||
-                                             op == ew_op::sub || op == ew_op::mul)) {
+    if (c.out[0]->dtype == onnxpb::INT64 &&
+        (op == ew_op::mod_ || op == ew_op::max_ || op == ew_op::min_ || op == ew_op::add ||
+         op == ew_op::sub || op == ew_op::mul)) {
         const tensor * A = c.in[0];
         const tensor * B = c.in.size() > 1 ? c.in[1] : nullptr;
         const bool a_dev = A->dev && A->host.empty();
@@ -1664,6 +1680,7 @@ void exec_gemm(op_ctx & c) {
 
 void exec_identity(op_ctx & c) {
     if (copy_i64(c)) return;
+    if (copy_host_small(c)) return;
     q_copy_dev(c.q, (const float *)c.in[0]->dev, (float *)c.out[0]->dev, c.in[0]->count * 4);
 }
 
@@ -1693,6 +1710,7 @@ void exec_shape(op_ctx & c) {
 void exec_reshape(op_ctx & c) {
     // The target shape is a constant; the copy is a straight one.
     if (copy_i64(c)) return;
+    if (copy_host_small(c)) return;
     q_copy_dev(c.q, (const float *)c.in[0]->dev, (float *)c.out[0]->dev, c.in[0]->count * 4);
 }
 
@@ -1814,6 +1832,7 @@ void exec_transpose(op_ctx & c) {
 
 void exec_flatten(op_ctx & c) {
     if (copy_i64(c)) return;
+    if (copy_host_small(c)) return;
     q_copy_dev(c.q, (const float *)c.in[0]->dev, (float *)c.out[0]->dev, c.in[0]->count * 4);
 }
 
@@ -2268,6 +2287,7 @@ void exec_where(op_ctx & c) {
 // The shape operators: the data is copied, the shape changes.
 void exec_copy(op_ctx & c) {
     if (copy_i64(c)) return;
+    if (copy_host_small(c)) return;
     q_copy_dev(c.q, (const float *)c.in[0]->dev, (float *)c.out[0]->dev, c.in[0]->count * 4);
 }
 
@@ -2401,9 +2421,16 @@ void exec_bitwise(op_ctx & c) {
     const std::string & name = c.node.op_type;
     const tensor * x = c.in[0];
     const size_t n = c.out[0]->count;
+    // The host path must see the bytes: a value the device owns (or one whose
+    // producer wrote it on the device) has an empty host copy, and reading it
+    // as an empty vector silently turns every operand into zero.
+    ensure_host(c.q, const_cast<tensor *>(x));
     std::vector<int64_t> a = host_i64(x);
     std::vector<int64_t> b;
-    if (c.in.size() > 1) b = host_i64(c.in[1]);
+    if (c.in.size() > 1) {
+        ensure_host(c.q, const_cast<tensor *>(c.in[1]));
+        b = host_i64(c.in[1]);
+    }
     const size_t esz = int_elem_size(c.out[0]);
     std::vector<uint8_t> raw((size_t)n * esz, 0);
     for (size_t i = 0; i < n; ++i) {
@@ -2433,7 +2460,6 @@ void exec_bitwise(op_ctx & c) {
 // done on the host.
 void exec_cumsum(op_ctx & c) {
     const tensor * x = c.in[0];
-    const std::vector<int64_t> v = host_i64(x);
     const std::vector<int64_t> & is = x->shape;
     const int64_t rank = (int64_t)is.size();
     // The axis: the second input, a constant.
@@ -2455,6 +2481,8 @@ void exec_cumsum(op_ctx & c) {
     // it.
     const bool exclusive = c.attr_i("exclusive", 0) != 0;
     const size_t n = c.out[0]->count;
+    ensure_host(c.q, const_cast<tensor *>(x));
+    const std::vector<int64_t> v = host_i64(x);
     std::vector<int64_t> res((size_t)n, 0);
     for (int64_t o = 0; o < outer; ++o) {
         for (int64_t i = 0; i < inner; ++i) {

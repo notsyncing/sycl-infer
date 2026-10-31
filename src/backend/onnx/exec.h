@@ -25,6 +25,8 @@
 namespace si {
 namespace onnx {
 
+struct op_entry;
+
 class executor {
 public:
     executor(exec_graph g, sycl::queue & q);
@@ -179,9 +181,43 @@ private:
     // The leak report (SI_ONNX_LEAK).
     void report_leak() const;
 
+    // A per-operator cache.  The shape function is a pure function of the
+    // input shapes (and, for a reshape/slice, of a few integer parameter
+    // bytes), so a Loop body recomputed the same shapes 2 500 times: the
+    // decoder's attention blocks have a fixed `[1,1,16,32]`, and only the
+    // KV-length-dependent tensors change.  The cache stores the last input
+    // signature and the shapes it produced; a hit skips the shape function
+    // entirely.  `shaped_from_size` marks an operator whose output size is
+    // data-dependent (a Resize whose sizes are tensors): it is never cached.
+    struct op_cache {
+        const op_entry * entry = nullptr;
+        bool valid = false;
+        bool shaped_from_size = false;
+        std::vector<int64_t> last_sig;
+        std::vector<uint8_t> last_params;
+        std::vector<std::vector<int64_t>> shapes;
+        std::vector<int32_t> last_dtypes;
+    };
+    std::vector<op_cache> oc_;
+    // This executor is a Loop's body, and this graph contains a Loop: a
+    // model-level Loop can grow a large free pool (the formula decoder's
+    // hidden states change shape every step).  The pool is what makes the
+    // loop fast, so it is kept for the run and released at the end of a
+    // *top-level* call - the layout/OCR/table models, which run on the same
+    // card in the document pipeline, then have the memory back.
+    bool body_ = false;
+    bool has_loop_ = false;
+
     exec_graph g_;
     sycl::queue & q_;
     std::vector<slot_state> state_;
+    // Which values are *shape arithmetic*: a `Shape`'s output, or a value
+    // derived from one through the integer operations the models use to
+    // build a reshape target (a cast, a concat, a slice, a multiply by a
+    // constant).  A loop body rebuilds these every iteration, and they are a
+    // few scalars that belong on the host; a token id (`ArgMax`) is data and
+    // must not be pulled back with them.  See exec.cpp's small-chain rule.
+    std::vector<char> shape_derived_;
     // The Loop bodies, built once.
     //
     // A Loop's body is a graph of its own: building it folds its constant
@@ -222,6 +258,11 @@ private:
     bool shape_dbg_ = false;    // SI_ONNX_SHAPE
     bool dump_dbg_ = false;     // SI_ONNX_DUMP
     bool time_dbg_ = false;     // SI_ONNX_TIME
+    // Time one iteration of a Loop body with a device wait per operator
+    // (SI_ONNX_TIMESTEP=N).  A per-op wait inflates the absolute numbers, but
+    // the shares are the only way to price a body at a deep context: the
+    // shapes grow every iteration, so a run at step 0 measures nothing.
+    bool sample_time_ = false;
     bool dump_file_dbg_ = false; // SI_ONNX_DUMP_FILE
     bool const_chk_ = false;    // SI_ONNX_CONSTCHK
     int dump_nvals_ = 0;
@@ -248,6 +289,15 @@ private:
     double wait0_ms_ = 0.0;
     double feed_ms_ = 0.0;   // the input feeds of a run
     double rb_ms_ = 0.0;     // the output readback enqueue
+    // The pooled (free) bytes and the cap.  A Loop with growing shapes adds
+    // one buffer per distinct size to the free list every iteration; freeing
+    // the whole list in one trim costs a queue drain plus thousands of
+    // `sycl::free`s (128-450 ms at a 2 500-step formula decode).  A buffer
+    // released past the cap therefore waits in `free_later_` and is freed at
+    // the next run's (already-paid) queue wait, a few at a time.
+    size_t pooled_now_ = 0;
+    size_t pool_cap_ = (size_t)2048 << 20;
+    std::vector<void *> free_later_;
     // The live device bytes and their high-water mark, maintained on
     // acquire/release (the pool's own total is the set of distinct buffers,
     // which is not the same thing as the peak concurrent need).

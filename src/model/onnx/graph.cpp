@@ -95,13 +95,6 @@ tensor transpose_conv_transpose_weight(const tensor & w, int64_t group) {
     return out;
 }
 
-namespace {
-
-const char * const kActivations[] = {"Relu", "Sigmoid", "Tanh",      "HardSigmoid",
-                                     "HardSwish", "Gelu", "Silu", "Clip"};
-
-} // namespace
-
 exec_graph build_graph(const std::string & path, bool verbose) {
     const onnxpb::model_proto model = onnxpb::parse_model(path);
     exec_graph g = build_graph_from_graph(model.graph, model.opset, path, verbose);
@@ -446,6 +439,27 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
     for (size_t i = 0; i < outer_nodes; ++i) {
         if (dead[i]) continue;
         const onnxpb::node_proto & n = g.nodes[i];
+        // A pure rename is not an operator.  `Identity` copies no bytes and
+        // changes neither the shape nor the type, so an internal one can be
+        // resolved away at build time: the consumer reads the input's slot
+        // directly.  The formula recogniser's Loop body is 1 743 operators
+        // and **792 of them are `Identity`** - every iteration paid a host
+        // dispatch, a shape function, an output allocation and a write-back
+        // for a value that is the same value.  That was ~10 ms of the 41 ms
+        // one iteration cost.  A graph output keeps its node: the name is
+        // part of the module's interface (a Loop's body output is how the
+        // loop reads a carried value).  An `If` branch is not touched here -
+        // its nodes are appended below, and a branch-local rename can
+        // collide with the other branch's names.
+        if (n.op_type == "Identity" && n.input.size() == 1 && n.output.size() == 1 &&
+            !n.input[0].empty() && !n.output[0].empty() &&
+            !b.graph_outputs.count(n.output[0])) {
+            std::string src = n.input[0];
+            for (int guard = 0; guard < 64 && alias.count(src); ++guard) src = alias[src];
+            alias[n.output[0]] = src;
+            dead[i] = true;
+            continue;
+        }
         if (n.op_type != "If") {
             g.ops.push_back(make_op(i));
             continue;

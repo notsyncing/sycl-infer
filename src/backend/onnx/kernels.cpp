@@ -704,6 +704,57 @@ void argmax_launch(sycl::queue & q, const float * x, int64_t * y, int64_t outer,
                    int64_t inner) {
     if (outer <= 0 || inner <= 0 || n <= 0) return;
     const int64_t total = outer * inner;
+    // A wide argmax (the formula decoder's 50 000-way vocabulary) is not
+    // one work-item's job: a single thread scanning 50 000 values measured
+    // 5.7 ms of one 27 ms loop iteration.  One work-group per output
+    // position, each lane striding the axis, is the same argmax with the
+    // same tie-break (the lowest index wins), and the reduction is in SLM.
+    // The narrow case (the UNET's 3-class map) keeps the serial kernel: one
+    // work-item per output position is right when `n` is tiny.
+    constexpr int kArgmaxWG = 256;
+    if (n >= kArgmaxWG && total <= 8192) {
+        q.submit([&](sycl::handler & h) {
+            sycl::local_accessor<float, 1> lv(kArgmaxWG, h);
+            sycl::local_accessor<int64_t, 1> li(kArgmaxWG, h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)total * kArgmaxWG),
+                                             sycl::range<1>(kArgmaxWG)),
+                           [=](sycl::nd_item<1> it) {
+                const int64_t pos = (int64_t)it.get_group(0);
+                const int lane = (int)it.get_local_id(0);
+                const int64_t o = pos / inner;
+                const int64_t i = pos % inner;
+                const float * p = x + o * n * inner + i;
+                // The serial kernel starts at element 0, and a NaN must not
+                // win: lane 0 carries that element and the others start
+                // below every value.
+                float best = lane == 0 ? p[0] : -INFINITY;
+                int64_t bi = lane == 0 ? 0 : (int64_t)1 << 62;
+                for (int64_t k = lane; k < n; k += kArgmaxWG) {
+                    const float v = p[k * inner];
+                    if (v > best || (v == best && k < bi)) {
+                        best = v;
+                        bi = k;
+                    }
+                }
+                lv[lane] = best;
+                li[lane] = bi;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int stride = kArgmaxWG / 2; stride > 0; stride >>= 1) {
+                    if (lane < stride) {
+                        const float vb = lv[lane + stride];
+                        const int64_t ib = li[lane + stride];
+                        if (vb > lv[lane] || (vb == lv[lane] && ib < li[lane])) {
+                            lv[lane] = vb;
+                            li[lane] = ib;
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                if (lane == 0) y[pos] = li[0];
+            });
+        });
+        return;
+    }
     q.submit([&](sycl::handler & h) {
         h.parallel_for(sycl::range<1>(total), [=](sycl::item<1> it) {
             const int64_t idx = it.get_id(0);
@@ -1281,8 +1332,16 @@ void gather_launch(sycl::queue & q, const float * x, const int64_t * idx, float 
             const int64_t i = idx_pos % inner;
             const int64_t k = (idx_pos / inner) % n_idx;
             const int64_t o = idx_pos / (inner * n_idx);
-            const int64_t pick = idx[k];
-            y[idx_pos] = x[o * axis_dim * inner + pick * inner + i];
+            int64_t pick = idx[k];
+            // The host path accepts ONNX's negative indices and leaves an
+            // out-of-range element at zero; the device path has to agree, or
+            // the two sides of a gather differ in exactly the case a model
+            // uses a negative index.
+            if (pick < 0) pick += axis_dim;
+            const float v = (pick >= 0 && pick < axis_dim)
+                                ? x[o * axis_dim * inner + pick * inner + i]
+                                : 0.0f;
+            y[idx_pos] = v;
         });
     });
 }
@@ -1950,6 +2009,19 @@ void ew_i64_launch(sycl::queue & q, const int64_t * a, const int64_t * b, int64_
             case ew_op::add: r = x + z; break;
             case ew_op::sub: r = x - z; break;
             case ew_op::mul: r = x * z; break;
+            // The int64 elementwise kernel also carries the comparisons: the
+            // formula decoder's stop check is a two-element compare on the
+            // token id, and pulling it back to the host for that drains the
+            // queue.  (The equality path is taken only when the result is
+            // itself int64; a BOOL result stays on the host.)
+            case ew_op::equal: r = x == z; break;
+            case ew_op::greater: r = x > z; break;
+            case ew_op::less: r = x < z; break;
+            case ew_op::greater_equal: r = x >= z; break;
+            case ew_op::less_equal: r = x <= z; break;
+            case ew_op::logical_and: r = (x != 0 && z != 0); break;
+            case ew_op::logical_or: r = (x != 0 || z != 0); break;
+            case ew_op::logical_not: r = (x == 0); break;
             default: r = x; break;
             }
             y[i] = r;
