@@ -269,6 +269,7 @@ executor::~executor() {
     }
     if (ws_) sycl::free(ws_, q_);
     if (ws2_) sycl::free(ws2_, q_);
+    if (pv_ws_) sycl::free(pv_ws_, q_);
     if (up_stage_) sycl::free(up_stage_, q_);
 }
 
@@ -481,10 +482,28 @@ void * executor::scratch_small() {
     if (!ws2_) {
         // 64 KB: the operators that convert a value and put it on the
         // device (a mixed-type elementwise) use this.
-        ws2_bytes_ = 64 << 10;
-        ws2_ = sycl::malloc_device(ws2_bytes_, q_);
+        ws2_ = sycl::malloc_device(ws2_bytes_ = 64 << 10, q_);
     }
     return ws2_;
+}
+
+void * executor::pv_scratch(size_t bytes) {
+    if (bytes == 0) return nullptr;
+    if (pv_ws_ && pv_ws_bytes_ >= bytes) return pv_ws_;
+    // Growing replaces the buffer, so the queue has to be drained first:
+    // a PV reduction may still be reading the old partials.
+    if (pv_ws_) {
+        q_.wait();
+        sycl::free(pv_ws_, q_);
+        pv_ws_ = nullptr;
+        pv_ws_bytes_ = 0;
+    }
+    size_t cap = std::max<size_t>(bytes, 1u << 20);
+    cap = (cap + 4095) & ~(size_t)4095;
+    pv_ws_ = sycl::malloc_device(cap, q_);
+    if (!pv_ws_) return nullptr;
+    pv_ws_bytes_ = cap;
+    return pv_ws_;
 }
 
 bool executor::is_output(int slot) const {
@@ -595,7 +614,7 @@ bool int_dev_capable(const std::string & ty) {
            ty == "GatherND" || ty == "ScatterND" || ty == "Tile" || ty == "Expand" ||
            ty == "Cast" || ty == "Mod" || ty == "Max" || ty == "Min" || ty == "Add" ||
            ty == "Sub" || ty == "Mul" || ty == "ReduceMax" || ty == "ReduceMin" ||
-           ty == "ReduceSum" || ty == "ReduceMean";
+           ty == "ReduceSum" || ty == "ReduceMean" || ty == "CumSum";
 }
 
 // An operator that reads the *values* of this input before it runs (its
@@ -638,6 +657,18 @@ bool shape_arith_op(const std::string & ty) {
            ty == "Not" || ty == "Where" || ty == "Expand" || ty == "Tile" || ty == "Range" ||
            ty == "ReduceMax" || ty == "ReduceMin" || ty == "ReduceSum" || ty == "ReduceMean" ||
            ty == "CumSum" || ty == "Split" || ty == "ConstantOfShape";
+}
+
+// The elementwise operators exec_elementwise can evaluate on the host
+// (`ew_host_ok` in ops_exec.cpp).  Kept here as a list because the decision
+// to skip the input uploads has to be made before the operator runs; see
+// the call site.  Keep the two lists in sync.
+bool host_elementwise_op(const std::string & ty) {
+    return ty == "Add" || ty == "Sub" || ty == "Mul" || ty == "Div" || ty == "Pow" ||
+           ty == "Neg" || ty == "Abs" || ty == "Floor" || ty == "Ceil" || ty == "Sign" ||
+           ty == "Greater" || ty == "Less" || ty == "Equal" || ty == "GreaterOrEqual" ||
+           ty == "LessOrEqual" || ty == "And" || ty == "Or" || ty == "Not" || ty == "Max" ||
+           ty == "Min" || ty == "Mod";
 }
 
 } // namespace
@@ -721,13 +752,12 @@ void executor::prepare_inputs(exec_op & op) {
     for (size_t pos = 0; pos < op.in.size(); ++pos) {
         const int s = op.in[pos];
         if (s < 0 || s >= (int)state_.size()) continue;
-        // A `Reshape`'s target is read only by the shape function, on the
-        // host; the operator never looks at it on the device (the data copy
-        // is a straight one).  The formula recogniser rebuilds the target
-        // every iteration for its growing KV caches, and uploading it was
-        // one host-to-device copy per `Reshape` (134 per iteration) for
-        // bytes nothing on the device reads.
-        if (pos == 1 && op.node->op_type == "Reshape") continue;
+        // The *parameters* a shape function reads are host-only: the device
+        // kernel gets the derived geometry (strides, axis, counts), never the
+        // parameter tensor.  Uploading them was one copy per operator for
+        // every reshape target (the formula recogniser rebuilds 134 of them
+        // per iteration), and nothing on the device read a byte of it.
+        if (int_shape_param(op.node->op_type, pos)) continue;
         slot_state & st = state_[s];
         std::vector<uint8_t> & h = host_of(s);
         if (h.empty()) {
@@ -1963,6 +1993,14 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         ctx.workspace_bytes = ws_bytes_;
         ctx.scratch = scratch_small();
         ctx.scratch_bytes = ws2_bytes_;
+        // The attention PV's partials live in their own buffer (the shared
+        // workspace is also the top-k's and the gather's).  Allocate it only
+        // for a model that has MatMuls; the capacity a call needs is checked
+        // there and an oversized shape falls back to the naive path.
+        if (op.node->op_type == "MatMul") {
+            ctx.pv_workspace = pv_scratch(1u << 20);
+            ctx.pv_workspace_bytes = pv_ws_bytes_;
+        }
         // The inputs are uploaded *before* the context is filled: the
         // operators read the device pointers through the context's tensors,
         // and a pointer captured before the upload is null.
@@ -1978,6 +2016,38 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         // inputs was copied to the device and then never read there - 47 of
         // the ~86 uploads one Loop iteration was paying.
         bool host_inputs_only = false;
+        // An int64 comparison whose operands are a scalar or the same length
+        // has a device kernel now (ew_i64_cmp_launch), including when its
+        // result is a BOOL (a float 0/1).  It is not in `int_dev_capable`
+        // because that list also promises an int32 and a broadcasting path;
+        // this one is narrower, so it only turns off the host fast path and
+        // the safety-net download for exactly the shapes the kernel handles.
+        bool cmp64_dev = false;
+        {
+            const std::string & ty = op.node->op_type;
+            if ((ty == "Equal" || ty == "Greater" || ty == "Less" || ty == "GreaterOrEqual" ||
+                 ty == "LessOrEqual" || ty == "And" || ty == "Or" || ty == "Not") &&
+                !op.in.empty() && op.in.size() <= 2) {
+                cmp64_dev = true;
+                int64_t counts[2] = {0, 0};
+                int n_in = 0;
+                for (int si : op.in) {
+                    if (si < 0) {
+                        cmp64_dev = false;
+                        break;
+                    }
+                    if (g_.tensors[si].dtype != onnxpb::INT64) {
+                        cmp64_dev = false;
+                        break;
+                    }
+                    if (n_in < 2) counts[n_in] = (int64_t)g_.tensors[si].count;
+                    ++n_in;
+                }
+                if (cmp64_dev && n_in == 2) {
+                    cmp64_dev = counts[0] == counts[1] || counts[0] == 1 || counts[1] == 1;
+                }
+            }
+        }
         if (!mirror_chk_) {
             const std::string & ty = op.node->op_type;
             if (ty == "Shape" || ty == "Range") {
@@ -2034,7 +2104,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // path off: the operator's device path reads it through its
             // device pointer, and the host inputs alongside it have to be
             // uploaded for that path.
-            if (host_inputs_only && int_dev_capable(op.node->op_type)) {
+            if (host_inputs_only && (int_dev_capable(op.node->op_type) || cmp64_dev)) {
                 for (int si : op.in) {
                     if (si < 0) continue;
                     // A device-authoritative integer input means the op's
@@ -2060,6 +2130,28 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 !g_.tensors[op.in[0]].host.empty() &&
                 g_.tensors[op.in[0]].count <= (size_t)65536) {
                 host_inputs_only = true;
+            }
+            // A small elementwise operator whose operands are already on the
+            // host is computed there by exec_elementwise.  Preparing its
+            // inputs uploaded them first and threw the copies away: the
+            // formula recogniser's position-embedding scalars are a Cast of
+            // an index times a constant, and both the inputs (12 x per step)
+            // and the (host) result were copied for nothing.
+            if (!host_inputs_only && op.kind == op_kind::elementwise &&
+                (op.activation.empty() || op.activation == "none") &&
+                host_elementwise_op(op.node->op_type)) {
+                bool all_host = true;
+                size_t max_in = 0;
+                for (int si : op.in) {
+                    if (si < 0) continue;
+                    const tensor & ti = g_.tensors[si];
+                    max_in = std::max(max_in, ti.count);
+                    if (!ti.on_host || ti.host.empty()) {
+                        all_host = false;
+                        break;
+                    }
+                }
+                if (all_host && max_in > 0 && max_in <= (size_t)8192) host_inputs_only = true;
             }
         }
         // A *small* integer chain is host arithmetic even when its first
@@ -2120,9 +2212,31 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 cast_chain = int_dtype(to) || int_dtype(g_.tensors[op.in[0]].dtype);
             }
             if (shape_chain_op && small && any_dev && !any_data_dev && (all_int_in || cast_chain)) {
+                static const bool chain_dbg = getenv("SI_ONNX_CHAINDBG") != nullptr;
+                const long chain_dl0 = chain_dbg ? g_q_downloads.load() : 0;
+                if (chain_dbg) {
+                    fprintf(stderr, "[onnx] chain: op %zu %s %s", i, op.node->op_type.c_str(),
+                            op.node->name.c_str());
+                    for (int si : op.in) {
+                        if (si < 0) {
+                            fprintf(stderr, " | -");
+                            continue;
+                        }
+                        fprintf(stderr, " | '%s' d%d n%zu host%zu dev%d sder%d",
+                                g_.tensors[si].name.c_str(), (int)g_.tensors[si].dtype,
+                                g_.tensors[si].count, host_of(si).size(),
+                                state_[si].dev ? 1 : 0,
+                                si < (int)shape_derived_.size() ? shape_derived_[si] : -1);
+                    }
+                    fprintf(stderr, "\n");
+                }
                 for (int si : op.in) {
                     if (si < 0) continue;
                     if (state_[si].dev && host_of(si).empty()) materialize_int(si);
+                }
+                if (chain_dbg) {
+                    fprintf(stderr, "[onnx] chain: op %zu %s downloads %ld\n", i,
+                            op.node->op_type.c_str(), g_q_downloads.load() - chain_dl0);
                 }
                 // Every input is on the host now: the uploads the device
                 // path would need are not just unnecessary, they are the
@@ -2490,7 +2604,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // zero and the model still produces plausible text.  A Shape is
             // exempt (it reads only the shape), and a capable operator took
             // the device path above.
-            if (!skip_exec && !int_dev_capable(op.node->op_type) &&
+            if (!skip_exec && !(int_dev_capable(op.node->op_type) || cmp64_dev) &&
                 !int_shape_only(op.node->op_type)) {
                 for (int s : op.in) {
                     if (s < 0) continue;
@@ -2997,7 +3111,17 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         std::sort(order.begin(), order.end(), [this](int a, int b) {
             return upload_bytes_by_slot_[a] > upload_bytes_by_slot_[b];
         });
-        if (order.size() > 12) order.resize(12);
+        static const int topn = [] {
+            const char * e = getenv("SI_ONNX_UPLOADTOPN");
+            return e && *e ? atoi(e) : 12;
+        }();
+        static const bool by_count = getenv("SI_ONNX_UPLOADCOUNT") != nullptr;
+        if (by_count) {
+            std::sort(order.begin(), order.end(), [this](int a, int b) {
+                return upload_by_slot_[a] > upload_by_slot_[b];
+            });
+        }
+        if (topn > 0 && order.size() > (size_t)topn) order.resize((size_t)topn);
         fprintf(stderr, "[onnx] uploads: %zu copies, %.2f MB", upload_count_,
                 upload_bytes_ / 1048576.0);
         for (int s : order) {

@@ -5,6 +5,7 @@
 #include "ops.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -387,6 +388,36 @@ void exec_elementwise(op_ctx & c) {
             else if (B && A->count == 1 && B->count != 1) scalar = 0;
             ew_i64_launch(c.q, (const int64_t *)A->dev, B ? (const int64_t *)B->dev : nullptr,
                           (int64_t *)c.out[0]->dev, c.out[0]->count, op, scalar);
+            return;
+        }
+    }
+    // A comparison on device-resident int64 operands, writing the runtime's
+    // boolean (a float 0/1; `shape_compare` gives a comparison FLOAT even
+    // where ONNX says BOOL).
+    //
+    // Without this the output fell through to the integer host path, whose
+    // `ensure_host` downloads every operand - and the download drains the
+    // in-order queue, so the formula recogniser's Loop paid two of them per
+    // iteration (the `Equal`s in its stop check).  Those two downloads were
+    // 6.0 of the loop's 11.4 host ms per step.
+    const bool is_cmp = op == ew_op::equal || op == ew_op::greater || op == ew_op::less ||
+                        op == ew_op::greater_equal || op == ew_op::less_equal ||
+                        op == ew_op::logical_and || op == ew_op::logical_or ||
+                        op == ew_op::logical_not;
+    if ((c.out[0]->dtype == onnxpb::BOOL || c.out[0]->dtype == onnxpb::FLOAT) && is_cmp &&
+        !c.in.empty()) {
+        const tensor * A = c.in[0];
+        const tensor * B = c.in.size() > 1 ? c.in[1] : nullptr;
+        const bool a_dev = A->dev && A->host.empty();
+        const bool b_dev = B && B->dev && B->host.empty();
+        const bool shape_ok = !B || A->count == B->count || A->count == 1 || B->count == 1;
+        if (c.out[0]->dev && (a_dev || b_dev) && shape_ok && A->dtype == onnxpb::INT64 &&
+            (!B || B->dtype == onnxpb::INT64) && (!B || B->dev)) {
+            int scalar = -1;
+            if (B && B->count == 1 && A->count != 1) scalar = 1;
+            else if (B && A->count == 1 && B->count != 1) scalar = 0;
+            ew_i64_cmp_launch(c.q, (const int64_t *)A->dev, B ? (const int64_t *)B->dev : nullptr,
+                              (float *)c.out[0]->dev, c.out[0]->count, op, scalar);
             return;
         }
     }
@@ -1620,6 +1651,47 @@ void exec_matmul(op_ctx & c) {
         for (int64_t d : c.out[0]->shape) fprintf(stderr, " %lld", (long long)d);
         fprintf(stderr, "  M %lld K %lld N %lld\n", (long long)M, (long long)K, (long long)N);
     }
+    // The formula recogniser's self-attention PV: P[..., 1, S] x V[..., S, D],
+    // with the head axis as the batch.  It is the one matmul whose K grows
+    // with the decode depth, and the naive kernel is one work-item per
+    // output (H*D = 512 at S=2500), so it was 1.09 ms per call, 12 calls per
+    // step.  The split-K form (one work-group per head and key slice, D
+    // lanes over the output columns) measures 0.054 ms.
+    //
+    // The routing is deliberately narrow - it is an attention shape, not a
+    // general batched matmul: M = 1, the head dim 32 or 64, at least 128
+    // keys, and the leading dims are exactly [H] or [1, H] with unit
+    // strides (i.e. contiguous [H][1][K] x [H][K][D], or the same with a
+    // leading 1).  Anything else keeps the naive/oneDNN path.  The
+    // workspace capacity is checked here: the buffer is the executor's own
+    // PV scratch, not the shared op workspace, so it cannot alias the
+    // top-k's or the gather's scratch.
+    if (M == 1 && (N == 32 || N == 64) && K >= 128 && l <= 2) {
+        static const bool pv_on = [] {
+            const char * e = getenv("PF_ONNX_MM_PV");
+            return !(e && *e && std::atoi(e) == 0);
+        }();
+        int64_t H = 0;
+        bool h_ok = false;
+        if (l == 1 && out_batch[0] > 1 && as[0] == 1 && bs[0] == 1) {
+            H = out_batch[0];
+            h_ok = true;
+        } else if (l == 2 && out_batch[0] == 1 && out_batch[1] > 1 && as[0] == 0 && bs[0] == 0 &&
+                   as[1] == 1 && bs[1] == 1) {
+            H = out_batch[1];
+            h_ok = true;
+        }
+        if (pv_on && h_ok) {
+            const int64_t splits = attn_pv_splits(K);
+            const size_t need = (size_t)H * (size_t)splits * (size_t)N * sizeof(float);
+            if (c.pv_workspace && c.pv_workspace_bytes >= need) {
+                attn_pv_launch(c.q, (const float *)a->dev, (const float *)b->dev,
+                               (float *)c.out[0]->dev, (float *)c.pv_workspace, H, K, N);
+                epilogue(N);
+                return;
+            }
+        }
+    }
     // A batch of one (the layout's decoder bmm is [1,300,32] x [1,32,40000])
     // is a plain matmul; the leading dims of >1 keep the SYCL kernel.
     bool one = true;
@@ -2481,6 +2553,18 @@ void exec_cumsum(op_ctx & c) {
     // it.
     const bool exclusive = c.attr_i("exclusive", 0) != 0;
     const size_t n = c.out[0]->count;
+    // A device-resident integer cumsum stays on the device.  The formula
+    // recogniser's stop check runs this on a 2 560-element mask every step,
+    // and the host path downloaded it: the queue drain at the end of the
+    // body cost 2.8 ms of an 8.1 ms step.
+    if (x->dev && x->host.empty() && c.out[0]->dev && x->dtype == c.out[0]->dtype &&
+        (x->dtype == onnxpb::INT64 || x->dtype == onnxpb::INT32)) {
+        const int64_t axis_len = is[(size_t)axis];
+        cumsum_i_launch(c.q, x->dev, c.out[0]->dev, x->dtype == onnxpb::INT64 ? 8 : 4, outer,
+                        axis_len, inner, exclusive);
+        c.out[0]->on_host = false;
+        return;
+    }
     ensure_host(c.q, const_cast<tensor *>(x));
     const std::vector<int64_t> v = host_i64(x);
     std::vector<int64_t> res((size_t)n, 0);

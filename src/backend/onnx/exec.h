@@ -173,6 +173,11 @@ private:
     void * scratch();
     // The small device buffer (64 KB).
     void * scratch_small();
+    // The dedicated attention-PV partials buffer.  It grows only when a
+    // caller asks for more than the current capacity (the executor routes a
+    // shape it cannot fit back to the naive path, so growth is the fallback,
+    // not the rule).
+    void * pv_scratch(size_t bytes);
     // The op's inputs, uploaded.
     void prepare_inputs(exec_op & op);
     void fold_constants();
@@ -357,6 +362,9 @@ private:
     // The small device buffer the operators convert a value into.
     void * ws2_ = nullptr;
     size_t ws2_bytes_ = 0;
+    // The attention PV's partials (op_ctx::pv_workspace).
+    void * pv_ws_ = nullptr;
+    size_t pv_ws_bytes_ = 0;
     // The constant values that have been evaluated.
 
     bool folded_ = false;

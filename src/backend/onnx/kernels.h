@@ -267,6 +267,22 @@ void expand_typed_launch(sycl::queue & q, const void * x, void * y, const int64_
 void ew_i64_launch(sycl::queue & q, const int64_t * a, const int64_t * b, int64_t * y, size_t n,
                    ew_op op, int scalar_op);
 
+// The same comparisons, but the result is the runtime's boolean: a float32
+// 0/1.  `Equal`/`Less`/... produce a BOOL, and the int64 kernel above only
+// writes an int64 - so a comparison of two device-resident int64 values took
+// the host path, and `ensure_host` downloaded both operands.  In the formula
+// recogniser's Loop that was two queue drains per iteration (the whole body
+// is queued behind them) and was the largest host-side cost of the loop.
+void ew_i64_cmp_launch(sycl::queue & q, const int64_t * a, const int64_t * b, float * y, size_t n,
+                       ew_op op, int scalar_op);
+
+// A cumulative sum over one axis of an integer tensor.  The formula
+// recogniser's stop check cumsums a 2 560-element int64 mask once per decode
+// step, and the host path downloaded the input - a queue drain at the end of
+// the body.  One work-item per (outer, inner) chain walks the axis serially.
+void cumsum_i_launch(sycl::queue & q, const void * x, void * y, int elem_size, int64_t outer,
+                     int64_t axis_len, int64_t inner, bool exclusive);
+
 // A concatenation along an axis: the inputs are copied into the output at
 // their offsets.
 void concat_launch(sycl::queue & q, const std::vector<const float *> & in,
@@ -347,6 +363,26 @@ enum scatter_idx_kind { kScatterIdxI32 = 0, kScatterIdxI64 = 1 };
 void scatter_elements_launch(sycl::queue & q, const void * data, const void * idx, int idx_kind,
                              int64_t n_idx, const void * upd, int64_t n_upd, void * out, int64_t L,
                              int64_t T, int64_t dim, bool slice_form, int kind);
+
+// ---------------------------------------------------------------------------
+// The formula recogniser's self-attention PV (the only matmul in that model
+// whose cost grows with the decode depth).
+//
+// The executor's naive batched matmul is one work-item per output, so at
+// S=2500, H=8, D=64 it launches 512 work-items that each walk 2500 keys: it
+// measured 1.09 ms per call and the model calls it 12 times per decode step.
+// This is the same arithmetic as a split-K GEMV: one work-group per
+// (head, K-slice), D lanes each owning one output column, so V is read once
+// and coalesced (the D lanes of a key read D contiguous floats).  The
+// partials are reduced by a second tiny kernel.  S=2500 measured 0.054 ms.
+//
+// `p` is [BH][S] (or [1][BH][S], the caller passes the base) and `v` is
+// [BH][S][D]; `part` is the caller's scratch, at least
+// BH * attn_pv_splits(S) * D floats.  D must be at most 64 (the work-group
+// size is D); the executor routes only D = 32/64 here.
+int64_t attn_pv_splits(int64_t S);
+void attn_pv_launch(sycl::queue & q, const float * p, const float * v, float * c, float * part,
+                    int64_t BH, int64_t S, int64_t D);
 
 } // namespace onnx
 } // namespace si

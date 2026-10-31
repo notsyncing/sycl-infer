@@ -51,6 +51,13 @@ struct op_ctx {
     // The workspace: a scratch buffer the operator may use.
     void * workspace = nullptr;
     size_t workspace_bytes = 0;
+    // A separate scratch buffer for the attention PV's split partials.  It is
+    // deliberately not `workspace`: the top-k and the gather also use that
+    // one, and an operator that writes it while an earlier PV reduction is
+    // still queued would corrupt the read.  The executor allocates it on
+    // demand (one MiB), and an operator that needs more falls back.
+    void * pv_workspace = nullptr;
+    size_t pv_workspace_bytes = 0;
     // A small device buffer, for the operators that have to put a converted
     // value on the device (the layout model divides a probability map by an
     // integer shape, and the device kernel reads floats).

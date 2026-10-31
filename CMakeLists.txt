@@ -431,6 +431,12 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
             "-Wl,-rpath-link,/opt/intel/oneapi/compiler/2026.2/lib"
             "-Wl,-rpath-link,/opt/intel/oneapi/dnnl/2026.1/lib")
     endif()
+
+    # The formula recogniser's split-K attention PV against a naive reference.
+    # Hermetic (no model, no graph): D = 32/64, BH = 8/16, S = 1/64/144/1024/2500,
+    # S = 1 bit-exact and the rest rel_rms < 1e-5.
+    add_executable(test_onnx_pv tests/onnx/test_onnx_pv.cpp)
+    target_link_libraries(test_onnx_pv PRIVATE si_onnx_core)
 endif()
 
 # ------------------------------------------------------------------- C API

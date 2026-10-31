@@ -2009,11 +2009,9 @@ void ew_i64_launch(sycl::queue & q, const int64_t * a, const int64_t * b, int64_
             case ew_op::add: r = x + z; break;
             case ew_op::sub: r = x - z; break;
             case ew_op::mul: r = x * z; break;
-            // The int64 elementwise kernel also carries the comparisons: the
-            // formula decoder's stop check is a two-element compare on the
-            // token id, and pulling it back to the host for that drains the
-            // queue.  (The equality path is taken only when the result is
-            // itself int64; a BOOL result stays on the host.)
+            // The int64 elementwise kernel also carries the comparisons.  An
+            // int64 *result* takes this path; a BOOL result (a float 0/1)
+            // uses ew_i64_cmp_launch below.
             case ew_op::equal: r = x == z; break;
             case ew_op::greater: r = x > z; break;
             case ew_op::less: r = x < z; break;
@@ -2027,6 +2025,112 @@ void ew_i64_launch(sycl::queue & q, const int64_t * a, const int64_t * b, int64_
             y[i] = r;
         });
     });
+}
+
+void ew_i64_cmp_launch(sycl::queue & q, const int64_t * a, const int64_t * b, float * y, size_t n,
+                       ew_op op, int scalar_op) {
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>(n), [=](sycl::item<1> it) {
+            const size_t i = it.get_id(0);
+            const int64_t x = a[scalar_op == 0 ? 0 : i];
+            const int64_t z = b ? b[scalar_op == 1 ? 0 : i] : 0;
+            bool r = false;
+            switch (op) {
+            case ew_op::equal: r = x == z; break;
+            case ew_op::greater: r = x > z; break;
+            case ew_op::less: r = x < z; break;
+            case ew_op::greater_equal: r = x >= z; break;
+            case ew_op::less_equal: r = x <= z; break;
+            case ew_op::logical_and: r = (x != 0 && z != 0); break;
+            case ew_op::logical_or: r = (x != 0 || z != 0); break;
+            case ew_op::logical_not: r = (x == 0); break;
+            default: r = x != 0; break;
+            }
+            // A boolean is a float32 0/1 in this runtime (see exec.cpp's
+            // value_is_true).
+            y[i] = r ? 1.0f : 0.0f;
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The formula recogniser's self-attention PV.  See kernels.h.
+// ---------------------------------------------------------------------------
+int64_t attn_pv_splits(int64_t S) {
+    // One split per 64 keys (floor, at least one), capped at 64.  This is the
+    // split count the prototype measured at S=2500 (39), which took the call
+    // from 1.09 ms to 0.054 ms; more splits stop helping once the 8 heads
+    // already fill the machine, and the workspace grows with them.
+    int64_t sp = S / 64;
+    if (sp < 1) sp = 1;
+    if (sp > 64) sp = 64;
+    return sp;
+}
+
+void attn_pv_launch(sycl::queue & q, const float * p, const float * v, float * c, float * part,
+                    int64_t BH, int64_t S, int64_t D) {
+    if (BH <= 0 || S <= 0 || D <= 0 || D > 64 || !part) return;
+    const int64_t splits = attn_pv_splits(S);
+    const int64_t groups = BH * splits;
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * D), sycl::range<1>(D)),
+                       [=](sycl::nd_item<1> it) {
+                           const int64_t grp = it.get_group(0);
+                           const int64_t bh = grp / splits;
+                           const int sp = (int)(grp % splits);
+                           const int d = (int)it.get_local_id(0);
+                           const int64_t s0 = S * sp / splits;
+                           const int64_t s1 = S * (sp + 1) / splits;
+                           float acc = 0.f;
+                           for (int64_t s = s0; s < s1; ++s)
+                               acc += p[bh * S + s] * v[(bh * S + s) * D + d];
+                           part[((int64_t)bh * splits + sp) * D + d] = acc;
+                       });
+    });
+    q.parallel_for(sycl::range<1>(BH * D), [=](sycl::item<1> it) {
+        const int64_t i = it.get_id(0);
+        const int64_t bh = i / D;
+        const int64_t d = i % D;
+        float acc = 0.f;
+        for (int64_t sp = 0; sp < splits; ++sp) acc += part[((int64_t)bh * splits + sp) * D + d];
+        c[i] = acc;
+    });
+}
+
+void cumsum_i_launch(sycl::queue & q, const void * x, void * y, int elem_size, int64_t outer,
+                     int64_t axis_len, int64_t inner, bool exclusive) {
+    if (!x || !y || outer <= 0 || axis_len <= 0 || inner <= 0) return;
+    if (elem_size == 8) {
+        const int64_t * xs = (const int64_t *)x;
+        int64_t * ys = (int64_t *)y;
+        q.parallel_for(sycl::range<2>(outer, inner), [=](sycl::item<2> it) {
+            const int64_t o = it.get_id(0);
+            const int64_t i = it.get_id(1);
+            int64_t acc = 0;
+            for (int64_t a = 0; a < axis_len; ++a) {
+                const int64_t e = (o * axis_len + a) * inner + i;
+                if (!exclusive) acc += xs[e];
+                ys[e] = acc;
+                if (exclusive) acc += xs[e];
+            }
+        });
+    } else if (elem_size == 4) {
+        const int32_t * xs = (const int32_t *)x;
+        int32_t * ys = (int32_t *)y;
+        q.parallel_for(sycl::range<2>(outer, inner), [=](sycl::item<2> it) {
+            const int64_t o = it.get_id(0);
+            const int64_t i = it.get_id(1);
+            int32_t acc = 0;
+            for (int64_t a = 0; a < axis_len; ++a) {
+                const int64_t e = (o * axis_len + a) * inner + i;
+                if (!exclusive) acc += xs[e];
+                ys[e] = acc;
+                if (exclusive) acc += xs[e];
+            }
+        });
+    } else {
+        throw std::runtime_error("the cumsum's element size is not 4 or 8");
+    }
 }
 
 } // namespace onnx
