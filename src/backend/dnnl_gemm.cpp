@@ -1336,10 +1336,6 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     impl::w4_entry e;
     e.K = K;
     e.N = N;
-    if (w4info) {
-        fprintf(stderr, "[w4] register key=%p type=%u K=%d N=%d (%.4f B/weight)\n", key, ggml_type, K, N,
-                (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
-    }
     e.vals = p->dev_alloc<uint8_t>(w.vals.size());
     e.scales = p->dev_alloc<uint16_t>(w.scale.size());
     e.off = p->dev_alloc<uint16_t>(w.off.size());
@@ -1383,6 +1379,15 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     const int ladder[] = {1, kMaxT, 2 * kMaxT, 3 * kMaxT, 4 * kMaxT, 8 * kMaxT, 16 * kMaxT};
     if (!(any_type || gemv_only)) {
         if ((size_t)p->cap_M * (size_t)N > p->acc_cap) {
+            if (w4info) {
+                // Say so: the packing succeeded and everything above was
+                // allocated, and only this budget check keeps the tensor on
+                // int8 - the LM head (248320 rows) is rejected here, so a
+                // "register" line printed before it reads as a conversion that
+                // never happens.
+                fprintf(stderr, "[w4] reject key=%p type=%u K=%d N=%d: cap_M*N=%zu > acc_cap=%zu\n", key, ggml_type,
+                        K, N, (size_t)p->cap_M * (size_t)N, p->acc_cap);
+            }
             p->dev_erase(e.vals);
             p->dev_erase(e.scales);
             p->dev_erase(e.off);
@@ -1408,6 +1413,11 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
         }
     }
     e.ok = any;
+    if (w4info) {
+        fprintf(stderr, "[w4] %s key=%p type=%u K=%d N=%d (%.4f B/weight)\n", any ? "register" : "reject(no M ladder)",
+                key, ggml_type, K, N,
+                (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
+    }
     if (any) {
         p->has_w4 = true; // quantize() must now also produce the grouped form
     }
