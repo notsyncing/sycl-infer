@@ -49,6 +49,9 @@ static const profile iris_xe = {
         // this is the card the reference model runs on, so anything XMX has to be
         // gated on si::dev::has_dpas_for_queue().
         .has_dpas = 0,
+
+        // Xe-LP reports {8, 16, 32}; nat_gemm keeps the measured SG=8 form.
+        .sub_group8 = 1,
     },
 
     // INHERITED: same Xe-LP lattice, so 7.5 is the expected shape.  With 96 EUs
@@ -118,6 +121,9 @@ static const profile iris_xe = {
         .dp4a = 1,
         .gemm_dnnl = 1,
         .dpas_in_gemm = 0, // same Xe-LP DPAS, same 37x-slower measurement
+        // INHERITED from the A770 (same Xe-LP class, same oneDNN 3.11 build with
+        // no XMX GEMM kernel, same sub-group lattice); NOT re-measured here.
+        .nat_gemm = 1,
     },
 
     // INHERITED, ALL OF IT: the tile cases, the flat grid, the dp4a gates and

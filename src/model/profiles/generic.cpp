@@ -74,7 +74,14 @@ extern const model_profile kQwen35MoeProfile = {
         .prefill = model_profile::prefill_kind::chunk32,
         .prefix_cache = true,
         .auto_layer_map = false,
-        .md_splits = false,
+        // MEASURED on the 35B / Arc 140V (2026-11-01): the generic multi-device
+        // path pins dec_splits to 1, so a single-token decode runs one warp per
+        // (token, head) over the whole KV - 0.07 T-MAC/s.  With the derived
+        // split (24 on this card) the 3.2k-token decode is 34.2 -> 29.9
+        // ms/token and the prefill is neutral.  The old pin existed for the
+        // multi-device split bug (fixed by the nat staging index); the
+        // decode-vs-prefill oracle is run with the split on.
+        .md_splits = true,
         .engram_ram_mb_default = 0,
     },
 

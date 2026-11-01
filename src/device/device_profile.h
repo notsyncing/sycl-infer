@@ -88,6 +88,26 @@ struct profile {
         // asked", which is how the query declining is distinguished from the
         // answer being no.
         int has_dpas;
+
+        // Does the card's sub-group lattice include an 8-wide sub-group?
+        // 1 = yes (Xe-LP Iris Xe and Xe-HPG A770 report {8,16,32}),
+        // 0 = no (Xe2 Arc 140V reports {16,32} only).
+        //
+        // This is a launch *capability*, not a tuning value: a SYCL kernel
+        // declared [[sycl::reqd_sub_group_size(8)]] cannot run on a device that
+        // does not advertise 8, and the runtime throws rather than slowing
+        // down.  nat_gemm_launch's batched native GEMM is instantiated at both
+        // SG=8 and SG=16 and picks the one the card can launch; SG=8 keeps the
+        // Arc A770 bit-identical to the measured kernel (NSG = TX/SG = 16,
+        // RB = 32), SG=16 is the Xe2 form (NSG = 8, RB = 16) and is
+        // numerically verified against the M=1 GEMV (dev/nat_repro).
+        //
+        // Not queried per launch: si::dev::for_queue(q) is a cached pointer
+        // compare (0.039 us), whereas an info::device::sub_group_sizes query in
+        // a launcher is a driver round trip (see the rmsnorm 3.2 ms/launch
+        // regression in AGENTS.md).  An unknown card inherits kDevices[0]'s
+        // value, so a new Xe2-class part needs its own profile row.
+        int sub_group8;
     } hw;
 
     // The decode attention launches n_head * dec_splits warps per layer and a
@@ -176,6 +196,21 @@ struct profile {
                           // GEMM on both cards (7.44 ms against nat_gemm's 0.200
                           // at M=5), so nothing depends on it; kept for a part
                           // where it wins
+
+        // PF_NAT: use nat_gemm_launch - the batched native-width GEMM (u4 /
+        // k5 / cb4 / int8) behind gemm_w4/gemm for M = 2..13, i.e. the batched
+        // decode and the MTP verify.  It beats oneDNN's grouped-scale int8
+        // matmul by 11x at M=512 and ~1.4x at the verify's M on the A770,
+        // because DG2's oneDNN 3.11 has no XMX GEMM kernel compiled in at all.
+        // On Xe2 (Arc 140V) that is NOT true any more: oneDNN there runs the
+        // int8 matmul with DPAS, and the native kernel measured 3.5% (N=2) to
+        // 7% (N=4) SLOWER end to end on the 35B A3B batched decode - it is the
+        // LM head (K=2048, N=248320) and one 8192-wide tensor that reach it, and
+        // that is exactly the shape XMX is best at.  So the default is 1 on the
+        // Xe-LP/Xe-HPG cards and 0 on the Xe2 one; PF_NAT overrides either way
+        // (PF_NAT=1 on Xe2 runs the SG=16 form, PF_NAT=0 on the A770 keeps the
+        // oneDNN matmul).
+        int nat_gemm;
     } wt;
 
     // Routed-expert GEMM and qwen4exp expert-bank tuning.

@@ -47,6 +47,11 @@ const profile & unknown_profile() {
         // assumed to have the unit.  A card that does have it loses nothing (the
         // query wins); a card that does not would otherwise fail to JIT.
         u.hw.has_dpas = -1;
+        // An unknown card must not claim the 8-lane sub-group lattice (nat_gemm
+        // instantiates reqd_sub_group_size(8) and would throw on a card without
+        // it), nor the measured native-GEMM default that depends on it.
+        u.hw.sub_group8 = 0;
+        u.wt.nat_gemm = 0;
         return u;
     }();
     return unknown;

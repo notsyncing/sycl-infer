@@ -38,6 +38,12 @@ static const profile arc_a770 = {
         // register-resident already-packed-operand DPAS reaches 14.5 T-MAC/s
         // (dev/dpas_slm arm C).
         .has_dpas = 1,
+
+        // Xe-HPG reports sub-group sizes {8, 16, 32}; measured (sycl-ls /
+        // info::device::sub_group_sizes).  nat_gemm keeps SG=8 here so the
+        // batched GEMM is byte-for-byte the kernel all the A770 numbers were
+        // measured with.
+        .sub_group8 = 1,
     },
 
     // MEASURED: 7.5 of the 8 warps/EU a Xe-LP EU holds.  The cliff itself is
@@ -101,6 +107,12 @@ static const profile arc_a770 = {
         .dp4a = 1,
         .gemm_dnnl = 1,
         .dpas_in_gemm = 0, // measured 37x slower than dp4a in a real GEMM
+        // MEASURED: the batched native GEMM is the shipped batched-decode / MTP
+        // verify path here.  DG2's oneDNN 3.11 compiles no XMX GEMM kernel (the
+        // library has no non-DUMMY dpas), so its grouped-scale int8 matmul is
+        // the 11x-slower reference nat_gemm beats at M=512 and by ~1.4x at the
+        // verify's M.  sub_group8 = 1 keeps the measured SG=8 instantiation.
+        .nat_gemm = 1,
     },
 
     // MEASURED (35B A3B / qwen4exp on 2x A770): cfg 43 is moe_grp_go's M=8

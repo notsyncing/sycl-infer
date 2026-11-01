@@ -30,6 +30,7 @@
 #include "dp4a.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include "common/env.h"
 
@@ -1807,7 +1808,15 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
     });
 }
 
-template <int FMT>
+// SG is a template parameter, not a constant: the lane = group mapping and the
+// final sub-group reduction are correct for any sub-group width, but a card's
+// driver only accepts the widths it advertises.  The Arc A770 / Iris Xe report
+// {8, 16, 32} and keep the measured SG=8 form (TX=128 -> NSG=16, RB=32); Xe2
+// (Arc 140V) reports {16, 32} only, so it runs SG=16 (NSG=8, RB=16) - without
+// it the reqd_sub_group_size(8) kernel does not launch there at all and the
+// batched decode fell back to oneDNN.  Both instantiations are built; which one
+// runs is decided once per launch from the device profile's hw.sub_group8.
+template <int FMT, int SG>
 static void nat_gemm_pick(queue & q, const uint8_t * w0, const uint8_t * w1, const int8_t * w8,
                           const uint16_t * scale, const uint16_t * off, const uint16_t * lut16,
                           const uint32_t * bit_lut, const int8_t * axe, const int8_t * axo, const int8_t * axg,
@@ -1835,14 +1844,18 @@ static void nat_gemm_pick(queue & q, const uint8_t * w0, const uint8_t * w1, con
 #ifndef NAT_C
 #define NAT_C 2
 #endif
-#ifndef NAT_SG
-#define NAT_SG 8
-#endif
+    // TX stays 128 for both sub-group widths: SG=8 -> NSG=16, RB=32 (the
+    // measured A770 form); SG=16 -> NSG=8, RB=16.  TX=256 at SG=16 (the same
+    // RB=32 tile as the A770) was tried and measured *identical* at N=2
+    // (26.0-26.2 tok/s aggregate, nb=2), so the tile width is not what costs
+    // here and the smaller work-group is kept.  TX does not change the
+    // per-column arithmetic (one sub-group owns a column; the group loop and
+    // the lane reduction are unchanged), so the two are numerically identical.
 #define NAT_M(mm)                                                                                          \
-    nat_gemm_impl<FMT, mm, NAT_C, 32, NAT_SG, 1, NAT_TX, 0, 1, 0, 1, 1, 0>(q, w0, w1, w8, scale, off,    \
-                                                                        lut16, bit_lut, axe, axo, axg,    \
-                                                                        asa, xs, out, out_stride,         \
-                                                                        residual, alpha, K, N)
+    nat_gemm_impl<FMT, mm, NAT_C, 32, SG, 1, NAT_TX, 0, 1, 0, 1, 1, 0>(q, w0, w1, w8, scale, off,        \
+                                                                    lut16, bit_lut, axe, axo, axg,        \
+                                                                    asa, xs, out, out_stride,             \
+                                                                    residual, alpha, K, N)
     switch (M) {
     case 2: NAT_M(2); return;
     case 3: NAT_M(3); return;
@@ -1861,6 +1874,36 @@ static void nat_gemm_pick(queue & q, const uint8_t * w0, const uint8_t * w1, con
 #undef NAT_M
 }
 
+// One format dispatch per sub-group width, so nat_gemm_launch has exactly one
+// call site per SG and the two instantiations cannot drift apart.
+template <int SG>
+static void nat_gemm_fmt(queue & q, int fmt, const uint8_t * b0, const uint8_t * b1, const int8_t * w8,
+                         const uint16_t * scale, const uint16_t * off, const uint16_t * lut16,
+                         const uint32_t * bit_lut, const int8_t * axe, const int8_t * axo, const int8_t * axg,
+                         const uint16_t * asa, const float * xs, float * out, int out_stride, const float * residual,
+                         float alpha, int M, int K, int N) {
+    switch (fmt) {
+    case 0:
+        nat_gemm_pick<0, SG>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out,
+                             out_stride, residual, alpha, M, K, N);
+        return;
+    case 1:
+        nat_gemm_pick<1, SG>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out,
+                             out_stride, residual, alpha, M, K, N);
+        return;
+    case 2:
+        nat_gemm_pick<2, SG>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out,
+                             out_stride, residual, alpha, M, K, N);
+        return;
+    case 3:
+        nat_gemm_pick<3, SG>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out,
+                             out_stride, residual, alpha, M, K, N);
+        return;
+    default:
+        return;
+    }
+}
+
 bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const int8_t * w8,
                      const uint16_t * scale, const uint16_t * off, const uint16_t * lut16, const uint32_t * bit_lut,
                      const int8_t * axe, const int8_t * axo, const int8_t * axg, const uint16_t * asa,
@@ -1869,52 +1912,66 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
     if (M < 2 || M > 13 || (K % 32) != 0) {
         return false;
     }
-    // The kernel is instantiated with reqd_sub_group_size(8).  Xe2 (Arc 140V)
-    // reports only {16, 32}: launching it throws from the runtime, and the
-    // same call is the batched-decode/verify GEMM, so decline and let the
-    // caller use the M-aware oneDNN primitive instead of dying.
-    static const bool sg8 = [&] {
-        for (auto n : q.get_device().get_info<sycl::info::device::sub_group_sizes>()) {
-            if (n == 8) {
-                return true;
-            }
-        }
-        return false;
-    }();
-    if (!sg8) {
-        return false;
-    }
-    // PF_NAT=0 disables the batched native GEMM everywhere (fall back to the
-    // oneDNN grouped-scale matmul + epilogue), for A/B and as an escape hatch.
-    static const bool nat_on = [] {
+    // Sub-group width: a kernel declared with a reqd_sub_group_size the device
+    // does not advertise throws at launch, so the width is a capability, and it
+    // is read from the queue's device profile (a cached handle compare, not a
+    // driver query - an info::device query in a launcher is a ~3 ms round trip
+    // once rmsnorm paid for that lesson).  SG=8 is the measured A770 form;
+    // SG=16 is the Xe2 form and is numerically identical to it (dev/nat_repro).
+    // An *unknown* card inherits kDevices[0]'s row (an A770 one), so its
+    // sub_group8 says 1 even on a part that has no 8-wide sub-group - and an
+    // unsupported reqd_sub_group_size is a launch failure, not a slowdown.  For
+    // that one case take the wider width: SG=16 is correct on every card and
+    // only costs the A770's RB=32 tile shape.  A card with a row of its own
+    // says what it means (device_registry's unknown_profile() should carry
+    // sub_group8 = 0; this is the in-launcher guard until it does).
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    const bool sg8 = dp.hw.sub_group8 != 0 && std::strcmp(dp.key, "unknown") != 0;
+    // PF_NAT overrides the card's default.  The batched native GEMM beats
+    // oneDNN's grouped-scale int8 matmul by a wide margin on Xe-LP/Xe-HPG
+    // (oneDNN 3.11 there has no XMX GEMM kernel compiled in at all) and loses
+    // to it on Xe2 (whose oneDNN does run DPAS, and the only tensors that reach
+    // this path - the LM head and one dense FFN - are XMX's best shape).  So
+    // "which GEMM" is a measured per-card default (wt.nat_gemm), and the env is
+    // only the A/B: PF_NAT=0 forces the oneDNN fallback, PF_NAT=1 forces this
+    // kernel (SG=16 on a card with no 8-wide sub-group).
+    static const int nat_env = [] {
         const char * e = si::env::str("PF_NAT");
-        return e ? atoi(e) != 0 : true;
+        return e ? atoi(e) : -1;
     }();
+    const bool nat_on = nat_env < 0 ? (dp.wt.nat_gemm != 0) : (nat_env != 0);
     if (!nat_on) {
         return false;
     }
-    const uint8_t * b0 = (const uint8_t *)w0;
-    const uint8_t * b1 = (const uint8_t *)w1;
-    switch (fmt) {
-    case 0:
-        nat_gemm_pick<0>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
-                         residual, alpha, M, K, N);
-        return true;
-    case 1:
-        nat_gemm_pick<1>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
-                         residual, alpha, M, K, N);
-        return true;
-    case 2:
-        nat_gemm_pick<2>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
-                         residual, alpha, M, K, N);
-        return true;
-    case 3:
-        nat_gemm_pick<3>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
-                         residual, alpha, M, K, N);
-        return true;
-    default:
+    if (fmt < 0 || fmt > 3) {
         return false;
     }
+    // PF_NAT_DBG=1 names the path the batched GEMM actually took, once per
+    // (format, M, SG) - the only way to tell "nat ran at SG=16" from "nat
+    // declined and oneDNN answered", which otherwise look identical in the
+    // token stream.  Default off.
+    static const bool nat_dbg = [] {
+        const char * e = si::env::str("PF_NAT_DBG");
+        return e && atoi(e) != 0;
+    }();
+    if (nat_dbg) {
+        static bool seen[4][14] = {};
+        const int mi = M < 14 ? M : 0;
+        if (!seen[fmt][mi]) {
+            seen[fmt][mi] = true;
+            fprintf(stderr, "[nat] fmt=%d M=%d K=%d N=%d sg=%d\n", fmt, M, K, N, sg8 ? 8 : 16);
+        }
+    }
+    const uint8_t * b0 = (const uint8_t *)w0;
+    const uint8_t * b1 = (const uint8_t *)w1;
+    if (sg8) {
+        nat_gemm_fmt<8>(q, fmt, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                        residual, alpha, M, K, N);
+    } else {
+        nat_gemm_fmt<16>(q, fmt, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                         residual, alpha, M, K, N);
+    }
+    return true;
 }
 
 } // namespace si

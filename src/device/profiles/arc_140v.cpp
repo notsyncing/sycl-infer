@@ -43,6 +43,13 @@ static const profile arc_140v = {
         // cl_intel_subgroup_matrix_multiply_accumulate.  QUERIED at run time;
         // this is only the fallback.
         .has_dpas = 1,
+
+        // Xe2 (Lunar Lake) reports sub-group sizes {16, 32} only - measured
+        // with info::device::sub_group_sizes on this part.  A kernel declared
+        // reqd_sub_group_size(8) does not launch here, so nat_gemm's batched
+        // GEMM runs its SG=16 instantiation (NSG=8, RB=16); the SG=8 form is
+        // still compiled for the Xe-LP/Xe-HPG cards.
+        .sub_group8 = 0,
     },
 
     // INHERITED: the 8-warp/EU Xe2 lattice is not measured here.  With 64 EUs
@@ -70,7 +77,7 @@ static const profile arc_140v = {
     .shape = {
         .gemv_rows_per_wg = 8,
         .rmsnorm_wg = 1024,
-        .gdn_cols = 2,
+        .gdn_cols = 8, // MEASURED: 290 -> 212 ms per 804-token state scan; 16 is a cliff
         .gdn_warps_per_wg = 8,
         .gdn_vec_max_rows = 2,
         .w4_rows_per_wg = 16, // INHERITED (SLM budget is the same)
@@ -87,7 +94,9 @@ static const profile arc_140v = {
         .xmx_gather_red_max = 512,
         .vec = 1,
         .xmx = 1,
-        .xmx_min_keys = 2048,
+        // MEASURED on this card: the 804-key chunk is 153.7 ms on the classic
+        // kernel and 48 ms on xmx; 2048 was the A770 crossover, inherited.
+        .xmx_min_keys = 512,
         .split_keys = 512,
         .dec_group = 0,
     },
@@ -103,6 +112,18 @@ static const profile arc_140v = {
         .dp4a = 1,
         .gemm_dnnl = 1,
         .dpas_in_gemm = 0,
+        // MEASURED on this part (35B A3B, PF_W4_ALL, ctx 8192, i8 KV, 128-token
+        // greedy requests, one process per cell): the batched native GEMM is
+        // SLOWER than oneDNN's fallback here, so it stays off.  With the SG=16
+        // instantiation enabled (PF_NAT=1) the aggregate decode was 26.2 /
+        // 33.4 tok/s at N=2 / N=4 against 27.4 / 36.1 for the oneDNN int8
+        // matmul (-3.5% / -7%), N=1 unchanged (29.0, and its stream is
+        // byte-identical).  Reason: only two tensors reach it - the LM head
+        // (K=2048, N=248320) and one N=8192 - and on Xe2 oneDNN runs its int8
+        // matmul with DPAS, which is the shape XMX is best at; on DG2 the same
+        // comparison went the other way because that library has no XMX kernel
+        // at all.  PF_NAT=1 forces it on for a re-measure on another workload.
+        .nat_gemm = 0,
     },
 
     // The grouped tile cases and grids are INHERITED.  row_gemv is the Xe2

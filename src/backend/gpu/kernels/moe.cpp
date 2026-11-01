@@ -281,6 +281,152 @@ static sycl::event moe_router_logits(queue & q, const void * gate_inp, int esize
     });
 }
 
+// ---------------------------------------------------------------------------
+// Tiled router logits: one sub-group per (one token x EB experts) tile.
+//
+// WHY.  The GEMV above is one sub-group per (token, expert), so each of a
+// token's n_expert sub-groups re-reads the token's whole activation row
+// (n_expert x the activation traffic) and every expert row is re-read once per
+// token.  At the 35B A3B's prefill shape (803 tokens, K=2048, 256 experts) that
+// is 3.4 GB of loads per layer for 0.42 GMAC and measures ~2.6 ms per layer
+// (403 ms over the 40 layers of a 3213-token prefill, 5% of it) at
+// 0.16 T-MAC/s.  It is not a bandwidth limit: the redundancy is the limit.
+//
+// A tile amortises the loads - the one activation value and the EB weight values
+// a lane loads per 32-lane k-chunk feed EB FMAs, so the token row is read once
+// instead of n_expert times - but the tile is bounded from above by the register
+// file, and on this part the cliff is sharp: IGC keeps this kernel at
+// 128 GRF/thread (4 hardware threads per EU, so 16 accs is already most of the
+// latency-hiding budget), and `.spill size` goes 0 at
+// 16 accumulators to 4224 B at 32 (8x4: 1.65 -> 3.63 ms) and 14208 B at 64
+// (8x8).  Measured per layer at 803 tokens (one process per cell):
+//
+//   1x16 (expert-major) 1.13 ms   2x8 1.26   4x4 1.65   8x4 3.63   8x8 4.79
+//   1x8 1.47            1x32 2.04  2x16 1.45  16x4 12.5
+//
+// so 1x16 is what ships for a prefill batch: it holds 16 experts' partial sums
+// in registers for one token (17 loads per 16 FMAs, and the 17 loads in flight
+// per step are what hides the L1/L2 latency at this occupancy), and the
+// expert-major tile order makes those 16 rows (128 KB) L1-resident across the
+// consecutive token tiles that reuse them.  A wider tile can only come from
+// more accumulators, and 32 already spills (see above).
+//
+// Two structures were built and measured as *slower* on this part and are not
+// here: an SLM-staged work-group tile (16x16, 512 threads, 2.15-3.7 ms across
+// BK 64..512 - the staging loop plus the per-chunk barriers cost more than the
+// L2 traffic they save, and the larger work-groups spill), and a
+// bandwidth-optimal 8x8 register tile (traffic 4x lower, 0.77 ms of loads in
+// isolation, but 14 KB of spill makes it 4.79 ms).
+//
+// THE SUMMATION ORDER IS THE CONTRACT.  Lanes still tile K in the GEMV's exact
+// split (lane l owns k = lane + 32*r, r ascending) and each output is reduced
+// by the same 32-lane butterfly from lane 0, so every logit is BIT-IDENTICAL to
+// moe_router_logits - not "within an ulp".  The MoE's discrete top-8 turns a
+// one-ulp logit difference into a different expert set, so PF_MOE_RT_CHK runs
+// both kernels over the same input and compares the raw logits.
+template <uint32_t RT, int EB>
+static sycl::event moe_router_logits_tiled(queue & q, const void * gate_inp, int esize, const float * x,
+                                           int x_stride, int n_tok, int n_embd, int n_expert, float * logits) {
+    // BT is 1: a tile is one token x EB experts, so every k of the token's row
+    // is read once and reused by EB FMAs.  Requires n_expert % EB == 0, which
+    // the launcher guarantees - with the tile always full there is no per-load
+    // guard and no pointer array.  That matters: an array of EB weight pointers
+    // (or a clamped row index per expert) spills this kernel by 2304 B and
+    // measures 4.7x slower (5.4 ms against 1.13 at 803 tokens).
+    const int n_et = n_expert / EB;
+    const int n_tiles = n_tok * n_et;
+    // Sub-groups per work-group.  Tiles are laid out expert-tile-fastest, so a
+    // work-group's four sub-groups are four expert tiles of the SAME token -
+    // the token row they share is one L1/L2 hit, not four - while consecutive
+    // work-groups walk the token axis for a fixed expert block, which keeps
+    // those EB weight rows (EB*8 KB = 128 KB) L1-resident.
+    constexpr int GW = 4;
+    const size_t n_wg = ((size_t)n_tiles + GW - 1) / GW;
+    const size_t rowb = (size_t)n_embd * (size_t)esize;
+    return q.parallel_for(nd_range<1>(n_wg * (GW * 32), GW * 32),
+                          [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int lane = (int)(it.get_local_id(0) & 31);
+        const int sgi = (int)(it.get_local_id(0) >> 5);
+        const sub_group sgg = it.get_sub_group();
+        const size_t tile = it.get_group(0) * GW + (size_t)sgi;
+        if (tile >= (size_t)n_tiles) {
+            return; // sub-group-uniform: every lane of this sub-group exits
+        }
+        const int t = (int)(tile % (size_t)n_tok); // expert-major
+        const int e0 = (int)(tile / (size_t)n_tok) * EB;
+        const float * xb = x + (size_t)t * x_stride;
+        const char * wb = (const char *)gate_inp + (size_t)e0 * rowb;
+        float acc[EB];
+#pragma unroll
+        for (int j = 0; j < EB; j++) {
+            acc[j] = 0.f;
+        }
+        // r ascending over the K axis is the GEMV's per-lane term order:
+        // lane l owns k = lane + 32*r, exactly as in moe_router_logits.
+        const int nr = n_embd / 32;
+        for (int r = 0; r < nr; r++) {
+            const int k = lane + 32 * r;
+            const float xv = xb[k];
+            float wv[EB];
+#pragma unroll
+            for (int j = 0; j < EB; j++) {
+                wv[j] = moe_rd<RT>(wb + rowb * (size_t)j, k);
+            }
+#pragma unroll
+            for (int j = 0; j < EB; j++) {
+                acc[j] += xv * wv[j];
+            }
+        }
+        // The same butterfly as the GEMV, and lane 0's value is the reference
+        // one (a butterfly's lanes each add in a different order), so the store
+        // is lane 0 only - exactly as above.
+#pragma unroll
+        for (int j = 0; j < EB; j++) {
+            const float v = sg_sum(acc[j], sgg);
+            if (lane == 0) {
+                logits[(size_t)t * n_expert + (e0 + j)] = v;
+            }
+        }
+    });
+}
+
+// Tile-shape dispatch.  Only shapes that were measured are instantiated; the
+// row count picks the one that won at that row count (the crossover between
+// them is flat, so 64 rows is the switch):
+//
+//   n_tok >= 64  1x16   (0.373 T-MAC/s at 803; 0.365 at 1024)
+//   n_tok >= 16  1x8    (0.277 at 128 - the 16-wide tile has fewer tiles than
+//                        the part has warp slots until ~64 rows)
+//   n_tok < 16   the GEMV, which is faster there (256 warps: 0.063 ms at n=8
+//                        against 0.101 for the tile)
+//
+// EB must divide n_expert (the kernel has no partial-tile path); the launcher
+// picks a divisor and falls back to the GEMV when there is none.
+template <uint32_t RT>
+static sycl::event moe_router_logits_tiled_dispatch(queue & q, const void * gate_inp, int esize, const float * x,
+                                                    int x_stride, int n_tok, int n_embd, int n_expert, int eb,
+                                                    float * logits) {
+    if (eb >= 16) {
+        return moe_router_logits_tiled<RT, 16>(q, gate_inp, esize, x, x_stride, n_tok, n_embd, n_expert, logits);
+    }
+    if (eb >= 8) {
+        return moe_router_logits_tiled<RT, 8>(q, gate_inp, esize, x, x_stride, n_tok, n_embd, n_expert, logits);
+    }
+    return moe_router_logits_tiled<RT, 4>(q, gate_inp, esize, x, x_stride, n_tok, n_embd, n_expert, logits);
+}
+
+// One entry point for both logits forms, so the exactness check can run the one
+// that was NOT selected over the same input.
+template <uint32_t RT>
+static sycl::event moe_router_logits_any(queue & q, bool gemv, int eb, const void * gate_inp, int esize,
+                                         const float * x, int x_stride, int n_tok, int n_embd, int n_expert,
+                                         float * logits) {
+    if (gemv) {
+        return moe_router_logits<RT>(q, gate_inp, esize, x, x_stride, n_tok, n_embd, n_expert, logits);
+    }
+    return moe_router_logits_tiled_dispatch<RT>(q, gate_inp, esize, x, x_stride, n_tok, n_embd, n_expert, eb, logits);
+}
+
 // The register-blocked tiling of the above (one 32-lane sub-group per
 // `MT tokens x EB experts` tile, lanes tiling K) was DELETED, not left behind a
 // switch.  It was 2.1x faster in isolation - 45.5 -> 20.5 ms of a ~1914 ms prefill -
@@ -679,8 +825,36 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
     // launch-overhead one.  It reports the three-kernel form under
     // PF_MOE_RT_OLD and the logits + fused pair otherwise.
     const bool rt_time = si::env::flag("PF_MOE_RT_TIME");
+    // The logits kernel: the tiled form is the default, PF_MOE_ROUTER=0 forces
+    // the original one-sub-group-per-(token, expert) GEMV for the A/B.
+    // PF_MOE_ROUTER_EB overrides the expert tile the row count picks.
+    //
+    // The tile is 1 x EB (see the measured table above the kernel): a prefill
+    // batch uses 16 experts, a shorter one 8 (a tile has one sub-group per
+    // expert block, so 16 tokens x 16 tiles is fewer warps than a 64-EU part can
+    // run until ~64 rows), and < 16 rows keep the GEMV - its 256 warps beat the
+    // tile's 4-16 at launch-overhead scale (M=8: 0.063 against 0.101 ms; M=16
+    // is where the tile takes over: 0.065 against 0.084).
+    // EB is capped by the expert count so a model with few experts does not run
+    // a mostly empty tile.
+    static const int rt_mode = si::env::i32("PF_MOE_ROUTER", 1);
+    static const int rt_eb = si::env::i32("PF_MOE_ROUTER_EB", 0);
+    int eb = rt_eb > 0 ? rt_eb : (n_tok >= 64 ? 16 : 8);
+    if (eb > n_expert) {
+        eb = n_expert;
+    }
+    // EB must divide n_expert so a tile is always full; walk down to the
+    // largest divisor of the {16,8,4} set (0 = none, use the GEMV).
+    while (eb > 1 && (n_expert % eb) != 0) {
+        eb >>= 1;
+    }
+    if (eb < 4 || (n_expert % eb) != 0) {
+        eb = 0;
+    }
+    const bool rt_gemv = rt_mode == 0 || n_tok < 16 || eb == 0 || (n_embd % 32) != 0;
     sycl::event e0;
-#define SI_MOE_R(GP, ESZ) e0 = moe_router_logits<GP>(q, gate_inp, ESZ, x, x_stride, n_tok, n_embd, n_expert, logits)
+#define SI_MOE_R(GP, ESZ)                                                                                              \
+    e0 = moe_router_logits_any<GP>(q, rt_gemv, eb, gate_inp, ESZ, x, x_stride, n_tok, n_embd, n_expert, logits)
     switch (gp_type) {
     case GGML_TYPE_F32: SI_MOE_R(GGML_TYPE_F32, 4); break;
     case GGML_TYPE_F16: SI_MOE_R(GGML_TYPE_F16, 2); break;
@@ -735,6 +909,36 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
         chk_last_n = n_tok;
         std::vector<float> h_log_raw((size_t)n_tok * n_expert);
         q.memcpy(h_log_raw.data(), logits, h_log_raw.size() * sizeof(float)).wait();
+        // The OTHER logits form over the same input.  The tiled kernel must
+        // reproduce the GEMV's logits BIT-FOR-BIT (it keeps the per-lane term
+        // order and the 32-lane butterfly), not merely the same top-k: the
+        // MoE's discrete selection is where a one-ulp difference shows up.
+        {
+            std::vector<float> h_log_alt(h_log_raw.size());
+            sycl::event ealt;
+#define SI_MOE_RALT(GP, ESZ)                                                                                           \
+    ealt = moe_router_logits_any<GP>(q, !rt_gemv, eb, gate_inp, ESZ, x, x_stride, n_tok, n_embd, n_expert, logits)
+            switch (gp_type) {
+            case GGML_TYPE_F32: SI_MOE_RALT(GGML_TYPE_F32, 4); break;
+            case GGML_TYPE_F16: SI_MOE_RALT(GGML_TYPE_F16, 2); break;
+            case GGML_TYPE_BF16: SI_MOE_RALT(GGML_TYPE_BF16, 2); break;
+            default: break;
+            }
+#undef SI_MOE_RALT
+            ealt.wait();
+            q.memcpy(h_log_alt.data(), logits, h_log_alt.size() * sizeof(float)).wait();
+            int alt_bad = 0;
+            float alt_max = 0.f;
+            for (size_t i = 0; i < h_log_alt.size(); i++) {
+                const float d = std::fabs(h_log_raw[i] - h_log_alt[i]);
+                alt_max = std::fmax(alt_max, d);
+                alt_bad += !(h_log_raw[i] == h_log_alt[i]);
+            }
+            fprintf(stderr, "[moertchk] logits %s vs %s: bad=%d/%zu maxdiff=%.3g\n", rt_gemv ? "gemv" : "tiled",
+                    rt_gemv ? "tiled" : "gemv", alt_bad, h_log_alt.size(), (double)alt_max);
+            // the selected path's raw logits are what the comparisons below run on
+            q.memcpy(logits, h_log_raw.data(), h_log_raw.size() * sizeof(float)).wait();
+        }
         e1 = moe_router_softmax(q, logits, n_tok, n_expert);
         e2 = moe_router_topk<true>(q, logits, n_tok, n_expert, top_k, ids, nullptr);
         e3 = moe_router_topk<false>(q, logits, n_tok, n_expert, top_k, wts, ids);
@@ -1481,7 +1685,8 @@ static inline void moe_dp_word(uint32_t qv, uint32_t hw, int cbits, uint32_t xlo
 template <uint32_t QT, int FUSE, int UNITSZ, int RPW, int UNITSX, int WGW>
 static void moe_row_gemv_impl(queue & q, const char * w0, const char * w1, size_t plane0, size_t plane1,
                               const int32_t * slot_map, const int32_t * ids, int n_pairs, int K, int N,
-                              const int8_t * xq, const uint16_t * asa, float * out, int out_stride) {
+                              const int8_t * xq, const uint16_t * asa, float * out, int out_stride,
+                              const float * gate = nullptr, bool act_pair = true) {
     constexpr int SB = (QT == 12) ? 144 : 176; // block_q4_K / block_q5_K
     constexpr int QOFF = (QT == 12) ? 16 : 48;
     constexpr int NW = UNITSZ / 16; // uint4s per unit
@@ -1516,7 +1721,7 @@ static void moe_row_gemv_impl(queue & q, const char * w0, const char * w1, size_
                        if (slot < 0) {
                            return;
                        }
-                       const int trow = (FUSE == 2) ? 0 : ia;
+                       const int trow = act_pair ? ia : 0;
                        const char * b0 = w0 + (size_t)slot * plane0 + (size_t)n * row_bytes;
                        const char * b1 = (FUSE == 2) ? (w1 + (size_t)slot * plane1 + (size_t)n * row_bytes)
                                                      : nullptr;
@@ -1625,7 +1830,17 @@ static void moe_row_gemv_impl(queue & q, const char * w0, const char * w1, size_
                            }
                        }
                        if (li == 0 && nrow < N) {
-                           out[(size_t)ia * (size_t)out_stride + n] = (FUSE == 2) ? silu_f(acc) * acc1 : acc;
+                           const size_t o = (size_t)ia * (size_t)out_stride + n;
+                           if constexpr (FUSE == 2) {
+                               out[o] = silu_f(acc) * acc1;
+                           } else if (gate) {
+                               // The up pass: one launch per bank (more warps,
+                               // one weight stream per warp) with the gate read
+                               // back from the same element this thread owns.
+                               out[o] = silu_f(gate[o]) * acc;
+                           } else {
+                               out[o] = acc;
+                           }
                        }
                    });
 }
@@ -1639,15 +1854,29 @@ bool moe_row_gemv_gate_up_launch(queue & q, const void * gbank, const void * uba
     }
     const char * g = (const char *)gbank;
     const char * u = (const char *)ubank;
-#define SI_ROW_GU(QT)                                                                                              \
-    moe_row_gemv_impl<QT, 2, 16, 2, 2, 8>(q, g, u, slot_gb, slot_ub, slot_map, ids, n_pairs, n_embd, n_ff_exp, xq,  \
-                                         asa, h, h_stride)
+    // Two one-bank passes by default: the fused form read two weight streams per
+    // warp and measured 60-73 GB/s of an 8-expert read; splitting doubles the
+    // warps and leaves one stream per warp.  The up pass reads back the gate
+    // element it owns (in-order queue, one writer per element).
+    static const bool fuse2 = si::env::flag("PF_MOE_ROW_FUSE2");
+#define SI_ROW_GU2(QT)                                                                                             \
+    do {                                                                                                           \
+        if (fuse2) {                                                                                               \
+            moe_row_gemv_impl<QT, 2, 16, 2, 2, 8>(q, g, u, slot_gb, slot_ub, slot_map, ids, n_pairs, n_embd,       \
+                                                  n_ff_exp, xq, asa, h, h_stride, nullptr, false);                 \
+        } else {                                                                                                   \
+            moe_row_gemv_impl<QT, 1, 16, 2, 2, 8>(q, g, nullptr, slot_gb, 0, slot_map, ids, n_pairs, n_embd,       \
+                                                  n_ff_exp, xq, asa, h, h_stride, nullptr, false);                 \
+            moe_row_gemv_impl<QT, 1, 16, 2, 2, 8>(q, u, nullptr, slot_ub, 0, slot_map, ids, n_pairs, n_embd,       \
+                                                  n_ff_exp, xq, asa, h, h_stride, h, false);                       \
+        }                                                                                                          \
+    } while (0)
     switch (gtype) {
-    case 12: SI_ROW_GU(12); return true;
-    case 13: SI_ROW_GU(13); return true;
+    case 12: SI_ROW_GU2(12); return true;
+    case 13: SI_ROW_GU2(13); return true;
     default: return false;
     }
-#undef SI_ROW_GU
+#undef SI_ROW_GU2
 }
 
 bool moe_row_gemv_down_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
@@ -1658,7 +1887,7 @@ bool moe_row_gemv_down_launch(queue & q, const void * dbank, const int32_t * slo
     // chunk, so four lanes cover a row and one iteration covers it end to end.
 #define SI_ROW_D(QT)                                                                                               \
     moe_row_gemv_impl<QT, 1, 32, 4, 1, 16>(q, d, nullptr, slot_db, 0, slot_map, ids, n_pairs, n_ff_exp, n_embd,    \
-                                          xq, asa, acc, acc_stride)
+                                          xq, asa, acc, acc_stride, nullptr, true)
     switch (dtype) {
     case 12: SI_ROW_D(12); return true;
     case 13: SI_ROW_D(13); return true;
