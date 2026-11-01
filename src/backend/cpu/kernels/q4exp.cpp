@@ -8,8 +8,12 @@
 // per sequence, so both shapes fall out of the same list.
 #include <immintrin.h>
 
+#include <chrono>
+#include <cstdio>
+
 #include "common.h"
 #include "common/cpu_isa.h"
+#include "common/env.h"
 
 namespace si {
 
@@ -468,22 +472,51 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
                       int ngram, int kern, float eps) {
     const int hc_dim = hc * n_embd;
     const int hist_rows = (kern - 1) * ngram;
+    // PF_Q4_PLEAPPLY_TIME: per-step wall clock of this host kernel.  `apply` is
+    // 1.9 ms/token in the engine's PLE block, which is far more than its
+    // 4 x 10 240-element loops should cost; this says which step pays.
+    static const bool pat = si::env::flag("PF_Q4_PLEAPPLY_TIME");
+    auto pnow = [] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const double pt0 = pat ? pnow() : 0.0;
+    double pt1 = pt0, pt2 = pt0, pt3 = pt0;
+    // The four loops here are 10 240 elements in a decode.  `par` wakes the
+    // whole host pool and rendezvouses on it, and measured on the 28-thread
+    // box that costs ~0.5 ms per call for this size - the whole 4-loop kernel
+    // was 1.9 ms/token against ~0.2 ms of actual work.  Run small regions on
+    // the calling thread; the prefill (n_tok * hc_dim = 256 K) still pools.
+    // The threshold is on the WORK, not on the job count: loop 2 below has only
+    // n_tok*hc jobs but each is a 2560-element RMSNorm, so a prefill's 2048 jobs
+    // are 5.2 M elements and must stay pooled.
+    static const int ple_ser_max = si::env::i32("PF_Q4_PLE_SER_MAX", 65536);
+    auto papply = [&](int n, long long work, auto && fn) {
+        if (work <= ple_ser_max) {
+            for (int i = 0; i < n; i++) {
+                fn(i);
+            }
+            return;
+        }
+        par(n, fn);
+    };
     // 1. gated value per stream
     const int total = n_tok * hc_dim;
-    par(total, [&](int j) {
+    papply(total, (long long)total, [&](int j) {
         const int c = j % n_embd;
         const int s = (j / n_embd) % hc;
         const int i = j / hc_dim;
         gated[(size_t)tok_row(rows, i) * hc_dim + (size_t)s * n_embd + c] =
             value[(size_t)tok_row(rows, i) * n_embd + c] * gate[(size_t)tok_row(rows, i) * hc + s];
     });
+    if (pat) pt1 = pnow();
     // 2. grouped RMSNorm of the gated value
-    par(n_tok * hc, [&](int j) {
+    papply(n_tok * hc, (long long)n_tok * hc_dim, [&](int j) {
         const int i = j / hc;
         const int s = j % hc;
         const size_t base = (size_t)tok_row(rows, i) * hc_dim + (size_t)s * n_embd;
         rmsnorm_row(gated + base, w_conv + (size_t)s * n_embd, normed + base, n_embd, eps);
     });
+    if (pat) pt2 = pnow();
     // 3. conv + residual add.  group[i] = position of token i inside its slot's
     // token run, computed by a linear scan (n_tok is at most kMaxB*kMaxT=512 and
     // usually <= 32).
@@ -497,7 +530,7 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
         }
         base_pos[i] = poss[i] - g; // position of this slot's first token in the call
     }
-    par(n_tok * hc_dim, [&](int j) {
+    papply(n_tok * hc_dim, (long long)n_tok * hc_dim, [&](int j) {
         const int c = j % hc_dim;
         const int i = j / hc_dim;
         const int slot = slots[i];
@@ -522,6 +555,7 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
         residual[(size_t)tok_row(rows, i) * hc_dim + c] +=
             gated[(size_t)tok_row(rows, i) * hc_dim + c] + cpu_silu(acc);
     });
+    if (pat) pt3 = pnow();
     // 4. append the new normalised rows to each slot's history
     for (int i = 0; i < n_tok;) {
         const int slot = slots[i];
@@ -544,7 +578,7 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
             std::memmove(h + (size_t)old_dst * hc_dim, h + (size_t)old_src * hc_dim,
                          (size_t)keep_old * hc_dim * sizeof(float));
         }
-        par(keep * hc_dim, [&](int j) {
+        papply(keep * hc_dim, (long long)keep * hc_dim, [&](int j) {
             const int t = j / hc_dim;
             const int c = j % hc_dim;
             h[(size_t)(hist_rows - keep + t) * hc_dim + c] =
@@ -552,6 +586,11 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
         });
         n_hist[slot] = keep_old + keep;
         i = end;
+    }
+    if (pat) {
+        const double pe = pnow();
+        fprintf(stderr, "[q4pa] n=%d gated=%.3f rms=%.3f conv=%.3f hist=%.3f total=%.3f ms\n", n_tok, pt1 - pt0,
+                pt2 - pt1, pt3 - pt2, pe - pt3, pe - pt0);
     }
 }
 

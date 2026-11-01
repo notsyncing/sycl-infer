@@ -601,6 +601,12 @@ struct engine {
     double q4_up_dma_ms_ = 0.0;          // PF_Q4_UPDMA: the H2D floor, measured
     size_t q4_up_bytes_ = 0;
     size_t q4_up_calls_ = 0;
+    // PF_Q4_UPSTAT: the device copies' own event intervals, so the printed rate
+    // is the DMA rate and not the host memcpy's.  Before this the line divided
+    // bytes by the pageable->pinned host memcpy time, which is zero on the
+    // shipped pinned path and printed either 0.00 or absurd values (17389 GB/s)
+    // depending on whether a ring slot happened to be reused in that step.
+    std::vector<sycl::event> q4_up_prof_;
     void q4_upload(int dev, void * dst, const void * src, size_t n, bool pinned = false);
     // Prefill-only: enqueue on the per-device copy queue so the H2D rides
     // alongside the previous batch's expert GEMMs.  The caller waits
@@ -611,8 +617,12 @@ struct engine {
     std::vector<std::unique_ptr<sycl::queue>> q4_up_q_; // per device, in-order copy queue
     std::vector<sycl::event> q4_up_last_ev_;            // last async copy this batch
     std::vector<unsigned char> q4_up_last_live_;
-    std::vector<uint32_t> q4_lru_age_; // [n_layer][R], the per-slot LRU clock
-    std::vector<float> q4_lru_heat_;    // [n_layer][R], decayed routing heat (PF_Q4_HEAT)
+    std::vector<int> R_cur_;           // per device: slots per layer
+    std::vector<size_t> q4_r_off_;     // [n_layer+1] offsets into the LRU arrays
+    // [layer][R_l] with R_l from that layer's device; q4_r_off_ gives the
+    // per-layer offset, so index these through it and never as il * R.
+    std::vector<uint32_t> q4_lru_age_; // the per-slot LRU clock
+    std::vector<float> q4_lru_heat_;   // decayed routing heat (PF_Q4_HEAT)
     uint32_t q4_lru_tick_ = 0;
     bool q4_hotchk_done_ = false;
     // Decode forwards seen by the q4 path (PF_Q4_CPU_MISS's warm-up gate).
@@ -640,6 +650,7 @@ struct engine {
         void * u = nullptr;
         void * d = nullptr;
         size_t sg = 0, su = 0, sd = 0;
+        int r = 0; // slots this layer's device could afford
         int32_t * sm = nullptr;  // slot map (decode / first prefill batch)
         int32_t * sm2 = nullptr; // alternate map for the two-pass prefetch
         void * hg = nullptr;     // pinned host copy of this layer's expert planes
@@ -770,6 +781,9 @@ struct engine {
                        float * qbuf, const float * kbuf, const float * vbuf, float * attn_out);
     void q4_alloc_banks();
     void q4_alloc();
+    // int8 store of the routed down planes, for the layers that do not run in
+    // the VRAM bank (and for the host-miss / FFCMP diagnostics).
+    void q4_build_down_i8();
     void q4_prefault();
     // mode 0 = decode (n_rows sequences, one token each), mode 2 = prefill
     // (one sequence, n_tok tokens laid out in kMaxT-wide rows)
@@ -926,7 +940,8 @@ struct engine {
     };
     std::vector<dec_bucket> buckets_;
 
-    float * h_logits = nullptr; // [kMaxB][vocab]
+    float * h_logits = nullptr; // [kMaxB][vocab], pinned USM when available
+    bool h_logits_pinned_ = false;
 
     std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g_pf;
     // prefill graph using the SI8/DP4A int8 path

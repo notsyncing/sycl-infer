@@ -192,27 +192,57 @@ over a 16k KV is what the extra 25.6 ms/step buys.
 `Qwen3.8-Flash-Next-UD-Q4_K_XL` (4 shards, `qwen4exp`): 48 layers, 512 routed
 experts (top-10), a 5.3 GiB dense trunk and a 71.7 GiB host-resident expert bank
 behind a per-expert LRU on the cards.  AOT Release, 2x Arc A770, f16 KV
-(except the 512 prefill), `--cpu-threads 28`, `--layer-map 0-23:gpu.0,24-47:gpu.1`,
-`PF_PREFIX_CACHE=0`, one process per cell, 2026-10-27.  The bank is 17 500 MB
-(121 slots/layer) except the 48k cell, which needs 16 000 MB to allocate at
-`--ctx 65536`.
+(except the 512 prefill), `--cpu-threads 28`, `PF_PREFIX_CACHE=0`, one process
+per cell.
+
+The cells below were measured (2026-10-27) with
+`--layer-map 0-23:gpu.0,24-47:gpu.1` and a 17 500 MB bank (121 slots/layer),
+except the 48k cell, which needs 16 000 MB to allocate at `--ctx 65536`.
+**The recommended map for new runs is `0-19:gpu.0,20-47:gpu.1`**: device 0 is
+the x8 slot, so giving the x16 card more layers pays, and the bank's slot count
+is per device (152 on device 0, 104 on device 1, 17.0 GiB) rather than one
+shared minimum.
+
+**Startup and footprint.**  A run reaches its first token in **56 s** and holds
+**80 GiB** resident: the routed-down int8 host store is built only for the
+layers that do not run in the bank (0.9 GiB), and the 69.8 GiB pinned expert
+source plus the 71.7 GiB routed bank stay host-resident as before.  The
+per-stage device budget of one decode step - dense GEMV 13.40 ms, GDN and
+attention cores 1.52, PLE 2.50, routed gate/up and down, router - is in
+[`design/18-qwen4exp.md`](design/18-qwen4exp.md) §7.2.
+
+**Column definitions.** `pp` is `prompt tokens / warm prefill`, taken from the
+engine's own `[q4] fwd n=<rows>` prefill rows (a repeat in the same process;
+the first prefill of a process also calibrates the expert bank and is 2-3 s
+slower).  `ms/step` is the mean wall clock of one decode forward, i.e. the
+engine's `[q4] fwd n=1` line, and `tg = 1000 / ms/step`.  **The first decode
+step after a prefill is 1.5-2x slower while the bank warms**, so a short
+generation reads high: the same 512-depth cell measures 103 ms/step with a cold
+bank and 73 ms/step once warm, and the table's 93.3 is the steady value a
+64-token generation reports.
 
 #### 4.4.1 By context depth, one stream
 
 | depth | prompt | pp | tg | ms/step |
 |---:|---:|---:|---:|---:|
-| 512 | 512 | 53 tok/s (9.6 s, warm) | 10.70 tok/s | 93.3 |
-| 16 445 | 16 445 | 41.3 tok/s (398.4 s) | 8.24 tok/s | 121.3 |
-| 48 139 | 48 139 | 35.8 tok/s (1 343.8 s) | 6.51 tok/s | 153.6 |
+| 512 | 537 | 50.7 tok/s (10.6 s) | 10.68 tok/s | 93.6 |
+| 16 037 | 16 037 | 48.9 tok/s (327.7 s) | 9.22 tok/s | 108.5 |
+| 48 222 | 48 222 | 42.8 tok/s (1 126.8 s) | 9.21 tok/s | 108.5 |
 
-The 512 prefill is the archive i8 cell and its decode is f16; the deep cells
-are f16 throughout.  f16 prefill at 2 426 tokens measures 53.4 tok/s, so the KV
-type is not the difference.  The 512 cell is the dense QSA path (`--ctx 4096`):
-the selector is dense-equivalent there and its deferred update is hidden under
-the LM head.  The two deep cells are the sparse QSA path, which selects the top
-2 048 of the pooled keys and then attends to those on the device.  The deep
-cells are single-request samples (9 and 7 decode steps), so the curve is not
-smooth: the 2 426-token f16 cell measured 53.4 tok/s pp and 7.28 tok/s tg.
+All three are f16 KV, `--context 4096 / 20 480 / 65 536`, 24 / 24 / 12 decode
+steps, and the bank is 17 500 MB (104 slots/layer on the 20/28 map) except the
+48k cell, which needs 16 000 MB (95 slots).  The 512 and 16k cells take a prose
+prompt; **the 48k cell's prompt is synthetic** (a repeated one-token word,
+because a 48k-token prose prompt exceeds the 128 KB single-argument limit), so
+its routing is degenerate and its decode is not directly comparable to a real
+document.
+
+`tg` is flat from 16k to 48k (9.2 tok/s) because the decode is weight-bound and
+the extra attention at 48k costs less than the bank's routing noise; the prefill
+falls 48.9 -> 42.8 tok/s over the same range.  The 512 cell is the dense QSA
+path (the selector is dense-equivalent under 2 048 keys and its deferred update
+is hidden under the LM head); the deep cells are the sparse path, which selects
+the top 2 048 pooled keys and attends to those on the device.
 
 #### 4.4.2 By batch size, at depth 512
 
@@ -238,9 +268,31 @@ requests measure 5.40 tok/s aggregate against 6.09 for one at a time;
 Not run: the policy is one row per forward, and the 2-row forward is already
 0.85x at depth 512.
 
+#### 4.4.4 One card only (the x16 slot)
+
+The bank's expert H2D runs at **9.96 GB/s** on the x16 card and **5.17 GB/s**
+on the x8 one, so it is worth asking whether putting every layer on the x16
+card wins.  It does not:
+
+| depth | pp (dual -> one card) | tg (dual -> one card) | ms/step |
+|---:|---:|---:|---:|
+| 512 | 50.7 -> 48.8 tok/s | 10.68 -> 9.84 tok/s | 93.6 -> 101.6 |
+| 16 037 | 48.9 -> 44.5 tok/s | 9.22 -> 9.37 tok/s | 108.5 -> 106.8 |
+| 48 222 | 42.8 -> - | 9.21 -> - | - |
+
+`--layer-map 0-47:gpu.0` with the second card hidden
+(`ONEAPI_DEVICE_SELECTOR=level_zero:1`) fits **5 250 MB of dense weights plus
+only a 4 000 MB bank = 28 slots/layer** (3.8 GiB) in 15.5 GiB - the 16 GB of
+VRAM, not the link, is the constraint, and 5 000 MB fails to allocate.  With a
+quarter of the slots the bank misses far more often, which cancels the faster
+link: the single card is **8 % slower at 512 depth**, a wash at 16k, and
+**cannot run a 48k context at all** (the 1.1 GB KV plus a working bank does not
+fit).  The dual card remains the configuration to run.
+
 Detailed logs - QSA Stage 1/2, the 2-row breakdown, tail-skip, the MTP no-go,
-the prefill ceiling and the deep-context raw runs - are in
-[`design/18-qwen4exp.md`](design/18-qwen4exp.md) §4, §6 and §7.
+the prefill ceiling, the dense/routed stage budget and the dead ends of this
+pass - are in
+[`design/18-qwen4exp.md`](design/18-qwen4exp.md) §4, §6, §7 and §9.
 
 ## 5. Qwen3.8-27B — the dense model
 

@@ -655,6 +655,27 @@ qwen4exp 的每专家 LRU、pinned expert source（`PF_Q4_PIN_SRC`，63.0 GiB / 
 [design/18-qwen4exp.md §6](18-qwen4exp.md) 与
 [design/15-moe-ncmoe.md §10](15-moe-ncmoe.md)。
 
+**专家 down / router 的实测补给（2026-11-01）**
+
+* `moe_down_q5_1_impl` 的 **61-84 GB/s 是 24 字节 block 的加载形状**，不是访存流。冷流实测
+  （`dev/bench_q5cold.cpp`，256 slot / 300 MB bank、25 个不相交的 10-slot 子集，barrier-pair
+  取设备时间）：纯 `uint4` 读 **363.5 GB/s**（天花板），Q4_K gate/up grouped **171**，
+  Q4_K down **178**，Q5_1 一 lane 一 block **98-101**，Q5_1 SG8 **NPB=1 81-85 / NPB=8 73.8**，
+  整行进 SLM 的 SG8 只有 **52**（每行一道 barrier 比省下的合并更贵）。原因：Q4_K 的 144 字节
+  superblock 一次给一个 warp **128 字节连续的 `qs`**；Q5_1 每个 block 只有 16 字节 `qs`，
+  SG=8 时 8 个 lane 有一半在读重复的 4 字节字。slot 是否相邻对 Q5_1 **完全无影响**
+  （73.8 adjacent = spread）。**NPB=1 是逐位一致的**，0.1875 → 0.1674 ms/layer；
+  `PF_Q4_Q5_LANE=1` 再快 15-25% 但**不是逐位一致**，保持 opt-in。
+* **router 的两个核不是一个问题**。`moe_router_logits` 每个 `(token, expert)` 一个 32-lane
+  sub-group，一个 decode 就是 512 个 work-group = **1 warp/EU（4096 warp 容量的 12.5%）**，
+  但读 `ffn_gate_inp`（5.24 MB/层）已经到 **286 GB/s** = 流式天花板的 75%。真正贵的是后面的
+  fused softmax+top-k：**每个 token 一个 work-group**，32 个 Xe-core 里只用 1 个（0.39%），
+  **39 µs/层**（GEMV 的 2.2 倍）。它的相位拆分是 top-k 选择 28 µs / 归一化和 8 / exp 4 /
+  扫描 6.5 / 归约树 6。把依赖 SLM 的加载批量提到寄存器（默认开，`PF_MOE_RT_FAST=0` 关）
+  得到 **0.0422 → 0.0377 ms/层（-10.7%）**、-0.22 ms/token，ids/weights/logits **逐位一致**。
+  三个重构都更慢：SLM max 合并 +65%、64-bit retire mask +29%、全 lane rank scan +12%；
+  N 已经切满、K-split 会翻 near-tie，所以"再切一刀"没有空间。
+
 ---
 
 ## 6. `qk_norm_rope_launch`（`qk_norm_rope.cpp:14-224`）

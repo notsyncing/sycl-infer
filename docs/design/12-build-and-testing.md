@@ -521,6 +521,34 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 [PERFORMANCE.md](../PERFORMANCE.md) 每一张表的表头**，新测出来的吞吐率要加进那张表，而不是只加进
 commit message。
 
+### 6.2 测量与 A/B 的九条教训（2026-11-01，qwen4exp 优化轮）
+
+这一轮跑了 6 个 subagent、改 6 个文件、拿到 -12.7%，但真正值得注意的是下面这些**踩过的坑**：
+
+1. **驻留 L2 的 probe 不能给流式 kernel 定价。** 一个 12.29 MB 工作集重复 100 次的 probe 测出
+   "一 lane 一 block 快 3-4 倍"，而 16 MB 的 L2 正好装得下；冷流（300 MB、25 个不相交子集）
+   只剩 **1.33 倍**。同一个 probe 骗了这个项目两次。
+2. **"不崩溃"不是验证。** `PF_Q4_STAGE=0` 只验了退出码 0，实际**输出是错的**（down 平面没上传）。
+   任何 A/B 开关都必须比**生成文本的 md5**，不只是比"跑通了"。code review 抓到了这一个。
+3. **把一个拷贝换到另一个队列，必须同时把等待也搬过去。** 拷贝从计算队列移到 copy queue 后，
+   复合计时器静默重归属：`up` 从 0.3-3.0 ms 变成 0，`aq` 从 0.1 变成 25。看到"某一段突然变 0"
+   就该怀疑等待点，而不是怀疑那段变快了。
+4. **launcher 里的 env 必须读进函数级 `static` 再拷成局部 `const`。** SYCL kernel lambda 不能
+   引用动态初始化的 static（编译直接报错），但也不能每次 launch 都 `getenv`（每层一次就是
+   48 次/token）。
+5. **每个模板实例化都是一个 AOT 设备镜像。** 一个 4 档 NPB 的 switch + 一个 4 档 lane switch
+   就是 8 个 kernel、8 次 `ocloc` lowering，而只有 1 个是出货配置。留 2 个（默认 + A/B）就够。
+6. **`env::str(k) != nullptr` 不是 `flag(k)`。** `PF_FOO=0` 也会被当成"开"。同一个开关在两个
+   地方用两种解析，就会得到"forward 里关着、startup 里开着"。
+7. **`par()` 有固定的唤醒+汇合成本**：28 线程池约 **0.5 ms/次**，一个 10240 元素的 decode 循环
+   实际工作只有 ~0.05 ms。小区域应在调用线程上跑；阈值要按**工作量**而不是迭代数，否则
+   prefill 里"2048 个 job × 2560 元素"会被误判成小活而串行。
+8. **聚合指标看不见"少算了一项"。** layer 2 的 shared expert 被一句无条件 `from_host` 覆盖掉，
+   token 流看起来完全正常；只有 `PF_Q4_DUMP=1` 逐层比对 `ffn_out` 与 `moe_routed`
+   （逐位相同）才暴露出来。
+9. **成对、同 session、同 lock。** 这台箱子跑间漂移 ±3%，冷页缓存会让 PLE gather 从 0.08 ms
+   变成 10-12 ms。A/B 必须交替跑，重活必须串行（`flock`），否则测的是噪声或别的进程。
+
 ---
 
 ## 7. 调试手册：27B 输出错乱是怎么查出来的

@@ -35,6 +35,7 @@
 #include "gguf.h" // GGML_TYPE_* (the kernel headers only pull the raw type ids)
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -427,6 +428,26 @@ static sycl::event moe_router_softmax_topk(queue & q, float * logits, int n_tok,
     // rank scan is 512 steps of 16 warps on a single EU and measures 0.079 ms;
     // it is 3.4 ms/token across the 43 banked layers.
     const bool rank_scan = si::env::flag("PF_MOE_RT_RANK");
+    // Phase ablation for the device-time probe (wrong results by design; the
+    // outputs stay in range so the engine keeps running).  This is how the
+    // fused kernel's ~40 us serial chain is attributed: 1 = skip exp,
+    // 2 = skip the p[] writeback, 3 = skip the top-k selection,
+    // 5 = skip the sequential normaliser sum, 6 = skip the 1/sum multiply.
+    // Function-scope statics (read once) copied into locals: a `static` cannot
+    // be referenced from inside the SYCL kernel lambda, but the env read must
+    // not happen per layer either.
+    static const int abl_c = si::env::i32("PF_MOE_RT_ABL", 0);
+    const int abl = abl_c;
+    // PF_MOE_RT_FAST (default ON) is the shipped switch: batch the fused
+    // kernel's dependent shared-memory loads into registers (the top-k scan,
+    // the cross-warp max fold and the weight-sum tail).  Every comparison runs
+    // in the original order with the original tie rule, so ids/wts/logits are
+    // bit-identical; only the SLM load latency overlaps.  Measured on qwen4exp
+    // (512 experts, top_k 10, one A770, alternating A/B 3 runs each): fused
+    // kernel 0.0422 -> 0.0377 ms/layer (-10.7%), router device time
+    // 0.0627 -> 0.0582 ms/layer, generated text byte-identical.
+    static const bool fast_c = si::env::i32("PF_MOE_RT_FAST", 1) != 0;
+    const bool fast = fast_c;
     return q.submit([&](handler & h) {
         local_accessor<float, 1> pl((size_t)n_expert, h);
         local_accessor<float, 1> red((size_t)NSG + 1, h);
@@ -449,46 +470,80 @@ static sycl::event moe_router_softmax_topk(queue & q, float * logits, int n_tok,
             }
             it.barrier();
             mx = red[0];
-            for (int s = 1; s < NSG; s++) {
-                mx = sycl::fmax(mx, red[s]);
+            if (fast) {
+                // same fmax sequence (fmax is exact and commutative), loads
+                // hoisted 8 at a time so the cross-warp slots overlap
+                int s = 1;
+                for (; s + 7 < NSG; s += 8) {
+                    const float a0 = red[s], a1 = red[s + 1], a2 = red[s + 2], a3 = red[s + 3];
+                    const float a4 = red[s + 4], a5 = red[s + 5], a6 = red[s + 6], a7 = red[s + 7];
+                    mx = sycl::fmax(mx, a0);
+                    mx = sycl::fmax(mx, a1);
+                    mx = sycl::fmax(mx, a2);
+                    mx = sycl::fmax(mx, a3);
+                    mx = sycl::fmax(mx, a4);
+                    mx = sycl::fmax(mx, a5);
+                    mx = sycl::fmax(mx, a6);
+                    mx = sycl::fmax(mx, a7);
+                }
+                for (; s < NSG; s++) {
+                    mx = sycl::fmax(mx, red[s]);
+                }
+            } else {
+                for (int s = 1; s < NSG; s++) {
+                    mx = sycl::fmax(mx, red[s]);
+                }
             }
             // exp in parallel, kept in SLM (and written back for compatibility)
             for (int e = tid; e < n_expert; e += WG) {
-                pl[e] = sycl::exp(p[e] - mx);
+                pl[e] = (abl == 1) ? p[e] : sycl::exp(p[e] - mx);
             }
             it.barrier();
             // the reference's sum: sequential, ascending index, on one lane.
             // Batched 8 loads then 8 dependent adds: the adds keep the
             // reference's order exactly (so 1/sum is bit-identical) while the
             // loads overlap instead of stalling the chain every iteration.
-            if (tid == 0) {
-                float sum = 0.f;
-                int e = 0;
-                for (; e + 8 <= n_expert; e += 8) {
-                    const float v0 = pl[e + 0], v1 = pl[e + 1], v2 = pl[e + 2], v3 = pl[e + 3];
-                    const float v4 = pl[e + 4], v5 = pl[e + 5], v6 = pl[e + 6], v7 = pl[e + 7];
-                    sum += v0;
-                    sum += v1;
-                    sum += v2;
-                    sum += v3;
-                    sum += v4;
-                    sum += v5;
-                    sum += v6;
-                    sum += v7;
+            float inv;
+            {
+                if (abl != 5 && tid == 0) {
+                    float sum = 0.f;
+                    int e = 0;
+                    for (; e + 8 <= n_expert; e += 8) {
+                        const float v0 = pl[e + 0], v1 = pl[e + 1], v2 = pl[e + 2], v3 = pl[e + 3];
+                        const float v4 = pl[e + 4], v5 = pl[e + 5], v6 = pl[e + 6], v7 = pl[e + 7];
+                        sum += v0;
+                        sum += v1;
+                        sum += v2;
+                        sum += v3;
+                        sum += v4;
+                        sum += v5;
+                        sum += v6;
+                        sum += v7;
+                    }
+                    for (; e < n_expert; e++) {
+                        sum += pl[e];
+                    }
+                    red[NSG] = sum;
                 }
-                for (; e < n_expert; e++) {
-                    sum += pl[e];
-                }
-                red[NSG] = sum;
+                it.barrier();
+                inv = (abl == 5) ? 1.f : 1.f / red[NSG];
             }
-            it.barrier();
-            const float inv = 1.f / red[NSG];
             for (int e = tid; e < n_expert; e += WG) {
-                pl[e] *= inv;
-                p[e] = pl[e];
+                if (abl != 6) {
+                    pl[e] *= inv;
+                }
+                if (abl != 2) {
+                    p[e] = pl[e];
+                }
             }
             it.barrier();
-            if (rank_scan) {
+            if (abl == 3) {
+                // valid ids/weights, no selection work (timing only)
+                if (tid < top_k) {
+                    ids[(size_t)t * top_k + tid] = tid;
+                    wl[tid] = pl[tid];
+                }
+            } else if (rank_scan) {
                 // top-k by rank, exactly as moe_router_topk<true>
                 for (int e = tid; e < n_expert; e += WG) {
                     const float pe = pl[e];
@@ -523,34 +578,87 @@ static sycl::event moe_router_softmax_topk(queue & q, float * logits, int n_tok,
                     for (int r = 0; r < top_k; r++) {
                         float best = -3.402823466e38f;
                         int bi = n_expert;
-                        for (int e = lane; e < n_expert; e += 32) {
+                        int e = lane;
+                        // PF_MOE_RT_FAST: hoist the round's independent SLM
+                        // loads into registers, 8 at a time, before the
+                        // dependent `best`/`bi` chain consumes them.  The
+                        // compares run in exactly the original order (lane's
+                        // elements, ascending e, same tie rule), so the ids
+                        // and weights are BIT-IDENTICAL to the serial form -
+                        // only the load latency is overlapped.
+                        if (fast) {
+                            for (; e + 32 * 7 < n_expert; e += 32 * 8) {
+                                const float v0 = pl[e], v1 = pl[e + 32], v2 = pl[e + 64], v3 = pl[e + 96];
+                                const float v4 = pl[e + 128], v5 = pl[e + 160], v6 = pl[e + 192], v7 = pl[e + 224];
+                                if (v0 > best || (v0 == best && e < bi)) { best = v0; bi = e; }
+                                if (v1 > best || (v1 == best && e + 32 < bi)) { best = v1; bi = e + 32; }
+                                if (v2 > best || (v2 == best && e + 64 < bi)) { best = v2; bi = e + 64; }
+                                if (v3 > best || (v3 == best && e + 96 < bi)) { best = v3; bi = e + 96; }
+                                if (v4 > best || (v4 == best && e + 128 < bi)) { best = v4; bi = e + 128; }
+                                if (v5 > best || (v5 == best && e + 160 < bi)) { best = v5; bi = e + 160; }
+                                if (v6 > best || (v6 == best && e + 192 < bi)) { best = v6; bi = e + 192; }
+                                if (v7 > best || (v7 == best && e + 224 < bi)) { best = v7; bi = e + 224; }
+                            }
+                        }
+                        for (; e < n_expert; e += 32) {
                             const float v = pl[e];
                             if (v > best || (v == best && e < bi)) {
                                 best = v;
                                 bi = e;
                             }
                         }
-                        for (int mask = 16; mask > 0; mask >>= 1) {
-                            const float ov = sycl::permute_group_by_xor(sgg, best, mask);
-                            const int oi = sycl::permute_group_by_xor(sgg, bi, mask);
-                            if (ov > best || (ov == best && oi < bi)) {
-                                best = ov;
-                                bi = oi;
+                        if (abl == 8) {
+                            // timing only: scan only, no cross-lane merge/retire
+                            if (lane == 0) {
+                                ids[(size_t)t * top_k + r] = bi;
+                                wl[r] = best;
+                            }
+                        } else {
+                            for (int mask = 16; mask > 0; mask >>= 1) {
+                                const float ov = sycl::permute_group_by_xor(sgg, best, mask);
+                                const int oi = sycl::permute_group_by_xor(sgg, bi, mask);
+                                if (ov > best || (ov == best && oi < bi)) {
+                                    best = ov;
+                                    bi = oi;
+                                }
+                            }
+                            if (abl == 9) {
+                                // timing only: scan + tree, no retire/barrier
+                                if (lane == 0) {
+                                    ids[(size_t)t * top_k + r] = bi;
+                                    wl[r] = best;
+                                }
+                            } else {
+                                if (lane == 0) {
+                                    ids[(size_t)t * top_k + r] = bi;
+                                    wl[r] = best;
+                                    pl[bi] = -3.402823466e38f;
+                                }
+                                sycl::group_barrier(sgg);
                             }
                         }
-                        if (lane == 0) {
-                            ids[(size_t)t * top_k + r] = bi;
-                            wl[r] = best;
-                            pl[bi] = -3.402823466e38f;
-                        }
-                        sycl::group_barrier(sgg);
                     }
                 }
             }
             it.barrier();
             if (tid == 0) {
                 float sum = 0.f;
-                for (int j = 0; j < top_k; j++) {
+                int j = 0;
+                if (fast) {
+                    for (; j + 7 < top_k; j += 8) {
+                        const float a0 = wl[j], a1 = wl[j + 1], a2 = wl[j + 2], a3 = wl[j + 3];
+                        const float a4 = wl[j + 4], a5 = wl[j + 5], a6 = wl[j + 6], a7 = wl[j + 7];
+                        sum += a0;
+                        sum += a1;
+                        sum += a2;
+                        sum += a3;
+                        sum += a4;
+                        sum += a5;
+                        sum += a6;
+                        sum += a7;
+                    }
+                }
+                for (; j < top_k; j++) {
                     sum += wl[j];
                 }
                 red[NSG] = sycl::fmax(sum, 6.103515625e-5f);
@@ -597,14 +705,20 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
     // PF_MOE_RT_WG forces the fused kernel's work-group width (A/B knob; the
     // default splits the row into at most 512 lanes).
     static const int rt_wg = si::env::i32("PF_MOE_RT_WG", 0);
+    // Resolve the width ONCE: the launch and the [moert] report must not be able
+    // to disagree about the work-group the kernel actually ran.
+    const int fwg = (rt_wg == 32) ? 32
+                    : (rt_wg == 128) ? 128
+                    : (rt_wg == 256 || (rt_wg != 512 && n_expert <= 256)) ? 256
+                                                                          : 512;
     auto fused = [&]() -> sycl::event {
-        if (rt_wg == 32) {
+        if (fwg == 32) {
             return moe_router_softmax_topk<32>(q, logits, n_tok, n_expert, top_k, ids, wts);
         }
-        if (rt_wg == 128) {
+        if (fwg == 128) {
             return moe_router_softmax_topk<128>(q, logits, n_tok, n_expert, top_k, ids, wts);
         }
-        if (rt_wg == 256 || (rt_wg != 512 && n_expert <= 256)) {
+        if (fwg == 256) {
             return moe_router_softmax_topk<256>(q, logits, n_tok, n_expert, top_k, ids, wts);
         }
         return moe_router_softmax_topk<512>(q, logits, n_tok, n_expert, top_k, ids, wts);
@@ -662,9 +776,27 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
         const double ts = (double)ef.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
         const double te = (double)ef.get_profiling_info<sycl::info::event_profiling::command_end>() / 1.0e6;
         const double t0 = (double)e0.get_profiling_info<sycl::info::event_profiling::command_end>() / 1.0e6;
-        fprintf(stderr, "[moert] n=%d ne=%d wg=%d logits=%.3f fused=%.3f gap=%.3f ms\n", n_tok, n_expert,
-                n_expert <= 256 ? 256 : 512, t0 - (double)e0.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6,
-                te - ts, ts - t0);
+        // Grid report (measurement aid): the logits GEMV launches one 32-lane
+        // sub-group per (token, expert), so a decode is `n_expert` work-groups
+        // of one warp; the fused softmax/top-k launches one work-group per
+        // token.  Print both with the card's compute-unit count so the wave
+        // occupancy is arithmetically visible in the same line as the device
+        // times.
+        static const int cu = [&q] {
+            try {
+                return (int)q.get_device().get_info<sycl::info::device::max_compute_units>();
+            } catch (...) {
+                return 0;
+            }
+        }();
+        const size_t lgroups = (size_t)n_tok * (size_t)n_expert;
+        fprintf(stderr,
+                "[moert] n=%d ne=%d wg=%d cu=%d lgroups=%zu lwarps=%zu fgroups=%d fwg=%d fwarps=%d "
+                "logits=%.4f fused=%.4f gap=%.4f ms\n",
+                n_tok, n_expert, fwg, cu, lgroups, lgroups, n_tok, fwg,
+                (int)((size_t)n_tok * (size_t)(fwg / 32)),
+                t0 - (double)e0.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6, te - ts,
+                ts - t0);
     }
     if (rt_time && (rt_old || do_chk)) {
         e3.wait();
@@ -2017,6 +2149,152 @@ static void moe_down_q5_1_impl(queue & q, const char * dbank, const int32_t * sl
     });
 }
 
+// ---------------------------------------------------------------------------
+// One lane per 32-value group (`PF_Q4_Q5_LANE=1`).
+//
+// WHY.  The SG=8 kernel above splits a block across eight lanes, so the warp
+// issues four memory instructions per group slice (qh, qs word, d, m) and the
+// 32 lanes together cover only four blocks per instruction group.  Cold-stream
+// numbers (dev/bench_q5cold.cpp: a 256-slot / 300 MB bank, 25 disjoint 10-slot
+// subsets so the reuse distance is ~300 MB, device time from barrier pairs;
+// K=640 N=2560, 10 experts):
+//
+//     shipped (SG=8, NPB=8)          73.8 GB/s     (also 79.5 at 256 experts)
+//     shipped (SG=8, NPB=1)          81-85 GB/s    (136.5 at 256 experts)
+//     one lane per group, NPB=1      98-101 GB/s   (191.8 at 256 experts)
+//     grouped Q4_K down, same bytes  178 GB/s      (281.5 at 256 experts)
+//     pure coalesced uint4 read      363.5 GB/s    (ceiling)
+//
+// so the ~65 GB/s is not the DRAM stream, it is the instruction mix: SG=8 needs
+// one load per 24 B of row, and the decode->dp4a->shuffle chain behind each is
+// what the warp waits on.  Giving one lane the whole block instead loads its
+// 24 B with qh (4 B), d+m (4 B) and two 8-byte qs loads and runs eight dp4a
+// back to back; that is 2-4 loads for 20 blocks per warp-row instead of 20,
+// and the whole weight row is read once per warp.  The old probe
+// (dev/bench_q5down.cpp) replayed 12.29 MB against a 16 MB L2 and reported a
+// 3.3-4.0x; that number was L2 and is withdrawn - cold, the gain is 1.3x.
+//
+// But with one block per lane only 20 of 32 lanes work, so the kernel needs
+// concurrency, not rows per warp: NPB=1 (one row per warp, 25600 warps at a
+// decode's ~10 experts) is the best shape (PF_Q4_Q5_LANE_NPB).  The extreme
+// sensitivity to NPB is the idle-lane trade: at 20/32 lanes the warp is
+// latency-bound and every wave matters.
+//
+// NOT BIT-IDENTICAL to the SG=8 kernel: each lane now sums all eight chunks of
+// its group and there is one 32-lane reduction per row, so the fp32
+// association of a 640-value dot changes.  The computed sum is the same
+// (rel-rms 1.5e-7 against the SG=8 kernel and ~1e-4 against an f64-style host
+// reference, i.e. inside the kernel's own existing error).  The weight decode
+// is hoisted out of the pair loop, so a prefill's many pairs still read each
+// row once.
+//
+// Two vector loads are deliberate: `qs` starts at byte 8 of a 24-byte block,
+// so it is 8-byte aligned but only every other block is 16-byte aligned.  A
+// uint4 load there is a misaligned 16-byte access (the AOT-widening trap the
+// Q8_0 GEMV hit); two uint2 loads at +0/+8 are safe and measure the same.
+// ---------------------------------------------------------------------------
+template <int NPB>
+static void moe_down_q5_1_lane_impl(queue & q, const char * dbank, const int32_t * slot_map, size_t slot_db,
+                                    const int32_t * off, const int32_t * pair, const int32_t * active,
+                                    const int32_t * n_active, int n_act_max, const int8_t * xq,
+                                    const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                                    int n_ff_exp) {
+    const int ng = n_ff_exp / 32;
+    const size_t row_bytes = (size_t)ng * sizeof(block_q5_1);
+    const int nrb = (n_embd + NPB - 1) / NPB;
+    const int nw = n_act_max * nrb;
+    if (nw <= 0) {
+        return;
+    }
+    q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
+                   [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int lid = (int)it.get_local_id(0);
+        const int sg = lid / 32;
+        const int lane = lid % 32;
+        const sub_group sgg = it.get_sub_group();
+        const int w = (int)it.get_group(0) * kMoENW + sg; // global warp id
+        if (w >= nw) {
+            return;
+        }
+        const int ia = w / nrb;
+        const int nb = w % nrb;
+        if (ia >= n_active[0]) {
+            return;
+        }
+        const int e = active[ia];
+        const int slot = slot_map[e];
+        if (slot < 0) {
+            return; // host-resident expert: the host computes it
+        }
+        const int b0 = off[e], b1 = off[e + 1];
+        const char * base = dbank + (size_t)slot * slot_db;
+        for (int rr = 0; rr < NPB; rr++) {
+            const int n = nb * NPB + rr;
+            if (n >= n_embd) {
+                break;
+            }
+            const char * dr = base + (size_t)n * row_bytes;
+            // ng == 20 on qwen4exp; the pass loop keeps a wider Q5_1 tensor
+            // correct (32 groups per pass, one per lane).
+            for (int g0 = 0; g0 < ng; g0 += 32) {
+                const int gr = g0 + lane;
+                // Decode this lane's group once, outside the pair loop.
+                uint32_t wq[8];
+                float wd = 0.f, wm = 0.f;
+                if (gr < ng) {
+                    const auto * blk =
+                        (const block_q5_1 *)(dr + (size_t)gr * sizeof(block_q5_1));
+                    const uint32_t qh = *reinterpret_cast<const uint32_t *>(blk->qh);
+                    // d at 0, m at 2: one 4-byte value (little endian).
+                    const uint32_t dm = ((uint32_t)blk->m << 16) | (uint32_t)blk->d;
+                    const uint2 q0 = *reinterpret_cast<const uint2 *>(blk->qs);
+                    const uint2 q1 = *reinterpret_cast<const uint2 *>(blk->qs + 8);
+                    const uint32_t qw[4] = {q0.x(), q0.y(), q1.x(), q1.y()};
+                    wd = fast_h2f((uint16_t)(dm & 0xFFFFu));
+                    wm = fast_h2f((uint16_t)(dm >> 16));
+#pragma unroll
+                    for (int c = 0; c < 8; c++) {
+                        const uint32_t v = qw[c & 3];
+                        const uint32_t nib = (c < 4) ? (v & 0x0F0F0F0Fu) : ((v >> 4) & 0x0F0F0F0Fu);
+                        const uint32_t hb = (qh >> (4 * c)) & 0xFu;
+                        const uint32_t hi = ((hb & 1u) << 4) | ((hb & 2u) << 11) | ((hb & 4u) << 18) |
+                                            ((hb & 8u) << 25);
+                        wq[c] = nib | hi;
+                    }
+                }
+                for (int i0 = b0; i0 < b1; i0++) {
+                    const int pr = pair[i0];
+                    const int8_t * xr = xq + (size_t)pr * (size_t)n_ff_exp;
+                    const uint16_t * ar = asa + (size_t)pr * (size_t)ng;
+                    const float * sr = xs + (size_t)pr * (size_t)ng;
+                    float a = 0.f;
+                    if (gr < ng) {
+                        const float A = fast_h2f(ar[gr]);
+#pragma unroll
+                        for (int c = 0; c < 8; c++) {
+                            const uint32_t xa = *reinterpret_cast<const uint32_t *>(
+                                xr + (size_t)gr * 32 + (size_t)c * 4);
+                            const int32_t qd = dp4a_s8u8(xa, wq[c], 0);
+                            a = sycl::fma(A * wd, (float)qd, a);
+                        }
+                        // The +m term is the whole 32-value group's sum, and
+                        // this lane owns the whole group, so it is added once.
+                        a = sycl::fma(A * wm, sr[gr], a);
+                    }
+                    const float v = sg_sum(a, sgg);
+                    if (lane == 0) {
+                        if (g0 == 0) {
+                            acc[(size_t)pr * (size_t)acc_stride + n] = v;
+                        } else {
+                            acc[(size_t)pr * (size_t)acc_stride + n] += v;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 void moe_down_q5_1_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                           const int32_t * off, const int32_t * pair, const int32_t * active,
                           const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
@@ -2026,8 +2304,46 @@ void moe_down_q5_1_launch(queue & q, const void * dbank, const int32_t * slot_ma
     if (n_pairs <= 0 || n_embd <= 0 || (n_ff_exp % 32) != 0) {
         return;
     }
-    moe_down_q5_1_impl<8>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq, asa,
-                          xs, acc, acc_stride, n_embd, n_ff_exp);
+    // PF_Q4_Q5_LANE=1 switches to the one-lane-per-group kernel above; the
+    // default 0 keeps the shipped SG=8 kernel so the two can be A/B'd.
+    // On that path NPB=1 is the measured optimum (see the note above): the
+    // warp uses only 20 of its 32 lanes, so it needs waves, not rows.
+    // Only NPB=1 is instantiated: it is the measured optimum for this kernel
+    // (the warp uses 20 of its 32 lanes, so it needs waves, not rows), and each
+    // extra instantiation is another AOT device image for a path that is
+    // opt-in and not bit-identical.
+    static const int lane_mode = si::env::i32("PF_Q4_Q5_LANE", 0);
+    if (lane_mode != 0) {
+        moe_down_q5_1_lane_impl<1>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max,
+                                   xq, asa, xs, acc, acc_stride, n_embd, n_ff_exp);
+        return;
+    }
+    // NPB rows per warp.  The kernel is latency-bound, not bandwidth-bound:
+    // the grid is n_act x ceil(n_embd/NPB) warps, so at NPB=8 a decode with
+    // ~10 active experts launches only ~3200 warps against 4096 resident slots
+    // (0.8 of a wave) and each warp's dependent decode->dp4a chain has nothing
+    // to hide behind.
+    //
+    // The default is 1, measured on a COLD stream (dev/bench_q5cold.cpp: a
+    // 256-slot / 300 MB bank, 25 disjoint 10-slot subsets per sample, so the
+    // reuse distance is ~300 MB).  NPB=8 / NPB=1 / one-lane-per-group are
+    // 73.8 / 84.5 / 101.3 GB/s there, and the in-engine AOT kernel times are
+    // 0.1935 / 0.1745 ms per layer - the old 8 was chosen from a probe whose
+    // 12.29 MB working set was replayed against a 16 MB L2, i.e. from L2, not
+    // from DRAM.  NPB=1 is BIT-IDENTICAL to NPB=8 and measured 90.71 ->
+    // 89.41 ms/token on the 48-token greedy decode (three alternating runs,
+    // same output md5), and the 576-token prefill is not worse.
+    // Two instantiations only: the shipped NPB=1 and the old default NPB=8 the
+    // A/B compares against.  2 and 4 measured no better than 1 and would each
+    // cost another AOT device image.
+    static const int npb = si::env::i32("PF_Q4_Q5NPB", 1);
+    if (npb == 8) {
+        moe_down_q5_1_impl<8>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq,
+                              asa, xs, acc, acc_stride, n_embd, n_ff_exp);
+    } else {
+        moe_down_q5_1_impl<1>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq,
+                              asa, xs, acc, acc_stride, n_embd, n_ff_exp);
+    }
 }
 
 // Native Q8_0 down, for the qwen4exp expert bank.

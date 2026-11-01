@@ -18,6 +18,7 @@
 #include <thread>
 #include <cstring>
 #include <stdexcept>
+#include <sys/resource.h>
 
 #include "engine.h"
 #include "device/device_profile.h"
@@ -40,46 +41,78 @@ int q4_gemv_tb(int mode, int n_tok) {
 
 } // namespace
 
-void engine::q4_alloc() {
+// The routed down bank's symmetric int8 store (per-32 scale).  Q5_1's block is
+// not a K-quant superblock and K=640 is not a 256 multiple, so the K-quant int8
+// GEMM cannot consume it; the host FFN path and the PF_Q4_CPU_MISS / PF_Q4_FFCMP
+// diagnostics read this instead.
+//
+// It used to be built for EVERY layer at startup, unconditionally: 42.2 GiB and
+// 112.8 s on the 2x A770 box, for a store only the layers that do NOT run in the
+// VRAM bank ever read (one layer - layer 2 - in the recommended all-GPU config).
+// The per-layer cost is 943.7 MB and ~2.3 s, so the selective build below is the
+// difference between a 2 minute and a 2 second startup.
+void engine::q4_build_down_i8() {
     const hparams & hp = m.hp;
-    // One-time conversion of the routed down bank to a symmetric int8 store
-    // (per-32 scale).  Q5_1's block is not a K-quant superblock and K=640 is
-    // not a 256 multiple, so the K-quant int8 GEMM cannot consume it; after
-    // this the grouped prefill path reads each expert's down once.
+    if (hp.n_expert <= 0) {
+        return;
+    }
     const char * em0 = si::env::str("PF_Q4_MIRROR");
     const bool mirror_mode = (em0 && em0[0] == '1') && moe_cfg_.vram_mb == 0;
-    if (hp.n_expert > 0) {
-        const double c0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        size_t bytes = 0;
-        for (int il = 0; il < hp.n_layer; il++) {
-            layer_t & L = m.layers[(size_t)il];
-            const int d = multi_dev ? layer_dev_[(size_t)il] : 0;
-            const bool host_layer = !multi_dev || d < 0 || dev_kind_[(size_t)d] == 1;
-            if (mirror_mode && !host_layer) {
-                continue; // GPU layers read the pinned mirror; no int8 down store
-            }
-            const int E = L.moe.down_exps.E, N = L.moe.down_exps.N, K = L.moe.down_exps.K;
-            const size_t nb = (size_t)E * N * K;
-            uint8_t * d8 = (uint8_t *)std::malloc(nb);
-            float * ds = (float *)std::malloc((size_t)E * N * (K / 32) * sizeof(float));
-            if (!d8 || !ds) {
-                throw std::runtime_error("qwen4exp: down int8 conversion allocation failed");
-            }
-            cpu_q4_convert_down(L.moe.down_exps.data, L.moe.down_exps.type, K, N, E, L.moe.down_exps.plane_bytes, d8,
-                                ds);
-            L.moe.down_i8 = d8;
-            L.moe.down_sc = ds;
-            L.moe.down_i8_K = K;
-            L.moe.down_i8_N = N;
-            L.moe.down_i8_E = E;
-            q4_owned_.push_back(d8);
-            q4_owned_.push_back(ds);
-            bytes += nb + (size_t)E * N * (K / 32) * sizeof(float);
+    // PF_Q4_FFCMP is the banked layer's output oracle and its reference reads
+    // this store, so an oracle run needs it for every layer.  A/B:
+    // PF_Q4_DOWN_I8_ALL=1.
+    const bool eager = si::env::flag("PF_Q4_DOWN_I8_ALL") || si::env::str("PF_Q4_FFCMP") != nullptr
+                       // i32, not str: the consumer at the decode's CPU-miss
+                       // path is `i32("PF_Q4_CPU_MISS", 0)`, so an explicit
+                       // `PF_Q4_CPU_MISS=0` must not force the full store.
+                       || si::env::i32("PF_Q4_CPU_MISS", 0) != 0;
+    static const bool bank_q5k_gen = si::env::flag("PF_Q4_BANK_Q5K");
+    const double c0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    size_t bytes = 0;
+    int nlayers = 0;
+    for (int il = 0; il < hp.n_layer; il++) {
+        layer_t & L = m.layers[(size_t)il];
+        if (L.moe.down_i8 || L.moe.down_exps.E <= 0) {
+            continue;
         }
-        const double c1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        fprintf(stderr, "[q4] down int8 store: %.1f GiB in %.1f s\n", (double)bytes / (1024.0 * 1024.0 * 1024.0),
-                c1 - c0);
+        const int d = multi_dev ? layer_dev_[(size_t)il] : 0;
+        const bool host_layer = !multi_dev || d < 0 || dev_kind_[(size_t)d] == 1;
+        if (mirror_mode && !host_layer) {
+            continue; // GPU layers read the pinned mirror; no int8 down store
+        }
+        // A banked layer computes its routed FFN on the card and never reads
+        // this store - except that a PF_Q4_BANK_Q5K bank is decode-only (the
+        // forward's gate uses it only when mode == 0), so that layer still runs
+        // its prefill through the host path and needs the store.
+        const bool decode_only_bank = bank_q5k_gen && L.moe.gate_exps.type == 13;
+        if (!eager && !decode_only_bank && il < (int)q4_bank_layer_.size() && q4_bank_layer_[(size_t)il].g) {
+            continue;
+        }
+        const int E = L.moe.down_exps.E, N = L.moe.down_exps.N, K = L.moe.down_exps.K;
+        const size_t nb = (size_t)E * N * K;
+        uint8_t * d8 = (uint8_t *)std::malloc(nb);
+        float * ds = (float *)std::malloc((size_t)E * N * (K / 32) * sizeof(float));
+        if (!d8 || !ds) {
+            throw std::runtime_error("qwen4exp: down int8 conversion allocation failed");
+        }
+        cpu_q4_convert_down(L.moe.down_exps.data, L.moe.down_exps.type, K, N, E, L.moe.down_exps.plane_bytes, d8, ds);
+        L.moe.down_i8 = d8;
+        L.moe.down_sc = ds;
+        L.moe.down_i8_K = K;
+        L.moe.down_i8_N = N;
+        L.moe.down_i8_E = E;
+        q4_owned_.push_back(d8);
+        q4_owned_.push_back(ds);
+        bytes += nb + (size_t)E * N * (K / 32) * sizeof(float);
+        nlayers++;
     }
+    const double c1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    fprintf(stderr, "[q4] down int8 store: %d layer(s), %.1f GiB in %.1f s\n", nlayers,
+            (double)bytes / (1024.0 * 1024.0 * 1024.0), c1 - c0);
+}
+
+void engine::q4_alloc() {
+    const hparams & hp = m.hp;
     const int R = kMaxB * kMaxT;
     const int hc_dim = hp.hc_mult * hp.n_embd;
     const size_t nb = multi_dev ? backends_.size() : 1;
@@ -122,6 +155,7 @@ void engine::q4_alloc() {
         throw std::runtime_error("qwen4exp: host scratch allocation failed");
     }
     q4_alloc_banks();
+    q4_build_down_i8();
     qsa_on_ = hp.idx_kpool > 1 && hp.idx_top_k > 0 && max_seq > hp.idx_top_k && hp.idx_n_head > 0;
     if (qsa_on_) {
         qsa_max_seq_ = max_seq;
@@ -194,6 +228,15 @@ void engine::q4_prefault() {
             ranges.push_back({(const char *)p, 0});
         }
     };
+    // PF_Q4_PLE_PREFAULT: the 26.8 GiB PLE table is NOT in the ranges below (it
+    // is gathered 16 rows/token from a 320M-row namespace, so every row is a
+    // first touch).  Without this every decode token takes ~16 MAJOR faults,
+    // i.e. 16 random 4 KiB disk reads; touching the table once turns them into
+    // page-cache hits.  Costs 26.8 GiB of (reclaimable, file-backed) RSS at
+    // startup; off by default.
+    if (m.ple_table.data && si::env::flag("PF_Q4_PLE_PREFAULT")) {
+        ranges.push_back({(const char *)m.ple_table.data, 0});
+    }
     for (int il = 0; il < m.hp.n_layer; il++) {
         const layer_t & L = m.layers[(size_t)il];
         // Read by the host half on every step, whatever the layer's device:
@@ -366,8 +409,16 @@ void engine::q4_upload_init(int nd, size_t max_plane) {
         // Same context as the compute queue: the pinned staging USM belongs
         // to it, and the bank pointers the copy writes are allocated from it.
         sycl::queue & qd = dev_queue(d);
-        q4_up_q_[(size_t)d] = std::make_unique<sycl::queue>(
-            qd.get_context(), qd.get_device(), sycl::property_list{sycl::property::queue::in_order()});
+        // Profiling only for the PF_Q4_UPSTAT diagnostic: this is the queue every
+        // expert-plane copy in the decode rides, and timestamps on it buy
+        // nothing when nobody reads them.
+        static const bool upstat_prof = si::env::flag("PF_Q4_UPSTAT");
+        const sycl::property_list upq_props =
+            upstat_prof ? sycl::property_list{sycl::property::queue::in_order(),
+                                              sycl::property::queue::enable_profiling{}}
+                        : sycl::property_list{sycl::property::queue::in_order()};
+        q4_up_q_[(size_t)d] =
+            std::make_unique<sycl::queue>(qd.get_context(), qd.get_device(), upq_props);
     }
     fprintf(stderr, "[q4] upload staging: %d x %.2f MB pinned per device (async copy queue)\n", q4_up_slots_,
             (double)q4_up_stride_ / (1024.0 * 1024.0));
@@ -392,6 +443,7 @@ void engine::q4_upload_impl(int dev, sycl::queue & q, void * dst, const void * s
             q4_up_enq_ms_ += std::chrono::duration<double, std::milli>(c1 - c0).count();
             q4_up_bytes_ += n;
             q4_up_calls_++;
+            q4_up_prof_.push_back(ev);
         }
         return;
     }
@@ -429,6 +481,7 @@ void engine::q4_upload_impl(int dev, sycl::queue & q, void * dst, const void * s
         q4_up_enq_ms_ += std::chrono::duration<double, std::milli>(c2 - c1).count();
         q4_up_bytes_ += n;
         q4_up_calls_++;
+        q4_up_prof_.push_back(q4_up_ev_[idx]);
     }
     q4_up_live_[idx] = 1;
 }
@@ -596,11 +649,30 @@ void engine::q4_alloc_banks() {
         if (nd_gpu == 0) {
             return;
         }
+        // Slots per layer, PER DEVICE.  The budget is split evenly, but the
+        // devices do not carry the same number of layers: on the recommended
+        // 0-19 / 20-47 map device 0 owns 20 layers and device 1 owns 28, so a
+        // single R (the minimum of the two) leaves ~2.8 GiB of device 0's VRAM
+        // unallocated.  Measured on the box: a single R gave 104 slots/layer
+        // for both cards; per-device gives device 0 152 and device 1 104, i.e.
+        // ~30% fewer misses on the SLOW (x8, 5.17 GB/s) card at no cost on the
+        // fast one.  PF_Q4_PERDEV_R=0 restores the single-R behaviour.
         const size_t per_dev = budget / (size_t)nd_gpu;
+        static const bool perdev_r = si::env::i32("PF_Q4_PERDEV_R", 1) != 0;
+        R_cur_.assign((size_t)nd, 0);
         int R = 512;
         for (int d = 0; d < nd; d++) {
             if (sum_e[(size_t)d] > 0) {
-                R = std::min(R, (int)(per_dev / sum_e[(size_t)d]));
+                const int rd = std::min(512, (int)(per_dev / sum_e[(size_t)d]));
+                R_cur_[(size_t)d] = rd;
+                R = std::min(R, rd);
+            }
+        }
+        if (!perdev_r) {
+            for (int d = 0; d < nd; d++) {
+                if (R_cur_[(size_t)d] > 0) {
+                    R_cur_[(size_t)d] = R;
+                }
             }
         }
         if (R < 8) {
@@ -635,11 +707,13 @@ void engine::q4_alloc_banks() {
                 continue;
             }
             q4_bank_t b;
+            const int Rl = R_cur_[(size_t)dev] > 0 ? R_cur_[(size_t)dev] : R;
+            b.r = Rl;
             const size_t gb = L.moe.gate_exps.plane_bytes, ub = L.moe.up_exps.plane_bytes,
                          db = L.moe.down_exps.plane_bytes;
-            b.g = dev_alloc_on(dev, (size_t)R * gb);
-            b.u = dev_alloc_on(dev, (size_t)R * ub);
-            b.d = dev_alloc_on(dev, (size_t)R * db + 256);
+            b.g = dev_alloc_on(dev, (size_t)Rl * gb);
+            b.u = dev_alloc_on(dev, (size_t)Rl * ub);
+            b.d = dev_alloc_on(dev, (size_t)Rl * db + 256);
             b.sm = (int32_t *)dev_alloc_on(dev, (size_t)E * sizeof(int32_t));
             b.sm2 = (int32_t *)dev_alloc_on(dev, (size_t)E * sizeof(int32_t));
             if (!b.g || !b.u || !b.d || !b.sm || !b.sm2) {
@@ -673,15 +747,22 @@ void engine::q4_alloc_banks() {
                 }
             }
             q4_bank_layer_[(size_t)il] = b;
-            total += (size_t)R * (gb + ub + db);
+            total += (size_t)Rl * (gb + ub + db);
             nbank++;
         }
         q4_hot_ = true;
         q4_hot_ready_ = true;
         q4_hot_r_ = R;
         q4_sm_host_.assign((size_t)hp.n_layer * (size_t)E, -1);
-        q4_lru_age_.assign((size_t)hp.n_layer * (size_t)R, 0);
-        q4_lru_heat_.assign((size_t)hp.n_layer * (size_t)R, 0.f);
+        // [layer][R_l], with R_l from that layer's device (0 for a layer with
+        // no bank, which never indexes these).
+        q4_r_off_.assign((size_t)hp.n_layer + 1, 0);
+        for (int il = 0; il < hp.n_layer; il++) {
+            const int rl = q4_bank_layer_[(size_t)il].g ? q4_bank_layer_[(size_t)il].r : 0;
+            q4_r_off_[(size_t)il + 1] = q4_r_off_[(size_t)il] + (size_t)rl;
+        }
+        q4_lru_age_.assign(q4_r_off_.back(), 0);
+        q4_lru_heat_.assign(q4_r_off_.back(), 0.f);
         fprintf(stderr, "[q4] hot expert bank: %d slots/layer, %d layers, %.1f GiB (calibrating on first prefill)\n", R,
                 nbank, (double)total / (1024.0 * 1024.0 * 1024.0));
         if (pin_src) {
@@ -711,23 +792,32 @@ void engine::q4_alloc_banks() {
                             continue;
                         }
                         const layer_t & L = m.layers[(size_t)il];
-                        const int32_t * row = &q4_sm_host_[(size_t)il * (size_t)E];
+                        int32_t * row = &q4_sm_host_[(size_t)il * (size_t)E];
                         const int dev = multi_dev ? layer_dev_[(size_t)il] : 0;
                         sycl::queue & qd = dev_queue(dev);
-                        qd.memcpy(b.sm, row, (size_t)E * sizeof(int32_t));
                         const bool pin = b.hg && b.hu && b.hd;
                         const char * gsrc = pin ? (const char *)b.hg : (const char *)L.moe.gate_exps.data;
                         const char * usrc = pin ? (const char *)b.hu : (const char *)L.moe.up_exps.data;
                         const char * dsrc = pin ? (const char *)b.hd : (const char *)L.moe.down_exps.data;
+                        // A saved map may have been written at a larger R (the
+                        // slot count is per device now, and --moe-vram-mb is a
+                        // runtime knob).  Clamp the map itself to -1, not just
+                        // the plane copies: an out-of-range entry left in b.sm
+                        // would make the forward treat a never-uploaded slot as
+                        // resident and index past this layer's b.r slots.
+                        const int rmax = b.r > 0 ? b.r : R;
                         for (int e = 0; e < E; e++) {
                             const int i = row[(size_t)e];
-                            if (i < 0 || i >= R) {
+                            if (i < 0 || i >= rmax) {
+                                row[(size_t)e] = -1;
                                 continue;
                             }
                             q4_upload(dev, (char *)b.g + (size_t)i * b.sg, gsrc + (size_t)e * b.sg, b.sg, pin);
                             q4_upload(dev, (char *)b.u + (size_t)i * b.su, usrc + (size_t)e * b.su, b.su, pin);
                             q4_upload(dev, (char *)b.d + (size_t)i * b.sd, dsrc + (size_t)e * b.sd, b.sd, pin);
                         }
+                        // Upload the validated map, not the raw file row.
+                        qd.memcpy(b.sm, row, (size_t)E * sizeof(int32_t));
                     }
                     q4_hot_ready_ = true;
                     q4_cal_done_ = true; // a static slot map is authoritative
@@ -1026,8 +1116,7 @@ void engine::q4_prefill_mm(const mm_prompt & p, int slot) {
 
 void engine::q4_hot_calibrate() {
     const int E = m.hp.n_expert;
-    const int R = q4_hot_r_;
-    if (R <= 0 || q4_cal_.empty()) {
+    if (q4_hot_r_ <= 0 || q4_cal_.empty()) {
         return;
     }
     // One-shot: the bank is a cache of the first prefill's frequency set and
@@ -1043,6 +1132,7 @@ void engine::q4_hot_calibrate() {
         if (!b.g) {
             continue;
         }
+        const int R = b.r > 0 ? b.r : q4_hot_r_;
         const layer_t & L = m.layers[(size_t)il];
         const uint32_t * c = &q4_cal_[(size_t)il * (size_t)E];
         std::iota(order.begin(), order.end(), 0);
@@ -1086,8 +1176,9 @@ void engine::q4_hot_calibrate() {
     const size_t pairs = q4_cal_pairs_;
     std::fill(q4_cal_.begin(), q4_cal_.end(), 0);
     q4_cal_pairs_ = 0;
-    fprintf(stderr, "[q4] hot calibration: %d slots/layer on %d layers, %zu experts copied, %.1f GiB, %zu pairs\n", R,
-            layers, copied, (double)bytes / (1024.0 * 1024.0 * 1024.0), pairs);
+    fprintf(stderr, "[q4] hot calibration: %d..%d slots/layer on %d layers, %zu experts copied, %.1f GiB, %zu pairs\n",
+            q4_hot_r_, q4_hot_r_ == 0 ? 0 : R_cur_.empty() ? 0 : R_cur_[0], layers, copied,
+            (double)bytes / (1024.0 * 1024.0 * 1024.0), pairs);
     const char * sf = si::env::str("PF_Q4_SM_SAVE");
     if (sf) {
         FILE * f = fopen(sf, "wb");
@@ -1216,6 +1307,38 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     };
     double t_segc = 0, t_gemvk = 0, tc_last = 0;
     int n_gemv_calls = 0;
+    // PF_Q4_SEGTIME: device-side segment timing for the decode forward.  A
+    // submit_barrier orders with everything already queued on an in-order
+    // queue, so consecutive barriers' command_start deltas are the device time
+    // of whatever was submitted between them - the only attribution that is not
+    // host-wait smeared (see the DFlash2 "A/B subtraction is not attribution"
+    // note in AGENTS.md).  Needs enable_profiling on the queue (it is set).
+    // NOT `static const bool x = flag(...) && mode == 0`: a function-local
+    // static initialises on the FIRST call, which is the prefill (mode 1/2),
+    // so the knob would be permanently false in this process.
+    static const bool q4seg_on = si::env::flag("PF_Q4_SEGTIME");
+    const bool q4seg = q4seg_on && mode == 0;
+    struct q4seg_ev {
+        int stage;
+        int dev;
+        sycl::event ev;
+    };
+    std::vector<q4seg_ev> q4seg_evs;
+    if (q4seg) {
+        q4seg_evs.reserve((size_t)(hp.n_layer + 2) * 14);
+    }
+    auto seg_mark = [&](int stage, int d) {
+        if (!q4seg || is_cpu(d)) {
+            return;
+        }
+        q4seg_evs.push_back({stage, d, DQ(d).ext_oneapi_submit_barrier()});
+    };
+    // Timing ablations (WRONG RESULTS BY DESIGN, decode timing only).  They
+    // exist to attribute `pre` without a barrier per phase: PF_Q4_ABL_NOGEMV
+    // drops the dense GEMV launches, PF_Q4_ABL_NOMIX drops the GDN / attention
+    // core kernels.  Difference two runs of the same cell.
+    static const bool abl_nogemv = si::env::flag("PF_Q4_ABL_NOGEMV");
+    static const bool abl_nomix = si::env::flag("PF_Q4_ABL_NOMIX");
 
     // Segment-descriptor ring.  Each GEMV call writes its descriptor into a
     // pinned host slot and enqueues the 184-byte H2D copy on the same in-order
@@ -1248,7 +1371,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     };
 
     auto gemv = [&](int d, const wt & w, const float * x, int xs, float * out, int os, int tb_use, int nb_use) {
-        if (!w.data) {
+        if (!w.data || abl_nogemv) {
             return;
         }
         // Prefill: oneDNN's int8 matmul reads the weights once per M-token
@@ -1336,6 +1459,9 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         int os;
     };
     auto gemv_many = [&](int d, const gemv_item * it, int n, const float * x, int xs, int tb_use, int nb_use) {
+        if (abl_nogemv) {
+            return;
+        }
         int m = 0;
         for (int i = 0; i < n; i++) {
             if (it[i].w->data) {
@@ -1480,7 +1606,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     int n_gdn_l = 0, n_attn_l = 0;
     static const bool q4time = si::env::flag("PF_Q4_TIME");
     static const bool qsatime = si::env::flag("PF_QSA_TIME");
-    const double t_start = q4time ? now_ms() : 0.0;
+    const double t_start = (q4time || q4seg) ? now_ms() : 0.0;
     // Wall clock of the whole forward, printed with PF_QSA_TIME.  The `[q4]`
     // line above is emitted before the LM head and the deferred QSA flush, so
     // its moe+rest sum is not a token time when the QSA update is deferred;
@@ -1686,10 +1812,21 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             ph1(dev, tx0, t_xc, true);
         }
         q4_bufs & b = buf(dev);
+        seg_mark(0, dev); // handoff/embedding since the previous layer's end
 
         // ---- PLE: host gather + projections + gate + conv -----------------
         if (il == hp.ple_layer && L.ple.ok() && !si::env::flag("PF_Q4_NOPLE")) {
             const double tp0 = ph0(dev);
+            // PF_Q4_PLEFAULT: page-fault cost of the 16-row gather, split out of
+            // the host PLE time.  A major fault here means the 26.8 GiB table is
+            // not in page cache (it is NOT part of q4_prefault's ranges).
+            static const bool plef = si::env::flag("PF_Q4_PLEFAULT");
+            const double pl_wall0 = plef ? now_ms() : 0.0;
+            struct rusage ple_ru0, ple_ru1;
+            const size_t ple_h0 = engram_hits_, ple_m0 = engram_misses_;
+            if (plef) {
+                getrusage(RUSAGE_SELF, &ple_ru0);
+            }
             std::vector<int32_t> idx((size_t)hp.ple_n_heads * n_tok);
             for (int i = 0; i < n_tok; i++) {
                 const int32_t tok = tok_of(i);
@@ -1720,6 +1857,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     }
                 }
             }
+            const double pl_g0 = plef ? now_ms() : 0.0;
             for (int i = 0; i < n_tok; i++) {
                 for (int h = 0; h < hp.ple_n_heads; h++) {
                     const int32_t row = idx[(size_t)i * hp.ple_n_heads + h];
@@ -1743,11 +1881,63 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
             }
             dbg_stats("ple_emb", dev, q4_ple_emb_, (size_t)n_tok * n_embd, 0);
-            hgemv1(L.ple.key, q4_ple_emb_, n_embd, q4_ple_key_, hc_dim);
-            hgemv1(L.ple.value, q4_ple_emb_, n_embd, q4_ple_val_, n_embd);
+            const double pl_g1 = plef ? now_ms() : 0.0;
+            const double pl_k1 = plef ? now_ms() : 0.0;
+            // PF_Q4_PLEGPU: run the PLE's two projections (ple_key 10240x2560
+            // Q8_0 + ple_value 2560x2560 Q8_0, 34.8 MB) on the layer's device
+            // instead of on the host.  Decode only: the gather produces ONE
+            // 2560-float row per token (M=1), which is the shape the device
+            // decode GEMV already owns, while the prefill's n_tok*n_embd row
+            // batch keeps the host path.  The weights are already in that
+            // device's VRAM (upload_device_weights covers L.ple.key/value for
+            // every qwen4exp partition), so this costs no extra device memory.
+            // The outputs stay in the host USM the existing gate/apply already
+            // reads - the GPU writes them directly and the `to_host` below is
+            // the (already required) wait, so there is no extra D2H copy.
+            // Measured: proj 1.611 -> 0.052 ms of host time, the GEMVs 0.190 ms
+            // of device time for 34.81 MB = 183 GB/s (host was 21 GB/s),
+            // -1.60 ms/token.  Not byte-identical: the device GEMV reassociates
+            // the dot, and the stream diverges at token 38 on a genuine near-tie
+            // (the top two logits are 0.031 apart in both configs).
+            static const bool plegpu = si::env::flag("PF_Q4_PLEGPU");
+            static const bool plegpu_t = si::env::flag("PF_Q4_PLEGPU_TIME");
+            const bool ple_dev = plegpu && mode == 0 && n_tok == 1 && !is_cpu(dev) && !abl_nogemv;
+            sycl::event plev[3];
+            if (ple_dev) {
+                if (plegpu_t) {
+                    plev[0] = DQ(dev).ext_oneapi_submit_barrier();
+                }
+                gemv(dev, L.ple.key, q4_ple_emb_, n_embd, q4_ple_key_, hc_dim, tb, nblocks);
+                if (plegpu_t) {
+                    plev[1] = DQ(dev).ext_oneapi_submit_barrier();
+                }
+                gemv(dev, L.ple.value, q4_ple_emb_, n_embd, q4_ple_val_, n_embd, tb, nblocks);
+                if (plegpu_t) {
+                    plev[2] = DQ(dev).ext_oneapi_submit_barrier();
+                }
+            } else {
+                hgemv1(L.ple.key, q4_ple_emb_, n_embd, q4_ple_key_, hc_dim);
+                hgemv1(L.ple.value, q4_ple_emb_, n_embd, q4_ple_val_, n_embd);
+            }
+            const double pl_g2 = plef ? now_ms() : 0.0;
             to_host(dev, q4_host_res_, b.res, (size_t)n_tok * hc_dim * sizeof(float));
+            const double pl_c1 = plef ? now_ms() : 0.0;
+            if (ple_dev && plegpu_t) {
+                // Device time of the two GEMV launches, from barrier pairs (the
+                // queue has enable_profiling).  The pair brackets the descriptor
+                // H2D + kernel, i.e. exactly what gemv() enqueues; `to_host`
+                // above has already drained them.
+                auto kdur = [&](int a, int e) {
+                    return (double)(plev[e].get_profiling_info<sycl::info::event_profiling::command_start>() -
+                                    plev[a].get_profiling_info<sycl::info::event_profiling::command_end>()) /
+                           1.0e6;
+                };
+                fprintf(stderr, "[q4pleg] dev=%d key=%.4f val=%.4f total=%.4f ms\n", dev, kdur(0, 1), kdur(1, 2),
+                        kdur(0, 2));
+            }
             cpu_q4_ple_gate(q4_ple_key_, q4_host_res_, L.ple.norm_key, L.ple.norm_query, q4_ple_gate_, nullptr, n_tok,
                             n_embd, hc, hp.rms_eps);
+            const double pl_ga = plef ? now_ms() : 0.0;
             dbg_stats("ple_gate", dev, q4_ple_gate_, (size_t)n_tok * hc, 0);
             std::vector<int32_t> slots((size_t)n_tok), poss((size_t)n_tok);
             for (int i = 0; i < n_tok; i++) {
@@ -1757,8 +1947,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             cpu_q4_ple_apply(q4_ple_val_, q4_ple_gate_, L.ple.norm_conv, L.ple.conv, q4_host_res_, q4_ple_a_,
                              q4_ple_b_, q4_ple_hist_, q4_ple_nhist_, nullptr, slots.data(), poss.data(), n_tok, n_embd,
                              hc, hp.ple_ngram, hp.ple_conv, hp.rms_eps);
+            const double pl_ap = plef ? now_ms() : 0.0;
             dbg_stats("ple_gated", dev, q4_ple_a_, (size_t)n_tok * hc_dim, 0);
             from_host(dev, b.res, q4_host_res_, (size_t)n_tok * hc_dim * sizeof(float));
+            const double pl_c2 = plef ? now_ms() : 0.0;
             // advance the per-slot token history
             for (int i = 0; i < n_tok; i++) {
                 const int slot = slot_of(i);
@@ -1769,12 +1961,30 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 p[hp.ple_ngram - 2] = tok_of(i);
             }
             ph1(dev, tp0, t_ple, true);
+            seg_mark(1, dev); // PLE (host gather/projections/conv)
+            if (plef) {
+                getrusage(RUSAGE_SELF, &ple_ru1);
+                // idx = hash loop, gather = 16 table rows, proj = the two host
+                // GEMVs, d2h = blocking to_host, gate/apply = the host epilogues,
+                // h2d = blocking from_host, misc = everything else in the block.
+                const double pl_e = now_ms();
+                const double idx_ms = pl_g0 - pl_wall0;
+                const double d2h = pl_c1 - pl_g2, gate_ms = pl_ga - pl_c1;
+                const double apply_ms = pl_ap - pl_ga, h2d = pl_c2 - pl_ap;
+                fprintf(stderr,
+                        "[q4ple] n=%d faults=%ld/%ld hits=%zu miss=%zu | idx=%.3f gather=%.3f proj=%.3f d2h=%.3f "
+                        "gate=%.3f apply=%.3f h2d=%.3f misc=%.3f block=%.3f ms\n",
+                        n_tok, ple_ru1.ru_minflt - ple_ru0.ru_minflt, ple_ru1.ru_majflt - ple_ru0.ru_majflt,
+                        engram_hits_ - ple_h0, engram_misses_ - ple_m0, idx_ms, pl_g1 - pl_g0, pl_g2 - pl_k1, d2h,
+                        gate_ms, apply_ms, h2d, pl_e - pl_c2, pl_e - pl_wall0);
+            }
         }
 
         dbg_stats("res_in", dev, b.res, (size_t)n_tok * hc_dim, hc);
         // ---- token mixer ---------------------------------------------------
         float * inj1 = nullptr;
         hc_mix(dev, L.hc_attn, inj1, ph_ha);
+        seg_mark(2, dev); // HC attn norm/down/up/inject/mix
         dbg_stats("hc_mixed_attn", dev, b.mixed, (size_t)n_tok * n_embd, 0);
         compute_backend & be = BE(dev);
         if (L.recurrent) {
@@ -1819,7 +2029,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 be.gdn(CONVOUT, ALPHA, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), BETA, gs, ATTNPRE, inf, hp.d_state,
                        hp.n_group, hp.dt_rank, hp.qkv_dim(), 1.0f / std::sqrt((float)hp.d_state), state_slots_, 1, 0,
                        n_tok, n_tok, {});
-            } else {
+            } else if (!abl_nomix) {
                 const int nrows = inf->n_rows;
                 const int nreal_call = (mode == 1) ? n_tok : 1;
                 be.conv_l2(QKV, cs, wf32(dev, L.ssm_conv1d), CONVOUT, inf, hp.qkv_dim(), hp.conv_k, hp.d_state,
@@ -1883,12 +2093,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             dbg_stats("Krope", dev, KBUF, (size_t)n_tok * hp.n_head_kv * hp.head_dim, 0);
             ph_t = ph0(dev);
             const double q_c0 = qsatime ? now_ms() : 0.0;
-            const bool qsa_done = qsa_on_ && qsa_attention(attn_idx, L, dev, n_tok, inf, b.mixed, QBUF, KBUF, VBUF,
-                                                           ATTN_OUT);
+            const bool qsa_done = !abl_nomix && qsa_on_ && qsa_attention(attn_idx, L, dev, n_tok, inf, b.mixed, QBUF,
+                                                                       KBUF, VBUF, ATTN_OUT);
             if (qsatime) {
                 t_qsa += now_ms() - q_c0;
             }
             if (qsa_done) {
+                ph1(dev, ph_t, t_ac, true);
+            } else if (abl_nomix) {
                 ph1(dev, ph_t, t_ac, true);
             } else {
             int nsp = 1;
@@ -1937,14 +2149,17 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             }
             attn_idx++;
         }
+        seg_mark(3, dev); // token mixer: GDN (qkv/conv/gdn/out) or attn (qkv/rope/attn/wo)
         dbg_stats("block_attn", dev, b.block, (size_t)n_tok * n_embd, 0);
         hc_combine(dev, inj1, ph_ha);
+        seg_mark(4, dev); // HC combine (attention residual)
         dbg_stats("hc_combine1", dev, b.res, (size_t)n_tok * hc_dim, hc);
 
         // ---- FFN: routed bank + shared expert on the host ------------------
         const double tm0 = q4time ? now_ms() : 0.0;
         float * inj2 = nullptr;
         hc_mix(dev, L.hc_ffn, inj2, ph_hf);
+        seg_mark(5, dev); // HC ffn norm/down/up/inject/mix
         dbg_stats("hc_mixed_ffn", dev, b.mixed, (size_t)n_tok * n_embd, 0);
         const double tc0 = q4time ? now_ms() : 0.0;
         const int k = hp.n_expert_used;
@@ -2023,6 +2238,16 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             const double q4_up_wait_snap = q4_up_wait_ms_;
             int upmiss = 0;
             size_t upbytes = 0;
+            // The down plane is not read until after gate_up + quant_h, so it is
+            // issued last and waited for late: its ~1.2 MB rides the copy queue
+            // underneath the gate/up GEMM instead of in front of it.
+            // PF_Q4_DOWN_PREF=0 restores the single-wait order.
+            static const bool down_pref = si::env::i32("PF_Q4_DOWN_PREF", 1) != 0;
+            std::vector<std::pair<int, int>> dpend;
+            dpend.reserve((size_t)hp.n_expert_used);
+            sycl::event pre_ev;
+            sycl::event d_ev;
+            bool have_pre = false, have_d = false;
             if (htt && mode == 0) {
                 // Drain the attention/GDN work enqueued before this section so
                 // the per-stage numbers below are this layer's FFN and not the
@@ -2051,6 +2276,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 moe_router_launch(qd, wptr(dev, L.moe.gate_inp), L.moe.gate_inp_type, b.mixed, n_embd, n_tok, n_embd,
                                   hp.n_expert, k, A.logits, ids_out, A.wts);
             }
+            seg_mark(6, dev); // router (softmax+top-k)
             if (q4rt) {
                 const double ts = now_ms();
                 qd.wait();
@@ -2136,7 +2362,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     thl = t;
                 }
                 const int E = hp.n_expert;
-                const int R = q4_hot_r_;
+                const int R = bank->r > 0 ? bank->r : q4_hot_r_;
                 sm = &q4_sm_host_[(size_t)il * (size_t)E];
                 std::vector<char> seen((size_t)E, 0);
                 const int k_used = hp.n_expert_used;
@@ -2296,9 +2522,9 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 // the A/B path above; everything it uploads is resident when
                 // the kernels below run.
                 const int E = hp.n_expert;
-                const int R = q4_hot_r_;
-                uint32_t * age = &q4_lru_age_[(size_t)il * (size_t)R];
-                float * heat = &q4_lru_heat_[(size_t)il * (size_t)R];
+                const int R = bank->r > 0 ? bank->r : q4_hot_r_;
+                uint32_t * age = &q4_lru_age_[q4_r_off_[(size_t)il]];
+                float * heat = &q4_lru_heat_[q4_r_off_[(size_t)il]];
                 static const bool use_heat = si::env::flag("PF_Q4_HEAT");
                 std::vector<int> slot_e((size_t)R, -1);
                 std::vector<char> slot_act((size_t)R, 0);
@@ -2376,6 +2602,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 const char * gsrc = pin ? (const char *)bank->hg : (const char *)L.moe.gate_exps.data;
                 const char * usrc = pin ? (const char *)bank->hu : (const char *)L.moe.up_exps.data;
                 const char * dsrc = pin ? (const char *)bank->hd : (const char *)L.moe.down_exps.data;
+                const double l_ev0 = htt ? now_ms() : 0.0;
                 for (int e : act) {
                     if (sm[e] >= 0) {
                         continue;
@@ -2404,13 +2631,22 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         heat[(size_t)victim] = 1.f;
                     }
                     const size_t gb = bank->sg, ub = bank->su, db = bank->sd;
-                    q4_upload(dev, (char *)bank->g + (size_t)victim * gb, gsrc + (size_t)e * gb, gb, pin);
-                    q4_upload(dev, (char *)bank->u + (size_t)victim * ub, usrc + (size_t)e * ub, ub, pin);
-                    q4_upload(dev, (char *)bank->d + (size_t)victim * db, dsrc + (size_t)e * db, db, pin);
+                    // The per-device copy queue, not the compute queue: the
+                    // copies then run on the copy engine while the CSR and
+                    // activation-quantisation kernels below run on the compute
+                    // engine, instead of the in-order compute queue inserting a
+                    // serial DMA stage between them and gate_up.  Safe because
+                    // the ids wait drained the compute queue first, so the
+                    // previous layer's kernels are done and cannot still be
+                    // reading the slots this overwrites.
+                    q4_upload_async(dev, (char *)bank->g + (size_t)victim * gb, gsrc + (size_t)e * gb, gb, pin);
+                    q4_upload_async(dev, (char *)bank->u + (size_t)victim * ub, usrc + (size_t)e * ub, ub, pin);
+                    dpend.push_back({e, victim});
                     upmiss++;
                     upbytes += gb + ub + db;
                     changed = true;
                 }
+                const double l_ev1 = htt ? now_ms() : 0.0;
                 if (cmiss) {
                     // The host's pairs are exactly the selected pairs whose
                     // expert has no slot, minus the tail-skipped ones (they
@@ -2429,7 +2665,49 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     }
                 }
                 if (changed) {
-                    q4_upload(dev, bank->sm, sm, (size_t)E * sizeof(int32_t));
+                    q4_upload_async(dev, bank->sm, sm, (size_t)E * sizeof(int32_t));
+                    // q4_up_last_ev_/live_ are sized only when the pinned ring
+                    // and its copy queue exist (q4_upload_init returns early on
+                    // PF_Q4_STAGE=0 / ring 0 / an allocation failure), so this
+                    // is guarded exactly like the generic path below.
+                    const bool have_q = dev >= 0 && dev < (int)q4_up_last_ev_.size()
+                                        && (int)q4_up_last_live_.size() == (int)q4_up_last_ev_.size();
+                    const size_t db = bank->sd;
+                    if (have_q && down_pref) {
+                        // Split wait: everything issued so far (gate, up, slot
+                        // map) is waited for before gate_up, and the down plane
+                        // is issued after it and waited for only just before
+                        // `down`, so its ~1.2 MB rides under the gate/up GEMM.
+                        pre_ev = q4_up_last_ev_[(size_t)dev];
+                        have_pre = true;
+                        if (!dpend.empty()) {
+                            for (const auto & pr : dpend) {
+                                q4_upload_async(dev, (char *)bank->d + (size_t)pr.second * db,
+                                                dsrc + (size_t)pr.first * db, db, pin);
+                            }
+                            d_ev = q4_up_last_ev_[(size_t)dev];
+                            have_d = true;
+                        }
+                        // The waits are taken explicitly below; do not let the
+                        // generic last-event path wait a second time.
+                        q4_up_last_live_[(size_t)dev] = 0;
+                    } else if (have_q) {
+                        // PF_Q4_DOWN_PREF=0: same copy queue, one wait for all
+                        // three planes (the generic last-event path below).
+                        for (const auto & pr : dpend) {
+                            q4_upload_async(dev, (char *)bank->d + (size_t)pr.second * db, dsrc + (size_t)pr.first * db,
+                                            db, pin);
+                        }
+                    } else {
+                        // No pinned ring / copy queue (PF_Q4_STAGE=0, a profile
+                        // with moe.upload_ring 0, or a failed allocation): the
+                        // down plane still has to be uploaded, and here it goes
+                        // on the in-order compute queue, which orders it for us.
+                        for (const auto & pr : dpend) {
+                            q4_upload(dev, (char *)bank->d + (size_t)pr.second * db, dsrc + (size_t)pr.first * db, db,
+                                      pin);
+                        }
+                    }
                     static const bool updma = si::env::flag("PF_Q4_UPDMA");
                     if (updma) {
                         // Diagnostic: these copies are the only work between the
@@ -2437,13 +2715,38 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         // in order, so this drain is the H2D time those GEMMs
                         // would have stalled on.  It removes the host's
                         // run-ahead, so this is an attribution run, not a cell.
+                        // The copies ride the per-device copy queue now, so a
+                        // compute-queue drain measures nothing; drain the copy
+                        // queue (and drop the pending event) to price the H2D.
                         const auto t0 = std::chrono::steady_clock::now();
-                        qd.wait();
+                        if (dev >= 0 && dev < (int)q4_up_q_.size() && q4_up_q_[(size_t)dev]) {
+                            q4_up_q_[(size_t)dev]->wait();
+                        } else {
+                            qd.wait();
+                        }
+                        if (dev >= 0 && dev < (int)q4_up_last_live_.size()) {
+                            q4_up_last_live_[(size_t)dev] = 0;
+                        }
+                        have_pre = false;
+                        have_d = false;
                         q4_up_dma_ms_ +=
                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     }
                 }
+                const double l_sm1 = htt ? now_ms() : 0.0;
                 if (!q4_hotchk_done_ && si::env::flag("PF_Q4_HOTCHK")) {
+                    // The bank planes are being written by the copy queue; the
+                    // check reads them with a compute-queue copy, which used to
+                    // be ordered against them when they rode that queue.  Drain
+                    // the copy queue first or the verifier races its subject.
+                    if (have_pre) {
+                        pre_ev.wait();
+                        have_pre = false;
+                    }
+                    if (have_d) {
+                        d_ev.wait();
+                        have_d = false;
+                    }
                     int bg = 0, bu = 0, bd = 0;
                     std::vector<uint8_t> got(256), want(256);
                     for (int e : act) {
@@ -2469,8 +2772,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     const double tl = now_ms();
                     qd.wait();
                     const double t = now_ms();
-                    fprintf(stderr, " lru=%.1f up=%.1f lwait=%.1f miss=%d upmb=%.2f", tl - thl, t - tl,
-                            q4_up_wait_ms_ - q4_up_wait_snap, upmiss, (double)upbytes / (1024.0 * 1024.0));
+                    fprintf(stderr, " lru=%.1f sel=%.2f ev=%.2f sm=%.2f up=%.1f lwait=%.1f miss=%d upmb=%.2f",
+                            tl - thl, (tl - thl) - (l_ev1 - l_ev0) - (l_sm1 - l_ev1), l_ev1 - l_ev0, l_sm1 - l_ev1,
+                            t - tl, q4_up_wait_ms_ - q4_up_wait_snap, upmiss,
+                            (double)upbytes / (1024.0 * 1024.0));
                     thl = t;
                 }
             }
@@ -2541,6 +2846,17 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
             };
             if (!two_pass) {
+                // PF_Q4_KTIME: the routed gate/up and down KERNELS alone, in
+                // device time.  The existing PF_Q4_HOT_TIME `gu`/`dn` columns are
+                // host-drained phases: `dn` also contains quant_h, the A.acc
+                // memset and the down-plane DMA wait, so it cannot price the
+                // kernel.  A barrier pair around each launch is the same method
+                // for both projections, and the commands between the barriers
+                // are exactly the launcher's kernel(s).  Diagnostic only: the
+                // extra barrier and the wait are env-gated.
+                // static: env::flag is a getenv, and this is inside the layer loop.
+                static const bool ktime = si::env::flag("PF_Q4_KTIME");
+                sycl::event kt[4];
                 const double tcg0 = cmiss_time ? now_ms() : 0.0;
                 quant_x();
                 if (htt) {
@@ -2549,7 +2865,27 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     fprintf(stderr, " aq=%.1f", t - thl);
                     thl = t;
                 }
+                // Wait for the gate/up (+ slot map) H2D here, not before
+                // quant_x: the CSR + activation-quantisation kernels were
+                // enqueued on the compute queue while the copy queue was already
+                // transferring, so the DMA overlaps them.  The down plane stays
+                // in flight across gate_up and is waited for just before `down`.
+                if (have_pre) {
+                    pre_ev.wait();
+                    have_pre = false;
+                } else if (dev >= 0 && dev < (int)q4_up_last_live_.size() && q4_up_last_live_[(size_t)dev]) {
+                    q4_up_last_ev_[(size_t)dev].wait();
+                    q4_up_last_live_[(size_t)dev] = 0;
+                }
+                seg_mark(7, dev); // ids wait + LRU select + expert H2D wait + act-quant
+                if (ktime) {
+                    kt[0] = qd.ext_oneapi_submit_barrier();
+                }
                 gate_up(bank->sm);
+                if (ktime) {
+                    kt[1] = qd.ext_oneapi_submit_barrier();
+                }
+                seg_mark(8, dev); // gate/up expert GEMM
                 if (htt) {
                     qd.wait();
                     const double t = now_ms();
@@ -2563,7 +2899,27 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     // expert cannot carry the previous layer's value.
                     qd.memset(A.acc, 0, (size_t)np * (size_t)n_embd * sizeof(float));
                 }
+                if (have_d) {
+                    d_ev.wait();
+                    have_d = false;
+                }
+                if (ktime) {
+                    kt[2] = qd.ext_oneapi_submit_barrier();
+                }
                 down(bank->sm);
+                if (ktime) {
+                    kt[3] = qd.ext_oneapi_submit_barrier();
+                    qd.wait();
+                    auto kdur = [&](int a, int b) {
+                        return (double)(kt[b].get_profiling_info<sycl::info::event_profiling::command_start>() -
+                                        kt[a].get_profiling_info<sycl::info::event_profiling::command_end>()) /
+                               1.0e6;
+                    };
+                    fprintf(stderr, "[q4kt] il=%d dev=%d nact=%d np=%d gtype=%u dtype=%u gu=%.4f dn=%.4f\n", il, dev,
+                            n_act, np, (unsigned)L.moe.gate_exps.type, (unsigned)L.moe.down_exps.type, kdur(0, 1),
+                            kdur(2, 3));
+                }
+                seg_mark(9, dev); // down expert GEMM
                 t_cmiss_submit = cmiss_time ? now_ms() - tcg0 : 0.0;
                 if (cmiss && !cmiss_pr.empty()) {
                     // The resident chain (CSR, quantize, gate/up, quantize,
@@ -2862,7 +3218,9 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     }
                 }
             }
+            seg_mark(10, dev); // (between down and reduce: acc memset / cmiss staging)
             moe_reduce_launch(qd, A.acc, A.wts, k, n_tok, n_embd, n_embd, b.block, n_embd);
+            seg_mark(11, dev); // reduce
             if (htt) {
                 qd.wait();
                 const double t = now_ms();
@@ -2906,7 +3264,9 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             if (q4time) {
                 t_moe += now_ms() - tm0;
             }
+            seg_mark(12, dev); // shared expert (oneDNN M=1 + gate add)
             hc_combine(dev, inj2, ph_hf);
+            seg_mark(13, dev); // HC combine (ffn residual)
             dbg_stats("l_last", dev, b.res, (size_t)n_tok * hc_dim, hc);
             continue;
         }
@@ -3016,6 +3376,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             }
         }
         if (!sh_gpu) {
+            // q4_host_out_ already holds this layer's routed residual (the
+            // host computed it above, unlike the bank path where it lives on
+            // the card), and cpu_moe_epilogue accumulates the shared expert
+            // into it in place.
             hgate_up(L.ffn_gate, L.ffn_up, q4_host_mix_, n_embd, q4_moe_sh_, 2 * hp.n_ff);
             dbg_stats("moe_sh_up", dev, q4_moe_sh_, (size_t)n_tok * 2 * hp.n_ff, 0);
             hdown(L.ffn_down, q4_moe_sh_, 2 * hp.n_ff, q4_moe_shout_, n_embd, true);
@@ -3026,9 +3390,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             from_host(dev, b.block, q4_host_out_, (size_t)n_tok * n_embd * sizeof(float));
         }
         if (q4time) { t_shared += now_ms() - ts0; }
-        const double tc1 = q4time ? now_ms() : 0.0;
-        from_host(dev, b.block, q4_host_out_, (size_t)n_tok * n_embd * sizeof(float));
-        if (q4time) { t_cp += now_ms() - tc1; }
+        // There used to be an unconditional `from_host(dev, b.block,
+        // q4_host_out_, ...)` here.  On the `sh_gpu` path that is a
+        // host->device copy of a stale scratch buffer over the result
+        // moe_gate_add_launch just wrote, i.e. the layer's shared expert was
+        // silently discarded on every GPU run (PF_Q4_DUMP=1 showed layer 2's
+        // ffn_out bit-identical to its moe_routed).  The `!sh_gpu` branch above
+        // already performs its own copy, so the only thing this line ever did
+        // correctly was duplicate it.
         dbg_stats("ffn_out", dev, b.block, (size_t)n_tok * n_embd, 0);
         hc_combine(dev, inj2, ph_hf);
         dbg_stats("l_last", dev, b.res, (size_t)n_tok * hc_dim, hc);
@@ -3063,9 +3432,27 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     if (upstat) {
         const double cms = q4_up_copy_ms_ - up_c0;
         const double mib = (double)(q4_up_bytes_ - up_b0) / (1024.0 * 1024.0);
-        fprintf(stderr, "[q4up] n=%d calls=%zu bytes=%.1f MiB copy=%.2f enq=%.2f wait=%.2f dma=%.2f ms (%.2f GB/s)\n", n_tok,
-                q4_up_calls_ - up_n0, mib, cms, q4_up_enq_ms_ - up_e0, q4_up_wait_ms_ - up_w0, q4_up_dma_ms_ - up_d0,
-                cms > 0.01 ? mib * 1.048576 / cms : 0.0);
+        // The real H2D rate is the device copies' own intervals.  A host timer
+        // around q.memcpy measures the enqueue and, on the pageable path, the
+        // driver's blocking rendezvous - which is how this line used to report
+        // 17389 GB/s (it divided bytes by a ~0 host memcpy time).
+        double dma = 0.0;
+        for (auto & ev : q4_up_prof_) {
+            try {
+                ev.wait();
+                const auto s0 = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+                const auto s1 = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+                dma += (double)(s1 - s0) / 1.0e6;
+            } catch (...) {
+                dma = 0.0;
+                break;
+            }
+        }
+        q4_up_prof_.clear();
+        const double rate = dma > 0.01 ? mib * 1.048576 / dma : 0.0;
+        fprintf(stderr,
+                "[q4up] n=%d calls=%zu bytes=%.1f MiB copy=%.2f enq=%.2f wait=%.2f dma=%.2f ms (%.2f GB/s)\n", n_tok,
+                q4_up_calls_ - up_n0, mib, cms, q4_up_enq_ms_ - up_e0, q4_up_wait_ms_ - up_w0, dma, rate);
     }
     if (!with_head) {
         // Apply any deferred QSA update before the chunk's device work is
@@ -3125,16 +3512,21 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         if (is_cpu(d0)) {
             std::memcpy(d_last_hidden, b0.mixed + (size_t)(n_tok - 1) * n_embd, (size_t)n_embd * sizeof(float));
         } else {
-            DQ(d0).memcpy(d_last_hidden, b0.mixed + (size_t)(n_tok - 1) * n_embd, (size_t)n_embd * sizeof(float)).wait();
+            // No .wait(): d_last_hidden is only read by the MTP draft head, and
+            // the qwen4exp profile forbids MTP (no NextN block, and this walk
+            // does not produce the per-token GDN/conv snapshots).  Waiting here
+            // drained the in-order queue in front of the LM head on every token.
+            DQ(d0).memcpy(d_last_hidden, b0.mixed + (size_t)(n_tok - 1) * n_embd, (size_t)n_embd * sizeof(float));
         }
         gemv(d0, m.output, b0.mixed + (size_t)(n_tok - 1) * n_embd, n_embd, d_logits, hp.n_vocab, 1, 0);
     } else {
         if (is_cpu(d0)) {
             std::memcpy(d_last_hidden, b0.mixed, (size_t)n_embd * sizeof(float));
         } else {
-            DQ(d0).memcpy(d_last_hidden, b0.mixed, (size_t)n_embd * sizeof(float)).wait();
+            DQ(d0).memcpy(d_last_hidden, b0.mixed, (size_t)n_embd * sizeof(float));
         }
         gemv(d0, m.output, b0.mixed, n_embd, d_logits, hp.n_vocab, tb, 1);
+        seg_mark(14, d0); // final HC mixer + LM head
         if (q4dbg) {
             std::vector<float> lg((size_t)hp.n_vocab);
             to_host(d0, lg.data(), d_logits, (size_t)hp.n_vocab * sizeof(float));
@@ -3170,6 +3562,69 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         sync_all();
     } else {
         BE(0).synchronize();
+    }
+    if (q4seg && !q4seg_evs.empty()) {
+        static const char * kSegName[15] = {"handoff/emb", "ple",       "hc_attn",   "mixer",    "hc_comb1",
+                                            "hc_ffn",      "router",    "select/aq", "gu",       "down",
+                                            "pre-reduce",  "reduce",    "shared",    "hc_comb2", "head"};
+        double acc[15] = {0};
+        int cnt[15] = {0};
+        double devspan = 0;
+        for (int d = 0; d < (multi ? (int)dev_kind_.size() : 1); d++) {
+            // This device's events in submission order.
+            std::vector<int> idx;
+            for (size_t i = 0; i < q4seg_evs.size(); i++) {
+                if (q4seg_evs[i].dev == d) {
+                    idx.push_back((int)i);
+                }
+            }
+            double last_start = 0;
+            double last_end = 0;
+            bool have = false;
+            for (size_t j = 0; j < idx.size(); j++) {
+                const q4seg_ev & e = q4seg_evs[(size_t)idx[j]];
+                double st, en;
+                try {
+                    st = (double)e.ev.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
+                    en = (double)e.ev.get_profiling_info<sycl::info::event_profiling::command_end>() / 1.0e6;
+                } catch (...) {
+                    continue;
+                }
+                if (have) {
+                    // Barrier k is submitted *after* stage k, so its command_start
+                    // is when stage k finished; the span from barrier j-1 to
+                    // barrier j is therefore stage j's work (the later barrier's
+                    // stage), not stage j-1's.
+                    const int stg = q4seg_evs[(size_t)idx[j]].stage;
+                    acc[stg] += st - last_start;
+                    cnt[stg]++;
+                }
+                last_start = st;
+                last_end = en;
+                have = true;
+            }
+            if (have) {
+                double d0s = 0;
+                try {
+                    d0s = (double)q4seg_evs[(size_t)idx[0]].ev.get_profiling_info<
+                              sycl::info::event_profiling::command_start>()
+                          / 1.0e6;
+                } catch (...) {
+                }
+                devspan += last_end - d0s;
+                fprintf(stderr, "[q4seg] device %d span=%.2f ms (%zu barriers)\n", d, last_end - d0s, idx.size());
+            }
+        }
+        double sum = 0;
+        fprintf(stderr, "[q4seg] n=%d device segments (ms):", n_tok);
+        for (int i = 0; i < 15; i++) {
+            sum += acc[i];
+            if (cnt[i] || acc[i] != 0) {
+                fprintf(stderr, " %s=%.2f(%d)", kSegName[i], acc[i], cnt[i]);
+            }
+        }
+        const double total = now_ms() - t_start;
+        fprintf(stderr, " | sum=%.2f devspan=%.2f total=%.2f ms\n", sum, devspan, total);
     }
     print_qsa();
     if (hctime) {

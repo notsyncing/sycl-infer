@@ -331,6 +331,41 @@ dequantized PLE rows.  The capacity is a power of two, the slot is
 `row & (cap - 1)`, and the tag is the row id; a miss dequantizes from the GGUF
 mmap, which is the disk tier.
 
+### 5.1 What the PLE block actually costs (2026-11-01)
+
+`PF_Q4_PLEFAULT=1` splits the block per token (`[q4ple] idx/gather/proj/d2h/
+gate/apply/h2d`).  On the recommended config it was **3.94 ms**, and only
+0.075 ms of that was the gather:
+
+* **The engram cache's 1.5 % hit rate is capacity, not a bug.**
+  `per_layer_token_embd` is IQ4_NL, **320,001,536 rows x 90 B = 28.8 GB**, and a
+  token touches 16 rows = **1.44 KB**.  The index is `row & (cap-1)` with a
+  default cap of 4,194,304 slots = **1.31 % of the rows**, and
+  `--engram-ram-mb 16384` measures 4.7 % - i.e. `hit ~= cap/rows` exactly.
+  There is no temporal reuse to exploit and the gather is 0.075 ms, so
+  prefaulting 26.8 GiB (`PF_Q4_PLE_PREFAULT`) is not worth it.
+* **`apply` was 1.90 ms against ~0.2 ms of work**, because each of its four
+  10 240-element loops paid a `par()` wake + rendezvous of the 28-thread pool
+  (**~0.5 ms per call** at this size; a pure 10240-float copy measured
+  0.55 ms).  Regions whose **work** is <= `PF_Q4_PLE_SER_MAX` (65536 elements)
+  now run on the calling thread: apply 1.90 -> 0.45 ms, block 3.94 -> 2.50 ms,
+  **-1.2 ms/token, byte-identical**.  A prefill's 5.2 M-element regions still
+  pool - the threshold is on the work, not on the job count, or loop 2 (only
+  `n_tok*hc` jobs of `n_embd` elements each) would go serial at n_tok=512.
+* **`proj` was 1.61 ms**: two host GEMVs over 34.8 MB at 21 GB/s.  The weights
+  are already in the layer's VRAM (`upload_device_weights` covers
+  `L.ple.key/value`), so `PF_Q4_PLEGPU=1` runs them with the existing Q8_0
+  decode GEMV: **0.190 ms of device time = 183 GB/s**, 0 extra MiB, no extra
+  D2H (the `to_host` the gate/apply path already did becomes the wait).  It is
+  **-1.60 ms/token** and **opt-in**, because the device dot reassociates and
+  the stream diverges at output token 38 on a genuine near-tie (the top two
+  logits are 0.031 apart in both configs).
+
+Measurement trap worth knowing: with a **cold** PLE page cache the gather is
+10-12 ms/token (16 major faults), which swamps the 1.6 ms win - so both arms of
+that A/B must run inside one lock, back to back.
+
+
 ## 6. Expert bank: per-expert LRU and two-pass prefill
 
 The generic three-tier `moe_cache` is **inactive** on qwen4exp: the model
@@ -435,6 +470,43 @@ the upload bytes back.  `PF_Q4_CPU_MISS_LAYER=<il>` and
 `PF_Q4_CPU_MISS_TIME` are the probe; the flag stays off.  The full table is in
 [`../PERFORMANCE.md`](../PERFORMANCE.md) §4.4.
 
+### 6.2 Placement and transfer details (2026-11-01)
+
+* **R is per device.**  The budget is split evenly, but the two devices do not
+  carry the same number of layers: on `0-19:gpu.0,20-47:gpu.1` device 0 owns 20
+  and device 1 owns 28, so one `R` = the minimum left ~2.8 GiB of device 0's
+  VRAM unallocated (104 slots/layer for both).  Per-device gives device 0 ~152
+  and device 1 ~104 - fewer misses on the **slow** (x8, 5.17 GB/s) card at no
+  cost on the fast one.  `q4_lru_age_`/`q4_lru_heat_` are now variable-stride,
+  indexed through `q4_r_off_`; indexing them as `il * R` is wrong.
+  `PF_Q4_PERDEV_R=0` restores the single-R behaviour.
+* **The decode's expert H2D rides the per-device copy queue**, and the down
+  plane is issued last and waited for only just before `down`, so ~1.2 MB of
+  DMA runs under the gate/up GEMM.  Safe only because the router-ids `qd.wait()`
+  drains the compute queue first - the previous layer's kernels must not still
+  be reading a slot the copy overwrites.  Every path must still **upload** the
+  down plane even when the split wait is off (`PF_Q4_DOWN_PREF=0`) or the copy
+  queue does not exist (`PF_Q4_STAGE=0`); only the wait point may vary.
+* **The routed-down int8 host store is built only for layers that do not run in
+  the bank.**  It used to be built for all 48 layers at startup: **42.2 GiB and
+  112.8 s** for a store only the non-banked layers (one, layer 2) and the
+  `PF_Q4_FFCMP`/`PF_Q4_CPU_MISS` diagnostics read.  Selective: **1 layer,
+  0.9 GiB, 0.5 s**; whole-run wall 200 -> 56 s, resident set 122 -> 80 GiB.
+  `PF_Q4_FFCMP` forces the full build, so the oracle's reference is unchanged.
+* **The non-bank layer's shared expert used to be discarded.**  The non-bank
+  path ended with an **unconditional** `from_host(dev, b.block, q4_host_out_)`;
+  on the `sh_gpu` path that copies a stale host scratch over what
+  `moe_gate_add_launch` just wrote, and `PF_Q4_DUMP=1` showed layer 2's
+  `ffn_out` **bit-identical to its `moe_routed`**.  Removed.  This block's
+  routed residual is computed on the *host*, so unlike the bank path it needs
+  no `to_host` - adding one would overwrite it.
+
+``moe_down_q5_1_launch`` now runs **NPB=1** by default (bit-identical, down
+kernel 0.1875 -> 0.1674 ms/layer, decode 90.71 -> 89.41 ms/token, identical
+md5).  The old NPB=8 came from a probe whose 12.29 MB working set was replayed
+against a 16 MB L2 - see `docs/design/12-build-and-testing.md` §6.1.
+
+
 ## 7. Measured (2x Arc A770, AOT Release)
 
 | configuration | 512-token prefill | decode |
@@ -445,6 +517,9 @@ the upload bytes back.  `PF_Q4_CPU_MISS_LAYER=<il>` and
 | per-expert LRU, all-GPU, 16000 MB, pinned source | ~12.0 s (45 tok/s) | ~101 ms/token (9.9 tok/s) |
 | **per-expert LRU, all-GPU, 17500 MB, pinned source** | **~11.4 s cold / 9.6 s warm (47-56 tok/s)** | **~93.3 ms/token (10.7 tok/s)** |
 | per-expert LRU, all-GPU, 18000 MB, pinned source | – | ~93.3 ms/token (10.7 tok/s) |
+
+The decode row is the 2026-10-27 configuration; §7.2 has the per-stage budget
+of one decode step on the current build.
 
 The pinned expert source is 69.8 GiB of host RAM copied once at startup.  A
 cold first prefill is **11.4 s** (the bank calibrates on it); the second/steady
@@ -637,6 +712,117 @@ decode is 121 ms at 16k and 154 ms at 48k.  The prefill falls monotonically
 with prompt length (53 -> 41 -> 36 tok/s) because each chunk attends to all the
 KV before it.
 
+### 7.2 The 2026-11-01 pass: H2D ceilings, the expert GEMV, the dense floor
+
+Unless stated otherwise: 2x Arc A770, AOT Release, `--layer-map
+0-19:gpu.0,20-47:gpu.1`, `--moe-vram-mb 17500`, `--cpu-threads 28`,
+`--ctx 2048 --kv-type f16`, 48-token greedy decode, one process per cell.
+The box drifts ~3 % between runs; the cells below are alternating or
+best-of-three.
+
+| | before | after |
+|---|---:|---:|
+| whole-run wall (48 tokens) | 7.350 s | **6.42 s** (-12.7 %) |
+| startup to first token | ~200 s | **56 s** |
+| resident set | ~122 GiB | **80 GiB** |
+| bank slots/layer | 121 (24/24 map) | 152 / 104 per device |
+
+Per-token stage budget measured with ablations (`PF_Q4_ABL_NOGEMV` /
+`PF_Q4_ABL_NOMIX`) and barrier-pair segment timing (`PF_Q4_QSA_TIME`-style,
+`PF_Q4_KTIME`, `PF_Q4_SEGTIME`):
+
+| line | bytes/token | measured | floor | verdict |
+|---|---:|---:|---:|---|
+| dense GEMV stream (`pre`) | 3559.9 MB | 13.40 ms (266 GB/s) | ~12.5 (shape) | at floor |
+| GDN + attention cores | - | 1.52 ms | - | small |
+| PLE block (layer 1) | 34.8 MB + 16 rows | 3.94 -> **2.50 ms** | ~1.1 | was off; fixed |
+| routed gate/up | 18.4 MB/layer | 0.115 ms (160 GB/s) | - | at floor |
+| routed Q5_1 down | 12.3 MB/layer | 0.1875 -> **0.1674 ms** | ~79 GB/s | at floor |
+| router GEMV `ffn_gate_inp` | 251.6 MB | 286 GB/s | 376 | 75 % |
+| router fused selection | 2 KB | 0.0422 -> **0.0377 ms/layer** | - | latency-bound |
+| LM head | 675 MB | 1.85 ms (364 GB/s) | 1.80 | at floor |
+
+The dense part is **Q8_0/F32, not u4**: `rep.raw_gemv_decode` means every dense
+linear is read in its raw GGUF type at M=1, so the stream is 3559.9 MB and not
+5.2 GiB, and the M=1 rate is 294-364 GB/s rather than the 376 GB/s streaming
+peak.  Against a shape-priced ~12.5 ms floor, 13.40 ms is 84 % - the earlier
+"1.45x off a 14 ms floor" was comparing the whole `pre` against the GEMV-only
+part and took the floor at the streaming peak.
+
+**The x8 slot's H2D is at its protocol ceiling, and it is 64 B, not 128 B.**
+Pinned bulk copy on the x8 card (root port `16:02.0`): H2D **5.186 GB/s**,
+D2H **5.685 GB/s**, against a 7.877 GB/s encoded line rate.  Every element
+advertises `MaxPayload 128` (the A770 and the retimer *capability* is 128, so
+256 is impossible), and the root complex's **RCB is 64 B** (`LnkCtl` bit 3 = 0,
+read-only), so a read completion carries 64 B: the TLP ceilings are **5.73
+(writes) / 6.00 (completions)**.  D2H is at 99 % of its ceiling and H2D at
+86 %; the last 14 % does not respond to 1/2/4/8 queues and threads, a device
+kernel instead of `queue::memcpy`, OpenCL instead of Level Zero, or 2 MiB
+alignment.  The config bits that would help (`RCB`, `MRRS`) are `EPERM` under
+Secure Boot + `lockdown=[integrity]`.
+
+
+What moved, and why:
+
+* the routed-down int8 host store is built only for the non-banked layers
+  (42.2 GiB / 112.8 s -> 0.9 GiB / 0.5 s) - most of the startup win;
+* `R` is per device, so the 20/28 layer map stops wasting device 0's VRAM;
+* the decode's expert H2D rides a per-device copy queue with the down plane
+  waited for after gate/up, and `moe_down_q5_1` runs NPB=1
+  (0.1875 -> 0.1674 ms/layer, bit-identical);
+* the PLE host block's four `par()` calls were a 28-thread rendezvous each
+  (-1.2 ms/token), and `PF_Q4_PLEGPU` moves its 34.8 MB projection to the card
+  for another -1.60 ms/token (opt-in: not byte-identical);
+* the fused router selection batches its SLM loads (-0.22 ms/token,
+  bit-identical).
+
+**What did not move, and why it cannot easily.**  The dense non-expert stream is
+at its M=1 floor (3559.9 MB/token in 13.40 ms = 266 GB/s, LM head 364 GB/s =
+97 % of the streaming rate), and the routed Q5_1 down is at the 24-byte-block
+load-shape ceiling rather than a bandwidth one.  The x8 card's pinned H2D is
+**5.186 GB/s** against a 6.00 GB/s 64-byte-completion ceiling - a protocol limit
+(MaxPayload 128 is a hardware cap and the root complex's RCB is 64 B), not an
+engine defect.  The only remaining large change is a byte-neutral 256-value
+superblock repack of the Q5_1 down plane (§9.1).
+
+
+### 7.3 Depth cells re-baselined, and the one-card experiment (2026-11-01)
+
+Both cards, `--layer-map 0-19:gpu.0,20-47:gpu.1`, f16 KV, 28 threads, tail 7,
+`PF_PREFIX_CACHE=0`, one process per cell.  `pp` is prompt tokens over the
+warm prefill (the `[q4] fwd n=<rows>` rows); `ms/step` is the mean of the
+`[q4] fwd n=1` forward, skipping the first three steps while the bank warms.
+
+| depth | prompt | pp | ms/step | tg | steps |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 537 | 50.7 tok/s (10.6 s) | 93.6 | 10.68 tok/s | 23 |
+| 16 037 | 16 037 | 48.9 tok/s (327.7 s) | 108.5 | 9.22 tok/s | 23 |
+| 48 222 | 48 222 | 42.8 tok/s (1 126.8 s) | 108.5 | 9.21 tok/s | 11 |
+
+The 48k prompt is a **repeated one-token word**: a 48k-token prose prompt is
+~210 KB and a single argv entry is capped at 128 KB, so that cell's routing is
+degenerate and its decode is not comparable to a document.  The 512 cell
+reproduces in two consecutive runs (93.6 both); the prefill at 537 tokens
+varies 49-51 tok/s and the same cell read 101.2 ms/step in a 31-step run, so
+the bank's warm-up is the spread, not the engine.
+
+**One card (the x16 slot).**  Hiding the x8 card and putting all 48 layers on
+the x16 card (`ONEAPI_DEVICE_SELECTOR=level_zero:1`, `--layer-map 0-47:gpu.0`)
+fits **5 250 MB of dense weights plus only a 4 000 MB bank = 28 slots/layer**
+in 15.5 GiB; 5 000 MB fails to allocate, so VRAM is the constraint, not the
+link.  The single card's H2D runs at 9.96 GB/s against the dual pair's ~5.17 on
+half the traffic, but a quarter of the slots cancels it:
+
+| depth | dual | one card (x16) |
+|---|---:|---:|
+| 512, 537 tok | **93.6 ms/step** | 101.6 (best of 3: 93.5) |
+| 16 037 | 108.5 | **106.8** |
+| 48 222 | **108.5** | does not fit (1.1 GB KV + bank) |
+
+So the dual card stays the configuration to run: one card is a wash at 16k,
+slower at 512, and cannot hold a 48k context.
+
+
 ## 8. Flags
 
 | flag / env | default | meaning |
@@ -671,6 +857,18 @@ KV before it.
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` host Stage 1; see §7.1 |
 | `PF_Q4_HIST=1`, `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_HOT_TIME` | off | routing histogram / phase attribution |
 | `PF_Q4_PREFAULT=0` / `PF_Q4_NOPLE=1` / `PF_Q4_FFCMP=<layer>` | on / off / off | skip prefault / skip PLE / routed-FFN host oracle |
+
+| `PF_Q4_PERDEV_R=0` | on | per-device bank slots/layer (device 0's share otherwise sits unused) |
+| `PF_Q4_DOWN_PREF=0` | on | issue the down plane last and wait for it just before `down`; `0` = one wait for all three planes |
+| `PF_Q4_DOWN_I8_ALL=1` | off | build the routed-down int8 store for every layer (42.2 GiB / ~110 s) instead of only the non-banked ones |
+| `PF_Q4_Q5NPB=8` | 1 | rows per warp for `moe_down_q5_1_launch`; 1 and 8 are the only instantiations |
+| `PF_Q4_Q5_LANE=1` | off | one lane per 32-value block in that kernel (+1.15-1.25x, **not bit-identical**) |
+| `PF_Q4_PLE_SER_MAX` | 65536 | run a `cpu_q4_ple_apply` region on the calling thread when its WORK is below this |
+| `PF_Q4_PLEGPU=1` | off | device PLE projections (-1.60 ms/token, 183 GB/s; **not byte-identical**) |
+| `PF_MOE_RT_FAST=0` | on | batched SLM loads in the fused router selection (bit-identical, -0.22 ms/token) |
+| `PF_Q4_KTIME=1` / `PF_Q4_SEGTIME=1` / `PF_Q4_SHTIME=1` | off | device-side kernel/segment timing from barrier pairs |
+| `PF_Q4_PLEFAULT=1` / `PF_Q4_PLEAPPLY_TIME=1` / `PF_Q4_PLEGPU_TIME=1` | off | PLE stage splits |
+| `PF_MOE_RT_ABL` / `PF_Q4_ABL_NOGEMV` / `PF_Q4_ABL_NOMIX` | 0 | phase ablations for attribution; **wrong output by design** |
 
 The full knob list (including the `PF_QSA_*` dumps) is in
 [`../../AGENTS.md`](../../AGENTS.md#environment-variables).
@@ -718,3 +916,42 @@ The full knob list (including the `PF_QSA_*` dumps) is in
   KL 0.029-0.037 at near-tie divergences).  It is an expert-drop but is now
   **default 7**; `PF_Q4_TAIL_SKIP=0` restores the exact set; the gate is in
   §7.1.
+
+### 9.1 Dead ends from the 2026-11-01 pass
+
+* **A native 4-bit expert bank.**  Designed, measured, rejected.  The u4 store
+  is `0.625 B/w`, so gate+up+down is **3,072,000 B/expert - byte-identical to
+  the raw GGUF** (`2 x 0.5625 + 0.75`): *no* extra slots, and it is lossy
+  (~4.4 % rel-L2) where the raw Q4_K/Q5_1 planes are exact.  A lossless
+  `Q5_1 -> k5t` repack is byte-neutral (0.75 B/w) and would only buy the
+  kernel's load shape.  Do not re-derive it.
+* **The Q5_1 down's 64-73 GB/s is the 24-byte block's load shape.**  Cold
+  sweep (`dev/bench_q5cold.cpp`: 256-slot / 300 MB bank, 25 disjoint 10-slot
+  subsets, barrier-pair device time): pure `uint4` read **363.5 GB/s** (the
+  ceiling), Q4_K gate/up grouped **171**, Q4_K down grouped **178**, Q5_1
+  one-lane **98-101**, Q5_1 SG8 NPB=1 **81-85**, SG8 NPB=8 **73.8**, SLM
+  row-staged SG8 **52** (slower - the per-row barrier costs more than the
+  coalescing buys).  A Q4_K 144-byte superblock feeds a warp 128 B of
+  contiguous `qs` per instruction; Q5_1's 16-byte `qs` per block either needs 8
+  lanes with duplicate words (SG8) or a 20/32-lane gather (one-lane).  The slot
+  scatter is a no-op (73.8 adjacent = spread), the down-plane DMA wait is 3 %
+  of the composite `dn`, and the ratio is preserved AOT vs JIT.  **The only
+  route to the grouped kernel's rate is a byte-neutral 256-value-superblock
+  repack of the down plane**, not a different 4-bit store.
+* **The shared expert must stay on oneDNN at M=1.**  Replacing its three Q8_0
+  matmuls with the raw GEMV loses **1.3-1.8 ms/token**: oneDNN is already at
+  86-88 GiB/s at this shape, the raw gate/up matches it (91) but the swiglu
+  **down** falls to the generic `lane=k` scalar dot at **33 GiB/s** because
+  K=640 is not a multiple of 256.  The 48-layer shared FFN is 6.3 ms/token, of
+  which ~3.6 ms is `moe_gate_add` (48 one-warp launches) - a 76 us one-warp
+  launch is almost certainly the barrier-pair gap rather than the kernel, so
+  do not quote it without a cleaner measurement.
+* **Router restructurings that lost** (all bit-identical): SLM max merge
+  +65 %, 64-bit retire mask +29 %, full-lane rank scan +12 %.  The GEMV is
+  already fully split over N (512 work-groups, one warp/EU) at 286 GB/s, so
+  there is nothing to split; a K-split would flip near-ties for ~5.6 us/layer.
+  The remaining 39 us/layer is one work-group's serial selection on a 2 KB
+  problem - eliminating it entirely is worth only ~1.3 ms/token.
+* **Increasing the engram cache.**  `hit ~= cap/rows` exactly, the gather is
+  0.075 ms, and the table is 28.8 GB; `PF_Q4_PLE_PREFAULT` costs 26.8 GiB to
+  save <= 0.08 ms.

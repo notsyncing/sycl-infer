@@ -1054,7 +1054,12 @@ engine::~engine() {
         sycl::free(m.dev_weights, q);
     }
     if (h_logits) {
-        free(h_logits);
+        if (h_logits_pinned_) {
+            sycl::free(h_logits, q);
+        } else {
+            free(h_logits);
+        }
+        h_logits = nullptr;
     }
 }
 
@@ -2613,7 +2618,14 @@ void engine::alloc_buffers() {
     d_tables = alloc_elems<int32_t>((size_t)kMaxB * max_blocks);
     q.memcpy(d_tables, h_tables.data(), h_tables.size() * 4).wait();
 
-    h_logits = (float *)malloc((size_t)kMaxB * hp.n_vocab * 4);
+    // Pinned: a pageable destination makes this backend block the host until
+    // the in-order queue drains - measured 238 us of enqueue for a 1 MB copy
+    // against 9 us pinned - and this runs once per generated token.
+    h_logits = sycl::malloc_host<float>((size_t)kMaxB * hp.n_vocab, q);
+    h_logits_pinned_ = h_logits != nullptr;
+    if (!h_logits) {
+        h_logits = (float *)malloc((size_t)kMaxB * hp.n_vocab * 4);
+    }
     d_info = sycl::malloc_host<step_info>(1, q);
     std::memset(d_info, 0, sizeof(step_info));
     // second step_info for the multi-device prefill pipeline (two chunks in
