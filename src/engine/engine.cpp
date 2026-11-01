@@ -2,12 +2,16 @@
 #include "device/device_profile.h"
 #include "model_profile.h"
 #include "quant.h"
+#include "common/w4.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include "common/env.h"
@@ -270,6 +274,15 @@ engine::engine(const engine_config & cfg)
     }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
+    } else if (moe_u4bank_wanted()) {
+        // The u4 gate/up bank replaces the raw expert upload, and only the
+        // per-tensor (multi-device) upload can express that: the whole-blob
+        // single-device path copies every tensor verbatim.  Say so instead of
+        // silently paying 12 GB of raw gate/up and then not using it.
+        fprintf(stderr,
+                "[moe] PF_MOE_U4BANK needs the per-tensor upload path - pass --layer-map 0-%d:gpu.0 (or "
+                "PF_MOE_U4BANK=0); keeping the raw routed experts\n",
+                m.hp.n_layer - 1);
     }
     // A heterogeneous split is supported: every kernel launcher asks for the
     // profile of the queue it is launching on (si::dev::for_queue) and clamps
@@ -1258,8 +1271,21 @@ void engine::moe_acts_alloc(int dev) {
         a.asa = (uint16_t *)dev_alloc_on(dev, bytes / 32 * 2);
         a.xs = F(bytes / 32);
     }
+    // u4 gate/up bank scratch.  The decode writes the up projection at pair rows
+    // into `gu` (P*n_ff_exp), while the prefill uses the first two 64-row tiles
+    // of it as the gate/up GEMM destinations; one buffer sized for the decode
+    // covers both.  `gather` is the prefill's [64][n_embd] activation tile.  Only
+    // allocated when a bank was actually built (the memory-tight qwen4exp path
+    // and an unbaked MoE run do not pay 17 MB per device for nothing).
+    if (moe_u4_any_) {
+        a.gu = F(P * (size_t)hp.n_ff_exp);
+        a.gather = F(64 * (size_t)hp.n_embd);
+    }
     if (!a.ids || !a.h || !a.acc || !a.slotmap) {
         throw std::runtime_error("MoE scratch allocation failed");
+    }
+    if (moe_u4_any_ && (!a.gu || !a.gather)) {
+        throw std::runtime_error("u4 expert bank scratch allocation failed");
     }
 }
 
@@ -1297,11 +1323,23 @@ void engine::setup_moe_slots() {
     moe_slot_gb.assign(nRows, 0);
     moe_slot_ub.assign(nRows, 0);
     moe_slot_db.assign(nRows, 0);
+    if (moe_u4_bank_.size() < nRows) {
+        moe_u4_bank_.resize(nRows, 0);
+        moe_u4_gplane_.resize(nRows, 0);
+        moe_u4_uplane_.resize(nRows, 0);
+    }
     for (size_t il = 0; il < nL; il++) {
         const moe_t & M = m.layers[il].moe;
         moe_slot_gb[il] = M.gate_exps.plane_bytes;
         moe_slot_ub[il] = M.up_exps.plane_bytes;
         moe_slot_db[il] = M.down_exps.plane_bytes;
+        if (moe_u4_bank_[il]) {
+            // the bank replaces the raw plane; the raw kernels never see this
+            // layer (the u4 path owns gate/up), but a diagnostic reading the
+            // strides should report the bank's.
+            moe_slot_gb[il] = moe_u4_gplane_[il];
+            moe_slot_ub[il] = moe_u4_uplane_[il];
+        }
     }
     if (nRows > nL) {
         moe_slot_gb[nL] = m.mtp.moe.gate_exps.plane_bytes;
@@ -1333,6 +1371,307 @@ void engine::setup_moe_slots() {
     fprintf(stderr, "[moe] %d experts, top-%d, expert_ff %d, shared_ff %d: %.2f GiB of routed experts (%.1f MiB/layer)\n",
             hp.n_expert, hp.n_expert_used, hp.n_ff_exp, hp.n_ff_shexp, (double)per_layer / (1024.0 * 1024.0 * 1024.0),
             (double)(per_layer / (size_t)std::max(1, hp.n_layer)) / (1024.0 * 1024.0));
+}
+
+// ---------------------------------------------------------------------------
+// Routed-expert u4 gate/up bank (PF_MOE_U4BANK).
+//
+// The routed experts are 18 GiB of native Q4_K/Q5_K blocks and a 3213-token
+// prefill reads almost all of them once per projection.  The prefill used to do
+// that through the grouped dp4a kernel (~0.2 T-MAC/s) or the tiled fp32-SLM
+// kernel (0.85 T-MAC/s here); oneDNN's u4 matmul over the same values (Q4_K is
+// already a per-32 linear grid, so the u4 store is lossless within its f16
+// metadata) measures 2.2 T-MAC/s at M=32 on this card.
+// The catch is the *store*: the primitive needs one stable, aligned device
+// address per expert, so the bank is packed once at load into `E * plane` bytes
+// per tensor and the raw upload is skipped (wptr then returns the bank).
+//
+// Only gate/up is banked.  Down stays on the raw Q5_K/Q6_K blocks: a u4 store of
+// a Q5_K down plane is a *re-quantization* (~10% weight error), not a lossless
+// repack, and the measured end-to-end error is unacceptable.
+// ---------------------------------------------------------------------------
+
+bool engine::moe_u4bank_wanted() const {
+    static const bool env_on = [] {
+        const char * e = si::env::str("PF_MOE_U4BANK");
+        return !(e && atoi(e) == 0);
+    }();
+    if (!env_on || cpu_mode || !m.hp.is_moe() || moe_host_only_) {
+        return false;
+    }
+    // The three-tier expert cache (and its host split) owns residency; the bank
+    // is the fully-resident path only.  A recorded graph over a host-decided
+    // residency set cannot coexist with it.
+    if (moe_cfg_.host_only || moe_cfg_.resident_per_layer > 0 || moe_cfg_.vram_mb > 0 || moe_cfg_.ram_mb > 0 ||
+        moe_cfg_.ram_tier) {
+        return false;
+    }
+    return true;
+}
+
+// The u4 plane of one expert (common/w4.h): vals [N][K/2] at +0, then the f16
+// step plane [K/32][N] and the f16 offset plane.
+static void u4_plane_of(int K, int N, size_t & vals_b, size_t & scale_b, size_t & plane) {
+    vals_b = (size_t)N * (size_t)(K / 2);
+    scale_b = (size_t)(K / 32) * (size_t)N * 2;
+    plane = vals_b + 2 * scale_b;
+}
+
+static bool u4_can_bank(const moe_wt & t) {
+    return t.ok() && t.type == 12 /* Q4_K */ && t.K > 0 && t.N > 0 && (t.K % 256) == 0 && (t.K % 32) == 0 &&
+           si::w4_supported(t.type);
+}
+
+bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
+    if (!moe_u4bank_wanted()) {
+        return false;
+    }
+    const int nL = m.hp.n_layer;
+    const size_t nRows = (size_t)nL + (m.mtp.moe.ok() ? 1 : 0);
+    if (moe_u4_bank_.size() < nRows) {
+        moe_u4_bank_.resize(nRows, 0);
+        moe_u4_gplane_.resize(nRows, 0);
+        moe_u4_uplane_.resize(nRows, 0);
+    }
+    // One pinned staging buffer, sized for the largest tensor this device owns.
+    size_t stage_bytes = 0;
+    for (int il = 0; il < nL; il++) {
+        if (layer_dev_[(size_t)il] != dev) {
+            continue;
+        }
+        const moe_t & M = m.layers[(size_t)il].moe;
+        const moe_wt * ts[2] = {&M.gate_exps, &M.up_exps};
+        for (int p = 0; p < 2; p++) {
+            if (!u4_can_bank(*ts[p])) {
+                continue;
+            }
+            size_t vb, sb, pl;
+            u4_plane_of(ts[p]->K, ts[p]->N, vb, sb, pl);
+            stage_bytes = std::max(stage_bytes, pl * (size_t)ts[p]->E);
+        }
+    }
+    if (!stage_bytes) {
+        return false;
+    }
+    uint8_t * stage = sycl::malloc_host<uint8_t>(stage_bytes, qd);
+    if (!stage) {
+        fprintf(stderr, "[moe] u4 gate/up bank: pinned staging allocation failed - keeping the raw experts\n");
+        return false;
+    }
+    auto now = [] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const double t_start = now();
+    double pack_s = 0, copy_s = 0;
+    size_t bank_bytes = 0;
+    int banked_layers = 0;
+    std::vector<const void *> registered;
+
+    auto pack_tensor = [&](const moe_wt & t, uint8_t ** out) -> size_t {
+        size_t vb, sb, pl;
+        u4_plane_of(t.K, t.N, vb, sb, pl);
+        const size_t bytes = pl * (size_t)t.E;
+        const double p0 = now();
+        std::atomic<int> bad{0};
+        std::vector<std::thread> th;
+        const int NT = 8;
+        for (int w = 0; w < NT; w++) {
+            th.emplace_back([&, w] {
+                si::w4t s;
+                for (int e = w; e < t.E; e += NT) {
+                    if (!si::w4_pack(t.type, t.plane(e), t.K, t.N, s)) {
+                        bad = 1;
+                        return;
+                    }
+                    uint8_t * d = stage + (size_t)e * pl;
+                    std::memcpy(d, s.vals.data(), vb);
+                    std::memcpy(d + vb, s.scale.data(), sb);
+                    std::memcpy(d + vb + sb, s.off.data(), sb);
+                }
+            });
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+        pack_s += now() - p0;
+        if (bad) {
+            return 0;
+        }
+        uint8_t * bank = sycl::malloc_device<uint8_t>(bytes, qd);
+        if (!bank) {
+            fprintf(stderr, "[moe] u4 bank: device allocation of %.1f MiB failed\n", (double)bytes / (1024.0 * 1024.0));
+            return 0;
+        }
+        const double c0 = now();
+        qd.memcpy(bank, stage, bytes).wait();
+        copy_s += now() - c0;
+        for (int e = 0; e < t.E; e++) {
+            uint8_t * b = bank + (size_t)e * pl;
+            if (!D.add_weight_w4_dev((const void *)b, b, b + vb, b + vb + sb, t.K, t.N)) {
+                fprintf(stderr, "[moe] u4 bank: oneDNN rejected the store (K=%d N=%d e=%d)\n", t.K, t.N, e);
+                return 0;
+            }
+            registered.push_back((const void *)b);
+        }
+        *out = bank;
+        return bytes;
+    };
+
+    for (int il = 0; il < nL; il++) {
+        if (layer_dev_[(size_t)il] != dev) {
+            continue;
+        }
+        const moe_t & M = m.layers[(size_t)il].moe;
+        if (!u4_can_bank(M.gate_exps) || !u4_can_bank(M.up_exps)) {
+            continue;
+        }
+        // The prefill dispatch reads K/N from the model's hparams, so a tensor
+        // with a different geometry must stay on the raw path.
+        if (M.gate_exps.K != m.hp.n_embd || M.gate_exps.N != m.hp.n_ff_exp ||
+            M.up_exps.K != M.gate_exps.K || M.up_exps.N != M.gate_exps.N) {
+            continue;
+        }
+        uint8_t * bg = nullptr;
+        uint8_t * bu = nullptr;
+        const size_t gb = pack_tensor(M.gate_exps, &bg);
+        const size_t ub = gb ? pack_tensor(M.up_exps, &bu) : 0;
+        if (!gb || !ub) {
+            // transactional: without both tensors the layer stays on the raw
+            // path and its Q4_K planes are still in the mmap (the per-tensor
+            // upload has not run yet), so only the banks need freeing.
+            if (bg) {
+                sycl::free(bg, qd);
+            }
+            if (bu) {
+                sycl::free(bu, qd);
+            }
+            continue;
+        }
+        m.page_out_host(M.gate_exps.data, M.gate_exps.total_bytes());
+        m.page_out_host(M.up_exps.data, M.up_exps.total_bytes());
+        // Pre-registering the device pointer under the tensor's host key is what
+        // makes wptr(dev, M.gate_exps.data) return the bank; the per-tensor
+        // upload then skips any key already in this map.
+        if (weight_maps_.size() <= (size_t)dev) {
+            weight_maps_.resize((size_t)dev + 1);
+        }
+        weight_maps_[(size_t)dev][M.gate_exps.data] = bg;
+        weight_maps_[(size_t)dev][M.up_exps.data] = bu;
+        if (dev_used_bytes_.size() <= (size_t)dev) {
+            dev_used_bytes_.resize((size_t)dev + 1, 0);
+        }
+        dev_used_bytes_[(size_t)dev] += gb + ub;
+        size_t vb, sb, pl;
+        u4_plane_of(M.gate_exps.K, M.gate_exps.N, vb, sb, pl);
+        moe_u4_bank_[(size_t)il] = 1;
+        moe_u4_gplane_[(size_t)il] = pl;
+        moe_u4_uplane_[(size_t)il] = pl;
+        bank_bytes += gb + ub;
+        banked_layers++;
+    }
+    sycl::free(stage, qd);
+    if (banked_layers) {
+        moe_u4_any_ = true;
+        fprintf(stderr,
+                "[moe] u4 gate/up bank (dev %d): %d layers, %.1f MiB on device, packed %.2f s in %.2f s of copies "
+                "(%.2f s total, %zu experts)\n",
+                dev, banked_layers, (double)bank_bytes / (1024.0 * 1024.0), pack_s, copy_s, now() - t_start,
+                registered.size());
+        return true;
+    }
+    return false;
+}
+
+bool engine::moe_u4_bank_ok(int dev, int moe_il) const {
+    if (!moe_u4_any_ || moe_il < 0 || (size_t)moe_il >= moe_u4_bank_.size() || !moe_u4_bank_[(size_t)moe_il]) {
+        return false;
+    }
+    if (dev < 0 || (size_t)dev >= dnnl_dev_.size() || !dnnl_dev_[(size_t)dev]) {
+        return false;
+    }
+    return true;
+}
+
+// gate/up through the bank.  Prefill (mode 1/2) runs one oneDNN u4 GEMM per
+// active expert over the pairs it owns, in 64-row tiles padded up to the 32/64
+// M bucket; a decode runs the M=1 u4 GEMV once per pair.  Both write
+// silu(gate)*up into d_moe_h at the *pair* rows, which is the layout the down
+// kernel and the weighted reduction already use.
+bool engine::moe_gate_up_u4(int dev, int moe_il, const moe_t & M, int n_tok, int n_pairs, int mode) {
+    if (!moe_u4_bank_ok(dev, moe_il) || moe_host_split()) {
+        return false;
+    }
+    dnnl_gemm * D = dnnl_for(dev);
+    if (!D) {
+        return false;
+    }
+    const int K = m.hp.n_embd;
+    const int N = m.hp.n_ff_exp;
+    const int k = m.hp.n_expert_used;
+    sycl::queue & qq = dev_queue(dev);
+    const auto & A = moe_as_[(size_t)(dev >= 0 ? dev : 0)];
+    const size_t gp = moe_u4_gplane_[(size_t)moe_il];
+    const size_t up = moe_u4_uplane_[(size_t)moe_il];
+    const uint8_t * bank_g = (const uint8_t *)wptr(dev, M.gate_exps.data);
+    const uint8_t * bank_u = (const uint8_t *)wptr(dev, M.up_exps.data);
+    size_t vb, sb, pl;
+    u4_plane_of(K, N, vb, sb, pl);
+    if (gp != pl || up != pl) {
+        // The bank was packed for a different geometry than the dispatch would
+        // read.  The raw planes are not uploaded, so a silent fallback would be
+        // a wrong answer; fail loudly instead.
+        throw std::runtime_error("u4 expert bank: layer geometry mismatch");
+    }
+
+    if (mode == 0) {
+        // ---- decode: one grouped u4 GEMV per projection, one launch ----
+        // The router ids stay on the device (the expert is addressed inside the
+        // kernel) and the activation is the plain per-32-group int8 tile, so
+        // this is two kernels on the queue and records into the decode command
+        // graph.  The old form read d_moe_ids back to the host, ran one
+        // w4_gemv_launch per (pair, projection) and finished with a silu-mul,
+        // which is why the whole decode had to run graph-free.
+        // The SAME quantizer quantize() runs: byte-identical xq/asa/xs to the
+        // per-pair path this replaces (moe_actq's 127/mx reciprocal rounds
+        // differently, and that moved the greedy stream).
+        act_quant_grp_run(qq, d_xnorm, K, n_tok, K, A.xq, A.asa, A.xs);
+        moe_u4_gemv_launch(qq, bank_g, gp, nullptr, d_moe_ids, n_pairs, A.xq, A.asa, A.xs, K, N, d_moe_h, N, nullptr,
+                           k);
+        moe_u4_gemv_launch(qq, bank_u, up, nullptr, d_moe_ids, n_pairs, A.xq, A.asa, A.xs, K, N, d_moe_h, N, d_moe_h,
+                           k);
+        return true;
+    }
+
+    // ---- prefill: per-expert oneDNN u4 GEMM over 64-row tiles ----
+    std::vector<int32_t> active((size_t)m.hp.n_expert + 1), off((size_t)m.hp.n_expert + 1);
+    int32_t nact = 0;
+    qq.memcpy(&nact, d_moe_nact, sizeof(int32_t));
+    qq.memcpy(active.data(), d_moe_active, active.size() * sizeof(int32_t));
+    qq.memcpy(off.data(), d_moe_off, off.size() * sizeof(int32_t));
+    qq.wait(); // the prefill is a direct replay: a per-layer schedule read is legal
+    if (nact <= 0) {
+        return true;
+    }
+    for (int ia = 0; ia < nact; ia++) {
+        const int e = active[(size_t)ia];
+        const int p0 = off[(size_t)e];
+        const int pe = off[(size_t)e + 1] - p0;
+        for (int c = 0; c < pe; c += 64) {
+            const int n = std::min(64, pe - c);
+            const int Mt = n <= 32 ? 32 : 64;
+            moe_u4_gather_launch(qq, d_xnorm, d_moe_pair, p0 + c, n, Mt, k, K, A.gather);
+            act_view v = D->quantize(A.gather, nullptr, K, K, Mt, K, /*do_split=*/false);
+            // No raw fallback exists once a layer is banked (its Q4_K planes were
+            // never uploaded), so a failure here must be an error, not a silent
+            // switch to a kernel that would read the u4 bank as Q4_K.
+            if (!v.valid() || !D->gemm_w4(v, bank_g + (size_t)e * gp, nullptr, 1.0f, Mt, K, A.gu, N) ||
+                !D->gemm_w4(v, bank_u + (size_t)e * up, nullptr, 1.0f, Mt, K, A.gu + (size_t)Mt * N, N)) {
+                throw std::runtime_error("u4 expert bank: prefill gate/up GEMM failed");
+            }
+            moe_u4_scatter_silu_launch(qq, A.gu, A.gu + (size_t)Mt * N, d_moe_pair, p0 + c, n, N, d_moe_h, N);
+        }
+    }
+    return true;
 }
 
 void engine::bind_moe_acts(int dev) {
@@ -1603,6 +1942,14 @@ void engine::upload_device_weights(int dev) {
     for (const auto & t : m.gguf.tensors) {
         if (!need.count(t.data)) {
             continue; // a CPU-side layer's weight: stays in the host mmap only
+        }
+        if (mp.count(t.data)) {
+            // Already materialized on this device by another path - today the
+            // routed experts' u4 gate/up bank (setup_moe_u4_bank pre-registers
+            // the bank pointer under the tensor's host key, which is what makes
+            // wptr(dev, gate_exps.data) return the bank).  The raw Q4_K upload is
+            // exactly what the bank replaces, so it must not happen.
+            continue;
         }
         if (dev < (int)w8_dev_.size() && w8_dev_[(size_t)dev].count(t.data)) {
             // the int8 (SIn) view replaces the raw device copy
@@ -2200,6 +2547,13 @@ bool engine::setup_md_dnnl() {
             }
             add(L.ssm_beta);
             add(L.ssm_alpha);
+        }
+        // Routed-expert u4 gate/up bank: packed and registered here, while this
+        // device's dnnl_gemm exists and before the per-tensor upload (which then
+        // skips the banked tensors).  A device whose only weights were the bank
+        // still keeps its oneDNN instance, which is what gemm_w4 runs on.
+        if (setup_moe_u4_bank((int)d, *D, *dev_queues_[d])) {
+            dev_ok = true;
         }
         if (dev_ok) {
             fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
@@ -3168,6 +3522,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     // every M in 32..512 and acc_cap covers the widest N), the CPU partition
     // i8_gemm, and the small non-convertible tensors one fp32 grid dispatch.
     if ((nog || use_dnnl || multi_dev) && !plan_pfb_.segs.empty()) {
+        const auto tp0 = std::chrono::steady_clock::now();
         if (dbg_pfb) {
             fprintf(stderr, "[pfb] direct record_forward(2)\n");
         }
@@ -3176,6 +3531,10 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
             sync_all();
         } else {
             q.wait();
+        }
+        if (dbg_pfb) {
+            fprintf(stderr, "[pfb] n=%d wall %.3f s\n", n,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
         }
         d_info->pc_active = 0;
         // The expert cache measures its residency from real traffic, and this is

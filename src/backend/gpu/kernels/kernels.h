@@ -537,6 +537,31 @@ bool moe_row_gemv_gate_up_launch(sycl::queue & q, const void * gbank, const void
 bool moe_row_gemv_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                               const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa,
                               float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype);
+// Routed-expert u4 bank (PF_MOE_U4BANK): the prefill's per-expert oneDNN u4
+// gate/up GEMM reads a contiguous [tile_m][K] f32 activation tile gathered from
+// the token rows its pairs point at, and writes the fused silu(gate)*up back to
+// the pair rows.  The padded tile rows are the GEMM's M bucket (32/64) and are
+// zero-filled; only the first `n` output rows are scattered.
+void moe_u4_gather_launch(sycl::queue & q, const float * x, const int32_t * pair, int p0, int n, int tile_m, int top_k,
+                          int K, float * tile);
+void moe_u4_scatter_silu_launch(sycl::queue & q, const float * g, const float * u, const int32_t * pair, int p0, int n,
+                                int N, float * h, int h_stride);
+// decode form: both operands already sit at the pair rows (M=1 GEMVs wrote them)
+void moe_u4_silu_mul_launch(sycl::queue & q, float * g, const float * u, int n);
+// Grouped u4 expert GEMV: one launch for every (pair, row-block) of a decode's
+// gate or up projection, straight out of the packed per-expert bank.  The grid
+// is (pair, row block) exactly as w4_gemv_launch shapes ONE tensor: each
+// sub-group owns output row n and stages its scale/off tile in SLM.  The
+// expert of pair ia is ids[ia], its plane starts at
+// bank + slot_map?[ids[ia]] * plane_bytes (slot_map == nullptr means identity).
+// The activation is the *contiguous* per-32-group int8 form `xq` (moe_actq),
+// row = top_k > 0 ? ia / top_k : ia, so no even/odd split is needed; the
+// nibble pairs are expanded in registers instead.  With `gate` non-null the
+// result is silu(gate[ia * out_stride + n]) * acc (the up pass, in place over
+// the gate row).  No host read, no wait: recordable in a command graph.
+void moe_u4_gemv_launch(sycl::queue & q, const uint8_t * bank, size_t plane_bytes, const int32_t * slot_map,
+                        const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs,
+                        int K, int N, float * out, int out_stride, const float * gate, int top_k);
 // down: [p_e, n_ff_exp] x [n_ff_exp, n_embd] per active expert.  Same contract.
 bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                          const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,

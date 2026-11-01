@@ -326,6 +326,14 @@ void epilogue_vec_launch(sycl::queue & q, const int32_t * acc, const float * sx,
 
 } // namespace
 
+void act_quant_grp_run(sycl::queue & q, const float * x, int x_stride, int M, int K, int8_t * xq, uint16_t * asa,
+                       float * xs) {
+    // The same kernel quantize() runs; only its contiguous outputs are needed
+    // (the split planes are for the dense u4 GEMV, not the expert bank).
+    act_quant_grp_launch(q, x, nullptr, x_stride, x_stride, xq, asa, xs, nullptr, nullptr, nullptr, /*do_split=*/false,
+                         M, K, nullptr, nullptr, 0);
+}
+
 static bool g_dnnl_capturing = false;
 void dnnl_set_capturing(bool on) {
     g_dnnl_capturing = on;
@@ -602,6 +610,10 @@ struct dnnl_gemm::impl {
         uint8_t * vals = nullptr;
         uint16_t * scales = nullptr;
         uint16_t * off = nullptr;
+        // The three planes are the caller's memory (the routed experts' resident
+        // bank), not this instance's allocation: weight_bytes() must not count
+        // them again, since the engine's own ledger already holds the bank.
+        bool dev_backed = false;
         memory wmem, scmem;
         // PF_W4_CORR_GEMM: the same `off` plane as the {ng,N} f16 B operand of
         // the correction matmul.  One wrapper per weight entry (the layout is
@@ -1123,6 +1135,9 @@ size_t dnnl_gemm::weight_bytes() const {
         n += (size_t)kv.second.K * kv.second.N + (size_t)kv.second.ng * kv.second.N * 2;
     }
     for (const auto & kv : p->w4weights) {
+        if (kv.second.dev_backed) {
+            continue; // the caller owns the planes (see w4_entry::dev_backed)
+        }
         n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)(kv.second.K / kW4Group) * kv.second.N * 4;
     }
     for (const auto & kv : p->w2weights) {
@@ -1396,6 +1411,46 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     if (any) {
         p->has_w4 = true; // quantize() must now also produce the grouped form
     }
+    auto ins = p->w4weights.emplace(key, std::move(e));
+    return ins.first->second.ok;
+}
+
+// Register a u4 store whose three planes already live in device memory.  This is
+// the routed experts' resident gate/up bank: the engine packs E experts into one
+// `E * plane` device buffer and calls this once per expert with a pointer into
+// it, so nothing is re-packed or copied here.  The oneDNN memories wrap the
+// caller's pointers, and the primitive is created lazily by gemm_w4 (it is keyed
+// by (M,K,N), which is the same for every expert of a tensor).
+bool dnnl_gemm::add_weight_w4_dev(const void * key, const void * dev_vals, const void * dev_scale, const void * dev_off,
+                                  int K, int N) {
+    if (!key || !dev_vals || !dev_scale || !dev_off) {
+        return false;
+    }
+    if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+        return false;
+    }
+    auto found = p->w4weights.find(key);
+    if (found != p->w4weights.end()) {
+        return found->second.ok;
+    }
+    const int ng = K / kW4Group;
+    impl::w4_entry e;
+    e.K = K;
+    e.N = N;
+    e.vals = (uint8_t *)dev_vals;
+    e.scales = (uint16_t *)dev_scale;
+    e.off = (uint16_t *)dev_off;
+    e.dev_backed = true;
+    e.wmem = sycl_interop::make_memory(memory::desc({K, N}, memory::data_type::u4, memory::format_tag::ba), p->eng,
+                                       sycl_interop::memory_kind::usm, (void *)e.vals);
+    e.scmem =
+        sycl_interop::make_memory(memory::desc({1, ng * N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
+                                  sycl_interop::memory_kind::usm, (void *)e.scales);
+    e.offmem = sycl_interop::make_memory(memory::desc({ng, N}, memory::data_type::f16, memory::format_tag::ab),
+                                         p->eng, sycl_interop::memory_kind::usm, (void *)e.off);
+    e.offmem_ok = e.offmem.get(true) != nullptr;
+    e.ok = true;
+    p->has_w4 = true; // quantize() must produce the grouped form
     auto ins = p->w4weights.emplace(key, std::move(e));
     return ins.first->second.ok;
 }
@@ -2150,6 +2205,19 @@ const float * dnnl_gemm::weight_scales(const void * key) const {
 
 const int8_t * dnnl_gemm::act_grp_data(const act_view & v) const {
     return view_is_current(v) ? p->axg : nullptr;
+}
+
+bool dnnl_gemm::act_split(const act_view & v, const int8_t ** even, const int8_t ** odd) const {
+    if (!view_is_current(v) || !v.split || !p->axe || !p->axo) {
+        return false;
+    }
+    if (even) {
+        *even = p->axe;
+    }
+    if (odd) {
+        *odd = p->axo;
+    }
+    return true;
 }
 
 const uint16_t * dnnl_gemm::act_grp_scales(const act_view & v) const {

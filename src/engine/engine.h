@@ -460,6 +460,12 @@ struct engine {
         int8_t * xq = nullptr;    // [rows][K]
         uint16_t * asa = nullptr; // [rows][K/32]
         float * xs = nullptr;     // [rows][K/32]
+        // u4 gate/up bank scratch (PF_MOE_U4BANK).  `gu` is the up projection's
+        // destination at pair rows for a decode, and the two [64][N] GEMM output
+        // tiles (gate at +0, up at +64*N floats) for a prefill; `gather` is the
+        // [64][n_embd] f32 activation tile the prefill GEMM reads.
+        float * gu = nullptr;
+        float * gather = nullptr;
     };
     std::vector<moe_act> moe_as_;
     // residency + the disk/RAM/VRAM expert cache tiers
@@ -529,6 +535,29 @@ struct engine {
     // slot (see moe_cache); 0 when every layer agrees.
     size_t moe_slot_gb_max = 0, moe_slot_ub_max = 0, moe_slot_db_max = 0;
     int moe_topk = 0;
+
+    // ---- routed-expert u4 gate/up bank (PF_MOE_U4BANK) --------------------
+    // When the per-tensor (multi-device) upload is in use, a MoE layer's
+    // gate_exps/up_exps are packed once into one `E * plane` u4 device buffer
+    // each (see common/w4.h) instead of the raw Q4_K upload, and the prefill
+    // runs per-expert oneDNN u4 GEMMs over it.  `moe_u4_bank_` is indexed like
+    // moe_all_ (trunk layers + the NextN block); a 0 keeps that layer on its raw
+    // experts (the MTP block is deliberately not banked yet).
+    std::vector<uint8_t> moe_u4_bank_;
+    std::vector<size_t> moe_u4_gplane_, moe_u4_uplane_;
+    bool moe_u4_any_ = false;
+    bool moe_u4bank_wanted() const;
+    bool setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd);
+    bool moe_u4_bank_ok(int dev, int moe_il) const;
+    // gate/up through the bank: per-expert oneDNN u4 GEMM (prefill) or the M=1
+    // per-expert u4 GEMV (decode).  Returns false when it cannot serve this
+    // call, in which case the caller keeps the raw path.
+    bool moe_gate_up_u4(int dev, int moe_il, const moe_t & M, int n_tok, int n_pairs, int mode);
+    // One direct decode forward + one M=32/64 u4 GEMM at startup.  Recording the
+    // decode command graph used to do this for free; the bank's host pass forces
+    // that graph off, and without this warmup the first prefill pays ~4 s of
+    // kernel JIT (measured) instead of ~0.6 s.
+    void warm_bank_path();
     void bind_moe_acts(int dev);
 
     // ---- qwen4exp (hyper-connections + PLE) -----------------------------

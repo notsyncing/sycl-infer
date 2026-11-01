@@ -3048,4 +3048,196 @@ void moe_gate_add_launch(queue & q, const void * gate, uint32_t gtype, const flo
     }
 }
 
+// ---------------------------------------------------------------------------
+// Routed-expert u4 bank (PF_MOE_U4BANK): the two small kernels the per-expert
+// oneDNN gate/up GEMM needs around it.  The bank itself is packed at load; the
+// GEMM consumes it, so these only move rows in and out of the GEMM's [M][K]
+// activation tile and its [M][N] output tiles.
+// ---------------------------------------------------------------------------
+
+// tile[j][k] = x[(pair[p0+j] / top_k)][k] for j < n, zero for the padded rows.
+// The padding is what makes the GEMM's M a fixed 32/64 bucket: a padded row must
+// quantize to a benign scale (zero -> the quantizer keeps 1.0), not to whatever
+// the scratch held before.
+void moe_u4_gather_launch(queue & q, const float * x, const int32_t * pair, int p0, int n, int tile_m, int top_k,
+                          int K, float * tile) {
+    q.parallel_for(range<2>((size_t)tile_m, (size_t)K), [=](id<2> i) {
+        const int j = (int)i[0];
+        const int k = (int)i[1];
+        float v = 0.f;
+        if (j < n) {
+            const int row = pair[p0 + j] / top_k;
+            v = x[(size_t)row * K + k];
+        }
+        tile[(size_t)j * K + k] = v;
+    });
+}
+
+// h[pair[p0+j]][i] = silu(g[j][i]) * u[j][i].  The output row is the pair id,
+// not the tile row: the down kernel and the weighted reduction are indexed by
+// pair, and an expert's pairs are contiguous in the CSR but not in pair-id order.
+void moe_u4_scatter_silu_launch(queue & q, const float * g, const float * u, const int32_t * pair, int p0, int n,
+                                int N, float * h, int h_stride) {
+    q.parallel_for(range<2>((size_t)n, (size_t)N), [=](id<2> i) {
+        const int j = (int)i[0];
+        const int c = (int)i[1];
+        const size_t src = (size_t)j * N + c;
+        const size_t dst = (size_t)pair[p0 + j] * h_stride + c;
+        h[dst] = silu_f(g[src]) * u[src];
+    });
+}
+
+// h[i] = silu(g[i]) * u[i] over n elements: the decode form, where both rows
+// already sit at their pair id (one M=1 GEMV per pair wrote them).
+void moe_u4_silu_mul_launch(queue & q, float * g, const float * u, int n) {
+    q.parallel_for(range<1>((size_t)n), [=](id<1> i) { g[i] = silu_f(g[i]) * u[i]; });
+}
+
+// ---------------------------------------------------------------------------
+// Grouped u4 expert GEMV: the decode form of the bank, ONE launch per
+// projection.
+//
+// The host loop this replaces walked `n_pairs` on the host (d_moe_ids read
+// back, one w4_gemv_launch per (pair, projection), then a silu-mul kernel), so
+// every layer needed a host->device wait and the decode command graph had to
+// be skipped.  Here the router ids stay on the device: the expert of pair ia is
+// ids[ia] and its plane is addressed inside the kernel, so the whole layer is
+// kernels on the queue and records into the decode graph again.
+//
+// Each (pair, row block) is one work-group, shaped exactly like
+// w4_gemv_launch's ONE tensor: RB sub-groups, the sub-group owning output row
+// n, and the (g,n) scale/off planes staged into SLM g-major / row-inner so the
+// strided reads coalesce.
+//
+// The activation is the contiguous per-32-group int8 tile `moe_actq_launch`
+// writes (no even/odd split).  One 16-byte weight load at group g is the 32
+// nibbles of k = 32g..32g+31 in order (byte j: low = 2j, high = 2j+1), so a
+// dp4a operand needs the *four consecutive* nibbles of two bytes expanded into
+// four bytes; the two helpers below do that in registers.  That is eight dp4a
+// per group, the same count as the dense u4 GEMV.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The low/high nibbles of two weight bytes -> four consecutive uint8 lanes.
+// w's bytes 0,1 carry elements 0..3 (low,high,low,high).
+inline uint32_t u4_lo_pair(uint32_t w) {
+    return (w & 0x0000000Fu) | ((w & 0x000000F0u) << 4) | ((w & 0x00000F00u) << 8) | ((w & 0x0000F000u) << 12);
+}
+// w's bytes 2,3 carry elements 4..7, starting at bit 16.
+inline uint32_t u4_hi_pair(uint32_t w) {
+    return ((w >> 16) & 0x0000000Fu) | ((w >> 12) & 0x00000F00u) | ((w >> 8) & 0x000F0000u) |
+           ((w >> 4) & 0x0F000000u);
+}
+// dp4a of four consecutive int8 activations against an expanded nibble word.
+inline int32_t u4_dp(const int8_t * x, uint32_t w, int32_t c) {
+    uint32_t a;
+    __builtin_memcpy((void *)&a, x, sizeof(a));
+    return dp4a_s8u8((int32_t)a, w, c);
+}
+
+int moe_u4_rb_for(const queue & q) {
+    static const int env_rb = si::env::i32("PF_W4_RB", 0);
+    const int want = env_rb > 0 ? env_rb : si::dev::for_queue(q).shape.w4_rows_per_wg;
+    return want <= 8 ? 8 : (want <= 16 ? 16 : 32);
+}
+
+} // namespace
+
+template <int RB>
+static void moe_u4_gemv_impl(queue & q, const uint8_t * bank, size_t plane_bytes, const int32_t * slot_map,
+                             const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa,
+                             const float * xs, int K, int N, float * out, int out_stride, const float * gate,
+                             int top_k) {
+    const int ng = K / 32;
+    const size_t vb = (size_t)N * (size_t)(K / 2);
+    const int nwg = (N + RB - 1) / RB;
+    constexpr int TX = RB * 32;
+    q.submit([&](handler & h) {
+        // step + off for this pair's RB rows, f16 (the dense u4 GEMV's tile)
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        h.parallel_for(nd_range<1>((size_t)n_pairs * (size_t)nwg * TX, TX), [=](nd_item<1> it)
+                           [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            const int gid = (int)it.get_group(0);
+            const int p = gid / nwg;
+            const int n0 = (gid - p * nwg) * RB;
+            const int e = ids[p];
+            const int slot = slot_map ? slot_map[e] : e;
+            const uint8_t * plane = bank + (size_t)slot * plane_bytes;
+            const uint16_t * scale = reinterpret_cast<const uint16_t *>(plane + vb);
+            const uint16_t * off = scale + (size_t)ng * (size_t)N;
+            // g-major / row-inner: consecutive lanes read consecutive n
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int r = i - g * RB;
+                const int n = n0 + r;
+                const bool ok = n < N;
+                const size_t src = (size_t)g * (size_t)N + n;
+                meta[i] = ok ? scale[src] : (uint16_t)0;
+                meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int n = n0 + sg;
+            if (n >= N) {
+                return;
+            }
+            const uint8_t * wrow = plane + (size_t)n * (size_t)(K / 2);
+            const int arow = top_k > 0 ? p / top_k : p;
+            const int8_t * xrow = xq + (size_t)arow * (size_t)K;
+            const uint16_t * asr = asa + (size_t)arow * (size_t)ng;
+            const float * xsr = xs + (size_t)arow * (size_t)ng;
+            float acc = 0.f;
+            for (int g = lane; g < ng; g += 32) {
+                // 16 bytes = the group's 32 nibbles, elements 32g..32g+31
+                const uint4 wv = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 16);
+                const int8_t * xg = xrow + (size_t)g * 32;
+                int32_t qd = 0;
+                qd = u4_dp(xg + 0, u4_lo_pair(wv.x()), qd);
+                qd = u4_dp(xg + 4, u4_hi_pair(wv.x()), qd);
+                qd = u4_dp(xg + 8, u4_lo_pair(wv.y()), qd);
+                qd = u4_dp(xg + 12, u4_hi_pair(wv.y()), qd);
+                qd = u4_dp(xg + 16, u4_lo_pair(wv.z()), qd);
+                qd = u4_dp(xg + 20, u4_hi_pair(wv.z()), qd);
+                qd = u4_dp(xg + 24, u4_lo_pair(wv.w()), qd);
+                qd = u4_dp(xg + 28, u4_hi_pair(wv.w()), qd);
+                const float sa = moe_h2f(asr[g]);
+                const size_t mo = (size_t)g * RB + sg;
+                acc += sa * (moe_h2f(meta[mo]) * (float)qd + moe_h2f(meta[(size_t)RB * ng + mo]) * xsr[g]);
+            }
+            const sub_group sgg = it.get_sub_group();
+            const float tot = reduce_over_group(sgg, acc, plus<float>());
+            if (lane == 0) {
+                const size_t oi = (size_t)p * (size_t)out_stride + n;
+                out[oi] = gate ? silu_f(gate[oi]) * tot : tot;
+            }
+        });
+    });
+}
+
+void moe_u4_gemv_launch(queue & q, const uint8_t * bank, size_t plane_bytes, const int32_t * slot_map,
+                        const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs,
+                        int K, int N, float * out, int out_stride, const float * gate, int top_k) {
+    const int ng = K / 32;
+    const int rb = moe_u4_rb_for(q);
+    const auto fits = [&](int n) {
+        return (size_t)2 * (size_t)n * (size_t)ng * sizeof(uint16_t) <=
+               (size_t)si::dev::for_queue(q).slm.budget_bytes;
+    };
+    if (rb == 8 && fits(8)) {
+        moe_u4_gemv_impl<8>(q, bank, plane_bytes, slot_map, ids, n_pairs, xq, asa, xs, K, N, out, out_stride, gate,
+                            top_k);
+    } else if (rb == 32 && fits(32)) {
+        moe_u4_gemv_impl<32>(q, bank, plane_bytes, slot_map, ids, n_pairs, xq, asa, xs, K, N, out, out_stride, gate,
+                             top_k);
+    } else if (fits(16)) {
+        moe_u4_gemv_impl<16>(q, bank, plane_bytes, slot_map, ids, n_pairs, xq, asa, xs, K, N, out, out_stride, gate,
+                             top_k);
+    } else {
+        moe_u4_gemv_impl<8>(q, bank, plane_bytes, slot_map, ids, n_pairs, xq, asa, xs, K, N, out, out_stride, gate,
+                            top_k);
+    }
+}
+
 } // namespace si

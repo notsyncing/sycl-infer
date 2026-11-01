@@ -36,6 +36,15 @@ bool dnnl_gemm_enabled(const sycl::queue & q);
 void dnnl_set_capturing(bool on);
 void dnnl_capture_guard();
 
+// The per-32-group activation quantizer quantize() uses, WITHOUT the even/odd
+// split planes: xq [M][K] int8, asa [M][K/32] f16 and xs [M][K/32] f32.  The
+// expert-bank decode's grouped u4 GEMV consumes the contiguous form, and it
+// has to see the same bytes quantize() would have produced, so it calls this
+// rather than a second (and subtly different) quantizer.  Pure kernel
+// launches: no host read, no wait, recordable in a command graph.
+void act_quant_grp_run(sycl::queue & q, const float * x, int x_stride, int M, int K, int8_t * xq, uint16_t * asa,
+                       float * xs);
+
 // What quantize() produced, and what every GEMM entry point requires.
 //
 // This used to be an implicit protocol on the object: a bool plus the (M, K)
@@ -85,6 +94,14 @@ struct dnnl_gemm {
     // u4 GEMV only (the MTP draft layer, which never prefills).
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
                        bool any_type = false, bool gemv_only = false, float scale_mul = 1.0f);
+    // Register a u4 store that *already lives in device memory* (the routed
+    // experts' resident bank): no pack, no copy, three memory objects that wrap
+    // `dev_vals` ([N][K/2] u4), `dev_scale` and `dev_off` ([K/32][N] f16).  The
+    // caller owns the storage (one expert is a `plane`-byte slice of the bank,
+    // see the layout in common/w4.h); this only makes the store addressable by
+    // `gemm_w4`/`w4_planes`.  Returns false when the shape cannot be served.
+    bool add_weight_w4_dev(const void * key, const void * dev_vals, const void * dev_scale, const void * dev_off,
+                           int K, int N);
     bool has_weight_w4(const void * key) const;
     // the u4 store's device planes (values, per-(g,n) f16 step, per-(g,n) f16
     // offset).  For consumers that read single rows rather than run a GEMM - the
@@ -175,6 +192,10 @@ struct dnnl_gemm {
     // (device pointers), produced alongside the per-row form when a u4 weight
     // has been registered.
     const int8_t * act_grp_data(const act_view & v) const;
+    // The even/odd k split of the same quantized activation ([M][K/2] each, the
+    // M=1 u4 GEMV's operands).  False when the view is stale or was quantized
+    // without do_split.
+    bool act_split(const act_view & v, const int8_t ** even, const int8_t ** odd) const;
     const uint16_t * act_grp_scales(const act_view & v) const;
     const float * act_scales(const act_view & v) const;
     // Per-32-group f32 sum of the quantized activations ([M][K/32]): the XOR-bias

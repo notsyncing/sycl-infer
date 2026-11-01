@@ -939,6 +939,13 @@ auto moe_call = [&](size_t idx) {
             // tile, N=16 137.43 against **130.50**, N=32 193.32 against
             // **191.64**, and N=1 53.95 against **37.69** with a one-row tile.
             const bool dec_step = (mode == 0);
+            // The routed-expert u4 gate/up bank (PF_MOE_U4BANK): when this
+            // layer's gate/up live in the packed per-expert u4 bank, gate/up is
+            // the bank's own path (per-expert oneDNN u4 GEMM for a prefill, the
+            // M=1 u4 GEMV for a decode) and every raw gate/up kernel below -
+            // tiled, row-shaped, grouped, fp32 - must not run: the raw tensors
+            // were never uploaded.  Down is unaffected and keeps its raw path.
+            const bool u4_gu = !on_cpu && moe_u4_bank_ok(dev, moe_il) && !moe_host_split();
             // Per queue (this layer's device), env first then the card profile:
             // a heterogeneous --layer-map must not run card 0's dp4a choice on
             // card 1.  PF_MOE_DP4A / PF_MOE_DP4A_DEC remain the A/B overrides.
@@ -960,7 +967,7 @@ auto moe_call = [&](size_t idx) {
             // unless a projection has to fall back to the grouped kernel.
             const bool row_mode = dec_step && n_tok == 1 && grp_ok
                                   && si::dev::profile_flag(qq, "PF_MOE_ROW", mdp.moe.row_gemv != 0);
-            const bool row_gu = row_mode && (M.gate_exps.type == 12 || M.gate_exps.type == 13)
+            const bool row_gu = row_mode && !u4_gu && (M.gate_exps.type == 12 || M.gate_exps.type == 13)
                                 && M.up_exps.type == M.gate_exps.type;
             const bool row_dn = row_mode && (M.down_exps.type == 12 || M.down_exps.type == 13);
             // Prefill: the tiled fp32-SLM expert GEMM (BM=32 pairs, BN=512
@@ -980,7 +987,7 @@ auto moe_call = [&](size_t idx) {
             // (measured: a 16-token prompt is 0.84 s tiled vs 0.70 s grouped).
             const bool tiled_want = mode == 2 && grp_ok && !moe_host_split() && n_pairs >= 256
                                     && si::dev::profile_flag(qq, "PF_MOE_TILED", mdp.moe.tiled != 0);
-            const bool tiled_gu = tiled_want && M.gate_exps.type == 12 && M.up_exps.type == 12;
+            const bool tiled_gu = tiled_want && !u4_gu && M.gate_exps.type == 12 && M.up_exps.type == 12;
             const bool tiled_dn = tiled_want && (M.down_exps.type == 12 || M.down_exps.type == 13);
             if (!(row_gu && row_dn)) {
                 moe_csr_clear_launch(qq, d_moe_off, d_moe_cur, d_moe_active, d_moe_nact, hp.n_expert);
@@ -989,7 +996,8 @@ auto moe_call = [&](size_t idx) {
                 moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
             }
             mtimer.lap(2);
-            if (grp_ok) {
+            bool gu_done = u4_gu && moe_gate_up_u4(dev, moe_il, M, n_tok, n_pairs, mode);
+            if (grp_ok && !gu_done) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
                     moe_actq_launch(qq, d_xnorm, hp.n_embd, n_tok, hp.n_embd, A.xq, A.asa, A.xs);
                 bool tdone = false;
@@ -1019,7 +1027,7 @@ auto moe_call = [&](size_t idx) {
                                                     M.gate_exps.type, M.up_exps.type, dec_step);
                 }
             }
-            if (!grp_ok) {
+            if (!grp_ok && !gu_done) {
                 moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
                                   moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, d_xnorm, hp.n_embd,
                                   d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type, M.up_exps.type);
@@ -2558,11 +2566,80 @@ void engine::build_plans() {
     }
 }
 
+void engine::warm_bank_path() {
+    const auto t0 = std::chrono::steady_clock::now();
+    // ---- one ungraphed decode forward, to JIT the bank's kernels ----
+    bind_acts(0);
+    bind_moe_acts(0);
+    d_info->pc_active = 0;
+    d_info->n_rows = 1;
+    d_info->tpb = 1;
+    d_info->n_real = 1;
+    d_info->mrope_on = 0;
+    d_info->img_embd = nullptr;
+    for (int r = 0; r < kMaxB; r++) {
+        d_info->pos[r] = 0;
+        d_info->slot[r] = r % kMaxB;
+        d_info->active[r] = (r == 0) ? 1 : 0;
+        d_info->tokens[r] = 0;
+        d_info->n_real_row[r] = 1;
+    }
+    if (!plan_dec8_.segs.empty() && d_segs_dec8) {
+        record_forward(0, plan_dec8_, d_segs_dec8, 1);
+        sync_all();
+    }
+    // The warm pass advanced slot 0's recurrent state (and wrote KV block 0); a
+    // real request starts from zero, exactly like the recorded graphs assume.
+    zero_slot(0);
+
+    // ---- the u4 prefill primitives' first execute (oneDNN JITs on it) ----
+    // One warm per device that owns a banked layer: each partition has its own
+    // dnnl_gemm and its own primitive cache.
+    for (size_t d = 0; d < dnnl_dev_.size(); d++) {
+        dnnl_gemm * D = dnnl_dev_[d].get();
+        if (!D || d >= dev_kind_.size() || dev_kind_[d] != 0) {
+            continue;
+        }
+        int banked = -1;
+        for (int il = 0; il < m.hp.n_layer; il++) {
+            if (layer_dev_[(size_t)il] == (int)d && moe_u4_bank_[(size_t)il]) {
+                banked = il;
+                break;
+            }
+        }
+        if (banked < 0 || d >= moe_as_.size()) {
+            continue;
+        }
+        sycl::queue & qd = dev_queue((int)d);
+        const moe_t & M = m.layers[(size_t)banked].moe;
+        const auto & A = moe_as_[d];
+        const int K = m.hp.n_embd, N = m.hp.n_ff_exp;
+        const uint8_t * bg = (const uint8_t *)wptr((int)d, M.gate_exps.data);
+        const uint8_t * bu = (const uint8_t *)wptr((int)d, M.up_exps.data);
+        qd.memset(A.gather, 0, (size_t)64 * K * sizeof(float));
+        for (int Mt : {32, 64}) {
+            act_view v = D->quantize(A.gather, nullptr, K, K, Mt, K, /*do_split=*/false);
+            if (!v.valid() || !D->gemm_w4(v, bg, nullptr, 1.0f, Mt, K, A.gu, N) ||
+                !D->gemm_w4(v, bu, nullptr, 1.0f, Mt, K, A.gu + (size_t)Mt * N, N)) {
+                fprintf(stderr, "[moe] u4 bank warmup: prefill prim M=%d failed (dev %zu)\n", Mt, d);
+            }
+        }
+        qd.wait();
+    }
+    fprintf(stderr, "[moe] u4 bank warmup: %.2f s\n",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
 void engine::build_md_dec_graphs() {
     static const bool nog = si::env::flag("PF_NOGRAPH");
     if (!multi_dev || !(md_int8 || md_xmx) || !d_segs_dec8 || m.hp.n_layer <= 0 || nog) {
         return; // PF_NOGRAPH=1 keeps the direct replay (diagnostics/PF_PROF)
     }
+    // A banked layer's decode gate/up is `moe_u4_gemv_launch`: one kernel per
+    // projection that addresses the expert from its router id *inside* the
+    // kernel.  Nothing is read on the host, so the decode records like any
+    // other MoE layer.  (The PRE-FILL still uses the per-expert oneDNN GEMM,
+    // which cannot be captured; that path is the direct replay.)
     // Split the layer loop into contiguous device runs.  The embedding always
     // runs on the primary device and the output norm + head after the loop do
     // too, so the first phase carries the embedding and the last one the head.
@@ -2661,6 +2738,15 @@ void engine::build_md_verify_graphs() {
     const int rows = (dfl.dflash_on_ ? dfl.df_k_ : mtp.mtp_k) + 1;
     vf_dec_rows = rows;
     if (!mtp.d_segs_vf || nog || rows <= 0 || mtp.plan_vf_.segs.empty()) {
+        return;
+    }
+    if (moe_u4_any_ && m.hp.n_layer > 0) {
+        // A verify batch is mode 2, whose banked gate/up is the per-expert
+        // oneDNN u4 GEMM.  oneDNN owns its own stream and cannot be recorded
+        // (dnnl_capture_guard throws), so the verify keeps the direct replay.
+        // The DECODE's banked path is `moe_u4_gemv_launch`, pure SYCL kernels,
+        // and does record - see build_md_dec_graphs.
+        fprintf(stderr, "[md] verify command graphs: skipped (u4 expert bank prefill GEMM is oneDNN)\n");
         return;
     }
     // phase split: one graph per contiguous device run, the head on the primary
@@ -2778,6 +2864,9 @@ void engine::build_graphs() {
         build_plans();
         if (multi_dev) {
             build_md_dec_graphs();
+            if (moe_u4_any_) {
+                warm_bank_path();
+            }
         }
         if (mtp.mtp_on || dfl.dflash_on_) {
             build_md_verify_graphs();
