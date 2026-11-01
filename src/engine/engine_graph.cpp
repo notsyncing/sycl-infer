@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "device/device_profile.h"
+#include "backend/gpu/kernels/moe_tiled.h" // the tiled prefill expert GEMM
 #include "backend/cpu/cpu_types.h" // the cpu-partition MoE mirror
 
 #include <algorithm>
@@ -917,11 +918,6 @@ auto moe_call = [&](size_t idx) {
                 moe_calib_ids_[moe_il] = ids_h;
             }
             mtimer.lap(1);
-            moe_csr_clear_launch(qq, d_moe_off, d_moe_cur, d_moe_active, d_moe_nact, hp.n_expert);
-            moe_csr_count_launch(qq, d_moe_ids, n_pairs, d_moe_off);
-            moe_csr_prefix_launch(qq, d_moe_off, d_moe_active, d_moe_nact, hp.n_expert);
-            moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
-            mtimer.lap(2);
             // Grouped dp4a expert GEMM, opt-in (PF_MOE_DP4A=1): the same product
             // off the same GGUF blocks, with the activation int8-quantized per
             // 32-value group and the multiply in dp4a.  The fp32 dequant path
@@ -951,14 +947,77 @@ auto moe_call = [&](size_t idx) {
                                       ? si::dev::profile_flag(qq, "PF_MOE_DP4A_DEC", mdp.moe.dp4a_dec != 0)
                                       : si::dev::profile_flag(qq, "PF_MOE_DP4A", mdp.moe.dp4a != 0);
             bool grp_ok = grp_want && A.xq && !moe_host_split() && !on_cpu && (dec_step || n_tok >= moe_grp_min_tok);
+            // The row-shaped single-token expert GEMV (Xe2): one warp per
+            // (expert, output row), so the whole superblock's 128 weight bytes
+            // are one coalesced load.  It is only valid when every active expert
+            // has exactly one pair, i.e. a one-row decode; a batched decode keeps
+            // the grouped kernel's M-row tile, which reads a row's weights once
+            // for all of its pairs.  PF_MOE_ROW is the A/B over the profile value.
+            //
+            // It also consumes the router's `ids` DIRECTLY: a one-token decode's
+            // eight pairs are eight experts, so the CSR (clear/count/prefix/
+            // scatter, four launches per layer) has nothing to add and is skipped
+            // unless a projection has to fall back to the grouped kernel.
+            const bool row_mode = dec_step && n_tok == 1 && grp_ok
+                                  && si::dev::profile_flag(qq, "PF_MOE_ROW", mdp.moe.row_gemv != 0);
+            const bool row_gu = row_mode && (M.gate_exps.type == 12 || M.gate_exps.type == 13)
+                                && M.up_exps.type == M.gate_exps.type;
+            const bool row_dn = row_mode && (M.down_exps.type == 12 || M.down_exps.type == 13);
+            // Prefill: the tiled fp32-SLM expert GEMM (BM=32 pairs, BN=512
+            // columns, 1024-thread workgroup).  Measured 0.85 T-MAC/s against
+            // the grouped kernel's 0.27, and it reads the same native blocks;
+            // it declines on a card without a 1024-thread workgroup and 68 KB
+            // of SLM (so an A770 keeps the grouped path).  Q6_K-down layers and
+            // a pair count below one tile stay on the grouped kernel too.
+            // Measured on the 35B / Arc 140V: even a 100-token tail batch
+            // (~3 pairs/expert, so a 32-row tile is mostly padding) is faster
+            // on the tiled kernel, because its per-MAC cost is 3.1x lower and
+            // the padding is paid in MACs, not in weight reads.  So the only
+            // gate is "at least one tile" plus the launcher's own shape/type
+            // checks (a small A770 declines on SLM and keeps the grouped path).
+            // 256 pairs = 32 tokens: below that the 32-row tile is mostly
+            // padding and the grouped kernel wins the small absolute time
+            // (measured: a 16-token prompt is 0.84 s tiled vs 0.70 s grouped).
+            const bool tiled_want = mode == 2 && grp_ok && !moe_host_split() && n_pairs >= 256
+                                    && si::dev::profile_flag(qq, "PF_MOE_TILED", mdp.moe.tiled != 0);
+            const bool tiled_gu = tiled_want && M.gate_exps.type == 12 && M.up_exps.type == 12;
+            const bool tiled_dn = tiled_want && (M.down_exps.type == 12 || M.down_exps.type == 13);
+            if (!(row_gu && row_dn)) {
+                moe_csr_clear_launch(qq, d_moe_off, d_moe_cur, d_moe_active, d_moe_nact, hp.n_expert);
+                moe_csr_count_launch(qq, d_moe_ids, n_pairs, d_moe_off);
+                moe_csr_prefix_launch(qq, d_moe_off, d_moe_active, d_moe_nact, hp.n_expert);
+                moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
+            }
+            mtimer.lap(2);
             if (grp_ok) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
                     moe_actq_launch(qq, d_xnorm, hp.n_embd, n_tok, hp.n_embd, A.xq, A.asa, A.xs);
-                grp_ok = moe_grp_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
-                                                moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off,
-                                                d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq,
-                                                A.asa, A.xs, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
-                                                M.gate_exps.type, M.up_exps.type, dec_step);
+                bool tdone = false;
+                if (tiled_gu) {
+                    // gate into d_moe_h, then up reads that f32 gate back and
+                    // writes silu(g)*u in place (one element, one owner).
+                    tdone = moe_tiled_gemm_launch(qq, wptr(dev, M.gate_exps.data), moe_slot_gb[(size_t)moe_il], sm,
+                                                  d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq, A.asa,
+                                                  d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
+                                                  M.gate_exps.type, nullptr, n_pairs);
+                    if (tdone)
+                        tdone = moe_tiled_gemm_launch(qq, wptr(dev, M.up_exps.data), moe_slot_ub[(size_t)moe_il], sm,
+                                                      d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq,
+                                                      A.asa, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
+                                                      M.up_exps.type, d_moe_h, n_pairs);
+                }
+                if (!tdone && !(row_gu && moe_row_gemv_gate_up_launch(qq, wptr(dev, M.gate_exps.data),
+                                                            wptr(dev, M.up_exps.data), sm,
+                                                            moe_slot_gb[(size_t)moe_il],
+                                                            moe_slot_ub[(size_t)moe_il], d_moe_ids, n_pairs, A.xq,
+                                                            A.asa, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp,
+                                                            M.gate_exps.type, M.up_exps.type))) {
+                    grp_ok = moe_grp_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
+                                                    moe_slot_gb[(size_t)moe_il], moe_slot_ub[(size_t)moe_il], d_moe_off,
+                                                    d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq,
+                                                    A.asa, A.xs, d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k,
+                                                    M.gate_exps.type, M.up_exps.type, dec_step);
+                }
             }
             if (!grp_ok) {
                 moe_gate_up_launch(qq, wptr(dev, M.gate_exps.data), wptr(dev, M.up_exps.data), sm,
@@ -969,9 +1028,23 @@ auto moe_call = [&](size_t idx) {
             if (grp_ok) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
                     moe_actq_launch(qq, d_moe_h, hp.n_ff_exp, n_pairs, hp.n_ff_exp, A.xq, A.asa, A.xs);
-                grp_ok = moe_grp_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off,
-                                             d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq, A.asa,
-                                             A.xs, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type, dec_step);
+                bool tdone = false;
+                if (tiled_dn) {
+                    // top_k == 0: the down activation is indexed by the CSR
+                    // pair position (d_moe_h was quantized per pair row).
+                    tdone = moe_tiled_gemm_launch(qq, wptr(dev, M.down_exps.data), moe_slot_db[(size_t)moe_il], sm,
+                                                  d_moe_off, d_moe_pair, d_moe_active, d_moe_nact, n_act, A.xq, A.asa,
+                                                  d_moe_acc, hp.n_embd, hp.n_ff_exp, hp.n_embd, 0,
+                                                  M.down_exps.type, nullptr, n_pairs);
+                }
+                if (!tdone && !(row_dn && moe_row_gemv_down_launch(qq, wptr(dev, M.down_exps.data), sm,
+                                                          moe_slot_db[(size_t)moe_il], d_moe_ids, n_pairs, A.xq,
+                                                          A.asa, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp,
+                                                          M.down_exps.type))) {
+                    grp_ok = moe_grp_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off,
+                                                 d_moe_pair, d_moe_active, d_moe_nact, n_act, hp.n_expert, n_pairs, A.xq, A.asa,
+                                                 A.xs, d_moe_acc, hp.n_embd, hp.n_embd, hp.n_ff_exp, M.down_exps.type, dec_step);
+                }
             }
             if (!grp_ok) {
                 moe_down_launch(qq, wptr(dev, M.down_exps.data), sm, moe_slot_db[(size_t)moe_il], d_moe_off, d_moe_pair, d_moe_active,
@@ -1485,7 +1558,13 @@ auto moe_call = [&](size_t idx) {
                 const int8_t * aq = D->act_data(av);
                 const float * asc = D->act_scales(av);
                 bool decoded = false;
-                if (mode == 0 && aq && asc) {
+                // ONE ROW ONLY.  `i8_row_gemv_multi` is the single-token GEMV:
+                // it reads one activation row and writes one output row, so on a
+                // batched decode (tb >= 2) rows 1..N-1 - including d_logits row 1 -
+                // were never written and every sequence but row 0 sampled stale
+                // memory.  With tb >= 2 fall through to the two M-aware paths
+                // below (gemm_i8_group for M <= 13, per-segment gemm_w4/gemm).
+                if (tb == 1 && aq && asc) {
                     // all segments of the call share the activation row: one
                     // GEMV launch covers the whole call
                     bool all = true;

@@ -524,6 +524,19 @@ bool moe_grp_gate_up_launch(sycl::queue & q, const void * gbank, const void * ub
                             const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
                             int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * h, int h_stride,
                             int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype, bool dec);
+// The single-token decode's expert GEMV, row-shaped instead of group-shaped:
+// one warp per (expert, output row), 32 lanes covering a superblock's 128 weight
+// bytes as one coalesced access.  Declines unless every active expert has
+// exactly one pair (the M=1 decode) and the type has the 4-byte lane mapping
+// (Q4_K/Q5_K), in which case the caller falls back to the grouped path above.
+// A device profile's moe.row_gemv selects it (Xe2: yes; Xe-LP/HPG: no).
+bool moe_row_gemv_gate_up_launch(sycl::queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
+                                 size_t slot_gb, size_t slot_ub, const int32_t * ids, int n_pairs,
+                                 const int8_t * xq, const uint16_t * asa, float * h, int h_stride, int n_embd,
+                                 int n_ff_exp, uint32_t gtype, uint32_t utype);
+bool moe_row_gemv_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                              const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa,
+                              float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype);
 // down: [p_e, n_ff_exp] x [n_ff_exp, n_embd] per active expert.  Same contract.
 bool moe_grp_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                          const int32_t * off, const int32_t * pair, const int32_t * active, const int32_t * n_active,

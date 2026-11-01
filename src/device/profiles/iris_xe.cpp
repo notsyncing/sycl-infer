@@ -137,6 +137,8 @@ static const profile iris_xe = {
         .dp4a_dec = 1,
         .upload_ring = 32,
         .pf_wmin = 24,
+        .row_gemv = 0,
+        .tiled = 0,
     },
 };
 

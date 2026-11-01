@@ -120,6 +120,8 @@ static const profile arc_a770 = {
         .dp4a_dec = 1,
         .upload_ring = 32,
         .pf_wmin = 24,
+        .row_gemv = 0,
+        .tiled = 0,
     },
 };
 
@@ -128,6 +130,15 @@ static bool arc_a770_matches(const std::string & device_name) {
     // name as well means a future A750/A580 lands here rather than falling
     // through -- which is deliberate, because it is the same DG2 part, and the
     // alternative is silently inheriting someone else's tuning.
+    // The SKU-less Xe2 name ("Intel(R) Arc(TM) Graphics") must NOT land here:
+    // it is a different microarchitecture with its own row (arc_140v) and a
+    // quarter of the bandwidth, so inheriting these values would be silently
+    // wrong rather than merely conservative.
+    if (device_name.find("Arc(TM) Graphics") != std::string::npos ||
+        device_name.find("Arc(R) Graphics") != std::string::npos ||
+        device_name.find("Arc Graphics") != std::string::npos) {
+        return false;
+    }
     return device_name.find("Arc") != std::string::npos ||
            device_name.find("A770") != std::string::npos;
 }

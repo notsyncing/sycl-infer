@@ -3019,12 +3019,32 @@ void engine::prefill_text(const std::vector<int> & toks, int slot, int n, int st
     }
     int pos = start;
     const int end = start + n;
+    // Split the prompt into EQUAL mode-2 batches instead of greedy
+    // min(rem, 1024).  3213 tokens used to become 1024/1024/1024/141, and a
+    // 141-token batch still touches almost every expert - it pays one full
+    // expert-bank pass for 1/7 of the pairs (measured 0.122 T-MAC/s against
+    // 0.477 for the full batch).  Only the direct-replay backends can take a
+    // partial last row, so the recorded-variant / md_int8 paths keep the old
+    // rule.
+    const bool direct_pf = use_dnnl || (multi_dev && dnnl_any_dev());
+    const int maxfit = kMaxB * kMaxT;
+    int nb_left = direct_pf ? (n + maxfit - 1) / maxfit : 0;
     while (pos < end) {
         const int rem = end - pos;
-        const int fit = cpu_mode ? 0 : batched_prefill_fit(rem);
+        int fit = cpu_mode ? 0 : batched_prefill_fit(rem);
+        if (direct_pf && nb_left > 0) {
+            int even = (rem + nb_left - 1) / nb_left;
+            if (even > maxfit) {
+                even = maxfit;
+            }
+            fit = even;
+        }
         if (fit >= 1 && fit <= rem) {
             prefill_batch(toks, pos, fit, slot, pos);
             pos += fit;
+            if (nb_left > 0) {
+                nb_left--;
+            }
         } else {
             const int c = std::min<int>(kMaxT, rem);
             prefill_chunk(toks, pos, c, slot);

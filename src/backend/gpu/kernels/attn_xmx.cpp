@@ -395,6 +395,18 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
     // kernel lambda cannot capture a runtime-initialised global
     const int nslice = gather_red(q);
     float * part = bs + 2;         // [2 * gather_red_max(q)] partials, past bs[0..1]
+    // The slice maxima are now an ATOMIC max, not a plain store: all 64 lanes
+    // of a slice's work-group used to execute `part[s] = km`, so the value was
+    // whichever lane won the race.  Measured consequence: the K/V block scale
+    // came out 72-86 % of the true block max and changed run to run, which both
+    // clamped the top ~20 % of K/V and is the real source of the documented
+    // prefill nondeterminism (the oneDNN matmul was blamed).  Non-negative
+    // floats order like their int bit patterns, so an int fetch_max is exact.
+    q.submit([&](sycl::handler & h) {
+        h.parallel_for(sycl::range<1>((size_t)2 * nslice), [=](sycl::id<1> i) {
+            reinterpret_cast<int *>(part)[i[0]] = 0;
+        });
+    });
     q.submit([&](sycl::handler & h) {
         h.parallel_for(nd_range<1>((size_t)nslice * 64, 64), [=](nd_item<1> it) {
             const int s = it.get_group(0);
@@ -446,8 +458,16 @@ static void xmx_gather(queue & q, const int8_t * kp_base, const int8_t * vp_base
                 km = sycl::fmax(sycl::fmax(acc[0], acc[1]), sycl::fmax(acc[2], acc[3]));
                 vm = sycl::fmax(sycl::fmax(vacc[0], vacc[1]), sycl::fmax(vacc[2], vacc[3]));
             }
-            part[s] = km;             // slice-private slot, no atomic needed
-            part[nslice + s] = vm;
+            {
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>
+                    ak(reinterpret_cast<int *>(part)[s]);
+                ak.fetch_max(*reinterpret_cast<const int *>(&km));
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>
+                    av(reinterpret_cast<int *>(part)[nslice + s]);
+                av.fetch_max(*reinterpret_cast<const int *>(&vm));
+            }
         });
     });
     // stage 2: fold the slices into the two block scales (nslice <= 64 floats)

@@ -69,7 +69,7 @@ static void expect_int(const char * what, int got, int want) {
 // They are pinned here for the same reason the split/shape groups are pinned in
 // the card files: a field that silently keeps a literal at its use site reads
 // as "the profile decided", and a card that omits one gets the compiler's zero.
-static void profile_values(const char * who, const dev::profile & p) {
+static void profile_values(const char * who, const dev::profile & p, int row_gemv = 0, int tiled = 0) {
     expect_int((std::string(who) + " moe.cfg_gate").c_str(), p.moe.cfg_gate, 43);
     expect_int((std::string(who) + " moe.cfg_down").c_str(), p.moe.cfg_down, 43);
     // 0 is the measured value: "auto" picks one row per expert for a
@@ -81,6 +81,8 @@ static void profile_values(const char * who, const dev::profile & p) {
     expect_int((std::string(who) + " moe.dp4a_dec").c_str(), p.moe.dp4a_dec, 1);
     expect_int((std::string(who) + " moe.upload_ring").c_str(), p.moe.upload_ring, 32);
     expect_int((std::string(who) + " moe.pf_wmin").c_str(), p.moe.pf_wmin, 24);
+    expect_int((std::string(who) + " moe.row_gemv").c_str(), p.moe.row_gemv, row_gemv);
+    expect_int((std::string(who) + " moe.tiled").c_str(), p.moe.tiled, tiled);
     expect_int((std::string(who) + " shape.w4_rows_per_wg").c_str(), p.shape.w4_rows_per_wg, 16);
     expect_int((std::string(who) + " shape.q8_rows").c_str(), p.shape.q8_rows, 512);
     expect_int((std::string(who) + " shape.f32_rows").c_str(), p.shape.f32_rows, 128);
@@ -104,12 +106,19 @@ int main() {
     // The names the two shipped profiles match.
     const std::string a770 = "Intel(R) Arc(TM) A770 Graphics";
     const std::string iris = "Intel(R) Iris(R) Xe Graphics";
+    // Lunar Lake reports no SKU.  This name must NOT resolve to arc_a770: the
+    // A770 matcher matches any "Arc", and a SKU-less Xe2 part is a different
+    // microarchitecture with a quarter of the bandwidth.
+    const std::string arc140v = "Intel(R) Arc(TM) Graphics";
 
     homogeneous("empty list", {}, "");
     homogeneous("one A770", {a770}, "arc_a770");
     homogeneous("two identical A770s", {a770, a770}, "arc_a770");
     homogeneous("three identical A770s", {a770, a770, a770}, "arc_a770");
     homogeneous("two Iris Xe", {iris, iris}, "iris_xe");
+    homogeneous("one Arc 140V", {arc140v}, "arc_140v");
+    heterogeneous("A770 + Arc 140V", {a770, arc140v}, "arc_a770", "arc_140v");
+    heterogeneous("Iris Xe + Arc 140V", {iris, arc140v}, "iris_xe", "arc_140v");
 
     // The case that matters: the two shipped cards have different work-group
     // limits (1024 vs 512), so a split across them cannot be launched safely.
@@ -129,6 +138,9 @@ int main() {
     // provenance; the values still have to be present and identical, because a
     // missing field is a zero tile, not "unmeasured".
     profile_values("iris_xe", dev::for_name(iris));
+    // Xe2 is the one card that turns the warp-per-row expert GEMV on; every
+    // other field is inherited, so it must still agree.
+    profile_values("arc_140v", dev::for_name(arc140v), 1, 1);
     // The unclaimed card is a copy of the A770 row, new fields included.
     profile_values("unknown", dev::unknown_profile());
     // ...with its hardware facts zeroed, so a derived quantity cannot look

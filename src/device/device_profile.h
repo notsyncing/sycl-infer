@@ -203,6 +203,8 @@ struct profile {
         int dp4a_dec;    // PF_MOE_DP4A_DEC: the same on a decode step
         int upload_ring; // qwen4exp expert-upload staging ring, slots/device
         int pf_wmin;     // qwen4exp two-pass prefill minimum workspace
+        int row_gemv;    // PF_MOE_XE2: warp-per-row single-token expert GEMV
+        int tiled;       // PF_MOE_TILED: tiled fp32-SLM prefill expert GEMM
     } moe;
 };
 

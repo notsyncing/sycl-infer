@@ -21,10 +21,12 @@ namespace si::dev {
 // row here.  Order is match order, first match wins.
 extern const device_entry arc_a770_device; // src/device/profiles/arc_a770.cpp
 extern const device_entry iris_xe_device;  // src/device/profiles/iris_xe.cpp
+extern const device_entry arc_140v_device; // src/device/profiles/arc_140v.cpp
 
 const device_entry *const kDevices[] = {
     &arc_a770_device,
     &iris_xe_device,
+    &arc_140v_device,
 };
 const int kNumDevices = (int)(sizeof(kDevices) / sizeof(kDevices[0]));
 

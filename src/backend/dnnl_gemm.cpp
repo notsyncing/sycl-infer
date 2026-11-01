@@ -96,8 +96,8 @@ void act_quant_launch(sycl::queue & q, const float * x, const float * up, int x_
 // scale per row.  This is what removes the dominant quantization error: with a
 // per-row scale the activation error (~0.9%) swamped the 4-bit weight error.
 void act_quant_grp_launch(sycl::queue & q, const float * x, const float * up, int x_stride, int up_stride, int8_t * xq,
-                          uint16_t * sasc, float * xs, int8_t * axe, int8_t * axo, bool do_split, int M, int K,
-                          int64_t * sumq, int64_t * sums, int slot) {
+                          uint16_t * sasc, float * xs, uint16_t * xsr, int8_t * axe, int8_t * axo, bool do_split,
+                          int M, int K, int64_t * sumq, int64_t * sums, int slot) {
     const int ng = K / kW4Group;
     const size_t kh = (size_t)K / 2;
     // One 32-lane workgroup per (row, group): each lane owns exactly one value,
@@ -166,12 +166,24 @@ void act_quant_grp_launch(sycl::queue & q, const float * x, const float * up, in
                 as.fetch_add((int64_t)bits);
             }
         }
-        if (xs) {
+        if (xs || xsr) {
             // a sub-group collective, so every lane must execute it (a divergent
             // call is UB and produced garbage xs - the u4 correction term)
             const int s = sycl::reduce_over_group(it.get_sub_group(), (int)q8, sycl::plus<int>());
             if (lane == 0) {
-                xs[(size_t)m * ng + g] = (float)s;
+                if (xs) {
+                    xs[(size_t)m * ng + g] = (float)s;
+                }
+                if (xsr) {
+                    // PF_W4_CORR_GEMM: the correction matmul's left operand.  A
+                    // group's dequantized activation sum is sum_k x[m][k] =
+                    // sum(q8) * scale = xs * sa, so this is exactly the product
+                    // w4_epilogue_launch forms per (m,g) - using the *stored*
+                    // f16 scale, which is what that kernel reads too.  Stored as
+                    // f16 (the operand type), an ulp of a group of <= 127*32.
+                    const float scf = (float)sycl::half(sc);
+                    xsr[(size_t)m * ng + g] = sycl::bit_cast<uint16_t>(sycl::half((float)s * scf));
+                }
             }
         }
     });
@@ -181,6 +193,26 @@ static inline float w4_f16_bits(uint16_t v) {
     sycl::half h;
     __builtin_memcpy((void *)&h, &v, sizeof(h));
     return (float)h;
+}
+
+// PF_W4_CORR_GEMM (default 1): run the u4 offset correction
+//   corr[m][n] = sum_g off[g][n] * (xs[m][g] * sa[m][g])
+// as a second oneDNN matmul  [M, K/32] f16 x [K/32, N] f16 --sum--> [M, N] f32
+// instead of w4_epilogue_launch's scalar loop over g.  That loop was 73 % of
+// the u4 prefill path (419 ms/chunk against 108 for the raw u4 matmul) because
+// the correction is a rank-(K/32) GEMM being run one multiply-add at a time;
+// the matmul version measures 164 ms/chunk on the same shapes.  The `off` plane
+// is already [ng][N] f16 and `src[m][g]` is produced by the same
+// act_quant_grp_launch that produces xs/asa, so this costs no extra launch and
+// no extra weight traffic.  M == 1 never reaches here (decode is the u4 GEMV),
+// so the decode path is untouched; any shape whose correction primitive does
+// not validate keeps the scalar epilogue.
+static bool w4_corr_gemm_env() {
+    static const bool on = [] {
+        const char * e = si::env::str("PF_W4_CORR_GEMM");
+        return !(e && atoi(e) == 0);
+    }();
+    return on;
 }
 
 // out[m][n] = alpha*sx[m]*(acc4[m][n] + sum_g off[g][n]*xs[m][g]) + residual
@@ -528,6 +560,10 @@ struct dnnl_gemm::impl {
     // 4-bit path: f32 matmul output [M][N] and the per-group activation sums
     float * accf = nullptr;
     float * xs = nullptr; // [M][K/32]
+    // PF_W4_CORR_GEMM: f16 left operand of the correction matmul, [M][K/32].
+    // xsr[m][g] = xs[m][g]*sa[m][g], written by the same act_quant_grp_launch
+    // as xs/asa (lane 0 only, so the u4 path pays no extra launch).
+    uint16_t * corrsrc = nullptr;
     int8_t * axg = nullptr;    // per-32-group quantized activations [M][K]
     uint16_t * asa = nullptr;  // their per-(m,g) f16 scales, [M][K/32]
     int8_t * axe = nullptr;    // even/odd k split of axg, for the u4 decode GEMV
@@ -567,6 +603,11 @@ struct dnnl_gemm::impl {
         uint16_t * scales = nullptr;
         uint16_t * off = nullptr;
         memory wmem, scmem;
+        // PF_W4_CORR_GEMM: the same `off` plane as the {ng,N} f16 B operand of
+        // the correction matmul.  One wrapper per weight entry (the layout is
+        // fixed by the entry's K,N), so the execute path allocates nothing.
+        memory offmem;
+        bool offmem_ok = false;
         bool ok = false;
     };
     std::unordered_map<const void *, w4_entry> w4weights;
@@ -683,6 +724,19 @@ struct dnnl_gemm::impl {
     struct prim4_entry {
         matmul prim;
         memory src, dst, sscales;
+        // PF_W4_CORR_GEMM: the correction matmul for the same (M, K, N), cached
+        // with it.  `cok` is false when oneDNN will not validate the f16
+        // correction shape (or M == 1, where the old epilogue is kept); the
+        // execute then falls back to w4_epilogue_launch.
+        matmul cprim;
+        bool cok = false;
+        memory csrc, cdst;
+        // The same correction with the residual folded in as a binary post-op
+        // and the sum post-op last (dst += corr + residual).  Created lazily -
+        // only the shapes that actually carry a residual pay for it - and only
+        // usable when out is the compact [M][N] f32 layout.
+        matmul rprim;
+        bool rcok = false, rfails = false;
     };
     std::unordered_map<uint64_t, prim4_entry> prims4;
 
@@ -774,6 +828,34 @@ struct dnnl_gemm::impl {
         e.sscales = sycl_interop::make_memory(
             memory::desc({M, K / kW4Group}, memory::data_type::f16, memory::format_tag::ab), eng,
             sycl_interop::memory_kind::usm, (void *)asa);
+        // PF_W4_CORR_GEMM: the offset-correction matmul for this same shape.
+        // f16 src is the [M][ng] group-sum-times-scale plane, f16 B is the
+        // weight's own off plane (bound at execute time, per weight), and the
+        // sum post-op accumulates into accf - the u4 matmul's destination -
+        // so the whole correction needs no [M][N] scratch.  M == 1 is the
+        // decode GEMV's shape, so it never gets one (keeps that path identical).
+        if (M > 1 && w4_corr_gemm_env() && corrsrc) {
+            const int ng = K / kW4Group;
+            auto xc = memory::desc({M, ng}, memory::data_type::f16, memory::format_tag::ab);
+            auto wc = memory::desc({ng, N}, memory::data_type::f16, memory::format_tag::ab);
+            primitive_attr cattr;
+            post_ops cop;
+            cop.append_sum(1.0f); // dst := 1*(dst - 0) + op(...) = accf + corr
+            cattr.set_post_ops(cop);
+            try {
+                e.cprim = matmul(matmul::primitive_desc(eng, xc, wc, dmd, cattr));
+                e.csrc = sycl_interop::make_memory(xc, eng, sycl_interop::memory_kind::usm, (void *)corrsrc);
+                e.cdst = sycl_interop::make_memory(dmd, eng, sycl_interop::memory_kind::usm, (void *)accf);
+                e.cok = true;
+            } catch (const std::exception & ex) {
+                static bool once = true;
+                if (once) {
+                    once = false;
+                    fprintf(stderr, "[dnnl] w4 correction prim M=%d ng=%d N=%d failed, using the scalar epilogue: %s\n",
+                            M, ng, N, ex.what());
+                }
+            }
+        }
         auto ins = prims4.emplace(pkey(M, K, N), std::move(e));
         return &ins.first->second;
     }
@@ -845,6 +927,8 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     // per-group activation sums (K/32 per row, at most 1024)
     p->accf = p->dev_alloc<float>(p->acc_cap);
     p->xs = p->dev_alloc<float>((size_t)p->cap_M * (p->cap_K / kW4Group));
+    // PF_W4_CORR_GEMM's f16 source: M*K/32 elements, at most 1024*1024 = 2 MiB
+    p->corrsrc = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group));
     p->axg = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K);
     p->asa = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group));
     p->axe = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K / 2);
@@ -856,7 +940,8 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     if (acc_sum_env()) {
         p->accsum = p->dev_alloc<int64_t>(impl::kAccSlots);
     }
-    if (!p->ax || !p->axs || !p->acc || !p->accf || !p->xs || !p->axg || !p->asa || !p->axe || !p->axo) {
+    if (!p->ax || !p->axs || !p->acc || !p->accf || !p->xs || !p->corrsrc || !p->axg || !p->asa || !p->axe
+        || !p->axo) {
         throw std::runtime_error("dnnl scratch alloc failed");
     }
 }
@@ -1257,6 +1342,12 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     e.scmem =
         sycl_interop::make_memory(memory::desc({1, ng * N}, memory::data_type::f16, memory::format_tag::ab), p->eng,
                                   sycl_interop::memory_kind::usm, (void *)e.scales);
+    // PF_W4_CORR_GEMM: the same off plane as the [ng][N] f16 B operand of the
+    // correction matmul.  Wrapped once here, so a GEMM execute only rebinds the
+    // pointer's memory object into the cached primitive.
+    e.offmem = sycl_interop::make_memory(memory::desc({ng, N}, memory::data_type::f16, memory::format_tag::ab),
+                                         p->eng, sycl_interop::memory_kind::usm, (void *)e.off);
+    e.offmem_ok = e.offmem.get(true) != nullptr;
 
     // Eagerly create the prefill primitives (same M ladder as add_weight): if no
     // shape can run on this GPU the tensor is marked unsupported and the engine
@@ -1505,8 +1596,8 @@ int dnnl_gemm::warmup() {
     if (dx && dsw && dout) {
         act_quant_launch(p->q, dx, nullptr, WK, WK, p->ax, p->axs, p->axsum, WM, WK);
         p->actq_note(WM, WK, nullptr);
-    act_quant_grp_launch(p->q, dx, nullptr, WK, WK, p->axg, p->asa, p->xs, p->axe, p->axo, true, WM, WK, p->actsum_q,
-                         p->actsum_s, p->actq_slot());
+    act_quant_grp_launch(p->q, dx, nullptr, WK, WK, p->axg, p->asa, p->xs, p->corrsrc, p->axe, p->axo, true, WM, WK,
+                         p->actsum_q, p->actsum_s, p->actq_slot());
         epilogue_f32_launch(p->q, p->accf, dout, WN, nullptr, 1.f, WM, WN);
         p->q.wait();
     }
@@ -1551,8 +1642,8 @@ act_view dnnl_gemm::quantize(const float * x, const float * up, int x_stride, in
     // prefill epilogue) and, for decode, the even/odd k split the u4 GEMV
     // reads, so no separate view kernels are needed.
     p->actq_note(M, K, nullptr); // quantize() has no weight key; (M,K) is periodic per layer
-    act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, p->xs, p->axe, p->axo, do_split, M, K,
-                         p->actsum_q, p->actsum_s, p->actq_slot());
+    act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, p->xs, p->corrsrc, p->axe, p->axo,
+                         do_split, M, K, p->actsum_q, p->actsum_s, p->actq_slot());
     p->cur_M = M;
     p->cur_K = K;
     p->acts_valid = true;
@@ -1888,13 +1979,69 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
         }
     }
     impl::prim4_entry & pe = pit->second;
+    const int N = w.N;
+    const int ng = K / kW4Group;
+    // PF_W4_NOCORR: bisection knob - drop the offset (zero-point) correction and
+    // keep only the oneDNN step-scaled matmul, to tell which half is wrong.
+    static const bool nocorr = [] {
+        const char * e = si::env::str("PF_W4_NOCORR");
+        return e && atoi(e) != 0;
+    }();
+    // PF_W4_CORR_GEMM: the off-plane correction runs as a second oneDNN matmul
+    // whose sum post-op accumulates into the same dst as the u4 matmul.
+    const bool corr_gemm = !nocorr && w4_corr_gemm_env() && pe.cok && w.offmem_ok;
+    // Without a residual (and with alpha == 1) the sum post-op already leaves
+    // the finished result in the destination, so the remaining "epilogue" would
+    // be a plain f32 copy: let the u4 matmul write `out` itself and the copy
+    // disappears (that is the 2-gemm number the dense lab measures).  The same
+    // shortcut applies with a residual by folding it into the correction as a
+    // binary add post-op.  Both need `out` (and the residual) to be the compact
+    // [M][N] f32 layout the primitive's dst descriptor expects (out_stride == N)
+    // and USM pointers oneDNN may load from (64 B); otherwise the accf +
+    // epilogue path below is kept.
+    const bool compact_out = out != nullptr && out_stride == N && ((uintptr_t)out % 64) == 0;
+    const bool compact_res = residual != nullptr && ((uintptr_t)residual % 64) == 0;
+    const bool alpha1 = alpha == 1.0f;
+    bool res_fuse = false;
+    if (corr_gemm && alpha1 && compact_out && compact_res) {
+        if (!pe.rcok && !pe.rfails) {
+            try {
+                auto xc = memory::desc({M, ng}, memory::data_type::f16, memory::format_tag::ab);
+                auto wc = memory::desc({ng, N}, memory::data_type::f16, memory::format_tag::ab);
+                primitive_attr rattr;
+                post_ops rop;
+                // binary add first, sum last - both are additions, so their
+                // order (and thus the fp association) is the only difference
+                // from the old (acc + corr) + residual.
+                rop.append_binary(algorithm::binary_add, pe.dst.get_desc());
+                rop.append_sum(1.0f);
+                rattr.set_post_ops(rop);
+                pe.rprim = matmul(matmul::primitive_desc(p->eng, xc, wc, pe.dst.get_desc(), rattr));
+                pe.rcok = true;
+            } catch (const std::exception & ex) {
+                pe.rfails = true;
+                static bool once = true;
+                if (once) {
+                    once = false;
+                    fprintf(stderr, "[dnnl] w4 residual-fused correction M=%d ng=%d N=%d failed: %s\n", M, ng, N,
+                            ex.what());
+                }
+            }
+        }
+        res_fuse = pe.rcok;
+    }
+    const bool direct = corr_gemm && residual == nullptr && alpha1 && compact_out;
+    memory dst_m = pe.dst;
+    if (direct || res_fuse) {
+        dst_m = sycl_interop::make_memory(pe.dst.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)out);
+    }
     dnnl_capture_guard();
     if (dnnl_qwait_env()) {
         p->q.wait();
     }
     pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                             {DNNL_ARG_WEIGHTS, w.wmem},
-                            {DNNL_ARG_DST, pe.dst},
+                            {DNNL_ARG_DST, dst_m},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe.sscales}});
     if (acc_sum_env() && p->accsum && p->accsum_n < impl::kAccSlots) {
@@ -1912,14 +2059,30 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
         // shows is not a valid arbiter.  Both domains, one arm.
         p->st.wait();
     }
-    const int N = w.N;
-    const int ng = K / kW4Group;
-    // PF_W4_NOCORR: bisection knob - drop the offset (zero-point) correction and
-    // keep only the oneDNN step-scaled matmul, to tell which half is wrong.
-    static const bool nocorr = [] {
-        const char * e = si::env::str("PF_W4_NOCORR");
-        return e && atoi(e) != 0;
-    }();
+    if (corr_gemm) {
+        // PF_W4_CORR_GEMM: dst = u4 matmul (step-scaled) + off^T * (xs*sa),
+        // the correction accumulated by oneDNN's sum post-op.  The source plane
+        // (p->corrsrc) was written by the quantizer that produced xs/asa, so no
+        // kernel and no [M][N] scratch is added.  In the non-direct case `dst`
+        // is accf and the remaining pass is alpha/residual (the same one pass
+        // the old epilogue did); in the direct case `dst` is `out` and there is
+        // nothing left to run.
+        dnnl_capture_guard();
+        if (res_fuse) {
+            memory rmem = sycl_interop::make_memory(pe.dst.get_desc(), p->eng, sycl_interop::memory_kind::usm,
+                                                    (void *)const_cast<float *>(residual));
+            pe.rprim.execute(p->st, {{DNNL_ARG_SRC, pe.csrc},
+                                     {DNNL_ARG_WEIGHTS, w.offmem},
+                                     {DNNL_ARG_DST, dst_m},
+                                     {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, rmem}});
+            return true;
+        }
+        pe.cprim.execute(p->st, {{DNNL_ARG_SRC, pe.csrc}, {DNNL_ARG_WEIGHTS, w.offmem}, {DNNL_ARG_DST, dst_m}});
+        if (!direct) {
+            epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, N);
+        }
+        return true;
+    }
     // xs was produced by quantize() (same launch as the grouped activation)
     w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : w.off, p->asa, out, out_stride, residual, alpha, M, N,
                        ng);

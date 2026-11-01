@@ -1435,8 +1435,13 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
                     const int gt = i - m * kt;
                     int8_t * dst = act_p + ((size_t)m * KT + gt) * APAD;
                     if constexpr (DIRECT == 1) {
-                        asa_p[i] = asa[(size_t)m * ng + (g0 + gt)];
-                        xs_p[i] = xs[(size_t)m * ng + (g0 + gt)];
+                        // The compute below reads asa_p[m * KT + gt], so the
+                        // staging must use KT even when this chunk is short
+                        // (kt < KT, i.e. ng % KT != 0).  Writing at
+                        // m*kt+gt made every row but 0 read another row's
+                        // scales; K=512/640 hit it, K%1024==0 did not.
+                        asa_p[(size_t)m * KT + gt] = asa[(size_t)m * ng + (g0 + gt)];
+                        xs_p[(size_t)m * KT + gt] = xs[(size_t)m * ng + (g0 + gt)];
                         continue;
                     }
                     if constexpr (FMT <= 1) {
@@ -1462,8 +1467,8 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
                             }
                         }
                     }
-                    asa_p[i] = asa[(size_t)m * ng + (g0 + gt)];
-                    xs_p[i] = xs[(size_t)m * ng + (g0 + gt)];
+                    asa_p[(size_t)m * KT + gt] = asa[(size_t)m * ng + (g0 + gt)];
+                    xs_p[(size_t)m * KT + gt] = xs[(size_t)m * ng + (g0 + gt)];
                 }
                 if constexpr (VECST == 1) {
                     for (int i = lid * 8; i < kt * RB; i += TX * 8) {
@@ -1862,6 +1867,21 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
                      const float * xs, float * out, int out_stride, const float * residual, float alpha, int M, int K,
                      int N) {
     if (M < 2 || M > 13 || (K % 32) != 0) {
+        return false;
+    }
+    // The kernel is instantiated with reqd_sub_group_size(8).  Xe2 (Arc 140V)
+    // reports only {16, 32}: launching it throws from the runtime, and the
+    // same call is the batched-decode/verify GEMM, so decline and let the
+    // caller use the M-aware oneDNN primitive instead of dying.
+    static const bool sg8 = [&] {
+        for (auto n : q.get_device().get_info<sycl::info::device::sub_group_sizes>()) {
+            if (n == 8) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if (!sg8) {
         return false;
     }
     // PF_NAT=0 disables the batched native GEMM everywhere (fall back to the

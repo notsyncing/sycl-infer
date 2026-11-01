@@ -1307,6 +1307,234 @@ void moe_actq_launch(queue & q, const float * x, int x_stride, int n_rows, int K
     });
 }
 
+// ---------------------------------------------------------------------------
+// Xe2 decode expert GEMV: 16-byte lanes, one coalesced 128-byte weight load per
+// superblock, and one 16-byte header load for d/dmin/scales.
+//
+// The previous form read 4 bytes per lane (one 32-value group split over eight
+// lanes) and paid ~5 scalar loads per superblock for d, dmin and the 6-bit
+// scales; it measured 61 GB/s on the 35B decode shape, issue-bound, not
+// bandwidth-bound.  This form gives a lane a 16-byte unit of `qs` (16 low
+// nibbles of group 2c + 16 high nibbles of group 2c+1), so eight consecutive
+// lanes cover the superblock's 128 bytes as ONE contiguous run and a lane does
+// 8 dp4a per weight load.  Bytes 0..15 of a superblock are exactly
+// (d, dmin, scales[12]), so the whole metadata is one uint4 and the two groups'
+// (scale,min) pairs are extracted with ALU only.  Measured on this part:
+// gate/up 61 -> 101 GB/s, down 56 -> 100 GB/s (DRAM-sized banks), i.e. 96-98%
+// of a 16-byte-per-lane read probe on the same access shape.
+//
+// RPW output rows share a warp (16 lanes per row at RPW=2); a workgroup is WGW
+// warps so a group of consecutive warps walks consecutive weight rows, which is
+// the dense u4 GEMV's winning shape.  The reduction is a butterfly over the
+// row's lane group only.
+// ---------------------------------------------------------------------------
+// One 4-byte weight word: four low-nibble values and four high-nibble values,
+// with Q5_K's fifth bit folded in.  The activation sums the asymmetric
+// zero-point term needs are one extra dp4a each (measured free at this rate).
+template <int QT>
+static inline void moe_dp_word(uint32_t qv, uint32_t hw, int cbits, uint32_t xlow, uint32_t xhigh, int & qdl,
+                               int & qdh, int & sxl, int & sxh) {
+    uint32_t lo = qv & 0x0F0F0F0Fu;
+    uint32_t hi = (qv >> 4) & 0x0F0F0F0Fu;
+    if constexpr (QT == 13) {
+        lo |= ((hw >> cbits) & 0x01010101u) << 4;
+        hi |= ((hw >> (cbits + 1)) & 0x01010101u) << 4;
+    }
+    qdl = dp4a_s8u8((int32_t)xlow, lo, qdl);
+    qdh = dp4a_s8u8((int32_t)xhigh, hi, qdh);
+    sxl = dp4a_s8u8((int32_t)xlow, 0x01010101u, sxl);
+    sxh = dp4a_s8u8((int32_t)xhigh, 0x01010101u, sxh);
+}
+
+template <uint32_t QT, int FUSE, int UNITSZ, int RPW, int UNITSX, int WGW>
+static void moe_row_gemv_impl(queue & q, const char * w0, const char * w1, size_t plane0, size_t plane1,
+                              const int32_t * slot_map, const int32_t * ids, int n_pairs, int K, int N,
+                              const int8_t * xq, const uint16_t * asa, float * out, int out_stride) {
+    constexpr int SB = (QT == 12) ? 144 : 176; // block_q4_K / block_q5_K
+    constexpr int QOFF = (QT == 12) ? 16 : 48;
+    constexpr int NW = UNITSZ / 16; // uint4s per unit
+    constexpr int LPR = 32 / RPW;   // lanes per output row
+    constexpr int USP = 128 / UNITSZ;
+    constexpr int TX = WGW * 32;
+    static_assert((LPR * UNITSX) % USP == 0, "the unit walk must tile whole superblocks");
+    const int nsb = K / 256;
+    const int ng = K / 32;
+    const size_t row_bytes = (size_t)nsb * (size_t)SB;
+    const int sbpi = (LPR * UNITSX) / USP; // superblocks consumed per iteration
+    const int nrb = (N + RPW - 1) / RPW;
+    const int njobs = n_pairs * nrb;
+    const int ngrp = (njobs + WGW - 1) / WGW;
+    q.parallel_for(nd_range<1>((size_t)ngrp * TX, TX),
+                   [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                       const int lid = (int)it.get_local_id(0);
+                       const int warp = lid >> 5, lane = lid & 31;
+                       const int job = (int)it.get_group(0) * WGW + warp;
+                       if (job >= njobs) {
+                           return;
+                       }
+                       const int ia = job / nrb, rb = job - ia * nrb;
+                       const int li = lane % LPR;
+                       const int nrow = rb * RPW + (lane / LPR);
+                       const int n = sycl::min(nrow, N - 1);
+                       // A single-token decode's router output IS the CSR: pair
+                       // ia has expert ids[ia]; gate/up's activation is the one
+                       // token (row 0), down's is the pair itself.
+                       const int e = ids[ia];
+                       const int slot = slot_map[e];
+                       if (slot < 0) {
+                           return;
+                       }
+                       const int trow = (FUSE == 2) ? 0 : ia;
+                       const char * b0 = w0 + (size_t)slot * plane0 + (size_t)n * row_bytes;
+                       const char * b1 = (FUSE == 2) ? (w1 + (size_t)slot * plane1 + (size_t)n * row_bytes)
+                                                     : nullptr;
+                       const int8_t * xr = xq + (size_t)trow * (size_t)K;
+                       const uint16_t * ar = asa + (size_t)trow * (size_t)ng;
+                       const int sbl0 = (li * UNITSX) / USP;
+                       const int ui0 = (li * UNITSX) % USP;
+                       float acc = 0.f, acc1 = 0.f;
+                       for (int sb = sbl0; sb < nsb; sb += sbpi) {
+                           const char * p0 = b0 + (size_t)sb * SB;
+                           const char * p1 = b1 ? (b1 + (size_t)sb * SB) : nullptr;
+                           // d, dmin, scales[12] in one 16-byte load.
+                           const uint4 h = *reinterpret_cast<const uint4 *>(p0);
+                           uint32_t hdr1 = 0, uw0 = 0, uw1 = 0, uw2 = 0;
+                           const uint4 u = (FUSE == 2) ? *reinterpret_cast<const uint4 *>(p1) : uint4(0, 0, 0, 0);
+                           if constexpr (FUSE == 2) {
+                               hdr1 = u.x();
+                               uw0 = u.y();
+                               uw1 = u.z();
+                               uw2 = u.w();
+                           }
+#pragma unroll
+                           for (int k = 0; k < UNITSX; k++) {
+                               const int off = (ui0 + k) * UNITSZ;
+                               const int cb = off >> 5;
+                               const int cbits = 2 * cb;
+                               uint4 xl[NW], xh[NW];
+#pragma unroll
+                               for (int w = 0; w < NW; w++) {
+                                   const int cc = (off + 16 * w) >> 5;
+                                   const int hh = ((off + 16 * w) >> 4) & 1;
+                                   const int xo = sb * 256 + 64 * cc + 16 * hh;
+                                   xl[w] = *reinterpret_cast<const uint4 *>(xr + xo);
+                                   xh[w] = *reinterpret_cast<const uint4 *>(xr + xo + 32);
+                               }
+                               const float alo = moe_h2f(ar[sb * 8 + 2 * cb]);
+                               const float ahi = moe_h2f(ar[sb * 8 + 2 * cb + 1]);
+                               // The six 6-bit scale/min fields of a chunk are
+                               // three 16-bit pairs of the header's three scale
+                               // words, selected by cb>>1 and shifted by
+                               // 16*(cb&1) - no byte loads, no branches.
+                               auto do_bank = [&](const char * p, uint32_t hdr, uint32_t sw0, uint32_t sw1,
+                                                  uint32_t sw2, float & accp) {
+                                   const int hi = 16 * (cb & 1);
+                                   const uint32_t wa = (cb < 2) ? sw0 : sw1;
+                                   const uint32_t wb = (cb < 2) ? sw1 : sw2;
+                                   const uint32_t pa = (wa >> hi) & 0xFFFFu; // s[j], s[j+1]
+                                   const uint32_t pb = (wb >> hi) & 0xFFFFu; // s[j+4], s[j+5]
+                                   uint32_t sd0, sm0, sd1, sm1;
+                                   if (cb < 2) {
+                                       sd0 = pa & 63u;
+                                       sm0 = pb & 63u;
+                                       sd1 = (pa >> 8) & 63u;
+                                       sm1 = (pb >> 8) & 63u;
+                                   } else {
+                                       const uint32_t pc = (sw0 >> hi) & 0xFFFFu;
+                                       sd0 = (pb & 0x0Fu) | ((pc & 0xC0u) >> 2);
+                                       sm0 = ((pb & 0xF0u) >> 4) | ((pa & 0xC0u) >> 2);
+                                       sd1 = ((pb >> 8) & 0x0Fu) | (((pc >> 8) & 0xC0u) >> 2);
+                                       sm1 = (((pb >> 8) & 0xF0u) >> 4) | ((((pa >> 8) & 0xC0u)) >> 2);
+                                   }
+                                   uint4 qw[NW], hq[NW];
+#pragma unroll
+                                   for (int w = 0; w < NW; w++) {
+                                       qw[w] = *reinterpret_cast<const uint4 *>(p + QOFF + off + 16 * w);
+                                       if constexpr (QT == 13) {
+                                           const int hh = ((off + 16 * w) >> 4) & 1;
+                                           hq[w] = *reinterpret_cast<const uint4 *>(p + 16 + 16 * hh);
+                                       }
+                                   }
+                                   int qdl = 0, qdh = 0, sxl = 0, sxh = 0;
+#pragma unroll
+                                   for (int w = 0; w < NW; w++) {
+                                       const uint4 v = qw[w];
+                                       uint32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+                                       if constexpr (QT == 13) {
+                                           q0 = hq[w].x();
+                                           q1 = hq[w].y();
+                                           q2 = hq[w].z();
+                                           q3 = hq[w].w();
+                                       }
+                                       moe_dp_word<QT>(v.x(), q0, cbits, xl[w].x(), xh[w].x(), qdl, qdh, sxl, sxh);
+                                       moe_dp_word<QT>(v.y(), q1, cbits, xl[w].y(), xh[w].y(), qdl, qdh, sxl, sxh);
+                                       moe_dp_word<QT>(v.z(), q2, cbits, xl[w].z(), xh[w].z(), qdl, qdh, sxl, sxh);
+                                       moe_dp_word<QT>(v.w(), q3, cbits, xl[w].w(), xh[w].w(), qdl, qdh, sxl, sxh);
+                                   }
+                                   const float dsb = moe_h2f((uint16_t)hdr);
+                                   const float mnsb = moe_h2f((uint16_t)(hdr >> 16));
+                                   const float st0 = dsb * (float)sd0, of0 = mnsb * (float)sm0;
+                                   const float st1 = dsb * (float)sd1, of1 = mnsb * (float)sm1;
+                                   accp += alo * (st0 * (float)qdl - of0 * (float)sxl);
+                                   accp += ahi * (st1 * (float)qdh - of1 * (float)sxh);
+                               };
+                               do_bank(p0, h.x(), h.y(), h.z(), h.w(), acc);
+                               if constexpr (FUSE == 2) {
+                                   do_bank(p1, hdr1, uw0, uw1, uw2, acc1);
+                               }
+                           }
+                       }
+                       const sub_group sg = it.get_sub_group();
+#pragma unroll
+                       for (int m = 1; m < LPR; m <<= 1) {
+                           acc += permute_group_by_xor(sg, acc, m);
+                           if constexpr (FUSE == 2) {
+                               acc1 += permute_group_by_xor(sg, acc1, m);
+                           }
+                       }
+                       if (li == 0 && nrow < N) {
+                           out[(size_t)ia * (size_t)out_stride + n] = (FUSE == 2) ? silu_f(acc) * acc1 : acc;
+                       }
+                   });
+}
+
+bool moe_row_gemv_gate_up_launch(queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
+                                 size_t slot_gb, size_t slot_ub, const int32_t * ids, int n_pairs,
+                                 const int8_t * xq, const uint16_t * asa, float * h, int h_stride, int n_embd,
+                                 int n_ff_exp, uint32_t gtype, uint32_t utype) {
+    if (gtype != utype) {
+        return false;
+    }
+    const char * g = (const char *)gbank;
+    const char * u = (const char *)ubank;
+#define SI_ROW_GU(QT)                                                                                              \
+    moe_row_gemv_impl<QT, 2, 16, 2, 2, 8>(q, g, u, slot_gb, slot_ub, slot_map, ids, n_pairs, n_embd, n_ff_exp, xq,  \
+                                         asa, h, h_stride)
+    switch (gtype) {
+    case 12: SI_ROW_GU(12); return true;
+    case 13: SI_ROW_GU(13); return true;
+    default: return false;
+    }
+#undef SI_ROW_GU
+}
+
+bool moe_row_gemv_down_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                              const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa,
+                              float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype) {
+    const char * d = (const char *)dbank;
+    // K = n_ff_exp = 512 -> two superblocks per row: a 32-byte unit is a whole
+    // chunk, so four lanes cover a row and one iteration covers it end to end.
+#define SI_ROW_D(QT)                                                                                               \
+    moe_row_gemv_impl<QT, 1, 32, 4, 1, 16>(q, d, nullptr, slot_db, 0, slot_map, ids, n_pairs, n_ff_exp, n_embd,    \
+                                          xq, asa, acc, acc_stride)
+    switch (dtype) {
+    case 12: SI_ROW_D(12); return true;
+    case 13: SI_ROW_D(13); return true;
+    default: return false;
+    }
+#undef SI_ROW_D
+}
+
 namespace {
 
 // Tile-shape dispatch.  The shape is a bandwidth/re-read/latency trade and all

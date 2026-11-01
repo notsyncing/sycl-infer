@@ -49,7 +49,7 @@ option(SYCL_INFER_AOT "AOT compile for the target GPU (avoids runtime JIT)" OFF)
 # mirror of a profile value.  The default stays `adl-p` because the primary dev
 # box is the Iris Xe; the 2x A770 host must pass -DSYCL_INFER_AOT_DEVICE=acm-g10.
 # Check `ocloc query` for any other SKU rather than inheriting either default.
-set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (adl-p = Iris Xe, acm-g10 = A770/DG2)")
+set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (adl-p = Iris Xe, acm-g10 = A770/DG2, lnl = Arc 140V / Xe2 Lunar Lake, bmg = Battlemage)")
 set(SYCL_INFER_AOT_PROFILE "" CACHE STRING "device profile key baked into the binary; empty = auto-detect from the SYCL device name")
 if(SYCL_INFER_AOT AND NOT SI_ROUTER_ONLY)
     add_compile_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
@@ -82,6 +82,26 @@ if(SYCL_INFER_AOT AND NOT SI_ROUTER_ONLY)
     # NOTE: `-g` (a Debug build) makes each device image several times larger and
     # slower to lower; configure with `-DCMAKE_BUILD_TYPE=Release` for AOT.
 endif()
+
+# Xe2-only kernels.  The tiled prefill expert GEMM has a 75,264 B-SLM wide tile
+# (BM=64 x BN=512) that only lowers for an Xe2 target; a 64 KB device image
+# (adl-p / acm-g10) must not contain it, or ocloc fails at the final link.  A
+# JIT build keeps it (the launcher declines at run time on a card whose profile
+# has less than 73.5 KB of SLM), and an AOT build gets it only when its target
+# is Xe2 (`lnl` Lunar Lake, `bmg` Battlemage).
+if(NOT SI_ROUTER_ONLY)
+    set(SI_XE2_TARGET OFF)
+    if(NOT SYCL_INFER_AOT)
+        set(SI_XE2_TARGET ON)
+    elseif(SYCL_INFER_AOT_DEVICE MATCHES "^(lnl|bmg|acm-g1[12])")
+        set(SI_XE2_TARGET ON)
+    endif()
+    if(SI_XE2_TARGET)
+        add_compile_definitions(SI_MOE_TILED_WIDE=1)
+        message(STATUS "sycl-infer: Xe2 wide device kernels enabled (SI_MOE_TILED_WIDE)")
+    endif()
+endif()
+
 # ---------------------------------------------------------------- core library
 # Everything from here to the router section needs SYCL; SI_ROUTER_ONLY skips
 # it (the router links none of it).
@@ -94,6 +114,7 @@ add_library(sycl_infer_core STATIC
     src/device/device_registry.cpp
     src/device/profiles/arc_a770.cpp
     src/device/profiles/iris_xe.cpp
+    src/device/profiles/arc_140v.cpp
     # common: quantization formats and shared low-level helpers
     src/common/w8.cpp
     src/common/w4.cpp
@@ -139,6 +160,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/mtp_argmax.cpp
     src/backend/gpu/kernels/dflash.cpp
     src/backend/gpu/kernels/moe.cpp
+    src/backend/gpu/kernels/moe_tiled.cpp
     src/backend/gpu/kernels/dp4a_common.cpp
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp
@@ -571,6 +593,7 @@ si_add_test(test_w4_topk     tests/engine/test_w4_topk.cpp)
 si_add_test(test_decode_vs_prefill tests/engine/test_decode_vs_prefill.cpp)
 si_add_test(test_dp4a        tests/backend/gpu/kernels/test_dp4a_gemm.cpp)
 si_add_test(test_moe_kernels tests/backend/gpu/kernels/test_moe_kernels.cpp)
+si_add_test(test_moe_tiled   tests/backend/gpu/kernels/test_moe_tiled.cpp)
 si_add_test(test_moe_ref tests/model/test_moe_ref.cpp)
 si_add_test(test_dflash_kernels tests/backend/gpu/kernels/test_dflash_kernels.cpp)
 si_add_test(test_spec        tests/engine/test_spec.cpp)
