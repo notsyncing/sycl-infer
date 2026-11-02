@@ -28,6 +28,7 @@
 #include "kernel_utils.h"
 
 #include "dp4a.h"
+#include "w4.h" // PF_W4_GROUP (w4_group_shift)
 
 #include <cstdlib>
 #include <cstring>
@@ -78,6 +79,7 @@ static void w4_gemv_impl(queue & q, const uint8_t * vals, const uint16_t * scale
                          const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                          int out_stride, const float * residual, float alpha, int K, int N) {
     const int ng = K / 32;
+    const int gs = si::w4_group_shift(); // PF_W4_GROUP: 32-groups per scale group
     constexpr int TX = RB * 32;
     const int nwg = (N + RB - 1) / RB;
     q.submit([&](handler & h) {
@@ -95,7 +97,7 @@ static void w4_gemv_impl(queue & q, const uint8_t * vals, const uint16_t * scale
                 const int r = i % RB;
                 const int n = n0 + r;
                 const bool ok = n < N;
-                const size_t src = (size_t)g * N + n;
+                const size_t src = (size_t)(g >> gs) * N + n;
                 meta[i] = ok ? scale[src] : (uint16_t)0;
                 meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
             }
@@ -839,6 +841,7 @@ static void w4_gemm_batched(queue & q, const uint8_t * vals, const uint16_t * sc
                             const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs,
                             float * out, int out_stride, const float * residual, float alpha, int K, int N) {
     const int ng = K / 32;
+    const int gs = si::w4_group_shift(); // PF_W4_GROUP: 32-groups per scale group
     const int kh = K / 2;
     constexpr int TX = RB * 32;
     const int nwg = (N + RB - 1) / RB;
@@ -854,7 +857,7 @@ static void w4_gemm_batched(queue & q, const uint8_t * vals, const uint16_t * sc
                 const int r = i % RB;
                 const int n = n0 + r;
                 const bool ok = n < N;
-                const size_t src = (size_t)g * N + n;
+                const size_t src = (size_t)(g >> gs) * N + n;
                 meta[i] = ok ? scale[src] : (uint16_t)0;
                 meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
             }
@@ -998,6 +1001,7 @@ static void w4_gemm_tn(queue & q, const uint8_t * vals, const uint16_t * scale, 
     constexpr int NG_SG = RB / TN;
     constexpr int TX = NG_SG * 32;
     const int ng = K / 32;
+    const int gs = si::w4_group_shift(); // PF_W4_GROUP: 32-groups per scale group
     const int kh = K / 2;
     const int nwg = (N + RB - 1) / RB;
     q.submit([&](handler & h) {
@@ -1012,7 +1016,7 @@ static void w4_gemm_tn(queue & q, const uint8_t * vals, const uint16_t * scale, 
                 const int r = i % RB;
                 const int n = nb + r;
                 const bool ok = n < N;
-                const size_t src = (size_t)g * N + n;
+                const size_t src = (size_t)(g >> gs) * N + n;
                 meta[i] = ok ? scale[src] : (uint16_t)0;
                 meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
             }
@@ -1123,6 +1127,7 @@ static void w4_gemm_c2(queue & q, const uint8_t * vals, const uint16_t * scale, 
                        int out_stride, const float * residual, float alpha, int K, int N) {
     constexpr int TX = 16 * 32;
     const int ng = K / 32;
+    const int gs = si::w4_group_shift(); // PF_W4_GROUP: 32-groups per scale group
     const int kh = K / 2;
     const int nwg = (N + RB - 1) / RB;
     q.submit([&](handler & h) {
@@ -1137,7 +1142,7 @@ static void w4_gemm_c2(queue & q, const uint8_t * vals, const uint16_t * scale, 
                 const int r = i % RB;
                 const int n = nb + r;
                 const bool ok = n < N;
-                const size_t src = (size_t)g * N + n;
+                const size_t src = (size_t)(g >> gs) * N + n;
                 meta[i] = ok ? scale[src] : (uint16_t)0;
                 meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
             }
@@ -1392,6 +1397,9 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
     // only format that regresses there.
     constexpr int APAD = (FMT == 0 && M >= 12) ? 48 : 32;
     const int ng = K / 32;
+    // PF_W4_GROUP: only the u4 (FMT 0) store has a widened scale group; k5,
+    // cb4 and the int8-grouped store keep the per-32 planes.
+    const int gs = (FMT == 0) ? si::w4_group_shift() : 0;
     const int kh = K / 2;
     const int nwg = (N + RB - 1) / RB;
     q.submit([&](handler & h) {
@@ -1476,7 +1484,7 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
                         const int gt = i / RB;
                         const int r = i - gt * RB;
                         const int n = n0 + r;
-                        const size_t s = (size_t)(g0 + gt) * N + n;
+                        const size_t s = (size_t)((g0 + gt) >> gs) * N + n;
                         if (n + 8 <= N) {
                             *reinterpret_cast<uint4 *>(&sc_p[i]) =
                                 *reinterpret_cast<const uint4 *>(&scale[s]);
@@ -1500,7 +1508,7 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
                         const int r = i - gt * RB;
                         const int n = n0 + r;
                         const bool ok = n < N;
-                        const size_t s = (size_t)(g0 + gt) * N + n;
+                        const size_t s = (size_t)((g0 + gt) >> gs) * N + n;
                         sc_p[i] = ok ? scale[s] : (uint16_t)0;
                         if constexpr (FMT <= 1) {
                             of_p[i] = ok ? off[s] : (uint16_t)0;

@@ -111,6 +111,28 @@ bool w4_k5_only() {
     return on;
 }
 
+int w4_group() {
+    static const int g = [] {
+        const char * e = si::env::str("PF_W4_GROUP");
+        const int v = e ? atoi(e) : kW4Group;
+        // Only 32/64/128 are powers of two that keep a 32-value sub-group
+        // alignment for the decode GEMV; anything else keeps the native grid.
+        if (v == 64 || v == 128) {
+            return v;
+        }
+        if (e && v != kW4Group) {
+            fprintf(stderr, "[w4] PF_W4_GROUP=%d not supported (32|64|128), using 32\n", v);
+        }
+        return kW4Group;
+    }();
+    return g;
+}
+
+int w4_group_shift() {
+    const int g = w4_group();
+    return g == 128 ? 2 : (g == 64 ? 1 : 0);
+}
+
 bool w4_supported(uint32_t ggml_type) {
     // Q4_K: q in [0,15] on a per-32-group grid (d*sc_j, dmin*m_j).
     if (ggml_type == 12) {
@@ -177,6 +199,7 @@ static bool pack_q4_K(const void * src, int K, int N, w4t & out) {
     out.K = K;
     out.N = N;
     out.bits = 4;
+    out.G = kW4Group;
     return true;
 }
 
@@ -188,14 +211,15 @@ static bool pack_q4_K(const void * src, int K, int N, w4t & out) {
 // step*q + off) so it slots straight into the u4 GEMV's `step*qdot + off*xs`.
 // Mirrors w8.cpp's PF_SI4 generic requant.
 static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t & out, bool allow) {
-    if (!(allow || w4_all_enabled()) || (K % kW4Group) != 0) {
+    const int G = w4_group();
+    if (!(allow || w4_all_enabled()) || (K % G) != 0) {
         return false;
     }
     const size_t row_bytes = quant_row_bytes(ggml_type, K);
     if (row_bytes == 0) {
         return false;
     }
-    const int ng = K / kW4Group;
+    const int ng = K / G;
     out.vals.assign((size_t)N * K / 2, 0);
     out.scale.assign((size_t)ng * N, 0);
     out.off.assign((size_t)ng * N, 0);
@@ -203,9 +227,9 @@ static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t
     for (int n = 0; n < N; n++) {
         dequantize_row(ggml_type, (const char *)src + (size_t)n * row_bytes, row.data(), K);
         for (int g = 0; g < ng; g++) {
-            const float * w = row.data() + (size_t)g * kW4Group;
+            const float * w = row.data() + (size_t)g * G;
             float mn = w[0], mx = w[0];
-            for (int j = 1; j < kW4Group; j++) {
+            for (int j = 1; j < G; j++) {
                 mn = std::min(mn, w[j]);
                 mx = std::max(mx, w[j]);
             }
@@ -216,8 +240,8 @@ static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t
             const float inv = 1.0f / step;
             out.scale[(size_t)g * N + n] = ggml_float_to_half(step);
             out.off[(size_t)g * N + n] = ggml_float_to_half(mn);
-            const size_t base = (size_t)n * K + (size_t)g * kW4Group;
-            for (int j = 0; j < kW4Group; j++) {
+            const size_t base = (size_t)n * K + (size_t)g * G;
+            for (int j = 0; j < G; j++) {
                 int q = (int)std::lround((w[j] - mn) * inv);
                 q = std::max(0, std::min(15, q));
                 const size_t ia = base + j;
@@ -228,6 +252,7 @@ static bool pack_generic(uint32_t ggml_type, const void * src, int K, int N, w4t
     out.K = K;
     out.N = N;
     out.bits = 4;
+    out.G = G;
     return true;
 }
 
@@ -392,6 +417,12 @@ bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out) {
     }
     switch (ggml_type) {
     case 12:
+        // PF_W4_GROUP > 32 widens the grid beyond the K-quant's native per-32
+        // (step, offset) pair, so the only way to build it is a re-quantization
+        // of the dequantized row - the same generic pack PF_W4_ALL uses.
+        if (w4_group() != kW4Group) {
+            return pack_generic(ggml_type, src, K, N, out, true);
+        }
         return pack_q4_K(src, K, N, out);
     case 13:
         // PF_W4_K5 (see w4_supported): Q5_K onto the u4 grid, nothing else.

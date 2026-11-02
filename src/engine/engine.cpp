@@ -1272,9 +1272,9 @@ void engine::moe_acts_alloc(int dev) {
         a.xs = F(bytes / 32);
     }
     // u4 gate/up bank scratch.  The decode writes the up projection at pair rows
-    // into `gu` (P*n_ff_exp), while the prefill uses the first two 64-row tiles
-    // of it as the gate/up GEMM destinations; one buffer sized for the decode
-    // covers both.  `gather` is the prefill's [64][n_embd] activation tile.  Only
+    // into `gu` (P*n_ff_exp), while the prefill uses the first two 64-row
+    // tiles as the GEMM destinations; one buffer sized for the decode covers
+    // both.  `gather` is the prefill's [64][n_embd] activation tile.  Only
     // allocated when a bank was actually built (the memory-tight qwen4exp path
     // and an unbaked MoE run do not pay 17 MB per device for nothing).
     if (moe_u4_any_) {
@@ -1410,16 +1410,16 @@ bool engine::moe_u4bank_wanted() const {
 }
 
 // The u4 plane of one expert (common/w4.h): vals [N][K/2] at +0, then the f16
-// step plane [K/32][N] and the f16 offset plane.
+// step plane [K/G][N] and the f16 offset plane, G = PF_W4_GROUP (32 default).
 static void u4_plane_of(int K, int N, size_t & vals_b, size_t & scale_b, size_t & plane) {
     vals_b = (size_t)N * (size_t)(K / 2);
-    scale_b = (size_t)(K / 32) * (size_t)N * 2;
+    scale_b = (size_t)(K / si::w4_group()) * (size_t)N * 2;
     plane = vals_b + 2 * scale_b;
 }
 
 static bool u4_can_bank(const moe_wt & t) {
-    return t.ok() && t.type == 12 /* Q4_K */ && t.K > 0 && t.N > 0 && (t.K % 256) == 0 && (t.K % 32) == 0 &&
-           si::w4_supported(t.type);
+    return t.ok() && t.type == 12 /* Q4_K */ && t.K > 0 && t.N > 0 && (t.K % 256) == 0 &&
+           (t.K % si::w4_group()) == 0 && si::w4_supported(t.type);
 }
 
 bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {

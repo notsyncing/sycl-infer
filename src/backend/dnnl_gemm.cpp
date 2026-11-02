@@ -223,7 +223,7 @@ static bool w4_corr_gemm_env() {
 // times / each offset value TM times.
 void w4_epilogue_launch(sycl::queue & q, const float * acc4, const float * xs, const uint16_t * off,
                         const uint16_t * sa, float * out, int out_stride, const float * residual, float alpha, int M,
-                        int N, int NG) {
+                        int N, int NG, int OF) {
     constexpr int TM = 4, TN = 4, GX = 16, GY = 16, TX = GX * GY;
     const int mb = GY * TM, nb = GX * TN;
     const int mt = (M + mb - 1) / mb;
@@ -252,7 +252,7 @@ void w4_epilogue_launch(sycl::queue & q, const float * acc4, const float * xs, c
                                 : 0.f;
                 }
                 for (int b = 0; b < TN; b++) {
-                    wv[b] = (n + b < N) ? w4_f16_bits(off[(size_t)g * N + n + b]) : 0.f;
+                    wv[b] = (n + b < N) ? w4_f16_bits(off[(size_t)(g / OF) * N + n + b]) : 0.f;
                 }
                 for (int a = 0; a < TM; a++) {
                     for (int b = 0; b < TN; b++) {
@@ -277,6 +277,26 @@ void w4_epilogue_launch(sycl::queue & q, const float * acc4, const float * xs, c
                 out[o] = v;
             }
         }
+    });
+}
+
+// PF_W4_GROUP > 32: rebin the correction source from the quantizer's per-32
+// groups to the weight store's group, so the correction matmul's A operand has
+// the same K as the per-G off plane.  F consecutive f16 entries are summed in
+// f32 and written back as f16; with F == 1 the plan is skipped entirely.
+static void w4_corr_group_launch(sycl::queue & q, const uint16_t * src32, uint16_t * dstG, int F, int M, int ng32) {
+    const int ngG = ng32 / F;
+    q.parallel_for(sycl::range<1>((size_t)M * (size_t)ngG), [=](sycl::id<1> i) {
+        const int m = (int)(i / (size_t)ngG);
+        const int g = (int)(i % (size_t)ngG);
+        float s = 0.f;
+        for (int j = 0; j < F; j++) {
+            s += w4_f16_bits(src32[(size_t)m * ng32 + (size_t)g * F + j]);
+        }
+        sycl::half h(s);
+        uint16_t bits;
+        __builtin_memcpy((void *)&bits, &h, sizeof(h));
+        dstG[(size_t)m * ngG + g] = bits;
     });
 }
 
@@ -572,6 +592,11 @@ struct dnnl_gemm::impl {
     // xsr[m][g] = xs[m][g]*sa[m][g], written by the same act_quant_grp_launch
     // as xs/asa (lane 0 only, so the u4 path pays no extra launch).
     uint16_t * corrsrc = nullptr;
+    // PF_W4_GROUP > 32: the same plane rebinned to the *weight* group (K/G
+    // entries per row), so the correction matmul's B operand (the per-G off
+    // plane) and its A operand have matching K.  Built by a small reduce right
+    // after the quantizer.
+    uint16_t * corrsrcG = nullptr;
     int8_t * axg = nullptr;    // per-32-group quantized activations [M][K]
     uint16_t * asa = nullptr;  // their per-(m,g) f16 scales, [M][K/32]
     int8_t * axe = nullptr;    // even/odd k split of axg, for the u4 decode GEMV
@@ -607,6 +632,7 @@ struct dnnl_gemm::impl {
     // (the correction coefficient).  See common/w4.h.
     struct w4_entry {
         int K = 0, N = 0;
+        int G = kW4Group; // scale/offset group width (PF_W4_GROUP)
         uint8_t * vals = nullptr;
         uint16_t * scales = nullptr;
         uint16_t * off = nullptr;
@@ -826,9 +852,13 @@ struct dnnl_gemm::impl {
         auto dmd = memory::desc({M, N}, memory::data_type::f32, memory::format_tag::ab);
         primitive_attr attr;
         dnnl_fpmath(attr);
-        // mask = dim 0 (K) zoomed by the 32-value group; layouts validated on
-        // this GPU (dims {1, NG*N} f16, exact against the integer reference)
-        attr.set_scales(DNNL_ARG_WEIGHTS, 1, {kW4Group, 1}, memory::data_type::f16);
+        // mask = dim 0 (K) zoomed by the store's group; layouts validated on
+        // this GPU (dims {1, NG*N} f16, exact against the integer reference).
+        // PF_W4_GROUP only widens the *weight* group: the activation scales stay
+        // per 32 (grouped SRC scales below), because the quantizer's per-32
+        // granularity is what keeps the u4 prefill's accuracy and the epilogue's
+        // xs/asa planes unchanged.
+        attr.set_scales(DNNL_ARG_WEIGHTS, 1, {si::w4_group(), 1}, memory::data_type::f16);
         // grouped SRC scales: mask on dim 1 (K) of src {M,K}, groups {1,32}
         attr.set_scales(DNNL_ARG_SRC, 2, {1, kW4Group}, memory::data_type::f16);
         prim4_entry e;
@@ -847,7 +877,13 @@ struct dnnl_gemm::impl {
         // so the whole correction needs no [M][N] scratch.  M == 1 is the
         // decode GEMV's shape, so it never gets one (keeps that path identical).
         if (M > 1 && w4_corr_gemm_env() && corrsrc) {
-            const int ng = K / kW4Group;
+            // The B operand is the weight's per-G off plane, so the A operand
+            // must be binned to the same group: corrsrcG holds the F f16 sums
+            // of corrsrc's per-32 entries (PF_W4_GROUP > 32), corrsrc itself
+            // when G == 32.
+            const int wg = si::w4_group();
+            const int ng = K / wg;
+            const uint16_t * csrc = (wg > kW4Group) ? corrsrcG : corrsrc;
             auto xc = memory::desc({M, ng}, memory::data_type::f16, memory::format_tag::ab);
             auto wc = memory::desc({ng, N}, memory::data_type::f16, memory::format_tag::ab);
             primitive_attr cattr;
@@ -856,7 +892,7 @@ struct dnnl_gemm::impl {
             cattr.set_post_ops(cop);
             try {
                 e.cprim = matmul(matmul::primitive_desc(eng, xc, wc, dmd, cattr));
-                e.csrc = sycl_interop::make_memory(xc, eng, sycl_interop::memory_kind::usm, (void *)corrsrc);
+                e.csrc = sycl_interop::make_memory(xc, eng, sycl_interop::memory_kind::usm, (void *)csrc);
                 e.cdst = sycl_interop::make_memory(dmd, eng, sycl_interop::memory_kind::usm, (void *)accf);
                 e.cok = true;
             } catch (const std::exception & ex) {
@@ -941,6 +977,7 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     p->xs = p->dev_alloc<float>((size_t)p->cap_M * (p->cap_K / kW4Group));
     // PF_W4_CORR_GEMM's f16 source: M*K/32 elements, at most 1024*1024 = 2 MiB
     p->corrsrc = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group));
+    p->corrsrcG = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / si::w4_group()));
     p->axg = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K);
     p->asa = p->dev_alloc<uint16_t>((size_t)p->cap_M * (p->cap_K / kW4Group));
     p->axe = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K / 2);
@@ -952,7 +989,7 @@ dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
     if (acc_sum_env()) {
         p->accsum = p->dev_alloc<int64_t>(impl::kAccSlots);
     }
-    if (!p->ax || !p->axs || !p->acc || !p->accf || !p->xs || !p->corrsrc || !p->axg || !p->asa || !p->axe
+    if (!p->ax || !p->axs || !p->acc || !p->accf || !p->xs || !p->corrsrc || !p->corrsrcG || !p->axg || !p->asa || !p->axe
         || !p->axo) {
         throw std::runtime_error("dnnl scratch alloc failed");
     }
@@ -1138,7 +1175,7 @@ size_t dnnl_gemm::weight_bytes() const {
         if (kv.second.dev_backed) {
             continue; // the caller owns the planes (see w4_entry::dev_backed)
         }
-        n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)(kv.second.K / kW4Group) * kv.second.N * 4;
+        n += (size_t)kv.second.K * kv.second.N / 2 + (size_t)(kv.second.K / kv.second.G) * kv.second.N * 4;
     }
     for (const auto & kv : p->w2weights) {
         n += (size_t)kv.second.K * kv.second.N / 4 + (size_t)(kv.second.K / kW4Group) * kv.second.N * 4;
@@ -1310,7 +1347,8 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
         }
         return false;
     }
-    if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+    const int G = si::w4_group();
+    if (K <= 0 || N <= 0 || (K % G) != 0 || K > kActMaxK) {
         if (w4info) {
             fprintf(stderr, "[w4] reject key=%p: K=%d N=%d maxK=%d\n", key, K, N, (int)kActMaxK);
         }
@@ -1343,10 +1381,13 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
             memcpy(&w.scale[i], &h, 2);
         }
     }
-    const int ng = K / kW4Group;
+    // The packed store's own group width (PF_W4_GROUP): its scale/off planes and
+    // the oneDNN grouped-scale mask both follow it.
+    const int ng = K / w.G;
     impl::w4_entry e;
     e.K = K;
     e.N = N;
+    e.G = w.G;
     e.vals = p->dev_alloc<uint8_t>(w.vals.size());
     e.scales = p->dev_alloc<uint16_t>(w.scale.size());
     e.off = p->dev_alloc<uint16_t>(w.off.size());
@@ -1447,17 +1488,19 @@ bool dnnl_gemm::add_weight_w4_dev(const void * key, const void * dev_vals, const
     if (!key || !dev_vals || !dev_scale || !dev_off) {
         return false;
     }
-    if (K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+    const int G = si::w4_group();
+    if (K <= 0 || N <= 0 || (K % G) != 0 || K > kActMaxK) {
         return false;
     }
     auto found = p->w4weights.find(key);
     if (found != p->w4weights.end()) {
         return found->second.ok;
     }
-    const int ng = K / kW4Group;
+    const int ng = K / G;
     impl::w4_entry e;
     e.K = K;
     e.N = N;
+    e.G = G;
     e.vals = (uint8_t *)dev_vals;
     e.scales = (uint16_t *)dev_scale;
     e.off = (uint16_t *)dev_off;
@@ -1720,6 +1763,12 @@ act_view dnnl_gemm::quantize(const float * x, const float * up, int x_stride, in
     p->actq_note(M, K, nullptr); // quantize() has no weight key; (M,K) is periodic per layer
     act_quant_grp_launch(p->q, x, up, x_stride, up_stride, p->axg, p->asa, p->xs, p->corrsrc, p->axe, p->axo,
                          do_split, M, K, p->actsum_q, p->actsum_s, p->actq_slot());
+    // PF_W4_GROUP > 32: the correction matmul's A operand must be binned to the
+    // weight store's group (its B is the per-G off plane).  One small kernel per
+    // quantize; at G == 32 the per-32 plane is already the right shape.
+    if (p->has_w4 && M > 1 && si::w4_group() > kW4Group) {
+        w4_corr_group_launch(p->q, p->corrsrc, p->corrsrcG, si::w4_group() / kW4Group, M, K / kW4Group);
+    }
     p->cur_M = M;
     p->cur_K = K;
     p->acts_valid = true;
@@ -1815,7 +1864,7 @@ bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residua
             return ev && atoi(ev) != 0;
         }();
         w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : e.off, p->asa, out, out_stride, residual, alpha, M,
-                           e.N, e.ng);
+                           e.N, e.ng, 1);
         return true;
     }
     if (auto cit = p->cb4weights.find(key); cit != p->cb4weights.end() && cit->second.ok) {
@@ -2056,7 +2105,7 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
     }
     impl::prim4_entry & pe = pit->second;
     const int N = w.N;
-    const int ng = K / kW4Group;
+    const int ng = K / w.G;
     // PF_W4_NOCORR: bisection knob - drop the offset (zero-point) correction and
     // keep only the oneDNN step-scaled matmul, to tell which half is wrong.
     static const bool nocorr = [] {
@@ -2064,7 +2113,9 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
         return e && atoi(e) != 0;
     }();
     // PF_W4_CORR_GEMM: the off-plane correction runs as a second oneDNN matmul
-    // whose sum post-op accumulates into the same dst as the u4 matmul.
+    // whose sum post-op accumulates into the same dst as the u4 matmul.  The
+    // correction's A operand is binned to the store's group (corrsrcG when
+    // PF_W4_GROUP > 32), so its K matches the per-G off plane for any G.
     const bool corr_gemm = !nocorr && w4_corr_gemm_env() && pe.cok && w.offmem_ok;
     // Without a residual (and with alpha == 1) the sum post-op already leaves
     // the finished result in the destination, so the remaining "epilogue" would
@@ -2170,9 +2221,10 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
         }
         return true;
     }
-    // xs was produced by quantize() (same launch as the grouped activation)
+    // xs/asa are the quantizer's per-32 planes (NG = K/32); the weight's off
+    // plane is per G, so OF = G/32 consecutive activation groups share one entry.
     w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : w.off, p->asa, out, out_stride, residual, alpha, M, N,
-                       ng);
+                       K / kW4Group, w.G / kW4Group);
     return true;
 }
 

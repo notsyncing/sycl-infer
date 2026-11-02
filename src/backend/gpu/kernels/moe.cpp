@@ -30,6 +30,7 @@
 // token - that reuse is the point of a grouped GEMM, and a plain per-pair order
 // would read a prefill's expert weights once per token that selected them.
 #include "kernels.h"
+#include "w4.h" // PF_W4_GROUP (w4_group_shift)
 #include "device/device_profile.h"
 #include "kernel_utils.h"
 #include "gguf.h" // GGML_TYPE_* (the kernel headers only pull the raw type ids)
@@ -3149,6 +3150,10 @@ static void moe_u4_gemv_impl(queue & q, const uint8_t * bank, size_t plane_bytes
                              const float * xs, int K, int N, float * out, int out_stride, const float * gate,
                              int top_k) {
     const int ng = K / 32;
+    // PF_W4_GROUP: the bank's scale/off planes are per group; a widened group
+    // is F consecutive 32-value groups sharing one (step, off).
+    const int gs = si::w4_group_shift();
+    const int ngw = ng >> gs;
     const size_t vb = (size_t)N * (size_t)(K / 2);
     const int nwg = (N + RB - 1) / RB;
     constexpr int TX = RB * 32;
@@ -3167,14 +3172,14 @@ static void moe_u4_gemv_impl(queue & q, const uint8_t * bank, size_t plane_bytes
             const int slot = slot_map ? slot_map[e] : e;
             const uint8_t * plane = bank + (size_t)slot * plane_bytes;
             const uint16_t * scale = reinterpret_cast<const uint16_t *>(plane + vb);
-            const uint16_t * off = scale + (size_t)ng * (size_t)N;
+            const uint16_t * off = scale + (size_t)ngw * (size_t)N;
             // g-major / row-inner: consecutive lanes read consecutive n
             for (int i = lid; i < RB * ng; i += TX) {
                 const int g = i / RB;
                 const int r = i - g * RB;
                 const int n = n0 + r;
                 const bool ok = n < N;
-                const size_t src = (size_t)g * (size_t)N + n;
+                const size_t src = (size_t)(g >> gs) * (size_t)N + n;
                 meta[i] = ok ? scale[src] : (uint16_t)0;
                 meta[(size_t)RB * ng + i] = ok ? off[src] : (uint16_t)0;
             }

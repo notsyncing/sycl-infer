@@ -42,13 +42,26 @@ namespace si {
 
 constexpr int kW4Group = 32;
 
+// PF_W4_GROUP=32|64|128: the u4 store's scale/offset group width.  Group 32 is
+// the native K-quant grid, so it is the only lossless setting; 64/128
+// re-quantize the nibbles onto a wider grid and cut the two f16 metadata planes
+// from 4 B per 32 weights to 4 B per 64/128, i.e. 0.625 -> 0.5625 -> 0.53125
+// B/weight.  On this card the decode GEMV is bandwidth-bound at ~90% of the
+// measured read ceiling, so that byte cut is the whole win - it is the same
+// trade OpenVINO's int4 MatMul makes (0.539 B/w at group 128).  It is
+// process-wide because the packed planes and every consumer (oneDNN's grouped
+// scales, the decode GEMVs, the expert bank's plane stride) have to agree.
+int w4_group();       // 32, 64 or 128
+int w4_group_shift(); // log2(w4_group() / 32): 0, 1 or 2
+
 struct w4t {
     std::vector<uint8_t> vals;   // [N][K] u4, K inner, low nibble first
-    std::vector<uint16_t> scale; // [K/32][N] f16 step
-    std::vector<uint16_t> off;   // [K/32][N] f16 offset
+    std::vector<uint16_t> scale; // [K/G][N] f16 step
+    std::vector<uint16_t> off;   // [K/G][N] f16 offset
     int K = 0;
     int N = 0;
     int bits = 4;
+    int G = kW4Group; // scale/offset group width this store was packed with
     bool ok() const {
         return !vals.empty() && !scale.empty() && !off.empty();
     }
