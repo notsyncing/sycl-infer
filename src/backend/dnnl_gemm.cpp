@@ -1296,11 +1296,17 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // per-32-group f16 step/offset planes.  Returns false for unsupported types,
 // which keep their int8 conversion.
 bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                              bool any_type, bool gemv_only, float scale_mul) {
+                              bool any_type, bool gemv_only, float scale_mul, const char * cls, int layer) {
     const bool w4info = si::env::flag("PF_W4_INFO");
-    if (!key || !host_data || !(any_type || si::w4_supported(ggml_type))) {
+    // PF_W4_ALL_ONLY: a set list turns the generic pack on for its classes and
+    // off for everything else, so it overrides both w4_supported() and
+    // any_type.  Unset = the original behaviour.
+    const bool filtered = si::w4_only_set();
+    const bool listed = filtered && si::w4_only_allows(cls, layer);
+    if (!key || !host_data || (filtered ? !listed : !(any_type || si::w4_supported(ggml_type)))) {
         if (w4info) {
-            fprintf(stderr, "[w4] reject key=%p: precheck type=%u any=%d\n", key, ggml_type, (int)any_type);
+            fprintf(stderr, "[w4] reject key=%p: precheck type=%u any=%d cls=%s layer=%d listed=%d\n", key,
+                    ggml_type, (int)any_type, cls ? cls : "-", layer, (int)listed);
         }
         return false;
     }
@@ -1315,7 +1321,12 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
         return found->second.ok;
     }
     si::w4t w;
-    if (!(any_type ? si::w4_pack_any(ggml_type, host_data, K, N, w) : si::w4_pack(ggml_type, host_data, K, N, w))) {
+    // A natively-representable type keeps its exact grid; every other type
+    // (including a class that PF_W4_ALL_ONLY selected) takes the generic pack.
+    // Unfiltered callers keep the original any_type/pack dispatch exactly.
+    const bool native = (ggml_type == 12) || (ggml_type == 13 && si::w4_k5_only());
+    const bool use_any = filtered ? !native : any_type;
+    if (!(use_any ? si::w4_pack_any(ggml_type, host_data, K, N, w) : si::w4_pack(ggml_type, host_data, K, N, w))) {
         if (w4info) {
             fprintf(stderr, "[w4] reject key=%p: pack failed type=%u K=%d N=%d\n", key, ggml_type, K, N);
         }
@@ -2067,8 +2078,19 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
     const bool compact_out = out != nullptr && out_stride == N && ((uintptr_t)out % 64) == 0;
     const bool compact_res = residual != nullptr && ((uintptr_t)residual % 64) == 0;
     const bool alpha1 = alpha == 1.0f;
+    // The residual-fused form is only valid when `residual` is a *different*
+    // buffer from `out`.  With residual == out (the engine's in-place residual
+    // stream: attn_output "o" and GDN "ssm_out" are called that way) the u4
+    // matmul writes `out` in place first, so the binary post-op would read the
+    // u4 result as the residual: dst = u4 + (u4 + corr) instead of
+    // residual + u4 + corr.  The residual is then ~2x the layer output, which
+    // compounds to garbage over the 40 layers (measured: cos 0.998 against the
+    // scalar epilogue per GEMM, but the token stream degrades immediately).
+    // Nothing about this is shape-dependent: the lab reproduces it at every
+    // (K,N), including the K=2048 ones, whenever it passes out == residual.
+    const bool res_aliases_out = residual != nullptr && residual == out;
     bool res_fuse = false;
-    if (corr_gemm && alpha1 && compact_out && compact_res) {
+    if (corr_gemm && alpha1 && compact_out && compact_res && !res_aliases_out) {
         if (!pe.rcok && !pe.rfails) {
             try {
                 auto xc = memory::desc({M, ng}, memory::data_type::f16, memory::format_tag::ab);

@@ -2336,12 +2336,31 @@ bool engine::setup_md_dnnl() {
         const bool add_k5 = si::dev::profile_flag(dq, "PF_K5", si::dev::for_queue(dq).wt.k5 != 0);
         // PF_CB4=0 keeps IQ4_XS/IQ4_NL on the int8 conversion (A/B knob)
         const bool add_cb = si::dev::profile_flag(dq, "PF_CB4", si::dev::for_queue(dq).wt.cb4 != 0);
-        auto add = [&](const wt & t) {
+        // PF_W4_ALL_LAYER=<il>[,PF_W4_ALL_SLOT=<i>]: convert only that layer's
+        // tensors through PF_W4_ALL (slot = lay_wts index).  Diagnostic
+        // bisection; both unset = convert every eligible tensor (the flag's
+        // documented behaviour).
+        static const int sel_l = [] {
+            const char * e = si::env::str("PF_W4_ALL_LAYER");
+            return e ? atoi(e) : -1;
+        }();
+        static const int sel_s = [] {
+            const char * e = si::env::str("PF_W4_ALL_SLOT");
+            return e ? atoi(e) : -1;
+        }();
+        // PF_W4_ALL_ONLY: the class-based allow-list (see si::w4_only_allows).
+        // It can enable the generic pack by itself, so it also satisfies the
+        // w4_on gate; unset leaves both flags' behaviour untouched.
+        const bool w4_only = si::w4_only_set();
+        auto add = [&](const wt & t, int il = -1, int slot = -1, const char * cls = nullptr) {
             if (!t.data) {
                 return;
             }
+            const bool sel = (sel_l < 0 || sel_l == il) && (sel_s < 0 || sel_s == slot);
             bool converted = false;
-            if (w4_on && D->add_weight_w4(t.data, t.data, t.type, t.K, t.N)) {
+            if (sel && (w4_on || w4_only) &&
+                D->add_weight_w4(t.data, t.data, t.type, t.K, t.N, /*any_type=*/false, /*gemv_only=*/false,
+                                 /*scale_mul=*/1.0f, cls, il)) {
                 dev_ok = true;
                 n_w4++;
                 converted = true;
@@ -2465,7 +2484,7 @@ bool engine::setup_md_dnnl() {
             // embed kernel reads the GGUF-quantized rows.  It is converted
             // after the upload, keyed by the uploaded device pointer - see
             // setup_multi_device.
-            add(m.output);
+            add(m.output, -1, -1, "head");
             // PF_MTP_HEAD_W4 (default on): one extra draft-only u4 copy of the
             // LM head.  The draft reads the head once per drafted token (k times
             // per cycle, 1.35 GB each at int8) and only needs its argmax, so
@@ -2542,11 +2561,17 @@ bool engine::setup_md_dnnl() {
             layer_t & L = m.layers[(size_t)il];
             layer_t::wl wls[7];
             const int nw = L.lay_wts(wls, /*with_w8t=*/false);
+            // Canonical class names for PF_W4_ALL_ONLY.  On a MoE layer the
+            // ffn_* slots are the *shared expert*, and the routed experts are
+            // not converted here at all.
+            static const char * const rec_cls[] = {"ffn_gate", "ffn_up", "ffn_down", "qkv", "z", "ssm_out"};
+            static const char * const att_cls[] = {"ffn_gate", "ffn_up", "ffn_down", "q", "k", "v", "o"};
+            const char * const * cls = L.recurrent ? rec_cls : att_cls;
             for (int i = 0; i < nw; i++) {
-                add(*wls[i].w);
+                add(*wls[i].w, il, i, cls[i]);
             }
-            add(L.ssm_beta);
-            add(L.ssm_alpha);
+            add(L.ssm_beta, il, -2, "ssm_beta");
+            add(L.ssm_alpha, il, -2, "ssm_alpha");
         }
         // Routed-expert u4 gate/up bank: packed and registered here, while this
         // device's dnnl_gemm exists and before the per-tensor upload (which then

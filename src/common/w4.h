@@ -65,6 +65,20 @@ bool w4_k5_only(); // PF_W4_K5: Q5_K alone onto the u4 grid (0.75 -> 0.625 B/w)
 // L2 on the weights, against 0.98% for the int8 conversion).  Off by default.
 bool w4_all_enabled();
 
+// PF_W4_ALL_ONLY=<token>[,<token>...]: a per-tensor allow-list for the generic
+// (lossy) 4-bit conversion.  A token is a tensor class the engine assigns at the
+// conversion site ("ffn_gate", "ffn_up", "ffn_down", "qkv", "z", "ssm_out",
+// "q", "k", "v", "o", "head", "ssm_beta", "ssm_alpha") and may be qualified to
+// one layer as "blk.<il>.<class>" (or "<il>:<class>").  "all" selects every
+// class the caller classifies.  When the variable is unset no filtering happens
+// (PF_W4_ALL keeps its documented behaviour); when it is set, only the listed
+// classes are packed to u4 and everything else keeps its int8 store - so a
+// mixed map (e.g. OVMS's U4-dense/I8-head layout) can be reproduced.  Also
+// enables the generic pack for a listed class without PF_W4_ALL.  Off by
+// default.
+bool w4_only_set();
+bool w4_only_allows(const char * cls, int layer);
+
 // Pack one GGUF tensor at its native width.  Returns false (and leaves `out`
 // untouched) for unsupported types, which keep the int8 conversion.
 bool w4_pack(uint32_t ggml_type, const void * src, int K, int N, w4t & out);

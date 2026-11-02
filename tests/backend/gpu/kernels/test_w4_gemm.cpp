@@ -31,6 +31,7 @@ int main(int argc, char ** argv) {
     int checked = 0;
     long samples = 0;
     double sum_rel = 0, worst = 0;
+    int inplace_fail = 0, inplace_n = 0;
 
     for (auto & t : f.tensors) {
         if (t.type != 12 || t.dims.empty() || t.dims[0] % QK_K != 0) {
@@ -193,6 +194,44 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // The engine calls the attn_output ("o") and GDN ("ssm_out") GEMMs with
+        // out == residual (the running residual stream).  The correction's
+        // residual-fused oneDNN post-op reads `residual` AFTER the u4 matmul has
+        // written `out`, so without a guard the result is out + (u4 + corr)
+        // instead of residual + (u4 + corr) - the residual is replaced by the
+        // u4 output, and over 40 layers that is garbage.  It was first seen as
+        // "PF_W4_ALL=1 is wrong only for the K=4096 tensors"; the real predicate
+        // is out == residual (those two are the only such u4 calls), and the
+        // lab reproduces it at every K when out == residual.  `out` is the
+        // no-residual result from above, so out + r is the expected value.
+        if (M > 1) {
+            std::vector<float> rr((size_t)M * N);
+            for (size_t i = 0; i < rr.size(); i++) {
+                rr[i] = 0.5f * out[i];
+            }
+            float * oi = sycl::malloc_device<float>((size_t)M * N, q);
+            q.memcpy(oi, rr.data(), rr.size() * 4).wait();
+            const si::act_view avi = D.quantize(xd, nullptr, K, 0, M, K);
+            if (avi.valid() && D.gemm_w4(avi, key, oi, 1.f, M, K, oi, N)) {
+                std::vector<float> gi(rr.size());
+                q.memcpy(gi.data(), oi, gi.size() * 4).wait();
+                double mx = 0, ref = 0;
+                for (size_t i = 0; i < gi.size(); i++) {
+                    mx = std::fmax(mx, (double)std::fabs(gi[i] - (out[i] + rr[i])));
+                    ref = std::fmax(ref, (double)std::fabs(out[i] + rr[i]));
+                }
+                const double e = mx / std::fmax(1.0, ref);
+                inplace_n++;
+                if (e > 5e-3) {
+                    inplace_fail++;
+                }
+                printf("  %-30s K=%5d N=%5d M=%3d  inplace-residual maxdiff=%.3e rel=%.2e%s\n", t.name.c_str(), K, N,
+                       M, mx, e, e > 5e-3 ? "  BAD" : "");
+            }
+            sycl::free(oi, q);
+            av = avi; // the reference below reads this view's grouped scratch
+        }
+
         sycl::free(xd, q);
         sycl::free(od, q);
 
@@ -260,7 +299,8 @@ int main(int argc, char ** argv) {
     }
     const double mean = sum_rel / (double)std::max(1L, samples);
     printf("\noverall mean rel=%.6f  worst=%.6f\n", mean, worst);
-    const bool ok = worst < 0.01;
+    printf("inplace-residual: %d/%d ok\n", inplace_n - inplace_fail, inplace_n);
+    const bool ok = worst < 0.01 && inplace_fail == 0 && inplace_n > 0;
     printf("%s\n", ok ? "w4 gemm OK" : "w4 gemm FAILED");
     return ok ? 0 : 1;
 }

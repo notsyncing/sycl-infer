@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <string>
 #include <vector>
 #include <cstdlib>
 #include "common/env.h"
@@ -20,6 +21,86 @@ bool w4_all_enabled() {
         return e && atoi(e) != 0;
     }();
     return on;
+}
+
+bool w4_only_set() {
+    static const bool on = [] {
+        const char * e = si::env::str("PF_W4_ALL_ONLY");
+        return e && *e != 0;
+    }();
+    return on;
+}
+
+// Parse PF_W4_ALL_ONLY once (load time only) into the token list.  A token is
+// either a class name, "all", or one layer's class as "blk.<il>.<class>" /
+// "<il>:<class>".  Whitespace around tokens is ignored.
+static const std::vector<std::string> & w4_only_tokens() {
+    static const std::vector<std::string> toks = [] {
+        std::vector<std::string> out;
+        const char * e = si::env::str("PF_W4_ALL_ONLY");
+        if (!e) {
+            return out;
+        }
+        std::string cur;
+        auto flush = [&] {
+            size_t b = cur.find_first_not_of(" \t");
+            size_t z = cur.find_last_not_of(" \t");
+            if (b != std::string::npos) {
+                out.push_back(cur.substr(b, z - b + 1));
+            }
+            cur.clear();
+        };
+        for (const char * p = e; *p; p++) {
+            if (*p == ',') {
+                flush();
+            } else {
+                cur.push_back(*p);
+            }
+        }
+        flush();
+        return out;
+    }();
+    return toks;
+}
+
+bool w4_only_allows(const char * cls, int layer) {
+    if (!w4_only_set()) {
+        return true;
+    }
+    const std::vector<std::string> & toks = w4_only_tokens();
+    if (toks.empty()) {
+        return true;
+    }
+    if (!cls) {
+        // Unclassified call sites (MTP/draft stores) keep PF_W4_ALL's behaviour.
+        return true;
+    }
+    const std::string c(cls);
+    for (const std::string & t : toks) {
+        if (t == "all" || t == c) {
+            return true;
+        }
+        // blk.<il>.<class>
+        if (t.rfind("blk.", 0) == 0) {
+            const size_t dot = t.find('.', 4);
+            if (dot != std::string::npos) {
+                const int il = atoi(t.c_str() + 4);
+                if (il == layer && t.compare(dot + 1, std::string::npos, c) == 0) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        // <il>:<class>
+        const size_t colon = t.find(':');
+        if (colon != std::string::npos) {
+            const int il = atoi(t.c_str());
+            if (il == layer && t.compare(colon + 1, std::string::npos, c) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool w4_k5_only() {

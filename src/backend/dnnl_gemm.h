@@ -92,8 +92,11 @@ struct dnnl_gemm {
     // any_type: pack a type with no native 4-bit grid (the draft LM head).
     // gemv_only: skip the prefill primitive ladder - the consumer is the M=1
     // u4 GEMV only (the MTP draft layer, which never prefills).
+    // cls/layer: the tensor class (see si::w4_only_allows) for the
+    // PF_W4_ALL_ONLY allow-list.  Unclassified call sites pass nullptr.
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                       bool any_type = false, bool gemv_only = false, float scale_mul = 1.0f);
+                       bool any_type = false, bool gemv_only = false, float scale_mul = 1.0f,
+                       const char * cls = nullptr, int layer = -1);
     // Register a u4 store that *already lives in device memory* (the routed
     // experts' resident bank): no pack, no copy, three memory objects that wrap
     // `dev_vals` ([N][K/2] u4), `dev_scale` and `dev_off` ([K/32][N] f16).  The
