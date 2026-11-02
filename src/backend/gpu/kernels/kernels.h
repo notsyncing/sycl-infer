@@ -304,6 +304,23 @@ void gdn_launch(sycl::queue & q, const float * conv_out, const float * alpha, co
 void gated_norm_launch(sycl::queue & q, const float * attn, const float * z, const float * weight, float * out,
                        const step_info * info, int n_heads, int head_dim, float eps, int n_rows, int n_real,
                        int row0 = 0, bool sigmoid_gate = false);
+// Work-group-per-head GDN: all `head_dim/cols` column groups of one head share
+// a work-group, stage the token's q/k in SLM once, and (optionally) fuse the
+// gated norm and the conv-window update into the same launch.  Same arithmetic
+// as gdn_launch + gated_norm_launch + conv_state_update_launch.
+// Warp-per-group GDN conv: the 128-channel q/k L2 tree is reproduced by one
+// warp (exact), and a single-token row's conv-window shift is folded into the
+// same lane.  PF_GDN_CONV_FAST=0 keeps conv_l2_launch.
+void gdn_conv_launch(sycl::queue & q, const float * qkv_raw, float * conv_state, const float * conv_w,
+                     float * conv_out, const step_info * info, int conv_dim, int kernel_size, int head_k_dim,
+                     int n_k_heads, float eps, int n_rows, int n_real, int row0, int tpb_arg, bool cross_row,
+                     bool update_state, pc_snap snap);
+void gdn_head_launch(sycl::queue & q, const float * qkv_raw, float * conv_state, int conv_k, const float * conv_out,
+                     const float * alpha, const float * dt_bias, const float * ssm_a, const float * beta,
+                     float * state, float * attn_out, const float * z, const float * norm_w, float * merged,
+                     const step_info * info, int head_dim, int n_k_heads, int n_heads, int conv_dim, float scale,
+                     int n_rows, int row0, int tpb_arg, int nreal_arg, pc_snap snap, bool fuse_state,
+                     bool fuse_gated, float eps, bool last_row_only, int cols);
 
 // qwen4exp hyper-connections (see src/backend/gpu/kernels/q4exp.cpp).  The
 // buffers are flat [token][hc][n_embd]; `residual` is the stream array and the

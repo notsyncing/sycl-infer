@@ -2,6 +2,7 @@
 #include "device/device_profile.h"
 #include "backend/gpu/kernels/moe_tiled.h" // the tiled prefill expert GEMM
 #include "backend/cpu/cpu_types.h" // the cpu-partition MoE mirror
+#include "backend/gpu/kernels/kernels.h" // the fused GDN decode/prefill kernel
 
 #include <algorithm>
 #include <numeric>
@@ -1815,6 +1816,15 @@ auto moe_call = [&](size_t idx) {
             const char * e = si::env::str("PF_ABL_NOATTN");
             return e && atoi(e) != 0;
         }();
+        // GDN sub-block ablations (timing only, wrong results by design).
+        static const bool nogated = [] {
+            const char * e = si::env::str("PF_ABL_NOGATED");
+            return e && atoi(e) != 0;
+        }();
+        static const bool noconv = [] {
+            const char * e = si::env::str("PF_ABL_NOCONV");
+            return e && atoi(e) != 0;
+        }();
                 // DFlash draft: this layer is one of the drafter's target_layers, so save
         // its *input* hidden state into the interleaved feature buffer the draft
         // injects from.  It must come after the device handoff above (d_x belongs
@@ -1894,16 +1904,87 @@ auto moe_call = [&](size_t idx) {
                 const int v = e ? atoi(e) : 2;
                 return v == 1 ? 1 : 2;
             }();
+            // PF_GDN_HEAD (default off; =1 enables): one work-group per head
+            // runs the scan with the token's q/k staged in SLM and folds the
+            // gated norm and the conv-window update into the same launch.  It
+            // is exact, but the per-head work-group uses only 32 of the 64 EUs
+            // and loses ~0.3 ms/token on the decode; it wins ~10% on the
+            // chunk-batched prefill's scan (PF_GDN_HEAD=1 is the A/B).
+            static const int head_mode = [] {
+                const char * e = si::env::str("PF_GDN_HEAD");
+                return e ? atoi(e) : 0;
+            }();
+            static const int head_cols = [] {
+                const char * e = si::env::str("PF_GDN_HEAD_COLS");
+                return (e && atoi(e) == 4) ? 4 : 8;
+            }();
+            const bool gpu_layer = multi_dev ? (dev_kind_[(size_t)dev] == 0) : !cpu_mode;
+            const int head_wg = (hp.d_state % head_cols == 0) ? (hp.d_state / head_cols) * 32 : 0;
+            const bool use_head = gpu_layer && head_mode != 0 && !nogdn && head_wg > 0 && head_wg <= 1024 &&
+                                  !(mode == 2 && fuse_gdn < 2);
+            // PF_GDN_CONV_FAST (default on): the warp-per-group conv.  It is
+            // exact (see gdn_conv_launch) and, for a single-token row, it folds
+            // the conv-window shift into the same lane, so the separate
+            // conv_state_update launch goes away.
+            static const int conv_fast = [] {
+                const char * e = si::env::str("PF_GDN_CONV_FAST");
+                return e ? atoi(e) : 1;
+            }();
+            const bool fast_conv = gpu_layer && conv_fast != 0 && hp.conv_k == 4 && hp.d_state == 128;
+            const bool fused_conv_state = fast_conv && mode != 2 && gdn_nr == 1;
+            auto run_conv = [&](int cn, int cr, int c0, int ctpb, bool cross, bool upd) {
+                if (fast_conv) {
+                    gdn_conv_launch(dev_queue(dev), d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(),
+                                    hp.conv_k, hp.d_state, hp.n_group, hp.rms_eps, cn, cr, c0, ctpb, cross, upd, snap);
+                } else {
+                    cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
+                                    hp.d_state, hp.n_group, hp.rms_eps, cn, cr, c0, ctpb, cross);
+                }
+            };
             const auto a_g = tnow();
             auto a_sub = tnow();
-            if (mode == 2 && fuse_gdn >= 1 && !nogdn) {
-                cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
-                               hp.d_state, hp.n_group, hp.rms_eps, NCH, kMaxT, 0, kMaxT, /*cross_row=*/true);
-                g_lc.gdn++;
+            if (use_head) {
+                const float hscale = 1.0f / std::sqrt((float)hp.d_state);
+                if (mode == 2) {
+                    if (!noconv) {
+                        run_conv(NCH, kMaxT, 0, kMaxT, /*cross_row=*/true, /*upd=*/false);
+                        g_lc.gdn++;
+                    }
+                    stamp(prof_acc[11], a_sub);
+                    a_sub = tnow();
+                    gdn_head_launch(dev_queue(dev), d_qkv, cs, hp.conv_k, d_conv_out, d_alpha, wf32(dev, L.ssm_dt),
+                                    wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre, d_z, wf32(dev, L.ssm_norm),
+                                    d_attn_merged, inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(), hscale, 1,
+                                    0, T, T, snap, /*fuse_state=*/!noconv, /*fuse_gated=*/!nogated, hp.rms_eps,
+                                    /*last_row_only=*/true, head_cols);
+                    g_lc.gdn++;
+                    stamp(prof_acc[13], a_sub);
+                } else {
+                    if (!noconv) {
+                        run_conv(nrows, gdn_nr, 0, -1, false, /*upd=*/false);
+                        g_lc.gdn++;
+                    }
+                    stamp(prof_acc[11], a_sub);
+                    a_sub = tnow();
+                    gdn_head_launch(dev_queue(dev), d_qkv, cs, hp.conv_k, d_conv_out, d_alpha, wf32(dev, L.ssm_dt),
+                                    wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre, d_z, wf32(dev, L.ssm_norm),
+                                    d_attn_merged, inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(), hscale,
+                                    nrows, 0, -1, -1, snap, /*fuse_state=*/!noconv, /*fuse_gated=*/!nogated,
+                                    hp.rms_eps, /*last_row_only=*/false, head_cols);
+                    g_lc.gdn++;
+                    stamp(prof_acc[13], a_sub);
+                }
+            } else if (mode == 2 && fuse_gdn >= 1 && !nogdn) {
+                if (!noconv) {
+                    run_conv(NCH, kMaxT, 0, kMaxT, /*cross_row=*/true, /*upd=*/false);
+                    g_lc.gdn++;
+                }
                 stamp(prof_acc[11], a_sub);
                 a_sub = tnow();
-                cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT,
-                                         /*last_row_only=*/true, snap);
+                if (!noconv) {
+                    cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT,
+                                             /*last_row_only=*/true, snap);
+                }
                 stamp(prof_acc[12], a_sub);
                 a_sub = tnow();
                 static const bool tdbg = si::env::flag("PF_TIME");
@@ -1940,16 +2021,24 @@ auto moe_call = [&](size_t idx) {
                                 mode, r0, rr0, rn, gdn_nr, inf->n_rows, inf->active[rr0], inf->tpb);
                     g_lc.gdn++;
                     }
-                    cur_be->conv_l2(d_qkv, cs, wf32(dev, L.ssm_conv1d), d_conv_out, inf, hp.qkv_dim(), hp.conv_k,
-                                   hp.d_state, hp.n_group, hp.rms_eps, rn, gdn_nr, rr0, -1, false);
+                    a_sub = tnow();
+                    if (!noconv) {
+                        run_conv(rn, gdn_nr, rr0, -1, false, /*upd=*/fused_conv_state);
+                    }
+                    stamp(prof_acc[11], a_sub);
+                    a_sub = tnow();
                     g_lc.gdn++;
-                    cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, rn, rr0, -1, -1, false,
-                                             snap);
+                    if (!noconv && !fused_conv_state) {
+                        cur_be->conv_state_update(d_qkv, cs, inf, hp.qkv_dim(), hp.conv_k, rn, rr0, -1, -1, false,
+                                                 snap);
+                    }
+                    stamp(prof_acc[12], a_sub);
+                    a_sub = tnow();
                     cur_be->gdn(d_conv_out, d_alpha, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), d_beta, gs, d_attn_pre,
                                inf, hp.d_state, hp.n_group, hp.dt_rank, hp.qkv_dim(),
                                1.0f / std::sqrt((float)hp.d_state), state_slots_, rn, rr0, -1, -1, snap);
+                    stamp(prof_acc[13], a_sub);
                 }
-                stamp(prof_acc[13], a_sub);
                 a_sub = tnow();
             }
             if (inf->mtp_dt && (size_t)dev < mtp.d_mtp_rin_.size() && mtp.d_mtp_rin_[(size_t)dev] != nullptr) {
@@ -1970,8 +2059,10 @@ auto moe_call = [&](size_t idx) {
             // gated_norm has no state dependency on the row order, so all chunk
             // rows run in one dispatch (batched it is ~4x cheaper than NCH calls)
             g_lc.gdn++;
-            cur_be->gated_norm(d_attn_pre, d_z, wf32(dev, L.ssm_norm), d_attn_merged, inf, hp.dt_rank, hp.d_state,
-                              hp.rms_eps, mode == 2 ? NCH : nrows, gdn_nr, 0);
+            if (!nogated && !use_head) {
+                cur_be->gated_norm(d_attn_pre, d_z, wf32(dev, L.ssm_norm), d_attn_merged, inf, hp.dt_rank, hp.d_state,
+                                  hp.rms_eps, mode == 2 ? NCH : nrows, gdn_nr, 0);
+            }
             stamp(prof_acc[14], a_sub);
             a_sub = tnow();
             stamp(c_gdn, a_g);
