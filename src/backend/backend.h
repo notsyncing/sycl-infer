@@ -63,7 +63,8 @@ struct compute_backend {
                               void * kpool, void * vpool, const int32_t * tables, const step_info * info, int n_head,
                               int n_head_kv, int head_dim, int n_rot, float rope_base, const float * rope_freqs,
                               float rope_mscale, float eps, int max_blocks, int n_rows, int n_real,
-                              const void * kscales, const void * vscales) = 0;
+                              const void * kscales, const void * vscales, const float * q_bias = nullptr,
+                              const float * k_bias = nullptr, const float * v_bias = nullptr, int qgate = 2) = 0;
     virtual void attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
                       const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
                       const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out,

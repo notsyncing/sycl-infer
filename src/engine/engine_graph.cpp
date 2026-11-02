@@ -284,7 +284,8 @@ seg_plan engine::build_plan(int T, int tb, bool head_batched, bool use_w8, bool 
         } else {
             plan.begin_call(tb, hp.n_embd / 256);
             if (use_w8) {
-                add8(dev, L.wq, L.wq8, d_xnorm, hp.n_embd, d_qbuf, hp.n_head * 2 * hp.head_dim, nullptr);
+                add8(dev, L.wq, L.wq8, d_xnorm, hp.n_embd, d_qbuf,
+                 hp.n_head * (hp.attn_gate ? 2 : 1) * hp.head_dim, nullptr);
                 add8(dev, L.wk, L.wk8, d_xnorm, hp.n_embd, d_kbuf, hp.n_head_kv * hp.head_dim, nullptr);
                 add8(dev, L.wv, L.wv8, d_xnorm, hp.n_embd, d_vbuf, hp.n_head_kv * hp.head_dim, nullptr);
                 plan.set_xq(d_xnorm, nullptr, hp.n_embd, hp.n_embd, hp.n_embd);
@@ -1401,6 +1402,43 @@ auto moe_call = [&](size_t idx) {
         // activation layout is (g*tbm + t) with t the flat token index (chunk
         // rows are tpb=32 apart, so the tokens are contiguous).
         const int tbm = (mode == 2 && !single) ? rows : tb;
+        // f32 GEMM path (model profile `f32_gemm`): the decoder's linears were
+        // dequantized once at load and the generic f32 kernel runs every
+        // segment.  This skips the int8 activation quantization, which is the
+        // difference that matters for a small fine-tuned model; the raw GGUF
+        // copies are still uploaded because the embedding kernel reads them.
+        if (f32_path_) {
+            bool ok = true;
+            const int gb0 = plan.calls[idx].group_begin;
+            const int gc0 = plan.calls[idx].group_count;
+            for (int g = 0; g < gc0 && ok; g++) {
+                const seg_plan::group_t & gr = plan.groups[gb0 + g];
+                for (int j = 0; j < gr.n && ok; j++) {
+                    const gemv_seg & sj = plan.segs[gr.off + j];
+                    auto it = f32_weights_.find(sj.w);
+                    if (it == f32_weights_.end()) {
+                        ok = false;
+                        break;
+                    }
+                    const float * xsrc = sj.x;
+                    int xs = sj.x_stride;
+                    if (sj.act_up) {
+                        if (!d_f32act) {
+                            ok = false;
+                            break;
+                        }
+                        vit_silu_mul_launch(dev_queue(cur_dev), sj.x, sj.act_up, sj.x_stride, d_f32act, tbm, sj.K);
+                        xsrc = d_f32act;
+                        xs = sj.K;
+                    }
+                    vit_gemm_launch(dev_queue(cur_dev), it->second.ptr, GGML_TYPE_F32, sj.n_rows, sj.K, xsrc, xs, sj.out,
+                                    sj.out_stride, tbm, sj.alpha, sj.residual);
+                }
+            }
+            if (ok) {
+                return;
+            }
+        }
         // PF_GEMM_DNNL: run this call's w8 GEMMs on oneDNN.  Per call, not per
         // segment: the activation quantization is shared by all tensors of the
         // call, exactly like the dp4a xq_launch above.  Only take this route
@@ -2190,20 +2228,29 @@ auto moe_call = [&](size_t idx) {
             }
             const void * ksc = ksc0;
             const void * vsc = vsc0;
-            cur_be->qk_norm_rope(d_qbuf, d_kbuf, d_vbuf, wf32(dev, L.q_norm), wf32(dev, L.k_norm), kp, vp, d_tables,
+            cur_be->qk_norm_rope(d_qbuf, d_kbuf, d_vbuf, L.q_norm ? wf32(dev, L.q_norm) : nullptr,
+                                L.k_norm ? wf32(dev, L.k_norm) : nullptr, kp, vp, d_tables,
                                 inf, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_base,
-                                rope_freqs_for(dev), d_rope_mscale_, hp.rms_eps, max_blocks, nrows, nreal, ksc, vsc);
+                                rope_freqs_for(dev), d_rope_mscale_, hp.rms_eps, max_blocks, nrows, nreal, ksc, vsc,
+                                L.q_bias ? wf32(dev, L.q_bias) : nullptr,
+                                L.k_bias ? wf32(dev, L.k_bias) : nullptr,
+                                L.v_bias ? wf32(dev, L.v_bias) : nullptr, hp.attn_gate ? 2 : 1);
             static const bool dbg_kv = si::env::flag("PF_DUMP_KV");
             if (dbg_kv && !engine::g_capturing_ && mode != 0) {
                 dbg_dump_kv(dev_queue(cur_dev), d_kbuf, d_vbuf, mode, nrows, nreal, hp.n_head_kv, hp.head_dim, il);
             }
             const bool at_fused = (nsp == 1 && at_fuse);
-            cur_be->attn(d_qbuf, d_qbuf, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
+            // hp.attn_gate is false for Qwen2/Qwen2-VL: their q projection has
+            // no output gate, so the second half of the qbuf row is unwritten
+            // and must not be multiplied in (a stale/zero gate would halve or
+            // zero the attention output).
+            const float * agate = hp.attn_gate ? d_qbuf : nullptr;
+            cur_be->attn(d_qbuf, agate, kp, vp, part, d_tables, hp.n_head, hp.n_head_kv, hp.head_dim, nsp, inf,
                         hp.attn_scale, max_blocks, nrows, nreal, at_fused ? d_attn_out : nullptr, -1, ksc, vsc);
             // n_splits == 1 (batched prefill): the attention kernel writes the
             // gated output directly and the combine kernel is skipped
             if (!at_fused) {
-                cur_be->attn_combine(part, d_qbuf, d_attn_out, inf, hp.n_head, hp.head_dim, nsp, nrows, nreal);
+                cur_be->attn_combine(part, agate, d_attn_out, inf, hp.n_head, hp.head_dim, nsp, nrows, nreal);
             }
             stamp(c_attn, a_a);
             gemv();

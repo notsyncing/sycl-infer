@@ -28,6 +28,7 @@
 | 19 | [design/18-qwen4exp.md](design/18-qwen4exp.md) | Qwen3.8-Flash-Next（`qwen4exp`）：split GGUF 装载、hyper-connections、PLE/engram 缓存、QSA 主机选择器、每专家 LRU + 两遍预填充、K%256 的 down 规则与实测吞吐 |
 | 20 | [design/19-c-api.md](design/19-c-api.md) | 嵌入式 C ABI：句柄/生命周期、批量窗口与 FIFO 排队、多线程提交、请求隔离、停止串/超时/取消、ABI 版本与错误模型、与现有 `engine`/`scheduler` 的映射 |
 | 21 | [design/20-python-binding.md](design/20-python-binding.md) | Python binding 与 wheel：ctypes（v0.1）、流式/批量 API、setuptools、SYCL/oneDNN/oneAPI runtime 打包、JIT/AOT wheel、doctor |
+| 23 | [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md) | MinerU2.5 / Qwen2-VL 解码器（`qwen2vl`）：head_dim 64 的 classic attention、无 QK norm/门的 q 布局、Q5_0、视觉塔（patch 14 / 80 维头 / quick_gelu / 2D RoPE）、MinerU 两步抽取与特殊 prompt |
 | 22 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 面向使用者的说明：
@@ -48,6 +49,7 @@
 * 想动 DFlash2 块草稿器（卷积下标、RoPE 宽度、lattice、top-k）→ [design/14-dflash2.md](design/14-dflash2.md)
 * 想动 MoE / 专家切分 / 三级专家缓存 → [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md)
 * 想跑 Qwen3.8-Flash-Next（104 GiB、split GGUF、HC/PLE/QSA、512 专家）→ [design/18-qwen4exp.md](design/18-qwen4exp.md)
+* 想跑 MinerU2.5 / Qwen2-VL 文档抽取（`mineru --image`）→ [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md)
 * 想把引擎嵌进自己的 C/C++ 程序、做自动 batching 的批量推理 → [design/19-c-api.md](design/19-c-api.md)、[guides/c-api.md](guides/c-api.md)
 * 想用 Python/wheel，或需要把 SYCL runtime 一起分发 → [design/20-python-binding.md](design/20-python-binding.md)、[guides/python.md](guides/python.md)
 * 想动 MoE 专家 GEMM 的 tile（prefill 的 M=8 与 decode 的 M=1/M=2）→ [design/15-moe-ncmoe.md §3.4](design/15-moe-ncmoe.md)、[design/03-kernels.md §5.10](design/03-kernels.md)

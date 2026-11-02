@@ -45,4 +45,7 @@ mm_image mm_image_preprocess(const uint8_t * rgb, int w, int h, const image_prep
 // The aligned target size chosen by the smart-resize step (exposed for tests).
 void mm_image_target_size(int w, int h, const image_preproc_cfg & cfg, int & out_w, int & out_h);
 
+// Resize interleaved RGB8 with the same Pillow-compatible bicubic filter.
+void mm_image_resize_rgb(const uint8_t * src, int w, int h, uint8_t * dst, int tw, int th);
+
 } // namespace si

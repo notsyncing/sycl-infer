@@ -89,6 +89,11 @@ int main() {
         // A profile that declares a mechanism unsupported says why; a supported
         // one need not, but a null string would crash the report either way.
         CHECK(row.prof->spec.why != nullptr, (what + " capability reason is a string").c_str());
+        // The vision tower kind and the multimodal capability must agree: a
+        // model that cannot consume media declares `none`, and every model that
+        // can names the tower its mmproj must be.
+        CHECK(row.prof->spec.multimodal == (row.prof->vision != model_profile::vision_kind::none),
+              (what + " vision tower kind agrees with spec.multimodal").c_str());
     }
 
     printf("qwen4exp profile values\n");
@@ -139,6 +144,17 @@ int main() {
     CHECK(g35.rep.sin_w8 && g35.rep.dnnl_int8 && !g35.rep.raw_gemv_decode && !g35.rep.split_per_tensor_upload,
           "generic weights use the SIn/oneDNN stores and the single-blob upload");
     CHECK(g35.spec.mtp && g35.spec.dflash && g35.spec.multimodal, "generic MTP/DFlash/MM are wired");
+    CHECK(g35.vision == model_profile::vision_kind::qwen3vl
+              && gmoe.vision == model_profile::vision_kind::qwen3vl,
+          "generic mmproj files use the qwen3vl tower");
+
+    printf("qwen2vl profile values\n");
+    const model_profile & q2 = kQwen2VlProfile;
+    CHECK(q2.fwd == model_profile::fwd_kind::generic_plan, "qwen2vl uses the shared forward");
+    CHECK(q2.vision == model_profile::vision_kind::qwen2vl, "qwen2vl mmproj uses the qwen2vl tower");
+    CHECK(q2.spec.multimodal && !q2.spec.mtp && !q2.spec.dflash, "qwen2vl declares MM only");
+    CHECK(!q2.policy.prefix_cache && q2.policy.auto_layer_map && q2.policy.auto_layer_map_one_gpu,
+          "qwen2vl takes the per-tensor upload and disables the prefix cache");
 
     // The loader's registry rows must point at these exact objects, so the
     // profile report cannot print one object while the engine uses another.

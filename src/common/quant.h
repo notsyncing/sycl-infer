@@ -40,6 +40,18 @@ struct block_q8_0 {
 };
 static_assert(sizeof(block_q8_0) == 34, "q8_0 size");
 
+// Q5_0: 32 values as `q = low4 | (high_bit << 4)`, signed by subtracting 16 and
+// scaled by d.  ggml falls back to this format (rather than a K-quant) when the
+// row length is not a multiple of 256, which is exactly the case for the
+// Qwen2-VL family (n_embd 896): the mradermacher Q4_K_M file stores its
+// attention/FFN matrices as Q5_0/Q8_0 for that reason.
+struct block_q5_0 {
+    uint16_t d;
+    uint8_t qh[4];
+    uint8_t qs[QK8_0 / 2];
+};
+static_assert(sizeof(block_q5_0) == 22, "q5_0 size");
+
 // Q5_1: 32 values as `q = low4 | (high_bit << 4)` scaled by d and offset by m.
 // The Unsloth UD-Q4_K_XL quants put Q5_1 on the MoE down projections, so the
 // format has to be readable by both the host and the device GEMV.
@@ -209,6 +221,18 @@ static inline void dequantize_block_q8_0(const block_q8_0 * x, float * y) {
     const float d = ggml_half_to_float(x->d);
     for (int i = 0; i < QK8_0; i++) {
         y[i] = d * x->qs[i];
+    }
+}
+
+static inline void dequantize_block_q5_0(const block_q5_0 * x, float * y) {
+    const float d = ggml_half_to_float(x->d);
+    uint32_t qh;
+    std::memcpy(&qh, x->qh, sizeof(qh));
+    for (int j = 0; j < QK8_0 / 2; j++) {
+        const uint8_t xh0 = (uint8_t)(((qh >> (j + 0)) << 4) & 0x10);
+        const uint8_t xh1 = (uint8_t)((qh >> (j + 12)) & 0x10);
+        y[j] = (float)((int)((x->qs[j] & 0x0F) | xh0) - 16) * d;
+        y[j + QK8_0 / 2] = (float)((int)((x->qs[j] >> 4) | xh1) - 16) * d;
     }
 }
 
@@ -452,6 +476,12 @@ static inline void dequantize_row(uint32_t type, const void * data, float * y, i
             dequantize_block_q8_0(p + i, y + i * QK8_0);
         }
     } break;
+    case 6: { // Q5_0
+        auto * p = (const block_q5_0 *)data;
+        for (int64_t i = 0; i < n / QK8_0; i++) {
+            dequantize_block_q5_0(p + i, y + i * QK8_0);
+        }
+    } break;
     case 7: { // Q5_1
         auto * p = (const block_q5_1 *)data;
         for (int64_t i = 0; i < n / QK8_0; i++) {
@@ -505,6 +535,7 @@ static inline size_t quant_row_bytes(uint32_t type, int64_t n) {
     case 13: return (size_t)(n / QK_K) * sizeof(block_q5_K);
     case 14: return (size_t)(n / QK_K) * sizeof(block_q6_K);
     case 8: return (size_t)(n / QK8_0) * sizeof(block_q8_0);
+    case 6: return (size_t)(n / QK8_0) * sizeof(block_q5_0);
     case 7: return (size_t)(n / QK8_0) * sizeof(block_q5_1);
     case 1:
     case 30: return (size_t)n * 2;

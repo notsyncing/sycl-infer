@@ -1,11 +1,23 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// Qwen3.5 vision encoder ("clip" mmproj, projector qwen3vl_merger).
+// The engine's one vision encoder ("clip" mmproj): Qwen3.5 (`qwen3vl_merger`)
+// and Qwen2-VL (`qwen2vl_merger`).
 //
-// The mmproj GGUF is a 12-layer ViT over 16x16 patches (fused QKV + GELU MLP,
-// LayerNorm, learned absolute position embeddings) followed by a 2x2 patch
-// merger.  `vision_model::encode_host` implements the reference forward on the
-// host; the SYCL path in src/backend/gpu/kernels/vit.cpp mirrors it on the device.
+// The per-architecture differences are selected by `vision_model::kind`, which
+// comes from the text model's profile (`model_profile::vision`) and is
+// cross-checked against the mmproj's `clip.projector_type` at load:
+//
+//   qwen3vl: patch 16, fused `v.blk.N.attn_qkv`, learned `v.position_embd`,
+//            gelu_tanh FFN, gelu_tanh merger, head_dim 64/72.
+//   qwen2vl: patch 14 + temporal 2 (the two patch convs are summed), separate
+//            `attn_q/k/v` weights and biases (combined into one [3E][E] f32
+//            view at load), no position embeddings, quick_gelu FFN, exact-erf
+//            GELU merger, `v.post_ln` per patch before the 2x2 concat, head_dim
+//            80.
+//
+// Both variants use a 2x2 patch merger.  `vision_model::encode_host` implements
+// the reference forward on the host; the SYCL path in
+// src/backend/gpu/kernels/vit.cpp mirrors it on the device.
 //
 // The token order after the "spatial merge" reorder is the one the text model
 // sees: 2x2 patch groups (dy,dx) are laid out contiguously, so the merger can
@@ -19,8 +31,11 @@
 
 #include "gguf.h"
 #include "image.h"
+#include "model_profile.h"
 
 namespace si {
+
+struct dnnl_gemm;
 
 // view of one vision weight: N rows of K elements, row-major
 struct vt {
@@ -76,8 +91,14 @@ struct vision_input {
 struct vision_model {
     gguf_file gguf;
     vision_hparams hp;
-    // patch embedding: combined (weight0 + weight1) conv, already dequantized
-    std::vector<float> patch_w; // [n_embd][3*patch*patch]
+    // Which tower this file is (selected by the text model's profile and
+    // cross-checked against clip.projector_type).
+    model_profile::vision_kind kind = model_profile::vision_kind::qwen3vl;
+    // patch embedding: combined (weight0 + weight1) conv, already dequantized,
+    // rows padded to `patch_K` (a multiple of 8; the device GEMM's 16-byte
+    // weight loads require it)
+    std::vector<float> patch_w; // [n_embd][patch_K]
+    int patch_K = 0;
     const float * patch_b = nullptr;
     const float * pos_embd = nullptr; // [n_pos_side*n_pos_side][n_embd] (dequantized)
     std::vector<float> pos_embd_host;
@@ -88,7 +109,9 @@ struct vision_model {
     const float * mm0_b = nullptr;
     const float * mm2_b = nullptr;
 
-    void load(const std::string & path);
+    // `kind` is the text model's declared vision tower; `none` is refused.  The
+    // mmproj's `clip.projector_type` is cross-checked and a disagreement throws.
+    void load(const std::string & path, model_profile::vision_kind kind = model_profile::vision_kind::qwen3vl);
 
     // geometry helper used by preprocessing and the host/device forward
     static vision_input make_input(const vision_model & vm, const mm_image & img);
@@ -105,6 +128,23 @@ struct vision_model {
     // device copy of the weights (one blob)
     void * dev_weights = nullptr;
     size_t dev_weights_size = 0;
+    // PF_VISION_DNNL (default on for qwen2vl): every vision linear runs through
+    // the text model's oneDNN int8 matmul instead of vit_gemm.  `gemm` is a
+    // private instance created on upload; each call falls back to vit_gemm for a
+    // key the instance does not hold (so a projector with an unsupported shape
+    // still runs, just at the old speed).
+    dnnl_gemm * gemm = nullptr;
+    // One vision linear: out[0..T)[0..N) = alpha*W*x + residual, chunked to the
+    // oneDNN activation scratch's M cap.  Returns false when this weight is not
+    // on the dnnl path (caller uses vit_gemm).
+    bool linear_dnnl(sycl::queue & q, const void * key, const float * x, int x_stride, int T, int K, float * out,
+                     int out_stride, const float * residual, float alpha, int N);
+    // Extra host-side f32 copies: the combined qwen2vl q/k/v (and its bias), and
+    // - under PF_VISION_F32 - every linear.  `d_w32` is the device mirror and
+    // `dev_ptr` resolves pointers into either blob, so kernels do not care
+    // which representation a tensor uses.
+    std::vector<float> w32;
+    float * d_w32 = nullptr;
     // Queue every device allocation below was made on (set on first upload):
     // sycl::free needs it, and freeing on another queue is UB.  All callers
     // pass the engine queue, so one queue per model holds in practice.
@@ -119,7 +159,14 @@ struct vision_model {
     vision_model(const vision_model &) = delete;
     vision_model & operator=(const vision_model &) = delete;
     const void * dev_ptr(const void * host_ptr) const {
-        return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
+        const char * h = (const char *)host_ptr;
+        if (d_w32 && !w32.empty()) {
+            const char * b = (const char *)w32.data();
+            if (h >= b && h < b + w32.size() * sizeof(float)) {
+                return (const char *)d_w32 + (h - b);
+            }
+        }
+        return (const char *)dev_weights + (h - (const char *)gguf.map_base);
     }
 
     // Reference forward on the host: writes n_out * proj_dim embeddings.

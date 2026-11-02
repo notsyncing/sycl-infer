@@ -1061,13 +1061,18 @@ dnnl_gemm::~dnnl_gemm() {
 // so the values are the ones the dp4a path uses; only the representation
 // changes (per-row int8 instead of per-32 packed 4/5/6-bit).  Rows are
 // independent -> convert in parallel with one thread per row slab.
-bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N) {
+bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N, bool eager) {
     if (!key || !host_data) {
         return false;
     }
-    // any quantized format quant.h can dequantize row-wise (the K-quants, the
-    // IQ codebook formats and Q8_0) converts to an int8 oneDNN weight
+    // any format quant.h can dequantize row-wise converts to an int8 oneDNN
+    // weight: the K-quants and the IQ codebook formats, plus the float types the
+    // vision mmproj uses for its linears (f16 / f32 / bf16).
     switch (ggml_type) {
+    case 0:  // F32
+    case 1:  // F16
+    case 30: // BF16
+    case 6:  // Q5_0 (used when the row length is not a multiple of 256)
     case 8:  // Q8_0
     case 11: // Q3_K
     case 12: // Q4_K
@@ -1156,8 +1161,8 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
     // any multiple of kMaxT up to kMaxB*kMaxT rows (batched_prefill_fit), mode 1
     // uses kMaxT.  If a shape cannot run on this GPU, the tensor is marked
     // unsupported now so the engine falls back to dp4a before quantizing.
-    bool any = false;
-    for (int M = kMaxT; M <= p->cap_M; M += kMaxT) {
+    bool any = !eager; // lazy: primitives are created on the first gemm() for each shape
+    for (int M = kMaxT; eager && M <= p->cap_M; M += kMaxT) {
         if ((size_t)M * N > p->acc_cap) {
             continue;
         }

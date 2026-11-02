@@ -306,8 +306,14 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                  const step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out, int group,
                  const void * kscales, const void * vscales) {
     constexpr int HD = 256;
-    const bool avec = attn_vec_env(q);
-    const int qstride = n_head * 2 * head_dim;
+    // the two-float4-per-lane mapping below is specific to head_dim 256;
+    // narrower heads (Qwen2-VL is 64) take the scalar lane+32*i path.
+    const bool avec = attn_vec_env(q) && head_dim == HD;
+    // Qwen3.5's q projection interleaves q and the output gate per head
+    // (`[head][q|gate]`); Qwen2/Qwen2-VL carry no gate and the projection writes
+    // `[head][q]`.  The head stride follows the presence of the gate buffer.
+    const int qgate = gate ? 2 : 1;
+    const int qstride = n_head * qgate * head_dim;
     const int pstride = 2 + head_dim;
     const bool fuse = out != nullptr && n_splits == 1;
     const int n_wg = n_rows * n_real * n_head * n_splits;
@@ -398,7 +404,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     part[1] = 0.f;
                 }
 #pragma unroll
-                for (int i = 0; i < HD / 32; i++) {
+                for (int i = 0; i < head_dim / 32; i++) {
                     part[2 + lane + 32 * i] = 0.f;
                 }
                 return;
@@ -410,7 +416,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
             const int t0 = s * chunk;
             const int t1 = sycl::min(t0 + chunk, n_kv);
 
-            const float * q = qbuf + (size_t)row * qstride + (size_t)h * 2 * head_dim;
+            const float * q = qbuf + (size_t)row * qstride + (size_t)h * qgate * head_dim;
             const int kvh = (h * n_head_kv) / n_head;
             const int32_t * table = tables + (size_t)info->slot[r] * max_blocks;
 
@@ -475,12 +481,12 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 if (fuse) {
                     // n_splits == 1: no partial buffer round-trip and no combine
                     // kernel - every lane already holds the full softmax sum
-                    const float * gb = gate + (size_t)row * qstride + h * 2 * head_dim + head_dim;
+                    const float * gb = gate ? gate + (size_t)row * qstride + h * 2 * head_dim + head_dim : nullptr;
                     float * ob = out + (size_t)row * n_head * head_dim + h * head_dim;
                     sycl::float4 oa, obb;
                     for (int j = 0; j < 4; j++) {
-                        oa[j] = (l > 0.f ? aa[j] / l : 0.f) * sigmoid_f(gb[d0 + j]);
-                        obb[j] = (l > 0.f ? ab[j] / l : 0.f) * sigmoid_f(gb[d1 + j]);
+                        oa[j] = (l > 0.f ? aa[j] / l : 0.f) * (gb ? sigmoid_f(gb[d0 + j]) : 1.f);
+                        obb[j] = (l > 0.f ? ab[j] / l : 0.f) * (gb ? sigmoid_f(gb[d1 + j]) : 1.f);
                     }
                     *reinterpret_cast<sycl::float4 *>(ob + d0) = oa;
                     *reinterpret_cast<sycl::float4 *>(ob + d1) = obb;
@@ -495,9 +501,9 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 return;
             }
 
-            float acc[HD / 32];
+            float acc[HD / 32]; // widest instantiation; loops use head_dim/32
 #pragma unroll
-            for (int i = 0; i < HD / 32; i++) {
+            for (int i = 0; i < head_dim / 32; i++) {
                 acc[i] = 0.f;
             }
             float m = -INFINITY, l = 0.f;
@@ -513,7 +519,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     // dims lane+32*i are exactly block i: one scale per iteration
                     const auto * ks = kv_row_scales(ksc_base, unit, ko, head_dim);
 #pragma unroll
-                    for (int i = 0; i < HD / 32; i++) {
+                    for (int i = 0; i < head_dim / 32; i++) {
                         float kv;
                         if constexpr (I4) {
                             kv = i4_ld(kp, lane + 32 * i);
@@ -524,7 +530,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     }
                 } else {
 #pragma unroll
-                    for (int i = 0; i < HD / 32; i++) {
+                    for (int i = 0; i < head_dim / 32; i++) {
                         dot += q[lane + 32 * i] * kv_ld(kp + lane + 32 * i);
                     }
                 }
@@ -536,7 +542,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 if constexpr (V8 || V4) {
                     const auto * vs = kv_row_scales(vsc_base, unit, ko, head_dim);
 #pragma unroll
-                    for (int i = 0; i < HD / 32; i++) {
+                    for (int i = 0; i < head_dim / 32; i++) {
                         float vv;
                         if constexpr (V4) {
                             vv = i4_ld(vp, lane + 32 * i);
@@ -547,7 +553,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                     }
                 } else {
 #pragma unroll
-                    for (int i = 0; i < HD / 32; i++) {
+                    for (int i = 0; i < head_dim / 32; i++) {
                         acc[i] = acc[i] * corr + e * kv_ld(vp + lane + 32 * i);
                     }
                 }
@@ -555,11 +561,11 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
             }
 
             if (fuse) {
-                const float * gb = gate + (size_t)row * qstride + h * 2 * head_dim + head_dim;
+                const float * gb = gate ? gate + (size_t)row * qstride + h * 2 * head_dim + head_dim : nullptr;
                 float * ob = out + (size_t)row * n_head * head_dim + h * head_dim;
 #pragma unroll
-                for (int i = 0; i < HD / 32; i++) {
-                    ob[lane + 32 * i] = (l > 0.f ? acc[i] / l : 0.f) * sigmoid_f(gb[lane + 32 * i]);
+                for (int i = 0; i < head_dim / 32; i++) {
+                    ob[lane + 32 * i] = (l > 0.f ? acc[i] / l : 0.f) * (gate ? sigmoid_f(gb[lane + 32 * i]) : 1.f);
                 }
                 return;
             }
@@ -568,7 +574,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
                 part[1] = l;
             }
 #pragma unroll
-            for (int i = 0; i < HD / 32; i++) {
+            for (int i = 0; i < head_dim / 32; i++) {
                 part[2 + lane + 32 * i] = acc[i];
             }
         });
@@ -599,7 +605,8 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
 void attn_combine_launch(queue & q, const float * partials, const float * gate, float * out, const step_info * info,
                          int n_head, int head_dim, int n_splits, int n_rows, int n_real) {
     const int pstride = 2 + head_dim;
-    const int qstride = n_head * 2 * head_dim;
+    const int qgate = gate ? 2 : 1;
+    const int qstride = n_head * qgate * head_dim;
     q.parallel_for(nd_range<1>((size_t)n_rows * n_real * n_head * head_dim, head_dim), [=](nd_item<1> it) {
         const int gid = it.get_group(0);
         const int r = gid / (n_real * n_head);
@@ -621,7 +628,7 @@ void attn_combine_launch(queue & q, const float * partials, const float * gate, 
             sum += part[s * pstride + 1] * w;
             acc += part[s * pstride + 2 + d] * w;
         }
-        const float gate_v = sigmoid_f(gate[(size_t)row * qstride + h * 2 * head_dim + head_dim + d]);
+        const float gate_v = gate ? sigmoid_f(gate[(size_t)row * qstride + h * 2 * head_dim + head_dim + d]) : 1.f;
         out[(size_t)row * n_head * head_dim + h * head_dim + d] = (sum > 0.f ? acc / sum : 0.f) * gate_v;
     });
 }

@@ -106,7 +106,8 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                       void * vpool, const int32_t * tables, const cpu_step_info * info, int n_head, int n_head_kv,
                       int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale, float eps, int max_blocks,
                       int n_rows, int n_real, cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales,
-                      const void * vscales);
+                      const void * vscales, const float * q_bias = nullptr, const float * k_bias = nullptr,
+                      const float * v_bias = nullptr, int qgate = 2);
 void cpu_attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,
               const cpu_step_info * info, float scale, int max_blocks, int n_rows, int n_real, float * out,

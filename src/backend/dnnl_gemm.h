@@ -79,7 +79,12 @@ struct dnnl_gemm {
     // Convert one tensor.  `key` is the w8t.vals pointer of the matching SIn
     // copy (the DNNL path keys its cache by it); `host_data` is the mapped GGUF
     // tensor.  Returns false for unsupported types/shapes.
-    bool add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N);
+    //
+    // float16 / float32 / bfloat16 sources are accepted (the vision mmproj
+    // stores its linears in those); `eager` false skips the prefill primitive
+    // ladder, so a caller that uses a fixed set of shapes (the vision tower's
+    // M chunks) pays only for the shapes it asks for.
+    bool add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N, bool eager = true);
     bool has_weight(const void * key) const;
 
     // ---- 4-bit (u4) weights (see common/w4.h) -----------------------------

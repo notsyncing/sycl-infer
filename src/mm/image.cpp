@@ -146,6 +146,12 @@ void mm_image_target_size(int w, int h, const image_preproc_cfg & cfg, int & out
     out_h = h_bar;
 }
 
+void mm_image_resize_rgb(const uint8_t * src, int w, int h, uint8_t * dst, int tw, int th) {
+    if (src && dst && w > 0 && h > 0 && tw > 0 && th > 0) {
+        resize_bicubic(src, w, h, dst, tw, th);
+    }
+}
+
 mm_image mm_image_preprocess(const uint8_t * rgb, int w, int h, const image_preproc_cfg & cfg) {
     mm_image out;
     if (!rgb || w <= 0 || h <= 0) {

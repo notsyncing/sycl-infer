@@ -95,8 +95,9 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                          const float * k_norm, void * kpool, void * vpool, const int32_t * tables,
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,
                          const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
-                         int n_real, const void * kscales, const void * vscales, int sum_slot, int64_t * sum_kv) {
-    const int qstride = n_head * 2 * head_dim;
+                         int n_real, const void * kscales, const void * vscales, int sum_slot, int64_t * sum_kv,
+                         const float * q_bias, const float * k_bias, const float * v_bias, int qgate) {
+    const int qstride = n_head * qgate * head_dim;
     const int n_sg = n_head + 2 * n_head_kv; // Q + K + V groups
     auto launch = [&](auto * kdst_base, auto * vdst_base, const sycl::half * ksc_base, const sycl::half * vsc_base) {
         using KVT = std::remove_cv_t<std::remove_pointer_t<decltype(kdst_base)>>;
@@ -171,8 +172,25 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                     const int s2 = info->mrope_sections[2];
                     const int sect_dims = s0 + s1 + s2 + info->mrope_sections[3];
                     const int sector = sect_dims > 0 ? lane % sect_dims : lane;
+                    // Two layouts share this field.  Qwen3.5 (Qwen3-VL's
+                    // "imrope") cycles temporal/row/col by sector%3 over the
+                    // whole pair list.  Qwen2-VL uses *blocked* sections: its
+                    // mrope_section sums to exactly n_rot/2, and pairs
+                    // [0,s0) are temporal, [s0,s0+s1) row, [s0+s1,...) col -
+                    // exactly ggml's non-imrope branch.  The sum is the
+                    // discriminator: Qwen3.5's sections sum to 32 while its
+                    // n_rot/2 is 128.
+                    const bool blocked = sect_dims == n_rot / 2;
                     int sec = 3;
-                    if (sector % 3 == 1 && sector < 3 * s1) {
+                    if (blocked) {
+                        if (sector < s0) {
+                            sec = 0;
+                        } else if (sector < s0 + s1) {
+                            sec = 1;
+                        } else if (sector < s0 + s1 + s2) {
+                            sec = 2;
+                        }
+                    } else if (sector % 3 == 1 && sector < 3 * s1) {
                         sec = 1;
                     } else if (sector % 3 == 2 && sector < 3 * s2) {
                         sec = 2;
@@ -183,17 +201,26 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                 }
 
                 if (sg < n_head) {
-                    float * qh = qbuf + (size_t)row * qstride + (size_t)sg * 2 * head_dim;
-                    float ss = 0.f;
+                    float * qh = qbuf + (size_t)row * qstride + (size_t)sg * qgate * head_dim;
+                    if (q_bias) {
+                        const float * qb = q_bias + (size_t)sg * head_dim;
 #pragma unroll
-                    for (int i = 0; i < head_dim / 32; i++) {
-                        float v = qh[lane + 32 * i];
-                        ss += v * v;
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            qh[lane + 32 * i] += qb[lane + 32 * i];
+                        }
                     }
-                    const float inv = 1.0f / sycl::sqrt(sg_sum(ss, sgg) / head_dim + eps);
+                    if (q_norm) {
+                        float ss = 0.f;
 #pragma unroll
-                    for (int i = 0; i < head_dim / 32; i++) {
-                        qh[lane + 32 * i] *= inv * q_norm[lane + 32 * i];
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            float v = qh[lane + 32 * i];
+                            ss += v * v;
+                        }
+                        const float inv = 1.0f / sycl::sqrt(sg_sum(ss, sgg) / head_dim + eps);
+#pragma unroll
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            qh[lane + 32 * i] *= inv * q_norm[lane + 32 * i];
+                        }
                     }
                     if (lane < n_rot / 2) {
                         // YaRN: a non-null table carries the per-pair frequency
@@ -210,16 +237,25 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                 } else if (sg < n_head + n_head_kv) {
                     const int kh = sg - n_head;
                     float * khp = kbuf + (size_t)row * (n_head_kv * head_dim) + (size_t)kh * head_dim;
-                    float ss = 0.f;
+                    if (k_bias) {
+                        const float * kb = k_bias + (size_t)kh * head_dim;
 #pragma unroll
-                    for (int i = 0; i < head_dim / 32; i++) {
-                        float v = khp[lane + 32 * i];
-                        ss += v * v;
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            khp[lane + 32 * i] += kb[lane + 32 * i];
+                        }
                     }
-                    const float inv = 1.0f / sycl::sqrt(sg_sum(ss, sgg) / head_dim + eps);
+                    if (k_norm) {
+                        float ss = 0.f;
 #pragma unroll
-                    for (int i = 0; i < head_dim / 32; i++) {
-                        khp[lane + 32 * i] *= inv * k_norm[lane + 32 * i];
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            float v = khp[lane + 32 * i];
+                            ss += v * v;
+                        }
+                        const float inv = 1.0f / sycl::sqrt(sg_sum(ss, sgg) / head_dim + eps);
+#pragma unroll
+                        for (int i = 0; i < head_dim / 32; i++) {
+                            khp[lane + 32 * i] *= inv * k_norm[lane + 32 * i];
+                        }
                     }
                     if (lane < n_rot / 2) {
                         const float ang = rope_freqs ? rpos * rope_freqs[lane]
@@ -287,7 +323,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         auto * vsc = (sycl::half *)kv_row_scales(vsc_base, unit, ko, head_dim);
 #pragma unroll
                         for (int i = 0; i < head_dim / 32; i++) {
-                            const float v = vhp[lane + 32 * i];
+                            const float v = vhp[lane + 32 * i] + (v_bias ? v_bias[vh * head_dim + lane + 32 * i] : 0.f);
                             const float m = sg_max(sycl::fabs(v), sgg);
                             const float sc = m > 0.f ? m / 127.f : 1.f;
                             vrow[lane + 32 * i] = i8_quant(v, sc);
@@ -302,7 +338,7 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         auto * vsc = (sycl::half *)kv_row_scales(vsc_base, unit, ko, head_dim);
 #pragma unroll
                         for (int i = 0; i < head_dim / 32; i++) {
-                            const float v = vhp[lane + 32 * i];
+                            const float v = vhp[lane + 32 * i] + (v_bias ? v_bias[vh * head_dim + lane + 32 * i] : 0.f);
                             const float m = sg_max(sycl::fabs(v), sgg);
                             const float sc = m > 0.f ? m / 7.f : 1.f;
                             const uint32_t nib = (uint32_t)((uint8_t)i4_quant(v, sc) & 0xF);
@@ -319,7 +355,8 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                             vdst_base + (((size_t)vb * n_head_kv + vh) * kBlockSize + (pos % kBlockSize)) * head_dim;
 #pragma unroll
                         for (int i = 0; i < head_dim / 32; i++) {
-                            kv_st(vdst + lane + 32 * i, vhp[lane + 32 * i]);
+                            kv_st(vdst + lane + 32 * i,
+                                  vhp[lane + 32 * i] + (v_bias ? v_bias[vh * head_dim + lane + 32 * i] : 0.f));
                         }
                     }
                 }

@@ -87,6 +87,10 @@ measurements and gotchas.
 * [`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md) — the ONNX
   model service for the document pipeline: the protobuf reader, the graph
   transforms, the operator library and executor, and the wire protocol.
+* [`docs/design/21-mineru-qwen2vl.md`](docs/design/21-mineru-qwen2vl.md) — MinerU2.5 /
+  Qwen2-VL (`qwen2vl`): the dense Qwen2 decoder with head_dim 64, the
+  no-gate q layout, Q5_0, the 14-patch vision tower selected by the model
+  profile, and the MinerU two-step prompts/JSON.
 * [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md) — Qwen3.8-Flash-Next:
   split GGUF loading, hyper-connections, PLE and its engram cache, QSA, and the
   per-expert LRU with the two-pass prefill.
@@ -397,13 +401,15 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                   below; PF_ATTN_XMX below), qsa (the Stage 2 device gather +
                   scratch step_info for QSA; src/backend/gpu/kernels/qsa.cpp)
 src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
+                qwen2vl.cpp (Qwen2-VL dense decoder / MinerU trunk), profiles/qwen2vl.cpp,
                 model_arch.h (architecture registry), model_profile.h (the
                 declarative per-architecture policy), profiles/<arch>.cpp (one
                 architecture's complete profile: key, values, provenance),
                 qwen35.cpp, model_w8.cpp, tokenizer.{h,cpp} — see "Model
                 profiles" below
-src/mm/         image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
-                vision.{h,cpp} (mmproj loader + host vision encoder),
+src/mm/         vision.{h,cpp} (the ONE mmproj loader + host/device vision encoder;
+                qwen3vl and qwen2vl towers selected by model_profile::vision),
+                image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
                 video.{h,cpp} (video decode + uniform frame sampling),
                 audio.{h,cpp} (audio decode: WAV native / ffmpeg fallback +
                 log-mel), audio_model.{h,cpp} (AuT audio tower: host + device),
@@ -438,6 +444,7 @@ src/server/onnx/ service.{h,cpp} (the HTTP service), main.cpp
 src/common/     ... plus onnx_wire.{h,cpp} (the binary protocol, shared with
                 the router), onnx_activation.h and onnx_types.h (host-only
                 ONNX semantics shared by the graph and the executor)
+src/mineru.{h,cpp} MinerU two-step document extraction (layout + per-block prompts/JSON)
 src/main.cpp    CLI
 include/sycl_infer/sycl_infer.h  the C ABI header (opaque model/request handles)
 include/sycl_infer/onnx.h       the in-process ONNX ABI (no HTTP/subprocess)
@@ -596,8 +603,11 @@ library layout and per-kernel launch geometry.
 
 ### Multimodal (vision) input
 
-The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
-`clip` GGUF (`Qwen3.5-0.8B-mmproj-BF16.gguf`), loaded with `--mmproj`:
+The vision encoder lives in `src/mm/` and is driven by a separate `clip` GGUF
+(`Qwen3.5-0.8B-mmproj-BF16.gguf`), loaded with `--mmproj`.  One `vision_model`
+serves both Qwen3.5 (`qwen3vl_merger`) and Qwen2-VL (`qwen2vl_merger`); the
+`model_profile::vision` field selects the differences (`vision_model::kind`),
+and the mmproj's `clip.projector_type` is cross-checked at load:
 
 * `mm_image_preprocess` does the Qwen-VL smart resize (aspect preserving, sides
   aligned to `patch_size*merge`), a Pillow-compatible bicubic resample, and
@@ -609,6 +619,31 @@ The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
   bidirectional attention (online softmax, tiled through SLM), then the
   `qwen3vl_merger` (concat 4 patches - a stride reinterpretation - -> mm.0 ->
   GELU -> mm.2).  Both paths agree to ~2e-4; `test_multimodal` checks that.
+* **The vision linears run on the text model's oneDNN int8 matmul**
+  (`PF_VISION_DNNL`, default on for `qwen2vl`; `=0` restores `vit_gemm`).
+  `vit_gemm` tiles M in 32-token groups and re-reads each weight block per
+  tile - at 5476 patches that is ~172 passes over every linear; oneDNN reads
+  each weight once per <= 1024-row chunk.  `vision_model::upload` registers the
+  towers' linears on a private `dnnl_gemm` with `add_weight(..., eager=false)`:
+  the lazy flag skips the prefill primitive ladder so only the M shapes a page
+  asks for get a primitive (content crops all have different patch counts).
+  `dnnl_gemm::add_weight` accepts F16/F32/BF16 sources for this (the mmproj
+  stores its linears in those; `dequantize_row` already had them).  The patch
+  embedding stays on `vit_gemm` (K=592 is not a multiple of 32 and the GEMM is
+  ~1% of the work), and any tensor the instance did not accept falls back to
+  `vit_gemm` per call, so an unsupported projector still runs.  Measured on the
+  MinerU layout page: vision 58.7 s -> 3.64 s, page 113.1 s -> 15.8 s with a
+  byte-identical output, see *docs/PERFORMANCE.md* §7.4.
+* **The 80-wide attention tile is `BQ=32, BK=32, WG=1024`.**  47.6 KiB of SLM
+  per workgroup permits one workgroup per Xe core, so the workgroup's warp
+  count *is* the core's occupancy: the original 16/64/128 shape ran four warps
+  on a 16-EU core.  The score dot uses four independent accumulators (the
+  single-accumulator form is an 80-deep dependent FMA chain).  The padded rows
+  of a partial tile are guarded in every stage - the 56x56 self-check is 16
+  tokens, a partial tile on both axes - so the tile does not require n_tok to
+  be a multiple of BQ.  `PF_VIT_ATTN` selects the sweep variants (0 = 32/32/512,
+  1 = 64/16/512, 2 = 32/32/1024 default, 3 = 16/32/512, 4 = 32/32/256,
+  5 = 64/16/1024).
 * The mmproj stores the linears as BF16 and the norms/biases/patch/position
   tensors as F32; `upload` copies the whole GGUF blob once and `dev_ptr` maps a
   host tensor pointer into it.  `encode_device` runs on the queue it is given,
@@ -629,6 +664,24 @@ The Qwen3.5 vision encoder lives in `src/mm/` and is driven by a separate
 
 See [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) and
 [`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the full design.
+
+**Measured (one A770, MinerU 1.2B `qwen2vl`, the 1036x1036 layout page, 21
+blocks, 2026-11-02).**  Whole-page wall **113.1 s -> 15.8 s** (7.2x) with the
+same page md5 (`10eed240936226fd4696d943aaabc44b`) and the same text-only
+generation; the page's vision work goes **100.4 s -> 4.94 s** and the layout
+step's text prefill 1.92 s -> 0.26 s (mode-2 `prefill_batch`, see
+`PF_MM_BATCH_PREFILL`).  The stages are priced with `PF_VISION_TIME=1` (a
+`q.wait()` per stage, vision only) and `PF_MINERU_TIME=1` (prep / vision /
+prefill-to-first-token / decode per image); both are diagnostics and the
+default path never waits there.  Against `llama-mtmd-cli` (SYCL build, same
+page/prompt/model, one process per image because that build has no
+`llama-server`): the layout step as a layout-only process is 28.2 s vs 13.2 s
+wall (2.1x), or 20.9 s vs 7.2 s excluding each process's model load (2.9x); the
+whole page is 398 s vs 15.8 s.  That CLI pays ~7.3 s of model+mmproj init and
+~6 s of SYCL JIT **per process** and its persistent JIT cache SIGSEGVs on this
+driver, which is why the page gap is far larger than the per-step one - quote
+the layout-step number (2.1-2.9x) whenever a like-for-like single-request
+figure is needed.
 
 ### Audio + video input
 
@@ -2449,6 +2502,65 @@ Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.m
   At `--ctx 2048` QSA is off entirely.  The q4 server's long-prompt prefill now
   uses the whole-prompt q4 path (no `PF_PFB_MAX_M`; 2.2x; see design 18 §7.1).
 
+### MinerU2.5-Pro-2605-1.2B (`qwen2vl`)
+
+`opendatalab/MinerU2.5-Pro-2605-1.2B` is a **Qwen2-VL dense decoder** (24 layers,
+n_embd 896, n_ff 4864, 14 query / 2 KV heads, head_dim 64, RoPE sections
+[8,12,12,0], every layer full attention, tied output).  Files:
+`src/model/qwen2vl.cpp`, `src/model/profiles/qwen2vl.cpp`,
+`src/mm/vision.{h,cpp}` (the one vision module, here in its qwen2vl mode), and
+`src/mineru.{h,cpp}` (the MinerU two-step prompts/JSON).  `vision_model` serves
+both towers: Qwen2-VL's `model_profile::vision = qwen2vl` selects patch 14 +
+temporal 2, separate `attn_q/k/v` weights and biases (combined into one
+`[3E][E]` f32 view at load), no position embeddings, quick_gelu, exact-erf
+GELU in the merger, per-patch `v.post_ln` before the 4-patch concat, and 80-wide
+heads; Qwen3.5's `vision = qwen3vl` keeps the fused `attn_qkv`, learned
+positions and gelu_tanh.  The mmproj's `clip.projector_type` is cross-checked
+against the profile at load.  Its metadata's `feed_forward_length` is wrong (896
+vs the real 5120) - `n_ff` is derived from `ffn_up`'s shape.
+
+**The two bugs that made the layout output look like a table parser, both
+load-bearing:**
+
+* **The q projection's head stride follows the presence of the attention
+  gate.**  Qwen3.5 fuses q and the output gate (`[head][q|gate]`, stride
+  `2*head_dim`); Qwen2-VL has no gate, and its `attn_q` writes `[head][q]`
+  (stride `head_dim`).  A fixed `2*head_dim` stride made every head read the
+  next head's q.  The tell is decisive: **a single-token teacher-forced result
+  is right** (a one-key softmax returns V, so q never matters), while the
+  second token and every later one is wrong - a 5-token text prompt's top-1
+  differed from llama.cpp's.  `qgate = gate ? 2 : 1` is now threaded through
+  `qk_norm_rope`, `attn`, `attn_combine` and the plan's q out_stride.
+* **K=896 is not a 256 multiple**, so the Q4_K_M file stores those tensors as
+  Q5_0/Q8_0.  Q5_0 is not SIn-packable, so the model must take the per-tensor /
+  multi-device path (`auto_layer_map=true` + `auto_layer_map_one_gpu=true`) even
+  on one GPU; the single-device path's raw GEMV truncates K to K/256.  Q5_0
+  dequantization is in `quant.h` and `kernel_utils.h`, and `add_weight` accepts
+  type 6.
+
+**Verification (must keep):** against llama.cpp `llama-mtmd-cli` on the same
+1036x1036 page, `MTMD_DEBUG_EMBEDDINGS` gives 1369 tokens x 896 and a vision
+cos of **0.999997** (max|diff| 33 on a 69 RMS); a text prompt's first top-1
+matches (id 220); the layout boxes and text contents match (a few boxes differ
+by 1-2/1000).  The vision self-check (`PF_MINERU_DEBUG=1`) compares the host and
+device towers on a small crop.
+
+**Precision:** the int8 oneDNN path is the default and produces the same layout
+as f32.  `PF_F32=1` dequantizes the decoder linears and runs the generic f32
+GEMM (`vit_gemm` + `vit_silu_mul`) as an accuracy A/B; it costs ~4x the weight
+traffic.  `PF_VISION_F32=1` does the same for the vision linears (default f16).
+
+**MinerU image/chart extraction is always on.**  `--mineru-image-analysis` was
+removed: image and chart blocks are cropped and analysed (`\nImage Analysis:`)
+with every other block type, so the reference's default `false` is deliberately
+not reproduced.
+
+**Performance:** the vision tower dominates (5476 patches, 32 full bidirectional
+layers).  `vit_attn_impl<80,16,64>` is the known-correct SLM shape; BQ=32 is
+faster but corrupts/hangs when `n_tok` is not a multiple of 32 (the 56x56 probe
+is 16 tokens) until the padded rows are guarded.  A full layout + 10 text
+blocks is ~2-3 minutes on one A770.
+
 ### OpenAI-compatible API
 
 `GET /v1/models` lists the model (id from the GGUF `general.name`) and
@@ -3308,6 +3420,8 @@ overrides it; `K:V` sizes K and V independently, e.g. `i4:i8`), `PF_KV_F32`,
 `PF_SI4` (re-quantize weights to 4-bit SIn), `PF_META` (fp32 side scales).
 
 **Compute path**
+`PF_F32` (Qwen2-VL: use the f32 text GEMM instead of int8; default off),
+`PF_VISION_F32` (Qwen2-VL: keep the vision linears in f32 instead of f16; default off),
 `PF_YARN` (YaRN context extension, **default off**; `--yarn`), `PF_YARN_FACTOR`
 (the extension factor; 0/absent derives `--ctx / <arch>.context_length`),
 `PF_YARN_ORIG_CTX` (override the trained context the factor is measured
@@ -3561,6 +3675,23 @@ measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
 **Expert split / ncmoe / three-tier expert cache** (`--moe-resident N`,
 `--moe-vram-mb MB`, `--moe-ram-mb MB`; routed-MoE models only, see
 [`docs/design/15-moe-ncmoe.md`](docs/design/15-moe-ncmoe.md))
+`PF_MINERU_DEBUG` (MinerU: raw layout, per-block prints, host-vs-device vision self-check),
+`PF_MINERU_PROBE` (self-check crop side, default 56),
+`PF_MINERU_NOMROPE` / `PF_MINERU_ZERO_EMBD` / `PF_MINERU_DUMP_EMBD` (MinerU A/B dumps),
+`PF_MINERU_TIME` (MinerU: one line per image with prep / vision / prefill-to-first-token /
+decode / total ms, plus the mmproj load+upload time),
+`PF_VISION_TIME` (vision encoder: one line per encode with patch / merger / post_ln and
+the per-stage totals over all layers - ln1, qkv, rope, attn, out, ln2, up, act, down -
+taken with a `q.wait()` per stage, so only the diagnostic pays for them),
+`PF_VISION_DNNL` (vision linears on the oneDNN int8 matmul; default **on** for `qwen2vl`
+- verified byte-identical page output - and **off** for `qwen3vl`, whose BF16 tower has
+not been measured here; `0` restores `vit_gemm`),
+`PF_VIT_ATTN` (vision attention tile sweep: 0 = 32/32/512, 1 = 64/16/512, 2 = 32/32/1024
+default, 3 = 16/32/512, 4 = 32/32/256, 5 = 64/16/1024),
+`PF_MM_BATCH_PREFILL` (multimodal prefill in chunk-batched mode 2 - up to `kMaxB*kMaxT`
+tokens per forward, except on the pipelined two-GPU path; default on, `0` restores
+one 32-token mode-1 chunk per forward.  The pipelined path alternates step_infos and
+the M-RoPE/img_row arrays are written into one, so it keeps mode 1),
 `PF_MOE_RESIDENT` (experts kept on the device per layer, 0 = every expert
 resident, the default and what a model that fits does anyway),
 `PF_MOE_VRAM_MB` (device budget for the expert bank - authoritative over the

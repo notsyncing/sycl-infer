@@ -9,9 +9,10 @@ namespace si {
 void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm, void * kpool,
                       void * vpool, const int32_t * tables, const cpu_step_info * info, int n_head, int n_head_kv,
                       int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows, int n_real,
-                      cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales) {
+                      cpu_kv_dtype kkv, cpu_kv_dtype vkv, const void * kscales, const void * vscales,
+                      const float * q_bias, const float * k_bias, const float * v_bias, int qgate) {
     (void)max_blocks;
-    const int qstride = n_head * 2 * head_dim;
+    const int qstride = n_head * qgate * head_dim;
     const int kvstride = n_head_kv * head_dim;
     const int total = n_rows * n_real;
     par(total, [&](int idx) {
@@ -24,15 +25,23 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
         const int row = r * info->tpb + t;
         const int32_t * table = tables + (size_t)info->slot[r] * max_blocks;
         for (int h = 0; h < n_head; h++) {
-            float * qh = qbuf + (size_t)row * qstride + (size_t)h * 2 * head_dim;
-            rmsnorm_inplace(qh, q_norm, head_dim, eps);
+            float * qh = qbuf + (size_t)row * qstride + (size_t)h * qgate * head_dim;
+            if (q_bias) {
+                const float * qb = q_bias + (size_t)h * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    qh[d] += qb[d];
+                }
+            }
+            if (q_norm) {
+                rmsnorm_inplace(qh, q_norm, head_dim, eps);
+            }
             if (info->mrope_on) {
                 const int ridx = r * kCpuT + t;
                 const int n = kCpuB * kCpuT;
                 if (n_rot >= 2) {
                     const int half = n_rot / 2;
                     for (int i = 0; i < half; i++) {
-                        const int sec = mrope_section(info, i);
+                        const int sec = mrope_section(info, i, n_rot);
                         const int rp = info->mrope[sec * n + ridx];
                         // YaRN, as in rope_apply(): a null table is plain RoPE.
                         const float ang = rope_freqs ? (float)rp * rope_freqs[i]
@@ -49,14 +58,22 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
         }
         for (int h = 0; h < n_head_kv; h++) {
             float * khp = kbuf + (size_t)row * kvstride + (size_t)h * head_dim;
-            rmsnorm_inplace(khp, k_norm, head_dim, eps);
+            if (k_bias) {
+                const float * kb = k_bias + (size_t)h * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    khp[d] += kb[d];
+                }
+            }
+            if (k_norm) {
+                rmsnorm_inplace(khp, k_norm, head_dim, eps);
+            }
             if (info->mrope_on) {
                 const int ridx = r * kCpuT + t;
                 const int n = kCpuB * kCpuT;
                 if (n_rot >= 2) {
                     const int half = n_rot / 2;
                     for (int i = 0; i < half; i++) {
-                        const int sec = mrope_section(info, i);
+                        const int sec = mrope_section(info, i, n_rot);
                         const int rp = info->mrope[sec * n + ridx];
                         // YaRN, as in rope_apply(): a null table is plain RoPE.
                         const float ang = rope_freqs ? (float)rp * rope_freqs[i]
@@ -116,6 +133,15 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
         }
         for (int h = 0; h < n_head_kv; h++) {
             const float * vhp = vbuf + (size_t)row * kvstride + (size_t)h * head_dim;
+            float vt[256];
+            if (v_bias) {
+                const float * vbias = v_bias + (size_t)h * head_dim;
+                const int nd = head_dim < 256 ? head_dim : 256;
+                for (int d = 0; d < nd; d++) {
+                    vt[d] = vhp[d] + vbias[d];
+                }
+                vhp = vt;
+            }
             const int vb = table[pos / kCpuBlk];
             const int ko = pos % kCpuBlk;
             const size_t unit = (size_t)vb * n_head_kv + h;

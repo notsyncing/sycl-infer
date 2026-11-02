@@ -7,7 +7,9 @@
 // n_tok x n_tok score matrix.
 // ---------------------------------------------------------------------------
 #include "kernels.h"
+#include "device/device_profile.h"
 #include "common/rope.h"
+#include "common/env.h"
 #include "kernel_utils.h"
 
 #include <cmath>
@@ -28,6 +30,8 @@ inline float bf16_to_f32(uint16_t h) {
 template <uint32_t WT> inline float load_w(const void * w, size_t idx) {
     if constexpr (WT == GGML_TYPE_BF16) {
         return bf16_to_f32(((const uint16_t *)w)[idx]);
+    } else if constexpr (WT == GGML_TYPE_F16) {
+        return ggml_half_to_float(((const uint16_t *)w)[idx]);
     } else {
         return ((const float *)w)[idx];
     }
@@ -43,6 +47,14 @@ template <uint32_t WT> inline void load_w8(const void * w, size_t base, float * 
         for (int j = 0; j < 4; j++) {
             dst[2 * j] = sycl::bit_cast<float>((u[j] & 0xFFFFu) << 16);
             dst[2 * j + 1] = sycl::bit_cast<float>(u[j] & 0xFFFF0000u);
+        }
+    } else if constexpr (WT == GGML_TYPE_F16) {
+        const uint4 v = *reinterpret_cast<const uint4 *>((const uint16_t *)w + base);
+        const uint32_t u[4] = {v.x(), v.y(), v.z(), v.w()};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            dst[2 * j] = ggml_half_to_float((uint16_t)(u[j] & 0xFFFFu));
+            dst[2 * j + 1] = ggml_half_to_float((uint16_t)(u[j] >> 16));
         }
     } else {
         const float4 a = *reinterpret_cast<const float4 *>((const float *)w + base);
@@ -106,7 +118,7 @@ static void vit_gemm_impl(queue & q, const void * wv, int N, int K, const float 
 #pragma unroll
             for (int r = 0; r < RP; r++) {
                 const int row = sycl::min(rowc + r, N - 1);
-                wrow_ptr[r] = (const char *)wv + (size_t)row * K * (WT == GGML_TYPE_BF16 ? 2 : 4);
+                wrow_ptr[r] = (const char *)wv + (size_t)row * K * ((WT == GGML_TYPE_BF16 || WT == GGML_TYPE_F16) ? 2 : 4);
             }
 
             float acc[TP][RP];
@@ -201,6 +213,8 @@ void vit_gemm_launch(queue & q, const void * w, uint32_t wtype, int N, int K, co
                      float * out, int out_stride, int T, float alpha, const float * residual) {
     if (wtype == GGML_TYPE_BF16) {
         vit_gemm_impl<GGML_TYPE_BF16, 4, 4, 8>(q, w, N, K, x, x_stride, out, out_stride, T, alpha, residual);
+    } else if (wtype == GGML_TYPE_F16) {
+        vit_gemm_impl<GGML_TYPE_F16, 4, 4, 8>(q, w, N, K, x, x_stride, out, out_stride, T, alpha, residual);
     } else {
         vit_gemm_impl<GGML_TYPE_F32, 4, 4, 8>(q, w, N, K, x, x_stride, out, out_stride, T, alpha, residual);
     }
@@ -251,6 +265,45 @@ void vit_gelu_launch(queue & q, float * x, int n) {
         const float v = x[i];
         const float c = 0.7978845608028654f; // sqrt(2/pi)
         x[i] = 0.5f * v * (1.0f + sycl::tanh(c * (v + 0.044715f * v * v * v)));
+    });
+}
+
+// Qwen2-VL's vision blocks use quick_gelu: x * sigmoid(1.702*x).
+void vit_quick_gelu_launch(queue & q, float * x, int n) {
+    if (n <= 0) {
+        return;
+    }
+    q.parallel_for(sycl::range<1>((size_t)n), [=](id<1> i) {
+        const float v = x[i];
+        x[i] = v / (1.0f + sycl::exp(-1.702f * v));
+    });
+}
+
+// exact (erf) GELU, used by the patch merger (torch nn.GELU)
+void vit_gelu_errf_launch(queue & q, float * x, int n) {
+    if (n <= 0) {
+        return;
+    }
+    q.parallel_for(sycl::range<1>((size_t)n), [=](id<1> i) {
+        const float v = x[i];
+        x[i] = 0.5f * v * (1.0f + sycl::erf(v * 0.7071067811865476f));
+    });
+}
+
+// f32 GEMM path: the ffn_down input is silu(gate) * up.
+void vit_silu_mul_launch(queue & q, const float * gate, const float * up, int stride, float * out, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) {
+        return;
+    }
+    q.parallel_for(sycl::nd_range<1>((size_t)rows * 256, 256), [=](sycl::nd_item<1> it) {
+        const int r = (int)it.get_group(0);
+        const float * g = gate + (size_t)r * stride;
+        const float * u = up + (size_t)r * stride;
+        float * o = out + (size_t)r * cols;
+        for (int i = (int)it.get_local_id(0); i < cols; i += 256) {
+            const float v = g[i];
+            o[i] = (v / (1.0f + sycl::exp(-v))) * u[i];
+        }
     });
 }
 
@@ -335,7 +388,7 @@ void vit_rope_launch(queue & q, float * qkv, int qkv_stride, int n_tok, int n_he
 // The query tile is the one to halve: BK is woven through the online softmax
 // (the four-lanes-per-row reduction, the P/V inner loop), while BQ only
 // selects how many query rows share the staged K/V.
-template <int HD, int BQ, int BK>
+template <int HD, int BQ, int BK, int WG = 128>
 static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok,
                           int n_head, float scale) {
     if (n_tok <= 0 || n_head <= 0) {
@@ -343,7 +396,6 @@ static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * 
     }
     constexpr int HDP = HD + 4;
     constexpr int SDP = BK + 4;
-    constexpr int WG = 128;
     const int n_qb = (n_tok + BQ - 1) / BQ;
     const int embd = n_head * HD;
     const int total_qb = n_head * n_qb;
@@ -398,16 +450,23 @@ static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * 
                     if (r < n_q && k < n_k) {
                         const float * qr = &s_q[r * HDP];
                         const float * kr = &s_k[k * HDP];
+                        // Four independent accumulators: the single-accumulator
+                        // form is an 80-deep dependent FMA chain per pair, and
+                        // this loop is the kernel's hottest path (measured 95%
+                        // of the vision forward once the linears moved to
+                        // oneDNN).  The summation order changes, so the result
+                        // differs at the last ulp - the md5 check is the oracle.
+                        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
 #pragma unroll
                         for (int d = 0; d < HD; d += 4) {
                             const float4 a = *reinterpret_cast<const float4 *>(qr + d);
                             const float4 b = *reinterpret_cast<const float4 *>(kr + d);
-                            acc = sycl::fma(a.x(), b.x(), acc);
-                            acc = sycl::fma(a.y(), b.y(), acc);
-                            acc = sycl::fma(a.z(), b.z(), acc);
-                            acc = sycl::fma(a.w(), b.w(), acc);
+                            a0 = sycl::fma(a.x(), b.x(), a0);
+                            a1 = sycl::fma(a.y(), b.y(), a1);
+                            a2 = sycl::fma(a.z(), b.z(), a2);
+                            a3 = sycl::fma(a.w(), b.w(), a3);
                         }
-                        acc *= scale;
+                        acc = ((a0 + a1) + (a2 + a3)) * scale;
                     }
                     s_s[r * SDP + k] = acc;
                 }
@@ -529,6 +588,39 @@ void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, 
     switch (head_dim) {
     case 64: vit_attn_impl<64, 32, 64>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
     case 72: vit_attn_impl<72, 16, 64>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+    // Qwen2-VL: 16 heads x 80.  BQ=32 / BK=32 is 47.6 KiB of SLM (BQ=32 with
+    // BK=64 would be 73 KiB, over the per-work-group limit), and it halves the
+    // K/V staging traffic (each staged key block is reused by twice as many
+    // query rows).  The padded rows are guarded explicitly in every stage, so
+    // any n_tok is safe (the 56x56 self-check is 16 tokens, a partial tile on
+    // both axes).
+    //
+    // WG=512/1024: the 47.6 KiB of SLM allows one workgroup per Xe core, so the
+    // workgroup's warp count IS the core's occupancy.  At 128 threads that is
+    // four warps on a 16-EU core (a quarter of it idle); 512/1024 fills it.
+    // Measured on the layout page (32 layers, np=5476, attention ms):
+    //   16/64/128 10473 | 16/32/512 4658 | 32/32/128 8106 | 32/32/256 4563
+    //   32/32/512 3720 | 64/16/512 3335 | 32/32/1024 3263 (default)
+    // PF_VIT_ATTN picks an alternative tile for the sweep.
+    case 80: {
+        int cfg = SI_ENV_I32("PF_VIT_ATTN", 2);
+        // The 1024-thread variants fill a 512-EU A770 core; an Iris Xe caps a
+        // work-group at 512, so fall back to the 32/32/512 tile there (the
+        // launcher's own device query is cached by si::dev).
+        if (si::dev::wg_clamped_for_queue(q, 1024) < 1024 && (cfg == 2 || cfg == 5)) {
+            cfg = 0;
+        }
+        switch (cfg) {
+        case 1: vit_attn_impl<80, 64, 16, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 2: vit_attn_impl<80, 32, 32, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 3: vit_attn_impl<80, 16, 32, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 4: vit_attn_impl<80, 32, 32, 256>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 5: vit_attn_impl<80, 64, 16, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 0: vit_attn_impl<80, 32, 32, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        default: vit_attn_impl<80, 32, 32, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        }
+        break;
+    }
     default: break; // vision_model::runnable() rejects anything else up front
     }
 }

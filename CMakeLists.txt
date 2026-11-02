@@ -175,8 +175,10 @@ add_library(sycl_infer_core STATIC
     src/model/qwen35.cpp
     src/model/qwen35moe.cpp
     src/model/qwen4exp.cpp
+    src/model/qwen2vl.cpp
     src/model/profiles/generic.cpp
     src/model/profiles/qwen4exp.cpp
+    src/model/profiles/qwen2vl.cpp
     src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
@@ -284,7 +286,7 @@ endif()
 
 # ------------------------------------------------------------------- binaries
 if(NOT SI_ROUTER_ONLY)
-add_executable(sycl-infer src/main.cpp)
+add_executable(sycl-infer src/main.cpp src/mineru.cpp)
 target_link_libraries(sycl-infer PRIVATE sycl_infer_core)
 endif()
 

@@ -52,6 +52,7 @@ static const loader kLoaders[] = {
     {"qwen35", &load_qwen35, &kQwen35Profile},
     {"qwen35moe", &load_qwen35moe, &kQwen35MoeProfile},
     {"qwen4exp", &load_qwen4exp, &kQwen4ExpProfile},
+    {"qwen2vl", &load_qwen2vl, &kQwen2VlProfile},
 };
 
 const loader * find(const std::string & name) {
@@ -130,21 +131,20 @@ void report(const model_profile & p) {
 // Called from model::load for every architecture, so a new loader inherits it.
 void validate_hparams(const hparams & hp, const std::string & arch) {
     const std::string p = arch + ": ";
-    // attn.cpp's generic (non-specialised) attention kernel sizes its per-split
-    // partials with a *literal* `constexpr int HD = 256`, not with head_dim, so
-    // any other head_dim makes it write 2 + 256 floats into a stride of
-    // 2 + head_dim and overrun the partials buffer.  The special-cased kernels
-    // (oneDNN attention, flash, grouped) all guard on head_dim == HD and simply
-    // fall through to that same generic one, so there is no supported shape
-    // other than 256.
-    if (hp.head_dim != 256) {
-        throw std::runtime_error(p + "unsupported head_dim " + std::to_string(hp.head_dim) +
-                                 " (the attention kernels only support 256)");
+    // The classic attention kernel maps one 32-lane sub-group over the head
+    // (`lane + 32*i`, i < head_dim/32), so any multiple of 32 is exact.  The
+    // specialised kernels (oneDNN attention, flash, grouped decode) are
+    // guarded on head_dim == 256 and fall back to the classic one, which is
+    // what Qwen2-VL's 64-wide heads take.
+    if (hp.head_dim < 32 || hp.head_dim % 32 != 0) {
+        throw std::runtime_error(p + "head_dim " + std::to_string(hp.head_dim) +
+                                 " must be a positive multiple of 32 (the attention sub-group width)");
     }
-    if (hp.head_dim % 32 != 0) {
-        // qk_norm_rope's RMSNorm loop is `head_dim / 32` over a 32-lane
-        // sub-group; a non-multiple silently leaves the tail unnormalized.
-        throw std::runtime_error(p + "head_dim must be a multiple of 32 (the QK-norm sub-group width)");
+    if (hp.head_dim > 256) {
+        // partials are `2 + head_dim` per (token, head, split); the allocation
+        // follows head_dim, but the classic kernel's register array is sized
+        // for 256 and the KV layouts assume at most one 32-lane block per byte.
+        throw std::runtime_error(p + "head_dim " + std::to_string(hp.head_dim) + " exceeds the 256 ceiling");
     }
     if (hp.n_head <= 0 || hp.n_head_kv <= 0 || hp.n_head % hp.n_head_kv != 0) {
         // GQA is expanded as kvh = h * n_head_kv / n_head and the grouped/flash

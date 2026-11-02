@@ -157,6 +157,10 @@ engine::engine(const engine_config & cfg)
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     mp_ = m.prof;
+    {
+        const char * e = si::env::str("PF_F32");
+        f32_path_ = e && atoi(e) != 0 ? true : (e && atoi(e) == 0 ? false : mp_->rep.f32_gemm);
+    }
     if (!mp_) {
         throw std::runtime_error("model loaded without a model profile");
     }
@@ -260,6 +264,9 @@ engine::engine(const engine_config & cfg)
         try {
             ngpu = (int)sycl::device::get_devices(sycl::info::device_type::gpu).size();
         } catch (...) {
+            ngpu = 1;
+        }
+        if (mp_->policy.auto_layer_map_one_gpu) {
             ngpu = 1;
         }
         const int n = m.hp.n_layer;
@@ -378,6 +385,9 @@ engine::engine(const engine_config & cfg)
     // upload weights after setup_multi_device so multi-device can skip the
     // full-blob device copy and instead upload only each partition's tensors
     m.upload(q, /*host=*/cpu_mode || multi_dev);
+    if (f32_path_) {
+        build_f32_weights();
+    }
     if (m.dev_weights) {
         // The single-device path keeps the whole GGUF blob on the device.
         dev_used_bytes_.assign(1, 0);
@@ -1165,6 +1175,11 @@ std::vector<engine::md_phase> engine::split_md_phases() const {
 
 void * engine::alloc_bytes(size_t bytes) {
     const bool host = cpu_mode || host_act;
+    // A dense model with no GDN layers asks for zero-byte state buffers; the
+    // USM allocators return null for size 0, which used to read as OOM.
+    if (bytes == 0) {
+        bytes = 1;
+    }
     void * p = host ? sycl::malloc_host(bytes, q) : sycl::malloc_device(bytes, q);
     if (!p) {
         throw std::runtime_error("device alloc failed");
@@ -1182,6 +1197,9 @@ void * engine::dev_alloc_on(int dev, size_t bytes) {
         }
         dev_used_bytes_[0] += bytes;
         return p;
+    }
+    if (bytes == 0) {
+        bytes = 1; // see alloc_bytes: a dense model's GDN state is empty
     }
     void * p = dev_kind_[(size_t)dev] == 1 ? sycl::malloc_host(bytes, q)
                                            : sycl::malloc_device(bytes, *dev_queues_[(size_t)dev]);
@@ -2255,6 +2273,44 @@ const void * engine::wptr(int dev, const void * host) const {
 // holds just its partition of the weights instead of a whole-file copy.  Each
 // tensor gets its own device allocation; wptr() resolves host -> device through
 // this map, so the CPU-side layers' weights never occupy GPU memory.
+void engine::build_f32_weights() {
+    if (!f32_path_ || cpu_mode) {
+        return;
+    }
+    auto add = [&](const wt & w) {
+        if (!w.data || w.K <= 0 || w.N <= 0) {
+            return;
+        }
+        const void * key = wptr(0, w.data);
+        if (!key || f32_weights_.count(key)) {
+            return;
+        }
+        std::vector<float> buf((size_t)w.K * (size_t)w.N);
+        std::vector<float> row((size_t)w.K);
+        const char * base = (const char *)w.data;
+        const size_t rb = quant_row_bytes(w.type, (size_t)w.K);
+        for (int r = 0; r < w.N; r++) {
+            dequantize_row(w.type, base + (size_t)r * rb, row.data(), (int64_t)w.K);
+            std::memcpy(buf.data() + (size_t)r * w.K, row.data(), (size_t)w.K * sizeof(float));
+        }
+        float * d = (float *)dev_alloc_on(0, buf.size() * sizeof(float));
+        q.memcpy(d, buf.data(), buf.size() * sizeof(float)).wait();
+        f32_weights_[key] = f32wt{d, w.K, w.N};
+    };
+    for (auto & L : m.layers) {
+        layer_t::wl wls[7];
+        const int nw = L.lay_wts(wls);
+        for (int i = 0; i < nw; i++) {
+            add(*wls[i].w);
+        }
+    }
+    add(m.output);
+    const int maxk = std::max(m.hp.n_embd, m.hp.n_ff);
+    const size_t act = (size_t)kMaxB * kMaxT * (size_t)maxk;
+    d_f32act = (float *)dev_alloc_on(0, act * sizeof(float));
+    fprintf(stderr, "[dev] f32 GEMM path: %zu tensors\n", f32_weights_.size());
+}
+
 void engine::upload_device_weights(int dev) {
     auto & mp = weight_maps_[(size_t)dev];
     std::unordered_set<const void *> need;
@@ -2346,6 +2402,9 @@ void engine::upload_device_weights(int dev) {
             addp(L.wo.data);
             addp(L.q_norm);
             addp(L.k_norm);
+            addp(L.q_bias);
+            addp(L.k_bias);
+            addp(L.v_bias);
         }
         if (m.q4exp) {
             // the router and the shared-expert gate stay on the device even when
@@ -3275,7 +3334,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // accepts, and the fp32 dequant GEMV handles them all.  The profile says
         // whether the file can take the SIn store at all (rep.sin_w8); oneDNN
         // eligibility is decided by setup_md_dnnl() itself.
-        md_xmx = has_gpu && !dp4a_env_off && setup_md_dnnl();
+        md_xmx = has_gpu && !dp4a_env_off && !f32_path_ && setup_md_dnnl();
         md_int8 = has_gpu && !dp4a_env_off && mp_->rep.sin_w8 && !md_xmx;
         // md_xmx means "oneDNN int8 weights are available", not that the XMX
         // arrays are used: for the grouped-scale shapes here oneDNN selects
@@ -4339,13 +4398,36 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
             q4_prefill_mm(*mm, 0);
             pos = nprompt;
         } else {
+            // Chunk-batched (mode 2) prefill, the same path prefill_text uses.
+            // The image prompt's M-RoPE positions and img_row map are written
+            // per token and indexed as [row*kMaxT + t], which is exactly the
+            // contiguous layout mm_write_step produces for n tokens, so a
+            // multi-row batch is valid here.  Mode 1 (32-token chunks) re-reads
+            // every weight per chunk: on the 5476-patch layout page that is 44
+            // forwards instead of two, and it was the largest remaining text
+            // cost of a page.  PF_MM_BATCH_PREFILL=0 restores the old loop.
+            //
+            // Not on the pipelined two-GPU path: it alternates between d_info and
+            // d_info2_, and the M-RoPE/img_row arrays are written into d_info only
+            // (mm_write_step above), so its second chunk would read stale
+            // per-token positions.  Every other layout (single GPU - which
+            // qwen2vl always takes, the per-tensor upload still sets multi_dev -
+            // and the non-pipelined multi-GPU phases) uses d_info and is safe.
+            const bool batch_pf = si::env::i32("PF_MM_BATCH_PREFILL", 1) != 0 && !pf_pipe_ok_;
             while (pos < nprompt) {
-                const int n = std::min<int>(kMaxT, nprompt - pos);
+                const int rem = nprompt - pos;
+                const int fit = batch_pf && !cpu_mode ? batched_prefill_fit(rem) : 0;
+                const bool batched = fit >= 1 && fit <= rem;
+                const int n = batched ? fit : std::min<int>(kMaxT, rem);
                 // per-chunk M-RoPE positions (section-major) and image row mapping
                 d_info->mrope_on = 1;
                 d_info->img_embd = mm->d_embd ? mm->d_embd : (mm->embd.empty() ? nullptr : d_img_embd);
                 mm_write_step(*mm, pos, n, kMaxB * kMaxT, d_info->mrope, d_info->img_row);
-                prefill_chunk(prompt, pos, n, 0);
+                if (batched) {
+                    prefill_batch(prompt, pos, n, 0, pos);
+                } else {
+                    prefill_chunk(prompt, pos, n, 0);
+                }
                 pos += n;
             }
         }

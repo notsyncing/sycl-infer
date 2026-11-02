@@ -113,13 +113,28 @@ inline size_t kv_row_off_i4(size_t unit, int ko, int head_dim) {
 }
 
 // ---- RoPE (plain + the 4-section M-RoPE used by the text model) ------------
-inline int mrope_section(const cpu_step_info * info, int pair) {
+inline int mrope_section(const cpu_step_info * info, int pair, int n_rot) {
     const int s0 = info->mrope_sections[0];
     const int s1 = info->mrope_sections[1];
     const int s2 = info->mrope_sections[2];
     const int s3 = info->mrope_sections[3];
     const int sect = s0 + s1 + s2 + s3;
     const int sector = sect > 0 ? (pair % sect) : pair;
+    // Qwen2-VL's sections sum to n_rot/2 and are *blocked* (t, then row, then
+    // col); Qwen3.5's interleave by sector%3.  Same discriminator as the device
+    // kernel.
+    if (sect == n_rot / 2) {
+        if (sector < s0) {
+            return 0;
+        }
+        if (sector < s0 + s1) {
+            return 1;
+        }
+        if (sector < s0 + s1 + s2) {
+            return 2;
+        }
+        return 3;
+    }
     if (sector % 3 == 1 && sector < 3 * s1) {
         return 1;
     }

@@ -155,11 +155,12 @@ struct cpu_backend : compute_backend {
                       void * kpool, void * vpool, const int32_t * tables, const step_info * info, int n_head,
                       int n_head_kv, int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale,
                       float eps, int max_blocks, int n_rows, int n_real, const void * kscales,
-                      const void * vscales) override {
+                      const void * vscales, const float * q_bias, const float * k_bias,
+                      const float * v_bias, int qgate) override {
         const cpu_step_info ci = to_cpu_info(info);
         cpu_qk_norm_rope(qbuf, kbuf, vbuf, q_norm, k_norm, kpool, vpool, tables, &ci, n_head, n_head_kv, head_dim,
                          n_rot, rope_base, rope_freqs, rope_mscale, eps, max_blocks, n_rows, n_real, to_cpu_kv(),
-                         to_cpu_vkv(), kscales, vscales);
+                         to_cpu_vkv(), kscales, vscales, q_bias, k_bias, v_bias, qgate);
     }
     void attn(const float * qbuf, const float * gate, const void * kpool, const void * vpool, float * partials,
               const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits, const step_info * info,

@@ -13,7 +13,11 @@ using namespace si::kd;
 // ---------------------------------------------------------------------------
 void embed_launch(queue & q, const void * table, uint32_t type, const step_info * info, float * out, int n_embd,
                   size_t row_bytes) {
-    const int n_sb = n_embd / 256;
+    // n_embd is not necessarily a multiple of 256: Qwen2-VL's 896 is 3.5
+    // superblocks, and truncating to 3 left the last 128 embedding values
+    // unwritten.  The partial superblock is a prefix of the block types whose
+    // group is 32 (Q8_0/Q5_0/Q5_1), so the guard below is all it needs.
+    const int n_sb = (n_embd + 255) / 256;
     const int sb_bytes = superblock_bytes(type);
     // fixed grid (kMaxB*kMaxT rows): the row count is device-side state, so a
     // host-computed extent would be captured as zero in a command graph
@@ -26,6 +30,10 @@ void embed_launch(queue & q, const void * table, uint32_t type, const step_info 
         const int row = t / info->tpb;
         if (row >= info->n_rows || (t - row * info->tpb) >= row_nr(info, row)) {
             return;
+        }
+        const int col = sb * 256 + tid;
+        if (col >= n_embd) {
+            return; // partial tail superblock
         }
         // multimodal: tokens whose embedding was produced by the vision encoder
         // are copied verbatim instead of looked up in the token table

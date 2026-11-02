@@ -24,6 +24,7 @@ extern const model_profile kQwen35Profile = {
         "inherited: the 0.8B is the tied-head reference and the 27B is the untied split reference.",
 
     .fwd = model_profile::fwd_kind::generic_plan,
+    .vision = model_profile::vision_kind::qwen3vl,
 
     .residual = {.hyper = false, .streams = 0, .low_rank = 0},
     .extras = {.ple = false, .qsa = false, .qsa_top_k = 0, .qsa_pool = 0, .idx_heads = 0, .idx_head_dim = 0},
@@ -33,7 +34,15 @@ extern const model_profile kQwen35Profile = {
         .prefill = model_profile::prefill_kind::chunk32,
         .prefix_cache = true,
         .auto_layer_map = false,
-        .md_splits = false,
+        .auto_layer_map_one_gpu = false,
+        // MEASURED on the 35B / Arc 140V (2026-11-01): the generic multi-device
+        // path pins dec_splits to 1, so a single-token decode runs one warp per
+        // (token, head) over the whole KV - 0.07 T-MAC/s.  With the derived
+        // split (24 on this card) the 3.2k-token decode is 34.2 -> 29.9
+        // ms/token and the prefill is neutral.  The old pin existed for the
+        // multi-device split bug (fixed by the nat staging index); the
+        // decode-vs-prefill oracle is run with the split on.
+        .md_splits = true,
         .engram_ram_mb_default = 0, // no PLE module
     },
 
@@ -65,6 +74,7 @@ extern const model_profile kQwen35MoeProfile = {
         "everything except identity and the MoE note.",
 
     .fwd = model_profile::fwd_kind::generic_plan,
+    .vision = model_profile::vision_kind::qwen3vl,
 
     .residual = {.hyper = false, .streams = 0, .low_rank = 0},
     .extras = {.ple = false, .qsa = false, .qsa_top_k = 0, .qsa_pool = 0, .idx_heads = 0, .idx_head_dim = 0},
@@ -74,6 +84,7 @@ extern const model_profile kQwen35MoeProfile = {
         .prefill = model_profile::prefill_kind::chunk32,
         .prefix_cache = true,
         .auto_layer_map = false,
+        .auto_layer_map_one_gpu = false,
         // MEASURED on the 35B / Arc 140V (2026-11-01): the generic multi-device
         // path pins dec_splits to 1, so a single-token decode runs one warp per
         // (token, head) over the whole KV - 0.07 T-MAC/s.  With the derived

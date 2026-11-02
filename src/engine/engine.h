@@ -302,6 +302,18 @@ struct engine {
     // holds just its partition of the weights, not a whole-GGUF copy.  Empty
     // for a backend that reads the host mmap directly (CPU).
     std::vector<std::unordered_map<const void *, void *>> weight_maps_;
+    // f32 copies of the decoder linears, keyed by their raw device pointer.
+    // Only built when the model profile asks for the f32 GEMM path.
+    struct f32wt {
+        float * ptr = nullptr;
+        int K = 0;
+        int N = 0;
+    };
+    std::unordered_map<const void *, f32wt> f32_weights_;
+    // resolved at construction from the model profile, with PF_F32=0 as the A/B
+    bool f32_path_ = false;
+    float * d_f32act = nullptr;
+    void build_f32_weights();
     // multi-device decode: per-backend map of the SIn (w8) copies of the GPU
     // partitions' layer weights (host tensor pointer -> w8t on that device,
     // allocated on the device's queue).  The single-sequence decode plan then

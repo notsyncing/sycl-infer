@@ -419,6 +419,17 @@ template <uint32_t TYPE> inline void dequant_sb_lane_impl(const char * sb, int l
             w[h * 4 + 3] = d * sc[is + 6] * (int)(((ql1 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32);
         }
     } break;
+    case 6: { // Q5_0: 8 independent 32-value blocks, lane = value index
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            auto * blk = (const block_q5_0 *)(sb + b * (int)sizeof(block_q5_0));
+            const uint32_t qh = (uint32_t)blk->qh[0] | ((uint32_t)blk->qh[1] << 8) |
+                                ((uint32_t)blk->qh[2] << 16) | ((uint32_t)blk->qh[3] << 24);
+            const int hi = (int)((qh >> lane) & 1u);
+            const int lo = (blk->qs[lane % 16] >> (4 * (lane / 16))) & 0xF;
+            w[b] = fast_h2f(blk->d) * (float)((lo | (hi << 4)) - 16);
+        }
+    } break;
     case 8: { // Q8_0
 #pragma unroll
         for (int b = 0; b < 8; b++) {
@@ -467,6 +478,7 @@ inline void dequant_sb_lane(uint32_t type, const char * sb, int lane, float w[8]
     case 21: dequant_sb_lane_typed<21>(sb, lane, w); break;
     case 23: dequant_sb_lane_typed<23>(sb, lane, w); break;
     case 8: dequant_sb_lane_typed<8>(sb, lane, w); break;
+    case 6: dequant_sb_lane_typed<6>(sb, lane, w); break;
     case 7: dequant_sb_lane_typed<7>(sb, lane, w); break;
     case 30: dequant_sb_lane_typed<30>(sb, lane, w); break;
     case 1: dequant_sb_lane_typed<1>(sb, lane, w); break;
@@ -529,6 +541,15 @@ inline float dequant_elem_sb(uint32_t type, const char * sb, int e) {
         const int blk = e / 32, l = e % 32;
         auto * b = (const block_q8_0 *)(sb + blk * (int)sizeof(block_q8_0));
         return ggml_half_to_float(b->d) * b->qs[l];
+    }
+    case 6: {
+        const int blk = e / 32, l = e % 32;
+        auto * b = (const block_q5_0 *)(sb + blk * (int)sizeof(block_q5_0));
+        const uint32_t qh = (uint32_t)b->qh[0] | ((uint32_t)b->qh[1] << 8) |
+                            ((uint32_t)b->qh[2] << 16) | ((uint32_t)b->qh[3] << 24);
+        const int hi = (int)((qh >> l) & 1u);
+        const int lo = (b->qs[l % 16] >> (4 * (l / 16))) & 0xF;
+        return ggml_half_to_float(b->d) * (float)((lo | (hi << 4)) - 16);
     }
     case 7: {
         const int blk = e / 32, l = e % 32;
@@ -596,6 +617,14 @@ inline float dequant_lane_w(uint32_t type, const char * sb, int b, int lane) {
         auto * blk = (const block_q8_0 *)(sb + b * (int)sizeof(block_q8_0));
         return ggml_half_to_float(blk->d) * blk->qs[lane];
     }
+    case 6: {
+        auto * blk = (const block_q5_0 *)(sb + b * (int)sizeof(block_q5_0));
+        const uint32_t qh = (uint32_t)blk->qh[0] | ((uint32_t)blk->qh[1] << 8) |
+                            ((uint32_t)blk->qh[2] << 16) | ((uint32_t)blk->qh[3] << 24);
+        const int hi = (int)((qh >> lane) & 1u);
+        const int lo = (blk->qs[lane % 16] >> (4 * (lane / 16))) & 0xF;
+        return ggml_half_to_float(blk->d) * (float)((lo | (hi << 4)) - 16);
+    }
     case 7: {
         auto * blk = (const block_q5_1 *)(sb + b * (int)sizeof(block_q5_1));
         const int hi = (blk->qh[lane / 8] >> (lane % 8)) & 1;
@@ -619,6 +648,7 @@ inline int superblock_bytes(uint32_t type) {
     case 21: return 110;
     case 23: return 136;
     case 8: return 8 * 34;
+    case 6: return 8 * 22;
     case 7: return 8 * 24;
     case 30:
     case 1: return 256 * 2;

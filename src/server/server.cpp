@@ -635,7 +635,7 @@ int serve(engine & e, const server_config & cfg) {
     mm_server mm;
     if (!cfg.mmproj_path.empty()) {
         try {
-            mm.vm.load(cfg.mmproj_path);
+            mm.vm.load(cfg.mmproj_path, e.m.prof ? e.m.prof->vision : model_profile::vision_kind::qwen3vl);
             if (mm.vm.hp.proj_dim != e.m.hp.n_embd) {
                 throw std::runtime_error("vision projector output width != text n_embd");
             }

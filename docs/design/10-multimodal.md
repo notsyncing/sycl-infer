@@ -7,7 +7,9 @@
 
 ## 1. 概览
 
-Qwen3.5 的视觉输入由独立的 **mmproj GGUF**（`clip` 架构）提供。流程：
+视觉输入由独立的 **mmproj GGUF**（`clip` 架构）提供。`src/mm/vision.{h,cpp}` 是**唯一**的视觉模块：
+模型 profile 的 `vision` 字段（`qwen3vl` / `qwen2vl` / `none`）选择 `vision_model::kind`，
+并与 mmproj 的 `clip.projector_type` 交叉校验；两种塔共享同一套 host/device 前向。流程：
 
 ```mermaid
 flowchart LR
@@ -208,6 +210,22 @@ bias → GELU → `mm.2` → bias）→ `q.wait()`。
 **队列必须 in-order**：各阶段数据依赖但启动器不发事件（没有 `ext_oneapi_submit_barrier`），因此要求
 in-order 队列（引擎队列即是）。测试也显式建 in-order 队列（`test_multimodal.cpp` 里建 in-order 队列处）。
 
+**线性层走 oneDNN int8（`PF_VISION_DNNL`，`qwen2vl` 默认开）**：`vit_gemm` 按 32-token 一组切 M、
+每个 tile 重读一遍权重块；5476 个 patch 就是每个线性层约 172 遍权重。`vision_model::upload` 为视
+觉塔建一个私有 `dnnl_gemm`，用 `add_weight(..., eager=false)`（懒模式：只为实际用到的 M 形状构建
+primitive，页面里各 crop 的 patch 数都不同）注册每个线性层与 merger 的 `mm.0`/`mm.2`，每次前向按
+`kMaxB*kMaxT` 行分块 `quantize()` + `gemm()`。`add_weight` 新增接受 F16/F32/BF16 源（mmproj 的
+线性层就是这些类型）。patch embedding 仍走 `vit_gemm`（K=592 不是 32 的倍数，且只占约 1% 的工
+作）；实例没接受的张量逐调用回退到 `vit_gemm`，所以不支持的 projector 仍能跑。校验：页面输出
+md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.9994），见
+`docs/PERFORMANCE.md` §7.4。
+
+**多模态 prefill 走 mode 2（`PF_MM_BATCH_PREFILL`，默认开）**：图像 prompt 的 M-RoPE 与 `img_row`
+都是按 token 的、内核按 `[row*kMaxT + t]` 索引，正好是 `mm_write_step` 对 n 个 token 写出的连续
+布局，因此一次前向可以覆盖到 `kMaxB*kMaxT` 个 token（两卡流水线除外：它在 `d_info` 与
+`d_info2_` 之间轮换，而 M-RoPE/`img_row` 只写进其中一个，所以那条路径仍走 mode 1）。旧的循环每 32 token 一个 mode-1 chunk（布局
+页的 1394 token 就是 44 遍权重），布局步的文本 prefill 1.92 s -> 0.26 s。
+
 ### 3.6 视觉 kernel
 
 全部在 `src/backend/gpu/kernels/vit.cpp`，激活一律 fp32，权重 BF16 或 F32（行主序 `[N][K]`）：
@@ -219,7 +237,7 @@ in-order 队列（引擎队列即是）。测试也显式建 in-order 队列（`
 | `vit_gelu_launch` | 一线程一个元素（`vit.cpp:245-254`） | tanh 近似，`sqrt(2/pi)` 硬编码 |
 | `vit_add_bias_launch` / `vit_add_launch` / `vit_copy_launch` | `range<2>(rows, cols)` | 三种逐元素偏置/加法/拷贝 |
 | `vit_rope_launch` | `range<1>(n_tok*n_head*head_dim/2)` | 2D 视觉 RoPE，见 §3.7 |
-| `vit_attn_launch` | 每 `(head, 32-query block)` 一个 128 线程 WG，K/V tile 64 行过 SLM | 双向注意力，**在线 softmax**（running max/sum），score 矩阵不出工作组 |
+| `vit_attn_launch` | 每 `(head, BQ-query block)` 一个 WG；**qwen2vl 的 80 宽头是 `BQ=32, BK=32, WG=1024`**（47.6 KiB SLM，一个 WG 占满一个 Xe core），64/72 宽头仍是 16-32 query、64 key、128 线程 | 双向注意力，**在线 softmax**（running max/sum），score 矩阵不出工作组；部分 tile 的填充行在每个阶段都有 `r < n_q` / `k < n_k` 守卫 |
 
 在线 softmax 是必要的：token 数上界是 `kMaxImgPatches`，`n_tok × n_tok` 的 score 矩阵不能显式物化
 （`vit.cpp:5-7` 的文件头注释）。FFN 的 `up`/`down` GEMM 与 merger 的 `mm.0`/`mm.2` 都走同一个

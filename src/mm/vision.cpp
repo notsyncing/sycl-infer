@@ -1,6 +1,8 @@
 #include "vision.h"
 
 #include "env.h"
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -8,10 +10,49 @@
 #include "kernels.h"
 #include "quant.h"
 #include "enc_common.h"
+#include "dnnl_gemm.h"
+
+#include <chrono>
 
 namespace si {
 
 namespace {
+
+// PF_VISION_TIME: wall-clock split of the vision forward.  The stamps are taken
+// with q.wait() so the number is the device time of that stage (an in-order
+// queue otherwise lets launches run ahead and every stamp reads ~0).  Only the
+// diagnostic pays any cost; the default path never waits here.
+struct vision_stage_timer {
+    bool on = false;
+    std::chrono::high_resolution_clock::time_point t;
+    double patch = 0, ln1 = 0, qkv = 0, rope = 0, attn = 0, out = 0, ln2 = 0, up = 0, act = 0, down = 0,
+           post_ln = 0, mm = 0, layers = 0;
+    explicit vision_stage_timer(bool enabled) : on(enabled) {
+        if (on) {
+            t = std::chrono::high_resolution_clock::now();
+        }
+    }
+    void lap(sycl::queue & q, double & acc) {
+        if (!on) {
+            return;
+        }
+        q.wait();
+        auto now = std::chrono::high_resolution_clock::now();
+        acc += std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+    }
+    void lap_layer(sycl::queue & q, double & acc) {
+        if (!on) {
+            return;
+        }
+        q.wait();
+        auto now = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - t).count();
+        acc += ms;
+        layers += ms;
+        t = now;
+    }
+};
 
 // bilinear sample of the learned position grid (align_corners) for channel d
 void pos_sample(const float * pos, int n_side, int n_embd, int d, int pw, int ph, int x, int y, float & out) {
@@ -44,13 +85,33 @@ float vt_get(const vt & t, int row, int k) {
     }
 }
 
-void vision_model::load(const std::string & path) {
+void vision_model::load(const std::string & path, model_profile::vision_kind requested) {
+    if (requested == model_profile::vision_kind::none) {
+        throw std::runtime_error("mmproj: the model profile declares no vision tower");
+    }
+    kind = requested;
     gguf.load(path);
     const gguf_file & f = gguf;
     auto & hp = this->hp;
 
+    // The mmproj states its own projector; it must agree with the text model's
+    // profile, or a Qwen2-VL tower would run under Qwen3.5's layout rules.
+    if (const std::string * pt = f.get_str("clip.projector_type")) {
+        model_profile::vision_kind meta = model_profile::vision_kind::none;
+        if (pt->find("qwen2vl") != std::string::npos) {
+            meta = model_profile::vision_kind::qwen2vl;
+        } else if (pt->find("qwen3vl") != std::string::npos || pt->find("qwen3") != std::string::npos) {
+            meta = model_profile::vision_kind::qwen3vl;
+        }
+        if (meta != model_profile::vision_kind::none && meta != kind) {
+            throw std::runtime_error("mmproj: projector type \"" + *pt +
+                                     "\" disagrees with the model profile's vision tower");
+        }
+    }
+
+    const bool q2 = kind == model_profile::vision_kind::qwen2vl;
     hp.image_size = (int)f.get_u32("clip.vision.image_size");
-    hp.patch_size = (int)f.get_u32("clip.vision.patch_size");
+    hp.patch_size = (int)f.get_u32("clip.vision.patch_size", q2 ? 14u : 16u);
     hp.n_embd = (int)f.get_u32("clip.vision.embedding_length");
     hp.n_ff = (int)f.get_u32("clip.vision.feed_forward_length");
     hp.n_layer = (int)f.get_u32("clip.vision.block_count");
@@ -59,7 +120,8 @@ void vision_model::load(const std::string & path) {
     hp.proj_dim = (int)f.get_u32("clip.vision.projection_dim");
     hp.merge = (int)f.get_u32("clip.vision.spatial_merge_size", 2);
     hp.eps = f.get_f32("clip.vision.attention.layer_norm_epsilon", 1e-6f);
-    hp.rope_base = f.get_f32("clip.vision.rope_theta", 10000.0f);
+    // Qwen2-VL's vision RoPE is fixed at 1e4; its metadata may carry no theta.
+    hp.rope_base = q2 ? 10000.0f : f.get_f32("clip.vision.rope_theta", 10000.0f);
     if (const gguf_kv * mean = f.meta("clip.vision.image_mean")) {
         for (int i = 0; i < 3 && i < (int)mean->arr.size(); i++) {
             hp.mean[i] = mean->arr[i].as_f32();
@@ -74,9 +136,10 @@ void vision_model::load(const std::string & path) {
     const int P = hp.patch_size;
     const int patch_elems = 3 * P * P;
 
-    // patch conv: the reference sums two convs over the same input.  The weight
-    // is a 4D conv tensor [kw, kh, in_ch, out_ch], so the matmul view is
-    // out_ch rows of kw*kh*in_ch elements (row-major, matching ggml's layout).
+    // patch conv: the reference sums two convs over the same input (Qwen2-VL's
+    // temporal pair).  The weight is a 4D conv tensor [kw, kh, in_ch, out_ch],
+    // so the matmul view is out_ch rows of kw*kh*in_ch elements (row-major,
+    // matching ggml's layout; the same order for both towers).
     auto conv_weight = [&](const char * name) {
         const gguf_tensor_info * ti = f.find(name);
         if (!ti) {
@@ -93,75 +156,322 @@ void vision_model::load(const std::string & path) {
         return t;
     };
     vt pw0 = conv_weight("v.patch_embd.weight");
-    vt pw1 = conv_weight("v.patch_embd.weight.1");
+    vt pw1{};
+    if (f.find("v.patch_embd.weight.1")) {
+        pw1 = conv_weight("v.patch_embd.weight.1");
+    }
     if (pw0.N != hp.n_embd || pw0.K != patch_elems) {
         throw std::runtime_error("mmproj: unexpected patch embedding shape");
     }
-    patch_w.resize((size_t)hp.n_embd * patch_elems);
+    // The vision GEMM loads eight weights at a time with a 16-byte load, so the
+    // row length must be a multiple of 8 (and 8 floats is 32 bytes, keeping
+    // every row base 16-byte aligned).
+    patch_K = (patch_elems + 7) & ~7;
+    patch_w.assign((size_t)hp.n_embd * patch_K, 0.f);
     for (int o = 0; o < hp.n_embd; o++) {
         for (int k = 0; k < patch_elems; k++) {
             float v = vt_get(pw0, o, k);
             if (pw1.data) {
                 v += vt_get(pw1, o, k);
             }
-            patch_w[(size_t)o * patch_elems + k] = v;
+            patch_w[(size_t)o * patch_K + k] = v;
         }
     }
     patch_b = bind_f32_opt(f, "v.patch_embd.bias");
 
-    // learned absolute position embeddings, transposed to [pos][n_embd]
-    vt pe = bind_vt(f, "v.position_embd.weight");
-    const int n_side = (int)std::lround(std::sqrt((double)pe.N));
-    hp.n_pos_side = n_side;
-    if (n_side * n_side != pe.N) {
-        throw std::runtime_error("mmproj: position embedding not square");
-    }
-    pos_embd_host.resize((size_t)pe.N * pe.K);
-    for (int s = 0; s < pe.N; s++) {
-        for (int d = 0; d < pe.K; d++) {
-            pos_embd_host[(size_t)s * pe.K + d] = vt_get(pe, s, d);
+    // learned absolute position embeddings (qwen3vl only)
+    hp.n_pos_side = 0;
+    if (!q2) {
+        vt pe = bind_vt(f, "v.position_embd.weight");
+        const int n_side = (int)std::lround(std::sqrt((double)pe.N));
+        hp.n_pos_side = n_side;
+        if (n_side * n_side != pe.N) {
+            throw std::runtime_error("mmproj: position embedding not square");
         }
+        pos_embd_host.resize((size_t)pe.N * pe.K);
+        for (int s = 0; s < pe.N; s++) {
+            for (int d = 0; d < pe.K; d++) {
+                pos_embd_host[(size_t)s * pe.K + d] = vt_get(pe, s, d);
+            }
+        }
+        pos_embd = pos_embd_host.data();
     }
-    pos_embd = pos_embd_host.data();
 
     post_ln = bind_f32_opt(f, "v.post_ln.weight");
     post_ln_b = bind_f32_opt(f, "v.post_ln.bias");
+    if (!post_ln) {
+        throw std::runtime_error("mmproj: missing v.post_ln.weight");
+    }
 
-    layers.resize(hp.n_layer);
+    // Bind the block tensors first: the qwen2vl file has separate q/k/v, the
+    // qwen3vl file one fused qkv.  Both end up in the same vision_layer view.
+    struct raw_layer {
+        vt qkv, q, k, v, out, up, down;
+        const float * qkv_b = nullptr;
+        const float * q_b = nullptr, * k_b = nullptr, * v_b = nullptr;
+        const float * out_b = nullptr, * up_b = nullptr, * down_b = nullptr;
+        const float * ln1 = nullptr, * ln1_b = nullptr, * ln2 = nullptr, * ln2_b = nullptr;
+    };
+    std::vector<raw_layer> raw((size_t)hp.n_layer);
     for (int il = 0; il < hp.n_layer; il++) {
         const std::string pre = "v.blk." + std::to_string(il) + ".";
-        vision_layer & L = layers[il];
-        L.qkv = bind_vt(f, pre + "attn_qkv.weight");
-        L.qkv_b = bind_f32_opt(f, pre + "attn_qkv.bias");
-        L.out = bind_vt(f, pre + "attn_out.weight");
-        L.out_b = bind_f32_opt(f, pre + "attn_out.bias");
-        L.up = bind_vt(f, pre + "ffn_up.weight");
-        L.up_b = bind_f32_opt(f, pre + "ffn_up.bias");
-        L.down = bind_vt(f, pre + "ffn_down.weight");
-        L.down_b = bind_f32_opt(f, pre + "ffn_down.bias");
-        L.ln1 = bind_f32_opt(f, pre + "ln1.weight");
-        L.ln1_b = bind_f32_opt(f, pre + "ln1.bias");
-        L.ln2 = bind_f32_opt(f, pre + "ln2.weight");
-        L.ln2_b = bind_f32_opt(f, pre + "ln2.bias");
+        raw_layer & R = raw[(size_t)il];
+        if (q2) {
+            R.q = bind_vt(f, pre + "attn_q.weight");
+            R.k = bind_vt(f, pre + "attn_k.weight");
+            R.v = bind_vt(f, pre + "attn_v.weight");
+            R.q_b = bind_f32_opt(f, pre + "attn_q.bias");
+            R.k_b = bind_f32_opt(f, pre + "attn_k.bias");
+            R.v_b = bind_f32_opt(f, pre + "attn_v.bias");
+        } else {
+            R.qkv = bind_vt(f, pre + "attn_qkv.weight");
+            R.qkv_b = bind_f32_opt(f, pre + "attn_qkv.bias");
+        }
+        R.out = bind_vt(f, pre + "attn_out.weight");
+        R.out_b = bind_f32_opt(f, pre + "attn_out.bias");
+        R.up = bind_vt(f, pre + "ffn_up.weight");
+        R.up_b = bind_f32_opt(f, pre + "ffn_up.bias");
+        R.down = bind_vt(f, pre + "ffn_down.weight");
+        R.down_b = bind_f32_opt(f, pre + "ffn_down.bias");
+        R.ln1 = bind_f32_opt(f, pre + "ln1.weight");
+        R.ln1_b = bind_f32_opt(f, pre + "ln1.bias");
+        R.ln2 = bind_f32_opt(f, pre + "ln2.weight");
+        R.ln2_b = bind_f32_opt(f, pre + "ln2.bias");
     }
     mm0 = bind_vt(f, "mm.0.weight");
     mm0_b = bind_f32_opt(f, "mm.0.bias");
     mm2 = bind_vt(f, "mm.2.weight");
     mm2_b = bind_f32_opt(f, "mm.2.bias");
+
+    // The Qwen2-VL mmproj's `clip.vision.feed_forward_length` says 896 (the text
+    // hidden size) but ffn_up is [1280, 5120].  Trust the tensor for every
+    // tower; a wrong width silently truncates the FFN.
+    if (!raw.empty() && raw[0].up.N > 0) {
+        hp.n_ff = raw[0].up.N;
+    }
+
+    const int E = hp.n_embd;
+    const size_t kOffNone = (size_t)-1;
+    const bool f32_all = si::env::flag("PF_VISION_F32");
+    auto tsize = [](const vt & t) { return (size_t)t.N * (size_t)t.K; };
+    auto wants_f32 = [&](const vt & t) { return f32_all && t.data && t.type != GGML_TYPE_F32; };
+
+    // Reserve the exact side-blob size first; every converted tensor and the
+    // qwen2vl combined qkv+bias is appended to it.
+    size_t total = 0;
+    for (const raw_layer & R : raw) {
+        if (q2) {
+            total += 3 * (size_t)E * (size_t)E + 3 * (size_t)E;
+        } else if (wants_f32(R.qkv)) {
+            total += tsize(R.qkv);
+        }
+        for (const vt * t : {&R.out, &R.up, &R.down}) {
+            if (wants_f32(*t)) {
+                total += tsize(*t);
+            }
+        }
+    }
+    for (const vt * t : {&mm0, &mm2}) {
+        if (wants_f32(*t)) {
+            total += tsize(*t);
+        }
+    }
+    w32.reserve(total);
+
+    auto append_vt = [&](const vt & t) {
+        const size_t off = w32.size();
+        w32.resize(off + tsize(t));
+        for (int r = 0; r < t.N; r++) {
+            for (int k = 0; k < t.K; k++) {
+                w32[off + (size_t)r * t.K + k] = vt_get(t, r, k);
+            }
+        }
+        return off;
+    };
+
+    std::vector<size_t> qkv_off((size_t)hp.n_layer, kOffNone), qkv_b_off((size_t)hp.n_layer, kOffNone);
+    std::vector<size_t> out_off((size_t)hp.n_layer, kOffNone), up_off((size_t)hp.n_layer, kOffNone);
+    std::vector<size_t> down_off((size_t)hp.n_layer, kOffNone);
+    size_t mm0_off = kOffNone, mm2_off = kOffNone;
+
+    for (int il = 0; il < hp.n_layer; il++) {
+        const raw_layer & R = raw[(size_t)il];
+        if (q2) {
+            // One contiguous [3E][E] f32 qkv plus a [3E] bias: the decoder path
+            // then runs one fused projection exactly like qwen3vl, and the
+            // separate-tensor layout never reaches a kernel.
+            const size_t off = w32.size();
+            w32.resize(off + 3 * (size_t)E * (size_t)E);
+            auto copy = [&](const vt & t, int dst0) {
+                if (t.K != E || t.N != E) {
+                    throw std::runtime_error("mmproj: qwen2vl q/k/v is not [E][E]");
+                }
+                for (int r = 0; r < E; r++) {
+                    for (int k = 0; k < E; k++) {
+                        w32[off + (size_t)(dst0 + r) * E + k] = vt_get(t, r, k);
+                    }
+                }
+            };
+            copy(R.q, 0);
+            copy(R.k, E);
+            copy(R.v, 2 * E);
+            qkv_off[(size_t)il] = off;
+            const size_t boff = w32.size();
+            w32.resize(boff + 3 * (size_t)E);
+            for (int i = 0; i < E; i++) {
+                w32[boff + i] = R.q_b ? R.q_b[i] : 0.f;
+                w32[boff + E + i] = R.k_b ? R.k_b[i] : 0.f;
+                w32[boff + 2 * E + i] = R.v_b ? R.v_b[i] : 0.f;
+            }
+            qkv_b_off[(size_t)il] = boff;
+        } else if (wants_f32(R.qkv)) {
+            qkv_off[(size_t)il] = append_vt(R.qkv);
+        }
+        if (wants_f32(R.out)) {
+            out_off[(size_t)il] = append_vt(R.out);
+        }
+        if (wants_f32(R.up)) {
+            up_off[(size_t)il] = append_vt(R.up);
+        }
+        if (wants_f32(R.down)) {
+            down_off[(size_t)il] = append_vt(R.down);
+        }
+    }
+    if (wants_f32(mm0)) {
+        mm0_off = append_vt(mm0);
+    }
+    if (wants_f32(mm2)) {
+        mm2_off = append_vt(mm2);
+    }
+    if (w32.size() > total) {
+        throw std::runtime_error("mmproj: internal f32 side-blob size mismatch");
+    }
+
+    auto view = [&](size_t off, const vt & fallback) {
+        return off == kOffNone ? fallback : vt{w32.data() + off, GGML_TYPE_F32, fallback.K, fallback.N};
+    };
+
+    layers.resize((size_t)hp.n_layer);
+    for (int il = 0; il < hp.n_layer; il++) {
+        const raw_layer & R = raw[(size_t)il];
+        vision_layer & L = layers[(size_t)il];
+        if (q2) {
+            L.qkv = vt{w32.data() + qkv_off[(size_t)il], GGML_TYPE_F32, E, 3 * E};
+            L.qkv_b = w32.data() + qkv_b_off[(size_t)il];
+        } else {
+            L.qkv = view(qkv_off[(size_t)il], R.qkv);
+            L.qkv_b = R.qkv_b;
+        }
+        L.out = view(out_off[(size_t)il], R.out);
+        L.out_b = R.out_b;
+        L.up = view(up_off[(size_t)il], R.up);
+        L.up_b = R.up_b;
+        L.down = view(down_off[(size_t)il], R.down);
+        L.down_b = R.down_b;
+        L.ln1 = R.ln1;
+        L.ln1_b = R.ln1_b;
+        L.ln2 = R.ln2;
+        L.ln2_b = R.ln2_b;
+    }
+    mm0 = view(mm0_off, mm0);
+    mm2 = view(mm2_off, mm2);
 }
 
 vision_model::~vision_model() {
-    free_dev_ptrs(dev_q, {dev_weights, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0});
+    free_dev_ptrs(dev_q,
+                  {dev_weights, d_w32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0});
+    delete gemm;
+    gemm = nullptr;
+}
+
+// One vision linear on the oneDNN int8 matmul, chunked to the activation
+// scratch's row cap (the text model's largest batch, kMaxB*kMaxT).  Returns
+// false when the weight is not registered on this instance, so the caller can
+// run the old vit_gemm for it and stay correct.
+bool vision_model::linear_dnnl(sycl::queue & q, const void * key, const float * x, int x_stride, int T, int K,
+                               float * out, int out_stride, const float * residual, float alpha, int N) {
+    (void)q;
+    (void)N;
+    if (!gemm || !key || T <= 0 || K <= 0) {
+        return false;
+    }
+    if (!gemm->has_weight(key)) {
+        return false;
+    }
+    const int kChunk = kMaxB * kMaxT;
+    for (int t = 0; t < T; t += kChunk) {
+        const int m = std::min(kChunk, T - t);
+        // do_split=false: these are prefill-shaped calls (v.split must stay
+        // false or gemm() would take the decode/verify nat_gemm branch, whose
+        // activation form this quantizer did not produce).
+        const act_view v = gemm->quantize(x + (size_t)t * x_stride, nullptr, x_stride, x_stride, m, K, false);
+        if (!v.valid()) {
+            return false;
+        }
+        if (!gemm->gemm(v, key, residual ? residual + (size_t)t * out_stride : nullptr, alpha, m, K,
+                        out + (size_t)t * out_stride, out_stride)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void vision_model::upload(sycl::queue & q) {
     pin_dev_queue(dev_q, q, "vision");
+    if (dev_weights) {
+        return;
+    }
     dev_weights_size = gguf.map_size;
     dev_weights = sycl::malloc_device(dev_weights_size, q);
     if (!dev_weights) {
         throw std::runtime_error("mmproj device allocation failed");
     }
     q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
+    if (!w32.empty()) {
+        d_w32 = sycl::malloc_device<float>(w32.size(), q);
+        if (!d_w32) {
+            throw std::runtime_error("mmproj side-blob device allocation failed");
+        }
+        q.memcpy(d_w32, w32.data(), w32.size() * sizeof(float)).wait();
+    }
+
+    // The vision linears on the text model's oneDNN int8 path.  vit_gemm tiles
+    // M in 32-token groups and re-reads each weight block per tile; at 5476
+    // patches that is ~172 passes over every linear.  The oneDNN matmul reads
+    // each weight once per <=1024-row chunk instead.  Registration is lazy:
+    // only the M shapes actually asked for get a primitive (a page's content
+    // crops all have different patch counts), so this does not create a ladder
+    // of a thousand primitives per tensor.
+    //
+    // Default on for the qwen2vl tower (verified: identical page md5, self-check
+    // cos 0.9991, 5x on the layout image).  Off for qwen3vl: that tower is
+    // BF16/head_dim 64-72 and there is no model here to verify it against, so
+    // the flag is left as the opt-in until it is measured (PF_VISION_DNNL=1).
+    const int dnnl_dflt = kind == model_profile::vision_kind::qwen2vl ? 1 : 0;
+    if (si::env::i32("PF_VISION_DNNL", dnnl_dflt) != 0) {
+        gemm = new dnnl_gemm(q);
+        bool all = true;
+        auto add = [&](const vt & w) {
+            if (!w.data) {
+                return;
+            }
+            if (!gemm->add_weight(w.data, w.data, w.type, w.K, w.N, /*eager=*/false)) {
+                all = false;
+            }
+        };
+        for (const vision_layer & L : layers) {
+            add(L.qkv);
+            add(L.out);
+            add(L.up);
+            add(L.down);
+        }
+        add(mm0);
+        add(mm2);
+        if (si::env::flag("PF_VISION_TIME")) {
+            fprintf(stderr, "[vtime] dnnl vision: %s, %.1f MiB int8 weights\n", all ? "on" : "partial",
+                    (double)gemm->weight_bytes() / 1048576.0);
+        }
+    }
 }
 
 vision_input vision_model::make_input(const vision_model & vm, const mm_image & img) {
@@ -182,8 +492,7 @@ void vision_model::build_raw_patches(const vision_input & in, std::vector<float>
     const int P = hp.patch_size;
     const int M = hp.merge;
     const int np = in.n_patches;
-    const int patch_elems = 3 * P * P;
-    x.assign((size_t)np * patch_elems, 0.f);
+    x.assign((size_t)np * patch_K, 0.f);
     int tok = 0;
     for (int my = 0; my < in.out_h; my++) {
         for (int mx = 0; mx < in.out_w; mx++) {
@@ -191,7 +500,7 @@ void vision_model::build_raw_patches(const vision_input & in, std::vector<float>
                 for (int dx = 0; dx < M; dx++) {
                     const int py = my * M + dy;
                     const int px = mx * M + dx;
-                    float * xt = x.data() + (size_t)tok * patch_elems;
+                    float * xt = x.data() + (size_t)tok * patch_K;
                     int i = 0;
                     for (int c = 0; c < 3; c++) {
                         const float * plane = in.chw + (size_t)c * in.width * in.height;
@@ -247,13 +556,14 @@ void vision_model::build_patch_input(const vision_input & in, std::vector<float>
     const int P = hp.patch_size;
     const int E = hp.n_embd;
     const int M = hp.merge;
-    const int patch_elems = 3 * P * P;
     const int n_side = hp.n_pos_side;
     const int np = in.n_patches;
     x.assign((size_t)np * E, 0.f);
 
-    // patch embedding + learned position embeddings, in merged token order
-    std::vector<float> pv(patch_elems);
+    // patch embedding + learned position embeddings, in merged token order.
+    // The row is `patch_K` wide (zero-padded past patch_elems), matching the
+    // padded patch_w rows the device GEMM reads.
+    std::vector<float> pv(patch_K, 0.f);
     int tok = 0;
     for (int my = 0; my < in.out_h; my++) {
         for (int mx = 0; mx < in.out_w; mx++) {
@@ -273,9 +583,9 @@ void vision_model::build_patch_input(const vision_input & in, std::vector<float>
                     }
                     float * xt = x.data() + (size_t)tok * E;
                     for (int o = 0; o < E; o++) {
-                        const float * w = patch_w.data() + (size_t)o * patch_elems;
+                        const float * w = patch_w.data() + (size_t)o * patch_K;
                         float acc = patch_b ? patch_b[o] : 0.f;
-                        for (int k = 0; k < patch_elems; k++) {
+                        for (int k = 0; k < patch_K; k++) {
                             acc += w[k] * pv[k];
                         }
                         xt[o] = acc;
@@ -304,14 +614,38 @@ void vision_model::build_patch_input(const vision_input & in, std::vector<float>
 }
 
 bool vision_model::runnable(std::string * why) const {
-    // the kernel is instantiated for these two; anything else has no
-    // implementation, so say so up front rather than aborting on the first
-    // forward with the model already loaded
-    if (hp.head_dim != 64 && hp.head_dim != 72) {
+    auto fail = [&](const std::string & m) {
         if (why) {
-            *why = "vision: unsupported head_dim " + std::to_string(hp.head_dim) + " (the encoder implements 64 and 72)";
+            *why = m;
         }
         return false;
+    };
+    if (hp.n_layer <= 0 || hp.n_embd <= 0 || hp.n_head <= 0 || hp.n_ff <= 0 || hp.patch_size <= 0) {
+        return fail("vision: incomplete tower geometry");
+    }
+    // The attention kernel is instantiated per head width.  qwen3vl uses 64/72;
+    // qwen2vl's 80-wide head has its own correct BQ=16 instantiation.
+    if (kind == model_profile::vision_kind::qwen2vl) {
+        if (hp.head_dim != 80) {
+            return fail("vision: qwen2vl implements only the 80-wide head (got " + std::to_string(hp.head_dim) + ")");
+        }
+        if (hp.patch_size != 14 || hp.merge != 2) {
+            return fail("vision: qwen2vl implements only patch 14 / merge 2");
+        }
+    } else if (hp.head_dim != 64 && hp.head_dim != 72) {
+        return fail("vision: unsupported head_dim " + std::to_string(hp.head_dim) + " (the encoder implements 64, 72 and 80)");
+    }
+    const int E = hp.n_embd;
+    if ((int)layers.size() != hp.n_layer) {
+        return fail("vision: missing block weights");
+    }
+    for (const vision_layer & L : layers) {
+        if (!L.qkv.data || L.qkv.N != 3 * E || L.qkv.K != E || !L.out.data || !L.up.data || !L.down.data) {
+            return fail("vision: a block is missing a weight or its qkv is not [3E][E]");
+        }
+    }
+    if (mm0.K != hp.merge * hp.merge * E || mm2.K != mm0.N || mm2.N != hp.proj_dim) {
+        return fail("vision: projector shape mismatch");
     }
     return true;
 }
@@ -462,7 +796,14 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
         }
         matmul_all(L.up, L.up_b, tmp.data(), upbuf.data(), np);
         for (int t = 0; t < np; t++) {
-            gelu_tanh(upbuf.data() + (size_t)t * ff, ff);
+            if (kind == model_profile::vision_kind::qwen2vl) {
+                float * v = upbuf.data() + (size_t)t * ff;
+                for (int i = 0; i < ff; i++) {
+                    v[i] = v[i] / (1.0f + std::exp(-1.702f * v[i]));
+                }
+            } else {
+                gelu_tanh(upbuf.data() + (size_t)t * ff, ff);
+            }
         }
         if (il == 0) {
             fph("ffn_up", upbuf, (size_t) np * ff);
@@ -496,7 +837,14 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
     std::vector<float> h1((size_t)in.n_out * mm0.N);
     matmul_all(mm0, mm0_b, fe.data(), h1.data(), in.n_out);
     for (int m = 0; m < in.n_out; m++) {
-        gelu_tanh(h1.data() + (size_t)m * mm0.N, mm0.N);
+        float * h = h1.data() + (size_t)m * mm0.N;
+        if (kind == model_profile::vision_kind::qwen2vl) {
+            for (int i = 0; i < mm0.N; i++) {
+                h[i] = 0.5f * h[i] * (1.0f + std::erf(h[i] * 0.7071067811865476f));
+            }
+        } else {
+            gelu_tanh(h, mm0.N);
+        }
     }
     out.assign((size_t)in.n_out * hp.proj_dim, 0.f);
     matmul_all(mm2, mm2_b, h1.data(), out.data(), in.n_out);
@@ -517,7 +865,6 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
     const int M = hp.merge;
     const int np = in.n_patches;
     const int n_out = in.n_out;
-    const int patch_elems = 3 * hp.patch_size * hp.patch_size;
     const int C = M * M;
     const int hidden = C * E;
     if (np <= 0 || n_out <= 0) {
@@ -539,11 +886,11 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         upload(q);
     }
     if (!d_patch_w) {
-        d_patch_w = sycl::malloc_device((size_t)E * patch_elems * sizeof(float), q);
+        d_patch_w = sycl::malloc_device((size_t)E * patch_K * sizeof(float), q);
         if (!d_patch_w) {
             throw std::runtime_error("vision: patch weight allocation failed");
         }
-        q.memcpy(d_patch_w, patch_w.data(), (size_t)E * patch_elems * sizeof(float));
+        q.memcpy(d_patch_w, patch_w.data(), (size_t)E * patch_K * sizeof(float));
     }
 
     if (scratch_patches < np) {
@@ -560,7 +907,7 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         fre(d_ffn);
         fre(d_mm0);
         fre(d_pos);
-        d_patch_in = (float *)sycl::malloc_device((size_t)np * patch_elems * 4, q);
+        d_patch_in = (float *)sycl::malloc_device((size_t)np * patch_K * 4, q);
         d_pos = (float *)sycl::malloc_device((size_t)np * E * 4, q);
         d_x = (float *)sycl::malloc_device((size_t)np * E * 4, q);
         d_ln = (float *)sycl::malloc_device((size_t)np * E * 4, q);
@@ -570,9 +917,9 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         d_mm0 = (float *)sycl::malloc_device((size_t)n_out * hidden * 4, q);
         if (si::env::flag("PF_MM_DIAG")) {
             fprintf(stderr,
-                    "[mm] scratch np=%d E=%d ff=%d hidden=%d n_out=%d patch_elems=%d -> patch_in %.1f qkv %.1f "
+                    "[mm] scratch np=%d E=%d ff=%d hidden=%d n_out=%d patch_K=%d -> patch_in %.1f qkv %.1f "
                     "ffn %.1f mm0 %.1f MiB\n",
-                    np, E, ff, hidden, n_out, patch_elems, np * (double) patch_elems * 4 / 1048576.0,
+                    np, E, ff, hidden, n_out, patch_K, np * (double) patch_K * 4 / 1048576.0,
                     np * 3.0 * E * 4 / 1048576.0, np * (double) ff * 4 / 1048576.0,
                     n_out * (double) hidden * 4 / 1048576.0);
         }
@@ -584,18 +931,27 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
 
     auto devf = [&](const float * p) { return (const float *)dev_ptr(p); };
 
+    vision_stage_timer vt(si::env::flag("PF_VISION_TIME"));
+    const auto t_all0 = std::chrono::high_resolution_clock::now();
+
     std::vector<float> pin, pos;
     build_raw_patches(in, pin);
-    build_pos_emb(in, pos);
     q.memcpy(d_patch_in, pin.data(), pin.size() * sizeof(float));
-    q.memcpy(d_pos, pos.data(), pos.size() * sizeof(float));
+    const bool has_pos = pos_embd != nullptr;
+    if (has_pos) {
+        build_pos_emb(in, pos);
+        q.memcpy(d_pos, pos.data(), pos.size() * sizeof(float));
+    }
 
-    // patch embedding: out[N=E, K=3*P*P], then patch bias + position embedding
-    vit_gemm_launch(q, d_patch_w, GGML_TYPE_F32, E, patch_elems, d_patch_in, patch_elems, d_x, E, np, 1.f, nullptr);
+    // patch embedding: out[N=E, K=patch_K], then patch bias + position embedding
+    vit_gemm_launch(q, d_patch_w, GGML_TYPE_F32, E, patch_K, d_patch_in, patch_K, d_x, E, np, 1.f, nullptr);
     if (patch_b) {
         vit_add_bias_launch(q, d_x, E, devf(patch_b), np, E);
     }
-    vit_add_launch(q, d_x, E, d_pos, E, np, E);
+    if (has_pos) {
+        vit_add_launch(q, d_x, E, d_pos, E, np, E);
+    }
+    vt.lap(q, vt.patch);
 
     const float scale = 1.0f / std::sqrt((float)HD);
     const bool dbg_mm = si::env::flag("PF_MM_DIAG");
@@ -616,55 +972,109 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
     for (int il = 0; il < hp.n_layer; il++) {
         const vision_layer & L = layers[il];
         vit_layernorm_launch(q, d_x, E, devf(L.ln1), devf(L.ln1_b), d_ln, E, np, E, hp.eps);
+        vt.lap_layer(q, vt.ln1);
         if (il == 0) {
             fpd("ln1", d_ln, (size_t) np * E);
         }
-        vit_gemm_launch(q, dev_ptr(L.qkv.data), L.qkv.type, 3 * E, E, d_ln, E, d_qkv, 3 * E, np, 1.f, nullptr);
-        vit_add_bias_launch(q, d_qkv, 3 * E, devf(L.qkv_b), np, 3 * E);
+        if (!linear_dnnl(q, L.qkv.data, d_ln, E, np, E, d_qkv, 3 * E, nullptr, 1.f, 3 * E)) {
+            vit_gemm_launch(q, dev_ptr(L.qkv.data), L.qkv.type, 3 * E, E, d_ln, E, d_qkv, 3 * E, np, 1.f,
+                            nullptr);
+        }
+        if (L.qkv_b) {
+            vit_add_bias_launch(q, d_qkv, 3 * E, devf(L.qkv_b), np, 3 * E);
+        }
+        vt.lap_layer(q, vt.qkv);
         if (il == 0) {
             fpd("qkv", d_qkv, (size_t) np * 3 * E);
         }
         vit_rope_launch(q, d_qkv, 3 * E, np, NH, HD, in.out_w, M, hp.rope_base);
+        vt.lap_layer(q, vt.rope);
         if (il == 0) {
             fpd("qkv_rope", d_qkv, (size_t) np * 3 * E);
         }
         vit_attn_launch(q, d_qkv, 3 * E, d_attn, E, np, NH, HD, scale);
+        vt.lap_layer(q, vt.attn);
         if (il == 0) {
             fpd("attn", d_attn, (size_t) np * E);
         }
         // x += out_b, then x += attn_out_proj (residual through the GEMM)
-        vit_add_bias_launch(q, d_x, E, devf(L.out_b), np, E);
-        vit_gemm_launch(q, dev_ptr(L.out.data), L.out.type, E, E, d_attn, E, d_x, E, np, 1.f, d_x);
+        if (L.out_b) {
+            vit_add_bias_launch(q, d_x, E, devf(L.out_b), np, E);
+        }
+        if (!linear_dnnl(q, L.out.data, d_attn, E, np, E, d_x, E, d_x, 1.f, E)) {
+            vit_gemm_launch(q, dev_ptr(L.out.data), L.out.type, E, E, d_attn, E, d_x, E, np, 1.f, d_x);
+        }
+        vt.lap_layer(q, vt.out);
         if (il == 0) {
             fpd("x_after_attn", d_x, (size_t) np * E);
         }
         vit_layernorm_launch(q, d_x, E, devf(L.ln2), devf(L.ln2_b), d_ln, E, np, E, hp.eps);
+        vt.lap_layer(q, vt.ln2);
         if (il == 0) {
             fpd("ln2", d_ln, (size_t) np * E);
         }
-        vit_gemm_launch(q, dev_ptr(L.up.data), L.up.type, ff, E, d_ln, E, d_ffn, ff, np, 1.f, nullptr);
-        vit_add_bias_launch(q, d_ffn, ff, devf(L.up_b), np, ff);
-        vit_gelu_launch(q, d_ffn, np * ff);
+        if (!linear_dnnl(q, L.up.data, d_ln, E, np, E, d_ffn, ff, nullptr, 1.f, ff)) {
+            vit_gemm_launch(q, dev_ptr(L.up.data), L.up.type, ff, E, d_ln, E, d_ffn, ff, np, 1.f, nullptr);
+        }
+        if (L.up_b) {
+            vit_add_bias_launch(q, d_ffn, ff, devf(L.up_b), np, ff);
+        }
+        vt.lap_layer(q, vt.up);
+        if (kind == model_profile::vision_kind::qwen2vl) {
+            vit_quick_gelu_launch(q, d_ffn, np * ff);
+        } else {
+            vit_gelu_launch(q, d_ffn, np * ff);
+        }
+        vt.lap_layer(q, vt.act);
         if (il == 0) {
             fpd("ffn_up", d_ffn, (size_t) np * ff);
         }
-        vit_add_bias_launch(q, d_x, E, devf(L.down_b), np, E);
-        vit_gemm_launch(q, dev_ptr(L.down.data), L.down.type, E, ff, d_ffn, ff, d_x, E, np, 1.f, d_x);
+        if (L.down_b) {
+            vit_add_bias_launch(q, d_x, E, devf(L.down_b), np, E);
+        }
+        if (!linear_dnnl(q, L.down.data, d_ffn, ff, np, ff, d_x, E, d_x, 1.f, E)) {
+            vit_gemm_launch(q, dev_ptr(L.down.data), L.down.type, E, ff, d_ffn, ff, d_x, E, np, 1.f, d_x);
+        }
+        vt.lap_layer(q, vt.down);
         if (il == 0) {
             fpd("x_after_ffn", d_x, (size_t) np * E);
         }
     }
 
-    vit_layernorm_launch(q, d_x, E, devf(post_ln), devf(post_ln_b), d_ln, E, np, E, hp.eps);
+    vit_layernorm_launch(q, d_x, E, devf(post_ln), post_ln_b ? devf(post_ln_b) : nullptr, d_ln, E, np, E, hp.eps);
+    vt.lap(q, vt.post_ln);
 
     // merger: the 2x2 concat is a stride reinterpretation of d_ln
-    vit_gemm_launch(q, dev_ptr(mm0.data), mm0.type, mm0.N, hidden, d_ln, hidden, d_mm0, mm0.N, n_out, 1.f, nullptr);
-    vit_add_bias_launch(q, d_mm0, mm0.N, devf(mm0_b), n_out, mm0.N);
-    vit_gelu_launch(q, d_mm0, n_out * mm0.N);
-    vit_gemm_launch(q, dev_ptr(mm2.data), mm2.type, hp.proj_dim, mm0.N, d_mm0, mm0.N, d_out, hp.proj_dim, n_out, 1.f,
-                    nullptr);
-    vit_add_bias_launch(q, d_out, hp.proj_dim, devf(mm2_b), n_out, hp.proj_dim);
+    if (!linear_dnnl(q, mm0.data, d_ln, hidden, n_out, hidden, d_mm0, mm0.N, nullptr, 1.f, mm0.N)) {
+        vit_gemm_launch(q, dev_ptr(mm0.data), mm0.type, mm0.N, hidden, d_ln, hidden, d_mm0, mm0.N, n_out, 1.f,
+                        nullptr);
+    }
+    if (mm0_b) {
+        vit_add_bias_launch(q, d_mm0, mm0.N, devf(mm0_b), n_out, mm0.N);
+    }
+    if (kind == model_profile::vision_kind::qwen2vl) {
+        vit_gelu_errf_launch(q, d_mm0, n_out * mm0.N);
+    } else {
+        vit_gelu_launch(q, d_mm0, n_out * mm0.N);
+    }
+    if (!linear_dnnl(q, mm2.data, d_mm0, mm0.N, n_out, mm0.N, d_out, hp.proj_dim, nullptr, 1.f, hp.proj_dim)) {
+        vit_gemm_launch(q, dev_ptr(mm2.data), mm2.type, hp.proj_dim, mm0.N, d_mm0, mm0.N, d_out, hp.proj_dim, n_out,
+                        1.f, nullptr);
+    }
+    if (mm2_b) {
+        vit_add_bias_launch(q, d_out, hp.proj_dim, devf(mm2_b), n_out, hp.proj_dim);
+    }
+    vt.lap(q, vt.mm);
     q.wait();
+    if (vt.on) {
+        const double total =
+            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_all0).count();
+        fprintf(stderr,
+                "[vtime] np=%d n_out=%d L=%d: total=%.1f ms | patch=%.1f merger=%.1f post_ln=%.2f | "
+                "layers=%.1f (ln1=%.1f qkv=%.1f rope=%.1f attn=%.1f out=%.1f ln2=%.1f up=%.1f act=%.1f down=%.1f)\n",
+                np, n_out, hp.n_layer, total, vt.patch, vt.mm, vt.post_ln, vt.layers, vt.ln1, vt.qkv, vt.rope,
+                vt.attn, vt.out, vt.ln2, vt.up, vt.act, vt.down);
+    }
 }
 
 } // namespace si

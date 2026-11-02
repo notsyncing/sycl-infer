@@ -35,6 +35,7 @@ extern const model_profile kQwen4ExpProfile = {
         "GGUF decode (Q8_0/Q5_1/BF16 are not SIn/oneDNN-convertible).",
 
     .fwd = model_profile::fwd_kind::hc_ple_qsa,
+    .vision = model_profile::vision_kind::none,
 
     .residual = {.hyper = true, .streams = 4, .low_rank = 320},
     .extras = {
@@ -51,6 +52,7 @@ extern const model_profile kQwen4ExpProfile = {
         .prefill = model_profile::prefill_kind::whole_prompt,
         .prefix_cache = false,
         .auto_layer_map = true,
+        .auto_layer_map_one_gpu = false,
         .md_splits = true,
         .engram_ram_mb_default = 4096,
     },

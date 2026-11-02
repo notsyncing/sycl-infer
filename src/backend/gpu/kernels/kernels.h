@@ -27,7 +27,9 @@ constexpr int kMaxDecSplits = 512;
 constexpr int kPcMapLen = 1024;
 // max merged vision tokens one image may contribute to a prompt (bounds the
 // engine's image-embedding buffer and the vision scratch buffers)
-constexpr int kMaxImgTokens = 1024;
+// MinerU's layout page is 1036x1036 = 37x37 merged tokens (1369), so the old
+// 1024 budget could not hold one page.  4096 also covers a large block crop.
+constexpr int kMaxImgTokens = 4096;
 // max ViT patch tokens one image may produce (4 patches per merged token); the
 // device vision buffers are sized from this
 constexpr int kMaxImgPatches = 4 * kMaxImgTokens;
@@ -265,7 +267,8 @@ void qk_norm_rope_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vb
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,
                          const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
                          int n_real, const void * kscales = nullptr, const void * vscales = nullptr,
-                         int sum_slot = -1, int64_t * sum_kv = nullptr);
+                         int sum_slot = -1, int64_t * sum_kv = nullptr, const float * q_bias = nullptr,
+                         const float * k_bias = nullptr, const float * v_bias = nullptr, int qgate = 2);
 // QSA Stage 2 (PF_QSA_DEVATTN): compact the selected paged-KV rows and write
 // the scratch step_info that presents them as a one-row sequence.
 void qsa_sinfo_launch(sycl::queue & q, step_info * info, int nsel);
@@ -392,6 +395,12 @@ void vit_layernorm_launch(sycl::queue & q, const float * x, int x_stride, const 
 
 // in-place GELU (tanh approximation), matching ggml_gelu
 void vit_gelu_launch(sycl::queue & q, float * x, int n);
+// in-place quick_gelu (Qwen2-VL vision blocks) and exact erf GELU (merger)
+void vit_quick_gelu_launch(sycl::queue & q, float * x, int n);
+void vit_gelu_errf_launch(sycl::queue & q, float * x, int n);
+// out[r][i] = silu(gate[r][i]) * up[r][i] (row stride `stride`)
+void vit_silu_mul_launch(sycl::queue & q, const float * gate, const float * up, int stride, float * out, int rows,
+                         int cols);
 
 // y[row][i] += bias[i] for rows rows of cols elements
 void vit_add_bias_launch(sycl::queue & q, float * y, int y_stride, const float * bias, int rows, int cols);

@@ -95,6 +95,10 @@ struct hparams {
     uint32_t ple_off[64] = {0};
     uint32_t ple_vocab[64] = {0};
     bool gdn_sigmoid_gate = false; // qwen4exp's gated norm uses sigmoid, not silu
+    // Qwen3.5 fuses the attention output gate into attn_q (q and gate in one
+    // projection).  Qwen2/Qwen2-VL do not: their q projection is exactly
+    // n_head*head_dim wide and the attention output has no sigmoid gate.
+    bool attn_gate = true;
 
     bool is_moe() const {
         return n_expert > 0;
@@ -220,6 +224,10 @@ struct layer_t {
     wt wq, wk, wv, wo;
     const float * q_norm = nullptr;
     const float * k_norm = nullptr;
+    // optional projection biases (Qwen2/Qwen2-VL carry q/k/v bias, no qk norm)
+    const float * q_bias = nullptr;
+    const float * k_bias = nullptr;
+    const float * v_bias = nullptr;
     // gdn layers
     wt wqkv, wgate, ssm_beta, ssm_alpha, ssm_out;
     const float * ssm_a = nullptr;

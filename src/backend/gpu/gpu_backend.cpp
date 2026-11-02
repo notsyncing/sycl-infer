@@ -64,10 +64,11 @@ struct gpu_backend : compute_backend {
                       void * kpool, void * vpool, const int32_t * tables, const step_info * info, int n_head,
                       int n_head_kv, int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale,
                       float eps, int max_blocks, int n_rows, int n_real, const void * kscales,
-                      const void * vscales) override {
+                      const void * vscales, const float * q_bias, const float * k_bias,
+                      const float * v_bias, int qgate) override {
         qk_norm_rope_launch(q, qbuf, kbuf, vbuf, q_norm, k_norm, kpool, vpool, tables, info, n_head, n_head_kv,
                             head_dim, n_rot, rope_base, rope_freqs, rope_mscale, eps, max_blocks, n_rows, n_real,
-                            kscales, vscales, qk_sum_slot(), qk_sum_ptr());
+                            kscales, vscales, qk_sum_slot(), qk_sum_ptr(), q_bias, k_bias, v_bias, qgate);
     }
     // PF_KVSTORE_SUM: hand the per-call slot and the device checksum buffer to the
     // kernel, which folds the post-norm/post-RoPE K and V into it.  Diagnostic only;

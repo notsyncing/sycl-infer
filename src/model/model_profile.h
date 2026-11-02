@@ -47,6 +47,13 @@ struct model_profile {
     // (engine_q4exp.cpp), which cannot be expressed as the generic plan.
     enum class fwd_kind { generic_plan, hc_ple_qsa };
 
+    // Which vision tower an mmproj for this architecture is.  The loader
+    // (src/mm/vision.cpp) is one module that implements every variant; this
+    // field selects the per-architecture differences (fused vs separate q/k/v,
+    // position embeddings, FFN/merger activation, head width) and is
+    // cross-checked against the mmproj's own `clip.projector_type`.
+    enum class vision_kind { none, qwen3vl, qwen2vl };
+
     // How the scheduler feeds a prompt to prefill.  `chunk32` is the shared
     // chunker (kMaxT chunks, the batched mode-2 path); `whole_prompt` asks
     // prefill_text for the whole remaining prompt in one call, because the
@@ -63,6 +70,9 @@ struct model_profile {
     const char * provenance = ""; // how these values were obtained
 
     fwd_kind fwd = fwd_kind::generic_plan;
+    // Which vision tower this architecture's mmproj uses; `none` means the
+    // architecture has no multimodal path at all.
+    vision_kind vision = vision_kind::none;
 
     // Hyper-connections (qwen4exp): the residual is `streams` parallel copies of
     // the hidden state, mixed through a grouped RMSNorm and a `low_rank` gate.
@@ -97,6 +107,11 @@ struct model_profile {
         // the single-blob upload, so its per-tensor upload needs the multi-
         // device path even on one GPU).
         bool auto_layer_map = false;
+        // Keep the synthesised map on a single GPU even when several are
+        // present.  Right-sized for a small model: layer-pipeline parallelism
+        // adds a handoff between the halves without reducing a batch-1 decode,
+        // and it keeps the vision tower and the text trunk on one card.
+        bool auto_layer_map_one_gpu = false;
         // Keep the attention K-split on a multi-device run.  The generic
         // multi-device path pins n_splits/dec_splits to 1; a model whose
         // forward derives its own split (qwen4exp) sets this.
@@ -112,7 +127,13 @@ struct model_profile {
     struct rep_t {
         bool sin_w8 = true;               // build SIn int8 copies (dp4a)
         bool dnnl_int8 = true;            // convertible to oneDNN int8 weights
-        bool raw_gemv_decode = false;     // decode reads the raw GGUF blocks
+        bool raw_gemv_decode = false; // decode reads the raw GGUF blocks
+        // Dequantize the decoder's linears to f32 and run the GEMMs on the
+        // generic f32 kernel instead of the int8 oneDNN path.  A small
+        // fine-tuned model can be sensitive to the int8 activation
+        // quantization (Qwen2-VL/MinerU is), and f32 costs only ~15% of a
+        // 1.2B decode's time.  Default off for every other architecture.
+        bool f32_gemm = false;
         bool split_per_tensor_upload = false; // needs the per-tensor upload path
     } rep;
 
@@ -135,5 +156,6 @@ struct model_profile {
 extern const model_profile kQwen35Profile;    // qwen35
 extern const model_profile kQwen35MoeProfile; // qwen35moe
 extern const model_profile kQwen4ExpProfile;  // qwen4exp
+extern const model_profile kQwen2VlProfile;   // qwen2vl
 
 } // namespace si

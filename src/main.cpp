@@ -15,6 +15,7 @@
 #include "image.h"
 #include "model.h"
 #include "multimodal.h"
+#include "mineru.h"
 #include "server.h"
 #include "vision.h"
 #include "common/env.h"
@@ -53,6 +54,7 @@ static void usage(const char * prog) {
             "commands:\n"
             "  serve                        OpenAI-compatible HTTP server\n"
             "  gen                          generate once from --prompt\n"
+            "  mineru                       two-step MinerU document extraction (Qwen2-VL)\n"
             "\n"
             "common (both commands):\n"
             "  --model <gguf>               model path (default: %s)\n"
@@ -161,6 +163,8 @@ static void usage(const char * prog) {
             "  --temp T                     sampling temperature (default 0.7)\n"
             "  --top-p P                    nucleus sampling (default 0.95)\n"
             "  --top-k K                    top-k sampling (default 40)\n"
+            "  --mineru-only-type T         debug: extract only one block type\n"
+            "  --mineru-layout-side N       layout input side (default 1036)\n"
             "\n"
             "prefix cache (three LRU tiers; lookups promote, evictions demote\n"
             "VRAM -> RAM -> disk -> dropped):\n"
@@ -224,6 +228,8 @@ int main(int argc, char ** argv) {
     bool raw = false;
     bool thinking = false; // --thinking: chat template `enable_thinking`
     std::string mmproj_path;
+    std::string mineru_only_type;
+    int mineru_layout_side = 1036;
     std::string audio_mmproj_path;
     std::vector<std::string> image_paths;
     std::vector<std::string> audio_paths;
@@ -303,6 +309,10 @@ int main(int argc, char ** argv) {
             thinking = true;
         } else if (a == "--mmproj") {
             mmproj_path = next();
+        } else if (a == "--mineru-only-type") {
+            mineru_only_type = next();
+        } else if (a == "--mineru-layout-side") {
+            mineru_layout_side = atoi(next().c_str());
         } else if (a == "--audio-mmproj") {
             audio_mmproj_path = next();
         } else if (a == "--image") {
@@ -619,6 +629,22 @@ int main(int argc, char ** argv) {
             cfg.max_video_side = max_video_side;
             return serve(e, cfg);
         }
+        if (cmd == "mineru") {
+            if (mmproj_path.empty()) {
+                fprintf(stderr, "error: mineru needs --mmproj <mmproj.gguf>\n");
+                return 1;
+            }
+            if (image_paths.empty()) {
+                fprintf(stderr, "error: mineru needs --image <page.png>\n");
+                return 1;
+            }
+            mineru_options mo;
+            mo.layout_side = mineru_layout_side;
+            mo.max_tokens = max_tokens > 256 ? max_tokens : 4096;
+            mo.only_type = mineru_only_type;
+            mo.debug = si::env::flag("PF_MINERU_DEBUG");
+            return run_mineru(e, mmproj_path, image_paths[0], mo, stdout);
+        }
         if (cmd == "gen") {
             gen_params gp;
             gp.max_tokens = max_tokens;
@@ -656,7 +682,7 @@ int main(int argc, char ** argv) {
                         if (mmproj_path.empty()) {
                             throw std::runtime_error("--image/--video requires --mmproj <mmproj.gguf>");
                         }
-                        vm_owned.load(mmproj_path);
+                        vm_owned.load(mmproj_path, e.m.prof ? e.m.prof->vision : model_profile::vision_kind::qwen3vl);
                         // "loaded" is not "can run": ask before anything else is
                         // allocated, so an unsupported projector geometry is a
                         // message instead of a device fault inside the first
