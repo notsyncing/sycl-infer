@@ -205,6 +205,10 @@ engine::engine(const engine_config & cfg)
     // the load, because the profile is selected by the GGUF's architecture.
     engram_ram_mb_ =
         cfg.engram_ram_mb == engine_config::kEngramRamAuto ? mp_->policy.engram_ram_mb_default : cfg.engram_ram_mb;
+    // Tail-skip precedence: an explicit --q4-tail-skip / engine_config value
+    // wins, else PF_Q4_TAIL_SKIP, else 0 (the exact expert set).  Resolved once
+    // here so the forward has no second default at its use site.
+    q4_tail_skip_ = cfg.q4_tail_skip >= 0 ? cfg.q4_tail_skip : si::env::i32("PF_Q4_TAIL_SKIP", 0);
     tk.load(m.gguf);
     lt.lap("tokenizer load");
     // The model profile owns the expert placement.  qwen4exp's per-expert LRU
@@ -827,6 +831,9 @@ engine::~engine() {
         if (d.dsel) {
             sycl::free(d.dsel, qd);
         }
+        if (d.dcounts) {
+            sycl::free(d.dcounts, qd);
+        }
         if (d.tab) {
             sycl::free(d.tab, qd);
         }
@@ -839,6 +846,9 @@ engine::~engine() {
         sycl::queue & qd = dev_queue(x.dev < 0 ? 0 : x.dev);
         if (x.hsel) {
             sycl::free(x.hsel, qd);
+        }
+        if (x.hcnt) {
+            sycl::free(x.hcnt, qd);
         }
         if (x.sinfo) {
             sycl::free(x.sinfo, qd);
@@ -3113,7 +3123,43 @@ bool engine::setup_md_dnnl() {
             // embed kernel reads the GGUF-quantized rows.  It is converted
             // after the upload, keyed by the uploaded device pointer - see
             // setup_multi_device.
-            add(m.output, -1, -1, "head");
+            // PF_HEAD_U4 (default on): an *extra* native 4-bit store for the LM
+            // head, read by the M == 1 decode/prefill GEMV and by the native
+            // batched GEMM (M <= 32).  The head is Q6_K in the file (0.82 B/w)
+            // and the int8 conversion is 1.0625 B/w - on this model that is 29%
+            // of the decode's weight stream - so the u4 grid's 0.531-0.625 B/w
+            // roughly halves the head read.  The int8 store is kept as well
+            // because gemm_w4 only has native instantiations for some row
+            // counts: a batched decode with tb = 15 (or 17..19, 21..23, 25..27,
+            // 29..31) has none and must fall through to the int8 GEMM rather
+            // than the fp32 gemv_group (which would dereference the host key).
+            // The int8 store is registered *explicitly*: the branch above would
+            // see the u4 key already present and skip it.  PF_HEAD_U4=0
+            // restores the int8-only head exactly.
+            static const bool head_u4 = [] {
+                const char * e = si::env::str("PF_HEAD_U4");
+                return !e || atoi(e) != 0;
+            }();
+            if (head_u4) {
+                if (D->add_weight(m.output.data, m.output.data, m.output.type, m.output.K, m.output.N)) {
+                    dev_ok = true;
+                    n_i8++;
+                }
+                const bool ok = D->add_weight_w4(m.output.data, m.output.data, m.output.type, m.output.K, m.output.N,
+                                                 /*any_type=*/true, /*gemv_only=*/true);
+                if (ok) {
+                    dev_ok = true;
+                    n_w4++;
+                }
+                if (!m.q4exp) {
+                    m.page_out_tensor(m.output);
+                }
+                fprintf(stderr, "[w4] LM head u4 store: %s (K=%d N=%d G=%d, %.4f B/weight; int8 fallback kept)\n",
+                        ok ? "registered" : "failed - keeping the int8 head", (int)m.output.K, (int)m.output.N,
+                        si::w4_group(), 0.5 + 4.0 / (double)si::w4_group());
+            } else {
+                add(m.output, -1, -1, "head");
+            }
             // PF_MTP_HEAD_W4 (default on): one extra draft-only u4 copy of the
             // LM head.  The draft reads the head once per drafted token (k times
             // per cycle, 1.35 GB each at int8) and only needs its argmax, so
@@ -4410,7 +4456,19 @@ std::vector<float> engine::run_head() {
         // wkey: the host (oneDNN) key when the head was converted, the uploaded
         // device pointer otherwise
         const void * hk = wkey(0, m.output.data);
-        const act_view av = D->quantize(d_last_hidden, nullptr, hp.n_embd, hp.n_embd, 1, hp.n_embd);
+        // PF_HEAD_U4: the M == 1 u4 GEMV reads the even/odd activation planes,
+        // so this call must quantize in the split form - otherwise it consumes
+        // whatever the last layer's quantize left there.  (Measured: with
+        // do_split false the post-prefill logits came out at rel-L2 0.93, which
+        // is the *stale planes*, not the 4-bit weight error.)  The wider form
+        // costs one extra 2048-value kernel and leaves the int8 path's
+        // arithmetic untouched.
+        static const bool head_u4 = [] {
+            const char * e = si::env::str("PF_HEAD_U4");
+            return !e || atoi(e) != 0;
+        }();
+        const act_view av = D->quantize(d_last_hidden, nullptr, hp.n_embd, hp.n_embd, 1, hp.n_embd,
+                                        /*do_split=*/head_u4);
         if (hk && av.valid()) {
             head_done = D->gemm_w4(av, hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab)
                         || D->gemm(av, hk, nullptr, 1.0f, 1, hp.n_embd, d_logits, hp.n_vocab);

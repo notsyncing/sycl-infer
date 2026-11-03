@@ -1553,11 +1553,21 @@ auto moe_call = [&](size_t idx) {
             }
             if (!fused_quant) {
             const auto a2 = tnow();
+            // The LM head is always the plan's last call.  PF_HEAD_U4 routes it
+            // through the extra u4 store that setup_md_dnnl registers beside the
+            // int8 one (both decode and the single-token prefill head are M == 1
+            // here).  The MTP verify is excluded: its head readout is part of the
+            // acceptance oracle and stays on the int8 store it was measured with.
+            static const bool head_u4 = [] {
+                const char * e = si::env::str("PF_HEAD_U4");
+                return !e || atoi(e) != 0;
+            }();
+            const bool is_head = head_u4 && plan.has_head && idx + 1 == plan.calls.size() && !inf->mtp_dry;
             // decode reads the even/odd split in the u4 GEMV; prefill does not
             // do_split also feeds the native-u4 GEMM's even/odd activation planes,
             // which the MTP speculative verify (a mode-2 batch) uses.
             av = D->quantize(xq.x, xq.up, xq.x_stride, xq.up_stride, tbm, xq.K,
-                             /*do_split=*/mode == 0 || inf->mtp_dry != 0);
+                             /*do_split=*/mode == 0 || inf->mtp_dry != 0 || is_head);
             // one-shot: the first quantise of the layer-0 prefill is where a
             // zeroed d_qkv originates (an all-zero int8 activation makes the
             // GEMM write exact zeros, which is indistinguishable from "the GEMM
