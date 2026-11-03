@@ -30,7 +30,7 @@ pipeline {
         string(name: 'BUILD_JOBS', defaultValue: '4',
                description: 'parallel compile jobs; keep low on a memory-constrained agent')
         booleanParam(name: 'AOT', defaultValue: false,
-               description: 'AOT-compile the device image instead of runtime JIT')
+               description: 'AOT-compile the device image instead of runtime JIT (installs intel-ocloc)')
         string(name: 'AOT_DEVICE', defaultValue: 'acm-g10',
                description: 'ocloc target when AOT=true (acm-g10 = Arc A770, adl-p = Iris Xe)')
         string(name: 'HTTP_PROXY', defaultValue: '',
@@ -95,7 +95,16 @@ pipeline {
                             UBUNTU_TAG="ubuntu${VERSION_ID}"
 
                             apt-get update
-                            apt-get install -y --no-install-recommends python3 python3-venv python3-pip cmake make wget gnupg ca-certificates libssl-dev libtbb12 libze1 ocl-icd-libopencl1
+                            PACKAGES="python3 python3-venv python3-pip cmake make wget gnupg ca-certificates libssl-dev libtbb12 libze1 ocl-icd-libopencl1"
+                            # ocloc is not part of the compiler install (the toolkit
+                            # image has none); it is a separate package from the Intel
+                            # graphics repo, and the AOT device link shells out to it.
+                            # icpx only warns while compiling, so without this the build
+                            # dies at the final link with "llvm-foreach: command failed".
+                            if [ "$AOT" = "ON" ]; then
+                                PACKAGES="$PACKAGES intel-ocloc"
+                            fi
+                            apt-get install -y --no-install-recommends $PACKAGES
 
                             # The full toolkit image ships oneDNN; use it.  Only
                             # a base/slim image needs the Intel apt package.
@@ -141,11 +150,21 @@ pipeline {
                                 echo "icpx is not on PATH after setvars.sh" >&2
                                 exit 1
                             }
+                            # The AOT lowering runs ocloc at the final link; fail
+                            # here with the real reason instead of after a long
+                            # compile whose last step is the one that breaks.
+                            if [ "${AOT:-OFF}" = "ON" ]; then
+                                command -v ocloc >/dev/null || {
+                                    echo "AOT requested but ocloc is not on PATH (the intel-ocloc package provides it)" >&2
+                                    exit 1
+                                }
+                                ocloc --version || true
+                            fi
                             . /tmp/wheel-venv/bin/activate
                             DNNL_ROOT="$(cat /tmp/dnnl_root)"
                             BUILD_DIR="$WORKSPACE/build-wheel"
                             rm -rf "$BUILD_DIR"
-                            cmake -S "$WORKSPACE" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DDNNL_ROOT="$DNNL_ROOT" -DSI_C_API=ON -DSI_ONNX=ON -DSYCL_INFER_AOT="$AOT" -DSYCL_INFER_AOT_DEVICE="$AOT_DEVICE"
+                            cmake -S "$WORKSPACE" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DDNNL_ROOT="$DNNL_ROOT" -DSI_C_API=ON -DSI_ONNX=ON -DSYCL_INFER_AOT="$AOT" -DSYCL_INFER_AOT_DEVICE="$AOT_DEVICE" -DSYCL_INFER_AOT_JOBS="$BUILD_JOBS"
                             cmake --build "$BUILD_DIR" -j"$BUILD_JOBS" --target sycl_infer_c sycl_infer_onnx_c
                             '
                         '''
