@@ -3015,7 +3015,16 @@ bool engine::setup_md_dnnl() {
                 dev_ok = true;
                 n_cb++;
                 converted = true;
-            } else if (D->add_weight(t.data, t.data, t.type, t.K, t.N, /*eager=*/true, lazy_dnnl)) {
+            } else if (t.type != 0 && t.type != 1 && t.type != 30 &&
+                       D->add_weight(t.data, t.data, t.type, t.K, t.N, /*eager=*/true, lazy_dnnl)) {
+                // add_weight() accepts f16/f32/bf16 for the *vision* tower's
+                // linears (registered on its own dnnl_gemm).  A *text* layer's
+                // float tensor must stay on the fp32 path: build_plan gives
+                // GDN's F32 ssm_beta/ssm_alpha their own call with no xq entry,
+                // so that call never takes the oneDNN branch - converting the
+                // weight here pages its host copy out and skips the raw upload,
+                // leaving the fp32 fallback to read a released mmap on the
+                // device (DEVICE_LOST).
                 dev_ok = true;
                 n_i8++;
                 converted = true;
