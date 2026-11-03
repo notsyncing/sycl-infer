@@ -195,6 +195,15 @@ struct engine_config {
     static constexpr size_t kEngramRamAuto = (size_t)-1;
     size_t engram_ram_mb = kEngramRamAuto;
 
+    // qwen4exp routed-expert tail-skip (Strata's CUDA path): an expert that
+    // every token routes at rank >= N is not admitted on a miss; it keeps
+    // sm[e] = -1 and contributes zero.  0 = the exact expert set (the default);
+    // 1..9 are meaningful (a rank is 0..n_expert_used-1) and >= 10 is
+    // effectively off.  kQ4TailSkipAuto means "the PF_Q4_TAIL_SKIP env, else
+    // 0"; an explicit --q4-tail-skip / engine_config value wins over the env.
+    static constexpr int kQ4TailSkipAuto = -1;
+    int q4_tail_skip = kQ4TailSkipAuto;
+
     // YaRN context extension (src/common/yarn.h).  `yarn` off by default: it is
     // a scaling method whose gains in the paper come from long-context
     // fine-tuning, so it is opt-in.  `yarn_factor` 0 = derive from the trained
@@ -730,6 +739,9 @@ struct engine {
     std::vector<void *> q4_host_usm_; // pinned expert mirrors, freed with sycl::free
     std::vector<std::pair<void *, int>> q4_pin_src_; // pinned expert source + device, freed with sycl::free
     bool q4_mirror_ = false;
+    // Resolved once in the constructor: CLI/engine_config > PF_Q4_TAIL_SKIP >
+    // 0 (exact expert set).  0 means no tail-skip.
+    int q4_tail_skip_ = 0;
     size_t engram_ram_mb_ = 0;
     size_t engram_cap_ = 0; // power of two
     std::vector<int32_t> engram_tag_;
@@ -799,6 +811,8 @@ struct engine {
     bool qsa_f16mir_ = false;  // PF_QSA_F16MIR (default on)
     bool qsa_copyq_ = false;   // PF_QSA_COPYQ (default on)
     bool qsa_devattn_ = true; // PF_QSA_DEVATTN (default on, Stage 2; =0 keeps host)
+    bool qsa_pf_dev_ = true;  // PF_QSA_PF_DEV: device sparse *prefill* (see docs 18 §4)
+    int qsa_pf_wave_ = 8;     // PF_QSA_PF_WAVE: prefill rows per compact pool
     // PF_QSA_DEVATTN scratch.  Per device: the compact f16 K/V pool (the same
     // [block][kv head][kBlockSize token][head_dim] layout as the paged pool)
     // and its sequential table + selected-index buffer.  Per attention layer:
@@ -809,23 +823,30 @@ struct engine {
         int dev = -1;
         sycl::half * ck = nullptr;
         sycl::half * cv = nullptr;
-        int32_t * dsel = nullptr;
-        int32_t * tab = nullptr; // sequential compact block table (device)
+        int32_t * dsel = nullptr;  // [kMaxB*kMaxT][cap_keys]
+        int32_t * dcounts = nullptr; // [kMaxB*kMaxT] selected-key count per row
+        int32_t * tab = nullptr; // identity compact block table (device)
         int32_t * htab = nullptr; // pinned staging for the one-time table copy
         int cap_keys = 0;
         int cap_blocks = 0;
+        int cap_wave = 0; // prefill rows per compact pool
     };
     std::vector<qsa_dev_buf> qsa_dev_;
     struct qsa_dev_aux {
         int dev = -1;
-        int32_t * hsel = nullptr; // pinned staging, [cap_keys]
-        step_info * sinfo = nullptr; // device, one row
+        int32_t * hsel = nullptr; // pinned staging, [kMaxB*kMaxT][cap_keys]
+        int32_t * hcnt = nullptr; // pinned staging, [kMaxB*kMaxT]
+        step_info * sinfo = nullptr; // device, one wave of rows
     };
     std::vector<qsa_dev_aux> qsa_aux_;
     void qsa_devattn_ensure(int dev);
     void qsa_devattn_aux(int a, int dev);
     void qsa_devattn_run(int a, int dev, int slot, int pos, const std::vector<int> & sel, const float * qbuf,
                          float * attn_out);
+    // Sparse prefill: the host selector has filled `hsel`/`hcnt` for the whole
+    // chunk; gather/attend/combine run on the device in `cap_wave`-row waves.
+    void qsa_devattn_prefill_run(int a, int dev, int n_tok, int slot, const int32_t * hsel, const int32_t * hcnt,
+                                 const float * qbuf, float * attn_out);
     void qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
                           const float * mixed_host, const float * kh, const float * vh, float * qpos, bool with_q,
                           bool update_mirror);

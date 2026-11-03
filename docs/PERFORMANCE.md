@@ -221,6 +221,23 @@ generation reads high: the same 512-depth cell measures 103 ms/step with a cold
 bank and 73 ms/step once warm, and the table's 93.3 is the steady value a
 64-token generation reports.
 
+**Tail-skip default is now 0 (exact).**  The 2026-10-27/11-01 cells in this
+section were measured at the former default `PF_Q4_TAIL_SKIP=7`; they are kept
+as historical measurements and are **no longer the default behaviour**.  On the
+2026-11-03 build (same 2x Arc A770, `--layer-map 0-19:gpu.0,20-47:gpu.1
+--moe-vram-mb 17500 --cpu-threads 28 --ctx 2048 --kv-type f16 --max-slots 16`,
+468-token prose prompt, 48-token greedy decode, one process per cell, bank 104
+slots/layer / 17.0 GiB):
+
+| tail-skip | decode | expert upload | copy-queue time |
+|---|---:|---:|---:|
+| **0 (default, exact)** | **110.3 ms/step** | 233.3 MiB/token | 34.7 ms |
+| 7 (former default) | 83.7-86.4 ms/step | 128.7-164.8 MiB/token | 19.0-24.1 ms |
+
+At N=7 the emitted stream can flip at near-ties; the two-prompt KL/top-1 gate
+is in [`design/18-qwen4exp.md`](design/18-qwen4exp.md) §7.1.
+`--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N` opts back in (1..9 meaningful).
+
 #### 4.4.1 By context depth, one stream
 
 | depth | prompt | pp | tg | ms/step |

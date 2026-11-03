@@ -167,6 +167,10 @@ void engine::q4_alloc() {
         // faster on the 2412-token cell with the same 32-token stream and
         // byte-identical selector.  PF_QSA_DEVATTN=0 keeps the host Stage 1.
         qsa_devattn_ = SI_ENV_I32("PF_QSA_DEVATTN", 1) != 0;
+        // Sparse prefill on the device (the selector stays on the host).  The
+        // wave is bounded by kMaxB because the scratch step_info is kMaxB rows.
+        qsa_pf_dev_ = SI_ENV_I32("PF_QSA_PF_DEV", 1) != 0;
+        qsa_pf_wave_ = std::max(1, std::min(kMaxB, SI_ENV_I32("PF_QSA_PF_WAVE", 8)));
         qsa_cache_.resize((size_t)attn_layers());
         for (auto & v : qsa_cache_) {
             v.resize((size_t)state_slots_);
@@ -2321,15 +2325,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             std::vector<int> pf_bstart;
             std::vector<int> pf_bset; // 0/1 = workspace set for the reuse fence, -1 = kept/final
             bool two_pass = false;
-            // PF_Q4_TAIL_SKIP: Strata's tail-skip (CUDA path) - an expert
-            // that every token routes at rank >= T is not admitted when it is
-            // a miss.  It is declared here because both the two-pass schedule
-            // and the single-pass decode need it; rank_min is filled after the
-            // ids are available.
-            // Default 7: the quality gate showed the first divergence at a
-            // near-tie (top-1 28/29 and 15/16, KL 0.029/0.037) and the speedup
-            // is real; PF_Q4_TAIL_SKIP=0 restores the exact expert set.
-            static const int tail_skip = si::env::i32("PF_Q4_TAIL_SKIP", 7);
+            // PF_Q4_TAIL_SKIP / --q4-tail-skip (Strata's CUDA path) - an
+            // expert that every token routes at rank >= T is not admitted when
+            // it is a miss.  It is declared here because both the two-pass
+            // schedule and the single-pass decode need it; rank_min is filled
+            // after the ids are available.
+            // Resolved once by the engine constructor (CLI > env > 0); the
+            // default 0 keeps the exact expert set.  1..9 are meaningful.
+            const int tail_skip = q4_tail_skip_;
             std::vector<int> rank_min;
             if (q4_hot_ && q4_hot_ready_) {
                 // All-GPU LRU: every expert the step selects is uploaded into a

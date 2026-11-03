@@ -87,6 +87,10 @@ static void usage(const char * prog) {
             "                               (env PF_MOE_RAM_MB)\n"
             "  --engram-ram-mb N            qwen4exp PLE row cache in host RAM\n"
             "                               (default 4096; 0 disables)\n"
+            "  --q4-tail-skip N             qwen4exp routed-expert tail-skip: drop\n"
+            "                               a missed expert whose best rank over the\n"
+            "                               batch is >= N (default 0 = exact; 1..9\n"
+            "                               meaningful; env PF_Q4_TAIL_SKIP)\n"
             "  --yarn                       YaRN context extension, NTK-by-parts\n"
             "                               (default OFF; env PF_YARN).  It stretches\n"
             "                               the low-frequency RoPE pairs so a context\n"
@@ -213,6 +217,7 @@ int main(int argc, char ** argv) {
     size_t moe_vram_mb = 0;     // --moe-vram-mb: device budget for the expert bank
     size_t engram_ram_mb = engine_config::kEngramRamAuto; // --engram-ram-mb: 0 = off, unset = profile default
     size_t moe_ram_mb = 0;      // --moe-ram-mb: host budget for the decoded-expert tier
+    int q4_tail_skip = engine_config::kQ4TailSkipAuto; // --q4-tail-skip: 0 = exact (unset = env, else 0)
     bool yarn = false;          // --yarn: YaRN context extension
     int yarn_orig_ctx = 0;      // 0 = the GGUF's declared context_length
     float yarn_factor = 0.0f;   // 0 = derive from --ctx / trained context
@@ -391,6 +396,25 @@ int main(int argc, char ** argv) {
             engram_ram_mb = (size_t) std::atoi(next().c_str());
         } else if (a == "--moe-ram-mb") {
             moe_ram_mb = (size_t) std::atoi(next().c_str());
+        } else if (a == "--q4-tail-skip") {
+            // qwen4exp's routed-expert tail-skip: a missed expert whose best
+            // rank over the batch is >= N is not admitted (it contributes
+            // zero).  0 = the exact expert set, the default; 1..9 are
+            // meaningful and >= 10 is effectively off.  Negative and
+            // non-numeric values are rejected rather than clamped.
+            const std::string v = next();
+            bool ok = !v.empty();
+            for (const char c : v) {
+                if (c < '0' || c > '9') {
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                fprintf(stderr, "error: --q4-tail-skip expects a non-negative integer\n");
+                bad_arg = true;
+            } else {
+                q4_tail_skip = std::atoi(v.c_str());
+            }
         } else if (a == "--max-slots") {
             // Bounds the engine's per-slot recurrent state.  That state is the
             // largest non-weight allocation on a 27B (1.125 GiB per card at 16
@@ -525,6 +549,7 @@ int main(int argc, char ** argv) {
         ec.moe_vram_mb = moe_vram_mb;
         ec.engram_ram_mb = engram_ram_mb;
         ec.moe_ram_mb = moe_ram_mb;
+        ec.q4_tail_skip = q4_tail_skip;
         ec.n_splits = 16;
         ec.n_blocks = n_blocks;
         ec.yarn = yarn;

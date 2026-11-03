@@ -168,12 +168,15 @@ measured value (`cfg_dec` auto, `PF_Q4_F32_SPLIT=0`) reads the raw env with a
 
 ## 4. QSA
 
-The selector and the attention over the selected keys run on the host
-(`engine_qsa.cpp`).  Full-attention layers keep a host mirror of their K/V, so
-no device gather is needed; the result is written back for the existing `wo`
-GEMV.  The cache stores the **raw** indexer key (the reference pools raw keys
-before `k_norm`+RoPE), the mirror rounds to f16 like the reference's cache, and
-the top-2048 selection is a `std::partial_sort` with ggml's comparator.
+The selector runs on the host (`engine_qsa.cpp`).  The attention over the
+selected keys runs on the host for CPU, non-f16 KV, a non-256 head and the
+`PF_QSA_DEVATTN=0` / `PF_QSA_PF_DEV=0` A/Bs, and on the device for the f16 GPU
+sparse paths (one token via Stage 2, a whole prefill chunk via Stage 3 below).
+The host path keeps a mirror of each full-attention layer's K/V, so it needs no
+device gather; either path writes the result back for the existing `wo` GEMV.
+The cache stores the **raw** indexer key (the reference pools raw keys before
+`k_norm`+RoPE), the mirror rounds to f16 like the reference's cache, and the
+top-2048 selection is a `std::partial_sort` with ggml's comparator.
 
 Up to 2 048 keys the reference's selection covers every key, so the dense path
 is exactly equivalent.  Above it the sparse path runs and appends the
@@ -312,10 +315,75 @@ are byte-identical, and the one-layer ATTN_OUT/`wo` cos is 0.999999919 /
 0.999999788.  `--ctx 2048` QSA-off and `--ctx 4096` short md5s are unchanged.
 Caveats: device tokens skip the main K/V mirror update, so a post-decode sparse
 prefill on the same slot would need a mirror rebuild (the q4 prompt->decode
-flows never do; `zero_slot` clears); `head_dim != 256`, i8, CPU and prefill use
-the host Stage 1 path; the first device token allocates ~17 MB/device (~9.8 ms).
+flows never do; `zero_slot` clears); `head_dim != 256`, i8 and CPU use the host
+Stage 1 path (sparse prefill has its own device path, Stage 3 below); the
+first device token allocates ~17 MB/device (~9.8 ms).
 Default on for f16 GPU sparse decode on prompt->decode flows; `PF_QSA_DEVATTN=0`
 keeps the host Stage 1 path.
+
+**Stage 3: sparse prefill on the device (`PF_QSA_PF_DEV`, default on).**  A
+sparse prefill chunk (`n_tok > 1`, `pos > idx_top_k`) used to run the host
+attention over the mirror once per token - 4.6 s of QSA attention on the
+1024-token crossing chunk and 2.3 s on the 576-token tail of the 3660-token
+prompt below.  The selector is still the host one (same `std::partial_sort`
+comparator, now run with `par(n_tok)` over independent rows into per-layer
+pinned buffers), so the selected sets are bit-identical.  `qsa_devattn_prefill_run`
+copies the ids and counts once per layer and then walks `cap_wave` rows per
+wave:
+
+* `qsa_sinfo_multi_launch` makes each row a one-token sequence whose position
+  is its selected-key count and whose slot is its row index;
+* `qsa_gather_rows_launch` compacts each row's selected paged-KV rows into its
+  own slice of the compact pool (row `r` owns blocks
+  `[r*cap_blocks, (r+1)*cap_blocks)`; the block table is the identity with a
+  `cap_blocks` stride);
+* the ordinary `attn`/`attn_combine` run over it with `partials_dec` and the
+  decode split count (`PF_QSA_PF_NSP` may lower it).
+
+One slot per chunk is required (a mixed-slot chunk falls back to the host
+path).  The gate is GPU + f16 KV + `head_dim == 256` + `n_tok <= kMaxB*kMaxT`;
+dense forwards (`pos <= idx_top_k`) never enter it.  `PF_QSA_PF_WAVE` (default
+8) sets the compact-pool rows; its cost is
+`wave * 65 * n_head_kv * 32 * head_dim * 2 * 2 B` of VRAM (77 MB/device at 8)
+plus the per-layer pinned selection staging (8.5 MB/layer at `kMaxB*kMaxT`).
+
+Measured 2026-11-03 on 2x A770, the 3660-token `/tmp/prompt4k.txt` cell
+(`--ctx 4096 --kv-type f16`, `--moe-vram-mb 17500`, 28 threads, tail-skip 0,
+one process per cell, two interleaved reps; the chunk wall is the `[qsa] fwd
+wall` sum, not `[q4] rest`, which excludes async device work):
+
+| | `PF_QSA_PF_DEV=0` | `=1` |
+|---|---:|---:|
+| prefill, sum of chunk walls | 75.47 s | **67.83 s** |
+| post-load process wall | 80.88 s | 72.87 s |
+| chunk 3 (1024, sparse) wall | 24.13 s | 19.05 s |
+| chunk 4 (576, sparse) wall | 14.82 s | 12.26 s |
+| QSA attention, chunk 3 / chunk 4 | 4.64 / 2.30 s | **0.046 / 0.026 s** |
+| QSA selector, chunk 3 | 1.50 s | 0.13 s |
+| decode median | 131-149 ms | **113 ms** |
+
+The prefill gain is 7.6 s (-10%) and the QSA call itself falls to ~1/100; what
+remains of the crossing chunk is the gather's D2D traffic (each row re-gathers
+its ~2 080 keys) and the existing paged attention.  Decode is unchanged (its
+113 ms matches the cell without the new path; the 131-149 ms spread of the
+host-prefill cells is the expert bank state the different prefill leaves).
+
+**Correctness and the f16 rounding caveat.**  On a 2560-token prompt the only
+sparse chunk is the final 512-token one, so chunks 1-2 take the same dense path
+in both cells: `PF_QSA_SCORE`/`POOLS`/`MIX` are byte-identical, and the layer-0
+attention over all 512 rows matches the host attention to cosine
+**0.99999976** (mean 1.0, rel-RMS max **1.2e-6**) - but only when both read the
+same f16 K/V.  The shipped host mirror uses `ggml_float_to_half`, which
+**truncates** the mantissa, while the device KV store casts to `sycl::half`
+(round-to-nearest); that one-ulp disagreement is ~6e-4 relative RMS and is
+about half of the final-logit difference on that prompt (KL 0.20 with the
+truncating mirror, 0.045 with `PF_QSA_F16RND=1`, which makes the host mirror
+round and is a diagnostic only).  On the full 3660-token prompt the first-token
+logits land on a near-tie - 760 vs 27775, margins 0.13 / 0.19, KL 0.0127 - so
+the continuation differs; that is the same accumulation-order sensitivity the
+Stage 2 decode already has.  A dense 512-token prompt's stdout is md5-identical
+between the two cells.  `PF_QSA_ATTN_DUMP_ALL=1` writes every attention row (the
+per-row oracle used above); `PF_QSA_F16RND` is not the shipped host path.
 
 ## 5. PLE and the engram cache
 
@@ -458,7 +526,8 @@ against the baseline's 3.1 ms - a per-miss win, erased at model scale by the
 3.2x miss count.  The full cell is KL mean **1.9e-4**, max 6.4e-3, top-1
 **96/96**, and `PF_Q4_FFCMP` reports layer 0 cos **0.999988**.  The last-32
 wall is **148.1 ms against 99.3** (28 CPU threads; 227.1 at the default 14),
-and 122.2 against 93.2 with `PF_Q4_TAIL_SKIP=7`.  The blocker is the resident
+and 122.2 against 93.2 with `PF_Q4_TAIL_SKIP=7` (tail7, no longer the default).
+The blocker is the resident
 set, not the dot: the bank's hit rate comes from continuous LRU admission.
 Frozen at decode step 16 (`PF_Q4_CPU_MISS_WARM`, default 16), it misses **156
 of 460 pairs/token against 48.8** for the adaptive LRU, and a host miss costs
@@ -594,28 +663,31 @@ box), but the host-side MoE/PLE/HC work scales with the logical count.  On the
 | 14 | 7 | 100.1 ms | 16.49 s | |
 | **28** | **7** | **93.3 ms** | **15.52 s** | recommended; 10.7 tok/s |
 
-The 93.3 ms cell is 28 threads + tail7; the default-14 tail7 cell is 100.1 ms.
-The server gains much less (5.40 -> 5.57 tok/s aggregate; a single request
-6.09 -> 6.19) because its q4 path is dominated by the prefill and HTTP/sample
-path, and it still pays the one-row schedule.
+The 93.3 ms cell is 28 threads + tail7 (no longer the default); the default-14
+tail7 cell is 100.1 ms.  The server gains much less (5.40 -> 5.57 tok/s
+aggregate; a single request 6.09 -> 6.19) because its q4 path is dominated by
+the prefill and HTTP/sample path, and it still pays the one-row schedule.
 
-Tail-skip (`PF_Q4_TAIL_SKIP=7`, default 7) drops a miss whose best rank over the
-batch is >= 7: it stays `sm[e] = -1`, contributes zero and is neither copied nor
-computed.  It is a real approximation, gated on two prompts:
+Tail-skip (`PF_Q4_TAIL_SKIP=N` / `--q4-tail-skip N`, default 0 = the exact
+expert set) drops a miss whose best rank over the batch is >= N: it stays
+`sm[e] = -1`, contributes zero and is neither copied nor computed.  The
+measurements below were taken at the old default, N=7, and are kept as
+historical results.  It is a real approximation, gated on two prompts:
 
 | prompt | top-1 agreement | first diff | KL at first diff | decode mean | wall |
 |---|---:|---:|---:|---:|---:|
 | short `The TCP/IP protocol is` | 28/29 steps | 28 | 0.029 | - | 14.35 -> **11.99 s** |
 | 96-token TCP | 15/16 steps | 15 | 0.037 | 120.7 -> **100.1 ms** | 20.95 -> **16.49 s** |
 | 96-token TCP, 28 threads, tail0 | - | - | - | 109.6 ms | 18.08 s |
-| 96-token TCP, 28 threads, tail7 | same stream as the 14-thread tail7 row | - | - | **93.3 ms** | **15.52 s** |
+| 96-token TCP, 28 threads, tail7 (no longer the default) | same stream as the 14-thread tail7 row | - | - | **93.3 ms** | **15.52 s** |
 
 The first divergence was a near-tie in both (e.g. base 21.58 vs 21.07 with the
 other candidate at 21.0); step-0 prefill logits had KL 0.019-0.021 with the
 same top-1, and both outputs remained coherent.  The archive's 96-token cell
 measured 93.6 -> **86.9 ms** (-7.2%), last-token upload **56.2 -> 32.2 MiB**
-(-43%); rank 8 is 90.0 ms.  `PF_Q4_TAIL_SKIP=0` restores the exact expert set.
-The performance-first decision accepts the near-tie flips.
+(-43%); rank 8 is 90.0 ms.  The default is now 0 (the exact expert set);
+`--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N` opts back into the approximation, and
+a performance-first decision accepts the near-tie flips when it is enabled.
 
 #### 7.1.3 MTP verify gate: NO-GO
 
@@ -633,7 +705,8 @@ The kill thresholds were warm n=3 < 190 ms and n=5 < 230 ms; the measured
 values are 1.9-2.2x over.  Even n=1 is 2.5x a plain token (93.3 ms), so the
 existing mode-1 forward is not the verify shape.
 
-> **MTP q4 result: NO-GO (2026-10-27).**  The verify gate (tail7+28, warm)
+> **MTP q4 result: NO-GO (2026-10-27).**  The verify gate (tail7, no longer the
+> default, +28, warm)
 > measured n=1/3/5 = **224.5 / 367.7 / 420.6 ms** (reproduced 368.3 / 418.7)
 > against the kill lines 190 / 230; `PF_Q4_TIME` puts **207/331/403 ms** of the
 > 232/368/447 ms forward in the FFN with only 150/436/576 MiB H2D, so the cost
@@ -669,7 +742,8 @@ accumulation-order sensitivity; the generated content matched.
 
 #### 7.1.5 Deep context (2026-10-27)
 
-Conditions: the recommended 28 threads and tail7, f16 KV, `--ctx 4096` for the
+Conditions: the recommended 28 threads and tail7 (no longer the default), f16
+KV, `--ctx 4096` for the
 512 cell, `--ctx 32768` for 2,426 and 16,445, and `--ctx 65536` for the 48k
 cell.  The 48k cell uses `--moe-vram-mb 16000` (111 slots/layer, 15.1 GiB)
 because 17 500 MB does not allocate at that context; the other cells use
@@ -788,7 +862,8 @@ superblock repack of the Q5_1 down plane (§9.1).
 
 ### 7.3 Depth cells re-baselined, and the one-card experiment (2026-11-01)
 
-Both cards, `--layer-map 0-19:gpu.0,20-47:gpu.1`, f16 KV, 28 threads, tail 7,
+Both cards, `--layer-map 0-19:gpu.0,20-47:gpu.1`, f16 KV, 28 threads, tail 7
+(no longer the default),
 `PF_PREFIX_CACHE=0`, one process per cell.  `pp` is prompt tokens over the
 warm prefill (the `[q4] fwd n=<rows>` rows); `ms/step` is the mean of the
 `[q4] fwd n=1` forward, skipping the first three steps while the bank warms.
@@ -834,7 +909,8 @@ slower at 512, and cannot hold a 48k context.
 | `PF_Q4_BANK=0` / `PF_Q4_BANK_LAYER=1` | on / off | all-host path / whole-layer bank (A/B) |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
 | `PF_Q4_PIN_SRC=0` | on | stage from the mmap instead of the pinned expert source |
-| `PF_Q4_TAIL_SKIP=N` | 7 | drop a miss whose best batch rank is >= N (7 = default; `0` = exact; 86.9 ms, 32.2 MiB vs 93.6/56.2; gate 2026-10-27: KL 0.029/0.037 at near-tie divergences) |
+| `PF_Q4_TAIL_SKIP=N` | 0 | drop a miss whose best batch rank is >= N (default 0 = exact; 1..9 meaningful; `--q4-tail-skip` overrides; the 86.9 ms, 32.2 MiB vs 93.6/56.2 and the 2026-10-27 gate - KL 0.029/0.037 at near-tie divergences - were measured at N=7) |
+| `--q4-tail-skip N` | 0 | CLI form of the above: default 0 = exact, 1..9 meaningful, env `PF_Q4_TAIL_SKIP` |
 | `PF_Q4_CPU_MISS=1` | off | decode CPU miss for non-resident experts, int8 host path (`2` = f32 A/B); **148.1 vs 99.3 ms, rejected** (§6.1) |
 | `PF_Q4_CPU_MISS_WARM=N` / `_LAYER=il` / `_TIME` | 16 / all / off | decode steps with the LRU before the split freezes / one-layer probe / per-layer host+GPU print |
 | `PF_Q4_CMDBG=1` | off | per-call sub-phase ms inside the host miss expert |
@@ -913,8 +989,9 @@ The full knob list (including the `PF_QSA_*` dumps) is in
   to ~103 and costs ~10% decode.  The 74 tok/s target is out of reach on two
   cards.
 * **Tail-skip** works (120.7 -> 100.1 ms decode on the 96-token TCP prompt,
-  KL 0.029-0.037 at near-tie divergences).  It is an expert-drop but is now
-  **default 7**; `PF_Q4_TAIL_SKIP=0` restores the exact set; the gate is in
+  KL 0.029-0.037 at near-tie divergences; the numbers were taken at N=7).  It
+  is an expert-drop but the default is now **0 (exact)**;
+  `--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N` opts in; the gate is in
   §7.1.
 
 ### 9.1 Dead ends from the 2026-11-01 pass

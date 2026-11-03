@@ -256,6 +256,7 @@ Common flags:
 | `--moe-vram-mb MB` | 0 | routed-MoE: device budget for the expert bank; qwen4exp's per-expert LRU uses **17500** |
 | `--moe-ram-mb MB` | 0 | routed-MoE: host budget for the expert-block tier (`0` = off); qwen4exp keeps its experts host-resident and does not use this |
 | `--engram-ram-mb MB` | 4096 | qwen4exp: PLE row cache in host RAM (`0` disables) |
+| `--q4-tail-skip N` | 0 | qwen4exp: drop a missed expert whose best rank over the batch is >= N (`0` = exact; 1..9 meaningful; env `PF_Q4_TAIL_SKIP`) |
 | `--spec-type T` | `none` | speculative decoding: `none` / `mtp` / `dflash2` |
 | `--spec-draft-model <gguf>` | – | DFlash2 drafter GGUF (`--spec-type dflash2`); it reads the target's hidden states at the layers its `dflash.target_layers` names and proposes up to `dflash.block_size`-1 tokens |
 | `--spec-draft-n-max N` | 5 | draft tokens per cycle (DFlash2); the measured optimum |

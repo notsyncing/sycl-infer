@@ -71,6 +71,24 @@ inline float f16r(float x) {
     return ggml_half_to_float(ggml_float_to_half(x));
 }
 
+// PF_QSA_F16RND (diagnostic): the host attention mirror's f16 conversion.
+// `ggml_float_to_half` *truncates* the mantissa, while the device KV store
+// (`kv_st`'s `(sycl::half)` cast) rounds to nearest; the two differ by one ulp
+// on about half the values, which is the ~6e-4 attention difference the
+// device/host prefill A/B measures.  This knob makes the host mirror round so
+// the two are comparable; the shipped host path keeps the truncating form its
+// Stage 1 numbers were measured with.
+inline uint16_t f16_store(float x) {
+    static const bool rnd = si::env::flag("PF_QSA_F16RND");
+    if (!rnd) {
+        return ggml_float_to_half(x);
+    }
+    const sycl::half h = (sycl::half)x;
+    uint16_t u;
+    std::memcpy(&u, &h, sizeof(u));
+    return u;
+}
+
 // One-layer Stage 2 probe: PF_QSA_ATTN_LAYER selects the attention index and
 // PF_QSA_ATTN_DUMP is the path prefix.  The .qsa file is the gated attention
 // row; engine_q4exp writes the matching .wo file after the projection.
@@ -303,8 +321,8 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
                 uint16_t * kd = sp->k16.data() + (size_t)pos * kvd;
                 uint16_t * vd = sp->v16.data() + (size_t)pos * kvd;
                 for (int d = 0; d < kvd; d++) {
-                    kd[d] = ggml_float_to_half(ks[d]);
-                    vd[d] = ggml_float_to_half(vs[d]);
+                    kd[d] = f16_store(ks[d]);
+                    vd[d] = f16_store(vs[d]);
                 }
             } else {
                 float * kd = sp->k.data() + (size_t)pos * kvd;
@@ -426,24 +444,33 @@ void engine::qsa_devattn_ensure(int dev) {
     const int cap = ((need_keys + kBlockSize - 1) / kBlockSize) * kBlockSize;
     const int blocks = cap / kBlockSize;
     const int kvd = hp.n_head_kv * hp.head_dim;
+    const int ntok_max = kMaxB * kMaxT;
+    // The compact pool is `cap_wave` rows: each row's selected keys occupy
+    // blocks [r*cap_blocks, (r+1)*cap_blocks), and the identity table maps them
+    // with a cap_blocks stride.  Decode uses row 0 only, so its layout and its
+    // values are unchanged.
+    const int wave = std::max(1, std::min(kMaxB, qsa_pf_wave_));
+    const size_t pool_blocks = (size_t)wave * (size_t)blocks;
     sycl::queue & q = dev_queue(dev);
-    d.ck = (sycl::half *)dev_alloc_on(dev, (size_t)cap * (size_t)kvd * sizeof(sycl::half));
-    d.cv = (sycl::half *)dev_alloc_on(dev, (size_t)cap * (size_t)kvd * sizeof(sycl::half));
-    d.dsel = (int32_t *)dev_alloc_on(dev, (size_t)cap * sizeof(int32_t));
-    d.tab = (int32_t *)dev_alloc_on(dev, (size_t)blocks * sizeof(int32_t));
-    d.htab = (int32_t *)sycl::malloc_host((size_t)blocks * sizeof(int32_t), q);
-    if (!d.ck || !d.cv || !d.dsel || !d.tab || !d.htab) {
+    d.ck = (sycl::half *)dev_alloc_on(dev, pool_blocks * (size_t)kvd * kBlockSize * sizeof(sycl::half));
+    d.cv = (sycl::half *)dev_alloc_on(dev, pool_blocks * (size_t)kvd * kBlockSize * sizeof(sycl::half));
+    d.dsel = (int32_t *)dev_alloc_on(dev, (size_t)ntok_max * (size_t)cap * sizeof(int32_t));
+    d.dcounts = (int32_t *)dev_alloc_on(dev, (size_t)ntok_max * sizeof(int32_t));
+    d.tab = (int32_t *)dev_alloc_on(dev, pool_blocks * sizeof(int32_t));
+    d.htab = (int32_t *)sycl::malloc_host(pool_blocks * sizeof(int32_t), q);
+    if (!d.ck || !d.cv || !d.dsel || !d.dcounts || !d.tab || !d.htab) {
         throw std::runtime_error("qwen4exp: QSA Stage 2 scratch allocation failed");
     }
-    for (int i = 0; i < blocks; i++) {
-        d.htab[i] = i;
+    for (size_t i = 0; i < pool_blocks; i++) {
+        d.htab[i] = (int32_t)i;
     }
-    (void)q.memcpy(d.tab, d.htab, (size_t)blocks * sizeof(int32_t));
+    (void)q.memcpy(d.tab, d.htab, pool_blocks * sizeof(int32_t));
     d.cap_keys = cap;
     d.cap_blocks = blocks;
+    d.cap_wave = wave;
     d.dev = dev;
     if (si::env::flag("PF_Q4_QSADBG")) {
-        fprintf(stderr, "[qsa] devattn scratch dev=%d keys=%d blocks=%d\n", dev, cap, blocks);
+        fprintf(stderr, "[qsa] devattn scratch dev=%d keys=%d blocks=%d wave=%d\n", dev, cap, blocks, wave);
     }
 }
 
@@ -458,9 +485,11 @@ void engine::qsa_devattn_aux(int a, int dev) {
     }
     qsa_dev_buf & d = qsa_dev_[(size_t)dev];
     sycl::queue & q = dev_queue(dev);
-    x.hsel = (int32_t *)sycl::malloc_host((size_t)d.cap_keys * sizeof(int32_t), q);
+    const size_t ntok_max = (size_t)kMaxB * kMaxT;
+    x.hsel = (int32_t *)sycl::malloc_host(ntok_max * (size_t)d.cap_keys * sizeof(int32_t), q);
+    x.hcnt = (int32_t *)sycl::malloc_host(ntok_max * sizeof(int32_t), q);
     x.sinfo = (step_info *)dev_alloc_on(dev, sizeof(step_info));
-    if (!x.hsel || !x.sinfo) {
+    if (!x.hsel || !x.hcnt || !x.sinfo) {
         throw std::runtime_error("qwen4exp: QSA Stage 2 aux allocation failed");
     }
     x.dev = dev;
@@ -509,6 +538,73 @@ void engine::qsa_devattn_run(int a, int dev, int slot, int pos, const std::vecto
     cbe.attn_combine(part, qbuf, attn_out, x.sinfo, nh, hd, nsp, 1, 1);
     if (si::env::flag("PF_Q4_QSADBG")) {
         fprintf(stderr, "[qsa] devattn a=%d slot=%d nsel=%d nblk=%d nsp=%d\n", a, slot, nsel, nblk, nsp);
+    }
+}
+
+// Sparse prefill on the device.  The host has already run the selector for
+// every token into `hsel`/`hcnt` (row stride is the compact-pool capacity), so
+// the selected sets are exactly the Stage 1 ones.  Each wave compacts `T` rows
+// into its own slice of the compact pool, then the ordinary paged-attention
+// kernels run over it.  There is deliberately no per-wave host wait: the queue
+// is in-order, and the only host-side copy is the one H2D of the ids/counts
+// per layer (the pinned staging is per layer, so a later layer cannot overwrite
+// it before the copy has been consumed).
+void engine::qsa_devattn_prefill_run(int a, int dev, int n_tok, int slot, const int32_t * hsel, const int32_t * hcnt,
+                                    const float * qbuf, float * attn_out) {
+    if (n_tok <= 0) {
+        return;
+    }
+    const hparams & hp = m.hp;
+    const int nh = hp.n_head, nkv = hp.n_head_kv, hd = hp.head_dim;
+    if (n_tok > kMaxB * kMaxT) {
+        throw std::runtime_error("qwen4exp: QSA prefill chunk exceeds the device-path row capacity");
+    }
+    qsa_devattn_aux(a, dev);
+    qsa_dev_buf & d = qsa_dev_[(size_t)dev];
+    qsa_dev_aux & x = qsa_aux_[(size_t)a];
+    if (slot < 0) {
+        throw std::runtime_error("qwen4exp: QSA prefill device path needs a valid slot");
+    }
+    sycl::queue & q = dev_queue(dev);
+    const size_t nsel_bytes = (size_t)n_tok * (size_t)d.cap_keys * sizeof(int32_t);
+    std::memcpy(x.hsel, hsel, nsel_bytes);
+    std::memcpy(x.hcnt, hcnt, (size_t)n_tok * sizeof(int32_t));
+    // Both copies are queued behind the layer's own kernels on the in-order
+    // compute queue; gather reads them immediately after.
+    (void)q.memcpy(d.dsel, x.hsel, nsel_bytes);
+    (void)q.memcpy(d.dcounts, x.hcnt, (size_t)n_tok * sizeof(int32_t));
+
+    const char * kp = nullptr;
+    const char * vp = nullptr;
+    const char * ksc = nullptr;
+    const char * vsc = nullptr;
+    kv_layer_ptrs(a, kp, vp, ksc, vsc);
+    const int32_t * src = d_tables + (size_t)slot * max_blocks;
+    const int qstride = nh * 2 * hd;
+    float * part = multi_dev ? as_[(size_t)dev].partials_dec : d_partials_dec;
+    // The decode split count is what makes the decode path fill the card; the
+    // same grid over a cap_wave-row wave is the shape this path was measured
+    // with.  PF_QSA_PF_NSP overrides it for the A/B (0 = decode splits).
+    static const int nsp_env = si::env::i32("PF_QSA_PF_NSP", 0);
+    const int nsp_max = std::max(1, dec_splits);
+    // partials_dec is sized for dec_splits splits; an override may only lower it.
+    const int nsp = (nsp_env > 0 && nsp_env < nsp_max) ? nsp_env : nsp_max;
+    compute_backend & cbe = multi_dev ? *backends_[(size_t)dev] : *be;
+    const int W = std::min(d.cap_wave, n_tok);
+    for (int w = 0; w < n_tok; w += W) {
+        const int T = std::min(W, n_tok - w);
+        qsa_sinfo_multi_launch(q, x.sinfo, d.dcounts + w, T);
+        qsa_gather_rows_launch(q, kp, vp, src, d.dsel + (size_t)w * d.cap_keys, d.dcounts + w, d.cap_keys,
+                               d.cap_blocks, T, nkv, hd, kBlockSize, d.ck, d.cv);
+        // group = 0 keeps the classic split kernel: the grouped one assumes the
+        // paged geometry and is not needed here (same call as the decode path).
+        cbe.attn(qbuf + (size_t)w * qstride, qbuf + (size_t)w * qstride, d.ck, d.cv, part, d.tab, nh, nkv, hd, nsp,
+                 x.sinfo, hp.attn_scale, d.cap_blocks, T, 1, nullptr, 0, nullptr, nullptr);
+        cbe.attn_combine(part, qbuf + (size_t)w * qstride, attn_out + (size_t)w * nh * hd, x.sinfo, nh, hd, nsp, T,
+                         1);
+    }
+    if (si::env::flag("PF_Q4_QSADBG")) {
+        fprintf(stderr, "[qsa] devattn prefill a=%d slot=%d n_tok=%d wave=%d nsp=%d\n", a, slot, n_tok, W, nsp);
     }
 }
 
@@ -644,28 +740,51 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         return false;
     }
 
-    // Stage 2: the sparse, single-token GPU f16 path attends to the selected
-    // rows of the paged pool on the device.  The selector still runs here and
-    // is unchanged; only the main Q/K/V D2H and the host attention go away.
-    // Dense forwards, prefill chunks (n_tok > 1), CPU and non-f16 KV keep the
-    // Stage 1 host path, including the mirror update.
+    // Stage 2: the sparse GPU f16 path attends to the selected rows of the
+    // paged pool on the device.  The selector still runs here and is unchanged;
+    // only the main Q/K/V D2H and the host attention go away.
+    //  * one token (decode): row 0 of the compact pool;
+    //  * a prefill chunk (n_tok > 1): `cap_wave` rows per wave, and every row
+    //    must name the same slot because the compact table is per sequence.
+    // Dense forwards, CPU, non-f16 KV and a mixed-slot chunk keep the Stage 1
+    // host path, including the mirror update.
     const bool f16kv = kv_k_dtype() == kv_dtype_t::f16 && kv_v_dtype() == kv_dtype_t::f16;
     const bool dev_path = qsa_devattn_ && need && n_tok == 1 && !is_cpu(dev) && f16kv && hd == 256;
+    bool slot_const = need && n_tok > 1;
+    int chunk_slot = -1;
+    if (slot_const) {
+        for (int i = 0; i < n_tok; i++) {
+            const int sl = slotv[(size_t)i];
+            if (sl < 0 || sl >= (int)qsa_cache_[(size_t)a].size() || !qsa_cache_[(size_t)a][(size_t)sl]) {
+                slot_const = false;
+                break;
+            }
+            if (chunk_slot < 0) {
+                chunk_slot = sl;
+            } else if (chunk_slot != sl) {
+                slot_const = false;
+                break;
+            }
+        }
+    }
+    const bool dev_pf = qsa_pf_dev_ && qsa_devattn_ && slot_const && !is_cpu(dev) && f16kv && hd == 256
+                        && n_tok <= kMaxB * kMaxT;
+    const bool dev_attn = dev_path || dev_pf;
 
     // The sparse path runs inline and reads the mirror: apply any update a
     // preceding dense chunk deferred before the selector sees the pool.
     qsa_flush();
-    qsa_stage_ensure(a, n_tok, need && !dev_path, need, dev);
+    qsa_stage_ensure(a, n_tok, need && !dev_attn, need && !dev_attn, dev);
     qsa_stage & st = qsa_stage_[(size_t)a];
 
     const size_t mb = (size_t)n_tok * (size_t)n_embd * sizeof(float);
     const size_t qb = (size_t)n_tok * (size_t)nh * (size_t)stride * sizeof(float);
     const size_t kb = (size_t)n_tok * (size_t)kvd * sizeof(float);
     (void)to_host_async(st.mixed, mixed, mb);
-    if (need && !dev_path) {
+    if (need && !dev_attn) {
         (void)to_host_async(st.q, qbuf, qb);
     }
-    if (!dev_path) {
+    if (!dev_attn) {
         (void)to_host_async(st.k, kbuf, kb);
         (void)to_host_async(st.v, vbuf, kb);
     }
@@ -678,7 +797,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     }
 
     std::vector<float> qpos((size_t)n_tok * inh * id);
-    qsa_apply_update(a, L, n_tok, posv.data(), slotv.data(), st.mixed, st.k, st.v, qpos.data(), need, !dev_path);
+    qsa_apply_update(a, L, n_tok, posv.data(), slotv.data(), st.mixed, st.k, st.v, qpos.data(), need, !dev_attn);
 
     if (qdbg) {
         fprintf(stderr, "[qsa] caches updated need=%d\n", (int)need);
@@ -709,32 +828,27 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
             }
         }
     }
-    bool used_dev = false;
-    if (!dev_path) {
-        std::memset(st.out, 0, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
-    }
-    for (int i = 0; i < n_tok; i++) {
+    // The selector is identical for both paths: ggml_top_k's CPU form is
+    // std::partial_sort over the score with `a > b`, and reproducing it with
+    // the same algorithm/comparator is what keeps equal (rectified-to-zero)
+    // scores selecting the same pools.  `select_row` returns false only for an
+    // invalid slot, which the host loop treats as a zero row.
+    auto select_row = [&](int i, std::vector<int> & sel) -> bool {
         const int pos = posv[(size_t)i];
         const int slot = slotv[(size_t)i];
         if (slot < 0 || slot >= (int)qsa_cache_[(size_t)a].size() || !qsa_cache_[(size_t)a][(size_t)slot]) {
-            continue;
+            return false;
         }
-        const double q_row0 = qtime ? qsa_now_ms() : 0.0;
         const qsa_slot_state & sp = *qsa_cache_[(size_t)a][(size_t)slot];
         const int n_vis = pos + 1;
         const int n_pool_vis = n_vis / kp;
-        std::vector<int> sel;
+        sel.clear();
         if (n_pool_vis <= n_pool_max) {
             sel.resize((size_t)n_vis);
             for (int p = 0; p < n_vis; p++) {
                 sel[(size_t)p] = p;
             }
         } else {
-            // The reference runs ggml_top_k, whose CPU implementation is
-            // std::partial_sort over the score with `a > b`.  Reproduce it with
-            // the same algorithm and comparator so equal (rectified-to-zero)
-            // scores select the same pools; a priority queue with a lower-index
-            // tie-break picks a different subset.
             const float * qr = qpos.data() + (size_t)i * inh * id;
             const float inv = 1.0f / std::sqrt((float)id);
             std::vector<float> scores((size_t)n_pool_vis);
@@ -774,6 +888,55 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                 sel.push_back(p);
             }
         }
+        return true;
+    };
+    bool used_dev = false;
+    if (!dev_attn) {
+        std::memset(st.out, 0, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
+    }
+    if (dev_pf) {
+        qsa_devattn_aux(a, dev);
+        qsa_dev_buf & d = qsa_dev_[(size_t)dev];
+        qsa_dev_aux & x = qsa_aux_[(size_t)a];
+        const double q_sel0 = qtime ? qsa_now_ms() : 0.0;
+        // The selection is per token and independent: the shared read-only
+        // pool makes it parallel, and each row writes its own slice.
+        par(n_tok, [&](int i) {
+            std::vector<int> sel;
+            const bool ok = select_row(i, sel);
+            const int nsel = ok ? (int)sel.size() : 0;
+            int32_t * dst = x.hsel + (size_t)i * (size_t)d.cap_keys;
+            for (int j = 0; j < nsel; j++) {
+                dst[j] = (int32_t)sel[(size_t)j];
+            }
+            x.hcnt[i] = nsel;
+            if (qdbg) {
+                fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, posv[(size_t)i], slotv[(size_t)i], nsel);
+            }
+        });
+        if (qtime) {
+            qsa_sel_ms_ += qsa_now_ms() - q_sel0;
+            qsa_rows_ += n_tok;
+            for (int i = 0; i < n_tok; i++) {
+                qsa_nsel_ += x.hcnt[i];
+            }
+        }
+        const double q_att0 = qtime ? qsa_now_ms() : 0.0;
+        qsa_devattn_prefill_run(a, dev, n_tok, chunk_slot, x.hsel, x.hcnt, qbuf, attn_out);
+        if (qtime) {
+            qsa_attn_ms_ += qsa_now_ms() - q_att0;
+        }
+        used_dev = true;
+    }
+    for (int i = 0; !dev_pf && i < n_tok; i++) {
+        const int pos = posv[(size_t)i];
+        const int slot = slotv[(size_t)i];
+        const double q_row0 = qtime ? qsa_now_ms() : 0.0;
+        std::vector<int> sel;
+        if (!select_row(i, sel)) {
+            continue;
+        }
+        const qsa_slot_state & sp = *qsa_cache_[(size_t)a][(size_t)slot];
         const int nsel = (int)sel.size();
         if (qtime) {
             qsa_sel_ms_ += qsa_now_ms() - q_row0;
@@ -813,19 +976,26 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     }
     if (const char * dp = si::env::str("PF_QSA_ATTN_DUMP")) {
         if (a == qsa_dump_layer()) {
+            // PF_QSA_ATTN_DUMP_ALL writes every row of the chunk (the per-row
+            // oracle for a device/host attention A/B); the default writes the
+            // last row, which is what the Stage 2 decode check uses.
+            const bool dump_all = si::env::flag("PF_QSA_ATTN_DUMP_ALL");
             const int i = n_tok - 1;
             const int dpos = posv[(size_t)i];
+            const size_t nrow = (size_t)nh * (size_t)hd;
+            const size_t nout = dump_all ? (size_t)n_tok * nrow : nrow;
+            const size_t off = dump_all ? 0 : (size_t)i * nrow;
             char path[1024];
-            snprintf(path, sizeof(path), "%s.qsa.%d.%d.bin", dp, a, dpos);
+            snprintf(path, sizeof(path), dump_all ? "%s.qsa.%d.%d.all.bin" : "%s.qsa.%d.%d.bin", dp, a, dpos);
             if (FILE * fp = fopen(path, "wb")) {
                 if (used_dev) {
-                    std::vector<float> hout((size_t)nh * (size_t)hd);
+                    std::vector<float> hout(nout);
                     sycl::queue & q = dev_queue(dev);
-                    q.memcpy(hout.data(), attn_out, hout.size() * sizeof(float));
+                    q.memcpy(hout.data(), attn_out + off, nout * sizeof(float));
                     q.wait();
-                    fwrite(hout.data(), sizeof(float), hout.size(), fp);
+                    fwrite(hout.data(), sizeof(float), nout, fp);
                 } else {
-                    fwrite(st.out + (size_t)i * nh * hd, sizeof(float), (size_t)nh * hd, fp);
+                    fwrite(st.out + off, sizeof(float), nout, fp);
                 }
                 fclose(fp);
             }

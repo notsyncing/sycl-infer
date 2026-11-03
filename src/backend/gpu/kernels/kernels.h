@@ -278,6 +278,15 @@ void qk_norm_rope_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vb
 void qsa_sinfo_launch(sycl::queue & q, step_info * info, int nsel);
 void qsa_gather_launch(sycl::queue & q, const void * kpool, const void * vpool, const int32_t * tables,
                        const int32_t * sel, int nsel, int n_kv, int head_dim, int block_size, void * ck, void * cv);
+// QSA sparse prefill (PF_QSA_PF_DEV): the selector stays on the host and the
+// attention runs on the device for a `n_rows`-row wave.  The scratch step_info
+// presents each row as a one-token sequence whose position is its selected-key
+// count, and the compact pool is indexed by an identity table with a
+// `cap_blocks`-row stride (row r's blocks start at r*cap_blocks).
+void qsa_sinfo_multi_launch(sycl::queue & q, step_info * info, const int32_t * counts, int n_rows);
+void qsa_gather_rows_launch(sycl::queue & q, const void * kpool, const void * vpool, const int32_t * src_table,
+                            const int32_t * sel, const int32_t * counts, int row_stride, int cap_blocks, int n_rows,
+                            int n_kv, int head_dim, int block_size, void * ck, void * cv);
 
 void attn_launch(sycl::queue & q, const float * qbuf, const float * gate, const void * kpool, const void * vpool,
                  float * partials, const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,

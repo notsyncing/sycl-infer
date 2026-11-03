@@ -209,7 +209,9 @@ Its config is JSON **with comments**; see
 The CLI takes (`--model --ctx --blocks --kv-cap-mb --kv-type
 --port --host --device --cpu-threads --layer-map --mmproj --mtp --mtp-device
 --audio-mmproj`, the expert placement budgets `--moe-resident`/`--moe-vram-mb`/
-`--moe-ram-mb` and the qwen4exp PLE cache `--engram-ram-mb`, the three
+`--moe-ram-mb` and the qwen4exp PLE cache `--engram-ram-mb`, the qwen4exp
+routed-expert tail-skip `--q4-tail-skip` (default 0 = exact; 1..9 meaningful;
+env `PF_Q4_TAIL_SKIP`), the three
 prefix-cache budgets `--pc-vram-mb`/`--pc-mem-mb`
 (alias) `--pc-ram-mb`/`--pc-dir`+`--pc-disk-mb`, the control plane
 `--control-port`/`--control-host`/`--control-token`/`--control-token-file`, and
@@ -2013,7 +2015,8 @@ slower while the bank warms, so a short generation reads high.
 `PF_Q4_PIN_SRC=0` (staging) and `PF_Q4_BANK_Q5K=1` (layer 2 decode-only,
 107.2 ms, so off) are the A/Bs.
 
-**Deep context (2026-11-01, f16 KV, 28 threads, tail7, `--layer-map
+**Deep context (2026-11-01, f16 KV, 28 threads, tail7 - no longer the default,
+see the tail-skip bullet below - `--layer-map
 0-19:gpu.0,20-47:gpu.1`).**  At 16 037 prompt tokens the prefill is **48.9
 tok/s** and the decode **108.5 ms** (9.22 tok/s); at 48 222 it is **42.8 tok/s**
 and **108.5 ms** (9.21 tok/s), the latter with a 16 000 MB bank (95 slots)
@@ -2175,16 +2178,19 @@ the checks that catch them.
   the earlier "18000/20000 fail" note was measured before the four Q8_0 layers
   were banked: 20000 now fails, and 18000 loads (125 slots, 17.0 GiB) but is
   **not** faster than 17500.
-* **Tail-skip (`PF_Q4_TAIL_SKIP=7`, Strata CUDA path, default 7).**  An expert
-  that every token routes at rank >= 7 is not admitted when it is a miss; it
-  keeps `sm[e] = -1`, contributes zero (`A.acc` is zeroed before the down) and
-  is neither copied nor computed.  On the 96-token TCP cell at 17500:
-  **93.6 -> 86.9 ms (-7.2%)**, the last token's upload **56.2 -> 32.2 MiB
-  (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes; the KL/top-1 gate
-  was run on 2026-10-27 (28/29 and 15/16 step pairs, first divergence always a
-  near-tie, KL 0.029/0.037, text coherent), so it is a usable approximation and
-  is now **default 7**; `PF_Q4_TAIL_SKIP=0` restores the exact expert set.
-  Measured rank distribution: 39-42% of misses are rank >= 7.
+* **Tail-skip (`PF_Q4_TAIL_SKIP`, Strata CUDA path; measured below at 7, which
+  is no longer the default).**  An expert that every token routes at rank >= N
+  is not admitted when it is a miss; it keeps `sm[e] = -1`, contributes zero
+  (`A.acc` is zeroed before the down) and is neither copied nor computed.  The
+  numbers below were taken with N=7, the default at the time; **the default is
+  now 0 (the exact expert set)**, and `--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N`
+  re-enable it (1..9 meaningful).  On the 96-token TCP cell at 17500:
+  **93.6 -> 86.9 ms (-7.2%)** at N=7, the last token's upload **56.2 -> 32.2
+  MiB (-43%)**; rank 8 is 90.0 ms (-3.8%).  The output changes; the KL/top-1
+  gate was run on 2026-10-27 (28/29 and 15/16 step pairs, first divergence
+  always a near-tie, KL 0.029/0.037, text coherent), so it is a usable
+  approximation when opted in.  Measured rank distribution: 39-42% of misses
+  are rank >= 7.
 * **Decayed heat (`PF_Q4_HEAT=1`) is a loss on this engine**: 105.7 vs 93.6 ms
   and 156 vs 56 MiB of upload; the Strata adaptive-swap parameters do not
   transfer (the LFU prior was already negative).  Leave it off; the code is
@@ -2212,7 +2218,7 @@ the checks that catch them.
 * **CPU misses with a frozen resident set** (Strata's CUDA `kind = -1` idea)
   is implemented behind `PF_Q4_CPU_MISS` (default off) and **loses: 148.1 ms
   last-32 against 99.3** (28 CPU threads; the default 14 is 227.1), and
-  122.2 against 93.2 with tail-7.  A decode miss is not uploaded; the host
+  122.2 against 93.2 with tail-7 (no longer the default).  A decode miss is not uploaded; the host
   computes it from the pinned source in the *same* int8 form as the device
   (the per-32 amax/127 scale `moe_actq_launch` uses, the AVX-512-VNNI Q4_K row
   dot, native Q5_1/Q8_0 down), stages the rows into a pinned buffer and
@@ -2246,7 +2252,7 @@ the checks that catch them.
 | `PF_Q4_BANK_LAYER=1` | off | whole-layer bank instead of the per-expert LRU |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
 | `PF_Q4_PIN_SRC=0` | on | stage from the mmap instead of the pinned expert source |
-| `PF_Q4_TAIL_SKIP=N` | 7 | drop a miss whose best rank over the batch is >= N (Strata tail-skip; default 7, `0` = exact; gate 2026-10-27: KL 0.029/0.037 at near-tie divergences) |
+| `PF_Q4_TAIL_SKIP=N` | 0 | drop a miss whose best rank over the batch is >= N (Strata tail-skip; default 0 = exact, 1..9 meaningful; `--q4-tail-skip` overrides; the 2026-10-27 gate - KL 0.029/0.037 at near-tie divergences - was measured at N=7) |
 | `PF_Q4_CPU_MISS=1` | off | decode CPU miss for non-resident experts, int8 host path (`2` = f32 A/B); **measured 1.49x slower, see the dead ends** |
 | `PF_Q4_CPU_MISS_WARM=N` / `_LAYER=il` / `_TIME` | 16 / all / off | decode steps with the LRU before the split freezes / one-layer probe / per-layer host+GPU print |
 | `PF_Q4_CMDBG=1` | off | per-call sub-phase ms inside the host miss expert |
@@ -2284,6 +2290,10 @@ the checks that catch them.
 | `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
 | `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see design 18 §4 |
+| `PF_QSA_PF_DEV=0` | on | Stage 3 device sparse *prefill* attention for f16 GPU (`n_tok>1`), host selector and byte-identical selected sets; `=0` keeps the host path; measured 75.5 -> 67.8 s prefill on the 3660-token q4 cell, see design 18 §4 |
+| `PF_QSA_PF_WAVE=N` | 8 | prefill rows per compact pool; VRAM `N*65*n_head_kv*32*head_dim*2*2 B` per device (77 MB at 8) |
+| `PF_QSA_PF_NSP=N` | 0 (dec_splits) | override the prefill attention split count (may only lower `dec_splits`) |
+| `PF_QSA_F16RND=1` / `PF_QSA_ATTN_DUMP_ALL=1` | off | diagnostics: round the host K/V mirror like the device `sycl::half` store (the shipped mirror truncates) / dump every attention row |
 | `PF_Q4_IDS_HOST=0` / `PF_Q4_HOSTROUTER` | on / off | router ids copy / host router A/B |
 | `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_UPSTAT`, `PF_Q4_HOT_TIME`, `PF_Q4_FFCMP=<layer>` | off | phase attribution and the routed-FFN oracle |
 | `PF_Q4_HIST=1`, `PF_Q4_PREFAULT=0`, `PF_Q4_NOPLE=1` | off / on / off | routing histogram, skip the prefault, skip PLE (diagnostic) |
@@ -2303,7 +2313,7 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
   **56 s** wall and the resident set from ~122 GiB to **80 GiB**.  The oracle
   forces the full build (`PF_Q4_FFCMP` implies `PF_Q4_DOWN_I8_ALL`), so its
   reference is unchanged: cos **0.999985** at `PF_Q4_TAIL_SKIP=0`.  (With the
-  default tail-skip 7 the same oracle reports 0.96-0.98 - it compares a bank
+  tail-skip 7 (the former default) the same oracle reports 0.96-0.98 - it compares a bank
   that deliberately drops rank>=7 misses against a host reference that computes
   every pair, so it is **not** a bank-accuracy number.)
 * **`R` is per device now.**  The budget is split evenly but the two devices do
@@ -2473,8 +2483,8 @@ Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.m
   (14 on the 28-thread box), but the host-side MoE/PLE/HC work scales with the
   logical count.  On the 96-token TCP prompt: decode mean **120.7 -> 109.6 ms**,
   wall **20.95 -> 18.08 s**, output **md5 identical** (the `[q4] fwd` split
-  moves `rest` 23.22 -> 13.67 ms).  With tail7: **100.1 -> 93.3 ms** and
-  **16.49 -> 15.52 s**.  The recommended q4 run sets `--cpu-threads 28`; the
+  moves `rest` 23.22 -> 13.67 ms).  With tail7 (no longer the default):
+  **100.1 -> 93.3 ms** and **16.49 -> 15.52 s**.  The recommended q4 run sets `--cpu-threads 28`; the
   server gains much less (5.40 -> 5.57 tok/s aggregate) because it is
   prefill/HTTP-bound.  The 93.3 ms cell is 28 threads + tail7; the default-14
   tail7 cell is 100.1 ms.
@@ -2482,9 +2492,10 @@ Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.m
   prompts: top-1 agreed for 28/29 and 15/16 steps, the first divergence was a
   near-tie, the divergence-step KL was 0.029/0.037, and both outputs stayed
   coherent.  Decode mean 120.7 -> 100.1 ms on the 96-token TCP prompt (wall
-  20.95 -> 16.49 s; a short prompt 14.35 -> 11.99 s).  It is **default 7**;
-  `PF_Q4_TAIL_SKIP=0` restores the exact expert set.  It changes the token
-  stream at near-ties; the performance-first decision accepts that.
+  20.95 -> 16.49 s; a short prompt 14.35 -> 11.99 s).  The gate was measured at
+  N=7, which was the default at the time; **the default is now 0 (exact)** and
+  the gate applies to opting in.  It changes the token stream at near-ties; the
+  performance-first decision accepts that when enabled.
 * **MTP is no-go for this build.**  `test_q4_verify` (one slot, n consecutive
   tokens, LM head included) measures warm n=1/3/5 at **257.8 / 416.4 / 496.8
   ms** against the kill thresholds 190/230; even n=1 is 2.7x a plain token
@@ -2500,7 +2511,7 @@ Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.m
   added.
 
 > **MTP q4 result: NO-GO (2026-10-27).**  The verify gate (`test_q4_verify`,
-> tail7+28, warm) measured n=1/3/5 = **224.5 / 367.7 / 420.6 ms** (reproduced
+> tail7+28 (tail7 no longer the default), warm) measured n=1/3/5 = **224.5 / 367.7 / 420.6 ms** (reproduced
 > 368.3 / 418.7) against the kill lines 190 / 230; `PF_Q4_TIME` puts
 > **207/331/403 ms** of the 232/368/447 ms forward in the FFN with only
 > 150/436/576 MiB H2D, so the cost is the routed-expert compute/bank, not PCIe.
