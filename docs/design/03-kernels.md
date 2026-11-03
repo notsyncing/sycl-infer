@@ -368,6 +368,17 @@ launch。** GDN 的 `ssm_alpha` / `ssm_beta` 是两个同 K、同量化激活的
   累加顺序而非 `nat_gemm` 的，所以会重排 emit 流的接受率：一个 prompt 上 1.64 → 1.53，另两个不变
   （`-1.1 … +0.9 ms/token`）。
 
+**`i8_grp_quant_gemv_launch`（`w4_gemv.cpp`）—— M=1 decode 的“量化 + 整组 GEMV”一次 launch。**
+Qwen2-VL 这类窄 decoder 的每 call 成本主要是 kernel **数量**而不是字节：`n_embd=896` 时多数投影
+只有 0.1-9 MB，5 µs 的 launch 地板占比很大。这个 kernel 把一次 call 的
+`act_quant_grp_launch`（阶段 1，32 值组、子组 max、round/clamp、整数组和，逐位相同）和该 call
+最多 4 个普通 int8 段的 `i8_grp_gemv_impl`（阶段 3，同样的 lane→group 映射与子组归约）合成一次
+launch；阶段 2 把每行自己的 `[ng][N_seg]` f16 scale 从所属段的平面 stage 进 SLM。段可以有不同的
+N 与输出 stride（q 896、k/v 128），`RB=16` 行/工作组与逐段 GEMV 的形状一致。它只用于
+`mode == 0 && tb == 1` 且所有段都是普通 int8 的 call；调用方在段不可转换、K 不是 32 的倍数或
+SLM 装不下时返回 false，回落到原来的路径。输出与“量化 + 每段一次 launch”逐位相同，变的只是
+launch 数。
+
 ### 5.5 codebook 4-bit（IQ4_XS / IQ4_NL，`cb4_*`，`w4_gemv.cpp`）
 
 值不是网格而是 `scale[g][n] * kvalues_iq4nl[q]`（16 项 int8 码本 × 每 (行,组) f16 scale），
@@ -753,8 +764,10 @@ K 的实例化内部再按 `kv_v_dtype()` 分派 V——所以 `--kv-type K:V` �
 
 ### 7.1 调度
 
-`HD = 256`，`qstride = n_head*2*head_dim`，`pstride = 2 + head_dim`（partial 记录：`m`、`l`、`head_dim`
-个累加值）。`fuse = (out != nullptr && n_splits == 1)`。四个候选按顺序试：`attn_xmx_launch`（§7.5，
+`HD = 256` 是寄存器数组 `acc[HD/32]` 的上限，不是要求 `head_dim == 256`：`qstride =
+n_head*2*head_dim`，`pstride = 2 + head_dim`（partial 记录：`m`、`l`、`head_dim` 个累加值），
+内层循环用 `head_dim / 32`，所以任何 32 的倍数只要 ≤ 256 都走同一条 classic 路径。特化 kernel 才
+以 `head_dim == 256` 为条件，不满足时回落到这里（Qwen2-VL 的 64 宽头）。`fuse = (out != nullptr && n_splits == 1)`。四个候选按顺序试：`attn_xmx_launch`（§7.5，
 `n_real > 1 && head_dim == 256` 时最先试）→ `attn_flash_kernel`（§7.3，`PF_ATTN_FLASH`）→ 分组 decode
 kernel（§7.4）→ 经典 kernel（§7.2）。`grp` 来自参数或 `PF_DEC_GROUP`，默认取 profile 的
 `attn.dec_group`（**两张卡都是 0**，理由相反；`kernels.h:263` 那句 “default on” 的注释已过时）。
@@ -1048,7 +1061,9 @@ i4 读取细节：`i4_ld4` 用**一次对齐 16-bit 加载**取 4 个 nibble（`
 
 ## 12. 视觉编码器 kernel（`vit.cpp`）
 
-所有权重是 BF16（type 30）或 F32（type 0），行主序 `[N][K]`。
+mmproj 的线性层在文件里是 BF16（type 30）或 F32（type 0）、行主序 `[N][K]`。qwen2vl 默认把它们
+注册到文本模型的 oneDNN int8 矩阵乘（`PF_VISION_DNNL`），只有 norms/biases、patch embedding 和未被接受的张量仍由
+`vit_*` kernel 直接读；`vit_gemm` 仍是 host 参考与回退路径。
 
 | kernel | 说明 |
 |---|---|
@@ -1057,7 +1072,7 @@ i4 读取细节：`i4_ld4` 用**一次对齐 16-bit 加载**取 4 个 nibble（`
 | `vit_gelu_launch` | 原地 tanh 近似 GELU，与 `ggml_gelu` 一致 |
 | `vit_add_bias_launch` / `vit_add_launch` | 二维逐元素加法，独立 stride |
 | `vit_rope_launch` | 2D 视觉 RoPE（作用于 fused qkv 的 Q/K）：pair → section（`sec = pair/(head_dim/4)`，每节一节），`sec==0` 用 patch 行 `py`、否则用 patch 列 `px`，频率指数每节重置；从合并 token 反推 `(px,py)` |
-| `vit_attn_launch` | **双向非因果** attention，`HD` 固定 64，`BQ=32` 查询块、`BK=64` 键块，K/V 经 SLM（`HDP = HD+4`、`SDP = BK+4` 避免 bank 冲突），128 线程/组，在线 softmax，`1/sqrt(HD)` |
+| `vit_attn_launch` | **双向非因果** attention，K/V 经 SLM（`HDP = HD+4`、`SDP = BK+4` 避免 bank 冲突），在线 softmax，`1/sqrt(HD)`。`head_dim` 64/72 仍是 16-32 query、64 key、128 线程；**qwen2vl 的 80 宽头默认是 ILP `vit_attn_ilp<80,48,32,1024,16,2,2>`**（`PF_VIT_ATTN=70`；BQ=48、BK=32、WG=1024、SG=16、每线程 2 个查询行的 score dot、2 个 PV 行共享一个 V `float4`），`0` 回落到 `32/32/512`（Iris Xe 的 512 线程上限会强制回退），`1/2/3/4/5/6/7/60/71/72/73/76` 是扫描变体，`51` 是 f32 oneDNN QK/PV 的 opt-in（更快但求和顺序不同，默认不用） |
 | `vit_copy_launch` | `out[row][i] = x[row][i]`，独立 stride |
 
 视觉 tower 的 RoPE 与文本模型的交错 M-RoPE 是两套不同的东西，见

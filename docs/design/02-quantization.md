@@ -350,16 +350,29 @@ scalar 下是 `nullptr`（CPU kernel `common.cpp` 的 scalar ISA 分支），而
 **所有类型**（含 Q8_0）的重化误差都是 ~1%（`test_quant_audit` 实测），改成每 32 组后降到 ~0.1%，
 代价是 oneDNN 改用 f32-dst kernel（约 +20 % prefill）。
 
-`add_weight`（`dnnl_gemm.cpp:644-763`）：
+`add_weight`（`dnnl_gemm.cpp`）：
 
-* 拒绝 type ∉ {8,11,12,13,14,20,21,23}（`quant.h` 能逐行反量化的全部格式）、`K<=0`、`N<=0`、
-  `K%32!=0`、`K > kActMaxK=32768`（27B 的 `n_ff=17408`）；
-* 用 `min(N, hardware_concurrency())` 个线程并行反量化/量化（每线程一行条带）；
+* 接受 type ∈ {0 F32, 1 F16, 30 BF16, 6 Q5_0, 8 Q8_0, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K,
+  20 IQ4_NL, 21 IQ3_S, 23 IQ4_XS}（`quant.h` 能逐行反量化的全部格式，加上视觉 mmproj 的浮点
+  线性层，以及 `n_embd = 896` 那种不是 256 倍数的 Q5_0），拒绝 `K<=0`、`N<=0`、`K%32!=0`、
+  `K > kActMaxK=32768`（27B 的 `n_ff=17408`）；
+* 用 `min(N, hardware_concurrency())` 个线程并行反量化/量化（每线程一行条带）。量化循环不再调
+  `std::lround`（libm 调用无法向量化），而是 `add-copysign-truncate`（对 `[-127,127]` 与
+  round-half-away-from-zero 等价，实测行转换快 4x）。`PF_DNNL_QCHK=1` 对每个张量重算一行参考值
+  并报告 mismatch（MinerU 页面实测 287/287 个张量、0 mismatch）；
 * 权重 scale 用 `ggml_float_to_half`（`std::lround` + `[-127,127]` clamp，与 kernel 侧同一约定）；
+* 转换输出走**两个 pinned 暂存槽**（`PF_DNNL_NOSTAGE=1` 关掉，`PF_DNNL_SYNCCOPY=1` 恢复逐张量
+  阻塞拷贝；A/B 用）：一个槽的 H2D 可以排在下一个张量的反量化后面，因为队列是 in-order 的，主机
+  不会被阻塞。超过 256 MB 的张量（27B 的 LM head）回退到普通 `std::vector` + 逐次拷贝；
 * 上传设备并创建 `"ba"` 的 s8 memory 与 `{1, ng*N}` f16 的 scale memory（`PF_DNNL_BLOCKED=1/2/3`
   可强制 `Ab4a`/`Ab8a` 阻塞布局，**仅诊断用**：权重缓冲不会重排成它，结果是错的，
   `dnnl_gemm.cpp:509-512`）；
-* 预先为 `M = kMaxT..cap_M`（步长 `kMaxT`）创建所有 primitive，标记 `w.ok` 以便引擎在不支持时回退。
+* **primitive 阶梯可以是惰性的**：`eager=false` 只建调用者实际用到的 M（视觉塔；每个 crop 的
+  patch 数都不同，预先建阶梯没有意义）；`lazy=true` 服务文本分区——跳过 `M = kMaxT..cap_M` 的阶梯，`gemm()` 在某个 M 第一次出现时建 primitive，
+  但 **M=1 仍在这里预建**，因为单行 decode 会被录进 command graph，录制期间不能建 primitive。
+  默认由 `engine` 决定（`PF_DNNL_LAZY`；多设备无投机解码器时默认开），MinerU 页面省约 150 ms
+  的 oneDNN primitive 创建，页面 md5 不变；
+* 标记 `w.ok` 以便引擎在不支持时回退。
 
 ### 6.3 执行
 
@@ -483,6 +496,11 @@ primitive 与两个 SYCL kernel 各跑一次，把一次性 kernel 加载挡在�
 | `PF_ROWACT` | off | `1` 恢复已停用的每行激活量化 `act_quant_launch`（A/B，它实测只增加 per-call 延迟） |
 | `PF_DNNL_BLOCKED` | 0 | 诊断：强制 oneDNN 用阻塞（XMX 友好）权重布局；缓冲不重排，结果错 |
 | `PF_DNNL_NOWARM` | off | `1` 跳过 `warmup()`，让第一个请求付一次性 kernel 加载 |
+| `PF_DNNL_LAZY` | 视路径 | 跳过预填充 primitive 阶梯，`gemm()` 首次用到某个 M 时再建；M=1 仍预建（录制的 decode 图需要）。多设备无 MTP/DFlash 时默认开 |
+| `PF_DNNL_QCHK` | off | 逐张量复算一行参考量化值，打印 mismatch 与总数（正确性诊断） |
+| `PF_DNNL_NOSTAGE` | off | `1` 关闭 pinned 暂存槽，回到每张量 `std::vector` |
+| `PF_DNNL_SYNCCOPY` | off | `1` 恢复逐张量阻塞 H2D（A/B；默认两个暂存槽异步排队） |
+| `PF_LOAD_TIME` | off | 打印加载/上传各阶段耗时（host 转换 / H2D / primitive / 线程） |
 | `PF_GEMM_DNNL` | on | `0` 关闭 oneDNN，改用 DP4A chunk-batched |
 | `PF_CPU_ISA` | 自动 | `scalar\|avx2\|avxvnni\|avx512` 强制 CPU 整数内核的 ISA 变体；`scalar` 会整体关掉 CPU 的整数 int8 路径（§5.2） |
 | `PF_W2_PAIR` | off | `1` 让 w2 GEMV 一次载入两个 32 值组（实测更差，见 §12） |

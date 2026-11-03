@@ -100,8 +100,10 @@ Qwen3.5 用 interleaved（sections 和 32，`n_rot/2` = 128）。
 * **qwen2vl**：patch 14、temporal 2（两张静态图各用一半 conv，权重相加）、
   无 class token、无 learned position；32 层，1280 宽，16 个 80 维头，FFN
   5120，LayerNorm **带 bias**，q/k/v/out/up/down **全有 bias**，激活是
-  **quick_gelu**；分离的 `attn_q/k/v` 在加载时反量化并拼成一份连续的
-  `[3E][E]` f32 qkv（bias 拼成 `[3E]`），因此前向只有一次融合投影；
+  **quick_gelu**；分离的 `attn_q/k/v` 在 oneDNN 注册时用 `add_weight_blocks`
+  直接拼成一份融合的 `[3E][E]` int8 投影（bias 拼成 `[3E]`），因此前向只有
+  一次融合投影；host 参考/`vit_gemm` 回退需要的 f32 视图按需构建
+  （`PF_VISION_DEFER_QKV=0` 恢复加载时构建）；
 * **qwen3vl**：patch 16、融合 `attn_qkv`、learned `v.position_embd`、
   gelu_tanh，head_dim 64/72；
 * 两者共用的部分：2D RoPE（80 维头分 4 段 × 20 对，前 20 对用行号、后 20 对
@@ -114,8 +116,9 @@ attention 内核；为此增加了：
 
 * `GGML_TYPE_F16` 的权重加载（`load_w`/`load_w8`，用
   `ggml_half_to_float`，不要用 `sycl::bit_cast<sycl::half>`）；
-* `head_dim == 80` 的 attention instantiation，现在是 `vit_attn_impl<80,32,32,1024>`
-  （47.6 KiB SLM；见 §5）；
+* `head_dim == 80` 的 attention instantiation，默认是保序 ILP
+  `vit_attn_ilp<80,48,32,1024,16,2,2>`（`PF_VIT_ATTN=70`；47.6 KiB SLM；见 §5），
+  旧的 `vit_attn_impl<80,32,32,1024>` 是 `PF_VIT_ATTN=2`；
 * `vit_quick_gelu_launch`（视觉 block）和 `vit_gelu_errf_launch`（merger）；
 * `vit_silu_mul_launch`（f32 文本路径的 `silu(gate)*up`）。
 
@@ -123,9 +126,17 @@ attention 内核；为此增加了：
 开）。`vit_gemm` 按 32-token 一组切 M、每个 tile 重读一遍权重：5476 个 patch
 就是每个线性层 172 遍权重。`vision_model::upload` 建一个私有 `dnnl_gemm`，
 懒注册（`add_weight(..., eager=false)`）32 层的 qkv/out/up/down 与 merger 的
-`mm.0`/`mm.2`，每次前向按 `kMaxB*kMaxT` 行分块量化 + 相乘。patch embedding 仍是
+`mm.0`/`mm.2`，每次前向按 `kMaxB*kMaxT` 行分块量化 + 相乘。qwen2vl 的
+q/k/v 是三个独立张量，用 `add_weight_blocks` 直接按 GGUF 转换（不必先建
+3E×E 的 f32 副本）；合并的 f32 视图只在 host 参考前向和 `vit_gemm` 回退时
+按需构建（`PF_VISION_DEFER_QKV=0` 恢复加载时构建）。patch embedding 仍是
 `vit_gemm`（K=592 不是 32 的倍数，约占 1%），未被接受的张量逐调用回退。
 F16/F32/BF16 源都支持（`add_weight` 的 switch 与 `dequantize_row`）。
+
+**上传是紧凑的**：所有线性层都注册到 oneDNN 之后，设备内核真正读的只有
+norms/biases（1.32 GB 文件里的 3.7 MB），所以 `PF_VISION_COMPACT=1`（默认）
+只上传这些 span，`dev_ptr` 走 `blob_spans` 的二分查找；`PF_VISION_COMPACT=0`
+恢复整文件 1:1 映射（回退/A/B）。
 
 **验证**：对同一张 1036×1036 页面，和 llama.cpp `llama-mtmd-cli` 的
 `MTMD_DEBUG_EMBEDDINGS` 输出逐元素比较：1369 个 merged token × 896 维，
@@ -177,60 +188,168 @@ image/chart block **总是**被裁剪分析（`\nImage Analysis:`），不再有
 在示例页面 `layout_original_image_01.png` 上，layout 与 llama.cpp 的框几乎
 逐项一致（个别坐标差 1-2/1000），text block 的内容正确
 （"Where do you come from?"、"What do you study?" ...）。整页（layout + 21 个
-block）在单张 A770 上现在是 **15.8 s**（2026-11-02；视觉 4.94 s + 文本
-prefill 0.73 s + decode 4.75 s + 加载/启动 7.3 s），优化前是 **113.1 s**。
+block）在单张 A770 上现在是 **10.99/11.23 s 热缓存、11.89/12.28 s 冷缓存**
+（AOT Release、2400 MHz、静默窗口；逐阶段拆分与 113.1 s -> 15.8 s -> 11.0 s
+的历史见 §5）。
 
 ## 5. 性能与后续
 
-优化后的耗时拆分（同一张 1036×1036 页面、5476 patch、单卡 A770、AOT
-Release、`PF_MINERU_TIME=1`）：
+### 5.1 历史：113.1 s -> 15.8 s -> 11.0 s
 
-| 阶段 | 优化前 | 优化后 |
+同一张 1036×1036 页面（`layout_original_image_01.png`，5476 patch，21 个
+block）、单卡 A770、AOT Release、贪心、每个 block `--max-tokens 256`、每个
+rep 一个进程，2026-11-02。两轮优化的输出始终逐字节不变（页面 md5
+`10eed240936226fd4696d943aaabc44b`；纯文本 `gen` md5
+`bfc55c543af1d1aecae5da0b1f9b99e5`；视觉自检 cos 0.999104）。
+
+* **113.1 s -> 15.8 s（第一轮）。** 视觉线性层换 oneDNN int8、80 维头
+  attention 从 16/64/128 换到 32/32/1024、多模态 prefill 走 mode 2。
+* **15.8 s -> 11.0 s（第二轮）。** 盒子固定在 2400 MHz
+  （`xpu-smi config -d 0 --standby never`），静默窗口，每 rep 一个进程；
+  attention 换成保序的 ILP 形状，decode 融合了量化 + 整组 GEMV，加载路径
+  去掉一次性开销。
+
+### 5.2 每一阶段：113.06 s -> 15.82 s
+
+| 阶段 | 优化前 | 第一轮后 |
 |---|---:|---:|
-| layout 视觉编码 | 50.5 s | **3.64 s** |
+| layout 视觉编码（5476 patch -> 1369 token） | 50.5 s | **3.64 s** |
 | layout 文本 prefill（1394 token） | 1.92 s | **0.26 s** |
 | layout decode（463 token） | 3.28 s | 3.27 s |
 | 21 个 content block（视觉+文本合计） | 52.9 s | **3.30 s** |
 | **整页 wall** | **113.06 s** | **15.82 s** |
 
-三个改动，输出 md5 全部不变：
+第一轮的视觉分阶段（`PF_VISION_TIME=1`，每阶段一次 `q.wait()`，所以优化前
+那一列的等待也算在总数里）：
 
-1. **视觉线性层换 oneDNN int8**（见 §3），布局页视觉 58.7 s → 3.64 s。
-2. **80 维头的 attention tile 改成 `BQ=32, BK=32, WG=1024`**：47.6 KiB SLM
-   允许一个 workgroup 占一个 Xe core，所以 workgroup 的 warp 数就是
-   occupancy；旧的 16/64/128 只用了 16 EU 核里的 4 个。补零行在每个阶段都有
-   `r < n_q` / `k < n_k` 守卫，所以任意 `n_tok` 都安全（56×56 探针是 16
-   token，两个方向都是部分 tile）。布局页 attention：16/64/128 **10 473 ms**、
+| 阶段（32 层合计） | 优化前 | 第一轮后 |
+|---|---:|---:|
+| patch embedding（仍在 `vit_gemm`） | 26 ms | 23 ms |
+| qkv | 3 725 ms | **77 ms** |
+| attention | 11 237 ms | **3 262 ms** |
+| attn out | 4 733 ms | **49 ms** |
+| ffn up | 19 696 ms | **90 ms** |
+| ffn activation | 73 ms | 16 ms |
+| ffn down | 18 475 ms | **91 ms** |
+| merger（mm.0 / mm.2） | 682 ms | **2.5 ms** |
+| **视觉合计** | **58.7 s** | **3.64 s** |
+
+### 5.3 第二轮：15.8 s -> 11.0 s
+
+| | 15.8 s 那一版 | 最终 |
+|---|---:|---:|
+| 启动 + 文本模型加载 | 2.68 s | **1.65 s** |
+| layout 视觉 | 3.65 s | **2.49 s** |
+| - attention（32 层） | 3.26 s | **2.10 s** |
+| layout 文本 prefill | 0.26 s | 0.26 s |
+| layout decode（463 token） | 3.27 s | **3.16 s** |
+| 21 个 content block（视觉+文本） | 3.30 s | **2.77 s**（视觉 1.31，文本 1.93） |
+| 页面文本 decode（676 token） | 4.97 s | **4.60 s**（6.81 ms/token） |
+| **整页 wall** | **15.8 s** | **10.99 / 11.23 s**（11.08/11.12/11.28） |
+| 冷文件缓存 | 13.6 s | **11.89 / 12.28 s** |
+
+### 5.4 什么推动了这些数字
+
+1. **视觉线性层换 oneDNN int8**（见 §3）。`vit_gemm` 按 32-token 一组切 M，
+   5476 patch 就是每个线性层约 172 遍权重；oneDNN 每个 ≤1024 行的 chunk 只
+   读一遍。`add_weight` 接受 F16/F32/BF16 源并用 `eager=false` 跳过预填充
+   primitive 阶梯（页面里每个 crop 的 M 都不同）。布局页视觉 **58.7 s ->
+   3.64 s**。
+2. **80 维头 attention 的 tile 演进**。旧 16/64/128 只用了 16 EU 核里的 4
+   个：47.6 KiB SLM 允许一个 workgroup 占一个 Xe core，所以 workgroup 的
+   warp 数就是 occupancy。布局页 attention 实测：16/64/128 **10 473 ms**、
    16/32/512 4 658、32/32/128 8 106、32/32/256 4 563、32/32/512 3 720、
-   64/16/512 3 335、**32/32/1024 3 263**。
-3. **多模态 prefill 走 mode 2**（`PF_MM_BATCH_PREFILL`，默认开）：M-RoPE 与
-   `img_row` 按 `[row*kMaxT + t]` 索引，正好是 `mm_write_step` 的连续布局，一次
-   前向最多 `kMaxB*kMaxT` 个 token（两卡流水线轮换两个 step_info，仍走 mode 1）；
-   旧的每 32 token 一次前向。
+   64/16/512 3 335、32/32/1024 **3 263**；再加查询行 ILP 的
+   `BQ=48/BK=32/WG=1024` 是 2 865，默认的 ILP 形状（SG16、每线程 2 个查询
+   行的 score dot、2 个 PV 行共享一个 V `float4`）是 **2 076 ms**。所有改动
+   都保持原来的逐 score 求和顺序、BK=32 在线 softmax 分组和 PV 的 k 顺序，
+   部分 tile 的填充行在每个阶段都有 `r < n_q` / `k < n_k` 守卫（56×56 自检
+   是 16 token）。
+3. **多模态 prefill 走 mode 2**（`PF_MM_BATCH_PREFILL`，默认开）。M-RoPE 与
+   `img_row` 是按 token 的、内核按 `[row*kMaxT + t]` 索引，正好是
+   `mm_write_step` 对 n 个 token 写出的连续布局，所以一次前向最多覆盖
+   `kMaxB*kMaxT` 个 token（两卡流水线轮换两个 `step_info`，仍走 mode 1）。
+   旧的每 32 token 一次 mode-1 前向，布局页 1394 token 就是 44 遍权重；
+   layout 文本 prefill **1.92 s -> 0.26 s**。
+4. **decode 的量化 + 整组 GEMV 融合**（`i8_grp_quant_gemv_launch`）。M=1
+   的 decode 每次 call 原本是“激活量化 + 每个段一次 launch”；这个 kernel
+   把整个 call 的量化（阶段 1，与 `act_quant_grp_launch` 逐位相同）和最多 4
+   个 int8 段的 GEMV（阶段 3，与 `i8_grp_gemv_impl` 逐位相同）合成一次
+   launch，权重 scale 按段自己的 `[ng][N_seg]` 平面 stage 进 SLM。它只服务
+   `mode == 0 && tb == 1` 且段都是普通 int8 的 call。
+5. **加载路径**：文本 oneDNN 的 primitive 阶梯改为惰性（`PF_DNNL_LAZY`，
+   M=1 仍预建，因为它在录制的 decode 图里）；mmproj 只上传设备内核真正读的
+   3.7 MB（norms/biases），不再是整个 1.32 GB（`PF_VISION_COMPACT`）；
+   qwen2vl 的合并 q|k|v f32 副本按需构建（`PF_VISION_DEFER_QKV`）；int8
+   转换的量化器向量化（`PF_DNNL_QCHK=1` 逐张量复算参考行：287/287
+   个张量、0 mismatch）；转换输出走两个 pinned 暂存槽，H2D 与下一个张量的
+   反量化重叠；tied embedding 的复制留在 CPU 侧。启动+文本加载从第一轮前的
+   **5.03 s** 降到 **1.65 s**（15.8 s 那一版是 2.68 s）。
 
-剩下的成本：attention 占视觉的 90%，layout 的 463-token decode 是另一个大
-块；再快需要换 attention 算法（还没做的只有 oneDNN int8 QK），而不是更大的
-tile。同页 `llama-mtmd-cli`（SYCL）layout 步 28.2 s wall（我们同样只跑 layout
-的进程是 13.2 s，2.1x；各自去掉模型加载后 20.9 s vs 7.2 s，2.9x）、整页 398 s
-（我们 15.75 s）。那个 CLI 每张图一个进程，每进程约 7.3 s 模型+mmproj 初始化 +
-约 6 s SYCL JIT，且该驱动的 persistent JIT cache 会 SIGSEGV，所以整页差距远大
-于单步差距。
+### 5.5 剩余成本、天花板与不采用的路径
+
+现在是 **10.99/11.23 s 热缓存、11.89/12.28 s 冷缓存**。按当前保序数学的
+per-phase 地板约 **5.0 s one-shot**（load ~1.0、attention 0.87 流量 /
+0.55 计算、decode 0.9-1.5、vision GEMM 0.75、prefill 0.12、content ~0.5），
+进程复用时约 3.7 s。**11 s 是 bit-exact 的天花板**；再往下需要重排数学或
+批处理：
+
+* **decode 4.60 s vs 0.9-1.5 s 地板**：676 token × 0.52 GB/token @
+  76-88 GB/s。N=896 的窄投影只暴露 ~896 warp（512 EU 中的 ~112），这是形状
+  的上限；split-K / 重排归约会改 token 流，且 M=1 的 oneDNN 不能进录制的
+  decode 图。
+* **attention 2.10 s vs 0.87 s 流量地板**：保序天花板。
+* **content vision 1.31 s**：21 个不同的小 M 各自建 oneDNN primitive；把
+  crop 批起来或做 M 分桶阶梯是下一个 bit-exact 步骤，约 0.5-1 s。
+* **load 1.65 s vs ~1.0 s**：剩余是 int8 转换（总共 ~0.85 s）。
+
+已量到但**不采用**的路径：
+
+* `PF_VIT_ATTN=51`（f32 oneDNN QK/PV）：1.59 s，比手写 kernel 数值更好，但
+  求和顺序不同，且 **run-to-run 非确定**，只能 opt-in。block 级检查
+  （2026-11-03，两页、同机同 prompt）：
+  - layout 页 5 次：4 次与默认逐字节相同；1 次只有 1 个 text block 的 bbox
+    各差 0.001（crop +3/+1 px），21 个 block 的 type 和 content 全部相同。
+  - `table_07.png` 3 次：分别有 **5 / 3 / 2 个（共 14 个）block 的 content 不同**
+    （都是 image analysis），包括图注和识别文本：
+    `2020年/2021年` -> `29/2020`，`铜箔/HM9000` -> `钢带/HMMHPL`；还有
+    bbox 差 0.025。差异集合每次不同。
+  因此重排路径**会造成最终识别结果的语义差异**，默认必须保序。
+* int8 oneDNN QK/PV：1.38 s，页面 md5 改变且不可复现，关闭。
+* 预转换 int8 缓存：key 面没有版本，存在错误输出风险，拒绝。
+* split-K decode（`PF_I8_SPLITK`）：layout 与 table 两页各 2/2 bit-exact，
+  本卡上中性，默认关（构造上不保证）。
+* `i8_grp_gemv_rows_multi`：1 ulp 的差异改变了 emit 流，页面不用。
+
+同页 `llama-mtmd-cli`（SYCL）的对比：layout 步 28.2 s wall。第一轮
+（15.8 s 那版）我们的 layout-only 进程是 13.2 s（2.1x；去掉模型加载后
+20.9 s vs 7.2 s，2.9x）；最终版是 **9.03 s（3.1x；去掉加载 ~7.4 s，2.8x）**。
+整页 398 s（我们最终 11 s）。那个 CLI 每张图一个进程，每进程约 7.3 s
+模型+mmproj 初始化 + 约 6 s SYCL JIT，且该驱动的 persistent JIT cache 会
+SIGSEGV，所以整页差距远大于单步差距；单请求的保守数字引用 layout 步的
+2.8-3.1x。
 
 已量到的正确性基线（必须保持）：
 
 * 文本 top-1：`"The capital of France is "` → 220，与 llama.cpp 相同；
 * 视觉：cos 0.999997（对 `MTMD_DEBUG_EMBEDDINGS`）；
 * layout + text：与 llama.cpp 的框和文本一致；
-* 优化后整页 md5 `10eed240936226fd4696d943aaabc44b`、21 个 block，与优化前逐字节相同。
+* 整页 md5 `10eed240936226fd4696d943aaabc44b`、21 个 block，与优化前逐字节相同。
 
 ## 6. 诊断开关
 
 | 环境变量 | 作用 |
 |---|---|
 | `PF_F32=1` | 文本线性层走 f32（默认 int8） |
-| `PF_VISION_F32=1` | 视觉线性层反量化成 f32（默认 f16；qwen2vl 的 qkv 拼合始终是 f32） |
+| `PF_VISION_F32=1` | 视觉线性层反量化成 f32（qwen2vl 默认走 oneDNN int8；qwen3vl 保持文件里的 BF16/F32；合并的 qkv f32 视图只在 host/回退时按需构建） |
 | `PF_VISION_DNNL=0` | 视觉线性层回退到 `vit_gemm`（qwen2vl 默认走 oneDNN int8） |
-| `PF_VIT_ATTN=N` | 80 维头的 attention tile 扫描（0=32/32/512，1=64/16/512，2=32/32/1024 默认，3=16/32/512，4=32/32/256，5=64/16/1024） |
+| `PF_VIT_ATTN=N` | 80 维头的 attention 形状（`70` 默认 = ILP 48/32/1024、SG16、RQ2/RQP2；0=32/32/512 回退；1=64/16/512，2=32/32/1024，3=16/32/512，4=32/32/256，5=64/16/1024，6=48/32/1024 非 ILP，7=16/64/1024，60=48/32/1024 SG16，71=SG32，72=RQ4，73=RQP4，76=BQ52，51=f32 oneDNN opt-in） |
+| `PF_VISION_COMPACT=0` | 恢复整文件 mmproj 上传（默认只上传设备内核读的 3.7 MB） |
+| `PF_VISION_DEFER_QKV=0` | 加载时构建合并的 q/k/v f32 副本（默认按需） |
+| `PF_DNNL_LAZY` | 文本 oneDNN primitive 阶梯惰性化（M=1 仍预建） |
+| `PF_LOAD_TIME=1` | 打印启动/上传各阶段耗时 |
+| `PF_DNNL_QCHK=1` | 逐张量复算参考量化行，报告 mismatch 与总数 |
+| `PF_I8_SPLITK` | 窄 int8 decode GEMV 的 split-K（默认 0 = 关；本卡中性） |
 | `PF_MM_BATCH_PREFILL=0` | 多模态 prefill 回退到每 32 token 一个 mode-1 chunk |
 | `PF_MINERU_TIME=1` | 每张图一行：prep / vision / prefill / decode / total ms，以及 mmproj 加载+上传时间 |
 | `PF_VISION_TIME=1` | 每个视觉 encode 一行阶段耗时（patch / merger / post_ln + 32 层合计），带每阶段 `q.wait()` |

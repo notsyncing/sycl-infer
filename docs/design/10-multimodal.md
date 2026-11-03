@@ -9,7 +9,8 @@
 
 视觉输入由独立的 **mmproj GGUF**（`clip` 架构）提供。`src/mm/vision.{h,cpp}` 是**唯一**的视觉模块：
 模型 profile 的 `vision` 字段（`qwen3vl` / `qwen2vl` / `none`）选择 `vision_model::kind`，
-并与 mmproj 的 `clip.projector_type` 交叉校验；两种塔共享同一套 host/device 前向。流程：
+并与 mmproj 的 `clip.projector_type` 交叉校验；两种塔共享同一套 host/device 前向，**没有**第二个
+视觉塔实现。流程：
 
 ```mermaid
 flowchart LR
@@ -119,18 +120,19 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
   proj_dim, merge, n_pos_side, eps, rope_base, mean/std[3]`。`head_dim` 是**派生**的
   `n_embd / n_head`（`vision.cpp` 加载处派生，不是元数据字段）。
 * **「能加载」不等于「能跑」，所以这个区别是可查询的**：`vision_model::runnable()`
-  报告加载器是否会接受这个几何（`head_dim` 是否被支持、`proj_dim` 是否匹配文本宽度），
-  而前向自己也会查一遍。远端的 mmproj 文件全是 `head_dim 72`（编码器只实现 64）或
-  `proj_dim` 不匹配——在 `runnable()` 之前，这些文件能加载成功、23 项检查全部通过，
-  然后在第一次前向时 abort。**新增几何约束时要同时加到 `runnable()` 和前向的检查里**，
-  否则这个区别是不可见的；调用方应当用 `runnable()` 把「能加载但不能跑」报出来，
-  而不是让它变成一次运行时中止。
+  报告加载器是否会接受这个几何（按 `kind` 检查 `head_dim`：qwen3vl 支持 64/72，
+  qwen2vl 支持 80；`proj_dim` 必须等于文本宽度），而前向自己也会查一遍。
+  在 `runnable()` 之前，一个几何不匹配的文件能加载成功、23 项检查全部通过，然后在第一次
+  前向时 abort。**新增几何约束时要同时加到 `runnable()` 和前向的检查里**，否则这个区别
+  是不可见的；调用方应当用 `runnable()` 把「能加载但不能跑」报出来，而不是让它变成一次
+  运行时中止。
 * `vision_layer`（`vision.h:50-61`）：`qkv/out/up/down` + 可选 f32 bias，`ln1/ln1_b, ln2/ln2_b`。
 * `vision_input`（`vision.h:64-74`）：`chw`、`width/height`、`pw=w/P`、`ph=h/P`、`n_patches=pw*ph`、
   `out_w=pw/merge`、`out_h=ph/merge`、`n_out=out_w*out_h`；由
   `vision_model::make_input` 填写（`vision.cpp:260-272`）。
 * `vision_model`（`vision.h:76-127`）：权重 + 设备状态；`patch_w` 是两个 patch conv 相加后反量化的 f32
-  `[n_embd][3*P²]`；`pos_embd_host` 是反量化的 learned position；`dev_weights` 是整块 GGUF 的设备副本；
+  `[n_embd][3*P²]`；`pos_embd_host` 是反量化的 learned position；`dev_weights` 是紧凑 span 或
+整块 GGUF 的设备副本（§3.3）；
   `d_patch_w` 与 8 个 scratch 缓冲是模型自有的设备内存。所有权：`dev_q` pin 住首次传入的
   engine queue（换 queue 直接抛，跨 queue 释放是 UB），析构按成员表全释放
   （`free_dev_ptrs`，`enc_common.h`；audio 塔同构）。模型禁拷贝，只传引用。
@@ -140,7 +142,9 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 元数据来自 `clip.vision.*`（`vision.cpp:144-164`）：`image_size`、`patch_size`、`embedding_length`、
 `feed_forward_length`、`block_count`、`attention.head_count`、`projection_dim`、
 `spatial_merge_size`（默认 2）、`attention.layer_norm_epsilon`（默认 1e-6）、`rope_theta`（默认 10000）、
-`image_mean/std`。张量：
+`image_mean/std`。**`feed_forward_length` 不能直接信**：MinerU 的 mmproj 写的是 896（文本宽度），
+真实的 `ffn_up` 是 `[1280,5120]`；`n_ff` 一律从 `layers[0].up.N` 推导，错误的宽度会静默截断 FFN。
+张量：
 
 * `v.patch_embd.weight` + `v.patch_embd.weight.1`：两个 4-D 卷积 `[kw,kh,in,out]`，校验
   `N=n_embd`、`K=3P²`，**逐元素相加**后反量化为 `patch_w`（`vision.cpp:187-201`，注释解释了
@@ -158,11 +162,13 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 
 ### 3.3 上传与指针翻译
 
-`upload`（`vision.cpp:251-258`）把整个 mmproj 映射（`gguf.map_size`）一次性拷到设备；
-`dev_ptr`（`vision.h` 的 `dev_ptr`）用与文本模型相同的偏移恒等映射
-（`(char*)dev_weights + ((char*)host_ptr - (char*)gguf.map_base)`）。`patch_w` 是加载时合成的数据，不在
-映射内，因此单独分配设备副本 `d_patch_w`（`vision.cpp:570-576`，只拷一次）。析构有意不释放
-`dev_weights`（`vision.cpp:245-249` 的空实现带注释说明：分配它的队列已随模型生命周期结束）。
+`upload`（`vision.cpp` 的 `vision_model::upload`）默认只上传设备内核真正读的张量
+（`PF_VISION_COMPACT=1`，qwen2vl 的 oneDNN 线性层注册成功后只需 norms/biases，约 3.7 MB）；
+`blob_spans` 记录每个 span 的宿主指针范围与设备偏移，`dev_ptr` 二分查找后翻译
+（`(char*)dev_weights + span.off + (host - span.host)`）。`PF_VISION_COMPACT=0` 恢复整文件
+1:1 映射（`gguf.map_size`），用于 `PF_VISION_DNNL=0` 的完整回退或调试 A/B。`patch_w` 是加载时
+合成的数据，不在映射内，因此单独分配设备副本 `d_patch_w`（只拷一次）。析构有意不释放
+`dev_weights`（队列已随模型生命周期结束的注释仍然成立）。
 
 ### 3.4 host 参考前向（`encode_host`）
 
@@ -184,8 +190,9 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 
 ### 3.5 device 前向（`encode_device`）
 
-守卫（`vision.cpp:556-565`）：非空网格、`np <= kMaxImgPatches`、`HD == 64`（`vit_attn` 的
-`constexpr int HD = 64`，`vit.cpp:335-338`）。
+守卫：非空网格、`np <= kMaxImgPatches`、以及 `runnable()` 的几何检查（qwen3vl 的 64/72 宽头、
+qwen2vl 的 80 宽头；`vit_attn_launch` 对每个宽度都有对应实例）。`encode_device` 直接问
+`runnable()` 并带上原因，而不是重复写 `HD != 64`。
 
 迟初始化：首次调用时 `upload(q)`；`d_patch_w` 一次性拷贝；scratch 在 `np` 变大时整体重分配（8 个缓冲），
 `scratch_patches` 记录上次尺寸，因此后续更小的图复用 —— 即“增长到见过的最大图”（`vision_model::encode_device` 的 scratch 增长判断，`vision.cpp`）。
@@ -226,9 +233,40 @@ md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.99
 `d_info2_` 之间轮换，而 M-RoPE/`img_row` 只写进其中一个，所以那条路径仍走 mode 1）。旧的循环每 32 token 一个 mode-1 chunk（布局
 页的 1394 token 就是 44 遍权重），布局步的文本 prefill 1.92 s -> 0.26 s。
 
+### 3.5.1 视觉塔的演进（设计理由）
+
+这一节记录“为什么塔是现在这个形状”，数字与页面条件见
+[21-mineru-qwen2vl.md](21-mineru-qwen2vl.md) §5 和 `docs/PERFORMANCE.md` §7.4。
+
+* **线性层从 `vit_gemm` 换成 oneDNN int8。** 最初的 `vit_gemm` 按 32-token
+  一组切 M，每个 tile 都把权重块重读一遍；5476 个 patch 就是每个线性层约
+  172 遍权重。oneDNN 每个 ≤1024 行的 chunk 只读一遍，且权重只在上传后转换
+  一次。为了不改变线性层的数值，转换仍是每 32 组 f16 scale 的 int8（与
+  `act_quant_grp_launch` 同一约定），`add_weight` 新增 F16/F32/BF16 源；
+  `eager=false` 跳过预填充 primitive 阶梯，因为内容 crop 的 patch 数各不
+  相同，预先建阶梯几乎全是浪费。patch embedding 留在 `vit_gemm`：K=592 不是
+  32 的倍数，且只占约 1%。
+* **attention tile 的演进。** 80 维头最初的 16/64/128 只用了 16 个 EU 核里
+  的 4 个——47.6 KiB 的 SLM 本来就允许一个 workgroup 占一个核，所以
+  workgroup 的 warp 数直接就是 occupancy。按 (BQ, BK, WG) 扫描后
+  32/32/1024 用满了核；再把查询行按 2 行/线程做 ILP（`RQ=2`、`RQP=2`，
+  SG=16 → 每 EU 四个 16-lane 子组）减少了依赖链和 V 的重复载入，得到默认的
+  48/32/1024。**所有形状都保持原来的逐 score 求和顺序**：页面输出对
+  attention 的舍入极其敏感，换求和顺序会改 md5，所以“更快但不同序”的
+  版本只能 opt-in（`PF_VIT_ATTN=51` 的 f32 oneDNN QK/PV）。
+* **上传从整文件变成紧凑 blob。** 一旦所有线性层都注册到 oneDNN，设备内核
+  只剩 norms/biases 要读，继续把整个 1.32 GB 的 mmproj 拷到设备、并保留
+  1.28 GB 的 f16 线性层，纯属浪费。`PF_VISION_COMPACT` 只上传真正被读的
+  span；`PF_VISION_DEFER_QKV` 把 qwen2vl 的 3E×E 合并 f32 副本从加载时
+  构建推迟到 host 参考/回退真正需要时（加载少 0.67 s、H2D 少 148 ms）。
+* **MinerU 的 image/chart 总是分析。** 参考实现的 `--mineru-image-analysis`
+  默认 `false`；这里有意不复刻：image/chart block 与其它类型一样被裁剪并
+  用 `\nImage Analysis:` 提问，因此没有这个开关。
+
 ### 3.6 视觉 kernel
 
-全部在 `src/backend/gpu/kernels/vit.cpp`，激活一律 fp32，权重 BF16 或 F32（行主序 `[N][K]`）：
+全部在 `src/backend/gpu/kernels/vit.cpp`，激活一律 fp32；`vit_gemm` 路径的权重是 BF16/F32（行主序
+`[N][K]`），qwen2vl 的线性层默认改走 oneDNN int8（§3.5）：
 
 | kernel | 启动几何 | 说明 |
 |---|---|---|
@@ -237,7 +275,7 @@ md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.99
 | `vit_gelu_launch` | 一线程一个元素（`vit.cpp:245-254`） | tanh 近似，`sqrt(2/pi)` 硬编码 |
 | `vit_add_bias_launch` / `vit_add_launch` / `vit_copy_launch` | `range<2>(rows, cols)` | 三种逐元素偏置/加法/拷贝 |
 | `vit_rope_launch` | `range<1>(n_tok*n_head*head_dim/2)` | 2D 视觉 RoPE，见 §3.7 |
-| `vit_attn_launch` | 每 `(head, BQ-query block)` 一个 WG；**qwen2vl 的 80 宽头是 `BQ=32, BK=32, WG=1024`**（47.6 KiB SLM，一个 WG 占满一个 Xe core），64/72 宽头仍是 16-32 query、64 key、128 线程 | 双向注意力，**在线 softmax**（running max/sum），score 矩阵不出工作组；部分 tile 的填充行在每个阶段都有 `r < n_q` / `k < n_k` 守卫 |
+| `vit_attn_launch` | 每 `(head, BQ-query block)` 一个 WG；**qwen2vl 的 80 宽头默认是 ILP `BQ=48, BK=32, WG=1024, SG=16, RQ=2, RQP=2`**（47.6 KiB SLM，一个 WG 占满一个 Xe core；`PF_VIT_ATTN=70`），64/72 宽头仍是 16-32 query、64 key、128 线程 | 双向注意力，**在线 softmax**（running max/sum），score 矩阵不出工作组；部分 tile 的填充行在每个阶段都有 `r < n_q` / `k < n_k` 守卫。ILP 版本每线程算 2 个查询行的 score dot、2 个 PV 行共享一个 V `float4`，保持原来的求和顺序 |
 
 在线 softmax 是必要的：token 数上界是 `kMaxImgPatches`，`n_tok × n_tok` 的 score 矩阵不能显式物化
 （`vit.cpp:5-7` 的文件头注释）。FFN 的 `up`/`down` GEMM 与 merger 的 `mm.0`/`mm.2` 都走同一个

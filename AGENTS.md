@@ -539,13 +539,16 @@ third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
    unknown architecture still throws `unsupported architecture: <name>`.
 4. `validate_hparams` runs after every loader, so a geometry the kernels do not
    implement is refused at load time, before any device allocation.  This is a
-   memory-safety guard, not a precision one: `attn.cpp`'s generic attention sizes
-   each split's partials with a literal `constexpr int HD = 256` while indexing
-   them with `pstride = 2 + head_dim`, so `head_dim != 256` overruns the buffer
-   instead of merely losing accuracy - and every specialised kernel falls back to
-   that same one.  Also checked: `head_dim % 32`, the GQA ratio, the basic
-   extents, `full_attn_interval`, and the GDN geometry.  If your architecture
-   needs a geometry outside these, extend the check *and* the kernel together.
+   memory-safety guard, not a precision one: `attn.cpp`'s generic attention uses
+   `pstride = 2 + head_dim` for each split's partials and sizes its register
+   array `acc[HD/32]` for the 256 ceiling, so a `head_dim` that is not a
+   multiple of 32, or is above 256, overruns the buffer instead of merely losing
+   accuracy - and every specialised kernel (oneDNN attention, flash, grouped
+   decode) guards `head_dim == 256` and falls back to that same classic kernel,
+   which is the path Qwen2-VL's 64-wide heads take.  Also checked: the GQA ratio,
+   the basic extents, `full_attn_interval`, and the GDN geometry.  If your
+   architecture needs a geometry outside these, extend the check *and* the kernel
+   together.
 
 See [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
 [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) for the full
@@ -623,67 +626,110 @@ and the mmproj's `clip.projector_type` is cross-checked at load:
   (`PF_VISION_DNNL`, default on for `qwen2vl`; `=0` restores `vit_gemm`).
   `vit_gemm` tiles M in 32-token groups and re-reads each weight block per
   tile - at 5476 patches that is ~172 passes over every linear; oneDNN reads
-  each weight once per <= 1024-row chunk.  `vision_model::upload` registers the
+  each weight once per <=1024-row chunk.  `vision_model::upload` registers the
   towers' linears on a private `dnnl_gemm` with `add_weight(..., eager=false)`:
   the lazy flag skips the prefill primitive ladder so only the M shapes a page
   asks for get a primitive (content crops all have different patch counts).
   `dnnl_gemm::add_weight` accepts F16/F32/BF16 sources for this (the mmproj
-  stores its linears in those; `dequantize_row` already had them).  The patch
+  stores its linears in those), and the qwen2vl q/k/v are converted with
+  `add_weight_blocks` straight from the three GGUF tensors.  The combined
+  3E x E f32 view exists only for the host reference and the `vit_gemm`
+  fallback, so it is built on demand (`PF_VISION_DEFER_QKV=0` restores the
+  eager load; that cost 0.67 s and 148 ms of H2D per page).  Once every
+  linear is registered, the only mmproj tensors a device kernel reads are the
+  norms/biases (3.7 MB of the 1.32 GB file), so the blob is compact
+  (`PF_VISION_COMPACT=0` restores the whole-file 1:1 map).  The patch
   embedding stays on `vit_gemm` (K=592 is not a multiple of 32 and the GEMM is
   ~1% of the work), and any tensor the instance did not accept falls back to
-  `vit_gemm` per call, so an unsupported projector still runs.  Measured on the
-  MinerU layout page: vision 58.7 s -> 3.64 s, page 113.1 s -> 15.8 s with a
-  byte-identical output; a later pass took it to **11.0 s** (attention 3.26 ->
-  2.10 s, decode 4.97 -> 4.60 s, load 5.03 -> 1.65 s) - see
-  *docs/PERFORMANCE.md* §7.4.
+  `vit_gemm` per call, so an unsupported projector still runs.
 * **The 80-wide attention default is the ILP kernel `BQ=48, BK=32, WG=1024`,
   SG16, RQ2/RQP2** (two query rows' score dot per thread, two PV rows sharing
   one V `float4`).  It is bit-identical to the reference order and measured
-  2.10 s vs 3.26 s for 32/32/1024 on the layout page.  SLM permits one
+  **2.10 s vs 3.26 s** for 32/32/1024 on the layout page.  SLM permits one
   workgroup per Xe core, so the warp count *is* the occupancy; the padded rows
   of a partial tile are guarded in every stage (the 56x56 self-check is 16
-  tokens).  `PF_VIT_ATTN=70` is the default; 0 = 32/32/512 (Iris Xe fallback),
-  1 = 64/16/512, 2 = 32/32/1024, 3 = 16/32/512, 4 = 32/32/256, 5 = 64/16/1024,
-  6 = pre-ILP 48/32/1024, 7 = 16/64/1024, 51 = f32 oneDNN QK/PV (faster but a
-  different summation order, opt-in only).
-* The mmproj stores the linears as BF16 and the norms/biases/patch/position
-  tensors as F32; `upload` copies the whole GGUF blob once and `dev_ptr` maps a
-  host tensor pointer into it.  `encode_device` runs on the queue it is given,
-  which must be **in-order** (the vision stages are dependent kernel launches);
-  the engine's queue is.  Device scratch grows to the largest image seen.
-* The vision tower's own RoPE is the 4-section `VISION` mode (pairs 0..15 use
-  the patch row, 16..31 the column, exponent restarting per section) - do not
-  confuse it with the text model's *interleaved* M-RoPE.
-* `kMaxImgTokens` (1024) bounds one image's merged tokens and `kMaxImgPatches`
-  (4x that) the ViT patch tokens; `mm_image_preprocess` caps `max_pixels` to
-  match, and `encode_device` grows its scratch buffers to the largest image seen.
-* `mm_build_prompt` computes the merged embeddings on the host;
-  `mm_build_prompt_device` runs the tower on the GPU into the engine's
-  `d_img_embd`.  Both return the same token/position layout: each `<|image_pad|>`
-  expands to `n_out` merged tokens, `img_row` maps them to embedding rows, and
-  the 4-section M-RoPE positions are `(base, base+row, base+col)` with the image
-  consuming `max(nx, ny)` positions.
-
-See [`docs/design/10-multimodal.md`](docs/design/10-multimodal.md) and
-[`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the full design.
+  tokens).  `PF_VIT_ATTN=70` is the default; `0` = 32/32/512 (the Iris Xe
+  512-thread fallback), 1 = 64/16/512, 2 = 32/32/1024, 3 = 16/32/512,
+  4 = 32/32/256, 5 = 64/16/1024, 6 = pre-ILP 48/32/1024, 7 = 16/64/1024,
+  60 = 48/32/1024 SG16, 71 = the ILP SG32 variant, 72 = RQ4, 73 = RQP4,
+  76 = BQ52, 51 = f32 oneDNN QK/PV (faster but a different summation order,
+  opt-in only).  Every shipped shape keeps the original per-score dot order,
+  the BK=32 online-softmax grouping and the PV k order.
+* **The multimodal prefill uses the chunk-batched (mode 2) path**
+  (`PF_MM_BATCH_PREFILL`, default on): the image prompt's M-RoPE and `img_row`
+  maps are per token and indexed `[row*kMaxT + t]`, which is exactly the layout
+  `mm_write_step` produces for `n` tokens, so one forward can cover up to
+  `kMaxB*kMaxT` tokens (the pipelined two-GPU path alternates its two step_infos
+  and the M-RoPE arrays are written into one, so it keeps mode 1).  The old loop
+  ran one 32-token mode-1 chunk per forward.
+* **The M=1 decode fuses the activation quantizer and the call's int8
+  segments** (`i8_grp_quant_gemv_launch`): a narrow decoder like Qwen2-VL has
+  many 0.1-9 MB projections where the launch floor is a large share of the
+  step.  The kernel quantizes the call's activation exactly as
+  `act_quant_grp_launch` does, stages each row's per-32 scale from its own
+  segment plane, and runs `i8_grp_gemv_impl`'s row arithmetic - bit-identical
+  to quantize + one launch per segment.  It applies to `mode == 0 && tb == 1`
+  with 1-4 plain-int8 segments and K a multiple of 32; anything else falls
+  through to the ordinary path.
+* **The load path is lazy and staged.**  Text primitives are built on first
+  use (`PF_DNNL_LAZY`, default on for a multi-device partition with no
+  MTP/DFlash; M=1 is still primed because it is recorded into the decode
+  command graph).  The int8 converter uses a vectorised round (no `lround`;
+  `PF_DNNL_QCHK=1` recomputes one reference row per tensor - 287/287 tensors,
+  0 mismatches on the page) and two pinned staging slots so a tensor's H2D
+  overlaps the next tensor's dequantization (`PF_DNNL_NOSTAGE=1` /
+  `PF_DNNL_SYNCCOPY=1` are the A/Bs).  The tied-embedding copy stays on the
+  CPU.  `PF_LOAD_TIME=1` prints the split.
 
 **Measured (one A770, MinerU 1.2B `qwen2vl`, the 1036x1036 layout page, 21
-blocks, 2026-11-02).**  Whole-page wall **113.1 s -> 15.8 s** (7.2x) with the
-same page md5 (`10eed240936226fd4696d943aaabc44b`) and the same text-only
-generation; the page's vision work goes **100.4 s -> 4.94 s** and the layout
-step's text prefill 1.92 s -> 0.26 s (mode-2 `prefill_batch`, see
-`PF_MM_BATCH_PREFILL`).  The stages are priced with `PF_VISION_TIME=1` (a
-`q.wait()` per stage, vision only) and `PF_MINERU_TIME=1` (prep / vision /
-prefill-to-first-token / decode per image); both are diagnostics and the
-default path never waits there.  Against `llama-mtmd-cli` (SYCL build, same
-page/prompt/model, one process per image because that build has no
-`llama-server`): the layout step as a layout-only process is 28.2 s vs 13.2 s
-wall (2.1x), or 20.9 s vs 7.2 s excluding each process's model load (2.9x); the
-whole page is 398 s vs 15.8 s.  That CLI pays ~7.3 s of model+mmproj init and
-~6 s of SYCL JIT **per process** and its persistent JIT cache SIGSEGVs on this
-driver, which is why the page gap is far larger than the per-step one - quote
-the layout-step number (2.1-2.9x) whenever a like-for-like single-request
-figure is needed.
+blocks, 2026-11-02; AOT Release `acm-g10`, clocks fixed at 2400 MHz, quiet
+window, one process per rep).**  Warm page cache:
+
+| phase | warm |
+|---|---:|
+| startup + text model load | **1.65 s** |
+| layout vision (5476 patches -> 1369 tokens) | **2.49 s** (attention 2.10, GEMM/other 0.39) |
+| layout text prefill (1394 tokens) | **0.26 s** |
+| layout decode (463 tokens) | 3.16 s |
+| 21 content blocks (vision + text) | **2.77 s** (vision 1.31, text 1.93) |
+| page text decode (676 tokens) | **4.60 s** (6.81 ms/token) |
+| **page wall** | **10.99 / 11.23 s**; cold file cache **11.89 / 12.28 s** |
+
+Output is byte-identical throughout: page md5 `10eed240936226fd4696d943aaabc44b`
+(21 blocks), text-only `gen` md5 `bfc55c543af1d1aecae5da0b1f9b99e5`, vision
+self-check cos 0.999104.
+
+**The ceiling is the bit-exact one.**  The per-phase floor with the current
+exact-order math is ~5.0 s one-shot / ~3.7 s with the process reused; the
+measured 11 s is the ceiling *without* reordering.  The gap needs reordered
+math or content batching: decode is 4.60 s against a 0.9-1.5 s floor (676
+tokens x 0.52 GB/token at 76-88 GB/s; N=896 exposes ~896 warps of 512 EUs),
+attention is 2.10 s against a 0.87 s traffic floor, and the 21 content crops
+cost 1.31 s because each small M builds its own oneDNN primitives (batching
+them or an M-bucket ladder is worth ~0.5-1 s).  Rejected/opt-in, with numbers:
+f32 oneDNN QK/PV reaches 1.59 s but reorders the fp sum and is run-to-run
+nondeterministic; a block-level check (2026-11-03) found identical content on
+the layout page (1/5 runs moved one text box by 0.001) but **different image
+captions and recognized text on the table page** (`2020年/2021年` vs `29/2020`,
+`铜箔/HM9000` vs `钢带/HMMHPL`, 2-5 of 14 blocks across runs) - so it is not
+semantically safe; int8 oneDNN QK/PV (1.38 s) changed the page md5 and was
+nondeterministic; a preconverted int8 cache was rejected for an unversioned
+key surface; split-K decode (`PF_I8_SPLITK`) was bit-exact on both tested
+pages (2/2 each) but is not guaranteed and stays off; and
+`i8_grp_gemv_rows_multi` differs by 1 ulp and changes the stream, so the page
+does not use it.
+
+Against `llama-mtmd-cli` (SYCL build, same page/prompt/model, one process per
+image because that build has no `llama-server`): the layout step as a
+layout-only process is 28.2 s vs 9.03 s wall (3.1x), or 20.9 s vs ~7.4 s
+excluding each process's model load (2.8x); the whole page is 398 s against
+this engine's final 11 s.  The llama.cpp cells were measured once (its binary
+and per-process init/JIT are unchanged by the engine's later passes).  That
+CLI pays ~7.3 s of model+mmproj init and ~6 s of SYCL JIT **per process** and
+its persistent JIT cache SIGSEGVs on this driver, which is why the page gap is
+far larger than the per-step one - quote the layout-step number (2.8-3.1x)
+whenever a
+like-for-like single-request figure is needed.
 
 ### Audio + video input
 
@@ -2514,7 +2560,8 @@ n_embd 896, n_ff 4864, 14 query / 2 KV heads, head_dim 64, RoPE sections
 `src/mineru.{h,cpp}` (the MinerU two-step prompts/JSON).  `vision_model` serves
 both towers: Qwen2-VL's `model_profile::vision = qwen2vl` selects patch 14 +
 temporal 2, separate `attn_q/k/v` weights and biases (combined into one
-`[3E][E]` f32 view at load), no position embeddings, quick_gelu, exact-erf
+`[3E][E]` f32 view on demand; `PF_VISION_DEFER_QKV=0` restores the eager load),
+no position embeddings, quick_gelu, exact-erf
 GELU in the merger, per-patch `v.post_ln` before the 4-patch concat, and 80-wide
 heads; Qwen3.5's `vision = qwen3vl` keeps the fused `attn_qkv`, learned
 positions and gelu_tanh.  The mmproj's `clip.projector_type` is cross-checked
@@ -2550,7 +2597,8 @@ device towers on a small crop.
 **Precision:** the int8 oneDNN path is the default and produces the same layout
 as f32.  `PF_F32=1` dequantizes the decoder linears and runs the generic f32
 GEMM (`vit_gemm` + `vit_silu_mul`) as an accuracy A/B; it costs ~4x the weight
-traffic.  `PF_VISION_F32=1` does the same for the vision linears (default f16).
+traffic.  `PF_VISION_F32=1` does the same for the vision linears (qwen2vl's default is
+oneDNN int8; qwen3vl keeps the file's BF16/F32).
 
 **MinerU image/chart extraction is always on.**  `--mineru-image-analysis` was
 removed: image and chart blocks are cropped and analysed (`\nImage Analysis:`)
@@ -2558,10 +2606,20 @@ with every other block type, so the reference's default `false` is deliberately
 not reproduced.
 
 **Performance:** the vision tower dominates (5476 patches, 32 full bidirectional
-layers).  `vit_attn_impl<80,16,64>` is the known-correct SLM shape; BQ=32 is
-faster but corrupts/hangs when `n_tok` is not a multiple of 32 (the 56x56 probe
-is 16 tokens) until the padded rows are guarded.  A full layout + 10 text
-blocks is ~2-3 minutes on one A770.
+layers), and within it the attention dominates.  The default is the bit-exact
+ILP shape `vit_attn_ilp<80,48,32,1024,16,2,2>` (`PF_VIT_ATTN=70`): one
+workgroup per head/query block, 1024 threads, SG16, two query rows' score dot
+per thread and two PV rows sharing one V `float4`; the padded rows of a partial
+tile are guarded in every stage (the 56x56 self-check is 16 tokens).  The
+vision linears run on oneDNN int8 (see the multimodal section), the 21 content
+crops share the compact 3.7 MB mmproj blob, and the M=1 decode fuses the
+activation quantizer with the call's int8 GEMV group.  On one A770 (AOT
+Release, 2400 MHz) the whole 1036x1036 page, 21 blocks, is **10.99/11.23 s
+warm, 11.89/12.28 s cold** (startup 1.65, vision 2.49, prefill 0.26, layout
+decode 3.16, content 2.77, page text decode 4.60; md5 unchanged).  That is the
+bit-exact ceiling: the ~5.0 s hardware floor needs reordered attention/decode
+math or content batching, and the rejected/opt-in paths and their numbers are
+in *docs/PERFORMANCE.md* §7.4 and *docs/design/21-mineru-qwen2vl.md* §5.
 
 ### OpenAI-compatible API
 
@@ -3423,7 +3481,7 @@ overrides it; `K:V` sizes K and V independently, e.g. `i4:i8`), `PF_KV_F32`,
 
 **Compute path**
 `PF_F32` (Qwen2-VL: use the f32 text GEMM instead of int8; default off),
-`PF_VISION_F32` (Qwen2-VL: keep the vision linears in f32 instead of f16; default off),
+`PF_VISION_F32` (Qwen2-VL: dequantize the vision linears to f32 instead of the default oneDNN int8; default off),
 `PF_YARN` (YaRN context extension, **default off**; `--yarn`), `PF_YARN_FACTOR`
 (the extension factor; 0/absent derives `--ctx / <arch>.context_length`),
 `PF_YARN_ORIG_CTX` (override the trained context the factor is measured
@@ -3685,18 +3743,28 @@ decode / total ms, plus the mmproj load+upload time),
 `PF_VISION_TIME` (vision encoder: one line per encode with patch / merger / post_ln and
 the per-stage totals over all layers - ln1, qkv, rope, attn, out, ln2, up, act, down -
 taken with a `q.wait()` per stage, so only the diagnostic pays for them),
-`PF_VISION_DNNL` (vision linears on the oneDNN int8 matmul; default **on** for `qwen2vl`;
-`PF_VISION_COMPACT` / `PF_VISION_DEFER_QKV` control the 3.7 MB compact blob and the
-lazy q/k/v f32 relayout; `PF_DNNL_LAZY` makes the text primitive ladder lazy;
-`PF_LOAD_TIME` / `PF_DNNL_QCHK` / `PF_I8_SPLITK` are the load diagnostics/A-B
-- verified byte-identical page output - and **off** for `qwen3vl`, whose BF16 tower has
-not been measured here; `0` restores `vit_gemm`),
-`PF_VIT_ATTN` (vision attention tile sweep: 0 = 32/32/512, 1 = 64/16/512, 2 = 32/32/1024
-default, 3 = 16/32/512, 4 = 32/32/256, 5 = 64/16/1024),
+`PF_VISION_DNNL` (vision linears on the oneDNN int8 matmul; default **on** for
+`qwen2vl` and **off** for `qwen3vl`, whose BF16 tower has not been measured here;
+`0` restores `vit_gemm`),
+`PF_VISION_COMPACT=0` (restore the whole-file mmproj blob; the default uploads only
+the 3.7 MB the device kernels read),
+`PF_VISION_DEFER_QKV=0` (build the combined qwen2vl q|k|v f32 view at load; the
+default builds it on demand, saving 0.67 s and 148 ms of H2D per page),
+`PF_DNNL_LAZY` (text oneDNN primitive ladder lazy: create each M on first use,
+except M=1, which is primed for the recorded decode graph; default on for a
+multi-device partition without MTP/DFlash),
+`PF_VIT_ATTN` (vision attention shape: **70 default** = ILP 48/32/1024, SG16,
+RQ2/RQP2; 0 = 32/32/512 fallback; 1 = 64/16/512, 2 = 32/32/1024, 3 = 16/32/512,
+4 = 32/32/256, 5 = 64/16/1024, 6 = pre-ILP 48/32/1024, 7 = 16/64/1024,
+60 = 48/32/1024 SG16, 71 = SG32, 72 = RQ4, 73 = RQP4, 76 = BQ52, 51 = f32
+oneDNN QK/PV opt-in - faster but a different summation order),
 `PF_MM_BATCH_PREFILL` (multimodal prefill in chunk-batched mode 2 - up to `kMaxB*kMaxT`
 tokens per forward, except on the pipelined two-GPU path; default on, `0` restores
 one 32-token mode-1 chunk per forward.  The pipelined path alternates step_infos and
 the M-RoPE/img_row arrays are written into one, so it keeps mode 1),
+`PF_LOAD_TIME=1` / `PF_DNNL_QCHK=1` / `PF_I8_SPLITK` (startup-phase timing /
+per-tensor reference-row quantizer check / narrow int8 decode split-K, default
+off and measured neutral on this card),
 `PF_MOE_RESIDENT` (experts kept on the device per layer, 0 = every expert
 resident, the default and what a model that fits does anyway),
 `PF_MOE_VRAM_MB` (device budget for the expert bank - authoritative over the

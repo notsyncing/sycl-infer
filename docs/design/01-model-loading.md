@@ -86,8 +86,11 @@ K-quant 线性层的 `K`（= `dims[0]`）必须是块大小的整数倍。反过
 （`qwen35.cpp:81`）。
 
 计算路径实际消费的子集：F32（norm/标量）、Q4_K/Q5_K/Q6_K（线性层主力）、Q8_0/Q8_1
-（`ssm_beta`/`ssm_alpha` 这类窄 int8 行）、IQ4_XS/IQ4_NL（走 `PF_CB4` 的 codebook 4-bit 原生存储，
+（`ssm_beta`/`ssm_alpha` 这类窄 int8 行）、**Q5_0**（Qwen2-VL 的 `n_embd = 896` 不是 256 的倍数，
+ggml 对它的线性层用 Q5_0/Q8_0）、IQ4_XS/IQ4_NL（走 `PF_CB4` 的 codebook 4-bit 原生存储，
 见 [02-quantization.md](02-quantization.md)）、BF16/F32（视觉/音频 encoder 的线性层）。
+Q5_0 的 host 反量化在 `quant.h`，设备侧在 `kernel_utils.h`（`dequant_sb_lane_typed<6>` 等），
+oneDNN 的 `add_weight` 接受 type 6。
 
 ### 2.6 split GGUF（分片文件）
 
@@ -138,6 +141,7 @@ const loader * registry(size_t & n);             // 整张表，给 PF_MODEL_INF
 void load_qwen35(model & m);
 void load_qwen35moe(model & m);
 void load_qwen4exp(model & m);
+void load_qwen2vl(model & m);
 wt bind_tensor(const gguf_file & f, const std::string & name, uint32_t expect_type = 0xFFFFFFFF);
 const float * bind_f32(const gguf_file & f, const std::string & name);
 ```
@@ -149,6 +153,7 @@ static const loader kLoaders[] = {
     {"qwen35",     &load_qwen35,     &kQwen35Profile},
     {"qwen35moe",  &load_qwen35moe,  &kQwen35MoeProfile},
     {"qwen4exp",   &load_qwen4exp,   &kQwen4ExpProfile},
+    {"qwen2vl",    &load_qwen2vl,    &kQwen2VlProfile},
 };
 ```
 
@@ -158,7 +163,7 @@ static const loader kLoaders[] = {
 
 每个架构一个完整的 const，放在 `src/model/profiles/<arch>.cpp`（`generic.cpp`
 同时定义 `kQwen35Profile` / `kQwen35MoeProfile`，`qwen4exp.cpp` 定义
-`kQwen4ExpProfile`），字段分五组：
+`kQwen4ExpProfile`，`qwen2vl.cpp` 定义 `kQwen2VlProfile`），字段分五组：
 
 | 组 | 内容 |
 |---|---|
@@ -211,14 +216,15 @@ prompt 必须走模型自己的 chunker）。`model::prof` 是策略，`model::p
 `model::load` 在架构 loader 填完 `hp` 之后调用 `validate_hparams(hp, arch)`（`model.cpp`）。
 **几何不满足 kernel 硬编码假设的 GGUF 在加载期被拒绝**，而不是"算错"或"算零"。
 
-原因不是精度而是内存安全：`attn.cpp` 的通用（非特化）注意力 kernel 用**字面量**
-`constexpr int HD = 256` 计算每个 split 的 partials 长度，却用 `pstride = 2 + head_dim` 定位。
-所以 `head_dim = 128` 会让它往 130 个 float 的槽位里写 256 个 float，**越界写坏 partials 缓冲**。
-特化 kernel（oneDNN 注意力、flash、grouped）全部以 `head_dim == HD` 为条件，不满足时**回落到同一个
-通用 kernel**——因此除 256 以外没有任何受支持形状。`qk_norm_rope.cpp` 的 QK-norm 同理：RMSNorm 循环
-是 `head_dim / 32` 配 32 宽 sub-group，非 32 的倍数会静默漏掉尾部维度。
+原因不是精度而是内存安全：`attn.cpp` 的通用（非特化）注意力 kernel 每个 split 的 partial
+记录是 `pstride = 2 + head_dim`，它的寄存器数组 `acc[HD/32]` 按 **256 这个上限**定尺，
+K/V 的 32-lane 子组循环用 `head_dim / 32`。所以 `head_dim` 必须是 32 的倍数，且不能超过 256
+（超过会写坏 partials 缓冲）。特化 kernel（oneDNN 注意力、flash、grouped decode）以
+`head_dim == 256` 为条件，不满足时**回落到通用 classic kernel**——Qwen2-VL 的 64 宽头就
+走这条路。`qk_norm_rope.cpp` 的 QK-norm 同理：RMSNorm 循环是 `head_dim / 32` 配 32 宽
+sub-group，非 32 的倍数会静默漏掉尾部维度。
 
-当前校验项：`head_dim == 256`、`head_dim % 32 == 0`、
+当前校验项：`head_dim >= 32 && head_dim % 32 == 0 && head_dim <= 256`、
 `n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0`（GQA 比值被多处 kernel 整除）、
 `n_layer/n_embd/n_vocab > 0`、`full_attn_interval > 0`（`is_recr` 对它取模）、以及存在
 recurrent 层时 `d_state/n_group/dt_rank/conv_k > 0`。消息带架构名。
@@ -419,6 +425,39 @@ KV 存储类型与前缀缓存，并计入 `--kv-cap-mb` 与三层前缀缓存�
 ### 5.4 `load_qwen35`（`qwen35.cpp`）
 
 见 [11-qwen35-model.md](11-qwen35-model.md)。
+
+### 5.5 `load_qwen2vl`（`qwen2vl.cpp`，MinerU2.5）
+
+`general.architecture = qwen2vl`，是普通 dense decoder：24 层、`n_embd` 896、
+`n_ff` 4864、14 query / 2 KV heads、`head_dim` 64、RoPE sections
+`[8,12,12,0]`、每层 full attention、tied `output`。加载器只绑定普通的
+`attn_{q,k,v,output}` / `ffn_{gate,up,down}` / `attn_norm` / `ffn_norm`，并把
+Qwen2 的 q/k/v projection bias 绑到 `q_bias/k_bias/v_bias`（没有 QK RMSNorm，
+`q_norm`/`k_norm` 为 `nullptr`）。`head_dim` 取
+`attention.key_length`，缺失时派生 `n_embd / n_head`；`attn_gate = false`。
+
+**head_dim 64 第一次让 classic attention 走 `head_dim != 256`**：`attn.cpp`
+的通用 kernel 把 `HD/32` 的循环改成 `head_dim/32`，两 `float4` 快速路径只在
+`head_dim == 256` 时启用，其余走 `lane + 32*i` 的标量路径；partials 的
+stride 本来就是 `2 + head_dim`。`qk_norm_rope` / `attn` / `attn_combine` 支持
+没有 QK norm、没有输出门的模型（q/k 的 norm 为空时跳过；bias 在 rope 之前
+加；`hp.attn_gate == false` 时不乘 `sigmoid(gate)`）。
+
+**M-RoPE 是 blocked，不是 interleaved。** `qwen2vl` 的 sections
+`[8,12,12,0]` 之和是 `n_rot/2`，`qk_norm_rope` 以这个条件选 ggml 的
+non-imrope 分支：pairs `[0,8)` 用 t、`[8,20)` 用 row、`[20,32)` 用 col。
+Qwen3.5 的 interleaved 模式（sections 和为 32）是另一条分支。
+
+**默认走 per-tensor / multi-device 权重路径，即使只有一张卡。** profile 的
+`policy.auto_layer_map = true` + `auto_layer_map_one_gpu = true`：单设备路径
+要求 SIn 打包，而 Q5_0 不在 SIn 打包列表里，且 raw GEMV 以 256 为一个
+superblock，`K=896` 会被截断。per-tensor 路径的 oneDNN int8 转换通过
+`dequantize_row` 读 Q5_0，`i8_row_gemv_multi` 按 32 值组处理任意 K；转换在
+`setup_md_dnnl` 里用 `add_weight` 完成，`upload_device_weights` 因此跳过这些张量的
+原始设备拷贝。`policy.prefix_cache = false`（每个 crop 都不重复），
+`rep.sin_w8 = false`、`rep.dnnl_int8 = true`、`rep.f32_gemm = false`
+（`PF_F32=1` 是精度 A/B）。
+详见 [21-mineru-qwen2vl.md](21-mineru-qwen2vl.md)。
 
 ---
 

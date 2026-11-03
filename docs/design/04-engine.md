@@ -53,7 +53,8 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
    默认也钉成 1，`PF_MD_SPLITS=1` 才选回 split 路径（MTP 草稿**不**受此门控，它有自己的
    `mtp_splits`）。
 6. **权重上传**：`m.upload(q, /*host=*/cpu_mode || multi_dev)`——GPU 单设备拷整文件；CPU 只把
-   `dev_ptr` 退化为 mmap 指针。
+   `dev_ptr` 退化为 mmap 指针。qwen2vl 即使只有一张卡也走 per-tensor 路径（profile 的
+   `auto_layer_map_one_gpu`；Q5_0 不可 SIn 打包），所以它同样取 `multi_dev` 这一支。
 7. `PF_META` → `build_meta32`（默认关）；`PF_DP4A` → `pf8`、`pf8_dec`（默认都开，且 `pf8` 在
    `multi_dev` 下强制 false）。GPU 在 `pf8` 时 `m.build_w8(q)`（约 700 MB）；CPU 读 GGUF 整数
    block，**不建 w8**。
@@ -64,7 +65,10 @@ prof/launch 诊断）、`engine_kvpool.cpp`（虚拟地址动态 KV 池与 `attn
    （先磁盘、再 RAM、最后 VRAM 检查点数）；`pc_max_states == 0` 关闭整个缓存；打开 RAM/磁盘 store。
 9. **oneDNN**（`engine.cpp:368-465`）：单设备 `use_dnnl = pf8 && dnnl_gemm_enabled()`，为所有 SI8
    权重 `add_weight`，除 `PF_DNNL_NOWARM` 外 `warmup()`；多设备走另一条 `!md_int8 && !md_xmx`
-   的分支，每 GPU 后端一份只装该设备层的 `dnnl_gemm`。
+   的分支，每 GPU 后端一份只装该设备层的 `dnnl_gemm`。primitive 阶梯可以是惰性的
+   （`PF_DNNL_LAZY`）：多设备且没有 MTP/DFlash 时默认跳过预填充阶梯，`gemm()` 首次用到某个 M
+   时才建；**M=1 仍在注册时建**，因为单行 decode 会录进 command graph。MinerU 页面因此省约
+   150 ms 的 primitive 创建，页面 md5 不变。
 10. **尺寸与池预留**：`ffn_stride = 2*n_ff`（466），`max_blocks = ceil(max_seq/kBlockSize)`（467）；
     `pool_cap = max(n_blocks_, cap_blocks)`，前缀缓存开启时至少 `pc_max_states`（488-494）；
     `pool_initial = n_blocks_`；`PF_KV_GROW` → `pool_chunk`（默认 64）。
@@ -516,9 +520,12 @@ decode-vs-prefill 不匹配即由此而来）。`PF_NO_PFB_PARTIAL=1` / `PF_PFB_
   1. `reset_single`；seed `mt19937_64`（`gp.seed` 或 `random_device`）。
   2. 多模态：校验 `embd` 行数 ≤ `kMaxImgTokens`；若无设备指针则拷贝到 `d_img_embd`。
   3. 分配 prompt 的块并 `set_table(0, blocks)`。
-  4. **prefill**：多模态按 ≤32 token 分块设 `mrope_on`/`img_embd`/`img_row` 后
-     `prefill_chunk`（**每个 chunk 都带 head**，因为没有 head 的变体只在调度器路径用）；纯文本走
-     `prefill_text`。
+  4. **prefill**：多模态默认走 chunk-batched（mode 2）：把 `mrope_on`/`img_embd` 和逐 token 的
+     M-RoPE/`img_row` 写进 `d_info` 后，`prefill_batch` 一次覆盖最多 `kMaxB*kMaxT` 个 token
+     （`PF_MM_BATCH_PREFILL=0` 恢复每 32 token 一个 mode-1 `prefill_chunk`）。图像 prompt 的
+     M-RoPE 与 `img_row` 按 `[row*kMaxT + t]` 索引，正好是 `mm_write_step` 的连续布局；两卡
+     流水线在 `d_info`/`d_info2_` 之间轮换而 M-RoPE 只写进 `d_info`，所以它仍走 mode 1。
+     纯文本走 `prefill_text`。
   5. `run_head()` → `logits`；可选输出 `first_logits`。
   6. `next_pos = mm ? mm->pos_after : nprompt`；清 `img_embd`。
   7. **decode 循环**：`sample_token`（`out` 同时作为 `recent`）→ push token → EOS/回调/`max_tokens`/
@@ -555,6 +562,9 @@ decode-vs-prefill 不匹配即由此而来）。`PF_NO_PFB_PARTIAL=1` / `PF_PFB_
 | `PF_PREFIX_CACHE` / `PF_PC_*` | 前缀缓存 |
 | `PF_MTP*` / `PF_MTP_DEV` / `PF_MTP_FORCE_INT8` | MTP / NextN 投机解码，见 §12.9（总表以 `AGENTS.md#environment-variables` 为准） |
 | `PF_PF_PIPE=0` / `PF_NO_PFB_PARTIAL` / `PF_PFB_MAX_M` | 多设备 prefill 三相位流水线开关 / mode-2 只收 `kMaxT` 倍数（A/B）/ 可选 batch 上限（`0` = 无上限，默认） |
+| `PF_MM_BATCH_PREFILL=0` | 多模态 prompt 回退到每 32 token 一个 mode-1 `prefill_chunk`（默认走 mode 2，最多 `kMaxB*kMaxT` token/forward；两卡流水线仍走 mode 1） |
+| `PF_DNNL_LAZY` | 文本 oneDNN 的 primitive 阶梯惰性化；M=1 仍预建（录制的 decode 图），多设备无 MTP/DFlash 时默认开 |
+| `PF_LOAD_TIME=1` / `PF_DNNL_QCHK=1` | 启动/上传分期耗时 / 逐张量复算参考量化行（正确性诊断） |
 
 ---
 

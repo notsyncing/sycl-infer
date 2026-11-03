@@ -507,152 +507,90 @@ output is integer-equal to ONNXRuntime's on five real formula crops.
 * A `CumSum` is not a `Reduce`; an `If` branch may declare a constant as its
   output; and an operator inside a branch must not be skipped as "constant".
 
-## 7.4 The MinerU vision tower and two-step page extraction
+### 7.4 The MinerU vision tower and two-step page extraction
 
 The other document workload: MinerU2.5-Pro-2605-1.2B (`qwen2vl`: a Qwen2-VL
 dense decoder behind a 32-layer, 1280-wide vision tower with 80-wide heads),
 run as the two-step extraction (`mineru`).  Conditions: **one Arc A770 16 GB**,
-AOT Release (`acm-g10`), one 1036x1036 page
-(`layout_original_image_01.png`, 21 blocks), greedy, `--max-tokens 4096` per
-block, one process per rep, 2026-11-02.  The box is shared, so every cell is a
-quiet-window run (a concurrent GPU job time-slices the card and inflates a run
-up to 50x).
+AOT Release (`acm-g10`), clocks fixed at **2400 MHz**
+(`xpu-smi config -d 0 --standby never`), a quiet window, one 1036x1036 page
+(`layout_original_image_01.png`, 21 blocks), greedy, `--max-tokens 256` per
+block, one process per rep, 2026-11-02.  Warm page cache unless stated: a
+concurrent GPU job time-slices the card and inflates a run up to 50x.
 
-Page (one process, wall clock):
+| phase | warm |
+|---|---:|
+| startup + text model load | **1.65 s** |
+| layout vision encode (5476 patches -> 1369 tokens) | **2.49 s** |
+| - attention (32 layers) | 2.10 s |
+| - GEMM + other | 0.39 s |
+| layout text prefill (1394 prompt tokens) | **0.26 s** |
+| layout decode (463 tokens) | 3.16 s |
+| 21 content blocks (vision + text, summed) | **2.77 s** (vision 1.31, text 1.93) |
+| page text decode (676 tokens) | **4.60 s** (6.81 ms/token) |
+| **page wall** | **10.99 / 11.23 s** (11.08/11.12/11.28) |
+| cold file cache | **11.89 / 12.28 s** |
 
-| | before | after |
-|---|---:|---:|
-| layout vision encode (5476 patches -> 1369 tokens) | 50.5 s | **3.64 s** |
-| layout text prefill (1394 prompt tokens) | 1.92 s | **0.26 s** |
-| layout decode (463 tokens) | 3.28 s | 3.27 s |
-| 21 content blocks (vision + text, summed) | 52.9 s | **3.30 s** |
-| **whole page, wall (`/usr/bin/time`)** | **113.06 s** | **15.82 s** |
-
-The "before" arm is the same binary with `PF_VISION_DNNL=0
-PF_MM_BATCH_PREFILL=0`; both arms produce byte-identical output (md5
-`10eed240936226fd4696d943aaabc44b`, 21 blocks) and the same text-only
-generation as the reference tree.
-
-The layout image's vision stages (`PF_VISION_TIME=1`, one per-stage `q.wait()`,
-so the before column's waits are part of its total):
-
-| stage (32 layers, total) | before | after |
-|---|---:|---:|
-| patch embedding (kept on `vit_gemm`) | 26 ms | 23 ms |
-| qkv | 3 725 ms | **77 ms** |
-| attention | 11 237 ms | **3 262 ms** |
-| attn out | 4 733 ms | **49 ms** |
-| ffn up | 19 696 ms | **90 ms** |
-| ffn activation | 73 ms | 16 ms |
-| ffn down | 18 475 ms | **91 ms** |
-| merger (mm.0 / mm.2) | 682 ms | **2.5 ms** |
-| **vision total** | **58.7 s** | **3.64 s** |
-
-What moved it:
-
-* **The vision linears now run on the text model's oneDNN int8 matmul**
-  (`PF_VISION_DNNL`, default on for qwen2vl).  `vit_gemm` tiles M in 32-token
-  groups, so the layout image read every vision linear ~172 times; the oneDNN
-  matmul reads it once per <=1024-row chunk.  `dnnl_gemm::add_weight` now also
-  accepts F16/F32/BF16 sources (the mmproj stores the linears in those), and a
-  lazy mode skips the prefill primitive ladder: only the M shapes a page
-  actually asks for get a primitive.  Per-call fallback to `vit_gemm` for any
-  tensor the instance did not accept keeps a projector with an unsupported
-  shape running.
-* **The attention tile is `BQ=32, BK=32, WG=1024`** (16 heads x 80).  The
-  original 16/64/128 kernel left three quarters of each Xe core idle: 47.6 KiB
-  of SLM permits one workgroup per core, so the workgroup's warp count *is*
-  the occupancy.  Measured on the layout image (attention ms): 16/64/128
-  **10 473**, 16/32/512 4 658, 32/32/128 8 106, 32/32/256 4 563, 32/32/512
-  3 720, 64/16/512 3 335, **32/32/1024 3 263**.  The score dot also got four
-  independent accumulators (an 80-deep dependent FMA chain per score).
-* **The multimodal prefill uses the chunk-batched (mode 2) path**
-  (`PF_MM_BATCH_PREFILL`, default on): the image prompt's M-RoPE and `img_row`
-  maps are per token and indexed `[row*kMaxT + t]`, which is exactly the layout
-  `mm_write_step` produces for `n` tokens, so one forward can cover up to
-  `kMaxB*kMaxT` tokens (the pipelined two-GPU path alternates its two step_infos, so
-  it keeps mode 1).  The old loop ran one 32-token mode-1 chunk per forward (44
-  weight passes for the layout prompt).
-
-What the numbers say about the remaining time: the page is now
-`10.5 s` of per-image work (vision 4.9, text prefill 0.7, decode 4.8) plus
-`2.5 s` of engine load and `2.4 s` of mmproj load + int8 conversion.  Attention
-is 90% of the vision encoder and the layout step's 463-token decode is the
-other large block, so a further vision win would need a different attention
-algorithm (an int8 QK via oneDNN is the only one left with headroom) rather
-than a bigger tile.
+The output is the reference output at every step: page md5
+`10eed240936226fd4696d943aaabc44b`, 21 blocks; text-only `gen` md5
+`bfc55c543af1d1aecae5da0b1f9b99e5`; vision self-check cos 0.999104.  The
+per-stage numbers come from `PF_MINERU_TIME=1` (prep / vision / prefill /
+decode / total per image) and `PF_VISION_TIME=1` (a `q.wait()` per vision
+stage); both are diagnostics and the default path never waits there.
 
 Against llama.cpp's SYCL backend (`llama-mtmd-cli`, same page/prompt/model,
 2026-11-02).  That build has **no `llama-server`**, so the pipeline runs one
 process per image, and each process pays ~7.3 s of model+mmproj init and ~6 s
 of SYCL JIT (its persistent JIT cache SIGSEGVs on this driver: verified, three
-runs, all `SIGSEGV`).  Measured:
+runs, all `SIGSEGV`):
 
 | | this engine | llama.cpp |
 |---|---:|---:|
-| layout step, one layout-only process (wall) | **13.2 s** | 28.2 s |
-| the same, each process's model load removed | **7.2 s** | 20.9 s |
-| whole page, 21 blocks (wall, one process vs 22) | **15.75 s** | 398.2 s |
+| layout step, one layout-only process (wall) | **9.03 s** (8.91/9.15) | 28.2 s |
+| the same, each process's model load removed | **~7.4 s** | 20.9 s |
+| whole page, 21 blocks (wall, one process vs 22) | **11.0 s** | 398.2 s |
 
-So the like-for-like single-request ratio is **2.1x** as run (2.9x excluding
-the model load each engine pays), and the full-page ratio is **25x** - the page
-gap is dominated by the CLI's per-image init/JIT, not by its kernels.  Quote
-the layout-step figure when a conservative number is wanted.
-
-**Second pass, later the same day: 15.8 s -> 11.0 s.**  The box was fixed at
-2400 MHz (`xpu-smi config -d 0 --standby never`), one process per rep, quiet
-window.  Warm page cache unless stated:
-
-| | 15.8 s arm | final |
-|---|---:|---:|
-| startup + text model load | 2.68 s | **1.65 s** |
-| layout vision | 3.65 s | **2.49 s** |
-| - attention (32 layers) | 3.26 s | **2.10 s** |
-| layout text prefill | 0.26 s | 0.26 s |
-| layout decode (463 tok) | 3.27 s | 3.16 s |
-| 21 content blocks (vision + text) | 3.30 s | **2.77 s** (vision 1.31, text 1.93) |
-| text decode, page (676 tok) | 4.97 s | **4.60 s** (6.81 ms/tok) |
-| **page wall** | **15.8 s** | **10.99 / 11.23 s** (11.08/11.12/11.28) |
-| cold file cache | 13.6 s | **11.89 / 12.28 s** |
-
-Output is byte-identical throughout (21 blocks, md5
-`10eed240936226fd4696d943aaabc44b`; text-only `gen` md5
-`bfc55c543af1d1aecae5da0b1f9b99e5`; vision self-check cos 0.999104).  The
-attention ILP kernel (`RQ2/RQP2`, `BQ=48 BK=32 WG=1024`, SG16, vectorized K/V
-staging) keeps the per-score summation order; the decode fused
-quantize+whole-call GEMV reproduces `act_quant_grp_launch` + `i8_grp_gemv_impl`
-exactly; the load changes (lazy text primitives, compact 3.7 MB mmproj blob,
-deferred q/k/v f32 relayout, vectorized quantizer, async pinned staging, CPU
-tied-embedding copy) all produce the same weights (`PF_DNNL_QCHK=1`: 287/287
-tensors, 0 mismatches).
+So the like-for-like single-request ratio is **3.1x** as run (2.8x excluding
+the model load each engine pays).  The llama.cpp cells were measured once (its
+binary and per-process init/JIT are unchanged by the engine's later passes);
+the full-page ratio is dominated by the CLI's per-image init/JIT, not by its
+kernels - quote the layout-step figure (2.8-3.1x) whenever a conservative
+number is wanted.
 
 **Where the remaining time is, and the ceiling.**  The per-phase floor with the
 current exact-order math is about **5.0 s one-shot** (load ~1.0, attention
 0.87 traffic / 0.55 compute, decode 0.9-1.5, vision GEMM 0.75, prefill 0.12,
-content ~0.5), or ~3.7 s with the process reused.  The measured 11 s is close
-to the **bit-exact** ceiling; the gap to 5 s needs numerical reordering or
-batching:
+content ~0.5), or ~3.7 s with the process reused.  The measured 11 s is the
+**bit-exact** ceiling; the gap to 5 s needs numerical reordering or batching:
 
 * **decode 4.60 s vs 0.9-1.5 s floor**: 676 tokens x 0.52 GB/token at 76-88
   GB/s.  The narrow N=896 projections expose ~896 warps (~112 of 512 EUs),
   which is the shape's ceiling; split-K/reordered reductions change the token
   stream, and oneDNN M=1 cannot enter the recorded decode graph.
-* **attention 2.10 s vs 0.87 s traffic floor**: exact-order ceiling.  f32
-  oneDNN QK/PV reaches 1.59 s but is not the reference summation order (an
-  earlier build flipped one bbox digit and runs were not deterministic), and
-  int8 oneDNN QK/PV (1.38 s) changed the page md5 and was nondeterministic;
-  both stay opt-in/off.
+* **attention 2.10 s vs 0.87 s traffic floor**: the exact-order ceiling.  f32
+  oneDNN QK/PV reaches 1.59 s but is not the reference summation order and is
+  run-to-run nondeterministic; a block-level check found identical content on
+  the layout page (1/5 runs moved one text box by 0.001) but **different image
+  captions and recognized text on the table page** (e.g. `2020年/2021年` vs
+  `29/2020`, `铜箔/HM9000` vs `钢带/HMMHPL`, 2-5 of 14 blocks across runs).
+  int8 oneDNN QK/PV (1.38 s) changed the page md5 and was nondeterministic.
+  Both stay opt-in/off.
 * **content vision 1.31 s**: 21 different small M shapes each create their own
   oneDNN primitives; batching the crops or an M-bucket ladder is the next
   bit-exact step, worth ~0.5-1 s.
-* **load 1.65 s vs ~1.0 s**: the remaining int8 conversion (~0.85 s total);
-  a preconverted cache was rejected (unversioned key surface / wrong-output
-  risk).
+* **load 1.65 s vs ~1.0 s**: the remaining int8 conversion (~0.85 s total); a
+  preconverted cache was rejected (unversioned key surface / wrong-output
+  risk).  `PF_I8_SPLITK` (split-K for the narrow int8 decode GEMV) is off: it
+  was bit-exact on both tested pages (2/2 each) but is not guaranteed by
+  construction.  `i8_grp_gemv_rows_multi` was rejected for this
+  page: its 1-ulp difference from the single-call GEMV changes the stream.
 
-New knobs for this pass: `PF_VIT_ATTN=70` (ILP default; 0 = 32/32/512 fallback,
-71/72/73/76 = other ILP shapes, 51 = f32 oneDNN opt-in), `PF_DNNL_LAZY`,
-`PF_VISION_COMPACT`, `PF_VISION_DEFER_QKV`, `PF_LOAD_TIME`, `PF_DNNL_QCHK`,
-`PF_I8_SPLITK` (off).
+New knobs for this path: `PF_VIT_ATTN=70` (ILP default; 0 = the 32/32/512
+fallback, 71/72/73/76 = the other ILP shapes, 51 = f32 oneDNN opt-in),
+`PF_DNNL_LAZY`, `PF_VISION_COMPACT`, `PF_VISION_DEFER_QKV`, `PF_LOAD_TIME`,
+`PF_DNNL_QCHK`, `PF_I8_SPLITK` (off).  The history of how the page reached
+this point, including the rejected and opt-in paths, is in
+[`design/21-mineru-qwen2vl.md`](design/21-mineru-qwen2vl.md).
 
 ## 8. What the curves mean
 
