@@ -856,8 +856,10 @@ at its M=1 floor (3559.9 MB/token in 13.40 ms = 266 GB/s, LM head 364 GB/s =
 load-shape ceiling rather than a bandwidth one.  The x8 card's pinned H2D is
 **5.186 GB/s** against a 6.00 GB/s 64-byte-completion ceiling - a protocol limit
 (MaxPayload 128 is a hardware cap and the root complex's RCB is 64 B), not an
-engine defect.  The only remaining large change is a byte-neutral 256-value
-superblock repack of the Q5_1 down plane (§9.1).
+engine defect.  The candidate large change - a byte-neutral 128-value panel
+repack of the Q5_1 down plane - was implemented and measured: it is
+bit-identical and **slower** (0.1797 -> 0.2073 ms/layer), because bit-identity
+pins the 4-byte-per-lane `qs` load shape; §9.1 has the numbers.
 
 
 ### 7.3 Depth cells re-baselined, and the one-card experiment (2026-11-01)
@@ -1012,9 +1014,30 @@ The full knob list (including the `PF_QSA_*` dumps) is in
   contiguous `qs` per instruction; Q5_1's 16-byte `qs` per block either needs 8
   lanes with duplicate words (SG8) or a 20/32-lane gather (one-lane).  The slot
   scatter is a no-op (73.8 adjacent = spread), the down-plane DMA wait is 3 %
-  of the composite `dn`, and the ratio is preserved AOT vs JIT.  **The only
-  route to the grouped kernel's rate is a byte-neutral 256-value-superblock
-  repack of the down plane**, not a different 4-bit store.
+  of the composite `dn`, and the ratio is preserved AOT vs JIT.
+* **The byte-neutral 128-value panel repack was implemented, is bit-exact, and
+  is SLOWER (`PF_Q4_Q5SB`, default off; measured 2026-11-03).**  The hypothesis
+  above - that a superblock repack would reach the grouped kernel's rate - was
+  tested rather than assumed.  `q5_1_sb_pack` rewrites each 640-wide down row
+  (20 x 24 B blocks) into 5 x 96 B panels (qs[64] in the Q4_K split-half nibble
+  order, qh[16], meta[16]) and `moe_down_q5_1_sb_launch` reads it with the
+  *same* lane/group/pair map and FMA order.  It is byte-neutral (0.75 B/w, no
+  extra GiB), the 43 repacked layers cost 25.2 GiB and 3.4-4.1 s of startup,
+  and the result is **bit-identical**: 96 greedy steps produced the same text
+  md5 and the same per-step `PF_DUMP_DEC_LOGITS` md5, `PF_Q4_Q5NPB` 1 and 8 are
+  identical, and prefill is unchanged (70.35 vs 70.51 s on the 3.2 k-token
+  prompt).  **But the down kernel is 0.1797 -> 0.2073 ms/layer (median, 4 128
+  samples/layer), i.e. ~70 -> ~61 GB/s.**  The repack cannot change the `qs`
+  issue shape: bit-identity fixes one 32-value group per lane and 4 B of `qs`
+  per load, so the warp still issues the same four 4-byte loads per group
+  slice; what does change is `qh`/`meta`, which the 24-byte block layout served
+  as per-block broadcasts and the panel serves as wider, repeatedly-read
+  slices.  The form that actually reaches ~100 GB/s is the 16-byte-per-lane
+  `moe_row_gemv_impl` (measured 56 -> 100 GB/s), and that necessarily changes
+  the reduction/decomposition - not bit-identical.  So the repack is kept as
+  the opt-in A/B (`PF_Q4_Q5SB=1`; default 0, `--q4-tail-skip` and the bank
+  budget remain the levers), and **the earlier "only route" claim above is
+  superseded**.
 * **The shared expert must stay on oneDNN at M=1.**  Replacing its three Q8_0
   matmuls with the raw GEMV loses **1.3-1.8 ms/token**: oneDNN is already at
   86-88 GiB/s at this shape, the raw gate/up matches it (91) but the swiglu

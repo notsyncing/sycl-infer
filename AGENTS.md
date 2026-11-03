@@ -2360,6 +2360,23 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
   The down-plane DMA wait is 0.0065 ms of the 0.2 ms composite `dn` (3%), and
   the slot scatter is a no-op for this kernel (73.8 GB/s adjacent and spread
   alike), so neither explains the gap.
+* **The byte-neutral 128-value panel repack does NOT move the Q5_1 down
+  (`PF_Q4_Q5SB`, default off; measured 2026-11-03).**  `q5_1_sb_pack` rewrites
+  each 640-wide down row (20 x 24 B Q5_1 blocks) into 5 x 96 B panels - qs[64]
+  as the Q4_K split-half nibble plane, qh[16], meta[16] - and
+  `moe_down_q5_1_sb_launch` reads it with the same lane/group/pair map and FMA
+  order.  It is byte-neutral (0.75 B/weight, no extra GiB), bit-identical (96
+  greedy steps: text md5 and every per-step `PF_DUMP_DEC_LOGITS` md5 equal;
+  `PF_Q4_Q5NPB` 1 and 8 also identical), the 43 layers repack in 3.4-4.1 s
+  (25.2 GiB) and prefill is unchanged (70.35 vs 70.51 s on the 3.2 k-token
+  prompt).  **And it is slower: 0.1797 -> 0.2073 ms/layer (median, 4 128
+  samples/layer; ~70 -> ~61 GB/s).**  The reason is the lane map: bit-identity
+  fixes one group per lane with 4 B of qs per load, so the repack cannot change
+  the qs issue shape; it only makes the qh/meta reads wider while the old
+  24-byte block layout served them as per-block broadcasts.  The 16-B-per-lane
+  form that does reach ~100 GB/s (`moe_row_gemv_impl`, measured 56 -> 100
+  GB/s) changes the reduction/decomposition and is not bit-identical.  Do not
+  re-derive this; `--q4-tail-skip`/bank tuning are the levers that remain.
 * **The dense (non-expert) part is at its M=1 floor, and the store is not u4.**
   `rep.raw_gemv_decode` on qwen4exp means there is **no u4/k5/cb4 store at all**:
   every dense linear is read in its raw GGUF type at M=1, and they are Q8_0

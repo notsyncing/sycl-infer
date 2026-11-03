@@ -209,6 +209,9 @@ void cpu_q4_silu_scaled(float * x, int n, float scale);
 // Convert one routed-expert down tensor to the symmetric int8 store above.
 void cpu_q4_convert_down(const void * src, uint32_t type, int K, int N, int E, size_t plane_bytes, uint8_t * dst,
                          float * sc);
+// Byte-neutral Q5_1 -> 128-value panel repack for a routed down plane (K must
+// be a whole number of 128-value panels).  Same bytes per row as Q5_1.
+void q5_1_sb_pack(const void * src, int K, int N, int E, void * dst);
 // Grouped down projection: P pairs of one expert, weights read once per
 // 64-pair tile.  `pairs` maps a local pair to the caller's acc row.
 void cpu_q4_down_grouped(const uint8_t * w, const float * sc, const int8_t * x8, const float * xmeta,

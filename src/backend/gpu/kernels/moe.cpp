@@ -2387,6 +2387,144 @@ static void moe_down_q5_1_impl(queue & q, const char * dbank, const int32_t * sl
 }
 
 // ---------------------------------------------------------------------------
+// Q5_1 down on the 128-value panel repack (`q5_1_sb_pack`, PF_Q4_Q5SB).
+//
+// The same work decomposition, lane/group/pair map and FMA order as the SG=8
+// Q5_1 kernel above; only the block decode changes.  A panel covers four
+// consecutive 32-value groups in 96 B (64 qs + 16 qh + 16 meta), byte-identical
+// to four Q5_1 blocks, and a lane's uint32 at qs + 32p + 4*ch carries both
+// groups of a pair (low nibble = even group, high = odd), so the warp reads the
+// plane as 32 B contiguous per instruction instead of 16 B per block.  The
+// panel is `gr>>2`, the pair `(gr>>1)&1`, the group-in-pair `gr&3`; the f16
+// d/m bits are copied raw by the host pack, so the arithmetic is bit-identical
+// to `moe_down_q5_1_impl` (verified by PF_DUMP_DEC_LOGITS).
+// ---------------------------------------------------------------------------
+template <int NPB>
+static void moe_down_q5_1_sb_impl(queue & q, const char * dbank, const int32_t * slot_map, size_t slot_db,
+                                  const int32_t * off, const int32_t * pair, const int32_t * active,
+                                  const int32_t * n_active, int n_act_max, const int8_t * xq, const uint16_t * asa,
+                                  const float * xs, float * acc, int acc_stride, int n_embd, int n_ff_exp) {
+    constexpr int SG = 8;   // lanes per 32-value group: 8 x 4 values
+    constexpr int GSL = 4;  // group slices per warp (SG * GSL == 32 lanes)
+    constexpr int NGL = 5;  // groups per lane per pass: 20 = K/32 for this model
+    const int ng = n_ff_exp / 32;
+    if (ng <= 0 || (ng % 4) != 0) {
+        return; // the repack only exists for whole 128-value panels
+    }
+    const size_t row_bytes = (size_t)(ng / 4) * 96;
+    const int nrb = (n_embd + NPB - 1) / NPB;
+    const int nw = n_act_max * nrb;
+    if (nw <= 0) {
+        return;
+    }
+    q.parallel_for(nd_range<1>(moe_grid((size_t)nw * 32), kMoEWG),
+                   [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int lid = (int)it.get_local_id(0);
+        const int sg = lid / 32;
+        const int lane = lid % 32;
+        const sub_group sgg = it.get_sub_group();
+        const int w = (int)it.get_group(0) * kMoENW + sg; // global warp id
+        if (w >= nw) {
+            return;
+        }
+        const int ia = w / nrb;
+        const int nb = w % nrb;
+        if (ia >= n_active[0]) {
+            return;
+        }
+        const int e = active[ia];
+        const int slot = slot_map[e];
+        if (slot < 0) {
+            return; // host-resident expert: the host computes it
+        }
+        const int b0 = off[e], b1 = off[e + 1];
+        const int gs = lane / SG; // which group slice this lane owns
+        const int ch = lane % SG; // the lane's four-value chunk inside a group
+        const char * base = dbank + (size_t)slot * slot_db;
+        // Panel/pair/sub for group gr = g0 + gs + GSL*j: g0 is a multiple of 4
+        // and gs < GSL == 4, so the low two bits of gr are `gs`.  The offsets
+        // are therefore per-lane invariants the compiler can hoist out of the
+        // unrolled j loop:
+        //   panel = (gr>>2) = g0/4 + j, pair = (gr>>1)&1 = gs>>1,
+        //   sub   = gr&3   = gs.
+        const int qs_lane = 32 * (gs >> 1) + 4 * ch; // uint32 in the pair's qs
+        const int qh_lane = 64 + 2 * ch;             // uint16 of high bits
+        const int me_lane = 80 + 4 * gs;             // uint32 {f16 d, f16 m}
+        const uint32_t qh_sh = 4u * (uint32_t)gs;
+        const uint32_t nib_sh = (uint32_t)(gs & 1) * 4u; // odd group = high nibble
+        for (int rr = 0; rr < NPB; rr++) {
+            const int n = nb * NPB + rr;
+            if (n >= n_embd) {
+                break;
+            }
+            const char * dr = base + (size_t)n * row_bytes;
+            for (int g0 = 0; g0 < ng; g0 += GSL * NGL) {
+                const char * dr0 = dr + (size_t)(g0 / GSL) * 96;
+                // Decode this pass's groups once, into registers.  A panel is
+                // compile-time-offset inside the unrolled loop, which is what
+                // keeps these arrays in registers instead of scratch.
+                uint32_t wq[NGL];
+                float wd[NGL], wm[NGL];
+#pragma unroll
+                for (int j = 0; j < NGL; j++) {
+                    const int gr = g0 + gs + GSL * j;
+                    wq[j] = 0u;
+                    wd[j] = 0.f;
+                    wm[j] = 0.f;
+                    if (gr < ng) {
+                        const char * pb = dr0 + (size_t)j * 96;
+                        const uint32_t v = *reinterpret_cast<const uint32_t *>(pb + qs_lane);
+                        // The panel stores the pair's even group in the low
+                        // nibble and the odd group in the high one.
+                        const uint32_t nib = (v >> nib_sh) & 0x0F0F0F0Fu;
+                        const uint16_t hw = *reinterpret_cast<const uint16_t *>(pb + qh_lane);
+                        const uint32_t hb = (uint32_t)(hw >> qh_sh) & 0xFu;
+                        const uint32_t hi = ((hb & 1u) << 4) | ((hb & 2u) << 11) | ((hb & 4u) << 18) |
+                                            ((hb & 8u) << 25);
+                        wq[j] = nib | hi;
+                        const uint32_t meta = *reinterpret_cast<const uint32_t *>(pb + me_lane);
+                        wd[j] = fast_h2f((uint16_t)(meta & 0xFFFFu));
+                        wm[j] = fast_h2f((uint16_t)(meta >> 16));
+                    }
+                }
+                for (int i0 = b0; i0 < b1; i0++) {
+                    const int pr = pair[i0];
+                    const int8_t * xr = xq + (size_t)pr * (size_t)n_ff_exp;
+                    const uint16_t * ar = asa + (size_t)pr * (size_t)ng;
+                    const float * sr = xs + (size_t)pr * (size_t)ng;
+                    float a = 0.f;
+#pragma unroll
+                    for (int j = 0; j < NGL; j++) {
+                        const int gr = g0 + gs + GSL * j;
+                        if (gr < ng) {
+                            const uint32_t xa =
+                                *reinterpret_cast<const uint32_t *>(xr + (size_t)gr * 32 + (size_t)ch * 4);
+                            const int32_t qd = dp4a_s8u8(xa, wq[j], 0);
+                            const float A = fast_h2f(ar[gr]);
+                            a = sycl::fma(A * wd[j], (float)qd, a);
+                            // One lane per group carries the +m zero point, so
+                            // the warp reduction sums it exactly once.
+                            if (ch == 0) {
+                                a = sycl::fma(A * wm[j], sr[gr], a);
+                            }
+                        }
+                    }
+                    // every lane must enter the collective
+                    const float v = sg_sum(a, sgg);
+                    if (lane == 0) {
+                        if (g0 == 0) {
+                            acc[(size_t)pr * (size_t)acc_stride + n] = v;
+                        } else {
+                            acc[(size_t)pr * (size_t)acc_stride + n] += v;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // One lane per 32-value group (`PF_Q4_Q5_LANE=1`).
 //
 // WHY.  The SG=8 kernel above splits a block across eight lanes, so the warp
@@ -2580,6 +2718,31 @@ void moe_down_q5_1_launch(queue & q, const void * dbank, const int32_t * slot_ma
     } else {
         moe_down_q5_1_impl<1>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max, xq,
                               asa, xs, acc, acc_stride, n_embd, n_ff_exp);
+    }
+}
+
+// The same contract on the 128-value panel repack (`q5_1_sb_pack`).  The bank
+// plane the caller passes holds the repacked bytes, so only a layer the host
+// actually repacked may take this entry point.
+void moe_down_q5_1_sb_launch(queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                             const int32_t * off, const int32_t * pair, const int32_t * active,
+                             const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
+                             const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                             int n_ff_exp) {
+    (void)n_expert;
+    if (n_pairs <= 0 || n_embd <= 0 || (n_ff_exp % 128) != 0) {
+        return;
+    }
+    // NPB is the same A/B knob as the raw Q5_1 kernel (PF_Q4_Q5NPB, default 1).
+    // Both orientations are arithmetic-identical, so the shipped NPB=1 and the
+    // old NPB=8 stay instantiated for the comparison.
+    static const int npb = si::env::i32("PF_Q4_Q5NPB", 1);
+    if (npb == 8) {
+        moe_down_q5_1_sb_impl<8>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max,
+                                 xq, asa, xs, acc, acc_stride, n_embd, n_ff_exp);
+    } else {
+        moe_down_q5_1_sb_impl<1>(q, (const char *)dbank, slot_map, slot_db, off, pair, active, n_active, n_act_max,
+                                 xq, asa, xs, acc, acc_stride, n_embd, n_ff_exp);
     }
 }
 

@@ -662,6 +662,13 @@ void moe_down_q5_1_launch(sycl::queue & q, const void * dbank, const int32_t * s
                           const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
                           const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
                           int n_ff_exp);
+// The same projection on the byte-neutral 128-value panel repack of the down
+// plane (PF_Q4_Q5SB); bit-identical to the Q5_1 kernel above.
+void moe_down_q5_1_sb_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
+                             const int32_t * off, const int32_t * pair, const int32_t * active,
+                             const int32_t * n_active, int n_act_max, int n_expert, int n_pairs, const int8_t * xq,
+                             const uint16_t * asa, const float * xs, float * acc, int acc_stride, int n_embd,
+                             int n_ff_exp);
 // Native Q8_0 down: 34-byte blocks (f16 d + 32 int8), same contract; the
 // signed weights are biased by 128 inside dp4a and the activation group sum
 // removes the bias.  Used by the Q4_K/Q8_0-down layers 4, 30, 46 and 47.

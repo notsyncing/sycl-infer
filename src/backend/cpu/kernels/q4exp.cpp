@@ -209,6 +209,86 @@ void cpu_q4_convert_down(const void * src, uint32_t type, int K, int N, int E, s
     });
 }
 
+// Q5_1 -> 128-value panel repack for the routed down plane.
+//
+// WHY.  A Q5_1 block is 24 B per 32 values (d, m, a 4-byte high-bit plane and a
+// 16-byte nibble plane), so an SG=8 kernel has to issue four loads per 24 B and
+// the warp covers only four blocks per instruction group.  Re-laying the plane
+// out as 128-value panels - which is the Q4_K superblock width the grouped
+// gate/up and down kernels already stream well - lets a lane's four values of
+// a group pair come from one naturally-aligned uint32, one uint16 of high bits
+// and one uint32 of meta: the same 96 B per panel as four Q5_1 blocks, so the
+// plane stays byte-identical in size (0.75 B/weight, no extra GiB).
+//
+// Panel = 4 consecutive 32-value groups:
+//   qs[64]  : group pair p at qs + 32p; byte j is the low nibble of the even
+//             group's element j and the high nibble of the odd group's, so a
+//             lane reads uint32 at qs + 32p + 4*ch and gets both groups' four
+//             values (low = even, high = odd).
+//   qh[16]  : 8 uint16, lane ch reads qh + 2ch; its four bits per group are at
+//             bit 4*sub, where sub = gr&3, and cover elements 4ch..4ch+3.
+//   meta[16]: 4 x {f16 d, f16 m} at meta + 4*sub, read as one uint32.
+// The raw f16 bits are copied, not converted: this is a repack, not a
+// quantization.
+void q5_1_sb_pack(const void * src, int K, int N, int E, void * dst) {
+    const int ng = K / 32;
+    if (ng <= 0 || (ng % 4) != 0) {
+        return; // only whole 128-value panels; the caller gates on this too
+    }
+    const size_t row_bytes = (size_t)ng * sizeof(block_q5_1);
+    const int npan = ng / 4;
+    constexpr size_t kPanel = 96; // 64 qs + 16 qh + 16 meta
+    const uint8_t * s = (const uint8_t *)src;
+    uint8_t * d = (uint8_t *)dst;
+    // A row is only 480 B, so one row per pool task is ~56M tasks per startup
+    // and the pool's shared atomic cursor dominates (measured 23.7 s for the
+    // 25.2 GiB).  Chunk rows instead: the work is a linear copy either way and
+    // one task per 256 rows keeps the atomic count in the thousands.
+    const int total = E * N;
+    constexpr int kRowsPerTask = 256;
+    const int ntasks = (total + kRowsPerTask - 1) / kRowsPerTask;
+    par(ntasks, [&](int t) {
+        const int j0 = t * kRowsPerTask;
+        const int j1 = std::min(total, j0 + kRowsPerTask);
+        for (int j = j0; j < j1; j++) {
+        // plane_bytes == N * row_bytes for every routed expert tensor, so one
+        // contiguous index addresses (expert, row).
+        const uint8_t * sr = s + (size_t)j * row_bytes;
+        uint8_t * dr = d + (size_t)j * row_bytes;
+        for (int pn = 0; pn < npan; pn++) {
+            const uint8_t * sp = sr + (size_t)pn * 4 * sizeof(block_q5_1);
+            uint8_t * dp = dr + (size_t)pn * kPanel;
+            uint8_t * dqs = dp;      // [64]
+            uint8_t * dqh = dp + 64; // [16]
+            uint8_t * dme = dp + 80; // [16]
+            for (int p = 0; p < 2; p++) {
+                const auto * be = (const block_q5_1 *)(sp + (size_t)(2 * p) * sizeof(block_q5_1));
+                const auto * bo = (const block_q5_1 *)(sp + (size_t)(2 * p + 1) * sizeof(block_q5_1));
+                for (int i = 0; i < 32; i++) {
+                    const int ev = i < 16 ? (be->qs[i] & 0xF) : ((be->qs[i - 16] >> 4) & 0xF);
+                    const int ov = i < 16 ? (bo->qs[i] & 0xF) : ((bo->qs[i - 16] >> 4) & 0xF);
+                    dqs[32 * p + i] = (uint8_t)(ev | (ov << 4));
+                }
+            }
+            uint16_t qh[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int sub = 0; sub < 4; sub++) {
+                const auto * b = (const block_q5_1 *)(sp + (size_t)sub * sizeof(block_q5_1));
+                uint32_t q = 0;
+                std::memcpy(&q, b->qh, 4);
+                for (int i = 0; i < 32; i++) {
+                    if ((q >> i) & 1u) {
+                        qh[i >> 2] |= (uint16_t)(1u << (4 * sub + (i & 3)));
+                    }
+                }
+                std::memcpy(dme + 4 * sub, &b->d, 2);
+                std::memcpy(dme + 4 * sub + 2, &b->m, 2);
+            }
+            std::memcpy(dqh, qh, sizeof(qh));
+        }
+        }
+    });
+}
+
 void cpu_q4_down_grouped(const uint8_t * w, const float * sc, const int8_t * x8, const float * xmeta,
                          const int32_t * xsumq, int xTB, int P, int N, int K, float * acc, int acc_stride,
                          const int * pairs) {

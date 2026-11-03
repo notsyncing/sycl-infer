@@ -691,6 +691,24 @@ void engine::q4_alloc_banks() {
         // pinned host memory lets the copy engine read the expert plane
         // directly; PF_Q4_PIN_SRC=0 restores the staging path for the A/B.
         static const bool pin_src = si::env::i32("PF_Q4_PIN_SRC", 1) != 0;
+        // Byte-neutral Q5_1 -> 128-value panel repack of the down plane.  The
+        // pinned host source is the only place the bytes exist before the H2D,
+        // so the pack replaces that memcpy in place; it needs the pinned source
+        // (the staging path copies straight from the mmap) and must be off
+        // while PF_Q4_CPU_MISS reads the raw plane.  PF_Q4_Q5SB=0 keeps the
+        // mmap bytes and the old kernel (the A/B in one binary).  Default OFF:
+        // the repack is byte-neutral and bit-identical, but it does not move the
+        // kernel's rate (see docs/design/18-qwen4exp.md §9.1), so it stays an
+        // opt-in experiment rather than paying its startup cost by default.
+        static const bool q5sb_on = si::env::i32("PF_Q4_Q5SB", 0) != 0;
+        static const int q5sb_cmiss = si::env::i32("PF_Q4_CPU_MISS", 0);
+        const bool q5sb_ok = q5sb_on && pin_src && q5sb_cmiss == 0;
+        int q5sb_layers = 0;
+        size_t q5sb_bytes = 0;
+        double q5sb_s = 0.0;
+        if (q5sb_on && !q5sb_ok) {
+            fprintf(stderr, "[q4] q5_1 down repack: disabled (needs PF_Q4_PIN_SRC=1 and PF_Q4_CPU_MISS=0)\n");
+        }
         size_t pin_bytes = 0;
         int pin_layers = 0;
         sycl::queue & pin_q = q;
@@ -736,7 +754,16 @@ void engine::q4_alloc_banks() {
                 if (b.hg && b.hu && b.hd) {
                     std::memcpy(b.hg, L.moe.gate_exps.data, (size_t)E * gb);
                     std::memcpy(b.hu, L.moe.up_exps.data, (size_t)E * ub);
-                    std::memcpy(b.hd, L.moe.down_exps.data, (size_t)E * db);
+                    if (q5sb_ok && L.moe.down_exps.type == 7 && (L.moe.down_exps.K % 128) == 0) {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        q5_1_sb_pack(L.moe.down_exps.data, L.moe.down_exps.K, L.moe.down_exps.N, E, b.hd);
+                        q5sb_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        b.q5sb = true;
+                        q5sb_layers++;
+                        q5sb_bytes += (size_t)E * db;
+                    } else {
+                        std::memcpy(b.hd, L.moe.down_exps.data, (size_t)E * db);
+                    }
                     q4_pin_src_.push_back({b.hg, dev});
                     q4_pin_src_.push_back({b.hu, dev});
                     q4_pin_src_.push_back({b.hd, dev});
@@ -772,6 +799,10 @@ void engine::q4_alloc_banks() {
         if (pin_src) {
             fprintf(stderr, "[q4] pinned expert source: %d layers, %.1f GiB (direct H2D, no staging memcpy)\n",
                     pin_layers, (double)pin_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        if (q5sb_layers > 0) {
+            fprintf(stderr, "[q4] q5_1 down repack: %d layers, %.1f GiB in %.2f s\n", q5sb_layers,
+                    (double)q5sb_bytes / (1024.0 * 1024.0 * 1024.0), q5sb_s);
         }
         size_t max_plane = 0;
         for (int il = 0; il < hp.n_layer; il++) {
@@ -945,7 +976,11 @@ void engine::q4_alloc_banks() {
                     L.moe.gate_exps.type, L.moe.up_exps.type, L.moe.down_exps.type);
             chk("g", b.g, L.moe.gate_exps.data, bg);
             chk("u", b.u, L.moe.up_exps.data, bu);
-            chk("d", b.d, L.moe.down_exps.data, bd);
+            // A repacked layer's device down plane is the panel layout, not the
+            // mmap's raw Q5_1 blocks; this bank path does not repack today, so
+            // b.hd is null and the mmap is the source, but keep the comparison
+            // honest if that changes.
+            chk("d", b.d, b.q5sb ? (const void *)b.hd : (const void *)L.moe.down_exps.data, bd);
         }
         used[(size_t)dev] += need;
         total += need;
@@ -2767,7 +2802,11 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         };
                         one(bg, (const char *)bank->g, (const char *)L.moe.gate_exps.data, bank->sg);
                         one(bu, (const char *)bank->u, (const char *)L.moe.up_exps.data, bank->su);
-                        one(bd, (const char *)bank->d, (const char *)L.moe.down_exps.data, bank->sd);
+                        // The down source is the pinned plane when it exists:
+                        // a repacked layer's device run is the repack, not the
+                        // mmap's raw Q5_1 blocks, and the verifier has to
+                        // compare against what was uploaded.
+                        one(bd, (const char *)bank->d, dsrc, bank->sd);
                     }
                     fprintf(stderr, "[q4hotchk] il=%d act=%zu bad=%d/%d/%d\n", il, act.size(), bg, bu, bd);
                 }
@@ -2802,6 +2841,11 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             const int n_act = two_pass ? std::min(hp.n_expert, (int)act.size()) : std::min(hp.n_expert, np);
             const bool dec = (mode == 0);
             const bool grp_off = si::env::flag("PF_Q4_NOGRP") || si::env::flag("PF_Q4_NOGRP_DOWN");
+            // The panel repack is a per-layer property (bank->q5sb); PF_Q4_Q5SB=0
+            // selects the raw Q5_1 kernel for the A/B in the same binary.
+            // Default off (see the startup gate): the repack does not pay for
+            // itself on this shape.
+            static const bool q5sb_kernel = si::env::i32("PF_Q4_Q5SB", 0) != 0;
             auto gate_up = [&](const int32_t *smap) {
                 bool ok = false;
                 if (!si::env::flag("PF_Q4_NOGRP") && !si::env::flag("PF_Q4_NOGRP_UP")) {
@@ -2827,9 +2871,18 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     // K = n_ff_exp = 640 and the down used to fall through to
                     // the fp32-lane dequant kernel - the one projection of the
                     // bank that was not on dp4a.  `PF_Q4_NOGRP_DOWN=1` is the
-                    // A/B back to that path.
-                    moe_down_q5_1_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
-                                         hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd, hp.n_ff_exp);
+                    // A/B back to that path.  A layer whose pinned source was
+                    // repacked into the 128-value panel format takes the same
+                    // kernel on that layout; the arithmetic is identical.
+                    if (q5sb_kernel && bank->q5sb) {
+                        moe_down_q5_1_sb_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
+                                                hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd,
+                                                hp.n_ff_exp);
+                    } else {
+                        moe_down_q5_1_launch(qd, bank->d, smap, bank->sd, A.off, A.pair, A.active, A.nact, n_act,
+                                             hp.n_expert, np, A.xq, A.asa, A.xs, A.acc, n_embd, n_embd,
+                                             hp.n_ff_exp);
+                    }
                     okd = true;
                 } else if (L.moe.down_exps.type == 8 && !grp_off) {
                     // Q8_0's 34-byte block is one 32-value group, like Q5_1 but

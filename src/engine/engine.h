@@ -734,6 +734,7 @@ struct engine {
         void * hg = nullptr;     // pinned host copy of this layer's expert planes
         void * hu = nullptr;
         void * hd = nullptr;
+        bool q5sb = false;       // hd holds the 128-value Q5_1 down panel repack
     };
     std::vector<q4_bank_t> q4_bank_layer_;
     std::vector<void *> q4_host_usm_; // pinned expert mirrors, freed with sycl::free
