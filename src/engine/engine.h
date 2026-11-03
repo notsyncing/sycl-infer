@@ -465,7 +465,18 @@ struct engine {
         // tiles (gate at +0, up at +64*N floats) for a prefill; `gather` is the
         // [64][n_embd] f32 activation tile the prefill GEMM reads.
         float * gu = nullptr;
+        float * g2 = nullptr;        // prefill up projection, CSR order (gate is in `gu`)
+        int32_t * pos = nullptr;     // pair id -> CSR position (inverse of `pair`)
         float * gather = nullptr;
+        // One copy of the layer's quantized activation in CSR (pair) order, so
+        // each expert's rows are contiguous and the oneDNN expert GEMMs can
+        // bind them directly instead of running a gather kernel per tile.
+        // Sized for P pair rows of n_embd (the larger of the gate/up and down
+        // shapes), plus the last tile's padding.
+        int8_t * csr_xq = nullptr;
+        uint16_t * csr_asa = nullptr;
+        float * csr_xs = nullptr;
+        uint16_t * csr_corr = nullptr;
     };
     std::vector<moe_act> moe_as_;
     // residency + the disk/RAM/VRAM expert cache tiers
@@ -501,7 +512,7 @@ struct engine {
     float * d_moe_shout = nullptr;
     float * d_moe_sg = nullptr;
     int32_t * d_moe_off = nullptr, *d_moe_cur = nullptr, *d_moe_pair = nullptr, *d_moe_active = nullptr,
-            *d_moe_nact = nullptr;
+            *d_moe_nact = nullptr, *d_moe_pos = nullptr;
     const int32_t * d_moe_slotmap = nullptr; // [n_layer][n_expert] of this device
 
     // Where a device's expert weights live.  `resident` (the default) is the
@@ -558,6 +569,23 @@ struct engine {
     // that graph off, and without this warmup the first prefill pays ~4 s of
     // kernel JIT (measured) instead of ~0.6 s.
     void warm_bank_path();
+
+    // ---- routed-expert int8 down bank (PF_MOE_DOWN_I8) --------------------
+    // The down projection's raw Q5_K/Q6_K planes are re-quantized once at load
+    // into a per-expert int8 store ([N][K] values + [K/32][N] f16 step, the same
+    // bytes dnnl_gemm::add_weight() would produce) and the prefill runs one
+    // oneDNN int8 GEMM per (expert, 64-pair tile) over the already-quantized
+    // pair-row activations.  Q5_K/Q6_K are otherwise read by the fp32 tiled
+    // kernel, which is at this card's fp32 ALU peak.  `moe_i8_bank_` is indexed
+    // like moe_all_; 0 means that layer keeps the raw planes (and the tiled
+    // path).  PF_MOE_DOWN_I8=0 disables it, PF_MOE_DOWN_I8_MB caps the bank.
+    std::vector<uint8_t> moe_i8_bank_;
+    std::vector<size_t> moe_i8_plane_;
+    bool moe_i8_any_ = false;
+    bool moe_down_i8_wanted() const;
+    bool setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd);
+    bool moe_down_i8_bank_ok(int dev, int moe_il) const;
+    bool moe_down_i8(int dev, int moe_il, const moe_t & M, int n_pairs, int n_act);
     void bind_moe_acts(int dev);
 
     // ---- qwen4exp (hyper-connections + PLE) -----------------------------

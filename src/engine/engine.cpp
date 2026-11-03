@@ -1055,11 +1055,16 @@ engine::~engine() {
             }
         }
     }
+    // A fused gate/up bank is registered under both tensors' keys and owns one
+    // allocation, so free each pointer once.
+    std::unordered_set<const void *> freed;
     for (size_t d = 0; d < weight_maps_.size(); d++) {
         // the partition was allocated on the owning device's queue
         sycl::queue & qd = (multi_dev && d < dev_queues_.size() && dev_queues_[d]) ? *dev_queues_[d] : q;
         for (auto & kv : weight_maps_[d]) {
-            sycl::free(kv.second, qd);
+            if (freed.insert(kv.second).second) {
+                sycl::free(kv.second, qd);
+            }
         }
     }
     weight_maps_.clear();
@@ -1247,7 +1252,11 @@ void engine::moe_acts_alloc(int dev) {
     a.ids = I(P);
     a.wts = F(P);
     a.h = F(P * (size_t)hp.n_ff_exp);
-    a.acc = F(P * (size_t)hp.n_embd);
+    // +512 rows: the expert GEMMs write whole M buckets (32..256), so the last
+    // tile's padded rows land past the real pair count.  They are overwritten
+    // by the next expert (tiles are issued in ascending CSR order) and the
+    // final tile's are discarded - but they must stay inside the allocation.
+    a.acc = F((P + 512) * (size_t)hp.n_embd);
     a.sh = F(R * (size_t)ffn_stride);
     a.shout = F(R * (size_t)hp.n_embd);
     a.sg = F(R);
@@ -1266,7 +1275,9 @@ void engine::moe_acts_alloc(int dev) {
     // sized for the larger of the two is therefore enough, and both are
     // multiples of 32 so the quantizer's 32-lane groups are uniform.
     {
-        const size_t bytes = R * (size_t)hp.n_embd + P * (size_t)hp.n_ff_exp;
+        // +512*ff for the down half: the last expert's M bucket reads rows past
+        // the real pair count (see a.acc).
+        const size_t bytes = R * (size_t)hp.n_embd + (P + 512) * (size_t)hp.n_ff_exp;
         a.xq = (int8_t *)dev_alloc_on(dev, bytes);
         a.asa = (uint16_t *)dev_alloc_on(dev, bytes / 32 * 2);
         a.xs = F(bytes / 32);
@@ -1274,17 +1285,36 @@ void engine::moe_acts_alloc(int dev) {
     // u4 gate/up bank scratch.  The decode writes the up projection at pair rows
     // into `gu` (P*n_ff_exp), while the prefill uses the first two 64-row
     // tiles as the GEMM destinations; one buffer sized for the decode covers
-    // both.  `gather` is the prefill's [64][n_embd] activation tile.  Only
+    // both.  `gather` is the prefill's [256][n_embd] activation tile.  Only
     // allocated when a bank was actually built (the memory-tight qwen4exp path
     // and an unbaked MoE run do not pay 17 MB per device for nothing).
+    if (moe_u4_any_ || moe_i8_any_) {
+        // +512 rows of slack: the CSR-order prefill writes each tile's padded
+        // rows past its real pair count, and the next tile (or expert) owns
+        // that range and overwrites it.  The last tile must still land inside
+        // the allocation.
+        // gu holds the fused gate+up GEMM output ([2*n_ff_exp] per pair row);
+        // g2 is the old separate-up destination, kept for the non-banked paths.
+        a.gu = F((P + 512) * (size_t)hp.n_ff_exp * 2);
+        a.g2 = F((P + 512) * (size_t)hp.n_ff_exp);
+        a.pos = I(P + 512);
+    }
     if (moe_u4_any_) {
-        a.gu = F(P * (size_t)hp.n_ff_exp);
-        a.gather = F(64 * (size_t)hp.n_embd);
+        a.gather = F(256 * (size_t)hp.n_embd);
+        // CSR-order activation staging for the oneDNN expert GEMMs (see
+        // moe_gate_up_u4 / moe_down_i8).  +512 rows covers the last tile's
+        // padding.  The gate/up shape is the larger one (n_embd >= n_ff_exp).
+        const size_t cp = P + 512;
+        const size_t cg = (size_t)hp.n_embd / 32;
+        a.csr_xq = (int8_t *)dev_alloc_on(dev, cp * (size_t)hp.n_embd);
+        a.csr_asa = (uint16_t *)dev_alloc_on(dev, cp * cg * 2);
+        a.csr_xs = F(cp * cg);
+        a.csr_corr = (uint16_t *)dev_alloc_on(dev, cp * cg * 2);
     }
     if (!a.ids || !a.h || !a.acc || !a.slotmap) {
         throw std::runtime_error("MoE scratch allocation failed");
     }
-    if (moe_u4_any_ && (!a.gu || !a.gather)) {
+    if (moe_u4_any_ && (!a.gu || !a.g2 || !a.pos || !a.gather)) {
         throw std::runtime_error("u4 expert bank scratch allocation failed");
     }
 }
@@ -1440,15 +1470,13 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
             continue;
         }
         const moe_t & M = m.layers[(size_t)il].moe;
-        const moe_wt * ts[2] = {&M.gate_exps, &M.up_exps};
-        for (int p = 0; p < 2; p++) {
-            if (!u4_can_bank(*ts[p])) {
-                continue;
-            }
-            size_t vb, sb, pl;
-            u4_plane_of(ts[p]->K, ts[p]->N, vb, sb, pl);
-            stage_bytes = std::max(stage_bytes, pl * (size_t)ts[p]->E);
+        if (!u4_can_bank(M.gate_exps) || !u4_can_bank(M.up_exps) ||
+            M.gate_exps.K != M.up_exps.K || M.gate_exps.N != M.up_exps.N) {
+            continue;
         }
+        size_t vb, sb, pl;
+        u4_plane_of(M.gate_exps.K, M.gate_exps.N, vb, sb, pl);
+        stage_bytes = std::max(stage_bytes, 2 * pl * (size_t)M.gate_exps.E);
     }
     if (!stage_bytes) {
         return false;
@@ -1517,6 +1545,79 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         return bytes;
     };
 
+    // Pack gate and up into ONE per-expert plane so a single N=2N GEMM computes
+    // both: vals [2N][K/2] (gate rows then up rows), then the f16 scale plane
+    // [K/G][2N] and the f16 off plane [K/G][2N], with each group's N gate
+    // entries followed by its N up entries.  One primitive + one correction
+    // matmul per expert instead of two of each is the whole point: at this
+    // shape oneDNN's per-execute cost is comparable to its compute.
+    auto pack_fused = [&](const moe_wt & tg, const moe_wt & tu, uint8_t ** out) -> size_t {
+        size_t vbg, sbg, plg, vbu, sbu, plu;
+        u4_plane_of(tg.K, tg.N, vbg, sbg, plg);
+        u4_plane_of(tu.K, tu.N, vbu, sbu, plu);
+        if (plg != plu || vbg != vbu || tg.N != tu.N || tg.K != tu.K) {
+            return 0;
+        }
+        const int N = tg.N, K = tg.K, G = si::w4_group();
+        const int ng = K / G;
+        const size_t vb2 = 2 * vbg;                     // vals bytes
+        const size_t sb2 = (size_t)ng * (size_t)(2 * N) * 2; // one scale/off plane
+        const size_t pl2 = vb2 + 2 * sb2;
+        const size_t bytes = pl2 * (size_t)tg.E;
+        const double p0 = now();
+        std::atomic<int> bad{0};
+        std::vector<std::thread> th;
+        const int NT = 8;
+        for (int w = 0; w < NT; w++) {
+            th.emplace_back([&, w] {
+                si::w4t sg, su;
+                for (int e = w; e < tg.E; e += NT) {
+                    if (!si::w4_pack(tg.type, tg.plane(e), K, N, sg) ||
+                        !si::w4_pack(tu.type, tu.plane(e), K, N, su)) {
+                        bad = 1;
+                        return;
+                    }
+                    uint8_t * d = stage + (size_t)e * pl2;
+                    std::memcpy(d, sg.vals.data(), vbg);
+                    std::memcpy(d + vbg, su.vals.data(), vbu);
+                    uint16_t * sc = reinterpret_cast<uint16_t *>(d + vb2);
+                    uint16_t * of = sc + (size_t)ng * (size_t)(2 * N);
+                    for (int g = 0; g < ng; g++) {
+                        std::memcpy(sc + (size_t)g * (2 * N), sg.scale.data() + (size_t)g * N, (size_t)N * 2);
+                        std::memcpy(sc + (size_t)g * (2 * N) + N, su.scale.data() + (size_t)g * N,
+                                    (size_t)N * 2);
+                        std::memcpy(of + (size_t)g * (2 * N), sg.off.data() + (size_t)g * N, (size_t)N * 2);
+                        std::memcpy(of + (size_t)g * (2 * N) + N, su.off.data() + (size_t)g * N, (size_t)N * 2);
+                    }
+                }
+            });
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+        pack_s += now() - p0;
+        if (bad) {
+            return 0;
+        }
+        uint8_t * bank = sycl::malloc_device<uint8_t>(bytes, qd);
+        if (!bank) {
+            return 0;
+        }
+        const double c0 = now();
+        qd.memcpy(bank, stage, bytes).wait();
+        copy_s += now() - c0;
+        for (int e = 0; e < tg.E; e++) {
+            uint8_t * b = bank + (size_t)e * pl2;
+            if (!D.add_weight_w4_dev((const void *)b, b, b + vb2, b + vb2 + sb2, K, 2 * N)) {
+                fprintf(stderr, "[moe] u4 bank: oneDNN rejected the fused store (K=%d N=%d e=%d)\n", K, 2 * N, e);
+                return 0;
+            }
+            registered.push_back((const void *)b);
+        }
+        *out = bank;
+        return bytes;
+    };
+
     for (int il = 0; il < nL; il++) {
         if (layer_dev_[(size_t)il] != dev) {
             continue;
@@ -1532,41 +1633,30 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
             continue;
         }
         uint8_t * bg = nullptr;
-        uint8_t * bu = nullptr;
-        const size_t gb = pack_tensor(M.gate_exps, &bg);
-        const size_t ub = gb ? pack_tensor(M.up_exps, &bu) : 0;
-        if (!gb || !ub) {
-            // transactional: without both tensors the layer stays on the raw
-            // path and its Q4_K planes are still in the mmap (the per-tensor
-            // upload has not run yet), so only the banks need freeing.
+        const size_t gb = pack_fused(M.gate_exps, M.up_exps, &bg);
+        if (!gb) {
             if (bg) {
                 sycl::free(bg, qd);
-            }
-            if (bu) {
-                sycl::free(bu, qd);
             }
             continue;
         }
         m.page_out_host(M.gate_exps.data, M.gate_exps.total_bytes());
         m.page_out_host(M.up_exps.data, M.up_exps.total_bytes());
-        // Pre-registering the device pointer under the tensor's host key is what
-        // makes wptr(dev, M.gate_exps.data) return the bank; the per-tensor
-        // upload then skips any key already in this map.
         if (weight_maps_.size() <= (size_t)dev) {
             weight_maps_.resize((size_t)dev + 1);
         }
         weight_maps_[(size_t)dev][M.gate_exps.data] = bg;
-        weight_maps_[(size_t)dev][M.up_exps.data] = bu;
+        weight_maps_[(size_t)dev][M.up_exps.data] = bg;
         if (dev_used_bytes_.size() <= (size_t)dev) {
             dev_used_bytes_.resize((size_t)dev + 1, 0);
         }
-        dev_used_bytes_[(size_t)dev] += gb + ub;
+        dev_used_bytes_[(size_t)dev] += gb;
         size_t vb, sb, pl;
         u4_plane_of(M.gate_exps.K, M.gate_exps.N, vb, sb, pl);
         moe_u4_bank_[(size_t)il] = 1;
-        moe_u4_gplane_[(size_t)il] = pl;
-        moe_u4_uplane_[(size_t)il] = pl;
-        bank_bytes += gb + ub;
+        moe_u4_gplane_[(size_t)il] = 2 * pl;
+        moe_u4_uplane_[(size_t)il] = 2 * pl;
+        bank_bytes += gb;
         banked_layers++;
     }
     sycl::free(stage, qd);
@@ -1592,6 +1682,287 @@ bool engine::moe_u4_bank_ok(int dev, int moe_il) const {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Routed-expert int8 down bank (PF_MOE_DOWN_I8).
+//
+// The down projection is 1.08 T-MAC of the 3213-token prefill and the fp32
+// tiled kernel runs it at 0.51 T-MAC/s, which is this card's fp32 FMA peak
+// (64 EU).  The same values in int8 let oneDNN's int8 matmul run it at ~2.5x;
+// Q5_K/Q6_K have no native int8 store, so the bank re-quantizes each expert
+// plane once at load exactly as dnnl_gemm::add_weight() would (per-32-group
+// amax/127, f16 step) - the same accuracy class as the engine's dense int8
+// conversion (0.5-1% weight error), not a 4-bit re-quantization.  Q6_K's
+// per-16 source scales are folded into the same per-32 grid.
+//
+// The bank replaces the raw upload: `weight_maps_` is pre-registered so
+// upload_device_weights skips the raw planes, and the mmap pages are released.
+// plane = N*K int8 + (K/32)*N f16 step.
+// ---------------------------------------------------------------------------
+
+bool engine::moe_down_i8_wanted() const {
+    static const bool env_on = [] {
+        const char * e = si::env::str("PF_MOE_DOWN_I8");
+        return !(e && atoi(e) == 0);
+    }();
+    if (!env_on || cpu_mode || !m.hp.is_moe() || moe_host_only_) {
+        return false;
+    }
+    if (moe_cfg_.host_only || moe_cfg_.resident_per_layer > 0 || moe_cfg_.vram_mb > 0 || moe_cfg_.ram_mb > 0 ||
+        moe_cfg_.ram_tier) {
+        return false;
+    }
+    return true;
+}
+
+bool engine::moe_down_i8_bank_ok(int dev, int moe_il) const {
+    if (!moe_i8_any_ || moe_il < 0 || (size_t)moe_il >= moe_i8_bank_.size() || !moe_i8_bank_[(size_t)moe_il]) {
+        return false;
+    }
+    if (dev < 0 || (size_t)dev >= dnnl_dev_.size() || !dnnl_dev_[(size_t)dev]) {
+        return false;
+    }
+    return true;
+}
+
+bool engine::setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
+    if (!moe_down_i8_wanted()) {
+        return false;
+    }
+    const int nL = m.hp.n_layer;
+    const size_t nRows = (size_t)nL + (m.mtp.moe.ok() ? 1 : 0);
+    if (moe_i8_bank_.size() < nRows) {
+        moe_i8_bank_.resize(nRows, 0);
+        moe_i8_plane_.resize(nRows, 0);
+    }
+    const long cap_bytes = (long)si::env::i32("PF_MOE_DOWN_I8_MB", 0) * 1024L * 1024L;
+    size_t used = 0;
+    int banked = 0;
+    const double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (int il = 0; il < nL; il++) {
+        if (layer_dev_[(size_t)il] != dev) {
+            continue;
+        }
+        const moe_t & M = m.layers[(size_t)il].moe;
+        const moe_wt & T = M.down_exps;
+        // Q5_K / Q6_K only; the dispatch needs the model's geometry.
+        if (!T.ok() || (T.type != 13 && T.type != 14) || T.K != m.hp.n_ff_exp || T.N != m.hp.n_embd ||
+            (T.K % 32) != 0 || T.E <= 0) {
+            continue;
+        }
+        if (T.type != 13) {
+            continue; // Q6_K has per-16 scales; the tiled path keeps it exact
+        }
+        const int K = T.K, N = T.N, E = T.E;
+        const size_t ng = (size_t)K / 32;
+        const size_t vb = (size_t)N * (size_t)K;
+        // vals [N][K] int8 + step [ng][N] f16 + off [ng][N] f16
+        const size_t plane = vb + ng * (size_t)N * 4;
+        const size_t bytes = plane * (size_t)E;
+        if (cap_bytes > 0 && used + bytes > (size_t)cap_bytes) {
+            continue;
+        }
+        uint8_t * stage = sycl::malloc_host<uint8_t>(bytes, qd);
+        if (!stage) {
+            fprintf(stderr, "[moe] down int8 bank: %.1f MiB staging failed\n", (double)bytes / (1024.0 * 1024.0));
+            break;
+        }
+        const size_t row_bytes = (size_t)quant_row_bytes(T.type, K);
+        std::vector<std::thread> th;
+        const int NT = 8;
+        for (int w = 0; w < NT; w++) {
+            th.emplace_back([&, w] {
+                std::vector<float> fr((size_t)K);
+                for (int e = w; e < E; e += NT) {
+                    const uint8_t * src = (const uint8_t *)T.plane(e);
+                    uint8_t * dst = stage + (size_t)e * plane;
+                    int8_t * q8 = (int8_t *)dst;
+                    uint16_t * sc = (uint16_t *)(dst + vb);
+                    uint16_t * of = sc + ng * (size_t)N;
+                    for (int n = 0; n < N; n++) {
+                        const uint8_t * rowp = src + (size_t)n * row_bytes;
+                        dequantize_row(T.type, rowp, fr.data(), K);
+                        int8_t * qr = q8 + (size_t)n * K;
+                        for (size_t g = 0; g < ng; g++) {
+                            const block_q5_K * blk = (const block_q5_K *)rowp + (g / 8);
+                            const int sb = (int)(g % 8);
+                            uint8_t sci = 0, mii = 0;
+                            get_scale_min_k4(sb, blk->scales, &sci, &mii);
+                            const float d = ggml_half_to_float(blk->d);
+                            const float dmin = ggml_half_to_float(blk->dmin);
+                            const float st = d * (float)sci;
+                            const float ofv = -(dmin * (float)mii);
+                            sc[g * (size_t)N + (size_t)n] = ggml_float_to_half(st);
+                            of[g * (size_t)N + (size_t)n] = ggml_float_to_half(ofv);
+                            // Preserve the native 5-bit q: round((v - off)/step)
+                            // recovers the integer the block encoded, so the only
+                            // loss is the f16 rounding of step/off (the same
+                            // error class the u4 gate/up bank already has).
+                            const float inv = st != 0.f ? 1.0f / st : 0.f;
+                            for (int k = 0; k < 32; k++) {
+                                int qv = 0;
+                                if (st != 0.f) {
+                                    qv = (int)std::lround((fr[g * 32 + (size_t)k] - ofv) * inv);
+                                }
+                                qr[g * 32 + (size_t)k] = (int8_t)std::max(0, std::min(31, qv));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+        uint8_t * bank = sycl::malloc_device<uint8_t>(bytes, qd);
+        if (!bank) {
+            sycl::free(stage, qd);
+            fprintf(stderr, "[moe] down int8 bank: %.1f MiB device allocation failed\n",
+                    (double)bytes / (1024.0 * 1024.0));
+            break;
+        }
+        qd.memcpy(bank, stage, bytes).wait();
+        sycl::free(stage, qd);
+        bool all_ok = true;
+        for (int e = 0; e < E && all_ok; e++) {
+            uint8_t * b = bank + (size_t)e * plane;
+            all_ok = D.add_weight_i8_dev((const void *)b, b, b + vb, b + vb + ng * (size_t)N * 2, K, N);
+        }
+        if (!all_ok) {
+            sycl::free(bank, qd);
+            fprintf(stderr, "[moe] down int8 bank: oneDNN rejected layer %d\n", il);
+            continue;
+        }
+        m.page_out_host(T.data, T.total_bytes());
+        if (weight_maps_.size() <= (size_t)dev) {
+            weight_maps_.resize((size_t)dev + 1);
+        }
+        weight_maps_[(size_t)dev][T.data] = bank;
+        if (dev_used_bytes_.size() <= (size_t)dev) {
+            dev_used_bytes_.resize((size_t)dev + 1, 0);
+        }
+        dev_used_bytes_[(size_t)dev] += bytes;
+        moe_i8_bank_[(size_t)il] = 1;
+        moe_i8_plane_[(size_t)il] = plane;
+        used += bytes;
+        banked++;
+    }
+    if (banked) {
+        // Compile every bucket's primitive now: creating one between queued
+        // expert GEMMs was measurably non-deterministic (same routing, different
+        // logits) when the per-expert M bucket mixed shapes inside a layer.
+        int Ms[] = {32, 64, 96, 128, 256};
+        D.warm_i8(m.hp.n_ff_exp, m.hp.n_embd, Ms, 5);
+        moe_i8_any_ = true;
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0;
+        fprintf(stderr, "[moe] down int8 bank (dev %d): %d layers, %.1f MiB on device (%.2f s)\n", dev, banked,
+                (double)used / (1024.0 * 1024.0), dt);
+        return true;
+    }
+    return false;
+}
+
+// The down projection through the int8 bank: one oneDNN int8 GEMM per
+// (expert, 64-pair tile) over the already-quantized pair-row activations.
+bool engine::moe_down_i8(int dev, int moe_il, const moe_t & M, int n_pairs, int n_act) {
+    if (!moe_down_i8_bank_ok(dev, moe_il) || moe_host_split()) {
+        return false;
+    }
+    dnnl_gemm * D = dnnl_for(dev);
+    if (!D) {
+        return false;
+    }
+    const int K = m.hp.n_ff_exp;
+    const int N = m.hp.n_embd;
+    sycl::queue & qq = dev_queue(dev);
+    const auto & A = moe_as_[(size_t)(dev >= 0 ? dev : 0)];
+    const uint8_t * bank = (const uint8_t *)wptr(dev, M.down_exps.data);
+    const size_t plane = moe_i8_plane_[(size_t)moe_il];
+    (void)n_act;
+    std::vector<int32_t> active((size_t)m.hp.n_expert + 1), off((size_t)m.hp.n_expert + 1);
+    int32_t nact = 0;
+    qq.memcpy(&nact, d_moe_nact, sizeof(int32_t));
+    qq.memcpy(active.data(), d_moe_active, active.size() * sizeof(int32_t));
+    qq.memcpy(off.data(), d_moe_off, off.size() * sizeof(int32_t));
+    qq.wait();
+    if (nact <= 0) {
+        return true;
+    }
+    // The down activation is already in pair (CSR) order, so only its f16
+    // correction plane has to be built; the int8 values and scales are bound
+    // directly by gemm_i8_csr.
+    static const bool csr_on_d = !si::env::str("PF_MOE_CSR") || si::env::i32("PF_MOE_CSR", 1) != 0;
+    static const bool group_corr = si::env::str("PF_MOE_DN_CORR") && si::env::i32("PF_MOE_DN_CORR", 0) != 0;
+    const bool use_csr_d = csr_on_d;
+    if (use_csr_d && !group_corr) {
+        moe_csr_corr_launch(qq, A.asa, A.xs, A.csr_corr, n_pairs, K / 32);
+    }
+    // ONE M for the whole layer, chosen to minimise padded MAC / oneDNN's
+    // measured M-rate ({32,64,96,128,256}: 2.2/3.8/4.5/5.4/4.8 T-MAC/s on this
+    // card).  A per-expert M is cheaper in theory but mixes GEMM shapes inside
+    // a layer, which measured NON-deterministic here (same routing, different
+    // logits between two passes); a uniform M with a multi-tile loop for the
+    // few experts wider than it is bit-reproducible, and still avoids the old
+    // fixed-128 padding (a chunk's mean is ~40 pairs/expert).
+    // Measured: one M of 128 for the whole layer beats the per-expert bucket
+    // *and* the cost model that picks 64 (a chunk's mean is ~40 pairs/expert,
+    // so 128 does ~2x the MACs, but oneDNN's in-situ rate at 128 is better than
+    // 2x its rate at 64; the model's {32,64,96,128} rates were isolated-GEMM
+    // numbers and over-value the small shapes).  A single M also keeps the
+    // result bit-reproducible - mixing shapes inside a layer measured
+    // non-deterministic here.
+    const int fixed_tile = std::max(0, si::env::i32("PF_MOE_DN_TILE", si::env::i32("PF_MOE_TILE", 0)));
+    const int layer_M = fixed_tile > 0 ? std::min(256, fixed_tile) : 128;
+    for (int ia = 0; ia < nact; ia++) {
+        const int e = active[(size_t)ia];
+        const int p0 = off[(size_t)e];
+        const int pe = off[(size_t)e + 1] - p0;
+        for (int c = 0; c < pe;) {
+            const int rem = pe - c;
+            const int Mt = layer_M;
+            const int n = std::min(rem, Mt);
+            // The down activation is the layer's CSR-ordered d_moe_h, so the
+            // tile's rows are contiguous and both the int8 values and the
+            // scales are bound directly; the output goes straight into
+            // d_moe_acc at the same position (the weighted reduction indexes it
+            // through the pair-position map).
+            const size_t ng = (size_t)K / 32;
+            if (use_csr_d) {
+                float * dst = d_moe_acc + (size_t)(p0 + c) * (size_t)N;
+                const bool ok = group_corr
+                                    ? D->gemm_i8_csr_nocorr(bank + (size_t)e * plane,
+                                                            A.xq + (size_t)(p0 + c) * (size_t)K,
+                                                            A.asa + (size_t)(p0 + c) * ng, Mt, K, dst, N)
+                                    : D->gemm_i8_csr(bank + (size_t)e * plane, A.xq + (size_t)(p0 + c) * (size_t)K,
+                                                     A.asa + (size_t)(p0 + c) * ng, A.xs + (size_t)(p0 + c) * ng,
+                                                     A.csr_corr + (size_t)(p0 + c) * ng, Mt, K, dst, N);
+                if (!ok) {
+                    return false;
+                }
+            } else {
+                act_view v = D->quantize_gathered(A.xq, A.asa, A.xs, nullptr, p0 + c, n, 0, Mt, K);
+                if (!v.valid() ||
+                    !D->gemm(v, bank + (size_t)e * plane, nullptr, 1.0f, Mt, K,
+                             d_moe_acc + (size_t)(p0 + c) * (size_t)N, N)) {
+                    return false;
+                }
+            }
+            c += n;
+        }
+    }
+    if (use_csr_d && group_corr) {
+        // Optional A/B (PF_MOE_DN_CORR=1): one correction pass over the layer
+        // instead of one oneDNN correction matmul per expert.  It measured
+        // SLOWER than the in-GEMM correction (it writes and re-reads the whole
+        // [pairs][N] accumulator), so it is off by default.  The GEMMs run on
+        // the oneDNN stream and this is a SYCL queue kernel, so wait for that
+        // stream before reading its output.
+        D->sync();
+        moe_down_corr_add_launch(qq, bank, plane, K, N, d_moe_off, d_moe_active, d_moe_nact, m.hp.n_expert, A.asa,
+                                 A.xs, d_moe_acc, N);
+    }
+    return true;
+}
+
 // gate/up through the bank.  Prefill (mode 1/2) runs one oneDNN u4 GEMM per
 // active expert over the pairs it owns, in 64-row tiles padded up to the 32/64
 // M bucket; a decode runs the M=1 u4 GEMV once per pair.  Both write
@@ -1613,10 +1984,9 @@ bool engine::moe_gate_up_u4(int dev, int moe_il, const moe_t & M, int n_tok, int
     const size_t gp = moe_u4_gplane_[(size_t)moe_il];
     const size_t up = moe_u4_uplane_[(size_t)moe_il];
     const uint8_t * bank_g = (const uint8_t *)wptr(dev, M.gate_exps.data);
-    const uint8_t * bank_u = (const uint8_t *)wptr(dev, M.up_exps.data);
     size_t vb, sb, pl;
     u4_plane_of(K, N, vb, sb, pl);
-    if (gp != pl || up != pl) {
+    if (gp != 2 * pl || up != 2 * pl) {
         // The bank was packed for a different geometry than the dispatch would
         // read.  The raw planes are not uploaded, so a silent fallback would be
         // a wrong answer; fail loudly instead.
@@ -1624,23 +1994,31 @@ bool engine::moe_gate_up_u4(int dev, int moe_il, const moe_t & M, int n_tok, int
     }
 
     if (mode == 0) {
-        // ---- decode: one grouped u4 GEMV per projection, one launch ----
+        // ---- decode: one grouped u4 GEMV for gate+up, then the silu ----
         // The router ids stay on the device (the expert is addressed inside the
         // kernel) and the activation is the plain per-32-group int8 tile, so
         // this is two kernels on the queue and records into the decode command
-        // graph.  The old form read d_moe_ids back to the host, ran one
-        // w4_gemv_launch per (pair, projection) and finished with a silu-mul,
-        // which is why the whole decode had to run graph-free.
-        // The SAME quantizer quantize() runs: byte-identical xq/asa/xs to the
-        // per-pair path this replaces (moe_actq's 127/mx reciprocal rounds
-        // differently, and that moved the greedy stream).
+        // graph.  The store is fused ([2N] columns), so one GEMV produces both
+        // projections and the silu kernel combines them.
         act_quant_grp_run(qq, d_xnorm, K, n_tok, K, A.xq, A.asa, A.xs);
-        moe_u4_gemv_launch(qq, bank_g, gp, nullptr, d_moe_ids, n_pairs, A.xq, A.asa, A.xs, K, N, d_moe_h, N, nullptr,
-                           k);
-        moe_u4_gemv_launch(qq, bank_u, up, nullptr, d_moe_ids, n_pairs, A.xq, A.asa, A.xs, K, N, d_moe_h, N, d_moe_h,
-                           k);
+        moe_u4_gemv_launch(qq, bank_g, gp, nullptr, d_moe_ids, n_pairs, A.xq, A.asa, A.xs, K, 2 * N, A.gu, 2 * N,
+                           nullptr, k);
+        moe_u4_silu_fused_launch(qq, A.gu, n_pairs, N, d_moe_h, N);
         return true;
     }
+
+    // ---- prefill: grouped u4 GEMM, one launch for the whole layer ----
+    // Opt-in (PF_MOE_GRP_U4=1).  The kernel is exact and avoids the per-tile
+    // activation quantize entirely, but on this 64-EU Xe2 part it measures
+    // 0.76 T-MAC/s against the per-expert oneDNN u4 matmul's ~1.2 (see the
+    // report in docs/PERFORMANCE.md), so the oneDNN path stays the default.
+    // The grouped kernel writes d_moe_h in pair-id order; the CSR prefill below
+    // does not.  It is therefore only usable when the down bank (which defines
+    // the order) is off.
+    // Whether the down bank is present decides the *order* of d_moe_h (CSR
+    // pair position for the int8 bank, pair id for the tiled path), not
+    // whether the fused gate/up store can be used.
+    const bool csr = moe_down_i8_bank_ok(dev, moe_il) && !moe_host_split();
 
     // ---- prefill: per-expert oneDNN u4 GEMM over 64-row tiles ----
     std::vector<int32_t> active((size_t)m.hp.n_expert + 1), off((size_t)m.hp.n_expert + 1);
@@ -1652,24 +2030,96 @@ bool engine::moe_gate_up_u4(int dev, int moe_il, const moe_t & M, int n_tok, int
     if (nact <= 0) {
         return true;
     }
+    // Quantize the activation ONCE per layer; every tile below gathers rows
+    // that are already quantized.  The per-tile form gathered 64 f32 rows and
+    // re-ran the per-32-group max pass for each tile, ~35 us of the ~70 us a
+    // tile cost at 190 tiles/layer.  These are the same bytes (the quantizer is
+    // per row), so the GEMM result is unchanged.
+    act_quant_grp_run(qq, d_xnorm, K, n_tok, K, A.xq, A.asa, A.xs);
+    // One CSR gather for the whole layer instead of one per (expert, tile):
+    // the pairs of an expert are contiguous after this, so the GEMM binds the
+    // rows directly (gemm_w4_csr) and no per-tile gather kernel runs.
+    static const bool csr_on = !si::env::str("PF_MOE_CSR") || si::env::i32("PF_MOE_CSR", 1) != 0;
+    const bool use_csr = A.csr_xq && csr_on;
+    if (use_csr) {
+        moe_csr_gather_i8_launch(qq, A.xq, A.asa, A.xs, d_moe_pair, n_pairs, k, K, A.csr_xq, A.csr_asa, A.csr_xs,
+                                 A.csr_corr);
+    }
+    // Per-expert M bucket: the same trade as the down projection's.  The
+    // prefill ladder is {32, 64, 96, 128, 256}; PF_MOE_TILE forces one width.
+    const int fixed_tile = std::max(0, si::env::i32("PF_MOE_GU_TILE", si::env::i32("PF_MOE_TILE", 0)));
+    // ONE M for the whole layer, chosen to minimise the padded MAC divided by
+    // oneDNN's measured M-rate ({32,64,96,128,256}: 2.2/3.8/4.5/5.4/4.8
+    // T-MAC/s on this card).  A per-expert M is faster in theory but mixes GEMM
+    // shapes inside a layer, which measured NON-deterministic here (same
+    // routing, different logits between two passes); a uniform M with a
+    // multi-tile loop for the few experts wider than it is bit-reproducible
+    // and still avoids the old fixed-128 padding (a chunk's mean is ~40
+    // pairs/expert, so 128 spent 3x the MACs of real work).
+    int layer_M = 32;
+    if (fixed_tile > 0) {
+        layer_M = std::min(256, fixed_tile);
+    } else {
+        static const int cand[] = {32, 64, 96, 128, 256};
+        static const double rate[] = {2.2, 3.8, 4.5, 5.4, 4.8};
+        double best = 1e30;
+        for (int ci = 0; ci < 5; ci++) {
+            const int Mc = cand[ci];
+            long long padded = 0;
+            for (int ia = 0; ia < nact; ia++) {
+                const int e = active[(size_t)ia];
+                const int pe = off[(size_t)e + 1] - off[(size_t)e];
+                padded += (long long)((pe + Mc - 1) / Mc) * Mc;
+            }
+            const double cost = (double)padded / rate[ci];
+            if (cost < best) {
+                best = cost;
+                layer_M = Mc;
+            }
+        }
+    }
     for (int ia = 0; ia < nact; ia++) {
         const int e = active[(size_t)ia];
         const int p0 = off[(size_t)e];
         const int pe = off[(size_t)e + 1] - p0;
-        for (int c = 0; c < pe; c += 64) {
-            const int n = std::min(64, pe - c);
-            const int Mt = n <= 32 ? 32 : 64;
-            moe_u4_gather_launch(qq, d_xnorm, d_moe_pair, p0 + c, n, Mt, k, K, A.gather);
-            act_view v = D->quantize(A.gather, nullptr, K, K, Mt, K, /*do_split=*/false);
+        for (int c = 0; c < pe;) {
+            const int rem = pe - c;
+            const int Mt = layer_M;
+            const int n = std::min(rem, Mt);
             // No raw fallback exists once a layer is banked (its Q4_K planes were
             // never uploaded), so a failure here must be an error, not a silent
             // switch to a kernel that would read the u4 bank as Q4_K.
-            if (!v.valid() || !D->gemm_w4(v, bank_g + (size_t)e * gp, nullptr, 1.0f, Mt, K, A.gu, N) ||
-                !D->gemm_w4(v, bank_u + (size_t)e * up, nullptr, 1.0f, Mt, K, A.gu + (size_t)Mt * N, N)) {
-                throw std::runtime_error("u4 expert bank: prefill gate/up GEMM failed");
+            if (use_csr) {
+                // CSR order: the pair range [p0, p0+pe) is contiguous, so the
+                // GEMM writes straight into the layer's activation plane and the
+                // per-tile scattered silu disappears.  A padded row lands on the
+                // next tile's (not yet computed) range, which overwrites it; the
+                // tiles are issued in ascending p0 because `active` is the CSR
+                // prefix order.  The activation slices are bound directly - no
+                // per-tile gather.
+                const size_t ng = (size_t)K / 32;
+                const int8_t * xa = A.csr_xq + (size_t)(p0 + c) * (size_t)K;
+                const uint16_t * sa = A.csr_asa + (size_t)(p0 + c) * ng;
+                const float * xsa = A.csr_xs + (size_t)(p0 + c) * ng;
+                const uint16_t * co = A.csr_corr + (size_t)(p0 + c) * ng;
+                float * go = A.gu + (size_t)(p0 + c) * (size_t)(2 * N);
+                if (!D->gemm_w4_csr(bank_g + (size_t)e * gp, xa, sa, xsa, co, Mt, K, go, 2 * N)) {
+                    throw std::runtime_error("u4 expert bank: prefill gate/up GEMM failed");
+                }
+            } else {
+                act_view v = D->quantize_gathered(A.xq, A.asa, A.xs, d_moe_pair, p0 + c, n, k, Mt, K);
+                if (!v.valid() || !D->gemm_w4(v, bank_g + (size_t)e * gp, nullptr, 1.0f, Mt, K, A.gu, 2 * N)) {
+                    throw std::runtime_error("u4 expert bank: prefill gate/up GEMM failed");
+                }
+                moe_u4_silu_fused_scatter_launch(qq, A.gu, d_moe_pair + (p0 + c), n, N, d_moe_h, N);
             }
-            moe_u4_scatter_silu_launch(qq, A.gu, A.gu + (size_t)Mt * N, d_moe_pair, p0 + c, n, N, d_moe_h, N);
+            c += n;
         }
+    }
+    if (csr) {
+        moe_u4_silu_fused_launch(qq, A.gu, n_pairs, N, d_moe_h, N);
+    } else {
+        moe_u4_silu_fused_scatter_launch(qq, A.gu, d_moe_pair, n_pairs, N, d_moe_h, N);
     }
     return true;
 }
@@ -1690,6 +2140,7 @@ void engine::bind_moe_acts(int dev) {
     d_moe_off = a.off;
     d_moe_cur = a.cur;
     d_moe_pair = a.pair;
+    d_moe_pos = a.pos;
     d_moe_active = a.active;
     d_moe_nact = a.nact;
     d_moe_slotmap = a.slotmap;
@@ -2578,6 +3029,12 @@ bool engine::setup_md_dnnl() {
         // skips the banked tensors).  A device whose only weights were the bank
         // still keeps its oneDNN instance, which is what gemm_w4 runs on.
         if (setup_moe_u4_bank((int)d, *D, *dev_queues_[d])) {
+            dev_ok = true;
+        }
+        // Routed down: re-quantized int8 bank + the per-expert oneDNN int8 GEMM.
+        // Built after the gate/up bank so the load-time peak is the smaller of
+        // the two orders.
+        if (setup_moe_down_i8_bank((int)d, *D, *dev_queues_[d])) {
             dev_ok = true;
         }
         if (dev_ok) {

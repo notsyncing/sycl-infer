@@ -161,6 +161,7 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/dflash.cpp
     src/backend/gpu/kernels/moe.cpp
     src/backend/gpu/kernels/moe_tiled.cpp
+    src/backend/gpu/kernels/moe_grp_u4.cpp
     src/backend/gpu/kernels/dp4a_common.cpp
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp

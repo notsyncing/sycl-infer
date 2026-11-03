@@ -1073,6 +1073,13 @@ void moe_csr_scatter_launch(queue & q, const int32_t * ids, int32_t * off, int32
     });
 }
 
+void moe_csr_pos_launch(queue & q, const int32_t * pair, int32_t * pos, int n_pairs) {
+    q.parallel_for(range<1>((size_t)n_pairs), [=](id<1> i) {
+        const int p = (int)i[0];
+        pos[pair[p]] = p;
+    });
+}
+
 // ===========================================================================
 // Grouped dp4a expert GEMM.
 //
@@ -2997,6 +3004,25 @@ void moe_reduce_launch(queue & q, const float * acc, const float * wts, int top_
     });
 }
 
+void moe_reduce_csr_launch(queue & q, const float * acc, const float * wts, const int32_t * pos, int top_k, int n_tok,
+                           int n_embd, int acc_stride, float * out, int out_stride) {
+    const int n_eb = (n_embd + 255) / 256;
+    q.parallel_for(nd_range<1>((size_t)n_tok * n_eb * 256, 256), [=](nd_item<1> it) {
+        const int g = (int)it.get_group(0);
+        const int t = g / n_eb;
+        const int e = (g - t * n_eb) * 256 + (int)it.get_local_id(0);
+        if (e >= n_embd) {
+            return;
+        }
+        float a = 0.f;
+        for (int j = 0; j < top_k; j++) {
+            const size_t pr = (size_t)t * top_k + j;
+            a += wts[pr] * acc[(size_t)pos[pr] * (size_t)acc_stride + e];
+        }
+        out[(size_t)t * out_stride + e] += a;
+    });
+}
+
 // MoE epilogue: out[t] += sigmoid(gate . x[t]) * shared[t].
 //
 // One work-group per token computes the gate as a full reduction over n_embd
@@ -3074,11 +3100,66 @@ void moe_u4_gather_launch(queue & q, const float * x, const int32_t * pair, int 
     });
 }
 
+// Gather an already-quantized activation tile: the same rows the per-tile
+// quantizer would have produced, without the f32 gather or the max pass.  One
+// 16-byte chunk per work-item, and the first K/32 chunks also copy the scale and
+// group sum.  Padded rows are zero (scale 0 would be a *different* quantizer
+// result, but the row is not read by the GEMM's real outputs; 1.0 matches the
+// quantizer's zero-row convention).
+void moe_u4_gather_i8_launch(queue & q, const int8_t * xq, const uint16_t * asa, const float * xs,
+                             const int32_t * pair, int p0, int n, int tile_m, int top_k, int K, int8_t * tq,
+                             int8_t * txe, int8_t * txo, uint16_t * tasa, float * txs, uint16_t * tcorr) {
+    const int ng = K / 32;
+    q.parallel_for(range<2>((size_t)tile_m, (size_t)(K / 16)), [=](id<2> i) {
+        const int j = (int)i[0];
+        const int c = (int)i[1];
+        uint4 v(0, 0, 0, 0);
+        int row = -1;
+        if (j < n) {
+            row = pair ? pair[p0 + j] / top_k : p0 + j;
+            v = *reinterpret_cast<const uint4 *>(xq + (size_t)row * K + (size_t)c * 16);
+        }
+        *reinterpret_cast<uint4 *>(tq + (size_t)j * K + (size_t)c * 16) = v;
+        if (txe) {
+            // even/odd k planes for the native batched GEMM: a 16-byte chunk is
+            // 16 consecutive values, so its 8 even and 8 odd values land at
+            // c*8 in the two half-width planes.
+            const int8_t * src = tq + (size_t)j * K + (size_t)c * 16;
+            int8_t * e = txe + (size_t)j * (K / 2) + (size_t)c * 8;
+            int8_t * o = txo + (size_t)j * (K / 2) + (size_t)c * 8;
+            for (int x = 0; x < 8; x++) {
+                e[x] = src[2 * x];
+                o[x] = src[2 * x + 1];
+            }
+        }
+        if (c < ng) {
+            const uint16_t sa_b = row >= 0 ? asa[(size_t)row * ng + c] : (uint16_t)0x3C00;
+            const float gs = row >= 0 ? xs[(size_t)row * ng + c] : 0.f;
+            tasa[(size_t)j * ng + c] = sa_b;
+            txs[(size_t)j * ng + c] = gs;
+            // The u4 correction matmul's A operand (xs * sa, f16).  quantize()
+            // fills this plane; a gather that skips it leaves the last call's
+            // values there and corrupts every gate/up result.
+            sycl::half h(gs * moe_h2f(sa_b));
+            uint16_t hb;
+            __builtin_memcpy((void *)&hb, &h, sizeof(h));
+            tcorr[(size_t)j * ng + c] = hb;
+        }
+    });
+}
+
 // h[pair[p0+j]][i] = silu(g[j][i]) * u[j][i].  The output row is the pair id,
 // not the tile row: the down kernel and the weighted reduction are indexed by
 // pair, and an expert's pairs are contiguous in the CSR but not in pair-id order.
 void moe_u4_scatter_silu_launch(queue & q, const float * g, const float * u, const int32_t * pair, int p0, int n,
                                 int N, float * h, int h_stride) {
+    static const bool abl_scg = [] {
+        const char * e = si::env::str("PF_MOE_ABL_SCG");
+        return e && atoi(e) != 0;
+    }();
+    if (abl_scg)
+        return;
+
     q.parallel_for(range<2>((size_t)n, (size_t)N), [=](id<2> i) {
         const int j = (int)i[0];
         const int c = (int)i[1];
@@ -3088,10 +3169,33 @@ void moe_u4_scatter_silu_launch(queue & q, const float * g, const float * u, con
     });
 }
 
+void moe_scatter_launch(queue & q, const float * src, const int32_t * pair, int p0, int n, int N, float * dst,
+                        int dst_stride) {
+    static const bool abl_scd = [] {
+        const char * e = si::env::str("PF_MOE_ABL_SCD");
+        return e && atoi(e) != 0;
+    }();
+    if (abl_scd)
+        return;
+
+    q.parallel_for(range<2>((size_t)n, (size_t)N), [=](id<2> i) {
+        const int j = (int)i[0];
+        const int c = (int)i[1];
+        dst[(size_t)pair[p0 + j] * dst_stride + c] = src[(size_t)j * N + c];
+    });
+}
+
 // h[i] = silu(g[i]) * u[i] over n elements: the decode form, where both rows
 // already sit at their pair id (one M=1 GEMV per pair wrote them).
 void moe_u4_silu_mul_launch(queue & q, float * g, const float * u, int n) {
     q.parallel_for(range<1>((size_t)n), [=](id<1> i) { g[i] = silu_f(g[i]) * u[i]; });
+}
+
+void moe_u4_silu_pair_launch(queue & q, const float * g, const float * u, int n_pairs, int N, float * h) {
+    q.parallel_for(range<1>((size_t)n_pairs * (size_t)N), [=](id<1> i) {
+        const size_t x = i[0];
+        h[x] = silu_f(g[x]) * u[x];
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3243,6 +3347,163 @@ void moe_u4_gemv_launch(queue & q, const uint8_t * bank, size_t plane_bytes, con
         moe_u4_gemv_impl<8>(q, bank, plane_bytes, slot_map, ids, n_pairs, xq, asa, xs, K, N, out, out_stride, gate,
                             top_k);
     }
+}
+
+// Down int8 bank decode GEMV (see the declaration in kernels.h).
+void moe_i8_gemv_down_launch(queue & q, const uint8_t * bank, size_t plane_bytes, const int32_t * ids, int n_pairs,
+                             const int8_t * xq, const uint16_t * asa, const float * xs, int K, int N, float * out,
+                             int out_stride) {
+    const int ng = K / 32;
+    const size_t vb = (size_t)N * (size_t)K;
+    const int RB = 8; // warps per workgroup (8 output rows)
+    q.submit([&](handler & h) {
+        h.parallel_for(nd_range<1>((size_t)n_pairs * ((N + RB - 1) / RB) * (RB * 32), RB * 32),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           const int lid = (int)it.get_local_id(0);
+                           const int sg = lid / 32;
+                           const int lane = lid % 32;
+                           const int gid = (int)it.get_group(0);
+                           const int nblk = (N + RB - 1) / RB;
+                           const int p = gid / nblk;
+                           const int n = (gid - p * nblk) * RB + sg;
+                           if (n >= N) {
+                               return;
+                           }
+                           const uint8_t * plane = bank + (size_t)ids[p] * plane_bytes;
+                           const int8_t * wrow = (const int8_t *)plane + (size_t)n * K;
+                           const uint16_t * step = (const uint16_t *)(plane + vb) + (size_t)n;
+                           const uint16_t * offp = step + (size_t)ng * N;
+                           const int8_t * xrow = xq + (size_t)p * K;
+                           const uint16_t * asr = asa + (size_t)p * ng;
+                           float acc = 0.f;
+                           for (int g = lane; g < ng; g += 32) {
+                               const uint4 w0 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32);
+                               const uint4 w1 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32 + 16);
+                               const uint4 x0 = *reinterpret_cast<const uint4 *>(xrow + (size_t)g * 32);
+                               const uint4 x1 = *reinterpret_cast<const uint4 *>(xrow + (size_t)g * 32 + 16);
+                               int32_t qd = 0;
+                               qd = dp4a_s8s8((int32_t)x0.x(), w0.x(), qd);
+                               qd = dp4a_s8s8((int32_t)x0.y(), w0.y(), qd);
+                               qd = dp4a_s8s8((int32_t)x0.z(), w0.z(), qd);
+                               qd = dp4a_s8s8((int32_t)x0.w(), w0.w(), qd);
+                               qd = dp4a_s8s8((int32_t)x1.x(), w1.x(), qd);
+                               qd = dp4a_s8s8((int32_t)x1.y(), w1.y(), qd);
+                               qd = dp4a_s8s8((int32_t)x1.z(), w1.z(), qd);
+                               qd = dp4a_s8s8((int32_t)x1.w(), w1.w(), qd);
+                               const float sa = moe_h2f(asr[g]);
+                               const float st = moe_h2f(step[(size_t)g * N]);
+                               const float ofv = moe_h2f(offp[(size_t)g * N]);
+                               acc += sa * (st * (float)qd + ofv * xs[(size_t)p * ng + g]);
+                           }
+                           const float tot = reduce_over_group(it.get_sub_group(), acc, plus<float>());
+                           if (lane == 0) {
+                               out[(size_t)p * out_stride + n] = tot;
+                           }
+                       });
+    });
+}
+
+
+void moe_csr_gather_i8_launch(queue & q, const int8_t * xq, const uint16_t * asa, const float * xs,
+                              const int32_t * pair, int n_pairs, int top_k, int K, int8_t * tq, uint16_t * tasa,
+                              float * txs, uint16_t * tcorr) {
+    const int ng = K / 32;
+    q.parallel_for(range<2>((size_t)n_pairs, (size_t)(K / 16)), [=](id<2> i) {
+        const int p = (int)i[0];
+        const int c = (int)i[1];
+        const int row = top_k > 0 ? pair[p] / top_k : pair[p];
+        const uint4 v = *reinterpret_cast<const uint4 *>(xq + (size_t)row * K + (size_t)c * 16);
+        *reinterpret_cast<uint4 *>(tq + (size_t)p * K + (size_t)c * 16) = v;
+        if (c < ng) {
+            const uint16_t sa = asa[(size_t)row * ng + c];
+            const float gs = xs[(size_t)row * ng + c];
+            tasa[(size_t)p * ng + c] = sa;
+            txs[(size_t)p * ng + c] = gs;
+            sycl::half h(gs * moe_h2f(sa));
+            uint16_t hb;
+            __builtin_memcpy((void *)&hb, &h, sizeof(hb));
+            tcorr[(size_t)p * ng + c] = hb;
+        }
+    });
+}
+
+void moe_csr_corr_launch(queue & q, const uint16_t * asa, const float * xs, uint16_t * corr, int n_rows, int ng) {
+    q.parallel_for(range<1>((size_t)n_rows * (size_t)ng), [=](id<1> i) {
+        sycl::half h(xs[i] * moe_h2f(asa[i]));
+        uint16_t hb;
+        __builtin_memcpy((void *)&hb, &h, sizeof(hb));
+        corr[i] = hb;
+    });
+}
+
+
+void moe_u4_silu_fused_launch(queue & q, const float * gu, int n_rows, int N, float * h, int h_stride) {
+    const int n2 = 2 * N;
+    q.parallel_for(range<1>((size_t)n_rows * (size_t)N), [=](id<1> i) {
+        const size_t x = i[0];
+        const int r = (int)(x / (size_t)N);
+        const int c = (int)(x - (size_t)r * (size_t)N);
+        h[(size_t)r * h_stride + c] = silu_f(gu[(size_t)r * n2 + c]) * gu[(size_t)r * n2 + N + c];
+    });
+}
+
+void moe_u4_silu_fused_scatter_launch(queue & q, const float * gu, const int32_t * pair, int n_pairs, int N,
+                                      float * h, int h_stride) {
+    const int n2 = 2 * N;
+    q.parallel_for(range<1>((size_t)n_pairs * (size_t)N), [=](id<1> i) {
+        const size_t x = i[0];
+        const int r = (int)(x / (size_t)N);
+        const int c = (int)(x - (size_t)r * (size_t)N);
+        const int pid = pair ? pair[r] : r;
+        h[(size_t)pid * h_stride + c] = silu_f(gu[(size_t)r * n2 + c]) * gu[(size_t)r * n2 + N + c];
+    });
+}
+
+
+void moe_down_corr_add_launch(queue & q, const uint8_t * bank, size_t plane_bytes, int K, int N, const int32_t * off,
+                              const int32_t * active, const int32_t * n_active, int n_act_max, const uint16_t * asa,
+                              const float * xs, float * acc, int acc_stride) {
+    const int ng = K / 32;
+    const size_t vb = (size_t)N * (size_t)K;      // int8 values
+    const size_t sb = (size_t)ng * (size_t)N * 2; // f16 step plane
+    const int nblk = (N + 255) / 256;
+    q.parallel_for(nd_range<1>((size_t)n_act_max * (size_t)nblk * 256, 256), [=](nd_item<1> it) {
+        const int gid = (int)it.get_group(0);
+        const int ia = gid / nblk;
+        if (ia >= n_active[0]) {
+            return;
+        }
+        const int nb = gid - ia * nblk;
+        const int e = active[ia];
+        const int p0 = off[e];
+        const int pe = off[e + 1] - p0;
+        if (pe <= 0) {
+            return;
+        }
+        const uint16_t * op = reinterpret_cast<const uint16_t *>(bank + (size_t)e * plane_bytes + vb + sb);
+        const int tid = (int)it.get_local_id(0);
+        const int n = nb * 256 + tid;
+        if (n >= N) {
+            return;
+        }
+        for (int p = p0; p < p0 + pe; p++) {
+            float s = 0.f;
+            const float * xr = xs + (size_t)p * (size_t)ng;
+            const uint16_t * ar = asa + (size_t)p * (size_t)ng;
+            for (int g = 0; g < ng; g++) {
+                sycl::half h, ha;
+                const uint16_t hb = op[(size_t)g * (size_t)N + n];
+                __builtin_memcpy((void *)&h, &hb, sizeof(h));
+                __builtin_memcpy((void *)&ha, &ar[g], sizeof(ha));
+                // the correction's A operand is the quantizer's group sum times
+                // the group scale (corrsrc = xs*asa), exactly as the oneDNN
+                // correction matmul consumes it
+                const float cg = (float)(sycl::half)((float)ha * xr[g]);
+                s = sycl::fma((float)h, cg, s);
+            }
+            acc[(size_t)p * (size_t)acc_stride + n] += s;
+        }
+    });
 }
 
 } // namespace si

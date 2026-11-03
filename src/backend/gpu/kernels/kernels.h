@@ -507,6 +507,10 @@ void moe_csr_count_launch(sycl::queue & q, const int32_t * ids, int n_pairs, int
 void moe_csr_prefix_launch(sycl::queue & q, int32_t * off, int32_t * active, int32_t * n_active, int n_expert);
 void moe_csr_scatter_launch(sycl::queue & q, const int32_t * ids, int32_t * off, int32_t * cur, int32_t * pair,
                             int n_pairs);
+// Inverse of the CSR scatter: pos[pair[i]] = i.  The banked prefill keeps
+// d_moe_acc in CSR order (a contiguous GEMM destination) and the weighted
+// reduction needs the pair id -> position map.
+void moe_csr_pos_launch(sycl::queue & q, const int32_t * pair, int32_t * pos, int n_pairs);
 void moe_gate_up_launch(sycl::queue & q, const void * gbank, const void * ubank, const int32_t * slot_map,
                         size_t slot_gb, size_t slot_ub, const int32_t * off, const int32_t * pair,
                         const int32_t * active, const int32_t * n_active, int n_act_max, const float * x, int x_stride,
@@ -541,6 +545,15 @@ bool moe_grp_gate_up_launch(sycl::queue & q, const void * gbank, const void * ub
                             const int32_t * active, const int32_t * n_active, int n_act_max, int n_expert,
                             int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, float * h, int h_stride,
                             int n_embd, int n_ff_exp, int top_k, uint32_t gtype, uint32_t utype, bool dec);
+// Decode GEMV over the routed down int8 bank (PF_MOE_DOWN_I8): one warp per
+// (pair, output row), 32 lanes covering a 32-value group each, contiguous int8
+// reads.  out[p][n] = sum_g asa[p][g] * step[g][n] * dot(xq[p][g], q8[n][g]).
+// No host read and no wait, so it records into the decode command graph exactly
+// like the raw row GEMV it replaces (the raw planes are not uploaded once a
+// layer is banked).
+void moe_i8_gemv_down_launch(sycl::queue & q, const uint8_t * bank, size_t plane_bytes, const int32_t * ids,
+                             int n_pairs, const int8_t * xq, const uint16_t * asa, const float * xs, int K, int N,
+                             float * out, int out_stride);
 // The single-token decode's expert GEMV, row-shaped instead of group-shaped:
 // one warp per (expert, output row), 32 lanes covering a superblock's 128 weight
 // bytes as one coalesced access.  Declines unless every active expert has
@@ -554,6 +567,18 @@ bool moe_row_gemv_gate_up_launch(sycl::queue & q, const void * gbank, const void
 bool moe_row_gemv_down_launch(sycl::queue & q, const void * dbank, const int32_t * slot_map, size_t slot_db,
                               const int32_t * ids, int n_pairs, const int8_t * xq, const uint16_t * asa,
                               float * acc, int acc_stride, int n_embd, int n_ff_exp, uint32_t dtype);
+// Grouped u4 gate/up prefill GEMM over the resident per-expert bank: one
+// launch for every (active expert, column block) of a layer, each workgroup
+// staging a 128-value K chunk of the expert's u4 plane (expanded to int8 in
+// SLM) and running the expert's pairs in 64-row tiles.  The caller has already
+// quantized the token rows with act_quant_grp_run (xq/asa/xs), so no gather or
+// per-tile quantize happens.  `gate` != null applies silu(gate)*acc (the up
+// launch, in place over the gate output).  Returns false when the shape cannot
+// be served.
+bool moe_grp_u4_launch(sycl::queue & q, const uint8_t * bank, size_t plane_bytes, const int32_t * off,
+                       const int32_t * pair, const int32_t * active, const int32_t * n_active, int n_act_max,
+                       const int8_t * xq, const uint16_t * asa, const float * xs, float * out, int out_stride, int K,
+                       int N, int top_k, const float * gate);
 // Routed-expert u4 bank (PF_MOE_U4BANK): the prefill's per-expert oneDNN u4
 // gate/up GEMM reads a contiguous [tile_m][K] f32 activation tile gathered from
 // the token rows its pairs point at, and writes the fused silu(gate)*up back to
@@ -561,9 +586,24 @@ bool moe_row_gemv_down_launch(sycl::queue & q, const void * dbank, const int32_t
 // zero-filled; only the first `n` output rows are scattered.
 void moe_u4_gather_launch(sycl::queue & q, const float * x, const int32_t * pair, int p0, int n, int tile_m, int top_k,
                           int K, float * tile);
+// Gate/up's activation is quantized ONCE per layer (act_quant_grp_run) instead
+// of once per (expert, 64-row tile).  This gathers the already-quantized rows a
+// tile needs - xq [tile_m][K] int8, asa [tile_m][K/32] f16, xs [tile_m][K/32]
+// f32 - from the token rows `pair[p0+j] / top_k`.  It is the exact same bytes
+// the per-tile quantizer would have produced (it quantizes row by row), so the
+// oneDNN GEMM's result is unchanged; only the f32 gather + requantize goes
+// away, which measured ~35 us of the ~70 us a tile cost.
+void moe_u4_gather_i8_launch(sycl::queue & q, const int8_t * xq, const uint16_t * asa, const float * xs,
+                             const int32_t * pair, int p0, int n, int tile_m, int top_k, int K, int8_t * tq, int8_t * txe, int8_t * txo,
+                             uint16_t * tasa, float * txs, uint16_t * tcorr);
 void moe_u4_scatter_silu_launch(sycl::queue & q, const float * g, const float * u, const int32_t * pair, int p0, int n,
                                 int N, float * h, int h_stride);
 // decode form: both operands already sit at the pair rows (M=1 GEMVs wrote them)
+// dst[pair[p0+j]][c] = src[j][c], no activation: the int8 down bank's output is
+// already the projection result (the gate/up scatter applies silu because it
+// consumed the two halves).
+void moe_scatter_launch(sycl::queue & q, const float * src, const int32_t * pair, int p0, int n, int N, float * dst,
+                        int dst_stride);
 void moe_u4_silu_mul_launch(sycl::queue & q, float * g, const float * u, int n);
 // Grouped u4 expert GEMV: one launch for every (pair, row-block) of a decode's
 // gate or up projection, straight out of the packed per-expert bank.  The grid
@@ -615,4 +655,37 @@ void moe_reduce_launch(sycl::queue & q, const float * acc, const float * wts, in
 void moe_gate_add_launch(sycl::queue & q, const void * gate, uint32_t gtype, const float * x, int x_stride, int n_tok,
                          int n_embd, const float * shared, int sh_stride, float * out, int out_stride);
 
+void moe_u4_silu_pair_launch(sycl::queue & q, const float * g, const float * u, int n_pairs, int N, float * h);
+// The fused gate+up bank writes [pairs][2N] (columns 0..N-1 gate, N..2N-1 up),
+// so one silu kernel produces the FFN input.  `scatter` writes h at the pair
+// id (the tiled down path indexes by pair id); the linear form keeps the CSR
+// (pair-position) order the int8 down bank consumes.
+void moe_u4_silu_fused_launch(sycl::queue & q, const float * gu, int n_rows, int N, float * h, int h_stride);
+void moe_u4_silu_fused_scatter_launch(sycl::queue & q, const float * gu, const int32_t * pair, int n_pairs, int N,
+                                      float * h, int h_stride);
+// The banked prefill's weighted reduction: d_moe_acc is in CSR order, so the
+// pair -> token mapping is the inverse-scatter position map.
+void moe_reduce_csr_launch(sycl::queue & q, const float * acc, const float * wts, const int32_t * pos, int top_k,
+                           int n_tok, int n_embd, int acc_stride, float * out, int out_stride);
+
+// CSR-order activation staging for the oneDNN expert GEMMs.  The token-row
+// quantizer writes xq/asa/xs (act_quant_grp_run), and the expert bank's GEMMs
+// need the *pair* rows contiguously - one copy for the whole layer instead of
+// one gather per (expert, tile), so each expert's slice can be bound to a
+// oneDNN memory object with no kernel at all.  corr is the f16 xs*asa plane the
+// u4/int8 offset correction consumes.
+void moe_csr_gather_i8_launch(sycl::queue & q, const int8_t * xq, const uint16_t * asa, const float * xs,
+                              const int32_t * pair, int n_pairs, int top_k, int K, int8_t * tq,
+                              uint16_t * tasa, float * txs, uint16_t * tcorr);
+// The same correction plane for an activation that is already in pair order
+// (the down projection: moe_actq_launch quantizes d_moe_h row by row).
+void moe_csr_corr_launch(sycl::queue & q, const uint16_t * asa, const float * xs, uint16_t * corr, int n_rows, int ng);
+// The routed down projection's offset term, added once over the whole layer:
+// acc[p][n] += sum_g off_e[g][n] * xs[p][g].  One workgroup per (expert, 256
+// column block) walks that expert's CSR pairs, so the per-32 off plane is read
+// coalesced and the pair's 16 xs values are register/L1 resident.  This
+// replaces a oneDNN correction matmul per expert.
+void moe_down_corr_add_launch(sycl::queue & q, const uint8_t * bank, size_t plane_bytes, int K, int N,
+                              const int32_t * off, const int32_t * active, const int32_t * n_active, int n_act_max,
+                              const uint16_t * asa, const float * xs, float * acc, int acc_stride);
 } // namespace si

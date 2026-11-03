@@ -106,6 +106,11 @@ struct dnnl_gemm {
     bool add_weight_w4_dev(const void * key, const void * dev_vals, const void * dev_scale, const void * dev_off,
                            int K, int N);
     bool has_weight_w4(const void * key) const;
+    // Register a device-resident per-32-group int8 store (values [N][K] int8,
+    // step [K/32][N] f16).  Same bytes add_weight() would have produced, so
+    // gemm()'s int8 branch is the consumer; used by the routed down bank.
+    bool add_weight_i8_dev(const void * key, const void * dev_vals, const void * dev_scales, const void * dev_off,
+                           int K, int N);
     // the u4 store's device planes (values, per-(g,n) f16 step, per-(g,n) f16
     // offset).  For consumers that read single rows rather than run a GEMM - the
     // DFlash2 candidate selector gathers one row per candidate token.
@@ -146,6 +151,14 @@ struct dnnl_gemm {
     size_t weight_bytes() const;
     // Same contract as gemm(); out = alpha*sx[m]*(acc4 + correction) + residual.
     bool gemm_w4(const act_view & v, const void * key, const float * residual, float alpha, int M, int K, float * out, int out_stride);
+    // The same prefill GEMM, but for an activation that is *already* in the
+    // grouped-scale int8 form and in the caller's CSR (pair) order, so this
+    // binds xq/asa/corr straight into oneDNN memory objects - no per-tile
+    // gather, no copy.  alpha == 1 and residual == null (the expert banks).
+    // `corr` is the f16 xs*asa plane the offset correction consumes; `xs` is
+    // only needed for the scalar-epilogue fallback.
+    bool gemm_w4_csr(const void * key, const int8_t * xq, const uint16_t * asa, const float * xs,
+                     const uint16_t * corr, int M, int K, float * out, int out_stride);
 
     // Quantize one call's activations: x is token-major [M][x_stride]; if up is
     // non-null the value is silu(x)*up (ffn_down).  The result stays valid
@@ -156,6 +169,13 @@ struct dnnl_gemm {
     // Returns the view it produced, or an invalid one (gen == 0) on failure.
     act_view quantize(const float * x, const float * up, int x_stride, int up_stride, int M, int K,
                       bool do_split = true);
+    // The same scratch, filled by a gather of rows that are ALREADY quantized
+    // (the engine's per-layer act_quant_grp_run).  Rows are the token rows
+    // pair[p0+j] / top_k; a tile the per-tile quantize() would have produced is
+    // byte-identical (it quantizes row by row), so any GEMM sees the same
+    // operands.  split is false.  Used by the routed-expert gate/up path.
+    act_view quantize_gathered(const int8_t * xq, const uint16_t * asa, const float * xs, const int32_t * pair,
+                               int p0, int n, int top_k, int tile_m, int K);
     // True when `v` is still the activation sitting in the scratch buffers, i.e.
     // no quantize() has run since.  Every entry point that reads the scratch
     // checks this first and returns false (its caller then falls back) if not.
@@ -166,6 +186,23 @@ struct dnnl_gemm {
     // `v` is not the current activation.
     bool gemm(const act_view & v, const void * key, const float * residual, float alpha, int M, int K,
               float * out, int out_stride);
+    // int8 counterpart of gemm_w4_csr, for the routed down bank's per-32-group
+    // int8 store.  Same contract: the caller's CSR-order xq/asa/corr are bound
+    // directly, so the per-expert tile costs one primitive execute.
+    bool gemm_i8_csr(const void * key, const int8_t * xq, const uint16_t * asa, const float * xs,
+                     const uint16_t * corr, int M, int K, float * out, int out_stride);
+    // The step-scaled main matmul only (no offset correction): the caller adds
+    // sum_g off[g][n]*xs[m][g] with its own grouped kernel.  Saves one oneDNN
+    // execute per expert, which is comparable to the compute at this M.
+    bool gemm_i8_csr_nocorr(const void * key, const int8_t * xq, const uint16_t * asa, int M, int K, float * out,
+                            int out_stride);
+    // Wait for queued GEMM work on both ordering domains (the queue and the
+    // interop stream).  A SYCL queue wait does not cover a separate stream.
+    void sync();
+    // Pre-create the int8 primitives (and their offset-correction matmuls) for
+    // every M bucket the routed down bank can use, so no primitive is compiled
+    // between queued expert GEMMs.
+    void warm_i8(int K, int N, const int * Ms, int n);
 
     // Execute every cached primitive once on dummy data so the first real
     // request does not pay the one-time kernel load.  Call after all weights

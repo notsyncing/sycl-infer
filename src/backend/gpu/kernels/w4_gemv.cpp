@@ -1395,7 +1395,7 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
     // conflicts).  Exception: at M>=12 the u4 kernel's larger accumulator set
     // wants the 48-byte stride back (u4 M=12: 0.572 -> 0.549 ms); u4 is the
     // only format that regresses there.
-    constexpr int APAD = (FMT == 0 && M >= 12) ? 48 : 32;
+    constexpr int APAD = (FMT == 0 && M >= 12 && M <= 13) ? 48 : 32;
     const int ng = K / 32;
     // PF_W4_GROUP: only the u4 (FMT 0) store has a widened scale group; k5,
     // cb4 and the int8-grouped store keep the per-32 planes.
@@ -1824,6 +1824,36 @@ static void nat_gemm_impl(queue & q, const uint8_t * w0, const uint8_t * w1, con
 // it the reqd_sub_group_size(8) kernel does not launch there at all and the
 // batched decode fell back to oneDNN.  Both instantiations are built; which one
 // runs is decided once per launch from the device profile's hw.sub_group8.
+// The prefill's routed tiles are wider than the verify's: a 32-token batch has
+// ~25 (token, expert) pairs per expert, so M = 32 is the shape that matters.
+// Same kernel, C=1 (P = M * C = 32 accumulators, the register budget that
+// measured best) and APAD = 32 so act_s stays at 32 KB.  Only the u4 and
+// grouped-int8 stores are instantiated: those are the routed gate/up and down
+// banks; k5/cb4 never reach this width.
+#ifndef NAT_TX
+#define NAT_TX 128
+#endif
+template <int FMT, int SG>
+static void nat_gemm_big(queue & q, const uint8_t * w0, const int8_t * w8, const uint16_t * scale,
+                         const uint16_t * off, const int8_t * axe, const int8_t * axo, const int8_t * axg,
+                         const uint16_t * asa, const float * xs, float * out, int out_stride, const float * residual,
+                         float alpha, int M, int K, int N) {
+#define NAT_MBIG(mm)                                                                                       \
+    nat_gemm_impl<FMT, mm, 1, 32, SG, 1, NAT_TX, 0, 1, 0, 1, 1, 0>(q, w0, nullptr, w8, scale, off, nullptr, \
+                                                                     nullptr, axe, axo, axg, asa, xs, out,    \
+                                                                     out_stride, residual, alpha, K, N)
+    switch (M) {
+    case 14: NAT_MBIG(14); return;
+    case 16: NAT_MBIG(16); return;
+    case 20: NAT_MBIG(20); return;
+    case 24: NAT_MBIG(24); return;
+    case 28: NAT_MBIG(28); return;
+    case 32: NAT_MBIG(32); return;
+    default: return;
+    }
+#undef NAT_MBIG
+}
+
 template <int FMT, int SG>
 static void nat_gemm_pick(queue & q, const uint8_t * w0, const uint8_t * w1, const int8_t * w8,
                           const uint16_t * scale, const uint16_t * off, const uint16_t * lut16,
@@ -1890,6 +1920,16 @@ static void nat_gemm_fmt(queue & q, int fmt, const uint8_t * b0, const uint8_t *
                          const uint32_t * bit_lut, const int8_t * axe, const int8_t * axo, const int8_t * axg,
                          const uint16_t * asa, const float * xs, float * out, int out_stride, const float * residual,
                          float alpha, int M, int K, int N) {
+    if (M > 13) {
+        if (fmt == 0) {
+            nat_gemm_big<0, SG>(q, b0, w8, scale, off, axe, axo, axg, asa, xs, out, out_stride, residual, alpha, M,
+                                K, N);
+        } else if (fmt == 3) {
+            nat_gemm_big<3, SG>(q, b0, w8, scale, off, axe, axo, axg, asa, xs, out, out_stride, residual, alpha, M,
+                                K, N);
+        }
+        return;
+    }
     switch (fmt) {
     case 0:
         nat_gemm_pick<0, SG>(q, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out,
@@ -1917,7 +1957,7 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
                      const int8_t * axe, const int8_t * axo, const int8_t * axg, const uint16_t * asa,
                      const float * xs, float * out, int out_stride, const float * residual, float alpha, int M, int K,
                      int N) {
-    if (M < 2 || M > 13 || (K % 32) != 0) {
+    if (M < 2 || M > 32 || (K % 32) != 0) {
         return false;
     }
     // Sub-group width: a kernel declared with a reqd_sub_group_size the device

@@ -947,6 +947,12 @@ auto moe_call = [&](size_t idx) {
             // tiled, row-shaped, grouped, fp32 - must not run: the raw tensors
             // were never uploaded.  Down is unaffected and keeps its raw path.
             const bool u4_gu = !on_cpu && moe_u4_bank_ok(dev, moe_il) && !moe_host_split();
+            // The banked prefill keeps the routed activation/accumulator in CSR
+            // order (contiguous per expert, so the GEMMs write their destinations
+            // directly and no per-tile scatter runs).  It needs both banks: the
+            // u4 gate/up produces the CSR-ordered h and the int8 down consumes it.
+            const bool csr_layer = !dec_step && u4_gu && !on_cpu && moe_down_i8_bank_ok(dev, moe_il) &&
+                                   !moe_host_split();
             // Per queue (this layer's device), env first then the card profile:
             // a heterogeneous --layer-map must not run card 0's dp4a choice on
             // card 1.  PF_MOE_DP4A / PF_MOE_DP4A_DEC remain the A/B overrides.
@@ -996,6 +1002,10 @@ auto moe_call = [&](size_t idx) {
                 moe_csr_prefix_launch(qq, d_moe_off, d_moe_active, d_moe_nact, hp.n_expert);
                 moe_csr_scatter_launch(qq, d_moe_ids, d_moe_off, d_moe_cur, d_moe_pair, n_pairs);
             }
+            if (csr_layer) {
+                // pair id -> CSR position, for the weighted reduction.
+                moe_csr_pos_launch(qq, d_moe_pair, d_moe_pos, n_pairs);
+            }
             mtimer.lap(2);
             bool gu_done = u4_gu && moe_gate_up_u4(dev, moe_il, M, n_tok, n_pairs, mode);
             if (grp_ok && !gu_done) {
@@ -1034,11 +1044,32 @@ auto moe_call = [&](size_t idx) {
                                   d_moe_h, hp.n_ff_exp, hp.n_embd, hp.n_ff_exp, k, M.gate_exps.type, M.up_exps.type);
             }
             mtimer.lap(3);
+            const bool i8_bank = !on_cpu && moe_down_i8_bank_ok(dev, moe_il) && !moe_host_split();
+            const bool i8_dn = mode != 0 && i8_bank;
             if (grp_ok) {
                 if (!si::env::flag("PF_MOE_NOACTQ"))
                     moe_actq_launch(qq, d_moe_h, hp.n_ff_exp, n_pairs, hp.n_ff_exp, A.xq, A.asa, A.xs);
                 bool tdone = false;
-                if (tiled_dn) {
+                if (i8_bank && dec_step) {
+                    // A banked layer's raw planes were never uploaded, so the
+                    // decode reads the same store through the int8 GEMV.  It is
+                    // the same formula and the same bytes the prefill GEMM uses,
+                    // records into the decode command graph, and keeps the
+                    // expert-id addressing of the raw row GEMV it replaces.
+                    moe_i8_gemv_down_launch(qq, (const uint8_t *)wptr(dev, M.down_exps.data),
+                                            moe_i8_plane_[(size_t)moe_il], d_moe_ids, n_pairs, A.xq, A.asa, A.xs,
+                                            hp.n_ff_exp, hp.n_embd, d_moe_acc, hp.n_embd);
+                    tdone = true;
+                }
+                if (i8_dn) {
+                    // The raw planes were never uploaded once this layer is
+                    // banked, so a refusal is an error, not a fallback.
+                    if (!moe_down_i8(dev, moe_il, M, n_pairs, n_act)) {
+                        throw std::runtime_error("int8 expert down bank: GEMM failed");
+                    }
+                    tdone = true;
+                }
+                if (!tdone && tiled_dn) {
                     // top_k == 0: the down activation is indexed by the CSR
                     // pair position (d_moe_h was quantized per pair row).
                     tdone = moe_tiled_gemm_launch(qq, wptr(dev, M.down_exps.data), moe_slot_db[(size_t)moe_il], sm,
@@ -1086,7 +1117,12 @@ auto moe_call = [&](size_t idx) {
                         std::sqrt(sx2 / (double) xr_h.size()));
             }
             mtimer.lap(4);
-            moe_reduce_launch(qq, d_moe_acc, d_moe_wts, k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
+            if (csr_layer) {
+                moe_reduce_csr_launch(qq, d_moe_acc, d_moe_wts, d_moe_pos, k, n_tok, hp.n_embd, hp.n_embd, d_x,
+                                      hp.n_embd);
+            } else {
+                moe_reduce_launch(qq, d_moe_acc, d_moe_wts, k, n_tok, hp.n_embd, hp.n_embd, d_x, hp.n_embd);
+            }
             }
             mtimer.lap(5);
             // PF_MOE_HIST: how many routed pairs each active expert has.  This

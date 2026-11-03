@@ -623,7 +623,11 @@ struct dnnl_gemm::impl {
         int8_t * dev = nullptr;      // [N][K] row-major int8, quantized per group
         uint16_t * scales = nullptr; // [ng][N] f16 step (oneDNN grouped scale)
         memory wmem, scmem;
+        const uint16_t * off = nullptr; // per-32 f16 offset coefficient (lossless store)
+        memory offmem;
+        bool offmem_ok = false;
         bool ok = false;
+        bool dev_backed = false;     // the caller owns dev/scales (a bank)
     };
     std::unordered_map<const void *, w_entry> weights;
 
@@ -775,12 +779,25 @@ struct dnnl_gemm::impl {
         // usable when out is the compact [M][N] f32 layout.
         matmul rprim;
         bool rcok = false, rfails = false;
+        // CSR-order expert GEMMs: persistent memory objects whose handles are
+        // re-pointed at the caller's slices per tile.  Creating a memory object
+        // per tile cost more than the primitive (~10-20 us of a ~36 us call);
+        // set_data_handle is a store.
+        memory xsrc, xsscales, xcsrc, xdst;
+        bool xmem = false, xcsrc_ok = false;
     };
     std::unordered_map<uint64_t, prim4_entry> prims4;
 
     struct prim_entry {
         matmul prim;
         memory src, dst, sscales; // sscales wraps p->asa (grouped SRC scales)
+        // rank-(K/32) offset-correction matmul for a lossless int8 store
+        matmul cprim;
+        memory csrc;
+        bool cok = false, cfails = false;
+        // the same persistent-handle trick as prim4_entry
+        memory xsrc, xsscales, xcsrc, xdst;
+        bool xmem = false, xcsrc_ok = false;
     };
     std::unordered_map<uint64_t, prim_entry> prims;
 
@@ -1169,6 +1186,9 @@ bool dnnl_gemm::has_weight(const void * key) const {
 size_t dnnl_gemm::weight_bytes() const {
     size_t n = 0;
     for (const auto & kv : p->weights) {
+        if (kv.second.dev_backed) {
+            continue; // the caller owns the planes (the routed down bank)
+        }
         n += (size_t)kv.second.K * kv.second.N + (size_t)kv.second.ng * kv.second.N * 2;
     }
     for (const auto & kv : p->w4weights) {
@@ -1519,6 +1539,44 @@ bool dnnl_gemm::add_weight_w4_dev(const void * key, const void * dev_vals, const
     return ins.first->second.ok;
 }
 
+// Register a per-32-group int8 store whose two planes already live in device
+// memory: the routed-expert down bank.  Layout matches add_weight()'s output
+// exactly - values [N][K] int8 with an amax/127 scale per 32-value group, and a
+// [ng][N] f16 step plane - so gemm()'s plain int8 branch consumes it with no
+// other change.  The planes belong to the caller; weight_bytes() must not count
+// them again (the engine's own ledger holds the bank).
+bool dnnl_gemm::add_weight_i8_dev(const void * key, const void * dev_vals, const void * dev_scales,
+                                  const void * dev_off, int K, int N) {
+    if (!key || !dev_vals || !dev_scales || K <= 0 || N <= 0 || (K % kW4Group) != 0 || K > kActMaxK) {
+        return false;
+    }
+    auto found = p->weights.find(key);
+    if (found != p->weights.end()) {
+        return found->second.ok;
+    }
+    const int ng = K / kW4Group;
+    impl::w_entry e;
+    e.K = K;
+    e.N = N;
+    e.ng = ng;
+    e.dev = (int8_t *)dev_vals;
+    e.scales = (uint16_t *)dev_scales;
+    e.off = (const uint16_t *)dev_off;
+    e.dev_backed = true;
+    if (dev_off) {
+        e.offmem = sycl_interop::make_memory(memory::desc({ng, N}, memory::data_type::f16, memory::format_tag::ab),
+                                             p->eng, sycl_interop::memory_kind::usm, (void *)dev_off);
+        e.offmem_ok = e.offmem.get(true) != nullptr;
+    }
+    e.wmem = sycl_interop::make_memory(memory::desc({K, N}, memory::data_type::s8, memory::format_tag::ba), p->eng,
+                                       sycl_interop::memory_kind::usm, (void *)e.dev);
+    e.scmem = sycl_interop::make_memory(memory::desc({1, ng * N}, memory::data_type::f16, memory::format_tag::ab),
+                                        p->eng, sycl_interop::memory_kind::usm, (void *)e.scales);
+    e.ok = true;
+    auto ins = p->weights.emplace(key, std::move(e));
+    return ins.first->second.ok;
+}
+
 bool dnnl_gemm::has_weight_w4(const void * key) const {
     auto it = p->w4weights.find(key);
     return it != p->w4weights.end() && it->second.ok;
@@ -1780,6 +1838,41 @@ act_view dnnl_gemm::quantize(const float * x, const float * up, int x_stride, in
     return v;
 }
 
+act_view dnnl_gemm::quantize_gathered(const int8_t * xq, const uint16_t * asa, const float * xs,
+                                      const int32_t * pair, int p0, int n, int top_k, int tile_m, int K) {
+    act_view v;
+    p->acts_valid = false;
+    ++p->act_gen;
+    // pair == nullptr: a linear gather (rows p0 .. p0+n-1), which the banked
+    // prefill's down projection uses because its activation plane is already in
+    // CSR order.
+    if (!xq || !asa || !xs || n < 0 || n > tile_m || tile_m <= 0 || tile_m > p->cap_M || K <= 0 ||
+        K > p->cap_K || K % 32 != 0 || (!pair && top_k != 0)) {
+        return v;
+    }
+    static const bool abl_qg = [] {
+        const char * e = si::env::str("PF_MOE_ABL_QG");
+        return e && atoi(e) != 0;
+    }();
+    if (!abl_qg)
+        moe_u4_gather_i8_launch(p->q, xq, asa, xs, pair, p0, n, tile_m, top_k, K, p->axg, p->axe, p->axo, p->asa,
+                                p->xs, p->corrsrc);
+    if (p->has_w4 && tile_m > 1 && si::w4_group() > kW4Group) {
+        w4_corr_group_launch(p->q, p->corrsrc, p->corrsrcG, si::w4_group() / kW4Group, tile_m, K / kW4Group);
+    }
+    p->cur_M = tile_m;
+    p->cur_K = K;
+    p->acts_valid = true;
+    // The gather also writes the even/odd k planes, so the native batched GEMM
+    // (nat_gemm, extended to the prefill's 32-row tiles) can consume this view.
+    p->split_valid = (p->axe != nullptr && p->axo != nullptr);
+    v.m = tile_m;
+    v.k = K;
+    v.split = p->split_valid;
+    v.gen = p->act_gen;
+    return v;
+}
+
 bool dnnl_gemm::view_is_current(const act_view & v) const {
     return v.valid() && p->acts_valid && v.gen == p->act_gen;
 }
@@ -1979,13 +2072,23 @@ bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residua
         }
     }
     impl::prim_entry & pe = pit->second;
+    // A compact [M][N] destination with no residual and alpha == 1 can be the
+    // primitive's dst directly: the f32 epilogue pass and its kernel launch
+    // disappear.  The routed down bank uses this to write straight into its
+    // CSR-ordered accumulator.
+    const bool direct_i8 = out != nullptr && residual == nullptr && alpha == 1.0f && out_stride == w.N &&
+                           ((uintptr_t)out % 64) == 0;
+    memory dst_m = pe.dst;
+    if (direct_i8) {
+        dst_m = sycl_interop::make_memory(pe.dst.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)out);
+    }
     dnnl_capture_guard();
     if (dnnl_qwait_env()) {
         p->q.wait();
     }
     pe.prim.execute(p->st, {{DNNL_ARG_SRC, pe.src},
                             {DNNL_ARG_WEIGHTS, w.wmem},
-                            {DNNL_ARG_DST, pe.dst},
+                            {DNNL_ARG_DST, dst_m},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
                             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, pe.sscales}});
     if (acc_sum_env() && p->accsum && p->accsum_n < impl::kAccSlots) {
@@ -2004,7 +2107,45 @@ bool dnnl_gemm::gemm(const act_view & v, const void * key, const float * residua
         p->st.wait();
     }
     // both the weight and the activation scales are applied by the matmul now
-    epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, w.N);
+    // A lossless store keeps the source's q and carries its zero point in the
+    // off plane: accf already has the step (weights scales) and the activation
+    // scale applied, so add sum_g off*xs*sa exactly as the u4 path does.  The
+    // scalar epilogue over ng=16 groups is far too slow for N=2048 (measured
+    // 32 s of the 3213-token prefill), so use the same rank-ng correction
+    // matmul the u4 path uses, with this weight's off plane as its B operand.
+    if (w.off) {
+        if (!pit->second.cok && !pit->second.cfails) {
+            try {
+                const int ng32 = K / kW4Group;
+                auto xc = memory::desc({M, ng32}, memory::data_type::f16, memory::format_tag::ab);
+                auto wc = memory::desc({ng32, w.N}, memory::data_type::f16, memory::format_tag::ab);
+                primitive_attr cattr;
+                post_ops cop;
+                cop.append_sum(1.0f);
+                cattr.set_post_ops(cop);
+                pit->second.cprim = matmul(matmul::primitive_desc(p->eng, xc, wc, pit->second.dst.get_desc(), cattr));
+                pit->second.csrc =
+                    sycl_interop::make_memory(xc, p->eng, sycl_interop::memory_kind::usm, (void *)p->corrsrc);
+                pit->second.cok = true;
+            } catch (const std::exception &) {
+                pit->second.cfails = true;
+            }
+        }
+        if (pit->second.cok && w.offmem_ok) {
+            pit->second.cprim.execute(p->st, {{DNNL_ARG_SRC, pit->second.csrc},
+                                              {DNNL_ARG_WEIGHTS, w.offmem},
+                                              {DNNL_ARG_DST, dst_m}});
+            if (!direct_i8) {
+                epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, w.N);
+            }
+        } else {
+            w4_epilogue_launch(p->q, p->accf, p->xs, w.off, p->asa, out, out_stride, residual, alpha, M, w.N, w.ng, 1);
+        }
+    } else {
+        if (!direct_i8) {
+            epilogue_f32_launch(p->q, p->accf, out, out_stride, residual, alpha, M, w.N);
+        }
+    }
     return true;
 }
 
@@ -2226,6 +2367,221 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
     w4_epilogue_launch(p->q, p->accf, p->xs, nocorr ? nullptr : w.off, p->asa, out, out_stride, residual, alpha, M, N,
                        K / kW4Group, w.G / kW4Group);
     return true;
+}
+
+// CSR-order prefill expert GEMMs: the activation is already what quantize()
+// would have produced (per-32-group int8, f16 scales, f16 xs*sa), and the
+// caller's rows are the GEMM's rows in order - so every expert tile binds the
+// slices directly.  The per-tile gather kernel this replaces was ~20 us of a
+// ~39 us call on the 35B A3B.
+bool dnnl_gemm::gemm_w4_csr(const void * key, const int8_t * xq, const uint16_t * asa, const float * xs,
+                            const uint16_t * corr, int M, int K, float * out, int out_stride) {
+    if (!key || !xq || !asa || !xs || M <= 0 || K <= 0 || M > p->cap_M) {
+        return false;
+    }
+    auto it = p->w4weights.find(key);
+    if (it == p->w4weights.end() || !it->second.ok) {
+        return false;
+    }
+    impl::w4_entry & w = it->second;
+    if (w.K != K) {
+        return false;
+    }
+    auto pit = p->prims4.find(impl::pkey(M, K, w.N));
+    if (pit == p->prims4.end()) {
+        impl::prim4_entry * e = nullptr;
+        try {
+            e = p->make_prim4(M, K, w.N);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (!e) {
+            return false;
+        }
+        pit = p->prims4.find(impl::pkey(M, K, w.N));
+    }
+    impl::prim4_entry & pe = pit->second;
+    const int N = w.N;
+    const bool direct = out != nullptr && out_stride == N && ((uintptr_t)out % 64) == 0;
+    memory src = sycl_interop::make_memory(pe.src.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)xq);
+    memory ssc = sycl_interop::make_memory(pe.sscales.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)asa);
+    memory dst_m = direct ? sycl_interop::make_memory(pe.dst.get_desc(), p->eng, sycl_interop::memory_kind::usm,
+                                                      (void *)out)
+                          : pe.dst;
+    dnnl_capture_guard();
+    pe.prim.execute(p->st, {{DNNL_ARG_SRC, src},
+                            {DNNL_ARG_WEIGHTS, w.wmem},
+                            {DNNL_ARG_DST, dst_m},
+                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
+                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, ssc}});
+    if (corr && pe.cok) {
+        memory cs = sycl_interop::make_memory(pe.csrc.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)corr);
+        pe.cprim.execute(p->st, {{DNNL_ARG_SRC, cs}, {DNNL_ARG_WEIGHTS, w.offmem}, {DNNL_ARG_DST, dst_m}});
+        if (!direct) {
+            epilogue_f32_launch(p->q, p->accf, out, out_stride, nullptr, 1.0f, M, N);
+        }
+        return true;
+    }
+    w4_epilogue_launch(p->q, direct ? out : p->accf, xs, corr ? w.off : nullptr, asa, out, out_stride, nullptr, 1.0f,
+                       M, N, K / kW4Group, w.G / kW4Group);
+    return true;
+}
+
+bool dnnl_gemm::gemm_i8_csr(const void * key, const int8_t * xq, const uint16_t * asa, const float * xs,
+                            const uint16_t * corr, int M, int K, float * out, int out_stride) {
+    if (!key || !xq || !asa || !xs || M <= 0 || K <= 0 || M > p->cap_M) {
+        return false;
+    }
+    auto it = p->weights.find(key);
+    if (it == p->weights.end() || !it->second.ok) {
+        return false;
+    }
+    impl::w_entry & w = it->second;
+    if (w.K != K) {
+        return false;
+    }
+    auto pit = p->prims.find(impl::pkey(M, K, w.N));
+    if (pit == p->prims.end()) {
+        impl::prim_entry * e = nullptr;
+        try {
+            e = p->make_prim(M, K, w.N);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (!e) {
+            return false;
+        }
+        pit = p->prims.find(impl::pkey(M, K, w.N));
+    }
+    impl::prim_entry & pe = pit->second;
+    const bool direct = out != nullptr && out_stride == w.N && ((uintptr_t)out % 64) == 0;
+    memory src = sycl_interop::make_memory(pe.src.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)xq);
+    memory ssc = sycl_interop::make_memory(pe.sscales.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)asa);
+    memory dst_m = direct ? sycl_interop::make_memory(pe.dst.get_desc(), p->eng, sycl_interop::memory_kind::usm,
+                                                      (void *)out)
+                          : pe.dst;
+    dnnl_capture_guard();
+    pe.prim.execute(p->st, {{DNNL_ARG_SRC, src},
+                            {DNNL_ARG_WEIGHTS, w.wmem},
+                            {DNNL_ARG_DST, dst_m},
+                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
+                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, ssc}});
+    if (w.off) {
+        if (!pe.cok && !pe.cfails) {
+            try {
+                const int ng32 = K / kW4Group;
+                auto xc = memory::desc({M, ng32}, memory::data_type::f16, memory::format_tag::ab);
+                auto wc = memory::desc({ng32, w.N}, memory::data_type::f16, memory::format_tag::ab);
+                primitive_attr cattr;
+                post_ops cop;
+                cop.append_sum(1.0f);
+                cattr.set_post_ops(cop);
+                pe.cprim = matmul(matmul::primitive_desc(p->eng, xc, wc, pe.dst.get_desc(), cattr));
+                pe.csrc = sycl_interop::make_memory(xc, p->eng, sycl_interop::memory_kind::usm, (void *)p->corrsrc);
+                pe.cok = true;
+            } catch (const std::exception &) {
+                pe.cfails = true;
+            }
+        }
+        if (pe.cok && w.offmem_ok && corr) {
+            memory cs = sycl_interop::make_memory(pe.csrc.get_desc(), p->eng, sycl_interop::memory_kind::usm,
+                                                  (void *)corr);
+            pe.cprim.execute(p->st, {{DNNL_ARG_SRC, cs}, {DNNL_ARG_WEIGHTS, w.offmem}, {DNNL_ARG_DST, dst_m}});
+            if (!direct) {
+                epilogue_f32_launch(p->q, p->accf, out, out_stride, nullptr, 1.0f, M, w.N);
+            }
+            return true;
+        }
+        static bool once_fail = true;
+        if (once_fail) {
+            once_fail = false;
+            fprintf(stderr, "[dnnl] i8 csr correction unavailable M=%d K=%d N=%d cok=%d csrc=%d offmem=%d\n", M, K,
+                    w.N, (int)pe.cok, (int)(corr != nullptr), (int)w.offmem_ok);
+        }
+        w4_epilogue_launch(p->q, direct ? out : p->accf, xs, w.off, asa, out, out_stride, nullptr, 1.0f, M, w.N, w.ng,
+                           1);
+        return true;
+    }
+    if (!direct) {
+        epilogue_f32_launch(p->q, p->accf, out, out_stride, nullptr, 1.0f, M, w.N);
+    }
+    return true;
+}
+
+void dnnl_gemm::warm_i8(int K, int N, const int * Ms, int n) {
+    for (int i = 0; i < n; i++) {
+        const int M = Ms[i];
+        if (M <= 0 || M > p->cap_M || (size_t)M * (size_t)N > p->acc_cap) {
+            continue;
+        }
+        impl::prim_entry * pe = nullptr;
+        try {
+            pe = p->make_prim(M, K, N);
+        } catch (const std::exception &) {
+            continue;
+        }
+        if (!pe || pe->cok || pe->cfails) {
+            continue;
+        }
+        try {
+            const int ng32 = K / kW4Group;
+            auto xc = memory::desc({M, ng32}, memory::data_type::f16, memory::format_tag::ab);
+            auto wc = memory::desc({ng32, N}, memory::data_type::f16, memory::format_tag::ab);
+            primitive_attr cattr;
+            post_ops cop;
+            cop.append_sum(1.0f);
+            cattr.set_post_ops(cop);
+            pe->cprim = matmul(matmul::primitive_desc(p->eng, xc, wc, pe->dst.get_desc(), cattr));
+            pe->csrc = sycl_interop::make_memory(xc, p->eng, sycl_interop::memory_kind::usm, (void *)p->corrsrc);
+            pe->cok = true;
+        } catch (const std::exception &) {
+            pe->cfails = true;
+        }
+    }
+}
+
+bool dnnl_gemm::gemm_i8_csr_nocorr(const void * key, const int8_t * xq, const uint16_t * asa, int M, int K,
+                                    float * out, int out_stride) {
+    if (!key || !xq || !asa || M <= 0 || K <= 0 || M > p->cap_M || out == nullptr) {
+        return false;
+    }
+    auto it = p->weights.find(key);
+    if (it == p->weights.end() || !it->second.ok) {
+        return false;
+    }
+    impl::w_entry & w = it->second;
+    if (w.K != K || out_stride != w.N || ((uintptr_t)out % 64) != 0) {
+        return false;
+    }
+    auto pit = p->prims.find(impl::pkey(M, K, w.N));
+    if (pit == p->prims.end()) {
+        impl::prim_entry * e = nullptr;
+        try {
+            e = p->make_prim(M, K, w.N);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (!e) {
+            return false;
+        }
+        pit = p->prims.find(impl::pkey(M, K, w.N));
+    }
+    impl::prim_entry & pe = pit->second;
+    memory src = sycl_interop::make_memory(pe.src.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)xq);
+    memory ssc = sycl_interop::make_memory(pe.sscales.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)asa);
+    memory dst = sycl_interop::make_memory(pe.dst.get_desc(), p->eng, sycl_interop::memory_kind::usm, (void *)out);
+    dnnl_capture_guard();
+    pe.prim.execute(p->st, {{DNNL_ARG_SRC, src},
+                            {DNNL_ARG_WEIGHTS, w.wmem},
+                            {DNNL_ARG_DST, dst},
+                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, w.scmem},
+                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, ssc}});
+    return true;
+}
+
+void dnnl_gemm::sync() {
+    p->q.wait();
+    p->st.wait();
 }
 
 const int8_t * dnnl_gemm::weight_data(const void * key) const {
