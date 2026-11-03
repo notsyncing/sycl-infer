@@ -599,6 +599,61 @@ the model load each engine pays), and the full-page ratio is **25x** - the page
 gap is dominated by the CLI's per-image init/JIT, not by its kernels.  Quote
 the layout-step figure when a conservative number is wanted.
 
+**Second pass, later the same day: 15.8 s -> 11.0 s.**  The box was fixed at
+2400 MHz (`xpu-smi config -d 0 --standby never`), one process per rep, quiet
+window.  Warm page cache unless stated:
+
+| | 15.8 s arm | final |
+|---|---:|---:|
+| startup + text model load | 2.68 s | **1.65 s** |
+| layout vision | 3.65 s | **2.49 s** |
+| - attention (32 layers) | 3.26 s | **2.10 s** |
+| layout text prefill | 0.26 s | 0.26 s |
+| layout decode (463 tok) | 3.27 s | 3.16 s |
+| 21 content blocks (vision + text) | 3.30 s | **2.77 s** (vision 1.31, text 1.93) |
+| text decode, page (676 tok) | 4.97 s | **4.60 s** (6.81 ms/tok) |
+| **page wall** | **15.8 s** | **10.99 / 11.23 s** (11.08/11.12/11.28) |
+| cold file cache | 13.6 s | **11.89 / 12.28 s** |
+
+Output is byte-identical throughout (21 blocks, md5
+`10eed240936226fd4696d943aaabc44b`; text-only `gen` md5
+`bfc55c543af1d1aecae5da0b1f9b99e5`; vision self-check cos 0.999104).  The
+attention ILP kernel (`RQ2/RQP2`, `BQ=48 BK=32 WG=1024`, SG16, vectorized K/V
+staging) keeps the per-score summation order; the decode fused
+quantize+whole-call GEMV reproduces `act_quant_grp_launch` + `i8_grp_gemv_impl`
+exactly; the load changes (lazy text primitives, compact 3.7 MB mmproj blob,
+deferred q/k/v f32 relayout, vectorized quantizer, async pinned staging, CPU
+tied-embedding copy) all produce the same weights (`PF_DNNL_QCHK=1`: 287/287
+tensors, 0 mismatches).
+
+**Where the remaining time is, and the ceiling.**  The per-phase floor with the
+current exact-order math is about **5.0 s one-shot** (load ~1.0, attention
+0.87 traffic / 0.55 compute, decode 0.9-1.5, vision GEMM 0.75, prefill 0.12,
+content ~0.5), or ~3.7 s with the process reused.  The measured 11 s is close
+to the **bit-exact** ceiling; the gap to 5 s needs numerical reordering or
+batching:
+
+* **decode 4.60 s vs 0.9-1.5 s floor**: 676 tokens x 0.52 GB/token at 76-88
+  GB/s.  The narrow N=896 projections expose ~896 warps (~112 of 512 EUs),
+  which is the shape's ceiling; split-K/reordered reductions change the token
+  stream, and oneDNN M=1 cannot enter the recorded decode graph.
+* **attention 2.10 s vs 0.87 s traffic floor**: exact-order ceiling.  f32
+  oneDNN QK/PV reaches 1.59 s but is not the reference summation order (an
+  earlier build flipped one bbox digit and runs were not deterministic), and
+  int8 oneDNN QK/PV (1.38 s) changed the page md5 and was nondeterministic;
+  both stay opt-in/off.
+* **content vision 1.31 s**: 21 different small M shapes each create their own
+  oneDNN primitives; batching the crops or an M-bucket ladder is the next
+  bit-exact step, worth ~0.5-1 s.
+* **load 1.65 s vs ~1.0 s**: the remaining int8 conversion (~0.85 s total);
+  a preconverted cache was rejected (unversioned key surface / wrong-output
+  risk).
+
+New knobs for this pass: `PF_VIT_ATTN=70` (ILP default; 0 = 32/32/512 fallback,
+71/72/73/76 = other ILP shapes, 51 = f32 oneDNN opt-in), `PF_DNNL_LAZY`,
+`PF_VISION_COMPACT`, `PF_VISION_DEFER_QKV`, `PF_LOAD_TIME`, `PF_DNNL_QCHK`,
+`PF_I8_SPLITK` (off).
+
 ## 8. What the curves mean
 
 

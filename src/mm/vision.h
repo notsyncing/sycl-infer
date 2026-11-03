@@ -139,12 +139,44 @@ struct vision_model {
     // on the dnnl path (caller uses vit_gemm).
     bool linear_dnnl(sycl::queue & q, const void * key, const float * x, int x_stride, int T, int K, float * out,
                      int out_stride, const float * residual, float alpha, int N);
-    // Extra host-side f32 copies: the combined qwen2vl q/k/v (and its bias), and
-    // - under PF_VISION_F32 - every linear.  `d_w32` is the device mirror and
+    // Extra host-side f32 copies: the combined qwen2vl q/k/v, and - under
+    // PF_VISION_F32 - every linear.  `d_w32` is the device mirror and
     // `dev_ptr` resolves pointers into either blob, so kernels do not care
     // which representation a tensor uses.
-    std::vector<float> w32;
+    //
+    // The qwen2vl q|k|v matrix is 3*n_embd^2 floats (629 MB on MinerU's tower)
+    // and is *only* read by the host reference forward and by the vit_gemm
+    // fallback: the oneDNN int8 converter reads the separate q/k/v tensors
+    // directly (add_weight_blocks).  Building it eagerly cost 0.67 s and
+    // 148 ms of H2D on every page, so it is built on demand (`ensure_w32`) and
+    // the device mirror exists only when a kernel can actually read it.
+    mutable std::vector<float> w32;
     float * d_w32 = nullptr;
+    // bytes the f32 side blob would occupy (its offsets are fixed at load, so
+    // the views stay valid when the values are filled later)
+    size_t w32_bytes = 0;
+    mutable bool w32_built = false;
+    // qwen2vl's combined q|k|v bias ([n_layer][3*E] f32) is small enough to
+    // build and upload eagerly; it is read on the device by vit_add_bias.
+    std::vector<float> qkv_b32;
+    float * d_qkv_b32 = nullptr;
+    struct qkv_src {
+        vt q, k, v;
+        size_t off = 0;
+    };
+    std::vector<qkv_src> host_qkv;
+    void ensure_w32() const;
+    // Compact weight blob: with every linear on the oneDNN int8 path, the only
+    // mmproj tensors a device kernel reads are the norms/biases (3.7 MB of the
+    // 1.32 GB file).  `blob_spans` maps the uploaded (host pointer, bytes) to
+    // its device offset; empty means the whole file is mapped 1:1 (the
+    // PF_VISION_DNNL=0 / partial-registration fallback).
+    struct blob_span {
+        const char * host = nullptr;
+        size_t bytes = 0;
+        size_t off = 0;
+    };
+    std::vector<blob_span> blob_spans;
     // Queue every device allocation below was made on (set on first upload):
     // sycl::free needs it, and freeing on another queue is UB.  All callers
     // pass the engine queue, so one queue per model holds in practice.
@@ -160,11 +192,31 @@ struct vision_model {
     vision_model & operator=(const vision_model &) = delete;
     const void * dev_ptr(const void * host_ptr) const {
         const char * h = (const char *)host_ptr;
-        if (d_w32 && !w32.empty()) {
-            const char * b = (const char *)w32.data();
-            if (h >= b && h < b + w32.size() * sizeof(float)) {
-                return (const char *)d_w32 + (h - b);
+        if (d_w32 && w32_bytes && h >= (const char *)w32.data() && h < (const char *)w32.data() + w32_bytes) {
+            return (const char *)d_w32 + (h - (const char *)w32.data());
+        }
+        if (d_qkv_b32 && !qkv_b32.empty() && h >= (const char *)qkv_b32.data()
+            && h < (const char *)qkv_b32.data() + qkv_b32.size() * sizeof(float)) {
+            return (const char *)d_qkv_b32 + (h - (const char *)qkv_b32.data());
+        }
+        if (!blob_spans.empty()) {
+            // binary search the uploaded spans (sorted by host pointer)
+            size_t lo = 0, hi = blob_spans.size();
+            while (lo < hi) {
+                const size_t mid = (lo + hi) / 2;
+                if (blob_spans[mid].host <= h) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
+            if (lo > 0) {
+                const blob_span & s = blob_spans[lo - 1];
+                if (h >= s.host && h < s.host + s.bytes) {
+                    return (const char *)dev_weights + s.off + (h - s.host);
+                }
+            }
+            return nullptr; // a tensor the compact blob deliberately omitted
         }
         return (const char *)dev_weights + (h - (const char *)gguf.map_base);
     }

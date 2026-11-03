@@ -505,10 +505,260 @@ static void i8_grp_gemv_impl(queue & q, const int8_t * w8, const uint16_t * wsc,
     });
 }
 
+// Split-K int8 grouped GEMV: SK sub-groups share one output row, each summing
+// a contiguous range of the row's 32-value groups.  Same per-group arithmetic
+// as i8_grp_gemv_impl; only the final fold differs (sub-group partials summed
+// in sub-group order).  This is for the shapes the decode's narrow projections
+// have - N = n_embd/n_kv = 896/128 with K = 4864 - where one warp per row
+// leaves most of the card idle because there are fewer rows than warp slots.
+template <int SK>
+static void i8_grp_gemv_sk_impl(queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                                const uint16_t * asa, const float * xs, float * out, const float * residual,
+                                float alpha, int K, int N) {
+    const int ng = K / 32;
+    const int chunk = (ng + SK - 1) / SK;
+    constexpr int TX = SK * 32;
+    q.submit([&](handler & h) {
+        local_accessor<float, 1> part((size_t)SK, h);
+        h.parallel_for(nd_range<1>((size_t)N * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int n = (int)it.get_group(0);
+            const int sg = (int)it.get_local_id(0) / 32;
+            const int lane = (int)it.get_local_id(0) % 32;
+            const int g0 = sg * chunk;
+            const int g1 = sycl::min(ng, g0 + chunk);
+            const int8_t * wrow = w8 + (size_t)n * K;
+            float acc = 0.f;
+            for (int g = g0 + lane; g < g1; g += 32) {
+                const uint4 w0 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32);
+                const uint4 w1 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32 + 16);
+                const uint4 x0 = *reinterpret_cast<const uint4 *>(xq + (size_t)g * 32);
+                const uint4 x1 = *reinterpret_cast<const uint4 *>(xq + (size_t)g * 32 + 16);
+                int32_t qd = 0;
+                qd = dp4a_s8u8((int32_t)x0.x(), w0.x() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x0.y(), w0.y() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x0.z(), w0.z() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x0.w(), w0.w() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x1.x(), w1.x() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x1.y(), w1.y() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x1.z(), w1.z() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8((int32_t)x1.w(), w1.w() ^ 0x80808080u, qd);
+                qd -= 128 * (int32_t)xs[g];
+                acc += w4_h2f(asa[g]) * w4_h2f(wsc[(size_t)g * N + n]) * (float)qd;
+            }
+            const sub_group sgg = it.get_sub_group();
+            const float tot = reduce_over_group(sgg, acc, plus<float>());
+            if (lane == 0) {
+                part[sg] = tot;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            if (it.get_local_id(0) == 0) {
+                float v = 0.f;
+                for (int s = 0; s < SK; s++) {
+                    v += part[s];
+                }
+                v *= alpha;
+                if (residual) {
+                    v += residual[n];
+                }
+                out[n] = v;
+            }
+        });
+    });
+}
+
+void i8_grp_gemv_sk_launch(queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
+                           const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha,
+                           int K, int N, int sk) {
+    // round down to an instantiated sub-group count (the caller only passes >= 2)
+    if (sk >= 8) {
+        i8_grp_gemv_sk_impl<8>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
+    } else if (sk >= 6) {
+        i8_grp_gemv_sk_impl<6>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
+    } else if (sk >= 4) {
+        i8_grp_gemv_sk_impl<4>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
+    } else if (sk >= 3) {
+        i8_grp_gemv_sk_impl<3>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
+    } else {
+        i8_grp_gemv_sk_impl<2>(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N);
+    }
+}
+
+// Fused activation quantize + grouped int8 GEMV for the M == 1 decode.
+//
+// The decode's per-call cost is dominated by the *number* of kernels, not their
+// bytes: a decoder like Qwen2-VL is n_embd 896 / n_ff 4864, so most of its
+// projections are 0.1-9 MB and a 5 us launch floor is a large share of each.
+// This kernel merges the activation quantizer (one work-group per group) and a
+// whole *call*'s segments (q|k|v, gate|up) into one launch:
+//
+//   * phase 1 quantizes the call's activation into SLM with the arithmetic of
+//     `act_quant_grp_launch` - same 32-value group, same sub-group max, same
+//     round/clamp, same integer group sum - so the int8 values and the f16
+//     scales are bit-identical to the global-buffer kernel;
+//   * phase 2 stages each row's per-group weight scales, from its own segment's
+//     scale plane (`[ng][N_seg]`), which lets the segments differ in width and
+//     output stride (q 896, k/v 128);
+//   * phase 3 is `i8_grp_gemv_impl`'s row arithmetic unchanged (same lane ->
+//     group map, same sub-group reduction), reading the quantized activation
+//     from SLM.
+//
+// So the output is bit-identical to quantize + one launch per segment; only the
+// launch count changes.  RB rows per work-group matches the per-segment GEMV's
+// shape so the scale staging keeps its coalescing.
+template <int RB, int NS>
+static void i8_grp_quant_gemv_impl(queue & q, const i8_grp_seg * segs, int total_rows, const float * x,
+                                   const float * up, int K) {
+    const int ng = K / 32;
+    constexpr int TX = RB * 32;
+    const int nwg = (total_rows + RB - 1) / RB;
+    // The descriptors must reach the kernel by value (a host stack array would
+    // be read as zeros on the device); see i8_grp_gemv_rows_multi_impl.
+    i8_grp_seg sv[NS];
+#pragma unroll
+    for (int i = 0; i < NS; i++) {
+        sv[i] = segs[i];
+    }
+    q.submit([&](handler & h) {
+        local_accessor<int, 1> xq_s((size_t)K / 4, h);
+        local_accessor<uint16_t, 1> asa_s((size_t)ng, h);
+        local_accessor<float, 1> xs_s((size_t)ng, h);
+        local_accessor<uint16_t, 1> meta((size_t)RB * (size_t)ng, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            int8_t * xq_b = reinterpret_cast<int8_t *>(xq_s.get_pointer().get());
+            // ---- phase 1: the call's activation, bit-identical to
+            // act_quant_grp_launch (M == 1, so the row offset is 0) ----
+            for (int g = sg; g < ng; g += RB) {
+                const int idx = g * 32 + lane;
+                float v = x[idx];
+                if (up) {
+                    v = silu_f(v) * up[idx];
+                }
+                const float mx = reduce_over_group(it.get_sub_group(), sycl::fabs(v), sycl::maximum<float>());
+                const float sc = mx > 0.f ? mx / 127.0f : 1.0f;
+                const float inv = 1.0f / sc;
+                const int qi = (int)sycl::round(v * inv);
+                const int8_t qv = (int8_t)sycl::max(-127, sycl::min(127, qi));
+                const int gsum = reduce_over_group(it.get_sub_group(), (int)qv, sycl::plus<int>());
+                if (lane == 0) {
+                    sycl::half hsc(sc);
+                    uint16_t bits;
+                    __builtin_memcpy((void *)&bits, &hsc, sizeof(bits));
+                    asa_s[g] = bits;
+                    xs_s[g] = (float)gsum;
+                }
+                xq_b[idx] = qv;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            // ---- phase 2: each row's weight scales, from its own segment ----
+            for (int i = lid; i < RB * ng; i += TX) {
+                const int g = i / RB;
+                const int row = (int)it.get_group(0) * RB + (i % RB);
+                uint16_t bits = 0;
+                if (row < total_rows) {
+                    int b = 0, s = 0, nr = sv[0].n_rows;
+                    while (row >= b + nr && s + 1 < NS) {
+                        b += nr;
+                        s++;
+                        nr = sv[s].n_rows;
+                    }
+                    bits = sv[s].wsc[(size_t)g * sv[s].n_rows + (row - b)];
+                }
+                meta[i] = bits;
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            // ---- phase 3: one row per sub-group, i8_grp_gemv_impl's loop ----
+            const int row = (int)it.get_group(0) * RB + sg;
+            if (row >= total_rows) {
+                return;
+            }
+            int b = 0, s = 0, nr = sv[0].n_rows;
+            while (row >= b + nr && s + 1 < NS) {
+                b += nr;
+                s++;
+                nr = sv[s].n_rows;
+            }
+            const i8_grp_seg & S = sv[s];
+            const int n = row - b;
+            const int8_t * wrow = S.w8 + (size_t)n * K;
+            float acc = 0.f;
+            for (int g = lane; g < ng; g += 32) {
+                const uint4 w0 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32);
+                const uint4 w1 = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 32 + 16);
+                const int * xp = xq_s.get_pointer().get() + (size_t)g * 8;
+                int32_t qd = 0;
+                qd = dp4a_s8u8(xp[0], w0.x() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[1], w0.y() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[2], w0.z() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[3], w0.w() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[4], w1.x() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[5], w1.y() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[6], w1.z() ^ 0x80808080u, qd);
+                qd = dp4a_s8u8(xp[7], w1.w() ^ 0x80808080u, qd);
+                qd -= 128 * (int32_t)xs_s[g];
+                acc += w4_h2f(asa_s[g]) * w4_h2f(meta[(size_t)g * RB + sg]) * (float)qd;
+            }
+            const sub_group sgg = it.get_sub_group();
+            const float tot = reduce_over_group(sgg, acc, plus<float>());
+            if (lane == 0) {
+                float v = S.alpha * tot;
+                if (S.residual) {
+                    v += S.residual[n];
+                }
+                S.out[n] = v;
+            }
+        });
+    });
+}
+
+void i8_grp_quant_gemv_launch(queue & q, const i8_grp_seg * segs, int n_segs, int total_rows, const float * x,
+                              const float * up, int K) {
+    constexpr int RB = 16;
+    switch (n_segs) {
+    case 1: i8_grp_quant_gemv_impl<RB, 1>(q, segs, total_rows, x, up, K); return;
+    case 2: i8_grp_quant_gemv_impl<RB, 2>(q, segs, total_rows, x, up, K); return;
+    case 3: i8_grp_quant_gemv_impl<RB, 3>(q, segs, total_rows, x, up, K); return;
+    case 4: i8_grp_quant_gemv_impl<RB, 4>(q, segs, total_rows, x, up, K); return;
+    default: break;
+    }
+    throw std::runtime_error("i8_grp_quant_gemv_launch: too many segments");
+}
+
 void i8_grp_gemv_launch(queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
                         const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha,
                         int K, int N) {
     const int ng = K / 32;
+    // Split-K: relevant only when a row has more groups than one warp has lanes
+    // (K > 1024), because below that a split leaves lanes idle instead of
+    // adding warps.  The row thresholds are the card profile's (the same ones
+    // the dp4a decode GEMV uses): `gemv_rows` rows fill the machine, `max`
+    // caps the split.  PF_I8_SPLITK: 0/unset = off, 1 = auto, >=2 = force SK.
+    // Off by default: measured neutral-to-worse on the A770 (a K=4864 row
+    // already has five independent group iterations per lane to hide latency).
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    const int max_sk = std::min(dp.split.max, ng / 32);
+    int sk = 1;
+    if (max_sk >= 2) {
+        const char * e = si::env::str("PF_I8_SPLITK");
+        const int ev = e ? atoi(e) : 0; // off unless asked: measured neutral
+        if (ev != 0) {
+            if (N <= dp.split.gemv_rows * 2) {
+                sk = (dp.split.gemv_rows + N - 1) / N;
+                if (sk > max_sk) {
+                    sk = max_sk;
+                }
+            }
+            if (ev >= 2) {
+                sk = std::min(max_sk, ev);
+            }
+        }
+    }
+    if (sk >= 2) {
+        i8_grp_gemv_sk_launch(q, w8, wsc, xq, asa, xs, out, residual, alpha, K, N, sk);
+        return;
+    }
     const int rb = w4_rb_for(q);
     const auto fits = [&](int n) { return (size_t)n * (size_t)ng * sizeof(uint16_t) <= (size_t)si::dev::for_queue(q).slm.budget_bytes; };
     if (rb == 8 && fits(8)) {

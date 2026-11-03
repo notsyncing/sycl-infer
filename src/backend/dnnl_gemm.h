@@ -84,8 +84,25 @@ struct dnnl_gemm {
     // stores its linears in those); `eager` false skips the prefill primitive
     // ladder, so a caller that uses a fixed set of shapes (the vision tower's
     // M chunks) pays only for the shapes it asks for.
-    bool add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N, bool eager = true);
+    // `lazy` is the same trade for a text partition that *does* prefill: the
+    // ladder is skipped and gemm() creates each M's primitive on its first
+    // call, except M=1, which is primed here because the 1-row decode is
+    // recorded into a command graph (a primitive must not be built while
+    // recording).  Measured on MinerU's multi-device partition: the page uses
+    // M=1 (decode graph) and one large prefill M, so a ladder of 32 shapes per
+    // tensor is almost entirely unused.
+    bool add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N, bool eager = true,
+                    bool lazy = false);
     bool has_weight(const void * key) const;
+
+    // Same conversion, but the [N][K] matrix is assembled from `n_src` row
+    // blocks: source s supplies `rows_per_src[s]` consecutive rows (its own
+    // ggml type) and `srcs[s]` points at its first row.  Used by the Qwen2-VL
+    // mmproj, whose q/k/v are three tensors that the kernels consume as one
+    // fused [3E][E] projection: converting them directly skips building (and
+    // re-reading) a 3E*E f32 copy of what is already in the file.
+    bool add_weight_blocks(const void * key, const void * const * srcs, const int * rows_per_src, int n_src,
+                           uint32_t ggml_type, int K, int N, bool lazy = false);
 
     // ---- 4-bit (u4) weights (see common/w4.h) -----------------------------
     // Native-width packing of a Q4_K tensor: u4 values [N][K] plus per-32-group
@@ -99,9 +116,13 @@ struct dnnl_gemm {
     // u4 GEMV only (the MTP draft layer, which never prefills).
     // cls/layer: the tensor class (see si::w4_only_allows) for the
     // PF_W4_ALL_ONLY allow-list.  Unclassified call sites pass nullptr.
+    // lazy: skip the prefill ladder but stay usable for prefill - gemm_w4()
+    // creates a missing shape's primitive on its first call; the M=1 primitive
+    // is still created here so a 1-row command-graph capture never builds one
+    // mid-recording.
     bool add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
                        bool any_type = false, bool gemv_only = false, float scale_mul = 1.0f,
-                       const char * cls = nullptr, int layer = -1);
+                       const char * cls = nullptr, int layer = -1, bool lazy = false);
     // Register a u4 store that *already lives in device memory* (the routed
     // experts' resident bank): no pack, no copy, three memory objects that wrap
     // `dev_vals` ([N][K/2] u4), `dev_scale` and `dev_off` ([K/32][N] f16).  The
@@ -214,6 +235,10 @@ struct dnnl_gemm {
     // were added.  Returns the number of primitives executed.
     int warmup();
 
+    // PF_LOAD_TIME: the registration split (host conversion / H2D / primitive
+    // ladder) accumulated across add_weight*().  One line, no-op when off.
+    void report_load(const char * who) const;
+
     // ---- diagnostics (dev checks) ----
     const int8_t * weight_data(const void * key) const;
     const float * weight_scales(const void * key) const;
@@ -232,6 +257,15 @@ struct dnnl_gemm {
     bool gemm_i8_group(const act_view & v, const void * const * keys, const int * n_rows, const float * const * outs,
                        int out_stride, const float * const * residuals, const float * alphas, int n_segs, int M,
                        int K);
+    // Fused quantize + whole-call int8 GEMV for the M == 1 decode: one launch
+    // for the call's activation quantizer and all of its plain-int8 segments.
+    // Bit-identical to quantize() followed by one gemm() per segment; `x`/`up`
+    // are the call's fp32 activations (up applies silu(gate) for ffn_down).
+    // Returns false when a segment is not a plain grouped-int8 weight, the K
+    // does not match, or the kernel's SLM tile does not fit this card.
+    bool gemm_i8_quant_group(const float * x, const float * up, const void * const * keys, const int * n_rows,
+                             const float * const * outs, const float * const * residuals, const float * alphas,
+                             int n_segs, int K);
     const int8_t * act_data(const act_view & v) const;
     // u4 path: the per-32-group quantized activations and their f16 scales
     // (device pointers), produced alongside the per-row form when a u4 weight
@@ -266,6 +300,11 @@ struct dnnl_gemm {
 private:
     struct impl;
     std::unique_ptr<impl> p;
+
+    // shared body of add_weight / add_weight_blocks: `rows[r]` is row r's
+    // first byte in its source tensor
+    bool add_weight_rows(const void * key, const char * const * rows, uint32_t ggml_type, int K, int N, bool eager,
+                         bool lazy);
 };
 
 // Queue -> dnnl_gemm registry: the attention kernels (src/backend/gpu/kernels/

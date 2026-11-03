@@ -18,6 +18,39 @@ namespace si {
 
 namespace {
 
+// PF_LOAD_TIME: the mmproj's load/upload phases.  The page's startup is a third
+// of its wall clock, and the mmproj alone is about half of that - but "load"
+// covers the GGUF parse, the qwen2vl qkv f32 re-layout, a 1.3 GB H2D and the
+// host-side int8 conversion, which have completely different fixes.  Off by
+// default; only clock reads.
+struct vision_load_timer {
+    bool on = si::env::flag("PF_LOAD_TIME");
+    std::chrono::steady_clock::time_point first, last;
+    vision_load_timer() : first(std::chrono::steady_clock::now()) {
+        last = first;
+    }
+    void lap(const char * what) {
+        if (!on) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[load]   vision %-24s %8.1f ms\n", what,
+                std::chrono::duration<double, std::milli>(now - last).count());
+        last = now;
+    }
+    void total(const char * what) {
+        if (!on) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[load]   vision %-24s %8.1f ms\n", what,
+                std::chrono::duration<double, std::milli>(now - first).count());
+        last = now;
+    }
+};
+
+// (the rest of the anonymous namespace)
+
 // PF_VISION_TIME: wall-clock split of the vision forward.  The stamps are taken
 // with q.wait() so the number is the device time of that stage (an in-order
 // queue otherwise lets launches run ahead and every stamp reads ~0).  Only the
@@ -86,11 +119,13 @@ float vt_get(const vt & t, int row, int k) {
 }
 
 void vision_model::load(const std::string & path, model_profile::vision_kind requested) {
+    vision_load_timer lt;
     if (requested == model_profile::vision_kind::none) {
         throw std::runtime_error("mmproj: the model profile declares no vision tower");
     }
     kind = requested;
     gguf.load(path);
+    lt.lap("gguf parse/mmap");
     const gguf_file & f = gguf;
     auto & hp = this->hp;
 
@@ -250,9 +285,13 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         hp.n_ff = raw[0].up.N;
     }
 
+    lt.lap("hparams/tensor bind");
     const int E = hp.n_embd;
     const size_t kOffNone = (size_t)-1;
     const bool f32_all = si::env::flag("PF_VISION_F32");
+    // PF_VISION_DEFER_QKV=0 builds the combined q|k|v f32 side blob at load, the
+    // pre-optimisation behaviour (A/B only: it costs ~0.67 s and 0.63 GB).
+    const bool defer_qkv = si::env::i32("PF_VISION_DEFER_QKV", 1) != 0;
     auto tsize = [](const vt & t) { return (size_t)t.N * (size_t)t.K; };
     auto wants_f32 = [&](const vt & t) { return f32_all && t.data && t.type != GGML_TYPE_F32; };
 
@@ -261,7 +300,7 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
     size_t total = 0;
     for (const raw_layer & R : raw) {
         if (q2) {
-            total += 3 * (size_t)E * (size_t)E + 3 * (size_t)E;
+            total += 3 * (size_t)E * (size_t)E; // the combined q/k/v matrix; the bias is separate
         } else if (wants_f32(R.qkv)) {
             total += tsize(R.qkv);
         }
@@ -277,13 +316,27 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         }
     }
     w32.reserve(total);
-
-    auto append_vt = [&](const vt & t) {
-        const size_t off = w32.size();
-        w32.resize(off + tsize(t));
-        for (int r = 0; r < t.N; r++) {
-            for (int k = 0; k < t.K; k++) {
-                w32[off + (size_t)r * t.K + k] = vt_get(t, r, k);
+    w32_bytes = total * sizeof(float);
+    if (q2) {
+        qkv_b32.assign((size_t)hp.n_layer * 3 * (size_t)E, 0.f);
+    }
+    // Offsets are assigned against a cursor, not against w32.size(): the
+    // qwen2vl q/k/v matrix is 3E*E floats per layer (~629 MB on MinerU's
+    // tower) and is only needed by the host reference forward and the
+    // vit_gemm fallback, so it is filled on demand (ensure_w32) unless the
+    // PF_VISION_F32 diagnostic is on.
+    size_t cursor = 0;
+    auto append_vt = [&](const vt & t, bool fill) {
+        const size_t off = cursor;
+        cursor += tsize(t);
+        if (fill) {
+            if (w32.size() < cursor) {
+                w32.resize(cursor);
+            }
+            for (int r = 0; r < t.N; r++) {
+                for (int k = 0; k < t.K; k++) {
+                    w32[off + (size_t)r * t.K + k] = vt_get(t, r, k);
+                }
             }
         }
         return off;
@@ -299,9 +352,9 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         if (q2) {
             // One contiguous [3E][E] f32 qkv plus a [3E] bias: the decoder path
             // then runs one fused projection exactly like qwen3vl, and the
-            // separate-tensor layout never reaches a kernel.
-            const size_t off = w32.size();
-            w32.resize(off + 3 * (size_t)E * (size_t)E);
+            // separate-tensor layout never reaches a kernel.  Only the bias is
+            // filled here; the matrix is the deferred side blob.
+            const size_t off = append_vt(vt{nullptr, GGML_TYPE_F32, E, 3 * E}, false);
             auto copy = [&](const vt & t, int dst0) {
                 if (t.K != E || t.N != E) {
                     throw std::runtime_error("mmproj: qwen2vl q/k/v is not [E][E]");
@@ -312,52 +365,59 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
                     }
                 }
             };
-            copy(R.q, 0);
-            copy(R.k, E);
-            copy(R.v, 2 * E);
+            if (f32_all || !defer_qkv) {
+                if (w32.size() < off + 3 * (size_t)E * (size_t)E) {
+                    w32.resize(off + 3 * (size_t)E * (size_t)E);
+                }
+                copy(R.q, 0);
+                copy(R.k, E);
+                copy(R.v, 2 * E);
+            }
+            host_qkv.push_back(qkv_src{R.q, R.k, R.v, off});
             qkv_off[(size_t)il] = off;
-            const size_t boff = w32.size();
-            w32.resize(boff + 3 * (size_t)E);
+            const size_t boff = (size_t)il * 3 * (size_t)E;
             for (int i = 0; i < E; i++) {
-                w32[boff + i] = R.q_b ? R.q_b[i] : 0.f;
-                w32[boff + E + i] = R.k_b ? R.k_b[i] : 0.f;
-                w32[boff + 2 * E + i] = R.v_b ? R.v_b[i] : 0.f;
+                qkv_b32[boff + i] = R.q_b ? R.q_b[i] : 0.f;
+                qkv_b32[boff + E + i] = R.k_b ? R.k_b[i] : 0.f;
+                qkv_b32[boff + 2 * E + i] = R.v_b ? R.v_b[i] : 0.f;
             }
             qkv_b_off[(size_t)il] = boff;
         } else if (wants_f32(R.qkv)) {
-            qkv_off[(size_t)il] = append_vt(R.qkv);
+            qkv_off[(size_t)il] = append_vt(R.qkv, true);
         }
         if (wants_f32(R.out)) {
-            out_off[(size_t)il] = append_vt(R.out);
+            out_off[(size_t)il] = append_vt(R.out, true);
         }
         if (wants_f32(R.up)) {
-            up_off[(size_t)il] = append_vt(R.up);
+            up_off[(size_t)il] = append_vt(R.up, true);
         }
         if (wants_f32(R.down)) {
-            down_off[(size_t)il] = append_vt(R.down);
+            down_off[(size_t)il] = append_vt(R.down, true);
         }
     }
     if (wants_f32(mm0)) {
-        mm0_off = append_vt(mm0);
+        mm0_off = append_vt(mm0, true);
     }
     if (wants_f32(mm2)) {
-        mm2_off = append_vt(mm2);
+        mm2_off = append_vt(mm2, true);
     }
-    if (w32.size() > total) {
+    if (cursor != total) {
         throw std::runtime_error("mmproj: internal f32 side-blob size mismatch");
     }
+    w32_built = f32_all || !defer_qkv; // otherwise the deferred q/k/v matrix is filled on demand
 
     auto view = [&](size_t off, const vt & fallback) {
         return off == kOffNone ? fallback : vt{w32.data() + off, GGML_TYPE_F32, fallback.K, fallback.N};
     };
 
+    lt.lap("f32 side blob (qkv relayout)");
     layers.resize((size_t)hp.n_layer);
     for (int il = 0; il < hp.n_layer; il++) {
         const raw_layer & R = raw[(size_t)il];
         vision_layer & L = layers[(size_t)il];
         if (q2) {
             L.qkv = vt{w32.data() + qkv_off[(size_t)il], GGML_TYPE_F32, E, 3 * E};
-            L.qkv_b = w32.data() + qkv_b_off[(size_t)il];
+            L.qkv_b = qkv_b32.data() + qkv_b_off[(size_t)il];
         } else {
             L.qkv = view(qkv_off[(size_t)il], R.qkv);
             L.qkv_b = R.qkv_b;
@@ -375,11 +435,37 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
     }
     mm0 = view(mm0_off, mm0);
     mm2 = view(mm2_off, mm2);
+    lt.total("load total");
+}
+
+// The deferred qwen2vl q|k|v f32 matrix: only the host reference forward and
+// the vit_gemm fallback read it, and both are cold paths (the page's encoder
+// runs every linear on the oneDNN int8 matmul, which converts q/k/v from the
+// GGUF's own f16 tensors).
+void vision_model::ensure_w32() const {
+    if (w32_built) {
+        return;
+    }
+    const int E = hp.n_embd;
+    w32.resize(w32_bytes / sizeof(float));
+    for (const qkv_src & S : host_qkv) {
+        auto copy = [&](const vt & t, int dst0) {
+            for (int r = 0; r < E; r++) {
+                for (int k = 0; k < E; k++) {
+                    w32[S.off + (size_t)(dst0 + r) * E + k] = vt_get(t, r, k);
+                }
+            }
+        };
+        copy(S.q, 0);
+        copy(S.k, E);
+        copy(S.v, 2 * E);
+    }
+    w32_built = true;
 }
 
 vision_model::~vision_model() {
     free_dev_ptrs(dev_q,
-                  {dev_weights, d_w32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0});
+                  {dev_weights, d_w32, d_qkv_b32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0});
     delete gemm;
     gemm = nullptr;
 }
@@ -417,23 +503,12 @@ bool vision_model::linear_dnnl(sycl::queue & q, const void * key, const float * 
 }
 
 void vision_model::upload(sycl::queue & q) {
+    vision_load_timer lt;
     pin_dev_queue(dev_q, q, "vision");
     if (dev_weights) {
         return;
     }
-    dev_weights_size = gguf.map_size;
-    dev_weights = sycl::malloc_device(dev_weights_size, q);
-    if (!dev_weights) {
-        throw std::runtime_error("mmproj device allocation failed");
-    }
-    q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
-    if (!w32.empty()) {
-        d_w32 = sycl::malloc_device<float>(w32.size(), q);
-        if (!d_w32) {
-            throw std::runtime_error("mmproj side-blob device allocation failed");
-        }
-        q.memcpy(d_w32, w32.data(), w32.size() * sizeof(float)).wait();
-    }
+    const int E = hp.n_embd;
 
     // The vision linears on the text model's oneDNN int8 path.  vit_gemm tiles
     // M in 32-token groups and re-reads each weight block per tile; at 5476
@@ -443,14 +518,23 @@ void vision_model::upload(sycl::queue & q) {
     // crops all have different patch counts), so this does not create a ladder
     // of a thousand primitives per tensor.
     //
+    // Registration runs *before* the blob copy because it decides what the
+    // blob has to contain: once every linear is on the int8 path, the only
+    // mmproj tensors a device kernel reads are the norms/biases (3.7 MB of the
+    // 1.32 GB file), so the 1.28 GB of f16 linears is neither copied nor kept
+    // resident.
+    //
     // Default on for the qwen2vl tower (verified: identical page md5, self-check
     // cos 0.9991, 5x on the layout image).  Off for qwen3vl: that tower is
     // BF16/head_dim 64-72 and there is no model here to verify it against, so
     // the flag is left as the opt-in until it is measured (PF_VISION_DNNL=1).
+    bool all = false;
+    // PF_VISION_COMPACT=0 restores the whole-file blob (fallback/debug A/B).
+    const bool compact_ok = si::env::i32("PF_VISION_COMPACT", 1) != 0;
     const int dnnl_dflt = kind == model_profile::vision_kind::qwen2vl ? 1 : 0;
     if (si::env::i32("PF_VISION_DNNL", dnnl_dflt) != 0) {
         gemm = new dnnl_gemm(q);
-        bool all = true;
+        all = true;
         auto add = [&](const vt & w) {
             if (!w.data) {
                 return;
@@ -459,19 +543,128 @@ void vision_model::upload(sycl::queue & q) {
                 all = false;
             }
         };
-        for (const vision_layer & L : layers) {
-            add(L.qkv);
+        for (size_t il = 0; il < layers.size(); il++) {
+            vision_layer & L = layers[il];
+            bool qkv_ok = false;
+            if (kind == model_profile::vision_kind::qwen2vl && il < host_qkv.size()) {
+                // q/k/v are three tensors and the kernel consumes one fused
+                // [3E][E] projection.  Convert them straight from the GGUF
+                // rather than from the 3E*E f32 copy that exists only for the
+                // host path.
+                const qkv_src & S = host_qkv[il];
+                const void * srcs[3] = {S.q.data, S.k.data, S.v.data};
+                const int rows[3] = {E, E, E};
+                if (S.q.type == S.k.type && S.q.type == S.v.type && S.q.K == E && S.q.N == E
+                    && S.k.K == E && S.k.N == E && S.v.K == E && S.v.N == E) {
+                    // lazy: the tower's M values are per-crop patch counts (every
+                    // content block differs), so a ladder cannot predict them -
+                    // this is the same trade the other vision linears already
+                    // make with eager=false.
+                    qkv_ok = gemm->add_weight_blocks(L.qkv.data, srcs, rows, 3, S.q.type, E, 3 * E, /*lazy=*/true);
+                }
+                if (!qkv_ok) {
+                    // mixed types/shapes: build the f32 copy and take the old route
+                    ensure_w32();
+                }
+            }
+            if (!qkv_ok) {
+                add(L.qkv);
+            }
             add(L.out);
             add(L.up);
             add(L.down);
         }
         add(mm0);
         add(mm2);
+        gemm->report_load("vision");
+        lt.lap("int8 convert (add_weight)");
         if (si::env::flag("PF_VISION_TIME")) {
             fprintf(stderr, "[vtime] dnnl vision: %s, %.1f MiB int8 weights\n", all ? "on" : "partial",
                     (double)gemm->weight_bytes() / 1048576.0);
         }
     }
+
+    // Weight blob.  Compact when every linear is on the int8 path; otherwise
+    // the whole file is mapped 1:1 so a vit_gemm fallback can still read any
+    // tensor at its GGUF offset.
+    blob_spans.clear();
+    if (all && compact_ok) {
+        // the host-side tensor each linear was converted from
+        std::vector<const void *> linear;
+        for (size_t il = 0; il < layers.size(); il++) {
+            if (kind == model_profile::vision_kind::qwen2vl && il < host_qkv.size()) {
+                linear.push_back(host_qkv[il].q.data);
+                linear.push_back(host_qkv[il].k.data);
+                linear.push_back(host_qkv[il].v.data);
+            }
+        }
+        for (const vision_layer & L : layers) {
+            for (const vt * t : {&L.out, &L.up, &L.down}) {
+                linear.push_back(t->data);
+            }
+            if (kind != model_profile::vision_kind::qwen2vl) {
+                linear.push_back(L.qkv.data);
+            }
+        }
+        linear.push_back(mm0.data);
+        linear.push_back(mm2.data);
+        auto is_linear = [&](const void * p) {
+            for (const void * q2p : linear) {
+                if (q2p == p) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        size_t need = 0;
+        for (const gguf_tensor_info & t : gguf.tensors) {
+            if (!t.data || t.nbytes() == 0 || is_linear(t.data)) {
+                continue;
+            }
+            blob_spans.push_back(blob_span{(const char *)t.data, (size_t)t.nbytes(), need});
+            need += (size_t)t.nbytes();
+        }
+        std::sort(blob_spans.begin(), blob_spans.end(),
+                  [](const blob_span & a, const blob_span & b) { return a.host < b.host; });
+        dev_weights_size = need;
+        dev_weights = sycl::malloc_device(dev_weights_size ? dev_weights_size : 1, q);
+        if (!dev_weights) {
+            throw std::runtime_error("mmproj device allocation failed");
+        }
+        for (const blob_span & sp : blob_spans) {
+            q.memcpy((char *)dev_weights + sp.off, sp.host, sp.bytes);
+        }
+        q.wait();
+    } else {
+        dev_weights_size = gguf.map_size;
+        dev_weights = sycl::malloc_device(dev_weights_size, q);
+        if (!dev_weights) {
+            throw std::runtime_error("mmproj device allocation failed");
+        }
+        q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
+        // a fallback reads the qwen2vl q/k/v through w32, so that copy must
+        // exist and be resident
+        if (!host_qkv.empty()) {
+            ensure_w32();
+        }
+        if (!w32.empty()) {
+            d_w32 = sycl::malloc_device<float>(w32.size(), q);
+            if (!d_w32) {
+                throw std::runtime_error("mmproj side-blob device allocation failed");
+            }
+            q.memcpy(d_w32, w32.data(), w32.size() * sizeof(float)).wait();
+            lt.lap("f32 side blob H2D");
+        }
+    }
+    lt.lap("blob H2D");
+    if (!qkv_b32.empty()) {
+        d_qkv_b32 = sycl::malloc_device<float>(qkv_b32.size(), q);
+        if (!d_qkv_b32) {
+            throw std::runtime_error("mmproj qkv-bias allocation failed");
+        }
+        q.memcpy(d_qkv_b32, qkv_b32.data(), qkv_b32.size() * sizeof(float)).wait();
+    }
+    lt.total("upload total");
 }
 
 vision_input vision_model::make_input(const vision_model & vm, const mm_image & img) {
@@ -651,6 +844,8 @@ bool vision_model::runnable(std::string * why) const {
 }
 
 void vision_model::encode_host(const vision_input & in, std::vector<float> & out) const {
+    // the qwen2vl q|k|v f32 matrix is deferred; the host reference forward reads it
+    ensure_w32();
     const int E = hp.n_embd;
     const int M = hp.merge;
     const int ff = hp.n_ff;

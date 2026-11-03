@@ -1329,6 +1329,12 @@ struct engine {
       const uint16_t * df_sel_ns_ = nullptr, * df_sel_no_ = nullptr;
     } dfl;
 
+    // --spec-draft-model was asked for (setup_dflash runs after the weight
+    // conversion, so setup_md_dnnl cannot ask dfl).  A draft's verify is a
+    // *recorded* multi-row forward, so the lazy oneDNN weight ladder must not be
+    // the default there.
+    bool draft_requested_ = false;
+
     void setup_dflash(const std::string & draft_path);
     bool df_gemm(const wt & w, const float * x, int xs, float * out, int os, const float * res, int M,
                  const float * up = nullptr, int us = 0);

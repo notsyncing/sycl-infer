@@ -11,6 +11,9 @@
 #include "common/rope.h"
 #include "common/env.h"
 #include "kernel_utils.h"
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+#include <unordered_map>
 
 #include <cmath>
 
@@ -388,7 +391,7 @@ void vit_rope_launch(queue & q, float * qkv, int qkv_stride, int n_tok, int n_he
 // The query tile is the one to halve: BK is woven through the online softmax
 // (the four-lanes-per-row reduction, the P/V inner loop), while BQ only
 // selects how many query rows share the staged K/V.
-template <int HD, int BQ, int BK, int WG = 128>
+template <int HD, int BQ, int BK, int WG = 128, int SG = 32>
 static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok,
                           int n_head, float scale) {
     if (n_tok <= 0 || n_head <= 0) {
@@ -411,7 +414,7 @@ static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * 
         sycl::local_accessor<float, 1> s_red(sycl::range<1>((size_t)BQ * 4), h);
         sycl::local_accessor<float, 1> s_rc(sycl::range<1>((size_t)BQ), h);
 
-        h.parallel_for(nd_range<1>((size_t)total_qb * WG, WG), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        h.parallel_for(nd_range<1>((size_t)total_qb * WG, WG), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int qb = it.get_group(0) % n_qb;
             const int hd = it.get_group(0) / n_qb;
             const int tid = it.get_local_id(0);
@@ -433,12 +436,20 @@ static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * 
 
             for (int k0 = 0; k0 < n_tok; k0 += BK) {
                 const int n_k = sycl::min(BK, n_tok - k0);
-                for (int i = tid; i < BK * HD; i += WG) {
-                    const int r = i / HD, d = i % HD;
+                // 16-byte staged copies: the row base, the head offset and the
+                // SLM stride are all multiples of 4 floats, so a float4 load
+                // from the f32 qkv row lands aligned.  The scalar form this
+                // replaces issued one 4-byte load per element with a /HD and
+                // %HD per element (measured as part of the staging cost).
+                constexpr int DV = HD / 4;
+                for (int i = tid; i < BK * DV; i += WG) {
+                    const int r = i / DV, d4 = (i % DV) * 4;
                     if (r < n_k) {
                         const float * row = qkv + (size_t)(k0 + r) * qkv_stride;
-                        s_k[r * HDP + d] = row[embd + hd * HD + d];
-                        s_v[r * HDP + d] = row[2 * embd + hd * HD + d];
+                        const float4 kk = *reinterpret_cast<const float4 *>(row + embd + hd * HD + d4);
+                        const float4 vv = *reinterpret_cast<const float4 *>(row + 2 * embd + hd * HD + d4);
+                        *reinterpret_cast<float4 *>(&s_k[r * HDP + d4]) = kk;
+                        *reinterpret_cast<float4 *>(&s_v[r * HDP + d4]) = vv;
                     }
                 }
                 it.barrier();
@@ -577,6 +588,491 @@ static void vit_attn_impl(queue & q, const float * qkv, int qkv_stride, float * 
     });
 }
 
+// ---------------------------------------------------------------------------
+// ILP variant of the tiled kernel: same arithmetic order, more independent
+// accumulator chains per thread.
+//
+// The page output is bit-sensitive to the attention's fp summation ORDER (a
+// f32 oneDNN matmul, which is numerically *better* than this kernel, flips the
+// page md5), so the only shippable changes are ones that leave every per-score
+// dot and every per-dim k-accumulation in the same order.  This kernel does:
+// each score still runs a0..a3 over d%4 and then (a0+a1)+(a2+a3), and each PV
+// dimension still accumulates k=0..n_k-1 in order.  It only changes how many
+// of them one thread owns.
+//
+// Score: one thread owns TWO query rows for one key (8 accumulators, 3 float4
+// loads per 8 FMAs instead of 2 per 4).  PV: one thread owns TWO rows for one
+// 4-dim group, so the V float4 is loaded once for both rows.
+template <int HD, int BQ, int BK, int WG = 1024, int SG = 16, int RQ = 2, int RQP = 2>
+static void vit_attn_ilp(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok,
+                         int n_head, float scale) {
+    if (n_tok <= 0 || n_head <= 0) {
+        return;
+    }
+    constexpr int HDP = HD + 4;
+    constexpr int SDP = BK + 4;
+    static_assert(BQ % RQ == 0 && BQ % RQP == 0, "row block must divide BQ");
+    const int n_qb = (n_tok + BQ - 1) / BQ;
+    const int embd = n_head * HD;
+    const int total_qb = n_head * n_qb;
+
+    q.submit([&](handler & h) {
+        sycl::local_accessor<float, 1> s_q(sycl::range<1>((size_t)BQ * HDP), h);
+        sycl::local_accessor<float, 1> s_k(sycl::range<1>((size_t)BK * HDP), h);
+        sycl::local_accessor<float, 1> s_v(sycl::range<1>((size_t)BK * HDP), h);
+        sycl::local_accessor<float, 1> s_s(sycl::range<1>((size_t)BQ * SDP), h);
+        sycl::local_accessor<float, 1> s_acc(sycl::range<1>((size_t)BQ * HDP), h);
+        sycl::local_accessor<float, 1> s_m(sycl::range<1>((size_t)BQ), h);
+        sycl::local_accessor<float, 1> s_l(sycl::range<1>((size_t)BQ), h);
+        sycl::local_accessor<float, 1> s_red(sycl::range<1>((size_t)BQ * 4), h);
+        sycl::local_accessor<float, 1> s_rc(sycl::range<1>((size_t)BQ), h);
+
+        h.parallel_for(nd_range<1>((size_t)total_qb * WG, WG), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int qb = it.get_group(0) % n_qb;
+            const int hd = it.get_group(0) / n_qb;
+            const int tid = it.get_local_id(0);
+            const int q0 = qb * BQ;
+            const int n_q = sycl::min(BQ, n_tok - q0);
+
+            for (int i = tid; i < BQ; i += WG) {
+                s_m[i] = -INFINITY;
+                s_l[i] = 0.f;
+            }
+            for (int i = tid; i < BQ * HDP; i += WG) {
+                s_acc[i] = 0.f;
+            }
+            for (int i = tid; i < BQ * HD; i += WG) {
+                const int r = i / HD, d = i % HD;
+                s_q[r * HDP + d] = (r < n_q) ? qkv[(size_t)(q0 + r) * qkv_stride + hd * HD + d] : 0.f;
+            }
+            it.barrier();
+
+            for (int k0 = 0; k0 < n_tok; k0 += BK) {
+                const int n_k = sycl::min(BK, n_tok - k0);
+                constexpr int DV = HD / 4;
+                for (int i = tid; i < BK * DV; i += WG) {
+                    const int r = i / DV, d4 = (i % DV) * 4;
+                    if (r < n_k) {
+                        const float * row = qkv + (size_t)(k0 + r) * qkv_stride;
+                        const float4 kk = *reinterpret_cast<const float4 *>(row + embd + hd * HD + d4);
+                        const float4 vv = *reinterpret_cast<const float4 *>(row + 2 * embd + hd * HD + d4);
+                        *reinterpret_cast<float4 *>(&s_k[r * HDP + d4]) = kk;
+                        *reinterpret_cast<float4 *>(&s_v[r * HDP + d4]) = vv;
+                    }
+                }
+                it.barrier();
+
+                // RQ query rows per thread for one key.  Every score keeps the
+                // a0..a3/d%4 order and the (a0+a1)+(a2+a3) reduction.
+                {
+                    constexpr int NT = (BQ / RQ) * BK;
+                    for (int i = tid; i < NT; i += WG) {
+                        const int qg = i / BK, k = i % BK;
+                        const int r0 = qg * RQ;
+                        float a0[RQ], a1[RQ], a2[RQ], a3[RQ];
+#pragma unroll
+                        for (int t = 0; t < RQ; t++) {
+                            a0[t] = a1[t] = a2[t] = a3[t] = 0.f;
+                        }
+                        if (k < n_k) {
+                            const float * kr = &s_k[k * HDP];
+#pragma unroll
+                            for (int d = 0; d < HD; d += 4) {
+                                const float4 kv = *reinterpret_cast<const float4 *>(kr + d);
+#pragma unroll
+                                for (int t = 0; t < RQ; t++) {
+                                    const float4 qv = *reinterpret_cast<const float4 *>(&s_q[(r0 + t) * HDP + d]);
+                                    a0[t] = sycl::fma(qv.x(), kv.x(), a0[t]);
+                                    a1[t] = sycl::fma(qv.y(), kv.y(), a1[t]);
+                                    a2[t] = sycl::fma(qv.z(), kv.z(), a2[t]);
+                                    a3[t] = sycl::fma(qv.w(), kv.w(), a3[t]);
+                                }
+                            }
+                        }
+#pragma unroll
+                        for (int t = 0; t < RQ; t++) {
+                            if (r0 + t < n_q) {
+                                s_s[(r0 + t) * SDP + k] =
+                                    (k < n_k) ? ((a0[t] + a1[t]) + (a2[t] + a3[t])) * scale : 0.f;
+                            }
+                        }
+                    }
+                }
+                it.barrier();
+
+                {
+                    const int r = tid / 4, j = tid % 4;
+                    if (r < n_q) {
+                        float pm = -INFINITY;
+                        for (int k = j; k < n_k; k += 4) {
+                            pm = sycl::fmax(pm, s_s[r * SDP + k]);
+                        }
+                        s_red[r * 4 + j] = pm;
+                    }
+                }
+                it.barrier();
+                if (tid < BQ && tid < n_q) {
+                    const int r = tid;
+                    float mnew = s_m[r];
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        mnew = sycl::fmax(mnew, s_red[r * 4 + j]);
+                    }
+                    const float corr = sycl::exp(s_m[r] - mnew);
+                    s_rc[r] = corr;
+                    s_l[r] *= corr;
+                    s_m[r] = mnew;
+                }
+                it.barrier();
+                {
+                    const int r = tid / 4, j = tid % 4;
+                    if (r < n_q) {
+                        const float corr = s_rc[r];
+                        if (corr != 1.f) {
+                            constexpr int DQ = HD / 4;
+                            float * ar = &s_acc[r * HDP + j * DQ];
+#pragma unroll
+                            for (int d = 0; d < DQ; d++) {
+                                ar[d] *= corr;
+                            }
+                        }
+                        const float mn = s_m[r];
+                        float ps = 0.f;
+                        for (int k = j; k < n_k; k += 4) {
+                            const float p = sycl::exp(s_s[r * SDP + k] - mn);
+                            s_s[r * SDP + k] = p;
+                            ps += p;
+                        }
+                        s_red[r * 4 + j] = ps;
+                    }
+                }
+                it.barrier();
+                if (tid < BQ && tid < n_q) {
+                    const int r = tid;
+                    float ss = s_l[r];
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        ss += s_red[r * 4 + j];
+                    }
+                    s_l[r] = ss;
+                }
+                it.barrier();
+
+                // RQP rows per thread for one 4-dim group: V loaded once.
+                {
+                    constexpr int DB = HD / 4;
+                    constexpr int NT = (BQ / RQP) * DB;
+                    for (int i = tid; i < NT; i += WG) {
+                        const int rg = i / DB, db = i % DB;
+                        const int r0 = rg * RQP;
+                        if (r0 >= n_q) {
+                            continue;
+                        }
+                        float4 acc[RQP];
+#pragma unroll
+                        for (int t = 0; t < RQP; t++) {
+                            acc[t] = {0.f, 0.f, 0.f, 0.f};
+                        }
+                        for (int k = 0; k < n_k; k++) {
+                            const float4 v = *reinterpret_cast<const float4 *>(&s_v[k * HDP + db * 4]);
+#pragma unroll
+                            for (int t = 0; t < RQP; t++) {
+                                if (r0 + t < n_q) {
+                                    const float p = s_s[(r0 + t) * SDP + k];
+                                    acc[t].x() = sycl::fma(p, v.x(), acc[t].x());
+                                    acc[t].y() = sycl::fma(p, v.y(), acc[t].y());
+                                    acc[t].z() = sycl::fma(p, v.z(), acc[t].z());
+                                    acc[t].w() = sycl::fma(p, v.w(), acc[t].w());
+                                }
+                            }
+                        }
+#pragma unroll
+                        for (int t = 0; t < RQP; t++) {
+                            if (r0 + t < n_q) {
+                                float4 * ap = reinterpret_cast<float4 *>(&s_acc[(r0 + t) * HDP + db * 4]);
+                                const float4 cur = *ap;
+                                *ap = {cur.x() + acc[t].x(), cur.y() + acc[t].y(), cur.z() + acc[t].z(),
+                                       cur.w() + acc[t].w()};
+                            }
+                        }
+                    }
+                }
+                it.barrier();
+            }
+
+            for (int i = tid; i < BQ * HD; i += WG) {
+                const int r = i / HD, d = i % HD;
+                if (r >= n_q) {
+                    continue;
+                }
+                out[(size_t)(q0 + r) * out_stride + hd * HD + d] = s_acc[r * HDP + d] / s_l[r];
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// f32 QK/PV on oneDNN.
+//
+// The two GEMMs are plain f32 matmuls: no activation quantisation and PV uses
+// the exact softmax weights.  Opt-in (`PF_VIT_ATTN=51`) because, although it is
+// numerically *better* than the hand kernel (self-check cos 0.999142 against
+// 0.999104), its different fp summation order flips the page md5 - the page is
+// bit-sensitive to attention rounding, so a different order cannot ship as the
+// default.  It is deterministic (an int8 variant, evaluated separately, was
+// not: oneDNN's int8 matmul is nondeterministic at these shapes).
+//
+// Measured on the A770 (probe): QK [5476,80]x[80,2048] 0.32 ms and PV
+// [5476,2048]x[2048,80] 0.24-0.46 ms, ~2.8 T-MAC/s, versus 0.86 T-MAC/s for the
+// hand kernel.  The primitives are cached by (M,K,N) and the query/key extents
+// are bucketed (multiples of 1024 / 512-1024-2048) so one page's 21 crops share
+// a couple of primitives instead of creating ~80 of them.
+//
+// Bucketing pads the query rows (zeroed Q -> harmless) and the key columns.
+// The key pad is never read by the softmax (it only loops k < nb) and its P
+// column is explicitly zeroed, so a stale/garbage V pad contributes 0.
+namespace {
+
+constexpr int kOdNBmax = 2048;
+constexpr int kOdTile = 1024;
+
+struct vit_od_bufs {
+    int cap_m = 0;
+    float * qc = nullptr;  // [M][80]
+    float * kc = nullptr;  // [NBmax][80]
+    float * vc = nullptr;  // [NBmax][80]
+    float * sc = nullptr;  // [M][NBmax]
+    float * p = nullptr;   // [M][NBmax]
+    float * pv = nullptr;  // [M][80]
+    float * acc = nullptr; // [M][80]
+    float * mrow = nullptr;
+    float * lrow = nullptr;
+    float * corr = nullptr;
+};
+
+static vit_od_bufs g_od;
+
+static dnnl::engine & od_engine(sycl::queue & q) {
+    static dnnl::engine e = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+    return e;
+}
+static dnnl::stream & od_stream(sycl::queue & q) {
+    static dnnl::stream s = dnnl::sycl_interop::make_stream(od_engine(q), q);
+    return s;
+}
+
+struct od_prim {
+    dnnl::matmul mm;
+    dnnl::memory::desc x, w, d;
+};
+
+static const od_prim * od_get(std::unordered_map<uint64_t, od_prim> & cache, sycl::queue & q, int M, int K, int N,
+                              bool qk) {
+    const uint64_t key = ((uint64_t)M << 42) | ((uint64_t)K << 21) | (uint64_t)N | ((uint64_t)qk << 63);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return &it->second;
+    }
+    using dt = dnnl::memory::data_type;
+    using tg = dnnl::memory::format_tag;
+    od_prim e;
+    e.x = dnnl::memory::desc({M, K}, dt::f32, tg::ab);
+    e.w = qk ? dnnl::memory::desc({K, N}, dt::f32, tg::ba) : dnnl::memory::desc({K, N}, dt::f32, tg::ab);
+    e.d = dnnl::memory::desc({M, N}, dt::f32, tg::ab);
+    e.mm = dnnl::matmul(dnnl::matmul::primitive_desc(od_engine(q), e.x, e.w, e.d));
+    return &cache.emplace(key, std::move(e)).first->second;
+}
+
+static bool vit_od_ready(sycl::queue & q, int M) {
+    vit_od_bufs & b = g_od;
+    if (M <= b.cap_m) {
+        return true;
+    }
+    auto fre = [&](void * p) {
+        if (p) {
+            sycl::free(p, q);
+        }
+    };
+    fre(b.qc);
+    fre(b.kc);
+    fre(b.vc);
+    fre(b.sc);
+    fre(b.p);
+    fre(b.pv);
+    fre(b.acc);
+    fre(b.mrow);
+    fre(b.lrow);
+    fre(b.corr);
+    b.cap_m = M;
+    b.qc = sycl::malloc_device<float>((size_t)M * 80, q);
+    b.kc = sycl::malloc_device<float>((size_t)kOdNBmax * 80, q);
+    b.vc = sycl::malloc_device<float>((size_t)kOdNBmax * 80, q);
+    b.sc = sycl::malloc_device<float>((size_t)M * kOdNBmax, q);
+    b.p = sycl::malloc_device<float>((size_t)M * kOdNBmax, q);
+    b.pv = sycl::malloc_device<float>((size_t)M * 80, q);
+    b.acc = sycl::malloc_device<float>((size_t)M * 80, q);
+    b.mrow = sycl::malloc_device<float>((size_t)M, q);
+    b.lrow = sycl::malloc_device<float>((size_t)M, q);
+    b.corr = sycl::malloc_device<float>((size_t)M, q);
+    if (!b.qc || !b.kc || !b.vc || !b.sc || !b.p || !b.pv || !b.acc || !b.mrow || !b.lrow || !b.corr) {
+        return false;
+    }
+    // padded query rows stay zero (only rows < np are ever written)
+    q.memset(b.qc, 0, (size_t)M * 80 * sizeof(float));
+    // K/V pad rows may hold stale finite values; P is zeroed there, so they
+    // contribute 0.  Zero once so nothing is uninitialised.
+    q.memset(b.kc, 0, (size_t)kOdNBmax * 80 * sizeof(float));
+    q.memset(b.vc, 0, (size_t)kOdNBmax * 80 * sizeof(float));
+    return true;
+}
+
+static void vit_od_copy_q(queue & q, const float * qkv, int qkv_stride, int np, int hd, float scale, float * qc) {
+    q.parallel_for(sycl::range<2>((size_t)np, 80), [=](id<2> i) {
+        const int r = (int)i[0], d = (int)i[1];
+        qc[(size_t)r * 80 + d] = qkv[(size_t)r * qkv_stride + hd * 80 + d] * scale;
+    });
+}
+
+static void vit_od_copy_kv(queue & q, const float * qkv, int qkv_stride, int k0, int nb, int E, int hd, float * kc,
+                           float * vc) {
+    q.parallel_for(sycl::range<2>((size_t)nb, 80), [=](id<2> i) {
+        const int r = (int)i[0], d = (int)i[1];
+        const float * row = qkv + (size_t)(k0 + r) * qkv_stride;
+        kc[(size_t)r * 80 + d] = row[E + hd * 80 + d];
+        vc[(size_t)r * 80 + d] = row[2 * E + hd * 80 + d];
+    });
+}
+
+static void vit_od_softmax(queue & q, const float * sc, int M, int NB, int nb, float * p, float * mrow, float * lrow,
+                           float * corr) {
+    q.submit([&](handler & h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(8), h);
+        h.parallel_for(nd_range<1>((size_t)M * 256, 256), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int row = (int)it.get_group(0);
+            const int tid = it.get_local_id(0);
+            const int sg = tid / 32, lane = tid % 32;
+            const float * sr = sc + (size_t)row * NB;
+            float bm = -INFINITY;
+            for (int k = tid; k < nb; k += 256) {
+                bm = sycl::fmax(bm, sr[k]);
+            }
+            bm = sycl::reduce_over_group(it.get_sub_group(), bm, sycl::maximum<float>());
+            if (lane == 0) {
+                red[sg] = bm;
+            }
+            it.barrier();
+            if (tid == 0) {
+                float mn = mrow[row];
+                for (int j = 0; j < 8; j++) {
+                    mn = sycl::fmax(mn, red[j]);
+                }
+                red[0] = mn;
+            }
+            it.barrier();
+            const float mnew = red[0];
+            const float cf = sycl::exp(mrow[row] - mnew);
+            float * pr = p + (size_t)row * NB;
+            float ps = 0.f;
+            for (int k = tid; k < nb; k += 256) {
+                const float pv = sycl::exp(sr[k] - mnew);
+                pr[k] = pv;
+                ps += pv;
+            }
+            for (int k = nb + tid; k < NB; k += 256) {
+                pr[k] = 0.f;
+            }
+            ps = sycl::reduce_over_group(it.get_sub_group(), ps, sycl::plus<float>());
+            if (lane == 0) {
+                red[sg] = ps;
+            }
+            it.barrier();
+            if (tid == 0) {
+                float ss = 0.f;
+                for (int j = 0; j < 8; j++) {
+                    ss += red[j];
+                }
+                lrow[row] = lrow[row] * cf + ss;
+                mrow[row] = mnew;
+                corr[row] = cf;
+            }
+        });
+    });
+}
+
+static void vit_od_acc(queue & q, const float * pv, const float * corr, float * acc, int M) {
+    q.parallel_for(sycl::range<2>((size_t)M, 80), [=](id<2> i) {
+        const int r = (int)i[0], d = (int)i[1];
+        acc[(size_t)r * 80 + d] = acc[(size_t)r * 80 + d] * corr[r] + pv[(size_t)r * 80 + d];
+    });
+}
+
+static bool vit_attn_od_launch(queue & q, const float * qkv, int qkv_stride, float * out, int out_stride, int n_tok,
+                               int n_head, int head_dim, float scale) {
+    if (head_dim != 80) {
+        return false;
+    }
+    const int np = n_tok;
+    const int M = std::max(kOdTile, ((np + kOdTile - 1) / kOdTile) * kOdTile);
+    const int NB = np <= 512 ? 512 : (np <= 1024 ? 1024 : kOdNBmax);
+    if (!vit_od_ready(q, M)) {
+        return false;
+    }
+    vit_od_bufs & b = g_od;
+    const int E = n_head * head_dim;
+    static std::unordered_map<uint64_t, od_prim> qk_cache, pv_cache;
+    const od_prim * qk = od_get(qk_cache, q, M, 80, NB, true);
+    const od_prim * pvp = od_get(pv_cache, q, M, NB, 80, false);
+    if (!qk || !pvp) {
+        return false;
+    }
+    dnnl::engine & eng = od_engine(q);
+    dnnl::stream & st = od_stream(q);
+    auto mk = [&](const dnnl::memory::desc & md, void * ptr) {
+        return dnnl::sycl_interop::make_memory(md, eng, dnnl::sycl_interop::memory_kind::usm, ptr);
+    };
+    for (int hd = 0; hd < n_head; hd++) {
+        // capture pointers, not the `vit_od_bufs &` (a captured reference makes
+        // the device read the host address of the struct; see the int8 path)
+        float * mrp = b.mrow;
+        float * lrp = b.lrow;
+        float * crp = b.corr;
+        q.parallel_for(sycl::range<1>((size_t)M), [=](id<1> i) {
+            mrp[i[0]] = -INFINITY;
+            lrp[i[0]] = 0.f;
+            crp[i[0]] = 0.f;
+        });
+        q.memset(b.acc, 0, (size_t)M * 80 * sizeof(float));
+        vit_od_copy_q(q, qkv, qkv_stride, np, hd, scale, b.qc);
+        for (int k0 = 0; k0 < np; k0 += NB) {
+            const int nb = std::min(NB, np - k0);
+            vit_od_copy_kv(q, qkv, qkv_stride, k0, nb, E, hd, b.kc, b.vc);
+            {
+                auto xm = mk(qk->x, b.qc);
+                auto wm = mk(qk->w, b.kc);
+                auto dm = mk(qk->d, b.sc);
+                qk->mm.execute(st, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+            }
+            vit_od_softmax(q, b.sc, M, NB, nb, b.p, b.mrow, b.lrow, b.corr);
+            {
+                auto xm = mk(pvp->x, b.p);
+                auto wm = mk(pvp->w, b.vc);
+                auto dm = mk(pvp->d, b.pv);
+                pvp->mm.execute(st, {{DNNL_ARG_SRC, xm}, {DNNL_ARG_WEIGHTS, wm}, {DNNL_ARG_DST, dm}});
+            }
+            vit_od_acc(q, b.pv, b.corr, b.acc, M);
+        }
+        float * accp = b.acc;
+        float * lp = b.lrow;
+        q.parallel_for(sycl::range<2>((size_t)np, 80), [=](id<2> i) {
+            const int r = (int)i[0], d = (int)i[1];
+            out[(size_t)r * out_stride + hd * head_dim + d] = accp[(size_t)r * 80 + d] / lp[r];
+        });
+    }
+    return true;
+}
+
+} // namespace
+
 // The vision head dim is a property of the projector, not of the kernel: 64 for
 // the Qwen-VL towers this was written against, 72 for the Qwen3.6/3.5 mmproj
 // files.  The workgroup layout is indexed by (query row, key) and never by
@@ -588,27 +1084,37 @@ void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, 
     switch (head_dim) {
     case 64: vit_attn_impl<64, 32, 64>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
     case 72: vit_attn_impl<72, 16, 64>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
-    // Qwen2-VL: 16 heads x 80.  BQ=32 / BK=32 is 47.6 KiB of SLM (BQ=32 with
-    // BK=64 would be 73 KiB, over the per-work-group limit), and it halves the
-    // K/V staging traffic (each staged key block is reused by twice as many
-    // query rows).  The padded rows are guarded explicitly in every stage, so
-    // any n_tok is safe (the 56x56 self-check is 16 tokens, a partial tile on
-    // both axes).
+    // Qwen2-VL: 16 heads x 80.  The page output is bit-sensitive to the
+    // attention's fp summation order, so the shipped kernels keep the original
+    // per-score dot order (a0..a3 over d%4, then (a0+a1)+(a2+a3)), the BK=32
+    // online-softmax grouping, and the PV k order.  Every change below is
+    // order-preserving; the page md5 stays 10eed240936226fd4696d943aaabc44b.
     //
-    // WG=512/1024: the 47.6 KiB of SLM allows one workgroup per Xe core, so the
-    // workgroup's warp count IS the core's occupancy.  At 128 threads that is
-    // four warps on a 16-EU core (a quarter of it idle); 512/1024 fills it.
-    // Measured on the layout page (32 layers, np=5476, attention ms):
-    //   16/64/128 10473 | 16/32/512 4658 | 32/32/128 8106 | 32/32/256 4563
-    //   32/32/512 3720 | 64/16/512 3335 | 32/32/1024 3263 (default)
+    // Measured on the layout page (np=5476, 32 layers, one A770, AOT, attention
+    // ms).  Baseline 16/64/128 = 10473.  With vectorized K/V staging:
+    //   16/32/512 4658 | 32/32/256 4563 | 64/16/512 3335 | 32/32/1024 3263
+    //   BQ=48/BK=32/WG=1024 2865 (more query rows per staged key block)
+    //   ILP (2 query rows/thread) + SG=16 2076 (default)
+    // The ILP kernel owns 2 query rows per score dot and 2 rows per PV 4-dim
+    // group, so a thread has 8 independent accumulators instead of 4 and the
+    // V float4 is loaded once for both rows.  SG=16 puts four 16-lane
+    // sub-groups per EU (SG=32 gives two) for latency hiding; SG=8 loses.
     // PF_VIT_ATTN picks an alternative tile for the sweep.
     case 80: {
-        int cfg = SI_ENV_I32("PF_VIT_ATTN", 2);
+        int cfg = SI_ENV_I32("PF_VIT_ATTN", 70);
         // The 1024-thread variants fill a 512-EU A770 core; an Iris Xe caps a
         // work-group at 512, so fall back to the 32/32/512 tile there (the
         // launcher's own device query is cached by si::dev).
-        if (si::dev::wg_clamped_for_queue(q, 1024) < 1024 && (cfg == 2 || cfg == 5)) {
+        if (si::dev::wg_clamped_for_queue(q, 1024) < 1024
+            && (cfg == 2 || cfg == 5 || cfg == 6 || cfg == 60 || cfg == 70 || cfg == 71 || cfg == 72 || cfg == 73
+                || cfg == 76)) {
             cfg = 0;
+        }
+        if (cfg == 51) {
+            if (vit_attn_od_launch(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, head_dim, scale)) {
+                break;
+            }
+            cfg = 70;
         }
         switch (cfg) {
         case 1: vit_attn_impl<80, 64, 16, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
@@ -616,8 +1122,16 @@ void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, 
         case 3: vit_attn_impl<80, 16, 32, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
         case 4: vit_attn_impl<80, 32, 32, 256>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
         case 5: vit_attn_impl<80, 64, 16, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
-        case 0: vit_attn_impl<80, 32, 32, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
-        default: vit_attn_impl<80, 32, 32, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 6: vit_attn_impl<80, 48, 32, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 7: vit_attn_impl<80, 16, 64, 1024>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 60: vit_attn_impl<80, 48, 32, 1024, 16>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 70: vit_attn_ilp<80, 48, 32, 1024, 16, 2, 2>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 71: vit_attn_ilp<80, 48, 32, 1024, 32, 2, 2>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 72: vit_attn_ilp<80, 48, 32, 1024, 16, 4, 2>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 73: vit_attn_ilp<80, 48, 32, 1024, 16, 2, 4>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 76: vit_attn_ilp<80, 52, 32, 1024, 16, 2, 2>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
+        case 0:
+        default: vit_attn_impl<80, 32, 32, 512>(q, qkv, qkv_stride, out, out_stride, n_tok, n_head, scale); break;
         }
         break;
     }

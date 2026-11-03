@@ -12,6 +12,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <sys/mman.h>
 #include <unordered_map>
 #include <unordered_set>
 #include "common/env.h"
@@ -19,6 +20,37 @@
 #include "cpu_types.h"
 
 namespace si {
+
+// PF_LOAD_TIME: a one-line-per-phase wall-clock breakdown of engine startup.
+// The engine constructor is the whole startup (GGUF parse/bind, the int8
+// conversion + primitive creation, H2D, plans and graph capture), so without
+// this the only observable is the CLI's total and every optimisation is a guess
+// at which phase moved.  Off by default; the stamps are just clock reads.
+struct load_timer {
+    bool on = si::env::flag("PF_LOAD_TIME");
+    std::chrono::steady_clock::time_point first, last;
+    load_timer() : first(std::chrono::steady_clock::now()) {
+        last = first;
+    }
+    void lap(const char * what) {
+        if (!on) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[load] %-30s %8.1f ms\n", what,
+                std::chrono::duration<double, std::milli>(now - last).count());
+        last = now;
+    }
+    void total(const char * what) {
+        if (!on) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[load] %-30s %8.1f ms\n", what,
+                std::chrono::duration<double, std::milli>(now - first).count());
+        last = now;
+    }
+};
 
 // Resolve the requested device: -1 = auto from PF_DEVICE (default gpu),
 // 0/1 = gpu/cpu.  Kept independent of the queue so a CPU build on a machine
@@ -112,6 +144,8 @@ engine::engine(const engine_config & cfg)
       md_ctx_(make_md_context(cfg.layer_map)),
       q(make_queue(device_req, md_ctx_.get())),
       max_seq(cfg.max_seq), max_slots(cfg.max_slots), n_splits(cfg.n_splits), n_blocks(cfg.n_blocks) {
+    load_timer lt;
+    lt.lap("queue + config init");
     // Resolve this engine's KV storage types before any buffer is sized, and
     // install them as a thread-local scope for the constructor's duration.
     // The process-wide value stays the fallback for the CLI and for code that
@@ -153,9 +187,11 @@ engine::engine(const engine_config & cfg)
     yarn_attn_factor_ = si::env::f32("PF_YARN_ATTN_FACTOR", cfg.yarn_attn_factor);
     const std::string & model_path = cfg.model_path;
     std::string layer_map = cfg.layer_map;
+    draft_requested_ = !cfg.draft_path.empty();
     dev_kind = device_req == 1 ? device_kind::cpu : device_kind::gpu;
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
+    lt.lap("model::load (gguf+bind)");
     mp_ = m.prof;
     {
         const char * e = si::env::str("PF_F32");
@@ -170,6 +206,7 @@ engine::engine(const engine_config & cfg)
     engram_ram_mb_ =
         cfg.engram_ram_mb == engine_config::kEngramRamAuto ? mp_->policy.engram_ram_mb_default : cfg.engram_ram_mb;
     tk.load(m.gguf);
+    lt.lap("tokenizer load");
     // The model profile owns the expert placement.  qwen4exp's per-expert LRU
     // bank is not the generic three-tier moe_cache, so that cache must stay
     // inactive (host_only computes total = 0 and the forward's own bank decides
@@ -199,6 +236,7 @@ engine::engine(const engine_config & cfg)
     // attention scaling applied without the frequency stretch, which is a silent
     // wrong answer rather than a disabled feature.
     build_rope_freqs(m.hp.n_rot, m.hp.rope_base);
+    lt.lap("rope table");
     // MTP draft length: --mtp N (0/absent = off), PF_MTP as an env override.
     mtp.mtp_k = cfg.mtp_k;
     if (const char * em = si::env::str("PF_MTP")) {
@@ -281,6 +319,7 @@ engine::engine(const engine_config & cfg)
     }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
+        lt.lap("setup_multi_device");
     } else if (moe_u4bank_wanted()) {
         // The u4 gate/up bank replaces the raw expert upload, and only the
         // per-tensor (multi-device) upload can express that: the whole-blob
@@ -385,6 +424,7 @@ engine::engine(const engine_config & cfg)
     // upload weights after setup_multi_device so multi-device can skip the
     // full-blob device copy and instead upload only each partition's tensors
     m.upload(q, /*host=*/cpu_mode || multi_dev);
+    lt.lap("model upload (H2D/raw)");
     if (f32_path_) {
         build_f32_weights();
     }
@@ -717,10 +757,12 @@ engine::engine(const engine_config & cfg)
     }
     n_blocks = pool_cap;
     alloc_buffers();
+    lt.lap("alloc_buffers (KV/act)");
     if (m.q4exp) {
         q4_alloc();
     } else {
         build_graphs();
+        lt.lap("build_graphs (plans+capture)");
     }
     // all weights are on their devices now: release the host pages of the GGUF
     // so the process does not carry the whole file in its RSS.  This cannot run
@@ -729,7 +771,9 @@ engine::engine(const engine_config & cfg)
     // which runs from alloc_buffers() above.
     if (!moe_host_weights_deferred_) {
         release_host_weight_pages();
+        lt.lap("release host pages");
     }
+    lt.total("engine ctor total");
     if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
         q4_hist_report();
     }
@@ -2448,6 +2492,18 @@ void engine::upload_device_weights(int dev) {
     }
     size_t bytes = 0;
     size_t n = 0;
+    // Deferred page release: the copies are enqueued asynchronously (one wait
+    // for the whole partition), and MADV_DONTNEED on a source page the copy is
+    // still reading would corrupt the upload.
+    std::vector<std::pair<const void *, size_t>> page_out_later;
+    // A/B knob for the per-tensor wait (PF_UPLOAD_SYNC=1 restores it).
+    const bool upload_sync = si::env::flag("PF_UPLOAD_SYNC");
+    const bool ldtime = si::env::flag("PF_LOAD_TIME");
+    auto tick = [] { return std::chrono::steady_clock::now(); };
+    auto ms_since = [](const std::chrono::steady_clock::time_point & a) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    };
+    double t_malloc = 0, t_enq = 0, t_tokemb = 0, t_pageout = 0, t_wait = 0;
     sycl::queue & qd = multi_dev ? *dev_queues_[(size_t)dev] : q;
     for (const auto & t : m.gguf.tensors) {
         if (!need.count(t.data)) {
@@ -2494,7 +2550,43 @@ void engine::upload_device_weights(int dev) {
             dev_used_bytes_.resize((size_t)dev + 1, 0);
         }
         dev_used_bytes_[(size_t)dev] += t.nbytes();
-        qd.memcpy(g, t.data, t.nbytes()).wait();
+        // a tied LM head keeps the embedding's host rows for its oneDNN
+        // conversion after this loop, so its pages are not dropped here
+        const bool keep_pages = md_xmx && m.output.data == m.tok_embd.data && t.data == m.tok_embd.data;
+        bool pages_dropped = false;
+        if (dev == 0 && t.data == m.tok_embd.data) {
+            // Host USM destination: copy on the CPU.  A queue memcpy whose
+            // destination is host USM goes through the GPU's copy engine and
+            // reads the *pageable* mmap source at ~0.3 GB/s (measured: 510 ms
+            // for the 144 MB tied embedding of the MinerU text model).  The
+            // destination is CPU-accessible by construction, the source is the
+            // mmap, and nothing has been submitted that could read it yet, so a
+            // plain memcpy is both correct and ~10 GB/s.
+            auto t_c = tick();
+            std::memcpy(g, t.data, t.nbytes());
+            t_tokemb += ms_since(t_c);
+            if (!keep_pages) {
+                m.page_out_host(t.data, t.nbytes());
+                pages_dropped = true;
+            }
+        } else {
+            auto t_b = tick();
+            qd.memcpy(g, t.data, t.nbytes());
+            t_enq += ms_since(t_b);
+            // Large tensors wait and release their pages immediately: a MoE
+            // model's expert bank is uploaded through this loop, and deferring
+            // every page-out to the end would hold the whole bank resident.
+            // The small tensors (norms/biases, ~200 of them) batch instead: a
+            // per-tensor wait drains the in-order queue at ~1-2 ms each.
+            if (upload_sync || t.nbytes() >= (8u << 20)) {
+                qd.wait();
+                t_wait += ms_since(t_b);
+                if (!keep_pages) {
+                    m.page_out_host(t.data, t.nbytes());
+                    pages_dropped = true;
+                }
+            }
+        }
         // PF_MOE_VERIFY: byte-compare the freshly uploaded copy against the host
         // mmap for the routed expert tensors.  A partial or clobbered expert
         // plane shows up as a 1e9-scale activation (a Q5_K scale read from
@@ -2528,10 +2620,24 @@ void engine::upload_device_weights(int dev) {
         // (the final release_host_weight_pages() covers anything left over).  A
         // tied LM head still needs the embedding's host rows to build its oneDNN
         // conversion after the upload, so keep those pages for now.
-        if (!(md_xmx && m.output.data == m.tok_embd.data && t.data == m.tok_embd.data)) {
-            m.page_out_host(t.data, t.nbytes());
+        if (!keep_pages && !pages_dropped) {
+            page_out_later.emplace_back(t.data, (size_t)t.nbytes());
         }
 
+    }
+    auto t_w = tick();
+    qd.wait();
+    t_wait += ms_since(t_w);
+    auto t_p = tick();
+    for (const auto & po : page_out_later) {
+        m.page_out_host(po.first, po.second);
+    }
+    t_pageout = ms_since(t_p);
+    if (ldtime) {
+        fprintf(stderr,
+                "[load]   upload dev %d: %zu tensors %.0f MB | malloc %.1f, enqueue %.1f, tokemb %.1f, wait %.1f, "
+                "pageout %.1f ms\n",
+                dev, n, (double)bytes / (1024.0 * 1024.0), t_malloc, t_enq, t_tokemb, t_wait, t_pageout);
     }
     fprintf(stderr, "[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
             (double)bytes / (1024.0 * 1024.0));
@@ -2804,6 +2910,7 @@ bool engine::setup_md_dnnl() {
     if (const char * en = si::env::str("PF_DP4A"); en && atoi(en) == 0) {
         return false; // PF_DP4A=0 forces the fp32 path
     }
+    load_timer lt;
     dnnl_dev_.clear();
     dnnl_dev_.resize(backends_.size());
     // Split draft-head readout state, filled by device 0's iteration (the pack)
@@ -2819,6 +2926,18 @@ bool engine::setup_md_dnnl() {
     }();
     bool head_split_pending_ = false;
     int head_split_K_ = 0, head_split_N_ = 0;
+    // PF_DNNL_LAZY: skip the per-tensor primitive ladder and build each M on
+    // first use, except M=1 (the row count the recorded decode graph uses).
+    // The eager ladder is 7 shapes for a native store and 32 for int8, per
+    // tensor; a page asks for M=1 plus one prefill M, so almost all of it is
+    // unused - and each primitive is a oneDNN JIT kernel creation.
+    // Default on for a multi-device partition without a speculative drafter: it
+    // saves ~150 ms of oneDNN primitive creation on MinerU's page (measured,
+    // md5 unchanged) and the only recorded graph there is the 1-row decode,
+    // whose M=1 primitives are still built eagerly.  MTP/DFlash record a
+    // multi-row verify, so they keep the eager ladder (PF_DNNL_LAZY=1 opts in).
+    const char * lazy_env = si::env::str("PF_DNNL_LAZY");
+    const bool lazy_dnnl = lazy_env ? atoi(lazy_env) != 0 : (!mtp.mtp_on && !draft_requested_);
     bool any = false;
     for (size_t d = 0; d < backends_.size(); d++) {
         if (dev_kind_[d] != 0 || !dev_queues_[d]) {
@@ -2870,7 +2989,7 @@ bool engine::setup_md_dnnl() {
             bool converted = false;
             if (sel && (w4_on || w4_only) &&
                 D->add_weight_w4(t.data, t.data, t.type, t.K, t.N, /*any_type=*/false, /*gemv_only=*/false,
-                                 /*scale_mul=*/1.0f, cls, il)) {
+                                 /*scale_mul=*/1.0f, cls, il, lazy_dnnl)) {
                 dev_ok = true;
                 n_w4++;
                 converted = true;
@@ -2884,7 +3003,7 @@ bool engine::setup_md_dnnl() {
                 dev_ok = true;
                 n_cb++;
                 converted = true;
-            } else if (D->add_weight(t.data, t.data, t.type, t.K, t.N)) {
+            } else if (D->add_weight(t.data, t.data, t.type, t.K, t.N, /*eager=*/true, lazy_dnnl)) {
                 dev_ok = true;
                 n_i8++;
                 converted = true;
@@ -3096,6 +3215,11 @@ bool engine::setup_md_dnnl() {
         if (setup_moe_down_i8_bank((int)d, *D, *dev_queues_[d])) {
             dev_ok = true;
         }
+        {
+            char lb[64];
+            snprintf(lb, sizeof(lb), "dev %zu weights (conv+prims)", d);
+            lt.lap(lb);
+        }
         if (dev_ok) {
             fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
                     n_w4, n_k5, n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
@@ -3136,6 +3260,9 @@ bool engine::setup_md_dnnl() {
             const char * envw = si::env::str("PF_DNNL_NOWARM");
             if (!(envw && atoi(envw) != 0)) {
                 D->warmup();
+                char lb[64];
+                snprintf(lb, sizeof(lb), "dev %zu warmup", d);
+                lt.lap(lb);
             }
             dnnl_dev_[d] = std::move(D);
             dnnl_register_queue(*dev_queues_[d], dnnl_dev_[d].get());
@@ -3152,6 +3279,7 @@ bool engine::setup_md_dnnl() {
 }
 
 void engine::setup_multi_device(const std::string & layer_map) {
+    load_timer lt;
     struct ent {
         int l0, l1, kind, dev_idx;
     };
@@ -3265,6 +3393,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
                     target.get_info<sycl::info::device::name>().c_str());
         }
     }
+    lt.lap("md queues/backends");
     if (cpu_backend_idx >= 0) {
         dev_kind_[(size_t)cpu_backend_idx] = 1;
         // Go through dev_queue(): a CPU partition has no queue of its own (only GPU
@@ -3295,6 +3424,24 @@ void engine::setup_multi_device(const std::string & layer_map) {
     // chooses the owning device's queue from `multi_dev`, and wptr()/the plan
     // builders consult the flags.  (Previously this was set after the upload,
     // so every partition was allocated on the primary GPU.)
+    lt.lap("md placement");
+    // A tied LM head keeps its raw GGUF rows on the host and is uploaded to
+    // host USM later (the embed kernel reads it).  A previous process's
+    // page-out has usually evicted those pages, and the copy would then read
+    // 136 MB from disk synchronously; start the kernel's readahead now so the
+    // weight conversion (~1 s) covers it.
+    if (!m.gguf.is_split() && m.output.data == m.tok_embd.data) {
+        const uintptr_t pg = 4096;
+        const uintptr_t a = (uintptr_t)m.tok_embd.data & ~(pg - 1);
+        uintptr_t b = ((uintptr_t)m.tok_embd.data + m.tensor_bytes(m.tok_embd) + pg - 1) & ~(pg - 1);
+        const uintptr_t end = (uintptr_t)m.gguf.map_base + m.gguf.map_size;
+        if (b > end) {
+            b = end;
+        }
+        if (b > a) {
+            madvise((void *)a, (size_t)(b - a), MADV_WILLNEED);
+        }
+    }
     multi_dev = true;
     host_act = true;
     pf8 = false;
@@ -3335,6 +3482,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // whether the file can take the SIn store at all (rep.sin_w8); oneDNN
         // eligibility is decided by setup_md_dnnl() itself.
         md_xmx = has_gpu && !dp4a_env_off && !f32_path_ && setup_md_dnnl();
+        lt.lap("setup_md_dnnl (all)");
         md_int8 = has_gpu && !dp4a_env_off && mp_->rep.sin_w8 && !md_xmx;
         // md_xmx means "oneDNN int8 weights are available", not that the XMX
         // arrays are used: for the grouped-scale shapes here oneDNN selects
@@ -3381,9 +3529,11 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // the LM head's int8 copy lives on the primary device (decode head)
         m.build_w8_one(*dev_queues_[0], m.output, m.output8);
     }
+    lt.lap("md_int8 fallback");
     for (size_t i = 0; i < gpu_indices.size(); i++) {
         upload_device_weights((int)i);
     }
+    lt.lap("upload raw weights");
     // PF_MOE_DIAG: why a call can miss every GEMM path.  The plan keys a segment
     // on wkey(dev, host) - the *host* pointer for a tensor the upload skipped
     // because oneDNN holds a converted copy, the *device* pointer otherwise -
@@ -3449,12 +3599,15 @@ void engine::setup_multi_device(const std::string & layer_map) {
     // while the embed kernel keeps reading the GGUF rows.
     if (md_xmx && !dnnl_dev_.empty() && dnnl_dev_[0] && m.output.data == m.tok_embd.data) {
         const void * dkey = wptr(0, m.output.data);
-        if (dnnl_dev_[0]->add_weight(dkey, m.output.data, m.output.type, m.output.K, m.output.N)) {
+        if (dnnl_dev_[0]->add_weight(dkey, m.output.data, m.output.type, m.output.K, m.output.N, true,
+                                     si::env::flag("PF_DNNL_LAZY"))) {
             fprintf(stderr, "[dev] tied LM head: oneDNN int8 conversion keyed by its device copy\n");
         }
+        dnnl_dev_[0]->report_load("tied head");
     }
     // CPU partitions keep weight_maps_ empty: wptr() then returns the host mmap
     // pointer directly (their weights are never copied to a device)
+    lt.total("setup_multi_device total");
     fprintf(stderr, "[dev] multi-device layer map: %s (%d backends)\n", layer_map.c_str(), ndev);
 }
 

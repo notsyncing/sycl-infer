@@ -633,17 +633,19 @@ and the mmproj's `clip.projector_type` is cross-checked at load:
   ~1% of the work), and any tensor the instance did not accept falls back to
   `vit_gemm` per call, so an unsupported projector still runs.  Measured on the
   MinerU layout page: vision 58.7 s -> 3.64 s, page 113.1 s -> 15.8 s with a
-  byte-identical output, see *docs/PERFORMANCE.md* §7.4.
-* **The 80-wide attention tile is `BQ=32, BK=32, WG=1024`.**  47.6 KiB of SLM
-  per workgroup permits one workgroup per Xe core, so the workgroup's warp
-  count *is* the core's occupancy: the original 16/64/128 shape ran four warps
-  on a 16-EU core.  The score dot uses four independent accumulators (the
-  single-accumulator form is an 80-deep dependent FMA chain).  The padded rows
-  of a partial tile are guarded in every stage - the 56x56 self-check is 16
-  tokens, a partial tile on both axes - so the tile does not require n_tok to
-  be a multiple of BQ.  `PF_VIT_ATTN` selects the sweep variants (0 = 32/32/512,
-  1 = 64/16/512, 2 = 32/32/1024 default, 3 = 16/32/512, 4 = 32/32/256,
-  5 = 64/16/1024).
+  byte-identical output; a later pass took it to **11.0 s** (attention 3.26 ->
+  2.10 s, decode 4.97 -> 4.60 s, load 5.03 -> 1.65 s) - see
+  *docs/PERFORMANCE.md* §7.4.
+* **The 80-wide attention default is the ILP kernel `BQ=48, BK=32, WG=1024`,
+  SG16, RQ2/RQP2** (two query rows' score dot per thread, two PV rows sharing
+  one V `float4`).  It is bit-identical to the reference order and measured
+  2.10 s vs 3.26 s for 32/32/1024 on the layout page.  SLM permits one
+  workgroup per Xe core, so the warp count *is* the occupancy; the padded rows
+  of a partial tile are guarded in every stage (the 56x56 self-check is 16
+  tokens).  `PF_VIT_ATTN=70` is the default; 0 = 32/32/512 (Iris Xe fallback),
+  1 = 64/16/512, 2 = 32/32/1024, 3 = 16/32/512, 4 = 32/32/256, 5 = 64/16/1024,
+  6 = pre-ILP 48/32/1024, 7 = 16/64/1024, 51 = f32 oneDNN QK/PV (faster but a
+  different summation order, opt-in only).
 * The mmproj stores the linears as BF16 and the norms/biases/patch/position
   tensors as F32; `upload` copies the whole GGUF blob once and `dev_ptr` maps a
   host tensor pointer into it.  `encode_device` runs on the queue it is given,
@@ -3683,7 +3685,10 @@ decode / total ms, plus the mmproj load+upload time),
 `PF_VISION_TIME` (vision encoder: one line per encode with patch / merger / post_ln and
 the per-stage totals over all layers - ln1, qkv, rope, attn, out, ln2, up, act, down -
 taken with a `q.wait()` per stage, so only the diagnostic pays for them),
-`PF_VISION_DNNL` (vision linears on the oneDNN int8 matmul; default **on** for `qwen2vl`
+`PF_VISION_DNNL` (vision linears on the oneDNN int8 matmul; default **on** for `qwen2vl`;
+`PF_VISION_COMPACT` / `PF_VISION_DEFER_QKV` control the 3.7 MB compact blob and the
+lazy q/k/v f32 relayout; `PF_DNNL_LAZY` makes the text primitive ladder lazy;
+`PF_LOAD_TIME` / `PF_DNNL_QCHK` / `PF_I8_SPLITK` are the load diagnostics/A-B
 - verified byte-identical page output - and **off** for `qwen3vl`, whose BF16 tower has
 not been measured here; `0` restores `vit_gemm`),
 `PF_VIT_ATTN` (vision attention tile sweep: 0 = 32/32/512, 1 = 64/16/512, 2 = 32/32/1024

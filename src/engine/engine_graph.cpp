@@ -1510,8 +1510,48 @@ auto moe_call = [&](size_t idx) {
         // quantize no longer compiles.  Invalid when dnnl_call is false, which is
         // exactly when the gemm paths below are not taken either.
         act_view av;
+        bool fused_quant = false;
         if (dnnl_call) {
             const seg_plan::xq_t & xq = plan.calls[idx].xq;
+            // M == 1 decode: one launch for this call's activation quantizer AND
+            // all of its plain-int8 segments.  A 0.8B-class decoder has ~360
+            // kernels per token and most projections are 0.1-9 MB, so the launch
+            // floor is a large share of the step; this removes the quantizer
+            // (4/layer) and fuses q|k|v / gate|up (up to 3 launches -> 1).  The
+            // kernel reproduces act_quant_grp_launch and i8_grp_gemv_impl's
+            // arithmetic exactly, so the output is unchanged; a call with an
+            // unconvertible segment or a K/SLM the kernel cannot take returns
+            // false and this falls through to the ordinary path below.
+            if (mode == 0 && tb == 1) {
+                const int c0 = plan.calls[idx].seg_off;
+                const int cs = plan.calls[idx].seg_count;
+                bool ok = cs >= 1 && cs <= 4 && xq.K > 0 && (xq.K % 32) == 0;
+                const void * keys[4];
+                int nrows[4];
+                const float * outs[4], * res[4];
+                float alphas[4];
+                int call_rows = 0;
+                for (int j = 0; ok && j < cs; j++) {
+                    const gemv_seg & sj = plan.segs[c0 + j];
+                    ok = !sj.w8.vals && sj.i8 == 0 && sj.K == xq.K && D->has_weight(sj.w);
+                    keys[j] = sj.w;
+                    nrows[j] = sj.n_rows;
+                    outs[j] = sj.out;
+                    res[j] = sj.residual;
+                    alphas[j] = sj.alpha;
+                    call_rows += sj.n_rows;
+                }
+                // A single very wide segment (the LM head: 150k rows) pays more
+                // to re-quantize the activation per work-group than the one
+                // launch it saves, so it keeps the separate quantizer.
+                if (cs == 1 && call_rows > 8192) {
+                    ok = false;
+                }
+                if (ok) {
+                    fused_quant = D->gemm_i8_quant_group(xq.x, xq.up, keys, nrows, outs, res, alphas, cs, xq.K);
+                }
+            }
+            if (!fused_quant) {
             const auto a2 = tnow();
             // decode reads the even/odd split in the u4 GEMV; prefill does not
             // do_split also feeds the native-u4 GEMM's even/odd activation planes,
@@ -1546,6 +1586,7 @@ auto moe_call = [&](size_t idx) {
                 sync_cur();
                 prof_acc[5] += tms(a2, tnow());
             }
+            } // !fused_quant
         } else if (idx < plan.calls.size() && plan.calls[idx].xq.x) {
             const seg_plan::xq_t & xq = plan.calls[idx].xq;
             const bool p2 = prof_on();
@@ -1567,7 +1608,7 @@ auto moe_call = [&](size_t idx) {
                 prof_acc[5] += tms(a2, tnow());
             }
         }
-        for (int g = 0; g < gc; g++) {
+        for (int g = 0; !fused_quant && g < gc; g++) {
             const seg_plan::group_t & gr = plan.groups[gb + g];
             const gemv_seg & s0 = plan.segs[gr.off];
             if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_path && idx == 0) {
@@ -1692,8 +1733,8 @@ auto moe_call = [&](size_t idx) {
                         ok = sj.K == plan.segs[gr.off].K && sj.out_stride == plan.segs[gr.off].out_stride;
                     }
                     if (ok) {
-                        decoded = D->gemm_i8_group(av, keys, nrows, outs, plan.segs[gr.off].out_stride, res, alphas, gr.n,
-                                                   tbm, plan.segs[gr.off].K);
+                        decoded = D->gemm_i8_group(av, keys, nrows, outs, plan.segs[gr.off].out_stride, res, alphas,
+                                                   gr.n, tbm, plan.segs[gr.off].K);
                         if (si::env::flag("PF_FUSEDBG")) {
                             static long fused = 0, tried = 0;
                             tried++;

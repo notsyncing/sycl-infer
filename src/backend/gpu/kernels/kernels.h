@@ -200,6 +200,10 @@ struct i8_grp_seg {
 };
 void i8_grp_gemv_rows_multi_launch(sycl::queue & q, const i8_grp_seg * segs, int n_segs, int total_rows,
                                     const int8_t * xq, const uint16_t * asa, const float * xs, int M, int K);
+// M == 1 decode: fuse the call's activation quantizer and all of its plain-int8
+// segments into one launch (bit-identical to quantize() + one GEMV per segment).
+void i8_grp_quant_gemv_launch(sycl::queue & q, const i8_grp_seg * segs, int n_segs, int total_rows,
+                              const float * x, const float * up, int K);
 void w4_gemm_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int M, int K, int N);

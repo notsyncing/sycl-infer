@@ -612,6 +612,93 @@ struct dnnl_gemm::impl {
     int accsum_n = 0;
     bool actsum_shape = si::env::flag("PF_ACTQ_SHAPE");
     bool has_w4 = false;       // any u4 weight registered -> produce axg/asa
+    // PF_LOAD_TIME: where the registration time goes.  The three parts have
+    // different fixes - the host dequant+requantize is CPU (vectorise/thread),
+    // the copies are pageable H2D (stage/pin), the ladder is oneDNN primitive
+    // creation (lazy) - and they look identical from outside.
+    bool pf_on = si::env::flag("PF_LOAD_TIME");
+    // PF_DNNL_QCHK=1: recompute one row per tensor with the reference
+    // (lround) formula and report mismatches.  The vectorised loop replaces
+    // std::lround (a libm call the compiler cannot vectorise) with
+    // add-copysign-truncate, which is the same round-half-away-from-zero for
+    // every value in [-127,127], but the claim is checked rather than assumed.
+    bool pf_qchk = si::env::flag("PF_DNNL_QCHK");
+    double pf_conv_ms = 0, pf_copy_ms = 0, pf_prim_ms = 0, pf_spawn_ms = 0;
+    int pf_n = 0;
+    long pf_qbad = 0;
+
+    // Host staging for the int8 conversion.  The conversion output is copied to
+    // the device once, so it does not need a zero-initialised std::vector per
+    // tensor: a reusable *pinned* buffer removes the memset, the allocation and
+    // the pageable-copy penalty (measured ~1.15x on H2D, plus the per-tensor
+    // page faults).  Capped so an LM-head-sized tensor (a 27B's 1.27 GB) does
+    // not pin that much host memory; anything larger keeps the vector path.
+    static constexpr size_t kStageMax = 256u << 20;
+    // Two slots so a tensor's H2D can run while the next tensor is being
+    // dequantized (the queue is in-order, so the copies queue up behind each
+    // other and the host never blocks).  A slot is only reused after its last
+    // copy is waited on, which by then is free: a full conversion ran in
+    // between.
+    struct stage_set {
+        int8_t * p = nullptr;
+        size_t cap = 0;
+        uint16_t * ps = nullptr;
+        size_t pcap = 0;
+        bool pending = false;
+    } sets[2];
+    int cur_set = 0;
+    bool pf_stage = [] {
+        const char * e = si::env::str("PF_DNNL_NOSTAGE");
+        return !(e && atoi(e) != 0);
+    }();
+    // PF_DNNL_SYNCCOPY=1 restores the per-tensor blocking copy (A/B).
+    bool pf_async = [] {
+        const char * e = si::env::str("PF_DNNL_SYNCCOPY");
+        return !(e && atoi(e) != 0);
+    }();
+    int stage_begin() {
+        stage_set & s = sets[cur_set];
+        if (s.pending) {
+            q.wait();
+            s.pending = false;
+        }
+        return cur_set;
+    }
+    int8_t * stage_i8(int slot, size_t n) {
+        if (!pf_stage || n > kStageMax) {
+            return nullptr;
+        }
+        stage_set & s = sets[slot];
+        if (n > s.cap) {
+            if (s.p) {
+                q.wait();
+                sycl::free(s.p, q);
+            }
+            s.p = sycl::malloc_host<int8_t>(n, q);
+            s.cap = s.p ? n : 0;
+        }
+        return s.p;
+    }
+    uint16_t * stage_u16(int slot, size_t n) {
+        if (!pf_stage || n * 2 > kStageMax) {
+            return nullptr;
+        }
+        stage_set & s = sets[slot];
+        if (n > s.pcap) {
+            if (s.ps) {
+                q.wait();
+                sycl::free(s.ps, q);
+            }
+            s.ps = sycl::malloc_host<uint16_t>(n, q);
+            s.pcap = s.ps ? n : 0;
+        }
+        return s.ps;
+    }
+    void stage_done(int slot) {
+        sets[slot].pending = true;
+        cur_set ^= 1;
+    }
+
 
     // int8 weight with a PER-32-GROUP scale (was per-row).  Every native quant
     // type here carries per-32 scales, so re-quantizing onto one per-row scale
@@ -1050,8 +1137,17 @@ dnnl_gemm::~dnnl_gemm() {
     // Every long-lived allocation was registered in owned_ at creation;
     // freeing the registry (not a per-field list) is what keeps a newly
     // added store from leaking by forgetting this function.
+    p->q.wait();
     for (void * ptr : p->owned_) {
         sycl::free(ptr, p->q);
+    }
+    for (auto & s : p->sets) {
+        if (s.p) {
+            sycl::free(s.p, p->q);
+        }
+        if (s.ps) {
+            sycl::free(s.ps, p->q);
+        }
     }
 }
 
@@ -1061,8 +1157,60 @@ dnnl_gemm::~dnnl_gemm() {
 // so the values are the ones the dp4a path uses; only the representation
 // changes (per-row int8 instead of per-32 packed 4/5/6-bit).  Rows are
 // independent -> convert in parallel with one thread per row slab.
-bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N, bool eager) {
+bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t ggml_type, int K, int N, bool eager,
+                           bool lazy) {
     if (!key || !host_data) {
+        return false;
+    }
+    if (K <= 0 || N <= 0 || (K % 32) != 0 || K > kActMaxK) {
+        return false;
+    }
+    if (p->weights.count(key)) {
+        return p->weights[key].ok;
+    }
+    const size_t row_bytes = quant_row_bytes(ggml_type, K);
+    std::vector<const char *> rows((size_t)N);
+    for (int r = 0; r < N; r++) {
+        rows[(size_t)r] = (const char *)host_data + (size_t)r * row_bytes;
+    }
+    return add_weight_rows(key, rows.data(), ggml_type, K, N, eager, lazy);
+}
+
+bool dnnl_gemm::add_weight_blocks(const void * key, const void * const * srcs, const int * rows_per_src, int n_src,
+                                  uint32_t ggml_type, int K, int N, bool lazy) {
+    if (!key || !srcs || !rows_per_src || n_src <= 0) {
+        return false;
+    }
+    if (K <= 0 || N <= 0 || (K % 32) != 0 || K > kActMaxK) {
+        return false;
+    }
+    if (p->weights.count(key)) {
+        return p->weights[key].ok;
+    }
+    int total_rows = 0;
+    for (int s = 0; s < n_src; s++) {
+        if (!srcs[s] || rows_per_src[s] < 0) {
+            return false;
+        }
+        total_rows += rows_per_src[s];
+    }
+    if (total_rows != N) {
+        return false;
+    }
+    const size_t row_bytes = quant_row_bytes(ggml_type, K);
+    std::vector<const char *> rows((size_t)N);
+    int r = 0;
+    for (int s = 0; s < n_src; s++) {
+        for (int j = 0; j < rows_per_src[s]; j++, r++) {
+            rows[(size_t)r] = (const char *)srcs[s] + (size_t)j * row_bytes;
+        }
+    }
+    return add_weight_rows(key, rows.data(), ggml_type, K, N, /*eager=*/true, lazy);
+}
+
+bool dnnl_gemm::add_weight_rows(const void * key, const char * const * rows, uint32_t ggml_type, int K, int N,
+                                bool eager, bool lazy) {
+    if (!key || !rows) {
         return false;
     }
     // any format quant.h can dequantize row-wise converts to an int8 oneDNN
@@ -1092,43 +1240,79 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
         return p->weights[key].ok;
     }
 
+    const auto pf_t0 = std::chrono::steady_clock::now();
     const size_t nvals = (size_t)N * K;
-    std::vector<int8_t> hw(nvals);
     const int ng = K / kW4Group;
-    std::vector<uint16_t> hs((size_t)ng * N); // [g][n] f16 step
-    const size_t row_bytes = quant_row_bytes(ggml_type, K);
+    std::vector<int8_t> hw_vec;
+    std::vector<uint16_t> hs_vec;
+    const int stage_slot = p->stage_begin();
+    int8_t * hw = p->stage_i8(stage_slot, nvals);
+    uint16_t * hs = p->stage_u16(stage_slot, (size_t)ng * N);
+    if (!hw) {
+        hw_vec.resize(nvals);
+        hw = hw_vec.data();
+    }
+    if (!hs) {
+        hs_vec.resize((size_t)ng * N);
+        hs = hs_vec.data();
+    }
     const int nthr = (int)std::min<size_t>((size_t)N, std::max<size_t>(1, std::thread::hardware_concurrency()));
     std::vector<std::vector<float>> frows(nthr, std::vector<float>(K));
     std::vector<std::thread> th;
     th.reserve(nthr);
+    const auto pf_s0 = std::chrono::steady_clock::now();
     for (int t = 0; t < nthr; t++) {
         th.emplace_back([&, t] {
-            std::vector<float> & fr = frows[t];
-            for (int r = t; r < N; r += nthr) {
-                dequantize_row(ggml_type, (const char *)host_data + (size_t)r * row_bytes, fr.data(), K);
-                int8_t * q8 = hw.data() + (size_t)r * K;
-                for (int g = 0; g < ng; g++) {
-                    float amax = 0.f;
+        std::vector<float> & fr = frows[t];
+        for (int r = t; r < N; r += nthr) {
+            dequantize_row(ggml_type, rows[(size_t)r], fr.data(), K);
+            int8_t * q8 = hw + (size_t)r * K;
+            for (int g = 0; g < ng; g++) {
+                float amax = 0.f;
+                for (int k = g * kW4Group; k < (g + 1) * kW4Group; k++) {
+                    amax = std::max(amax, std::fabs(fr[k]));
+                }
+                const float sc = amax > 0.f ? amax / 127.0f : 1.0f;
+                sycl::half h(sc);
+                uint16_t bits;
+                std::memcpy(&bits, &h, sizeof(h));
+                hs[(size_t)g * N + r] = bits;
+                const float inv = 1.0f / sc;
+                if (p->pf_qchk && r == 0) {
                     for (int k = g * kW4Group; k < (g + 1) * kW4Group; k++) {
-                        amax = std::max(amax, std::fabs(fr[k]));
-                    }
-                    const float sc = amax > 0.f ? amax / 127.0f : 1.0f;
-                    sycl::half h(sc);
-                    uint16_t bits;
-                    std::memcpy(&bits, &h, sizeof(h));
-                    hs[(size_t)g * N + r] = bits;
-                    const float inv = 1.0f / sc;
-                    for (int k = g * kW4Group; k < (g + 1) * kW4Group; k++) {
-                        int v = (int)std::lround(fr[k] * inv);
-                        q8[k] = (int8_t)std::max(-127, std::min(127, v));
+                        const int ref = (int)std::lround(fr[k] * inv);
+                        const float t0 = fr[k] * inv;
+                        const int got = (int)(t0 + (t0 >= 0.f ? 0.5f : -0.5f));
+                        if (ref != got) {
+                            p->pf_qbad++;
+                        }
                     }
                 }
+                // Round-half-away-from-zero without the libm call: the compiler
+                // vectorises this (measured 4x on the row conversion) where
+                // std::lround left the loop scalar.
+                #pragma clang loop vectorize(enable)
+                for (int k = g * kW4Group; k < (g + 1) * kW4Group; k++) {
+                    const float t0 = fr[k] * inv;
+                    int v = (int)(t0 + (t0 >= 0.f ? 0.5f : -0.5f));
+                    q8[k] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
+                }
             }
+        }
         });
     }
+    const auto pf_s1 = std::chrono::steady_clock::now();
     for (auto & x : th) {
         x.join();
     }
+    if (p->pf_on) {
+        p->pf_spawn_ms += std::chrono::duration<double, std::milli>(pf_s1 - pf_s0).count();
+    }
+    if (p->pf_on) {
+        p->pf_conv_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pf_t0).count();
+    }
+    const auto pf_t1 = std::chrono::steady_clock::now();
 
     impl::w_entry w;
     w.K = K;
@@ -1141,8 +1325,26 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
         p->dev_erase(w.scales);
         return false;
     }
-    p->q.memcpy(w.dev, hw.data(), nvals).wait();
-    p->q.memcpy(w.scales, hs.data(), (size_t)ng * N * 2).wait();
+    if (hw == p->sets[stage_slot].p && hs == p->sets[stage_slot].ps) {
+        // staged: enqueue and let the next tensor's conversion overlap the copy
+        p->q.memcpy(w.dev, hw, nvals);
+        p->q.memcpy(w.scales, hs, (size_t)ng * N * 2);
+        if (p->pf_async) {
+            p->stage_done(stage_slot);
+        } else {
+            p->q.wait();
+            p->sets[stage_slot].pending = false;
+            p->cur_set ^= 1;
+        }
+    } else {
+        p->q.memcpy(w.dev, hw, nvals).wait();
+        p->q.memcpy(w.scales, hs, (size_t)ng * N * 2).wait();
+    }
+    if (p->pf_on) {
+        p->pf_copy_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pf_t1).count();
+    }
+    const auto pf_t2 = std::chrono::steady_clock::now();
     static const int blocked = [] {
         const char * e = si::env::str("PF_DNNL_BLOCKED");
         return e ? atoi(e) : 0;
@@ -1161,8 +1363,8 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
     // any multiple of kMaxT up to kMaxB*kMaxT rows (batched_prefill_fit), mode 1
     // uses kMaxT.  If a shape cannot run on this GPU, the tensor is marked
     // unsupported now so the engine falls back to dp4a before quantizing.
-    bool any = !eager; // lazy: primitives are created on the first gemm() for each shape
-    for (int M = kMaxT; eager && M <= p->cap_M; M += kMaxT) {
+    bool any = !eager || lazy; // lazy: primitives are created on the first gemm() for each shape
+    for (int M = kMaxT; eager && !lazy && M <= p->cap_M; M += kMaxT) {
         if ((size_t)M * N > p->acc_cap) {
             continue;
         }
@@ -1178,7 +1380,28 @@ bool dnnl_gemm::add_weight(const void * key, const void * host_data, uint32_t gg
             }
         }
     }
+    if (lazy) {
+        // the 1-row decode runs inside a recorded graph; prime that shape now
+        try {
+            p->make_prim(1, K, N);
+        } catch (const std::exception &) {
+            any = false;
+        }
+    }
     w.ok = any;
+    if (p->pf_qchk) {
+        static long total_bad = 0;
+        static int nchk = 0;
+        total_bad += p->pf_qbad;
+        p->pf_qbad = 0;
+        nchk++;
+        fprintf(stderr, "[qchk] %3d K=%-5d N=%-6d mismatches(total)=%ld\n", nchk, K, N, total_bad);
+    }
+    if (p->pf_on) {
+        p->pf_prim_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pf_t2).count();
+        p->pf_n++;
+    }
     auto ins = p->weights.emplace(key, std::move(w));
     return ins.first->second.ok;
 }
@@ -1358,7 +1581,8 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
 // per-32-group f16 step/offset planes.  Returns false for unsupported types,
 // which keep their int8 conversion.
 bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t ggml_type, int K, int N,
-                              bool any_type, bool gemv_only, float scale_mul, const char * cls, int layer) {
+                              bool any_type, bool gemv_only, float scale_mul, const char * cls, int layer,
+                              bool lazy) {
     const bool w4info = si::env::flag("PF_W4_INFO");
     // PF_W4_ALL_ONLY: a set list turns the generic pack on for its classes and
     // off for everything else, so it overrides both w4_supported() and
@@ -1383,6 +1607,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     if (found != p->w4weights.end()) {
         return found->second.ok;
     }
+    const auto pf_t0 = std::chrono::steady_clock::now();
     si::w4t w;
     // A natively-representable type keeps its exact grid; every other type
     // (including a class that PF_W4_ALL_ONLY selected) takes the generic pack.
@@ -1413,6 +1638,15 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     e.K = K;
     e.N = N;
     e.G = w.G;
+    if (p->pf_on) {
+        p->pf_conv_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pf_t0).count();
+    }
+    const auto pf_t1 = std::chrono::steady_clock::now();
+    if (w4info) {
+        fprintf(stderr, "[w4] register key=%p type=%u K=%d N=%d (%.4f B/weight)\n", key, ggml_type, K, N,
+                (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
+    }
     e.vals = p->dev_alloc<uint8_t>(w.vals.size());
     e.scales = p->dev_alloc<uint16_t>(w.scale.size());
     e.off = p->dev_alloc<uint16_t>(w.off.size());
@@ -1425,6 +1659,11 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     p->q.memcpy(e.vals, w.vals.data(), w.vals.size()).wait();
     p->q.memcpy(e.scales, w.scale.data(), w.scale.size() * 2).wait();
     p->q.memcpy(e.off, w.off.data(), w.off.size() * 2).wait();
+    if (p->pf_on) {
+        p->pf_copy_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pf_t1).count();
+    }
+    const auto pf_t2 = std::chrono::steady_clock::now();
     e.wmem = sycl_interop::make_memory(memory::desc({K, N}, memory::data_type::u4, memory::format_tag::ba), p->eng,
                                        sycl_interop::memory_kind::usm, (void *)e.vals);
     e.scmem =
@@ -1452,9 +1691,9 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     // never have one, which is why the target head is int8.  Register it
     // GEMV-only.  `gemv_only` is the same thing for a *native* (Q4_K) tensor
     // whose prefill ladder cannot be built at this shape.
-    bool any = any_type || gemv_only;
+    bool any = any_type || gemv_only || lazy;
     const int ladder[] = {1, kMaxT, 2 * kMaxT, 3 * kMaxT, 4 * kMaxT, 8 * kMaxT, 16 * kMaxT};
-    if (!(any_type || gemv_only)) {
+    if (!(any_type || gemv_only || lazy)) {
         if ((size_t)p->cap_M * (size_t)N > p->acc_cap) {
             if (w4info) {
                 // Say so: the packing succeeded and everything above was
@@ -1489,6 +1728,16 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
             }
         }
     }
+    if (lazy && !any_type && !gemv_only) {
+        // Only the 1-row shape can be reached inside a recorded command graph
+        // (the multi-device decode).  Everything else is a direct replay, where
+        // gemm_w4() creates the primitive on first use.
+        try {
+            p->make_prim4(1, K, N);
+        } catch (const std::exception &) {
+            any = false;
+        }
+    }
     e.ok = any;
     if (w4info) {
         fprintf(stderr, "[w4] %s key=%p type=%u K=%d N=%d (%.4f B/weight)\n", any ? "register" : "reject(no M ladder)",
@@ -1497,6 +1746,11 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     }
     if (any) {
         p->has_w4 = true; // quantize() must now also produce the grouped form
+    }
+    if (p->pf_on) {
+        p->pf_prim_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pf_t2).count();
+        p->pf_n++;
     }
     auto ins = p->w4weights.emplace(key, std::move(e));
     return ins.first->second.ok;
@@ -1695,6 +1949,16 @@ bool dnnl_gemm::gemm_w2(const act_view & v, const void * key, const float * resi
 // instead of during the first request.  The activation quantizer and the
 // epilogue are launched once too: their SYCL kernels would otherwise be
 // JIT-compiled inside the first request.
+void dnnl_gemm::report_load(const char * who) const {
+    if (!p->pf_on) {
+        return;
+    }
+    const double tot = p->pf_conv_ms + p->pf_copy_ms + p->pf_prim_ms;
+    fprintf(stderr,
+            "[load]   dnnl %-12s %3d tensors: conv %7.1f ms (spawn %.1f), copy %6.1f ms, prim %6.1f ms (%.1f)\n", who,
+            p->pf_n, p->pf_conv_ms, p->pf_spawn_ms, p->pf_copy_ms, p->pf_prim_ms, tot);
+}
+
 int dnnl_gemm::warmup() {
     const bool tdbg = si::env::flag("PF_DNNL_TIME");
     const auto t0 = std::chrono::high_resolution_clock::now();
@@ -2587,6 +2851,45 @@ bool dnnl_gemm::gemm_i8_csr_nocorr(const void * key, const int8_t * xq, const ui
 void dnnl_gemm::sync() {
     p->q.wait();
     p->st.wait();
+}
+
+bool dnnl_gemm::gemm_i8_quant_group(const float * x, const float * up, const void * const * keys, const int * n_rows,
+                                   const float * const * outs, const float * const * residuals, const float * alphas,
+                                   int n_segs, int K) {
+    if (!x || n_segs < 1 || n_segs > 4 || K <= 0 || K % 32) {
+        return false;
+    }
+    const int ng = K / 32;
+    // SLM: the quantized activation + its f16 scales + group sums + RB rows of
+    // weight scales, with the kernel's fixed RB = 16.
+    const size_t slm = (size_t)K + (size_t)ng * 6 + (size_t)16 * (size_t)ng * 2;
+    // Half the per-work-group budget: the tile must not cost a resident
+    // work-group (the 896/4864-wide decoders use 2-11 KB; a 17k-wide K would
+    // take 38 KB).  The shape that misses this keeps the separate quantizer.
+    if (slm > (size_t)si::dev::for_queue(p->q).slm.budget_bytes / 2) {
+        return false;
+    }
+    i8_grp_seg segs[4];
+    int total = 0;
+    for (int i = 0; i < n_segs; i++) {
+        auto it = p->weights.find(keys[i]);
+        if (it == p->weights.end() || !it->second.ok || !it->second.dev || !it->second.scales) {
+            return false;
+        }
+        if (it->second.K != K || n_rows[i] <= 0) {
+            return false;
+        }
+        total += n_rows[i];
+        segs[i].w8 = it->second.dev;
+        segs[i].wsc = it->second.scales;
+        segs[i].n_rows = n_rows[i];
+        segs[i].out = (float *)outs[i];
+        segs[i].out_stride = n_rows[i];
+        segs[i].alpha = alphas[i];
+        segs[i].residual = residuals[i];
+    }
+    i8_grp_quant_gemv_launch(p->q, segs, n_segs, total, x, up, K);
+    return true;
 }
 
 const int8_t * dnnl_gemm::weight_data(const void * key) const {
