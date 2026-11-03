@@ -2892,6 +2892,38 @@ bool dnnl_gemm::gemm_i8_quant_group(const float * x, const float * up, const voi
     return true;
 }
 
+bool dnnl_gemm::gemm_w4_quant_group(const float * x, const float * up, const void * const * keys, const int * n_rows,
+                                    const float * const * outs, const float * const * residuals,
+                                    const float * alphas, int n_segs, int K) {
+    if (!x || n_segs < 1 || n_segs > 4 || K <= 0 || K % 32) {
+        return false;
+    }
+    const int G = si::w4_group();
+    w4_grp_seg segs[4];
+    int total = 0;
+    for (int i = 0; i < n_segs; i++) {
+        auto it = p->w4weights.find(keys[i]);
+        if (it == p->w4weights.end() || !it->second.ok) {
+            return false;
+        }
+        const impl::w4_entry & w = it->second;
+        // the packed planes must match this call's K and the global group width
+        // the fused kernel's staging index uses
+        if (w.K != K || w.G != G || !w.vals || !w.scales || !w.off || n_rows[i] <= 0) {
+            return false;
+        }
+        total += n_rows[i];
+        segs[i].vals = w.vals;
+        segs[i].scale = w.scales;
+        segs[i].off = w.off;
+        segs[i].n_rows = n_rows[i];
+        segs[i].out = (float *)outs[i];
+        segs[i].alpha = alphas[i];
+        segs[i].residual = residuals[i];
+    }
+    return w4_grp_quant_gemv_launch(p->q, segs, n_segs, total, x, up, K);
+}
+
 const int8_t * dnnl_gemm::weight_data(const void * key) const {
     auto it = p->weights.find(key);
     return it == p->weights.end() ? nullptr : it->second.dev;

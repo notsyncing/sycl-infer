@@ -240,6 +240,9 @@ struct profile {
         int pf_wmin;     // qwen4exp two-pass prefill minimum workspace
         int row_gemv;    // PF_MOE_XE2: warp-per-row single-token expert GEMV
         int tiled;       // PF_MOE_TILED: tiled fp32-SLM prefill expert GEMM
+        int gu_tile;     // PF_MOE_GU_TILE: banked prefill gate/up GEMM M, 0 = cost model
+        int dn_tile;     // PF_MOE_DN_TILE: banked prefill down GEMM M
+        int w4_qfuse;    // PF_W4_QFUSE: M=1 quantize+u4-GEMV fusion (narrow dense parts)
     } moe;
 };
 

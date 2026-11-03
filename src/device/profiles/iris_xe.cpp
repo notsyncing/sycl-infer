@@ -145,6 +145,9 @@ static const profile iris_xe = {
         .pf_wmin = 24,
         .row_gemv = 0,
         .tiled = 0,
+        .gu_tile = 0,
+        .dn_tile = 128,
+        .w4_qfuse = 0,
     },
 };
 

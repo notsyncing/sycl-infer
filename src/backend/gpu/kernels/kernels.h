@@ -204,6 +204,23 @@ void i8_grp_gemv_rows_multi_launch(sycl::queue & q, const i8_grp_seg * segs, int
 // segments into one launch (bit-identical to quantize() + one GEMV per segment).
 void i8_grp_quant_gemv_launch(sycl::queue & q, const i8_grp_seg * segs, int n_segs, int total_rows,
                               const float * x, const float * up, int K);
+// The u4 counterpart of i8_grp_quant_gemv_launch: quantize the call's activation
+// (per-32-group scale, even/odd k split, group sums) and run every one of its
+// plain-u4 segments from the same launch.  Bit-identical to quantize(do_split)
+// followed by one w4_gemv_launch per segment; `up` applies silu(gate) for
+// ffn_down.  Returns false (and launches nothing) when the activation tile and
+// the weight-scale staging do not fit this card's SLM.
+struct w4_grp_seg {
+    const uint8_t * vals;   // [n_rows][K/2] nibble plane
+    const uint16_t * scale; // per-(g,n) f16 step plane
+    const uint16_t * off;   // per-(g,n) f16 offset plane
+    int n_rows;
+    float * out;
+    float alpha;
+    const float * residual;
+};
+bool w4_grp_quant_gemv_launch(sycl::queue & q, const w4_grp_seg * segs, int n_segs, int total_rows,
+                              const float * x, const float * up, int K);
 void w4_gemm_launch(sycl::queue & q, const uint8_t * vals, const uint16_t * scale, const uint16_t * off,
                     const int8_t * axe, const int8_t * axo, const uint16_t * asa, const float * xs, float * out,
                     int out_stride, const float * residual, float alpha, int M, int K, int N);

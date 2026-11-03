@@ -1985,7 +1985,11 @@ bool engine::moe_down_i8(int dev, int moe_il, const moe_t & M, int n_pairs, int 
     // result bit-reproducible - mixing shapes inside a layer measured
     // non-deterministic here.
     const int fixed_tile = std::max(0, si::env::i32("PF_MOE_DN_TILE", si::env::i32("PF_MOE_TILE", 0)));
-    const int layer_M = fixed_tile > 0 ? std::min(256, fixed_tile) : 128;
+    // The card profile's measured down tile (arc_a770/iris_xe 128, arc_140v 96)
+    // unless the A/B env forces one.  A per-card value because the padding
+    // trade scales with the EU count and with oneDNN's M-rate on that part.
+    const int prof_dn = si::dev::for_queue(qq).moe.dn_tile;
+    const int layer_M = fixed_tile > 0 ? std::min(256, fixed_tile) : (prof_dn > 0 ? prof_dn : 128);
     for (int ia = 0; ia < nact; ia++) {
         const int e = active[(size_t)ia];
         const int p0 = off[(size_t)e];
@@ -2130,10 +2134,15 @@ bool engine::moe_gate_up_u4(int dev, int moe_il, const moe_t & M, int n_tok, int
     // multi-tile loop for the few experts wider than it is bit-reproducible
     // and still avoids the old fixed-128 padding (a chunk's mean is ~40
     // pairs/expert, so 128 spent 3x the MACs of real work).
-    int layer_M = 32;
+    // The card profile's measured gate/up tile; 0 keeps the cost model below.
+    // arc_140v sets 32: forcing it measures 5.46 s against the cost model's
+    // 5.65 s on the 35B (the model's rate table is isolated-GEMM numbers and
+    // over-values 96/128 in situ).
+    const int prof_gu = si::dev::for_queue(qq).moe.gu_tile;
+    int layer_M = prof_gu > 0 ? prof_gu : 32;
     if (fixed_tile > 0) {
         layer_M = std::min(256, fixed_tile);
-    } else {
+    } else if (prof_gu <= 0) {
         static const int cand[] = {32, 64, 96, 128, 256};
         static const double rate[] = {2.2, 3.8, 4.5, 5.4, 4.8};
         double best = 1e30;

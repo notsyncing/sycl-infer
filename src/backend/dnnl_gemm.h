@@ -266,6 +266,14 @@ struct dnnl_gemm {
     bool gemm_i8_quant_group(const float * x, const float * up, const void * const * keys, const int * n_rows,
                              const float * const * outs, const float * const * residuals, const float * alphas,
                              int n_segs, int K);
+    // The u4 counterpart: fused quantize + every plain-u4 segment of one M == 1
+    // call in a single launch.  Bit-identical to quantize(do_split=true)
+    // followed by one gemm_w4() per segment.  Returns false without launching
+    // when a segment is not a u4 store, the K does not match, or the SLM tile
+    // does not fit, so the caller keeps its per-segment path.
+    bool gemm_w4_quant_group(const float * x, const float * up, const void * const * keys, const int * n_rows,
+                             const float * const * outs, const float * const * residuals, const float * alphas,
+                             int n_segs, int K);
     const int8_t * act_data(const act_view & v) const;
     // u4 path: the per-32-group quantized activations and their f16 scales
     // (device pointers), produced alongside the per-row form when a u4 weight

@@ -726,6 +726,214 @@ void i8_grp_quant_gemv_launch(queue & q, const i8_grp_seg * segs, int n_segs, in
     throw std::runtime_error("i8_grp_quant_gemv_launch: too many segments");
 }
 
+// M == 1 decode, native u4: one launch for the call's activation quantizer and
+// all of its plain-u4 segments.  This is the u4 counterpart of
+// i8_grp_quant_gemv_launch and reproduces, step for step,
+//   act_quant_grp_launch(do_split=true)  +  w4_gemv_launch per segment
+// so the output is bit-identical: phase 1 is the quantizer (same 32-value
+// group, same sub-group max, same f16 scale bits, same group sum, same even/odd
+// k split), phase 2 stages this tile's weight step/offset planes exactly as
+// w4_gemv_impl does, and phase 3 is w4_gemv_impl's row arithmetic unchanged.
+//
+// Fusing is only worth it if the requantization is amortized: every work-group
+// must read the whole activation to have it in SLM, so a single row tile per
+// work-group re-reads it once per RB output rows and that redundancy measured
+// +2 ms/token on the 35B (the launch savings are ~1.5 ms).  Each work-group
+// therefore walks `tiles` row tiles after one quantize, and the launcher sizes
+// `tiles` so the grid still fills the machine.  Callers keep a wide single
+// segment - the LM head - on the separate quantizer either way.
+template <int RB, int NS>
+static void w4_grp_quant_gemv_impl(queue & q, const w4_grp_seg * segs, int total_rows, const float * x,
+                                   const float * up, int K, int tiles) {
+    const int ng = K / 32;
+    const int gs = si::w4_group_shift();
+    constexpr int TX = RB * 32;
+    const int per_wg = RB * tiles;
+    const int nwg = (total_rows + per_wg - 1) / per_wg;
+    w4_grp_seg sv[NS];
+#pragma unroll
+    for (int i = 0; i < NS; i++) {
+        sv[i] = segs[i];
+    }
+    q.submit([&](handler & h) {
+        local_accessor<int8_t, 1> axe_s((size_t)K / 2, h);
+        local_accessor<int8_t, 1> axo_s((size_t)K / 2, h);
+        local_accessor<uint16_t, 1> asa_s((size_t)ng, h);
+        local_accessor<float, 1> xs_s((size_t)ng, h);
+        local_accessor<uint16_t, 1> meta((size_t)2 * RB * ng, h);
+        h.parallel_for(nd_range<1>((size_t)nwg * TX, TX), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int lid = (int)it.get_local_id(0);
+            const int sg = lid / 32;
+            const int lane = lid % 32;
+            // ---- phase 1: the call's activation, bit-identical to
+            // act_quant_grp_launch (M == 1, so the row offset is 0) ----
+            for (int g = sg; g < ng; g += RB) {
+                const int idx = g * 32 + lane;
+                float v = x[idx];
+                if (up) {
+                    v = silu_f(v) * up[idx];
+                }
+                const float mx = reduce_over_group(it.get_sub_group(), sycl::fabs(v), sycl::maximum<float>());
+                const float sc = mx > 0.f ? mx / 127.0f : 1.0f;
+                const float inv = 1.0f / sc;
+                const int qi = (int)sycl::round(v * inv);
+                const int8_t qv = (int8_t)sycl::max(-127, sycl::min(127, qi));
+                const int gsum = reduce_over_group(it.get_sub_group(), (int)qv, sycl::plus<int>());
+                if (lane == 0) {
+                    sycl::half hsc(sc);
+                    uint16_t bits;
+                    __builtin_memcpy((void *)&bits, &hsc, sizeof(bits));
+                    asa_s[g] = bits;
+                    xs_s[g] = (float)gsum;
+                }
+                const int half = g * (32 / 2) + (lane >> 1);
+                if ((lane & 1) == 0) {
+                    axe_s[half] = qv;
+                } else {
+                    axo_s[half] = qv;
+                }
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            for (int t = 0; t < tiles; t++) {
+                const int rbase = (int)it.get_group(0) * per_wg + t * RB;
+                // ---- phase 2: this tile's weight step/offset, from each row's
+                // own segment (same g-major / row-inner staging as w4_gemv_impl) ----
+                for (int i = lid; i < RB * ng; i += TX) {
+                    const int g = i / RB;
+                    const int r = i % RB;
+                    const int row = rbase + r;
+                    uint16_t st = 0, of = 0;
+                    if (row < total_rows) {
+                        int b = 0, s = 0, nr = sv[0].n_rows;
+                        while (row >= b + nr && s + 1 < NS) {
+                            b += nr;
+                            s++;
+                            nr = sv[s].n_rows;
+                        }
+                        const int n = row - b;
+                        const size_t src = (size_t)(g >> gs) * (size_t)sv[s].n_rows + (size_t)n;
+                        st = sv[s].scale[src];
+                        of = sv[s].off[src];
+                    }
+                    meta[i] = st;
+                    meta[(size_t)RB * ng + i] = of;
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                // ---- phase 3: one row per sub-group, w4_gemv_impl's loop ----
+                const int row = rbase + sg;
+                if (row < total_rows) {
+                    int b = 0, s = 0, nr = sv[0].n_rows;
+                    while (row >= b + nr && s + 1 < NS) {
+                        b += nr;
+                        s++;
+                        nr = sv[s].n_rows;
+                    }
+                    const w4_grp_seg & S = sv[s];
+                    const int n = row - b;
+                    const uint8_t * wrow = S.vals + (size_t)n * (size_t)(K / 2);
+                    const int8_t * xrow_e = axe_s.get_pointer().get();
+                    const int8_t * xrow_o = axo_s.get_pointer().get();
+                    float acc = 0.f;
+                    for (int g = lane; g < ng; g += 32) {
+                        const uint4 wv = *reinterpret_cast<const uint4 *>(wrow + (size_t)g * 16);
+                        const uint32_t l0 = wv.x() & 0x0F0F0F0Fu, l1 = wv.y() & 0x0F0F0F0Fu;
+                        const uint32_t l2 = wv.z() & 0x0F0F0F0Fu, l3 = wv.w() & 0x0F0F0F0Fu;
+                        const uint32_t h0 = (wv.x() >> 4) & 0x0F0F0F0Fu, h1 = (wv.y() >> 4) & 0x0F0F0F0Fu;
+                        const uint32_t h2 = (wv.z() >> 4) & 0x0F0F0F0Fu, h3 = (wv.w() >> 4) & 0x0F0F0F0Fu;
+                        const uint32_t * xe = reinterpret_cast<const uint32_t *>(xrow_e + (size_t)g * 16);
+                        const uint32_t * xo = reinterpret_cast<const uint32_t *>(xrow_o + (size_t)g * 16);
+                        int32_t qd = 0;
+                        qd = dp4a_s8u8(xe[0], l0, qd);
+                        qd = dp4a_s8u8(xe[1], l1, qd);
+                        qd = dp4a_s8u8(xe[2], l2, qd);
+                        qd = dp4a_s8u8(xe[3], l3, qd);
+                        qd = dp4a_s8u8(xo[0], h0, qd);
+                        qd = dp4a_s8u8(xo[1], h1, qd);
+                        qd = dp4a_s8u8(xo[2], h2, qd);
+                        qd = dp4a_s8u8(xo[3], h3, qd);
+                        const float sa = w4_h2f(asa_s[g]);
+                        const size_t mo = (size_t)g * RB + sg;
+                        acc += sa * (w4_h2f(meta[mo]) * (float)qd + w4_h2f(meta[(size_t)RB * ng + mo]) * xs_s[g]);
+                    }
+                    const sub_group sgg = it.get_sub_group();
+                    const float tot = reduce_over_group(sgg, acc, plus<float>());
+                    if (lane == 0) {
+                        float v = S.alpha * tot;
+                        if (S.residual) {
+                            v += S.residual[n];
+                        }
+                        S.out[n] = v;
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+        });
+    });
+}
+
+bool w4_grp_quant_gemv_launch(queue & q, const w4_grp_seg * segs, int n_segs, int total_rows, const float * x,
+                              const float * up, int K) {
+    const int ng = K / 32;
+    const auto fits = [&](int rb) {
+        // two split planes (K bytes in total) + asa/xs, on top of w4_gemv's
+        // 2*RB*ng f16 staging
+        const size_t bytes = (size_t)2 * (size_t)rb * (size_t)ng * sizeof(uint16_t) + (size_t)K +
+                             (size_t)ng * (sizeof(uint16_t) + sizeof(float));
+        return bytes <= (size_t)si::dev::for_queue(q).slm.budget_bytes;
+    };
+    const int want = w4_rb_for(q);
+    int rb = 0;
+    if (want == 8 && fits(8)) {
+        rb = 8;
+    } else if (want == 32 && fits(32)) {
+        rb = 32;
+    } else if (fits(16)) {
+        rb = 16;
+    } else if (fits(8)) {
+        rb = 8;
+    } else {
+        return false;
+    }
+    if (n_segs < 1 || n_segs > 4) {
+        return false;
+    }
+    // Reuse the quantized activation across row tiles until the grid would
+    // stop filling the machine (about 32 work-groups of TX threads), capped at
+    // 8 so a very wide call still spreads over the EUs.
+    // Fill the machine: one work-group is TX = RB*32 threads (16 warps at the
+    // default RB), and an EU holds ~8 warps.  Measured best at 32 on the 64-EU
+    // part, which is exactly 64/2; a bigger card gets proportionally fewer row
+    // tiles per work-group rather than a fixed count that under-fills it.
+    const int cu = si::dev::for_queue(q).hw.compute_units;
+    const int auto_wg = std::max(8, cu / 2);
+    const int target_wg = si::env::i32("PF_W4_QFUSE_WG", auto_wg);
+    int tiles = total_rows / (rb * (target_wg > 0 ? target_wg : auto_wg));
+    if (tiles < 1) {
+        tiles = 1;
+    }
+    if (tiles > 8) {
+        tiles = 8;
+    }
+    static const int fixed_tiles = si::env::i32("PF_W4_QFUSE_TILES", 0);
+    if (fixed_tiles > 0) {
+        tiles = fixed_tiles;
+    }
+#define SI_W4Q_CASE(RBV)                                                                                              \
+    switch (n_segs) {                                                                                                 \
+    case 1: w4_grp_quant_gemv_impl<RBV, 1>(q, segs, total_rows, x, up, K, tiles); return true;                        \
+    case 2: w4_grp_quant_gemv_impl<RBV, 2>(q, segs, total_rows, x, up, K, tiles); return true;                        \
+    case 3: w4_grp_quant_gemv_impl<RBV, 3>(q, segs, total_rows, x, up, K, tiles); return true;                        \
+    default: w4_grp_quant_gemv_impl<RBV, 4>(q, segs, total_rows, x, up, K, tiles); return true;                       \
+    }
+    if (rb == 8) {
+        SI_W4Q_CASE(8)
+    } else if (rb == 32) {
+        SI_W4Q_CASE(32)
+    }
+    SI_W4Q_CASE(16)
+#undef SI_W4Q_CASE
+}
+
 void i8_grp_gemv_launch(queue & q, const int8_t * w8, const uint16_t * wsc, const int8_t * xq,
                         const uint16_t * asa, const float * xs, float * out, const float * residual, float alpha,
                         int K, int N) {

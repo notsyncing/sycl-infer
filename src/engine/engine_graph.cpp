@@ -1551,6 +1551,47 @@ auto moe_call = [&](size_t idx) {
                     fused_quant = D->gemm_i8_quant_group(xq.x, xq.up, keys, nrows, outs, res, alphas, cs, xq.K);
                 }
             }
+            // The u4 counterpart of the branch above: with PF_W4_ALL a decode
+            // call's segments are native-u4 stores, so the int8 fusion declines
+            // and every call paid a separate activation quantizer (~160/step).
+            // PF_W4_QFUSE=0 restores it for A/B.  Same wide-single-segment
+            // exclusion: the LM head's requantization per work-group costs more
+            // than the launch it saves.
+            // The default is this queue's card profile: the fusion pays by
+            // saving a launch against a per-work-group requantization, and that
+            // trade was only measured on the 64-EU part (arc_140v).  A
+            // 512-EU card launches ~8x the work-groups, so its requantization
+            // redundancy grows with the machine and the injective step is not
+            // free there; it stays off until measured.  PF_W4_QFUSE overrides.
+            const bool w4_qfuse =
+                si::dev::profile_flag(dev_queue(cur_dev), "PF_W4_QFUSE",
+                                      si::dev::for_queue(dev_queue(cur_dev)).moe.w4_qfuse != 0);
+            if (!fused_quant && w4_qfuse && mode == 0 && tb == 1) {
+                const int c0 = plan.calls[idx].seg_off;
+                const int cs = plan.calls[idx].seg_count;
+                bool ok = cs >= 1 && cs <= 4 && xq.K > 0 && (xq.K % 32) == 0;
+                const void * keys[4];
+                int nrows[4];
+                const float * outs[4], * res[4];
+                float alphas[4];
+                int call_rows = 0;
+                for (int j = 0; ok && j < cs; j++) {
+                    const gemv_seg & sj = plan.segs[c0 + j];
+                    ok = !sj.w8.vals && sj.i8 == 0 && sj.K == xq.K && D->has_weight_w4(sj.w);
+                    keys[j] = sj.w;
+                    nrows[j] = sj.n_rows;
+                    outs[j] = sj.out;
+                    res[j] = sj.residual;
+                    alphas[j] = sj.alpha;
+                    call_rows += sj.n_rows;
+                }
+                if (cs == 1 && call_rows > 8192) {
+                    ok = false;
+                }
+                if (ok) {
+                    fused_quant = D->gemm_w4_quant_group(xq.x, xq.up, keys, nrows, outs, res, alphas, cs, xq.K);
+                }
+            }
             if (!fused_quant) {
             const auto a2 = tnow();
             // The LM head is always the plan's last call.  PF_HEAD_U4 routes it

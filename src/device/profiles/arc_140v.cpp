@@ -33,7 +33,10 @@ static const profile arc_140v = {
         "grouped kernel's scattered 32-byte group loads.  Every other tuning "
         "group is INHERITED from arc_a770 and NOT re-swept on this part; in "
         "particular split.*, shape.w4_rows_per_wg / q8_rows / f32_rows and "
-        "attn.* are 512-EU values and should be treated as a starting point.",
+        "attn.* are 512-EU values and should be treated as a starting point.  "
+        "The banked prefill expert GEMM tiles ARE swept here: gu_tile 32 "
+        "(5.46 s against the cost model's 5.65 s on a 3.3k-token 35B prefill) "
+        "and dn_tile 96 (5.36 s against 128's 5.46 s; 192/256 lose).",
 
     .hw = {
         .compute_units = 64,
@@ -143,6 +146,9 @@ static const profile arc_140v = {
         .pf_wmin = 24,
         .row_gemv = 1,
         .tiled = 1,
+        .gu_tile = 32,
+        .dn_tile = 96,
+        .w4_qfuse = 1,
     },
 };
 
