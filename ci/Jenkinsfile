@@ -125,9 +125,22 @@ pipeline {
                         sh '''
                             bash -c '
                             set -e
+                            # The toolkit image exports SETVARS_COMPLETED=1, so a
+                            # second `source setvars.sh` only prints the usage
+                            # banner (whose last line is the "no 32-bit libraries"
+                            # note) and returns 3 - which `set -e` turns into a
+                            # stage failure.  Clear the guard so the script really
+                            # configures this shell, after which the sourcing is
+                            # guaranteed to return 0; it re-prepends PATH once per
+                            # container shell, which is harmless.
                             set +u
+                            unset SETVARS_COMPLETED
                             . /opt/intel/oneapi/setvars.sh
                             set -u
+                            command -v icpx >/dev/null || {
+                                echo "icpx is not on PATH after setvars.sh" >&2
+                                exit 1
+                            }
                             . /tmp/wheel-venv/bin/activate
                             DNNL_ROOT="$(cat /tmp/dnnl_root)"
                             BUILD_DIR="$WORKSPACE/build-wheel"
