@@ -285,10 +285,14 @@ void model::page_out_host(const void * p, size_t len) {
     }
     if (b > a) {
         madvise((void *)a, (size_t)(b - a), MADV_DONTNEED);
-        // now that the PTEs are gone, let the kernel drop the page cache too so
+        // Now that the PTEs are gone, let the kernel drop the page cache too so
         // the memory is actually freed rather than just unmapped from the
-        // process (a still-mapped CPU-partition range is skipped by the kernel)
-        gguf.drop_cache((size_t)(a - base), (size_t)(b - a));
+        // process (a still-mapped CPU-partition range is skipped by the kernel).
+        // keep_file_cache trades that RSS for a warm restart: the pages stay in
+        // the page cache and the next process maps them without disk I/O.
+        if (!keep_file_cache) {
+            gguf.drop_cache((size_t)(a - base), (size_t)(b - a));
+        }
     }
 }
 

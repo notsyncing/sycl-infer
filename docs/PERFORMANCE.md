@@ -203,10 +203,15 @@ the x8 slot, so giving the x16 card more layers pays, and the bank's slot count
 is per device (152 on device 0, 104 on device 1, 17.0 GiB) rather than one
 shared minimum.
 
-**Startup and footprint.**  A run reaches its first token in **56 s** and holds
-**80 GiB** resident: the routed-down int8 host store is built only for the
-layers that do not run in the bank (0.9 GiB), and the 69.8 GiB pinned expert
-source plus the 71.7 GiB routed bank stay host-resident as before.  The
+**Startup and footprint.**  With the 2026-11-04 I/O pass (parallel `pread` into
+the pinned source, prefault skip, page-cache retention) a **cold** start reaches
+its first token in **109-115 s** (285 s before) and a **warm restart in 28-29 s**
+(56 s before); the process's peak RSS is **5.8 GiB** (76 GiB before), because the
+pinned source is locked physical memory and the shards stay in the page cache
+rather than being faulted into the process.  The cold floor is the drive
+(~1.0-1.15 GB/s cold, so 69.8 GiB is ~60 s), not the engine.  The routed-down
+int8 host store is built only for the layers that do not run in the bank
+(0.9 GiB), and the 71.7 GiB routed bank stays host-resident as before.  The
 per-stage device budget of one decode step - dense GEMV 13.40 ms, GDN and
 attention cores 1.52, PLE 2.50, routed gate/up and down, router - is in
 [`design/18-qwen4exp.md`](design/18-qwen4exp.md) §7.2.

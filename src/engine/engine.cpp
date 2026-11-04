@@ -192,6 +192,14 @@ engine::engine(const engine_config & cfg)
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     lt.lap("model::load (gguf+bind)");
+    // qwen4exp loads 111.5 GB of shards and copies 69.8 GiB of it into a pinned
+    // expert source.  The explicit POSIX_FADV_DONTNEED in page_out_host would
+    // evict every byte of that from the page cache right after it was read, so
+    // the next start pays the whole disk pass again.  Keep the cache instead;
+    // the PTEs are still dropped, so the process RSS boundary is unchanged.
+    if (m.q4exp) {
+        m.keep_file_cache = si::env::i32("PF_Q4_KEEPCACHE", 1) != 0;
+    }
     mp_ = m.prof;
     {
         const char * e = si::env::str("PF_F32");
@@ -764,6 +772,7 @@ engine::engine(const engine_config & cfg)
     lt.lap("alloc_buffers (KV/act)");
     if (m.q4exp) {
         q4_alloc();
+        lt.lap("q4_alloc (banks+pin)");
     } else {
         build_graphs();
         lt.lap("build_graphs (plans+capture)");
@@ -3135,7 +3144,8 @@ void engine::release_host_weight_pages() {
         // token strings) is dead too
         m.page_out_host(m.gguf.map_base, m.gguf.data_offset);
     }
-    fprintf(stderr, "[mem] released %.1f MB of host-resident GGUF pages (RSS)\n", (double)dropped / (1024.0 * 1024.0));
+    fprintf(stderr, "[mem] released %.1f MB of host-resident GGUF pages (RSS)%s\n",
+            (double)dropped / (1024.0 * 1024.0), m.keep_file_cache ? ", page cache kept" : "");
 }
 
 // ---------------------------------------------------------------------------

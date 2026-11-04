@@ -305,6 +305,12 @@ struct model {
     hc_wt hc_head;
     wt ple_table;
     bool q4exp = false;
+    // Keep the GGUF shards' page cache when page_out_host() releases the PTEs.
+    // MADV_DONTNEED alone drops only this process's private mappings, so the
+    // file pages stay cached; the explicit evictor is the POSIX_FADV_DONTNEED
+    // that page_out_host issues afterwards.  qwen4exp keeps the file warm so a
+    // restart does not re-read 111.5 GB from disk (PF_Q4_KEEPCACHE).
+    bool keep_file_cache = false;
     size_t tok_embd_row_bytes = 0;
     w8t output8;
 

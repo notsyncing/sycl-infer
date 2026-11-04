@@ -861,6 +861,60 @@ repack of the Q5_1 down plane - was implemented and measured: it is
 bit-identical and **slower** (0.1797 -> 0.2073 ms/layer), because bit-identity
 pins the 4-byte-per-lane `qs` load shape; §9.1 has the numbers.
 
+#### Cold start: the pinned-source read was one serial memcpy (2026-11-04)
+
+The 69.8 GiB pinned expert source was populated by one `std::memcpy` per expert
+plane (141 calls, one host thread) out of the GGUF mmap.  On a cold page cache
+that single fault path is the whole disk pass and it dominates startup, and
+`page_out_host` then evicted the shards with `POSIX_FADV_DONTNEED`, so the next
+start paid it again.  Three changes, all default on:
+
+* `PF_Q4_PREAD=1` reads each plane **directly from its shard fd** into the
+  pinned destination (`pread`), split over `PF_Q4_PREAD_WORKERS` (8) workers.
+  The split GGUF already knows each tensor's shard: `tensor.data - shard.base`
+  is the file offset, and a range that does not lie wholly inside one shard
+  falls back to `memcpy` (the reservation's padding is `PROT_NONE` and is never
+  read).  `=0` restores the serial memcpy.
+* `PF_Q4_PREFAULT` now **skips** a banked layer's expert planes (they live in
+  the pinned source, not the mmap) and the GPU-resident shared/router tensors;
+  it keeps the non-banked host layer, the PLE table (opt-in) and the host QSA
+  indexer.  `PF_Q4_PREFAULT_ALL=1` restores the old every-tensor touch.
+* `PF_Q4_KEEPCACHE=1` (qwen4exp default) drops the PTEs but **not the page
+  cache** in `page_out_host`, so a restart maps the shards instead of reading
+  them.  The expert pages were already kept by the `!moe_resident` keep-set;
+  this is what keeps the ~5 GB of dense weights warm across runs (~14 s).
+
+Same box, same binary family, one process per cell, 2x A770,
+`--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 --cpu-threads 28
+--ctx 2048 --kv-type f16`, cold simulated with `posix_fadvise(DONTNEED)` on the
+four shards after `sync`:
+
+| arm | cold wall | pin phase (cold) | prefault (cold) | warm wall | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| HEAD (serial memcpy, touch every tensor, evict) | **284.6 s** | ~247 s | 3.0 s | **56.4 s** | 76.1 GiB |
+| pread only | 109.7 s | 64.9 s | 2.1 s | – | 76.1 GiB |
+| pread + prefault skip | 114.6 s | 67.0 s | 1.4 s | 43.1 s* | 5.8 GiB |
+| **pread + skip + keep cache** | **109.4-114.6 s** | **65.1-67.0 s** | **1.3-1.7 s** | **28.0-28.7 s** | **5.8 GiB** |
+
+\* the next run after a `PF_Q4_KEEPCACHE=0` run; a second keep-cache run is
+28.7 s.  The 56.4 s HEAD warm is the documented 52-55 s cell; the new warm is
+not slower.
+
+The cold floor is the **disk, not the engine**: this NVMe reads ~1.0 GB/s cold
+sequentially, and 8 and 16 pread workers both measure 1.13-1.16 GB/s aggregate
+(69.8 GiB / 1.15 GB/s ≈ 60 s).  One outlier cold run measured 142 s for the
+pin phase under a transient; the two repeats are 65-67 s.  The old target of
+25-35 s would need ~2.5 GB/s and is not reachable on this drive.
+
+**Exactness.** Against a pristine HEAD build of the same commit (not just
+knobs-off in the same binary): a 96-token greedy decode is **bit-identical at
+every step** (`PF_DUMP_DEC_LOGITS`, 96/96 files) and the stdout md5 is
+`e18cd2d7b663815ed68b7e1be1cdf695`; a 4212-token prefill's post-prefill logits
+are bit-identical (`4940...` on the earlier build, `1efcbcd8...` on HEAD and
+both new arms) with stdout `04399da0...`.  Within the new binary, pread-vs-memcpy
+and keep-vs-evict produce byte-identical logits.  Steady-state decode is
+unchanged (mean `[q4] fwd n=1` 97-112 ms/token, within run noise) and 4k prefill
+per-chunk times are unchanged.
 
 ### 7.3 Depth cells re-baselined, and the one-card experiment (2026-11-01)
 
@@ -911,6 +965,9 @@ slower at 512, and cannot hold a 48k context.
 | `PF_Q4_BANK=0` / `PF_Q4_BANK_LAYER=1` | on / off | all-host path / whole-layer bank (A/B) |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
 | `PF_Q4_PIN_SRC=0` | on | stage from the mmap instead of the pinned expert source |
+| `PF_Q4_PREAD=0` / `PF_Q4_PREAD_WORKERS=N` | on / 8 | read the pinned expert source with parallel `pread` from each shard fd; `=0` restores the serial memcpy; 8 and 16 workers both measure the drive's ~1.15 GB/s ceiling |
+| `PF_Q4_PREFAULT_ALL=1` | off | touch every tensor in the prefault again (the old behaviour); the default skips a banked layer's experts and the GPU-resident shared/router tensors |
+| `PF_Q4_KEEPCACHE=0` | on (qwen4exp) | `page_out_host` drops the PTEs but keeps the shard page cache, so a restart is warm; `=0` restores the `POSIX_FADV_DONTNEED` eviction |
 | `PF_Q4_TAIL_SKIP=N` | 0 | drop a miss whose best batch rank is >= N (default 0 = exact; 1..9 meaningful; `--q4-tail-skip` overrides; the 86.9 ms, 32.2 MiB vs 93.6/56.2 and the 2026-10-27 gate - KL 0.029/0.037 at near-tie divergences - were measured at N=7) |
 | `--q4-tail-skip N` | 0 | CLI form of the above: default 0 = exact, 1..9 meaningful, env `PF_Q4_TAIL_SKIP` |
 | `PF_Q4_CPU_MISS=1` | off | decode CPU miss for non-resident experts, int8 host path (`2` = f32 A/B); **148.1 vs 99.3 ms, rejected** (§6.1) |

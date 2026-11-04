@@ -2071,6 +2071,43 @@ slower while the bank warms, so a short generation reads high.
 `PF_Q4_PIN_SRC=0` (staging) and `PF_Q4_BANK_Q5K=1` (layer 2 decode-only,
 107.2 ms, so off) are the A/Bs.
 
+**Cold start is the pinned-source read, and it is now parallel (2026-11-04).**
+The 69.8 GiB pinned source used to be one serial `std::memcpy` per expert plane
+(141 calls, one host thread) from the mmap, and `page_out_host` evicted the
+shards with `POSIX_FADV_DONTNEED` afterwards, so every start paid the disk pass
+again.  Three changes, all default on:
+
+* `PF_Q4_PREAD=1` preads each plane from its shard fd straight into the pinned
+  destination over `PF_Q4_PREAD_WORKERS` (8) workers; a range not wholly inside
+  one shard falls back to `memcpy`, so the reservation's `PROT_NONE` gaps are
+  never read.  `=0` restores the serial memcpy.
+* the prefault **skips** a banked layer's expert planes (they are in the pinned
+  source, not the mmap) and the GPU-resident shared/router tensors;
+  `PF_Q4_PREFAULT_ALL=1` restores the old every-tensor touch.
+* `PF_Q4_KEEPCACHE=1` (qwen4exp default) drops the PTEs but keeps the shard page
+  cache, so the next start is warm.  The expert pages were already kept by the
+  `!moe_resident` keep-set; this keeps the ~5 GB of dense weights too (~14 s on
+  the next run).
+
+Measured on the 2x A770 box (same config as the cell above, cold simulated with
+`posix_fadvise(DONTNEED)` on the four shards after `sync`, one process per cell):
+
+| arm | cold wall | pin phase (cold) | prefault (cold) | warm wall | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| HEAD (serial memcpy, touch all, evict) | 284.6 s | ~247 s | 3.0 s | 56.4 s | 76.1 GiB |
+| pread only | 109.7 s | 64.9 s | 2.1 s | – | 76.1 GiB |
+| pread + prefault skip | 114.6 s | 67.0 s | 1.4 s | 43.1 s | 5.8 GiB |
+| **pread + skip + keep cache** | **109.4-114.6 s** | **65.1-67.0 s** | **1.3-1.7 s** | **28.0-28.7 s** | **5.8 GiB** |
+
+The cold floor is the drive: it reads ~1.0 GB/s cold sequentially and both 8 and
+16 workers measure 1.13-1.16 GB/s aggregate, so 69.8 GiB is ~60 s and the
+25-35 s target is not reachable here.  Exactness against a pristine HEAD build:
+the 96-token greedy decode's per-step logits and stdout md5 are bit-identical
+(`e18cd2d7...`), and a 4212-token prefill's post-prefill logits are
+bit-identical (`1efcbcd8...`, stdout `04399da0...`); steady decode and 4k
+prefill times are unchanged.  Details in
+[`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md#cold-start-the-pinned-source-read-was-one-serial-memcpy-2026-11-04).
+
 **Deep context (2026-11-01, f16 KV, 28 threads, tail7 - no longer the default,
 see the tail-skip bullet below - `--layer-map
 0-19:gpu.0,20-47:gpu.1`).**  At 16 037 prompt tokens the prefill is **48.9
@@ -2308,6 +2345,9 @@ the checks that catch them.
 | `PF_Q4_BANK_LAYER=1` | off | whole-layer bank instead of the per-expert LRU |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
 | `PF_Q4_PIN_SRC=0` | on | stage from the mmap instead of the pinned expert source |
+| `PF_Q4_PREAD=0` / `PF_Q4_PREAD_WORKERS=N` | on / 8 | parallel `pread` of the pinned expert source from each shard fd; `=0` restores the serial memcpy |
+| `PF_Q4_PREFAULT_ALL=1` | off | touch every tensor in the prefault again; the default skips a banked layer's experts and GPU-resident shared/router tensors |
+| `PF_Q4_KEEPCACHE=0` | on (qwen4exp) | keep the shard page cache across `page_out_host` (PTEs still dropped); `=0` restores the eviction |
 | `PF_Q4_TAIL_SKIP=N` | 0 | drop a miss whose best rank over the batch is >= N (Strata tail-skip; default 0 = exact, 1..9 meaningful; `--q4-tail-skip` overrides; the 2026-10-27 gate - KL 0.029/0.037 at near-tie divergences - was measured at N=7) |
 | `PF_Q4_CPU_MISS=1` | off | decode CPU miss for non-resident experts, int8 host path (`2` = f32 A/B); **measured 1.49x slower, see the dead ends** |
 | `PF_Q4_CPU_MISS_WARM=N` / `_LAYER=il` / `_TIME` | 16 / all / off | decode steps with the LRU before the split freezes / one-layer probe / per-layer host+GPU print |

@@ -13,12 +13,15 @@
 // just with no resident set at all - and the PLE module runs on the host too.
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <fcntl.h>
 #include <thread>
 #include <cstring>
 #include <stdexcept>
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include "engine.h"
 #include "device/device_profile.h"
@@ -43,6 +46,93 @@ int q4_gemv_tb(int mode, int n_tok) {
 // call is 12 800 rows over 28 threads, so one pool job per row spends more time
 // in the shared `next_` atomic than in the row's 2 560-value dot.
 constexpr int kPleChunkRows = 16;
+
+// ---- pinned expert source: direct, parallel file reads -------------------
+//
+// q4_alloc_banks copies 69.8 GiB out of the GGUF mmap into pinned host USM
+// with one std::memcpy per expert plane (one host thread, ~141 serial copies).
+// On a cold page cache that memcpy *is* the whole disk pass and it dominates
+// startup.  The split GGUF knows each tensor's shard fd and file offset
+// (tensor.data minus that shard's base), so the same bytes can be pread()ed
+// straight into the pinned destination, divided over a few workers.  A range
+// that is not wholly inside one shard is never read from the reservation's
+// PROT_NONE gaps: the caller falls back to memcpy for it.
+bool gguf_shard_range(const gguf_file & g, const void * p, size_t n, int & fd, off_t & off) {
+    const uintptr_t s = (uintptr_t)p;
+    if (!p || n == 0) {
+        return false;
+    }
+    for (const gguf_file::shard_t & sh : g.shards) {
+        const uintptr_t b = (uintptr_t)sh.base;
+        if (!sh.base) {
+            continue;
+        }
+        if (s >= b && s - b <= sh.size && n <= sh.size - (s - b)) {
+            fd = sh.fd;
+            off = (off_t)(s - b);
+            return fd >= 0;
+        }
+    }
+    return false;
+}
+
+// pread [off, off+n) from one fd into dst over `nw` disjoint slices.  Returns
+// false on any short/error read so the caller can fall back to a full memcpy
+// (the destination is simply overwritten again).  Pinned USM is ordinary
+// memory to pread; the pages are already locked, so there are no faults.
+bool parallel_pread(int fd, off_t off, void * dst, size_t n, int nw) {
+    if (!dst || n == 0) {
+        return true;
+    }
+    if (fd < 0) {
+        return false;
+    }
+    // SEQUENTIAL widens the kernel's readahead window so the workers' disjoint
+    // slices become large requests rather than 4 KiB probes.
+    const off_t pg = 4096;
+    const off_t aoff = off & ~(pg - 1);
+    const size_t alen = n + (size_t)(off - aoff);
+    posix_fadvise(fd, aoff, (off_t)alen, POSIX_FADV_SEQUENTIAL);
+    auto run = [&](int w, std::atomic<int> * fail) {
+        const size_t chunk = (n + (size_t)nw - 1) / (size_t)nw;
+        size_t a = chunk * (size_t)w;
+        size_t b = std::min(n, a + chunk);
+        uint8_t * d = (uint8_t *)dst;
+        while (a < b) {
+            if (fail->load(std::memory_order_relaxed)) {
+                return;
+            }
+            const ssize_t r = pread(fd, d + a, b - a, off + (off_t)a);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                fail->store(1, std::memory_order_relaxed);
+                return;
+            }
+            if (r == 0) {
+                fail->store(1, std::memory_order_relaxed); // short file
+                return;
+            }
+            a += (size_t)r;
+        }
+    };
+    std::atomic<int> fail{0};
+    if (nw <= 1 || n < (8u << 20)) {
+        run(0, &fail);
+        return fail.load() == 0;
+    }
+    std::vector<std::thread> th;
+    th.reserve((size_t)nw - 1);
+    for (int w = 0; w < nw - 1; w++) {
+        th.emplace_back(run, w, &fail);
+    }
+    run(nw - 1, &fail);
+    for (auto & t : th) {
+        t.join();
+    }
+    return fail.load() == 0;
+}
 
 } // namespace
 
@@ -237,11 +327,34 @@ void engine::q4_prefault() {
         }
     }
     std::vector<std::pair<const char *, size_t>> ranges;
+    // The tensor sizes are not stored on layer_t, so map each data pointer to
+    // its GGUF record once.  Resolving the size at `add` time (rather than in a
+    // second pass) lets the skip path account for what it avoids.
+    std::unordered_map<const void *, size_t> sz;
+    for (const auto & t : m.gguf.tensors) {
+        sz[t.data] = t.nbytes();
+    }
+    size_t total = 0, skipped = 0;
+    auto bytes_of = [&](const void * p) -> size_t {
+        if (!p) {
+            return 0;
+        }
+        auto it = sz.find(p);
+        return it == sz.end() ? 0 : it->second;
+    };
     auto add = [&](const void * p) {
-        if (p) {
-            ranges.push_back({(const char *)p, 0});
+        const size_t n = bytes_of(p);
+        if (n) {
+            ranges.push_back({(const char *)p, n});
+            total += n;
         }
     };
+    auto skip = [&](const void * p) { skipped += bytes_of(p); };
+    // PF_Q4_PREFAULT_ALL=1 restores the pre-skip behaviour (every range
+    // touched) for the A/B.
+    const bool prefaul_all = si::env::flag("PF_Q4_PREFAULT_ALL");
+    const bool have_pin = !q4_pin_src_.empty();
+    const bool host_router = si::env::flag("PF_Q4_HOSTROUTER");
     // PF_Q4_PLE_PREFAULT: the 26.8 GiB PLE table is NOT in the ranges below (it
     // is gathered 16 rows/token from a 320M-row namespace, so every row is a
     // first touch).  Without this every decode token takes ~16 MAJOR faults,
@@ -249,33 +362,65 @@ void engine::q4_prefault() {
     // page-cache hits.  Costs 26.8 GiB of (reclaimable, file-backed) RSS at
     // startup; off by default.
     if (m.ple_table.data && si::env::flag("PF_Q4_PLE_PREFAULT")) {
-        ranges.push_back({(const char *)m.ple_table.data, 0});
+        add(m.ple_table.data);
     }
     for (int il = 0; il < m.hp.n_layer; il++) {
         const layer_t & L = m.layers[(size_t)il];
-        // Read by the host half on every step, whatever the layer's device:
-        // routed experts, their router, the shared expert, and the PLE module.
-        add(L.moe.gate_exps.data);
-        add(L.moe.up_exps.data);
-        add(L.moe.down_exps.data);
-        add(L.moe.gate_inp);
-        add(L.ffn_gate.data);
-        add(L.ffn_up.data);
-        add(L.ffn_down.data);
+        const bool host_layer =
+            !multi_dev || layer_dev_[(size_t)il] < 0 || dev_kind_[(size_t)layer_dev_[(size_t)il]] == 1;
+        // A banked layer's expert planes are in the pinned source (read by the
+        // H2D copies and the calibration), so its mmap pages are not a host
+        // consumer: touching them here just re-reads what the pinned copy has
+        // already pulled from disk.  A non-banked layer still runs its routed
+        // experts on the host out of the mmap, so it keeps the prefault.
+        const q4_bank_t & b = q4_bank_layer_[(size_t)il];
+        const bool pinned_layer = have_pin && b.hg && b.hu && b.hd;
+        if (pinned_layer && !prefaul_all) {
+            skip(L.moe.gate_exps.data);
+            skip(L.moe.up_exps.data);
+            skip(L.moe.down_exps.data);
+        } else {
+            add(L.moe.gate_exps.data);
+            add(L.moe.up_exps.data);
+            add(L.moe.down_exps.data);
+        }
+        // The router is a device tensor on a GPU layer (wptr(dev, gate_inp));
+        // only a CPU partition or the PF_Q4_HOSTROUTER fallback reads it here.
+        if (host_layer || host_router || prefaul_all) {
+            add(L.moe.gate_inp);
+        } else {
+            skip(L.moe.gate_inp);
+        }
+        // The shared expert is a normal device tensor on a GPU layer.
+        if (host_layer || prefaul_all) {
+            add(L.ffn_gate.data);
+            add(L.ffn_up.data);
+            add(L.ffn_down.data);
+        } else {
+            skip(L.ffn_gate.data);
+            skip(L.ffn_up.data);
+            skip(L.ffn_down.data);
+        }
         if (L.ple.ok()) {
-            add(L.ple.key.data);
-            add(L.ple.value.data);
+            // key/value are the GPU GEMVs' weights on a GPU layer; the conv and
+            // the norms are read by the host PLE epilogue on every step.
+            if (host_layer || prefaul_all) {
+                add(L.ple.key.data);
+                add(L.ple.value.data);
+            } else {
+                skip(L.ple.key.data);
+                skip(L.ple.value.data);
+            }
             add(L.ple.conv);
         }
         if (L.idx.ok()) {
-            // the host QSA indexer projects from these on every step
+            // the host QSA indexer projects from these on every step, whatever
+            // the layer's device
             add(L.idx.q_proj.data);
             add(L.idx.k_proj.data);
             add(L.idx.q_norm);
             add(L.idx.k_norm);
         }
-        const bool host_layer = !multi_dev || layer_dev_[(size_t)il] < 0
-                                || dev_kind_[(size_t)layer_dev_[(size_t)il]] == 1;
         if (!host_layer) {
             continue; // dense trunk is on a device and already uploaded
         }
@@ -306,18 +451,6 @@ void engine::q4_prefault() {
             add(L.k_norm);
         }
     }
-    // The tensor sizes are not stored on layer_t, so derive each range from
-    // the GGUF tensor record by matching the data pointer.
-    std::unordered_map<const void *, size_t> sz;
-    for (const auto & t : m.gguf.tensors) {
-        sz[t.data] = t.nbytes();
-    }
-    size_t total = 0;
-    for (auto & r : ranges) {
-        auto it = sz.find(r.first);
-        r.second = it == sz.end() ? 0 : it->second;
-        total += r.second;
-    }
     const double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     std::atomic<size_t> next{0};
     std::atomic<unsigned long long> acc{0};
@@ -344,8 +477,9 @@ void engine::q4_prefault() {
         t.join();
     }
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0;
-    fprintf(stderr, "[q4] prefaulted %.1f GiB of host-side weights in %.1f s (%llu)\n", (double)total / (1024.0 * 1024.0 * 1024.0),
-            dt, acc.load());
+    fprintf(stderr,
+            "[q4] prefaulted %.1f GiB of host-side weights in %.1f s (%llu) [skipped %.1f GiB already pinned/device]\n",
+            (double)total / (1024.0 * 1024.0 * 1024.0), dt, acc.load(), (double)skipped / (1024.0 * 1024.0 * 1024.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +855,28 @@ void engine::q4_alloc_banks() {
         }
         size_t pin_bytes = 0;
         int pin_layers = 0;
+        // PF_Q4_PREAD (default on) reads each expert plane straight from its
+        // shard fd into the pinned source, split over a few workers; =0 restores
+        // the serial std::memcpy from the mmap for the A/B.  The typical plane is
+        // 0.5-0.6 GiB, so a single reader leaves most of the disk queue idle.
+        static const bool pread_on = si::env::i32("PF_Q4_PREAD", 1) != 0;
+        static const int pread_w = std::max(1, std::min(16, si::env::i32("PF_Q4_PREAD_WORKERS", 8)));
+        double pin_read_s = 0.0;
+        auto pin_read = [&](void * dst, const void * src, size_t n) {
+            const auto t0 = std::chrono::steady_clock::now();
+            bool done = false;
+            if (pread_on) {
+                int fd = -1;
+                off_t off = 0;
+                if (gguf_shard_range(m.gguf, src, n, fd, off)) {
+                    done = parallel_pread(fd, off, dst, n, pread_w);
+                }
+            }
+            if (!done) {
+                std::memcpy(dst, src, n);
+            }
+            pin_read_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        };
         sycl::queue & pin_q = q;
         const char * hln = si::env::str("PF_Q4_HOT_LAYERS");
         const int hn = hln ? std::max(0, atoi(hln)) : 1 << 30;
@@ -762,9 +918,12 @@ void engine::q4_alloc_banks() {
                 b.hu = sycl::malloc_host((size_t)E * ub, pin_q);
                 b.hd = sycl::malloc_host((size_t)E * db, pin_q);
                 if (b.hg && b.hu && b.hd) {
-                    std::memcpy(b.hg, L.moe.gate_exps.data, (size_t)E * gb);
-                    std::memcpy(b.hu, L.moe.up_exps.data, (size_t)E * ub);
+                    pin_read(b.hg, L.moe.gate_exps.data, (size_t)E * gb);
+                    pin_read(b.hu, L.moe.up_exps.data, (size_t)E * ub);
                     if (q5sb_ok && L.moe.down_exps.type == 7 && (L.moe.down_exps.K % 128) == 0) {
+                        // The panel repack reads and writes overlapping rows, so
+                        // it needs the raw plane first (it is opt-in and off).
+                        std::memcpy(b.hd, L.moe.down_exps.data, (size_t)E * db);
                         const auto t0 = std::chrono::steady_clock::now();
                         q5_1_sb_pack(L.moe.down_exps.data, L.moe.down_exps.K, L.moe.down_exps.N, E, b.hd);
                         q5sb_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -772,7 +931,7 @@ void engine::q4_alloc_banks() {
                         q5sb_layers++;
                         q5sb_bytes += (size_t)E * db;
                     } else {
-                        std::memcpy(b.hd, L.moe.down_exps.data, (size_t)E * db);
+                        pin_read(b.hd, L.moe.down_exps.data, (size_t)E * db);
                     }
                     q4_pin_src_.push_back({b.hg, dev});
                     q4_pin_src_.push_back({b.hu, dev});
@@ -807,8 +966,11 @@ void engine::q4_alloc_banks() {
         fprintf(stderr, "[q4] hot expert bank: %d slots/layer, %d layers, %.1f GiB (calibrating on first prefill)\n", R,
                 nbank, (double)total / (1024.0 * 1024.0 * 1024.0));
         if (pin_src) {
-            fprintf(stderr, "[q4] pinned expert source: %d layers, %.1f GiB (direct H2D, no staging memcpy)\n",
-                    pin_layers, (double)pin_bytes / (1024.0 * 1024.0 * 1024.0));
+            const double gbps = pin_read_s > 0.0 ? (double)pin_bytes / 1e9 / pin_read_s : 0.0;
+            fprintf(stderr,
+                    "[q4] pinned expert source: %d layers, %.1f GiB in %.1f s (%.2f GB/s, %s, %d workers)\n", pin_layers,
+                    (double)pin_bytes / (1024.0 * 1024.0 * 1024.0), pin_read_s, gbps, pread_on ? "pread" : "memcpy",
+                    pread_on ? pread_w : 1);
         }
         if (q5sb_layers > 0) {
             fprintf(stderr, "[q4] q5_1 down repack: %d layers, %.1f GiB in %.2f s\n", q5sb_layers,
