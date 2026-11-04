@@ -579,15 +579,36 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
         }
         par(n, fn);
     };
+    // PF_Q4_PLE_APPLY_IDIV: restructure loops 1 and 3 so the element index is
+    // produced by nested (i, s, c) loops instead of `j % n_embd` / `j / hc_dim`
+    // per element (two integer divisions on 20 480 elements per decode token,
+    // ~0.3 ms).  Every element's arithmetic and the 4-tap conv order are
+    // unchanged, and the papply work argument stays n_tok*hc_dim so the
+    // serial/pooled decision is the same.
+    static const bool ple_idiv = si::env::i32("PF_Q4_PLE_APPLY_IDIV", 1) != 0;
     // 1. gated value per stream
     const int total = n_tok * hc_dim;
-    papply(total, (long long)total, [&](int j) {
-        const int c = j % n_embd;
-        const int s = (j / n_embd) % hc;
-        const int i = j / hc_dim;
-        gated[(size_t)tok_row(rows, i) * hc_dim + (size_t)s * n_embd + c] =
-            value[(size_t)tok_row(rows, i) * n_embd + c] * gate[(size_t)tok_row(rows, i) * hc + s];
-    });
+    if (ple_idiv) {
+        papply(n_tok * hc, (long long)total, [&](int js) {
+            const int i = js / hc;
+            const int s = js % hc;
+            const int vr = tok_row(rows, i);
+            const float g = gate[(size_t)vr * hc + s];
+            const float * vp = value + (size_t)vr * n_embd;
+            float * gp = gated + (size_t)vr * hc_dim + (size_t)s * n_embd;
+            for (int c = 0; c < n_embd; c++) {
+                gp[c] = vp[c] * g;
+            }
+        });
+    } else {
+        papply(total, (long long)total, [&](int j) {
+            const int c = j % n_embd;
+            const int s = (j / n_embd) % hc;
+            const int i = j / hc_dim;
+            gated[(size_t)tok_row(rows, i) * hc_dim + (size_t)s * n_embd + c] =
+                value[(size_t)tok_row(rows, i) * n_embd + c] * gate[(size_t)tok_row(rows, i) * hc + s];
+        });
+    }
     if (pat) pt1 = pnow();
     // 2. grouped RMSNorm of the gated value
     papply(n_tok * hc, (long long)n_tok * hc_dim, [&](int j) {
@@ -610,31 +631,62 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
         }
         base_pos[i] = poss[i] - g; // position of this slot's first token in the call
     }
-    papply(n_tok * hc_dim, (long long)n_tok * hc_dim, [&](int j) {
-        const int c = j % hc_dim;
-        const int i = j / hc_dim;
-        const int slot = slots[i];
-        const int base = base_pos[i];
-        float acc = 0.0f;
-        for (int k = 0; k < kern; k++) {
-            const int d = (kern - 1 - k) * ngram;
-            const int tp = poss[i] - d;
-            float xv;
-            if (tp >= base) {
-                const int gi = i - (poss[i] - tp);
-                xv = normed[(size_t)tok_row(rows, gi) * hc_dim + c];
-            } else {
-                const int hi = hist_rows + (tp - base);
-                xv = (hi >= 0 && hi < hist_rows && n_hist[slot] > hi) ? hist[((size_t)slot * hist_rows + hi) * hc_dim + c]
-                                                                     : 0.0f;
+    if (ple_idiv) {
+        papply(n_tok, (long long)n_tok * hc_dim, [&](int i) {
+            const int slot = slots[i];
+            const int base = base_pos[i];
+            const size_t row = (size_t)tok_row(rows, i) * hc_dim;
+            for (int c = 0; c < hc_dim; c++) {
+                float acc = 0.0f;
+                for (int k = 0; k < kern; k++) {
+                    const int d = (kern - 1 - k) * ngram;
+                    const int tp = poss[i] - d;
+                    float xv;
+                    if (tp >= base) {
+                        const int gi = i - (poss[i] - tp);
+                        xv = normed[(size_t)tok_row(rows, gi) * hc_dim + c];
+                    } else {
+                        const int hi = hist_rows + (tp - base);
+                        xv = (hi >= 0 && hi < hist_rows && n_hist[slot] > hi)
+                                 ? hist[((size_t)slot * hist_rows + hi) * hc_dim + c]
+                                 : 0.0f;
+                    }
+                    // ple_conv1d is stored [kernel][channel] with nb0=kernel: the
+                    // tap coefficient for channel c is conv_w[k + kern*c], not
+                    // conv_w[k*hc_dim+c]
+                    acc += conv_w[(size_t)k + (size_t)kern * c] * xv;
+                }
+                residual[row + c] += gated[row + c] + cpu_silu(acc);
             }
-            // ple_conv1d is stored [kernel][channel] with nb0=kernel: the tap
-            // coefficient for channel c is conv_w[k + kern*c], not conv_w[k*hc_dim+c]
-            acc += conv_w[(size_t)k + (size_t)kern * c] * xv;
-        }
-        residual[(size_t)tok_row(rows, i) * hc_dim + c] +=
-            gated[(size_t)tok_row(rows, i) * hc_dim + c] + cpu_silu(acc);
-    });
+        });
+    } else {
+        papply(n_tok * hc_dim, (long long)n_tok * hc_dim, [&](int j) {
+            const int c = j % hc_dim;
+            const int i = j / hc_dim;
+            const int slot = slots[i];
+            const int base = base_pos[i];
+            float acc = 0.0f;
+            for (int k = 0; k < kern; k++) {
+                const int d = (kern - 1 - k) * ngram;
+                const int tp = poss[i] - d;
+                float xv;
+                if (tp >= base) {
+                    const int gi = i - (poss[i] - tp);
+                    xv = normed[(size_t)tok_row(rows, gi) * hc_dim + c];
+                } else {
+                    const int hi = hist_rows + (tp - base);
+                    xv = (hi >= 0 && hi < hist_rows && n_hist[slot] > hi)
+                             ? hist[((size_t)slot * hist_rows + hi) * hc_dim + c]
+                             : 0.0f;
+                }
+                // ple_conv1d is stored [kernel][channel] with nb0=kernel: the tap
+                // coefficient for channel c is conv_w[k + kern*c], not conv_w[k*hc_dim+c]
+                acc += conv_w[(size_t)k + (size_t)kern * c] * xv;
+            }
+            residual[(size_t)tok_row(rows, i) * hc_dim + c] +=
+                gated[(size_t)tok_row(rows, i) * hc_dim + c] + cpu_silu(acc);
+        });
+    }
     if (pat) pt3 = pnow();
     // 4. append the new normalised rows to each slot's history
     for (int i = 0; i < n_tok;) {

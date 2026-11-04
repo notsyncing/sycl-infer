@@ -10,7 +10,7 @@
 namespace si {
 
 void cpu_gemv_group(uint32_t type, const cpu_gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
-                    int n_tok_blocks, int n_threads) {
+                    int n_tok_blocks, int n_threads, int chunk) {
     (void)total_rows;
     (void)n_threads;
     (void)nsb;
@@ -32,11 +32,35 @@ void cpu_gemv_group(uint32_t type, const cpu_gemv_seg * segs, int n_segs, int to
         gemv_row(type, W + (size_t)r * row_bytes, x, up, K, sg.alpha, res, out + r);
     };
 
+    // `chunk` > 1 turns each pool job into a contiguous run of flat indices.
+    // Every row still goes through the same run_row(...) with the same
+    // arguments, so the arithmetic and the output bytes are unchanged; the
+    // only difference is that the pool's `next_` atomic is taken once per
+    // chunk instead of once per row (12800 rows per PLE projection call).
+    auto dispatch = [&](int njobs, auto && fn) {
+        if (njobs <= 0) {
+            return;
+        }
+        if (chunk <= 1) {
+            par(njobs, fn);
+            return;
+        }
+        const int nc = (njobs + chunk - 1) / chunk;
+        par(nc, [&](int c) {
+            const int j0 = c * chunk;
+            const int j1 = j0 + chunk < njobs ? j0 + chunk : njobs;
+            for (int j = j0; j < j1; j++) {
+                fn(j);
+            }
+        });
+    };
+
     if (n_segs > kCpuGemvMaxSegs) {
         // unlikely (groups are per type/nsb per layer): keep the old per-group
         // barriers rather than overflow the prefix table
         for (int s = 0; s < n_segs; s++) {
-            par(ntok * segs[s].n_rows, [&](int j) { run_row(segs[s], j / segs[s].n_rows, j % segs[s].n_rows); });
+            dispatch(ntok * segs[s].n_rows,
+                     [&](int j) { run_row(segs[s], j / segs[s].n_rows, j % segs[s].n_rows); });
         }
         return;
     }
@@ -50,7 +74,7 @@ void cpu_gemv_group(uint32_t type, const cpu_gemv_seg * segs, int n_segs, int to
     if (total <= 0 || ntok <= 0) {
         return;
     }
-    par(ntok * total, [&](int j) {
+    dispatch(ntok * total, [&](int j) {
         const int t = j / total;
         const int rr = j % total;
         int s = 0;

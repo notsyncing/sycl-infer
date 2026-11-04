@@ -39,6 +39,11 @@ int q4_gemv_tb(int mode, int n_tok) {
     return n_tok <= 8 ? 8 : (n_tok <= 16 ? 16 : 32);
 }
 
+// Rows per pool job for the PLE projections (PF_Q4_PLE_CHUNK = 1).  A decode
+// call is 12 800 rows over 28 threads, so one pool job per row spends more time
+// in the shared `next_` atomic than in the row's 2 560-value dot.
+constexpr int kPleChunkRows = 16;
+
 } // namespace
 
 // The routed down bank's symmetric int8 store (per-32 scale).  Q5_1's block is
@@ -1606,7 +1611,12 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             }
         }
     };
-    // host GEMV helpers (the shared expert and PLE); TB is the token count
+    // host GEMV helpers (the shared expert and PLE); TB is the token count.
+    // PF_Q4_PLE_CHUNK: 0 = the old one-job-per-row dispatch, 1 = the default
+    // chunk, N > 1 = N rows per pool job.  Every row still goes through
+    // gemv_row with the same arguments, so the output is bit-identical.
+    static const int ple_chunk_env = si::env::i32("PF_Q4_PLE_CHUNK", 1);
+    const int ple_chunk = ple_chunk_env <= 0 ? 0 : (ple_chunk_env == 1 ? kPleChunkRows : ple_chunk_env);
     auto hgemv1 = [&](const wt & w, const float * x, int xs, float * out, int os) {
         cpu_gemv_seg s{};
         s.w = w.data;
@@ -1618,7 +1628,34 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         s.out = out;
         s.out_stride = os;
         s.alpha = 1.0f;
-        cpu_gemv_group(w.type, &s, 1, w.N, n_tok, 0, 0, 0);
+        cpu_gemv_group(w.type, &s, 1, w.N, n_tok, 0, 0, 0, ple_chunk);
+    };
+    // The PLE's key and value projections read the same activation and are both
+    // Q8_0 in the shipped files, so they can share one pool region (two
+    // segments, one dispatch).  The row arithmetic is per segment and per row,
+    // unchanged; a type mismatch falls back to the two calls.
+    auto hgemv2 = [&](const wt & a, const wt & b, const float * x, int xs, float * oa, int osa, float * ob, int osb) {
+        if (a.type != b.type) {
+            hgemv1(a, x, xs, oa, osa);
+            hgemv1(b, x, xs, ob, osb);
+            return;
+        }
+        cpu_gemv_seg s[2]{};
+        const wt * ws[2] = {&a, &b};
+        float * outs[2] = {oa, ob};
+        const int strides[2] = {osa, osb};
+        for (int i = 0; i < 2; i++) {
+            s[i].w = ws[i]->data;
+            s[i].type = ws[i]->type;
+            s[i].K = ws[i]->K;
+            s[i].n_rows = ws[i]->N;
+            s[i].x = x;
+            s[i].x_stride = xs;
+            s[i].out = outs[i];
+            s[i].out_stride = strides[i];
+            s[i].alpha = 1.0f;
+        }
+        cpu_gemv_group(a.type, s, 2, a.N + b.N, n_tok, 0, 0, 0, ple_chunk);
     };
     auto hgate_up = [&](const wt & g, const wt & u, const float * x, int xs, float * sh, int sh_stride) {
         for (int which = 0; which < 2; which++) {
@@ -2089,8 +2126,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     plev[2] = DQ(dev).ext_oneapi_submit_barrier();
                 }
             } else {
-                hgemv1(L.ple.key, q4_ple_emb_, n_embd, q4_ple_key_, hc_dim);
-                hgemv1(L.ple.value, q4_ple_emb_, n_embd, q4_ple_val_, n_embd);
+                hgemv2(L.ple.key, L.ple.value, q4_ple_emb_, n_embd, q4_ple_key_, hc_dim, q4_ple_val_, n_embd);
             }
             const double pl_g2 = plef ? now_ms() : 0.0;
             to_host(dev, q4_host_res_, b.res, (size_t)n_tok * hc_dim * sizeof(float));

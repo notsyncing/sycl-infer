@@ -100,8 +100,13 @@ void cpu_rmsnorm(const float * x, const float * w, float * out, int n_rows, int 
 void cpu_copy_row(const float * src, float * dst, const cpu_step_info * info, int n, int row);
 void cpu_embed(const void * table, uint32_t type, const cpu_step_info * info, float * out, int n_embd,
                size_t row_bytes);
+// `chunk` = rows per pool job (0/1 = the old one-job-per-row dispatch).  A
+// chunked job is a contiguous run of flat (token, row) indices and calls the
+// same `gemv_row` with the same arguments, so the result is bit-identical; it
+// only removes the per-row `fetch_add` that dominates a narrow projection
+// (the PLE's 12 800-row key/value pair).
 void cpu_gemv_group(uint32_t type, const cpu_gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
-                    int n_tok_blocks, int n_threads);
+                    int n_tok_blocks, int n_threads, int chunk = 0);
 void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm, void * kpool,
                       void * vpool, const int32_t * tables, const cpu_step_info * info, int n_head, int n_head_kv,
                       int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale, float eps, int max_blocks,
