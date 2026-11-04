@@ -186,7 +186,10 @@ static void usage(const char * prog) {
             "env: PF_CTX, PF_KV_CAP_MB, PF_KV_TYPE, PF_PREFIX_CACHE, PF_PC_STATES,\n"
             "  PF_DEVICE, PF_CPU_ISA, PF_CPU_THREADS, PF_DP4A, PF_DP4A_DEC,\n"
             "  PF_GEMM_DNNL, PF_W4, PF_K5, PF_CB4, PF_ATTN_XMX, PF_MTP,\n"
-            "  PF_NOGRAPH, PF_PROF, PF_TIME, PF_MAX_SLOTS, PF_YARN.\n"
+            "  PF_NOGRAPH, PF_PROF, PF_TIME, PF_MAX_SLOTS, PF_YARN,\n"
+            "  PF_MOE_BANK_AUTO (expert-bank governor, default on),\n"
+            "  PF_MOE_BANK_RESERVE_MB (device MB to keep free, default 2048),\n"
+            "  PF_MOE_DOWN_I8, PF_MOE_U4BANK, PF_MEM_REPORT.\n"
             "  Full list: AGENTS.md.\n",
             prog, kDefaultModel, kDefaultCtx, kBlockSize, kMaxB);
 }
@@ -597,11 +600,16 @@ int main(int argc, char ** argv) {
             }
         }
         {
-            const double kv_mb = (double)e.kv_bytes_total() / (1024.0 * 1024.0);
+            // A fixed pool (the multi-device path) commits the whole cap at
+            // startup, so reporting pool_blocks would understate it (the block
+            // allocator only hands out 16 at a time while the device allocation
+            // is the full cap).  A virtual pool commits lazily, so its committed
+            // extent is what pool_blocks says.
+            const int kv_blocks_now = e.kv_virtual ? e.pool_blocks : e.pool_cap;
+            const double kv_mb = (double)(e.kv_virtual ? e.kv_bytes_total() : e.kv_bytes_cap()) / (1024.0 * 1024.0);
             const double cap_mb = (double)e.kv_bytes_cap() / (1024.0 * 1024.0);
             const double per_tok_kb =
-                e.pool_blocks > 0 ? (double)e.kv_bytes_total() / (double)((size_t)e.pool_blocks * kBlockSize) / 1024.0
-                                  : 0.0;
+                kv_blocks_now > 0 ? (double)kv_mb * 1024.0 / (double)((size_t)kv_blocks_now * kBlockSize) : 0.0;
             char kvname[32];
             if (kv_k_dtype() == kv_v_dtype()) {
                 snprintf(kvname, sizeof(kvname), "%s", kv_dtype_name(kv_k_dtype()));

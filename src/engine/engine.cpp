@@ -768,6 +768,32 @@ engine::engine(const engine_config & cfg)
         build_graphs();
         lt.lap("build_graphs (plans+capture)");
     }
+
+    // PF_MEM_REPORT: the engine's own device-allocation accounting against the
+    // device's reported total, so a capacity study does not have to infer the
+    // footprint from driver free-memory (which is unreliable on a shared-memory
+    // iGPU).  own = every dev_alloc_on + the oneDNN weight stores; the gap to
+    // total - driver_free is oneDNN scratch + driver overhead.
+    if (si::env::flag("PF_MEM_REPORT") && !cpu_mode && !dev_used_bytes_.empty()) {
+        for (size_t d = 0; d < dev_used_bytes_.size(); d++) {
+            uint64_t total = 0, dfree = 0;
+            try {
+                sycl::device dv = (multi_dev && d < dev_queues_.size() && dev_queues_[d]) ? dev_queues_[d]->get_device()
+                                                                                          : q.get_device();
+                total = dv.get_info<sycl::info::device::global_mem_size>();
+                if (dv.has(sycl::aspect::ext_intel_free_memory)) {
+                    dfree = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+                }
+            } catch (...) {
+            }
+            const double own = (double)dev_used_bytes_[d];
+            const double kv = d == 0 ? (double)kv_bytes_total() : 0.0;
+            fprintf(stderr,
+                    "[mem] dev %zu own=%.0f MB (kv=%.0f + rest=%.0f) total=%.0f driver_free=%.0f unaccounted=%.0f MB\n",
+                    d, own / 1048576.0, kv / 1048576.0, (own - kv) / 1048576.0, (double)total / 1048576.0,
+                    (double)dfree / 1048576.0, ((double)total - own - (double)dfree) / 1048576.0);
+        }
+    }
     // all weights are on their devices now: release the host pages of the GGUF
     // so the process does not carry the whole file in its RSS.  This cannot run
     // earlier: the release's keep-set includes the expert tensors whenever the
@@ -1362,7 +1388,9 @@ void engine::moe_acts_alloc(int dev) {
     // both.  `gather` is the prefill's [256][n_embd] activation tile.  Only
     // allocated when a bank was actually built (the memory-tight qwen4exp path
     // and an unbaked MoE run do not pay 17 MB per device for nothing).
-    if (moe_u4_any_ || moe_i8_any_) {
+    const bool bank_scratch = moe_bank_auto() && (moe_u4bank_wanted() || moe_down_i8_wanted());
+    const bool u4_scratch = (moe_bank_auto() && moe_u4bank_wanted()) || moe_u4_any_;
+    if (moe_u4_any_ || moe_i8_any_ || bank_scratch) {
         // +512 rows of slack: the CSR-order prefill writes each tile's padded
         // rows past its real pair count, and the next tile (or expert) owns
         // that range and overwrites it.  The last tile must still land inside
@@ -1373,7 +1401,7 @@ void engine::moe_acts_alloc(int dev) {
         a.g2 = F((P + 512) * (size_t)hp.n_ff_exp);
         a.pos = I(P + 512);
     }
-    if (moe_u4_any_) {
+    if (u4_scratch) {
         a.gather = F(256 * (size_t)hp.n_embd);
         // CSR-order activation staging for the oneDNN expert GEMMs (see
         // moe_gate_up_u4 / moe_down_i8).  +512 rows covers the last tile's
@@ -1388,7 +1416,10 @@ void engine::moe_acts_alloc(int dev) {
     if (!a.ids || !a.h || !a.acc || !a.slotmap) {
         throw std::runtime_error("MoE scratch allocation failed");
     }
-    if (moe_u4_any_ && (!a.gu || !a.g2 || !a.pos || !a.gather)) {
+    if ((moe_u4_any_ || bank_scratch) && (!a.gu || !a.g2 || !a.pos)) {
+        throw std::runtime_error("expert bank scratch allocation failed");
+    }
+    if ((moe_u4_any_ || u4_scratch) && (!a.gather || !a.csr_xq || !a.csr_asa || !a.csr_xs || !a.csr_corr)) {
         throw std::runtime_error("u4 expert bank scratch allocation failed");
     }
 }
@@ -1933,6 +1964,194 @@ bool engine::setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         return true;
     }
     return false;
+}
+
+
+// ---------------------------------------------------------------------------
+// Deferred expert-bank governor (PF_MOE_BANK_AUTO).
+//
+// The two routed-expert banks are load-time caches that replace the raw GGUF
+// planes, and both cost MORE device bytes than the planes they replace on this
+// card: u4 gate/up is 0.625 B/w against Q4_K's 0.5625, and the int8 down store
+// is 1.125 B/w against Q5_K's 0.6875.  On a shared-memory iGPU (Lunar Lake:
+// 28.12 GiB "device" memory out of a 30 GB host) those bytes come straight out
+// of the host's RAM, so committing both banks and then sizing the KV pool for a
+// long context is what leaves the host with ~1 GiB and can kill it.
+//
+// The decision cannot be made where the banks used to be built: at that point
+// the KV pool and the activation/state buffers do not exist yet.  So the raw
+// gate/up/down planes are deferred out of upload_device_weights(), and
+// finalize_moe_banks() runs at the end of alloc_buffers(), when the real
+// remaining memory is known.  It keeps the banks that fit above a reserve and
+// uploads the rest raw.
+//
+// Shed order is down-first, by measured value per byte: the down bank is 4.1 GiB
+// for ~4% of the prefill, the u4 gate/up bank is 1.3 GiB for ~21% of it.
+// ---------------------------------------------------------------------------
+
+bool engine::moe_bank_auto() const {
+    static const bool on = [] {
+        const char * e = si::env::str("PF_MOE_BANK_AUTO");
+        return !(e && atoi(e) == 0);
+    }();
+    return on && multi_dev && !cpu_mode && m.hp.is_moe() && !moe_host_only_;
+}
+
+bool engine::moe_u4bank_eligible(const moe_t & M) const {
+    if (!moe_u4bank_wanted()) {
+        return false;
+    }
+    if (!u4_can_bank(M.gate_exps) || !u4_can_bank(M.up_exps)) {
+        return false;
+    }
+    // The prefill dispatch reads K/N from the model's hparams, so a tensor with
+    // a different geometry must stay on the raw path (setup_moe_u4_bank applies
+    // the same test).
+    return M.gate_exps.K == m.hp.n_embd && M.gate_exps.N == m.hp.n_ff_exp && M.up_exps.K == M.gate_exps.K &&
+           M.up_exps.N == M.gate_exps.N;
+}
+
+bool engine::moe_down_i8_eligible(const moe_wt & T) const {
+    if (!moe_down_i8_wanted()) {
+        return false;
+    }
+    return T.ok() && T.type == 13 && T.K == m.hp.n_ff_exp && T.N == m.hp.n_embd && (T.K % 32) == 0 && T.E > 0;
+}
+
+void engine::upload_raw_tensor(int dev, const moe_wt & t, const char * why) {
+    if (!t.data || t.total_bytes() == 0) {
+        return;
+    }
+    if (weight_maps_.size() <= (size_t)dev) {
+        weight_maps_.resize((size_t)dev + 1);
+    }
+    if (weight_maps_[(size_t)dev].count(t.data)) {
+        return;
+    }
+    sycl::queue & qd = (dev < (int)dev_queues_.size() && dev_queues_[(size_t)dev]) ? *dev_queues_[(size_t)dev] : q;
+    void * g = sycl::malloc_device(t.total_bytes(), qd);
+    if (!g) {
+        throw std::runtime_error(std::string("expert raw upload failed (out of device memory): ") + why);
+    }
+    qd.memcpy(g, t.data, t.total_bytes()).wait();
+    weight_maps_[(size_t)dev][t.data] = g;
+    if (dev_used_bytes_.size() <= (size_t)dev) {
+        dev_used_bytes_.resize((size_t)dev + 1, 0);
+    }
+    dev_used_bytes_[(size_t)dev] += t.total_bytes();
+    m.page_out_host(t.data, t.total_bytes());
+}
+
+void engine::finalize_moe_banks() {
+    if (!moe_bank_auto()) {
+        return;
+    }
+    long reserve_mb = 2048;
+    if (const char * e = si::env::str("PF_MOE_BANK_RESERVE_MB")) {
+        reserve_mb = atol(e);
+    }
+    if (reserve_mb < 0) {
+        reserve_mb = 0;
+    }
+    const int nL = m.hp.n_layer;
+    for (int dev = 0; dev < (int)dev_queues_.size(); dev++) {
+        if (dev_kind_[(size_t)dev] != 0 || !dev_queues_[(size_t)dev] || (size_t)dev >= dnnl_dev_.size() ||
+            !dnnl_dev_[(size_t)dev]) {
+            continue;
+        }
+        size_t gu_bank = 0, gu_raw = 0, dn_bank = 0, dn_raw = 0;
+        int gu_layers = 0, dn_layers = 0;
+        for (int il = 0; il < nL; il++) {
+            if (layer_dev_[(size_t)il] != dev) {
+                continue;
+            }
+            const moe_t & M = m.layers[(size_t)il].moe;
+            if (!M.ok()) {
+                continue;
+            }
+            if (moe_u4bank_eligible(M)) {
+                size_t vb = 0, sb = 0, pl = 0;
+                u4_plane_of(M.gate_exps.K, M.gate_exps.N, vb, sb, pl);
+                gu_bank += 2 * pl * (size_t)M.gate_exps.E;
+                gu_raw += M.gate_exps.total_bytes() + M.up_exps.total_bytes();
+                gu_layers++;
+            }
+            if (moe_down_i8_eligible(M.down_exps)) {
+                const size_t ng = (size_t)M.down_exps.K / 32;
+                dn_bank += ((size_t)M.down_exps.N * (size_t)M.down_exps.K + ng * (size_t)M.down_exps.N * 4) *
+                           (size_t)M.down_exps.E;
+                dn_raw += M.down_exps.total_bytes();
+                dn_layers++;
+            }
+        }
+        if (!gu_layers && !dn_layers) {
+            continue;
+        }
+        uint64_t total = 0;
+        try {
+            total = dev_queues_[(size_t)dev]->get_device().get_info<sycl::info::device::global_mem_size>();
+        } catch (...) {
+        }
+        const int64_t reserve = (int64_t)reserve_mb * 1024 * 1024;
+        const int64_t room = (int64_t)total - reserve - (int64_t)dev_used_bytes_[(size_t)dev];
+        bool keep_gu = false;
+        bool keep_dn = false;
+        const bool opt_both = room >= (int64_t)(gu_bank + dn_bank);
+        const bool opt_nodn = room >= (int64_t)(gu_bank + dn_raw);
+        const bool opt_none = room >= (int64_t)(gu_raw + dn_raw);
+        if (gu_layers && dn_layers) {
+            // Preference by measured value per byte: both > gate/up only (the
+            // down bank is 4.1 GiB for ~4% of the prefill) > both raw.
+            keep_gu = opt_both || opt_nodn;
+            keep_dn = opt_both;
+            if (!opt_nodn && !opt_none) {
+                // Not even the raw planes fit next to the KV pool; take the
+                // cheapest and let the upload say what failed.
+                keep_gu = false;
+            }
+        } else if (gu_layers) {
+            keep_gu = room >= (int64_t)gu_bank;
+        } else if (dn_layers) {
+            keep_dn = room >= (int64_t)dn_bank;
+        }
+        dnnl_gemm & D = *dnnl_dev_[(size_t)dev];
+        sycl::queue & qd = *dev_queues_[(size_t)dev];
+        if (keep_gu) {
+            setup_moe_u4_bank(dev, D, qd);
+        }
+        if (keep_dn) {
+            setup_moe_down_i8_bank(dev, D, qd);
+        }
+        // Whatever did not get a bank is uploaded raw, before the host pages are
+        // released and before build_graphs() resolves the tensor pointers.
+        for (int il = 0; il < nL; il++) {
+            if (layer_dev_[(size_t)il] != dev) {
+                continue;
+            }
+            const moe_t & M = m.layers[(size_t)il].moe;
+            if (!M.ok()) {
+                continue;
+            }
+            if (moe_u4bank_eligible(M) && ((size_t)il >= moe_u4_bank_.size() || !moe_u4_bank_[(size_t)il])) {
+                upload_raw_tensor(dev, M.gate_exps, "gate_exps");
+                upload_raw_tensor(dev, M.up_exps, "up_exps");
+            }
+            if (moe_down_i8_eligible(M.down_exps) &&
+                ((size_t)il >= moe_i8_bank_.size() || !moe_i8_bank_[(size_t)il])) {
+                upload_raw_tensor(dev, M.down_exps, "down_exps");
+            }
+        }
+        fprintf(stderr,
+                "[moe] expert banks (dev %d): %s; room %.0f MB above a %ld MB reserve, "
+                "gate/up u4 %.0f MB vs raw %.0f MB, down int8 %.0f MB vs raw %.0f MB\n",
+                dev,
+                (keep_gu && keep_dn) ? "keep both"
+                : keep_gu            ? "keep gate/up u4, down raw"
+                : keep_dn            ? "keep down int8, gate/up raw"
+                                     : "both raw (context budget)",
+                (double)room / 1048576.0, reserve_mb, (double)gu_bank / 1048576.0, (double)gu_raw / 1048576.0,
+                (double)dn_bank / 1048576.0, (double)dn_raw / 1048576.0);
+    }
 }
 
 // The down projection through the int8 bank: one oneDNN int8 GEMM per
@@ -2504,9 +2723,17 @@ void engine::upload_device_weights(int dev) {
             // they ride the same per-device upload as the dense tensors: a
             // `--layer-map` partition then holds exactly its own layers'
             // experts, which is what makes the model fit on two 16 GB cards.
-            addp(L.moe.gate_exps.data);
-            addp(L.moe.up_exps.data);
-            addp(L.moe.down_exps.data);
+            // A tensor whose bank is still a candidate is deferred to
+            // finalize_moe_banks(), which decides with the KV-pool size known.
+            const bool defer_gu = moe_bank_auto() && moe_u4bank_eligible(L.moe);
+            const bool defer_dn = moe_bank_auto() && moe_down_i8_eligible(L.moe.down_exps);
+            if (!defer_gu) {
+                addp(L.moe.gate_exps.data);
+                addp(L.moe.up_exps.data);
+            }
+            if (!defer_dn) {
+                addp(L.moe.down_exps.data);
+            }
             addp(L.moe.gate_inp);
             addp(L.moe.gate_inp_shexp);
         }
@@ -3268,18 +3495,24 @@ bool engine::setup_md_dnnl() {
             add(L.ssm_beta, il, -2, "ssm_beta");
             add(L.ssm_alpha, il, -2, "ssm_alpha");
         }
-        // Routed-expert u4 gate/up bank: packed and registered here, while this
-        // device's dnnl_gemm exists and before the per-tensor upload (which then
-        // skips the banked tensors).  A device whose only weights were the bank
-        // still keeps its oneDNN instance, which is what gemm_w4 runs on.
-        if (setup_moe_u4_bank((int)d, *D, *dev_queues_[d])) {
-            dev_ok = true;
-        }
-        // Routed down: re-quantized int8 bank + the per-expert oneDNN int8 GEMM.
-        // Built after the gate/up bank so the load-time peak is the smaller of
-        // the two orders.
-        if (setup_moe_down_i8_bank((int)d, *D, *dev_queues_[d])) {
-            dev_ok = true;
+        // The routed-expert banks are built by finalize_moe_banks() at the end
+        // of alloc_buffers(), because whether they fit depends on the KV pool
+        // the requested context needs (see the comment there).  A device whose
+        // only weights were a bank still keeps its oneDNN instance, which is
+        // what gemm_w4 / the int8 expert GEMM run on.
+        if (moe_bank_auto()) {
+            if (moe_u4bank_wanted() || moe_down_i8_wanted()) {
+                dev_ok = true;
+            }
+        } else {
+            // PF_MOE_BANK_AUTO=0: the pre-governor behaviour - build both banks
+            // unconditionally, before the KV pool is sized.
+            if (setup_moe_u4_bank((int)d, *D, *dev_queues_[d])) {
+                dev_ok = true;
+            }
+            if (setup_moe_down_i8_bank((int)d, *D, *dev_queues_[d])) {
+                dev_ok = true;
+            }
         }
         {
             char lb[64];
@@ -3779,6 +4012,12 @@ void engine::alloc_buffers() {
         for (size_t d = 0; d < moe_as_.size(); d++) {
             moe_acts_alloc((int)d);
         }
+        // Decide and build the expert banks now: the KV pool and the activation
+        // sets above are the only device allocations that depend on the context,
+        // and setup_moe_slots() below reads moe_u4_bank_ to report the strides.
+        // Before the host pages are released and before build_graphs() resolves
+        // the tensors through weight_maps_.
+        finalize_moe_banks();
         moe_cache_.init(m, moe_cfg_, (int) m.hp.n_expert);
         if (!moe_cache_.all_resident() && moe_cache_.active()) {
             fprintf(stderr, "[moe] expert cache: host expert split active, the decode graph is disabled\n");

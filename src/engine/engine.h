@@ -605,6 +605,18 @@ struct engine {
     bool moe_i8_any_ = false;
     bool moe_down_i8_wanted() const;
     bool setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd);
+    // ---- deferred expert-bank governor (PF_MOE_BANK_AUTO) ----------------
+    // The u4 gate/up and int8 down banks cost more device bytes than the raw
+    // planes they replace, and on a shared-memory iGPU those bytes are the
+    // host's RAM.  The raw expert planes are therefore deferred out of
+    // upload_device_weights() and finalize_moe_banks() (end of
+    // alloc_buffers()) keeps the banks that fit above a reserve, uploading the
+    // rest raw.  See the comment at the implementation.
+    bool moe_bank_auto() const;
+    bool moe_u4bank_eligible(const moe_t & M) const;
+    bool moe_down_i8_eligible(const moe_wt & T) const;
+    void upload_raw_tensor(int dev, const moe_wt & t, const char * why);
+    void finalize_moe_banks();
     bool moe_down_i8_bank_ok(int dev, int moe_il) const;
     bool moe_down_i8(int dev, int moe_il, const moe_t & M, int n_pairs, int n_act);
     void bind_moe_acts(int dev);
