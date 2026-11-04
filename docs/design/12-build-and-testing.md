@@ -94,6 +94,10 @@ cmake --build build --target sycl-infer -j$(nproc)   # 只构建二进制，不�
   调小。
 * `CMakeLists.txt` 还传 `-fsycl-device-code-split=per_kernel`：默认的 `auto` 会把整个 module 合成一个
   镜像从而串行化 lowering，per-kernel 镜像可以并行 lower，也能逐个跳过。
+* **AOT 的设备目标标志挂在 `si_aot_flags`（INTERFACE 库）上，不是目录级选项。** 路由器用
+  `-fno-sycl` 编译，而 `-fsycl-targets` 没有 `-fsycl` 是硬错误（`-fno-sycl` 不能抵消
+  `-fsycl-targets`）；目录级标志会被路由器目标继承、直接编译失败。`si_aot_flags` 由携带设备镜像的
+  `sycl_infer_core` / `si_onnx_core` PUBLIC 链接，所以编译和最终（ocloc）链接都带上它，其它目标不受影响。
 * **用 `-DCMAKE_BUILD_TYPE=Release`。** Debug 构建的 `-g` 会给设备镜像加上 debug info，让每个镜像大若干倍、
   lower 更慢；强制的 `-O2` 并不会去掉它。
 * **ocloc 编译器缓存在这里不可用**：`-allow_caching` / `-cache_dir`（以及 `NEO_CACHE_DIR`）会创建目录但

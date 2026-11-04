@@ -618,6 +618,11 @@ wheel 元数据记录 `oneapi_version` / `dnnl_version` / `igc_version`，`docto
   distribution（例如 `sycl-infer-aot-acm-g10`），或用 `--extra-index-url`。
 * 默认 JIT wheel 的 `doctor` 会提示：如果目标机器没有 IGC，改用 AOT wheel；
   如果 `SYCL_CACHE_PERSISTENT=1` 在驱动上崩溃（`AGENTS.md` 有记录），关闭缓存。
+* **AOT wheel 的构建容器需要 `intel-ocloc`**：它不是 oneAPI toolkit 镜像的一部分（单独的 apt
+  包，来自 Intel graphics 源），`icpx` 只在编译期 warning，最终设备链接才以
+  `llvm-foreach: command failed` 失败。`ci/Jenkinsfile` 在 `AOT=true` 时安装它并在编译前预检。
+  同一个 pipeline 在 `source setvars.sh` 前清掉镜像导出的 `SETVARS_COMPLETED`：否则第二次 source
+  只打印 usage（最后一行就是那条 32-bit 说明）并返回 3，`set -e` 会把整个 stage 判失败。
 * wheel 的 `METADATA` 增加自定义字段（或 `sycl_infer/_build.json`）：
   `{"build": "jit", "aot_device": null, "oneapi": "2026.2", "dnnl": "3.13"}`。
 

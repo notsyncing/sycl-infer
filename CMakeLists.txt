@@ -51,9 +51,17 @@ option(SYCL_INFER_AOT "AOT compile for the target GPU (avoids runtime JIT)" OFF)
 # Check `ocloc query` for any other SKU rather than inheriting either default.
 set(SYCL_INFER_AOT_DEVICE "adl-p" CACHE STRING "ocloc target device for SYCL_INFER_AOT (adl-p = Iris Xe, acm-g10 = A770/DG2, lnl = Arc 140V / Xe2 Lunar Lake, bmg = Battlemage)")
 set(SYCL_INFER_AOT_PROFILE "" CACHE STRING "device profile key baked into the binary; empty = auto-detect from the SYCL device name")
+# The AOT device-target flags live on an INTERFACE library, not on the whole
+# directory.  The router is compiled with -fno-sycl, and icpx rejects
+# -fsycl-targets unless -fsycl is also in effect - -fno-sycl does not cancel
+# it, so a directory-wide flag breaks every router target.  Linking this
+# interface (PUBLIC from the two libraries that carry device images) puts the
+# flags on the compile of each SYCL consumer and on its final, ocloc-driven
+# link, and nowhere else.
+add_library(si_aot_flags INTERFACE)
 if(SYCL_INFER_AOT AND NOT SI_ROUTER_ONLY)
-    add_compile_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
-    add_link_options(-fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
+    target_compile_options(si_aot_flags INTERFACE -fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
+    target_link_options(si_aot_flags INTERFACE -fsycl-targets=spir64_gen -Xs "-device ${SYCL_INFER_AOT_DEVICE}")
     if(SYCL_INFER_AOT_PROFILE)
         # bake the profile in, so an AOT binary built for one card says so even
         # when it runs somewhere the name would mislead
@@ -65,7 +73,7 @@ if(SYCL_INFER_AOT AND NOT SI_ROUTER_ONLY)
     # (`auto`) merges a whole module into one image, which serialises that work;
     # `per_kernel` emits one image per kernel so they can be lowered in parallel
     # (and skipped individually if the ocloc cache is usable).
-    add_link_options(-fsycl-device-code-split=per_kernel)
+    target_link_options(si_aot_flags INTERFACE -fsycl-device-code-split=per_kernel)
     # The post-link device step defaults to a single ocloc process even on a
     # many-core host; this is what makes an AOT build look serial.  Each job is a
     # separate IGC translation, so RAM use scales with the count.
@@ -78,7 +86,7 @@ if(SYCL_INFER_AOT AND NOT SI_ROUTER_ONLY)
     if(SYCL_INFER_AOT_JOBS LESS 1)
         set(SYCL_INFER_AOT_JOBS 1)
     endif()
-    add_link_options(-fsycl-max-parallel-link-jobs=${SYCL_INFER_AOT_JOBS})
+    target_link_options(si_aot_flags INTERFACE -fsycl-max-parallel-link-jobs=${SYCL_INFER_AOT_JOBS})
     # NOTE: `-g` (a Debug build) makes each device image several times larger and
     # slower to lower; configure with `-DCMAKE_BUILD_TYPE=Release` for AOT.
 endif()
@@ -267,7 +275,7 @@ if(NOT DNNL_LIBRARY)
     message(FATAL_ERROR "libdnnl not found under ${DNNL_ROOT}/lib")
 endif()
 target_include_directories(sycl_infer_core PRIVATE "${DNNL_ROOT}/include")
-target_link_libraries(sycl_infer_core PUBLIC "${DNNL_LIBRARY}")
+target_link_libraries(sycl_infer_core PUBLIC "${DNNL_LIBRARY}" si_aot_flags)
 
 endif() # NOT SI_ROUTER_ONLY
 
@@ -294,8 +302,12 @@ endif()
 # The multi-model front end (docs/design/16-router.md).  It is a plain host
 # C++17 program: no SYCL device pass, no oneDNN, and it does NOT link
 # sycl_infer_core - so its container is tiny and its tests need neither a GPU
-# nor a model.  `-fno-sycl` has to come after the global `-fsycl`, which is
-# why it is set per source file (the same trick SI_CPU_SOURCES uses).
+# nor a model.  `-fno-sycl` has to come after the global `-fsycl`, so it is a
+# TARGET option, not a source property: source properties are directory
+# scoped, and src/common/onnx_wire.cpp is also a source of si_onnx_core, which
+# must keep the SYCL device pass.  A source-level -fno-sycl leaks into that
+# target and makes an AOT build fail with "-fsycl-targets must be used in
+# conjunction with -fsycl".
 add_library(si_router_core STATIC
     src/router/config.cpp
     src/router/registry.cpp
@@ -305,16 +317,7 @@ add_library(si_router_core STATIC
     src/common/onnx_wire.cpp
 )
 if(NOT SI_ROUTER_ONLY)
-    # The global -fsycl would drag the router through the device pass; this
-    # puts it back on the host path (the same trick SI_CPU_SOURCES uses).
-    set_source_files_properties(
-        src/router/config.cpp
-        src/router/registry.cpp
-        src/router/rpc_client.cpp
-        src/router/supervisor.cpp
-        src/router/proxy.cpp
-        src/common/onnx_wire.cpp
-        PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+    target_compile_options(si_router_core PRIVATE -fno-sycl)
 endif()
 target_include_directories(si_router_core PUBLIC src/router src/common third_party)
 find_package(Threads REQUIRED)
@@ -326,7 +329,7 @@ endif()
 
 add_executable(sycl-infer-router src/router/main.cpp)
 if(NOT SI_ROUTER_ONLY)
-    set_source_files_properties(src/router/main.cpp PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+    target_compile_options(sycl-infer-router PRIVATE -fno-sycl)
     target_link_options(sycl-infer-router PRIVATE -fno-sycl)
 endif()
 target_link_libraries(sycl-infer-router PRIVATE si_router_core)
@@ -383,7 +386,7 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
         src/device/profiles/iris_xe.cpp
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(si_onnx_core PUBLIC Threads::Threads)
+    target_link_libraries(si_onnx_core PUBLIC Threads::Threads si_aot_flags)
     # oneDNN for the group-1 f32 convolution path (conv_dnnl.cpp): the same
     # library the engine's int8 GEMM uses, and the same include/lib search
     # (DNNL_ROOT above).

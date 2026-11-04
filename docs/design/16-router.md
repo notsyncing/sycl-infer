@@ -775,8 +775,11 @@ services:
 ### 12.2 CMake
 
 * `si_router_core`（静态库）+ `sycl-infer-router`（可执行文件）。
-* 两者都用 `-fno-sycl`（源文件级，与 `SI_CPU_SOURCES` 同一个手法），**不链接
-  `sycl_infer_core`**——那会拖进 oneDNN 与 SYCL 运行时。
+* 两者都用 `-fno-sycl`，**并且是 target 级选项而不是源文件属性**，**不链接
+  `sycl_infer_core`**——那会拖进 oneDNN 与 SYCL 运行时。源属性是目录级的，而
+  `src/common/onnx_wire.cpp` 同时属于 `si_onnx_core`（它必须走 device pass）：
+  源级 `-fno-sycl` 会泄漏过去，AOT 构建里就变成 `-fsycl-targets` 缺少 `-fsycl`
+  的编译错误（`-fno-sycl` 并不能抵消 `-fsycl-targets`）。
 * **`SI_ROUTER_ONLY=ON`**：整个工程只构建路由器（连 `icpx` 都不找），这是容器镜像的构建路径，
   也是"路由器不带 GPU 也能构建"的保证。
 * 验收：`ldd build/sycl-infer-router` 里没有 `libsycl.so`。已验证（只有 libc/libstdc++/libssl）。
