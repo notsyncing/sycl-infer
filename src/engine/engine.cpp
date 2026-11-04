@@ -994,6 +994,7 @@ engine::~engine() {
         f0(mtp.d_mtp_amv_);
         f0(mtp.verify.d_argmax);
         f0(mtp.verify.d_argval);
+        f0(d_dec_argmax_);
         f0(mtp.d_am2_);
         if (mtp.d_mtp_rinfo) {
             sycl::free(mtp.d_mtp_rinfo, q);
@@ -1055,6 +1056,7 @@ engine::~engine() {
         mtp.d_am2_ = nullptr;
         mtp.verify.d_argmax = nullptr;
         mtp.verify.d_argval = nullptr;
+        d_dec_argmax_ = nullptr;
         mtp.h_head_stage = nullptr;
         dfl.d_df_h = dfl.d_df_b = dfl.d_df_c = dfl.d_df_qkv = dfl.d_df_gu = dfl.d_df_dyn = dfl.d_df_gate = nullptr;
         dfl.d_df_partials = dfl.d_df_feat = dfl.d_df_feat_dev = nullptr;
@@ -4412,6 +4414,32 @@ void engine::fetch_logits(int row, float * out) {
     std::memcpy(out, h_logits, (size_t)hp.n_vocab * 4);
 }
 
+// Greedy decode's argmax without the logits download: mtp_argmax_launch scans
+// the row on the device with the same strict-`>` / lowest-index tie rule as the
+// host loop in sample_token, so the token is identical.  Only used when the
+// request is a plain greedy one (see generate_impl); a logprobs request still
+// needs the full vector.
+int engine::fetch_argmax(int row) {
+    // The common path: q4_forward enqueued the argmax right after the LM head
+    // and its final sync already waited for the 4-byte copy into h_logits, so
+    // this is a host read with no submission round trip.
+    if (dec_argmax_dev_ && row == 0 && d_dec_argmax_ != nullptr) {
+        int32_t id = 0;
+        std::memcpy(&id, h_logits, sizeof(int32_t));
+        return (int)id;
+    }
+    // Fallback (a caller outside generate_impl's flagged loop): launch it now.
+    const int n = m.hp.n_vocab;
+    if (d_dec_argmax_ == nullptr) {
+        d_dec_argmax_ = sycl::malloc_device<int32_t>(1, dev_queue(0));
+    }
+    backend().mtp_argmax(d_logits + (size_t)row * n, n, d_dec_argmax_, nullptr, 1);
+    dev_queue(0).memcpy(h_logits, d_dec_argmax_, sizeof(int32_t)).wait();
+    int32_t id = 0;
+    std::memcpy(&id, h_logits, sizeof(int32_t));
+    return (int)id;
+}
+
 std::vector<float> engine::run_head() {
     if (m.q4exp) {
         q.memcpy(h_logits, d_logits, (size_t)m.hp.n_vocab * 4).wait();
@@ -4671,6 +4699,36 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // a model-owned decode entry point (qwen4exp) resets step_info; tell it the
     // per-step M-RoPE row below is live for this loop
     mm_decode_rope_ = (mm != nullptr);
+    // Greedy qwen4exp decode can take its token from a device argmax instead of
+    // downloading the 993 KB row and scanning it on the host.  mtp_argmax_launch
+    // uses the same strict-`>` / lowest-index tie rule as sample_token, so the
+    // token stream is identical.  Anything that needs the full vector keeps the
+    // host path: logprobs/need_score, penalties or logit_bias (they are folded
+    // into the host scan and are not in speculative_greedy), and the
+    // PF_DUMP_DEC_LOGITS diagnostic.  The helper's staging lives on device 0 and
+    // the q4 forward synchronises before it returns, so a GPU partition is
+    // required (CPU falls back).
+    static const bool argmax_dev = si::env::i32("PF_Q4_ARGMAX_DEV", 1) != 0;
+    const bool use_dev_argmax = argmax_dev && m.q4exp && !cpu_mode
+                                && !(multi_dev && dev_kind_[(size_t)0] == static_cast<int>(device_kind::cpu))
+                                && dbg_lg == nullptr && gp.speculative_greedy() && !gp.wants_logprobs();
+    // q4_forward reads this to enqueue the argmax into the same submission as
+    // the rest of the mode-0 forward (see fetch_argmax).  The guard clears it on
+    // every exit, including an exception from the emit callback.
+    dec_argmax_dev_ = use_dev_argmax;
+    struct dec_argmax_guard {
+        bool & f;
+        ~dec_argmax_guard() {
+            f = false;
+        }
+    } dec_argmax_guard_{dec_argmax_dev_};
+    // PF_Q4_ARGMAX_TIME: split the per-step logits acquisition (sample/fetch on
+    // the host vs the device argmax, plus the host logits download) so the A/B
+    // is measured inside the engine rather than inferred from wall clock.
+    static const bool arg_time = m.q4exp && si::env::flag("PF_Q4_ARGMAX_TIME");
+    double arg_ms = 0.0, fetch_ms = 0.0;
+    int arg_n = 0;
+    const auto t_loop = arg_time ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (int step = 0; step < gp.max_tokens; step++) {
         if (dbg_lg) {
             char path[512];
@@ -4680,7 +4738,12 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
                 fclose(fp);
             }
         }
-        const int tok = sample_token(logits.data(), hp.n_vocab, gp, out, ss);
+        const auto t_arg = arg_time ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const int tok = use_dev_argmax ? fetch_argmax(0) : sample_token(logits.data(), hp.n_vocab, gp, out, ss);
+        if (arg_time) {
+            arg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_arg).count();
+            arg_n++;
+        }
         out.push_back(tok);
         if (dbg_gen) {
             fprintf(stderr, "[gen] step=%d pos=%d id=%d eos=%d\n", step, pos, tok, (int)is_eos(tok));
@@ -4714,7 +4777,22 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
         decode_batch(tok_buf, pos_buf, slot_buf, 1);
         pos++;
         next_pos++;
-        fetch_logits(0, logits.data());
+        if (!use_dev_argmax) {
+            const auto t_f = arg_time ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            fetch_logits(0, logits.data());
+            if (arg_time) {
+                fetch_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_f).count();
+            }
+        }
+    }
+    if (arg_time) {
+        const double loop_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_loop).count();
+        fprintf(stderr,
+                "[q4arg] dev_argmax=%d steps=%d sample=%.3f fetch=%.3f total=%.3f loop=%.3f ms/step\n",
+                (int)use_dev_argmax, arg_n, arg_n ? arg_ms / arg_n : 0.0, arg_n ? fetch_ms / arg_n : 0.0,
+                arg_n ? (arg_ms + fetch_ms) / arg_n : 0.0, arg_n ? loop_ms / arg_n : 0.0);
     }
     mm_decode_rope_ = false;
     // Do not leave a multimodal prompt's M-RoPE state live for whatever runs

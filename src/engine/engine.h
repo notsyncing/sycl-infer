@@ -1058,6 +1058,12 @@ struct engine {
 
     float * h_logits = nullptr; // [kMaxB][vocab], pinned USM when available
     bool h_logits_pinned_ = false;
+    // Greedy qwen4exp decode's device argmax (see fetch_argmax).  q4_forward
+    // enqueues it at the end of the mode-0 head so the launch rides the same
+    // submission as the rest of the forward; the 4-byte result lands in the
+    // pinned h_logits and the forward's own sync waits for it.
+    bool dec_argmax_dev_ = false;
+    int32_t * d_dec_argmax_ = nullptr;
 
     std::unique_ptr<sx::command_graph<sx::graph_state::modifiable>> g_pf;
     // prefill graph using the SI8/DP4A int8 path
@@ -1450,6 +1456,10 @@ struct engine {
     void decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows);
     // copy the logits of row r to the host
     void fetch_logits(int row, float * out);
+    // device-side argmax of logits row r (greedy decode; the fast path that
+    // avoids the 993 KB D2H fetch and the host scan).  Same tie rule as the
+    // host scan: the lowest token id wins.
+    int fetch_argmax(int row);
     // LM head on the last prefill hidden (tests/diagnostics; generate_mtp uses
     // it for the prompt's first token after its multi-batch prefill).
     std::vector<float> run_head();

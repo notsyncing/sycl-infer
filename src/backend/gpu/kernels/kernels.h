@@ -259,6 +259,14 @@ void cb4_expand_launch(sycl::queue & q, const uint8_t * idx, const uint16_t * lu
 
 void gemv_group_launch(sycl::queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
                        int nsb, int n_tok_blocks = 0);
+// qwen4exp decode: one launch for a group whose segments mix Q8_0 and F32,
+// with every row keeping the arithmetic of its own type's standalone kernel
+// (see gemv.cpp).  `plan` returns false when that would not be bit-identical;
+// the caller then dispatches one launch per consecutive type run instead.
+bool gemv_mix_q8_f32_plan(sycl::queue & q, const gemv_seg * segs, int n_segs, int TB, int & n8, int & n0,
+                          int & wg_warps, int & wpr0, bool & force_scalar);
+void gemv_mix_q8_f32_launch(sycl::queue & q, const gemv_seg * segs, int n_segs, int n8, int n0, int wg_warps,
+                            int wpr0, bool force_scalar);
 // kscales/vscales: the int8/int4 per-32 fp16 scale planes (nullptr for the
 // other storage types); one plane entry per (block, kv head, token, 32 dims)
 // PF_KVSTORE_SUM accessors (see qk_norm_rope.cpp).  `kv_store_sum_slot` allocates
@@ -354,6 +362,12 @@ void q4_up_gemv_launch(sycl::queue & q, const void * w, uint32_t type, const flo
                        int n_tok, int K, int N);
 void q4_inject_launch(sycl::queue & q, const void * w, uint32_t type, const float * x, int xs, float * out, int os,
                       int n_tok, int K, int N);
+// qwen4exp: the HC inject and HC mix are independent, so one dispatch can carry
+// both (inject groups first, then the mixer's).  Bit-identical to the two
+// launches; falls back to them when the inject is not the F32 workgroup form.
+sycl::event q4_hc_inject_mix_launch(sycl::queue & q, const void * iw, uint32_t type, const float * ix, int ixs,
+                                    float * iout, int ios, int iK, int iN, const float * xn, const float * gate,
+                                    float * mixed, int n_tok, int n_embd, int hc);
 void q4_repeat_launch(sycl::queue & q, const float * emb, float * residual, int n_tok, int n_embd, int hc);
 
 // ---------------------------------------------------------------------------

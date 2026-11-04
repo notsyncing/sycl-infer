@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include <sycl/sycl.hpp> // IWYU pragma: keep
@@ -59,6 +60,20 @@ struct compute_backend {
                                    float * out_val) = 0;
     virtual void gemv_group(uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB, int nsb,
                             int n_tok_blocks) = 0;
+    // qwen4exp decode: one launch for a group mixing Q8_0 and F32 segments, each
+    // row on its own type's kernel (see gemv.cpp).  GPU only; the caller falls
+    // back to per-type launches for a CPU partition.
+    virtual void gemv_mix_q8_f32(const gemv_seg * segs, int n_segs, int n8, int n0, int wg_warps, int wpr0,
+                                 bool force_scalar) {
+        (void)segs;
+        (void)n_segs;
+        (void)n8;
+        (void)n0;
+        (void)wg_warps;
+        (void)wpr0;
+        (void)force_scalar;
+        throw std::runtime_error("gemv_mix_q8_f32: GPU only");
+    }
     virtual void qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm,
                               void * kpool, void * vpool, const int32_t * tables, const step_info * info, int n_head,
                               int n_head_kv, int head_dim, int n_rot, float rope_base, const float * rope_freqs,

@@ -260,6 +260,108 @@ static void inject_f32_impl(queue & q, const float * w, const float * x, int xs,
     });
 }
 
+// HC inject + HC mix in one nd_range.  They are independent (inject reads
+// `xn`, mix reads `xn`/`gate`; the inject output is only consumed later by
+// hc_combine), so the two launches per layer can share one dispatch: the first
+// n_tok*N groups are the inject workgroups and the rest are the mixer's.
+//
+// The inject body is copied from inject_f32_impl verbatim (same 256-lane
+// float4 chunks, same four accumulators, same warp reduce + SLM fold +
+// sequential red[0..NSG-1] sum), and each mixer work-item keeps the
+// per-(token, channel) s-loop and /hc of q4_hc_mix_launch.  The result is
+// therefore bit-identical to the two-launch path, which is the A/B
+// (PF_Q4_HCFUSE=0).  Requires the F32 workgroup inject path (the only caller)
+// and n_embd divisible by WG; otherwise the launcher falls back.
+template <int WG, bool V4>
+static sycl::event hc_inject_mix_impl(queue & q, const float * iw, const float * ix, int ixs, float * iout, int ios,
+                                      int iK, int iN, const float * xn, const float * gate, float * mixed,
+                                      int n_tok, int n_embd, int hc) {
+    constexpr int NSG = WG / 32;
+    const int n4 = iK >> 2;
+    const int inj_groups = n_tok * iN;
+    const int mix_per_tok = n_embd / WG;
+    const int mix_groups = n_tok * mix_per_tok;
+    return q.submit([&](handler & h) {
+        local_accessor<float, 1> red(NSG, h);
+        h.parallel_for(nd_range<1>((size_t)(inj_groups + mix_groups) * WG, WG),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           const int g = (int)it.get_group(0);
+                           const int tid = (int)it.get_local_id(0);
+                           if (g < inj_groups) {
+                               const int row = g % iN;
+                               const int tok = g / iN;
+                               const sub_group sg = it.get_sub_group();
+                               const float * wp = iw + (size_t)row * (size_t)iK;
+                               const float * xp = ix + (size_t)tok * (size_t)ixs;
+                               float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                               if constexpr (V4) {
+                                   const float4 * w4 = (const float4 *)wp;
+                                   const float4 * x4 = (const float4 *)xp;
+                                   int i = tid;
+                                   for (; i + 3 * WG < n4; i += 4 * WG) {
+                                       const float4 w0 = w4[i], x0 = x4[i];
+                                       const float4 w1 = w4[i + WG], x1 = x4[i + WG];
+                                       const float4 w2 = w4[i + 2 * WG], x2 = x4[i + 2 * WG];
+                                       const float4 w3 = w4[i + 3 * WG], x3 = x4[i + 3 * WG];
+                                       a0 += w0.x() * x0.x();
+                                       a1 += w0.y() * x0.y();
+                                       a2 += w0.z() * x0.z();
+                                       a3 += w0.w() * x0.w();
+                                       a0 += w1.x() * x1.x();
+                                       a1 += w1.y() * x1.y();
+                                       a2 += w1.z() * x1.z();
+                                       a3 += w1.w() * x1.w();
+                                       a0 += w2.x() * x2.x();
+                                       a1 += w2.y() * x2.y();
+                                       a2 += w2.z() * x2.z();
+                                       a3 += w2.w() * x2.w();
+                                       a0 += w3.x() * x3.x();
+                                       a1 += w3.y() * x3.y();
+                                       a2 += w3.z() * x3.z();
+                                       a3 += w3.w() * x3.w();
+                                   }
+                                   for (; i < n4; i += WG) {
+                                       const float4 wv = w4[i], xv = x4[i];
+                                       a0 += wv.x() * xv.x();
+                                       a1 += wv.y() * xv.y();
+                                       a2 += wv.z() * xv.z();
+                                       a3 += wv.w() * xv.w();
+                                   }
+                               } else {
+                                   for (int k = tid; k < iK; k += WG) {
+                                       a0 += wp[k] * xp[k];
+                                   }
+                               }
+                               float v = (a0 + a1) + (a2 + a3);
+                               v = reduce_over_group(sg, v, plus<float>());
+                               const int sgl = (int)sg.get_local_linear_id();
+                               const int sgi = (int)sg.get_group_linear_id();
+                               if (sgl == 0) {
+                                   red[sgi] = v;
+                               }
+                               it.barrier();
+                               if (tid == 0) {
+                                   float s = red[0];
+                                   for (int i = 1; i < NSG; i++) {
+                                       s += red[i];
+                                   }
+                                   iout[(size_t)tok * (size_t)ios + row] = s;
+                               }
+                           } else {
+                               const int mg = g - inj_groups;
+                               const int i = mg / mix_per_tok;
+                               const int c = (mg % mix_per_tok) * WG + tid;
+                               float acc = 0.f;
+                               for (int s = 0; s < hc; s++) {
+                                   const size_t o = ((size_t)i * hc + s) * n_embd + c;
+                                   acc += xn[o] * sigmoid_f(gate[o]);
+                               }
+                               mixed[(size_t)i * n_embd + c] = acc / (float)hc;
+                           }
+                       });
+    });
+}
+
 // The HC scatter projection has N = hc = 4, which the generic GEMV's tiling
 // does not accept; the F32 case (the only user of this launcher) is the
 // parallel workgroup dot above, and the block formats keep the row-dot kernel.
@@ -274,6 +376,29 @@ void q4_inject_launch(queue & q, const void * w, uint32_t type, const float * x,
         return;
     }
     q4_up_gemv_launch(q, w, type, x, xs, out, os, n_tok, K, N);
+}
+
+// One dispatch for the layer's HC inject and HC mix (see the kernel above).
+// Falls back to the two existing launchers when the inject is not the F32
+// workgroup path or n_embd is not a multiple of the 256-thread group.
+sycl::event q4_hc_inject_mix_launch(queue & q, const void * iw, uint32_t type, const float * ix, int ixs, float * iout,
+                                    int ios, int iK, int iN, const float * xn, const float * gate, float * mixed,
+                                    int n_tok, int n_embd, int hc) {
+    const bool f32 = type != 8 && type != 30 && type != 7;
+    static const bool par = si::env::i32("PF_Q4_INJECT", 1) != 0;
+    constexpr int WG = 256;
+    if (f32 && par && n_tok > 0 && iN > 0 && iK > 0 && n_embd > 0 && (n_embd % WG) == 0) {
+        const bool v4 =
+            ((iK & 3) == 0) && ((ixs & 3) == 0) && (((uintptr_t)iw & 15) == 0) && (((uintptr_t)ix & 15) == 0);
+        if (v4) {
+            return hc_inject_mix_impl<WG, true>(q, (const float *)iw, ix, ixs, iout, ios, iK, iN, xn, gate, mixed,
+                                                n_tok, n_embd, hc);
+        }
+        return hc_inject_mix_impl<WG, false>(q, (const float *)iw, ix, ixs, iout, ios, iK, iN, xn, gate, mixed, n_tok,
+                                             n_embd, hc);
+    }
+    q4_inject_launch(q, iw, type, ix, ixs, iout, ios, n_tok, iK, iN);
+    return q4_hc_mix_launch(q, xn, gate, mixed, n_tok, n_embd, hc);
 }
 
 void q4_repeat_launch(queue & q, const float * emb, float * residual, int n_tok, int n_embd, int hc) {

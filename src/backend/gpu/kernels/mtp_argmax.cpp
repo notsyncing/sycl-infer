@@ -13,6 +13,7 @@
 #include "kernels.h"
 #include "dp4a.h"
 #include "kernel_utils.h"
+#include "device/device_profile.h"
 
 #include <cstdint>
 #include <limits>
@@ -167,11 +168,8 @@ void mtp_gather_argmax_launch(queue & q, const float * vals, const int32_t * ids
     });
 }
 
-void mtp_argmax_launch(queue & q, const float * logits, int n, int32_t * out_idx, float * out_val, int M) {
-    if (M <= 0 || n <= 0) {
-        return;
-    }
-    constexpr int WG = 256;
+template <int WG>
+static void mtp_argmax_impl(queue & q, const float * logits, int n, int32_t * out_idx, float * out_val, int M) {
     q.submit([&](handler & h) {
         local_accessor<float, 1> sv((size_t)WG, h);
         local_accessor<int, 1> si((size_t)WG, h);
@@ -213,6 +211,22 @@ void mtp_argmax_launch(queue & q, const float * logits, int n, int32_t * out_idx
             }
         });
     });
+}
+
+void mtp_argmax_launch(queue & q, const float * logits, int n, int32_t * out_idx, float * out_val, int M) {
+    if (M <= 0 || n <= 0) {
+        return;
+    }
+    // One row is the greedy decode's readout: the whole row is 993 KB and the
+    // 256-lane scan is latency-bound (~1 ms, ~1 GB/s), so give it the widest
+    // work-group the card accepts.  The tie rule and the strided walk are
+    // unchanged, so the argmax is bit-identical for any WG; multi-row verifies
+    // keep the 256-lane form they were tuned with.
+    if (M == 1 && si::dev::wg_clamped_for_queue(q, 1024) >= 1024) {
+        mtp_argmax_impl<1024>(q, logits, n, out_idx, out_val, M);
+        return;
+    }
+    mtp_argmax_impl<256>(q, logits, n, out_idx, out_val, M);
 }
 
 } // namespace si

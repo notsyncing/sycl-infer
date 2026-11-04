@@ -1520,14 +1520,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         gemv_seg * dst = b.host_segs + base;
         int total = 0;
         int j = 0;
-        uint32_t type = 0;
         for (int i = 0; i < n; i++) {
             const wt & w = *it[i].w;
             if (!w.data) {
                 continue;
-            }
-            if (j == 0) {
-                type = w.type;
             }
             gemv_seg & s = dst[j];
             s.dev = d;
@@ -1543,6 +1539,27 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             total += w.N;
             j++;
         }
+        // A group used to take its type from segment 0, so a mixed group ran
+        // every row through the first segment's kernel.  Dispatch per segment's
+        // actual type: the qwen4exp GDN group (Q8_0 wqkv/wgate + F32 beta/alpha)
+        // is one fused launch when that is bit-identical, otherwise one launch
+        // per consecutive type run.
+        bool mixed = false;
+        int n8 = 0, n0 = 0, wg_warps = 0, wpr0 = 0;
+        bool force_scalar = false;
+        // PF_Q4_GEMV_SEGTYPE=0 keeps the per-type runs (the latent mixed-type
+        // fix) but does not take the fused Q8_0+F32 launch.  Either way the
+        // dispatch follows each segment's actual type.
+        static const bool segtype = si::env::i32("PF_Q4_GEMV_SEGTYPE", 1) != 0;
+        if (!is_cpu(d) && segtype && m > 1) {
+            bool differ = false;
+            for (int i = 1; i < m && !differ; i++) {
+                differ = dst[i].type != dst[0].type;
+            }
+            if (differ && gemv_mix_q8_f32_plan(DQ(d), dst, m, tb_use, n8, n0, wg_warps, wpr0, force_scalar)) {
+                mixed = true;
+            }
+        }
         const double tk0 = q4phase ? now_ms() : 0.0;
         if (is_cpu(d)) {
             std::memcpy(b.segs + base, b.host_segs + base, (size_t)m * sizeof(gemv_seg));
@@ -1553,7 +1570,22 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         } else {
             DQ(d).memcpy(b.segs + base, b.host_segs + base, (size_t)m * sizeof(gemv_seg)).wait();
         }
-        BE(d).gemv_group(type, b.segs + base, m, total, tb_use, 0, nb_use);
+        if (mixed) {
+            BE(d).gemv_mix_q8_f32(b.segs + base, m, n8, n0, wg_warps, wpr0, force_scalar);
+        } else {
+            int start = 0;
+            while (start < m) {
+                const uint32_t rt = dst[start].type;
+                int rows = dst[start].n_rows;
+                int end = start + 1;
+                while (end < m && dst[end].type == rt) {
+                    rows += dst[end].n_rows;
+                    end++;
+                }
+                BE(d).gemv_group(rt, b.segs + base + start, end - start, rows, tb_use, 0, nb_use);
+                start = end;
+            }
+        }
         if (q4phase) {
             const double te = now_ms();
             if (!is_cpu(d)) {
@@ -1563,8 +1595,8 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             t_gemvk += tk;
             n_gemv_calls++;
             if (si::env::flag("PF_Q4_GEMVDET")) {
-                fprintf(stderr, "[q4gemv] group d=%d n=%d total=%d enq=%.3f wait=%.3f ms:", d, m, total, te - tk0,
-                        tk - (te - tk0));
+                fprintf(stderr, "[q4gemv] group d=%d n=%d total=%d mixed=%d enq=%.3f wait=%.3f ms:", d, m, total,
+                        (int)mixed, te - tk0, tk - (te - tk0));
                 for (int i = 0; i < n; i++) {
                     if (it[i].w->data) {
                         fprintf(stderr, " [type=%u K=%d N=%d]", it[i].w->type, it[i].w->K, it[i].w->N);
@@ -1734,6 +1766,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         ph1(d, t0, ph.up, ph.rest);
         dbg_stats("hc_gate", d, b.gate, (size_t)n_tok * hc_dim, hc);
         t0 = ph0(d);
+        static const bool hcfuse = si::env::i32("PF_Q4_HCFUSE", 1) != 0;
         if (is_cpu(d)) {
             cpu_gemv_seg s{};
             s.w = H.inject.data;
@@ -1746,22 +1779,37 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             s.out_stride = hc;
             s.alpha = 1.0f;
             cpu_gemv_group(H.inject.type, &s, 1, H.inject.N, n_tok, 0, 0, 0);
+            ph1(d, t0, ph.inj, ph.rest);
+            dbg_stats("hc_inject", d, b.inj, (size_t)n_tok * hc, 0);
+            t0 = ph0(d);
+            cpu_q4_hc_mix(b.xn, b.gate, b.mixed, nullptr, n_tok, n_embd, hc);
+            ph1(d, t0, ph.mix, ph.rest);
+        } else if (hcfuse) {
+            // Inject and mix read the same `xn` and neither consumes the other's
+            // output, so one dispatch carries both (inject groups first).  The
+            // inject's arithmetic is unchanged; see q4exp.cpp.  Attribute the
+            // fused kernel's time to `mix` (the inject phase then reads 0 under
+            // PF_Q4_PHASE; the sum is unaffected).
+            sycl::event e = q4_hc_inject_mix_launch(DQ(d), wptr(d, H.inject.data), H.inject.type, b.xn, hc_dim, b.inj,
+                                                    hc, H.inject.K, H.inject.N, b.xn, b.gate, b.mixed, n_tok,
+                                                    n_embd, hc);
+            if (hctime) {
+                hc_evs.emplace_back(2, e);
+            }
+            ph1(d, t0, ph.mix, ph.rest);
+            dbg_stats("hc_inject", d, b.inj, (size_t)n_tok * hc, 0);
         } else {
             q4_inject_launch(DQ(d), wptr(d, H.inject.data), H.inject.type, b.xn, hc_dim, b.inj, hc, n_tok,
                              H.inject.K, H.inject.N);
-        }
-        ph1(d, t0, ph.inj, ph.rest);
-        dbg_stats("hc_inject", d, b.inj, (size_t)n_tok * hc, 0);
-        t0 = ph0(d);
-        if (is_cpu(d)) {
-            cpu_q4_hc_mix(b.xn, b.gate, b.mixed, nullptr, n_tok, n_embd, hc);
-        } else {
+            ph1(d, t0, ph.inj, ph.rest);
+            dbg_stats("hc_inject", d, b.inj, (size_t)n_tok * hc, 0);
+            t0 = ph0(d);
             sycl::event e = q4_hc_mix_launch(DQ(d), b.xn, b.gate, b.mixed, n_tok, n_embd, hc);
             if (hctime) {
                 hc_evs.emplace_back(2, e);
             }
+            ph1(d, t0, ph.mix, ph.rest);
         }
-        ph1(d, t0, ph.mix, ph.rest);
         inject = b.inj;
     };
     auto hc_combine = [&](int d, const float * inject, hc_ph & ph) {
@@ -2124,12 +2172,17 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             double ph_t = ph0(dev);
             if (mode == 0) {
                 // Decode: one dispatch per weight type instead of one per
-                // tensor (bit-exact; see gemv_many).  The prefill keeps the
-                // per-tensor calls because its oneDNN fast path is per tensor.
-                gemv_item gi[2] = {{&L.wqkv, QKV, hp.qkv_dim()}, {&L.wgate, Z, hp.d_inner}};
-                gemv_many(dev, gi, 2, b.mixed, n_embd, tb, nblocks);
-                gemv_item gb[2] = {{&L.ssm_beta, BETA, hp.dt_rank}, {&L.ssm_alpha, ALPHA, hp.dt_rank}};
-                gemv_many(dev, gb, 2, b.mixed, n_embd, tb, nblocks);
+                // tensor (bit-exact; see gemv_many).  wqkv/wgate are Q8_0 and
+                // ssm_beta/ssm_alpha are F32, so this group is the mixed-type
+                // case gemv_many dispatches per segment (one launch when the
+                // fused Q8_0+F32 kernel is bit-identical).  The prefill keeps
+                // the per-tensor calls because its oneDNN fast path is per
+                // tensor.
+                gemv_item gq[4] = {{&L.wqkv, QKV, hp.qkv_dim()},
+                                   {&L.wgate, Z, hp.d_inner},
+                                   {&L.ssm_beta, BETA, hp.dt_rank},
+                                   {&L.ssm_alpha, ALPHA, hp.dt_rank}};
+                gemv_many(dev, gq, 4, b.mixed, n_embd, tb, nblocks);
             } else {
                 gemv(dev, L.wqkv, b.mixed, n_embd, QKV, hp.qkv_dim(), tb, nblocks);
                 gemv(dev, L.wgate, b.mixed, n_embd, Z, hp.d_inner, tb, nblocks);
@@ -3704,6 +3757,17 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             DQ(d0).memcpy(d_last_hidden, b0.mixed, (size_t)n_embd * sizeof(float));
         }
         gemv(d0, m.output, b0.mixed, n_embd, d_logits, hp.n_vocab, tb, 1);
+        // Greedy decode's readout: enqueue the argmax and its 4-byte copy here,
+        // under the same submission as the head, so the per-step round trip is
+        // one kernel on an already-active queue instead of a separate launch
+        // after the forward's sync (fetch_argmax then just reads h_logits).
+        if (dec_argmax_dev_ && !is_cpu(d0)) {
+            if (d_dec_argmax_ == nullptr) {
+                d_dec_argmax_ = sycl::malloc_device<int32_t>(1, DQ(d0));
+            }
+            mtp_argmax_launch(DQ(d0), d_logits, hp.n_vocab, d_dec_argmax_, nullptr, 1);
+            DQ(d0).memcpy(h_logits, d_dec_argmax_, sizeof(int32_t));
+        }
         seg_mark(14, d0); // final HC mixer + LM head
         if (q4dbg) {
             std::vector<float> lg((size_t)hp.n_vocab);

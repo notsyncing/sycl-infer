@@ -554,6 +554,213 @@ static void gemv_dec_f32_split_kernel(queue & q, const gemv_seg * segs, int n_se
     });
 }
 
+// ---------------------------------------------------------------------------
+// One decode launch for a group that mixes Q8_0 and F32 segments.
+//
+// gemv_many used to take the group's type from its first segment, so a group
+// with two types would silently run every row through the first type's kernel.
+// This merges the qwen4exp GDN group (wqkv + wgate are Q8_0; ssm_beta/ssm_alpha
+// are F32) into one dispatch and, more importantly, removes that latent bug for
+// any mixed group that is not eligible for the fused kernel (gemv_many then
+// dispatches one launch per consecutive type run).
+//
+// Bit-exactness is the constraint: each row must keep the arithmetic of the
+// kernel its own type would have selected in a standalone launch.  The eligible
+// case is exactly the one the GDN group hits -
+//   Q8_0: the non-split vec/scalar kernel (gemv_dec_q8_kernel), and
+//   F32:  the WPR-warps-per-row split kernel (gemv_dec_f32_split_kernel).
+// The grid uses `wg_warps` warps per work-group (lcm of the Q8_0 rows-per-wg and
+// the F32 warp split, so both mappings tile it exactly): the first n8 rows get
+// one warp each and the F32 rows get wpr0 warps each.  The per-row lane mapping,
+// the per-superblock order and the SLM reduction order are copied verbatim
+// below, so the output is bit-identical to the two standalone launches.
+static inline void gemv_find_seg_typed(const gemv_seg * segs, int n_segs, uint32_t type, int row, int & seg_idx,
+                                       int & row_in_seg) {
+    int acc = 0;
+    seg_idx = -1;
+    row_in_seg = 0;
+    for (int s = 0; s < n_segs; s++) {
+        if (segs[s].type != type) {
+            continue;
+        }
+        if (row < acc + segs[s].n_rows) {
+            seg_idx = s;
+            row_in_seg = row - acc;
+            return;
+        }
+        acc += segs[s].n_rows;
+    }
+}
+
+static void gemv_mix_q8_f32_kernel(queue & q, const gemv_seg * segs, int n_segs, int n8, int n0, int wg_warps,
+                                   int wpr0, bool force_scalar) {
+    const int gw = wg_warps * 32;
+    const int q8_rpw = wg_warps;      // one warp per Q8_0 row
+    const int f32_rpw = wg_warps / wpr0; // wpr0 warps per F32 row
+    const int n_wg8 = (n8 + q8_rpw - 1) / q8_rpw;
+    const int n_wg0 = (n0 + f32_rpw - 1) / f32_rpw;
+    if (n_wg8 + n_wg0 == 0) {
+        return;
+    }
+    q.submit([&](handler & h) {
+        local_accessor<float, 1> part((size_t)wg_warps, h);
+        h.parallel_for(nd_range<1>((size_t)(n_wg8 + n_wg0) * gw, gw),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           const int g = (int)it.get_group(0);
+                           const int tid = (int)it.get_local_id(0);
+                           const int lane = tid & 31;
+                           const sub_group sgg = it.get_sub_group();
+                           if (g < n_wg8) {
+                               const int row = g * q8_rpw + (tid >> 5);
+                               if (row >= n8) {
+                                   return;
+                               }
+                               int seg_idx = -1, row_in_seg = 0;
+                               gemv_find_seg_typed(segs, n_segs, 8, row, seg_idx, row_in_seg);
+                               if (seg_idx < 0) {
+                                   return;
+                               }
+                               const gemv_seg sgd = segs[seg_idx];
+                               const int n_sb = sgd.K / 256;
+                               const char * rp =
+                                   (const char *)sgd.w + (size_t)row_in_seg * (size_t)(sgd.K / 32) * 34;
+                               const bool vec = !force_scalar && !sgd.act_up && n_sb * 256 == sgd.K;
+                               float acc = vec ? q8_0_dot_vec(rp, 0, n_sb, sgd.x, lane)
+                                               : q8_0_dot_scalar(rp, sgd.K, sgd.x, sgd.act_up, lane);
+                               acc = sg_sum(acc, sgg);
+                               if (lane == 0) {
+                                   float v = acc * sgd.alpha;
+                                   if (sgd.residual) {
+                                       v += sgd.residual[row_in_seg];
+                                   }
+                                   sgd.out[row_in_seg] = v;
+                               }
+                           } else {
+                               const int gg = g - n_wg8;
+                               const int warp = tid >> 5;
+                               const int rr = warp / wpr0;
+                               const int w = warp % wpr0;
+                               const int row = gg * f32_rpw + rr;
+                               float acc = 0.f;
+                               int seg_idx = -1, row_in_seg = 0;
+                               if (row < n0) {
+                                   gemv_find_seg_typed(segs, n_segs, 0, row, seg_idx, row_in_seg);
+                                   if (seg_idx >= 0) {
+                                       const gemv_seg sgd = segs[seg_idx];
+                                       const int n_sb = sgd.K / 256;
+                                       const char * rp =
+                                           (const char *)sgd.w + (size_t)row_in_seg * (size_t)n_sb * 1024;
+                                       const int sb0 = (int)((int64_t)n_sb * w / wpr0);
+                                       const int sb1 = (int)((int64_t)n_sb * (w + 1) / wpr0);
+                                       for (int sb = sb0; sb < sb1; sb++) {
+                                           const char * p = rp + (size_t)sb * 1024;
+                                           const float * xrow = sgd.x + (size_t)sb * 256;
+#pragma unroll
+                                           for (int b = 0; b < 8; b++) {
+                                               acc += ((const float *)p)[32 * b + lane] * xrow[32 * b + lane];
+                                           }
+                                       }
+                                   }
+                               }
+                               acc = sg_sum(acc, sgg);
+                               if (lane == 0) {
+                                   part[(size_t)rr * wpr0 + w] = acc;
+                               }
+                               it.barrier();
+                               if (row < n0 && w == 0 && lane == 0 && seg_idx >= 0) {
+                                   const gemv_seg sgd = segs[seg_idx];
+                                   float v = 0.f;
+                                   for (int i = 0; i < wpr0; i++) {
+                                       v += part[(size_t)rr * wpr0 + i];
+                                   }
+                                   v *= sgd.alpha;
+                                   if (sgd.residual) {
+                                       v += sgd.residual[row_in_seg];
+                                   }
+                                   sgd.out[row_in_seg] = v;
+                               }
+                           }
+                       });
+    });
+}
+
+// The effective split count the launcher's switch selects (2/4/16 explicit,
+// everything else 8).  Keep this in step with gemv_group_impl and the F32 gate.
+static inline int gemv_eff_wpr(int v) {
+    return (v == 2 || v == 4 || v == 16) ? v : 8;
+}
+
+bool gemv_mix_q8_f32_plan(queue & q, const gemv_seg * segs, int n_segs, int TB, int & n8, int & n0, int & wg_warps,
+                          int & wpr0, bool & force_scalar) {
+    if (TB != 1 || n_segs < 2 || gemv_env_cfg("GEMV_CFG1")) {
+        return false;
+    }
+    static const bool g8_on = si::env::i32("PF_Q4_GEMV8", 1) != 0;
+    if (!g8_on) {
+        return false;
+    }
+    const int g8_max_rows = si::env::i32("PF_Q4_GEMV8_MAX_ROWS", 1 << 30);
+    const si::dev::profile & dp = si::dev::for_queue(q);
+    const int g8_wpr = si::env::i32("PF_Q4_GEMV8_WPR", -1) >= 0 ? si::env::i32("PF_Q4_GEMV8_WPR", -1) : dp.split.max;
+    const int g8_rows =
+        si::env::i32("PF_Q4_GEMV8_SPLIT_ROWS", -1) >= 0 ? si::env::i32("PF_Q4_GEMV8_SPLIT_ROWS", -1) : dp.shape.q8_rows;
+    const int f32_env = si::env::i32("PF_Q4_F32_SPLIT", -1);
+    const int f32_split = f32_env >= 0 ? f32_env : dp.split.max;
+    int t8 = 0, t0 = 0;
+    bool has8 = false, has0 = false;
+    for (int s = 0; s < n_segs; s++) {
+        if (segs[s].type == 8) {
+            has8 = true;
+            t8 += segs[s].n_rows;
+        } else if (segs[s].type == 0) {
+            has0 = true;
+            t0 += segs[s].n_rows;
+        } else {
+            return false;
+        }
+    }
+    if (!has8 || !has0 || t8 > g8_max_rows) {
+        return false;
+    }
+    // The standalone Q8 group must be on the non-split kernel, and the F32 group
+    // on the split one - otherwise the fused row math would not be the baseline.
+    if (g8_wpr > 1 && t8 <= g8_rows) {
+        return false;
+    }
+    if (!(f32_split > 0 && t0 <= dp.shape.f32_rows)) {
+        return false;
+    }
+    const int rpw_env = si::env::i32("PF_Q4_GEMV8_RPW", 0);
+    const int rpw = rpw_env > 0 ? rpw_env : dp.shape.gemv_rows_per_wg;
+    const int w0 = gemv_eff_wpr(f32_split);
+    int a = rpw, b = w0;
+    while (b != 0) {
+        const int t = a % b;
+        a = b;
+        b = t;
+    }
+    const int lcm = (a > 0) ? (rpw / a) * w0 : w0;
+    if (lcm <= 0 || lcm > 32 || (lcm % w0) != 0) {
+        return false;
+    }
+    // A card with a smaller legal work-group (Iris Xe: 512 threads) must not be
+    // handed a 1024-thread launch.
+    if (si::dev::wg_clamped_for_queue(q, lcm * 32) < lcm * 32) {
+        return false;
+    }
+    n8 = t8;
+    n0 = t0;
+    wg_warps = lcm;
+    wpr0 = w0;
+    force_scalar = si::env::flag("PF_Q4_GEMV8_SCALAR");
+    return true;
+}
+
+void gemv_mix_q8_f32_launch(queue & q, const gemv_seg * segs, int n_segs, int n8, int n0, int wg_warps, int wpr0,
+                            bool force_scalar) {
+    gemv_mix_q8_f32_kernel(q, segs, n_segs, n8, n0, wg_warps, wpr0, force_scalar);
+}
+
 static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int n_segs, int total_rows, int TB,
                             int nsb, int n_tok_blocks) {
     const int n_tb = (TB > 1 && n_tok_blocks > 0) ? n_tok_blocks : 1;

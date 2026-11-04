@@ -60,6 +60,10 @@ struct gpu_backend : compute_backend {
                     int n_tok_blocks) override {
         gemv_group_launch(q, type, segs, n_segs, total_rows, TB, nsb, n_tok_blocks);
     }
+    void gemv_mix_q8_f32(const gemv_seg * segs, int n_segs, int n8, int n0, int wg_warps, int wpr0,
+                         bool force_scalar) override {
+        gemv_mix_q8_f32_launch(q, segs, n_segs, n8, n0, wg_warps, wpr0, force_scalar);
+    }
     void qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm,
                       void * kpool, void * vpool, const int32_t * tables, const step_info * info, int n_head,
                       int n_head_kv, int head_dim, int n_rot, float rope_base, const float * rope_freqs, float rope_mscale,
