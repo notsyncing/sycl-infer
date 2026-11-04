@@ -2144,6 +2144,26 @@ above the budget (missing indexer tensors).  `PF_Q4_QSADBG`, `PF_QSA_Q`,
 `PF_QSA_MIX`, `PF_QSA_SCORE`, `PF_QSA_POOLS` and `PF_QSA_POOLK` are
 diagnostics/dump knobs.
 
+**The decode indexer is on the device by default (`PF_QSA_IDX_DEV=1`), and the
+device selector is opt-in (`PF_QSA_SEL_DEV`, default 0).**  `qsa_indexer_launch`
+runs the two BF16 indexer projections from the live `mixed` activation on the
+card (the tensors are already in `upload_device_weights`' per-device upload),
+applies `q_norm`+RoPE and D2Hs only iq (512 floats) and the raw ik (128) per
+layer; the host ring/pool update is unchanged.  Interleaved A/B on the 3.6k
+`/tmp/prompt4k.txt` cell: decode wall **113.6 -> 110.2 ms** (-3.3/token), QSA
+call 10.7 -> 7.1, `gemv` 3.8 -> 0; 14.6k (4x repeat, `--ctx 32768`):
+**123.5 -> 119.7** (-3.8).  The selected pool set and the 32-token stream are
+identical (score max abs 3.0e-5, q max abs 7.0e-5).  `PF_QSA_SEL_DEV=1` additionally moves the
+ring/pool, the score and a canonical (score desc, index asc) radix top-k to the
+card and feeds the Stage 3 gather without an H2D; the host selector uses the
+same canonical rule.  It selects the identical set (512/512 at both depths,
+stream md5 identical), but it is **a wash at 14.6k (118.70 -> 119.02 ms) and
++3.2 ms/token at 3.6k** because the device chain competes with the routed
+experts, so it stays off.  Its pool costs `(max_seq/kp+1)*idx_head_dim*4 B` per
+(attention layer, slot) - 25 MB per active slot at 16k, 50 MB at 32k, 75 MB at
+48k - plus a 2 KB ring and a ~65 KB/device score+pool scratch (32k); the
+one-time pinned handoff staging is ~1.9 MB/device at 14.6k.
+
 **The selector's pool width comes from `hp.idx_kpool`, not a literal 4.**
 `qsa_pool_div()` returns `idx_kpool > 1 ? idx_kpool : 4`, and every pool
 expression uses it: the pool array and ring sizes, `pos / kp`, `pos % kp`, the
@@ -2392,6 +2412,8 @@ the checks that catch them.
 | `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
 | `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see design 18 §4 |
+| `PF_QSA_IDX_DEV=0` | on | host indexer projection + 10 KB `mixed` D2H; `=1` (default) runs the BF16 GEMV + q norm/RoPE on the card and D2Hs 2.5 KB |
+| `PF_QSA_SEL_DEV=1` | off | device ring/pool + canonical device selector, no selection H2D (step 3); a wash at 14.6k, +3.2 ms at 3.6k |
 | `PF_QSA_PF_DEV=0` | on | Stage 3 device sparse *prefill* attention for f16 GPU (`n_tok>1`), host selector and byte-identical selected sets; `=0` keeps the host path; measured 75.5 -> 67.8 s prefill on the 3660-token q4 cell, see design 18 §4 |
 | `PF_QSA_PF_WAVE=N` | 8 | prefill rows per compact pool; VRAM `N*65*n_head_kv*32*head_dim*2*2 B` per device (77 MB at 8) |
 | `PF_QSA_PF_NSP=N` | 0 (dec_splits) | override the prefill attention split count (may only lower `dec_splits`) |
@@ -3758,7 +3780,8 @@ from a slow launch; this is what found the `wg_clamped` regression below),
 `PF_Q4_TIME=1` (qwen4exp: one line per forward with the host-MoE / router /
 shared-expert / GPU-handoff split), `PF_QSA_TIME=1` (the host QSA split:
 `copy/gemv/upd/sel/attn`; `PF_QSA_ISA`, `PF_QSA_DEFER`, `PF_QSA_F16MIR`,
-`PF_QSA_COPYQ` and `PF_QSA_DEVATTN` are the A/B knobs),
+`PF_QSA_COPYQ`, `PF_QSA_DEVATTN`, `PF_QSA_IDX_DEV` and `PF_QSA_SEL_DEV` are the
+A/B knobs),
 `PF_Q4_HIST=1` (routing histogram: per-layer
 expert pair counts, top-B coverage and whole-layer coverage, printed at exit;
 `PF_Q4_BANK_TYPES`/`_MAX`/`_SKIP`/`_BANKCHK` are the bank diagnostics), `PF_Q4_DUMP=1` (per-stage rms/max/first),

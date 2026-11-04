@@ -853,8 +853,26 @@ engine::~engine() {
         fq(st.k);
         fq(st.v);
         fq(st.out);
+        fq(st.iq);
+        fq(st.ik);
     }
     qsa_stage_.clear();
+    for (auto & b : qsa_idx_dev_buf_) {
+        if (b.q) {
+            sycl::free(b.q, dev_queue(b.dev < 0 ? 0 : b.dev));
+        }
+        if (b.k) {
+            sycl::free(b.k, dev_queue(b.dev < 0 ? 0 : b.dev));
+        }
+    }
+    qsa_idx_dev_buf_.clear();
+    qsa_idx_slot_release_all();
+    for (auto & h : qsa_handoff_) {
+        if (h.stage) {
+            sycl::free(h.stage, dev_queue(h.dev < 0 ? 0 : h.dev));
+        }
+    }
+    qsa_handoff_.clear();
     for (auto & d : qsa_dev_) {
         sycl::queue & qd = dev_queue(d.dev < 0 ? 0 : d.dev);
         if (d.ck) {
@@ -874,6 +892,12 @@ engine::~engine() {
         }
         if (d.htab) {
             sycl::free(d.htab, qd);
+        }
+        if (d.scores) {
+            sycl::free(d.scores, qd);
+        }
+        if (d.dpools) {
+            sycl::free(d.dpools, qd);
         }
     }
     qsa_dev_.clear();

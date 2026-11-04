@@ -808,11 +808,57 @@ struct engine {
     struct qsa_early_copy {
         bool valid = false;
         int dev = -1;
+        int kind = 0; // 0 = `mixed` D2H, 1 = device-indexer iq/ik D2H
         sycl::event ev;
     };
     std::vector<qsa_early_copy> qsa_early_ev_;
     void qsa_early_mixed(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
                          const float * mixed);
+    // PF_QSA_IDX_DEV (default on after validation): project the indexer on the
+    // device from the live `mixed` activation and D2H only the 2.5 KB the host
+    // selector/pool update reads.  Falls back to qsa_early_mixed() for every
+    // shape it does not serve (non-BF16 indexer, CPU, dense-equivalent token).
+    bool qsa_idx_dev_ = true;
+    struct qsa_idx_dev_buf {
+        int dev = -1;
+        float * q = nullptr; // [cap][idx_n_head*idx_head_dim]
+        float * k = nullptr; // [cap][idx_head_dim]
+        int cap = 0;
+    };
+    std::vector<qsa_idx_dev_buf> qsa_idx_dev_buf_;
+    void qsa_idx_dev_ensure(int dev, int n_tok);
+    void qsa_early_indexer(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
+                           const float * mixed);
+    // PF_QSA_SEL_DEV (step 3, opt-in): the raw-key ring and pool live on the
+    // card per (attention layer, slot), the selector runs there, and Stage 3's
+    // gather consumes the device selection directly.  Measured a wash at
+    // 14.6k and 3.2 ms/token slower at 3.6k (the device chain competes with the
+    // MoE), so it defaults off; `=0` keeps the host ring/pool/selector (the
+    // step-2 path).
+    bool qsa_sel_dev_ = false;
+    struct qsa_idx_slot_dev {
+        int dev = -1;
+        float * pool = nullptr; // [(max_seq/kp)+1][idx_head_dim]
+        float * ring = nullptr; // [kp][idx_head_dim]
+        bool ready = false;     // host pool/ring handed off
+    };
+    std::vector<std::vector<std::unique_ptr<qsa_idx_slot_dev>>> qsa_idx_slot_;
+    void qsa_idx_slot_ensure(int a, int slot, int dev);
+    void qsa_idx_slot_release(int a, int slot);
+    void qsa_idx_slot_release_all();
+    // Per-device pinned handoff staging for the host -> device pool/ring copy
+    // that happens once per (layer, slot) at the first sparse decode token.
+    struct qsa_handoff {
+        int dev = -1;
+        float * stage = nullptr;
+        size_t cap = 0;
+        sycl::event ev;
+        bool ev_valid = false;
+    };
+    std::vector<qsa_handoff> qsa_handoff_;
+    void qsa_handoff_ensure(int dev, size_t n);
+    void qsa_idx_device_chain(int a, const layer_t & L, int dev, int slot, int pos);
+    void qsa_devattn_run_dev(int a, int dev, int slot, int pos, int nsel, const float * qbuf, float * attn_out);
     // Per-attention-layer pinned staging for the D2H inputs (mixed/q/k/v) and
     // the sparse attention's H2D output.  Allocated lazily and grown to the
     // largest chunk seen; a pageable std::vector makes the copy synchronous
@@ -823,13 +869,17 @@ struct engine {
         float * k = nullptr;
         float * v = nullptr;
         float * out = nullptr;
+        float * iq = nullptr; // PF_QSA_IDX_DEV: normed+RoPEd q, [cap_i][inh*id]
+        float * ik = nullptr; // PF_QSA_IDX_DEV: raw indexer key, [cap_i][id]
         size_t cap = 0;     // tokens: mixed/k/v
         size_t cap_q = 0;   // tokens: q
         size_t cap_out = 0; // tokens: out
+        size_t cap_i = 0;   // tokens: iq/ik
         int dev = -1;
     };
     std::vector<qsa_stage> qsa_stage_;
     void qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int dev);
+    void qsa_idx_stage_ensure(int a, int n_tok, int dev);
     // Per-device in-order copy queue for the deferred dense-prefill K/V D2H.
     // It rides beside the compute queue, so the copy overlaps the next layers
     // instead of being ordered into the queue; qsa_copy_guard() puts the
@@ -856,9 +906,12 @@ struct engine {
         int32_t * dcounts = nullptr; // [kMaxB*kMaxT] selected-key count per row
         int32_t * tab = nullptr; // identity compact block table (device)
         int32_t * htab = nullptr; // pinned staging for the one-time table copy
+        float * scores = nullptr; // PF_QSA_SEL_DEV: per-pool selector scores [max_seq/kp+1]
+        int32_t * dpools = nullptr; // PF_QSA_SEL_DEV: selected pool ids
         int cap_keys = 0;
         int cap_blocks = 0;
         int cap_wave = 0; // prefill rows per compact pool
+        int cap_pool = 0; // scores/dpools capacity
     };
     std::vector<qsa_dev_buf> qsa_dev_;
     struct qsa_dev_aux {
@@ -887,7 +940,7 @@ struct engine {
                                  const float * qbuf, float * attn_out);
     void qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
                           const float * mixed_host, const float * kh, const float * vh, float * qpos, bool with_q,
-                          bool update_mirror);
+                          bool update_mirror, const float * iq_pre = nullptr, const float * ik_pre = nullptr);
     double qsa_flush();
     // A slot is about to be handed to a new sequence (or the engine is being
     // reset): drop its host mirror/pool/ring and any deferred update that names

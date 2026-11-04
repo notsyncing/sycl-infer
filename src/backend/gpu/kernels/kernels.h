@@ -312,6 +312,34 @@ void qsa_sinfo_multi_launch(sycl::queue & q, step_info * info, const int32_t * c
 void qsa_gather_rows_launch(sycl::queue & q, const void * kpool, const void * vpool, const int32_t * src_table,
                             const int32_t * sel, const int32_t * counts, int row_stride, int cap_blocks, int n_rows,
                             int n_kv, int head_dim, int block_size, void * ck, void * cv);
+// QSA device indexer (PF_QSA_IDX_DEV): a BF16 GEMV of the two indexer
+// projections over one token, then q_norm + RoPE on the q rows.  `x` is the
+// live `mixed` activation (device USM), `qw`/`kw` are the uploaded BF16
+// weights.  `qout` receives the normed+RoPEd q (inh*id floats) and `kout` the
+// raw indexer key (id floats) - the host pools the *raw* key, exactly as the
+// host implementation does.  Decode only (one token), which is the shape the
+// D2H of qout/kout is sized for.
+void qsa_indexer_launch(sycl::queue & q, const float * x, const void * qw, const void * kw, int K, int inh, int id,
+                        int n_rot, float rope_base, int pos, const float * q_norm, float * qout, float * kout,
+                        float eps);
+// QSA device selector (PF_QSA_SEL_DEV, step 3).  The ring/pool are the host's
+// f16-rounded f32 values kept on the card, so the device and the host selector
+// see the same numbers:
+//   * qsa_idx_update_launch writes the raw key into the ring and, on a pool
+//     boundary, averages it in the host's order, applies k_norm + RoPE and
+//     stores the pool entry;
+//   * qsa_score_launch is the per-pool sum of max(dot, 0) over indexer heads;
+//   * qsa_topk_launch selects the `n_top` best pools with the canonical rule
+//     (score descending, pool index ascending) using a 64-bit rank key radix
+//     select, sorts the selected pools by index, then expands them into the
+//     selected key list (complete pools plus the incomplete tail) exactly as
+//     the host selector's `sel`.
+void qsa_idx_update_launch(sycl::queue & q, const float * kraw, int pos, float * ring, float * pool,
+                           const float * k_norm, int id, int kp, int n_rot, float rope_base, float eps);
+void qsa_score_launch(sycl::queue & q, const float * qact, const float * pool, int n_pool, int id, int inh,
+                      float inv, float * scores);
+void qsa_topk_launch(sycl::queue & q, const float * scores, int n_pool, int n_top, int kp, int n_vis, int32_t * pools,
+                     int32_t * sel);
 
 void attn_launch(sycl::queue & q, const float * qbuf, const float * gate, const void * kpool, const void * vpool,
                  float * partials, const int32_t * tables, int n_head, int n_head_kv, int head_dim, int n_splits,

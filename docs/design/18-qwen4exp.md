@@ -385,6 +385,53 @@ Stage 2 decode already has.  A dense 512-token prompt's stdout is md5-identical
 between the two cells.  `PF_QSA_ATTN_DUMP_ALL=1` writes every attention row (the
 per-row oracle used above); `PF_QSA_F16RND` is not the shipped host path.
 
+**Stage 4: device indexer (default on) and device selector (opt-in).**  The
+host indexer GEMV read 39 MB/token of BF16 weights from the mmap and the host
+selector scored every pooled key, so both grew with depth.  Two changes:
+
+* **`PF_QSA_IDX_DEV` (default on).**  `qsa_indexer_launch` runs the two BF16
+  projections on the card from the live `mixed` activation (the indexer
+  tensors are already in `upload_device_weights`' per-device upload), applies
+  `q_norm` + RoPE on the q rows, and enqueues only the 2.5 KB the host pool
+  update/selector reads (iq 512 floats, raw ik 128).  It is launched right
+  after `hc_mix`, so the wait is on this tiny chain, not on the layer's
+  QKV/rope.  This replaces the 10 KB `mixed` D2H and the host GEMV.  The raw
+  k still goes through the host ring/pool update, so its order is unchanged.
+
+  Interleaved A/B, 3.6k `/tmp/prompt4k.txt` cell (`--ctx 4096`, f16, bank
+  17 500, 28 threads, tail-skip 0, one process per cell, two reps each):
+  decode wall **113.55 / 113.59 -> 110.21 / 110.24 ms** (-3.3 ms/token), QSA
+  call 10.7 -> 7.1, `gemv` 3.81 -> 0.00, `attn` 1.15 -> 0.68.  At 14.6k
+  (4x the prompt, `--ctx 32768`): **123.49 -> 119.73 ms** (-3.8).  The selected
+  pool set is **identical**, the 32-token stream md5 is identical, q max|diff|
+  is 1.2e-6 and the score max abs is 1.6e-5 (no boundary pool moved; the
+  margin there is 4e-4).  The q max abs between the host and device indexers is
+  7.0e-5 (the RoPE/bf16 dot reassociation) and the score max abs is 3.0e-5.
+
+* **`PF_QSA_SEL_DEV` (default off).**  The raw-key ring and pool move to the
+  card per (attention layer, slot): `qsa_idx_update_launch` writes the ring and
+  completes a pool in the host's order when `pos%kp == kp-1`,
+  `qsa_score_launch` is the per-pool rectified sum, and `qsa_topk_launch`
+  selects the top pools with the canonical rank key (score descending, pool
+  index ascending) via an 8-byte radix select plus an index sort, then expands
+  them to the key list.  The host selector uses the same canonical rule, so
+  host and device select the same set by construction.  The selected ids are
+  consumed directly by the Stage 3 gather (no H2D).
+
+  The device chain is not free: it competes with the routed experts.
+  Interleaved at 3.6k: **110.2 -> 113.2 ms** (+3.2); at 14.6k it is a wash
+  (**118.70 -> 119.02**) because the MoE grows by 8.4 ms while the host
+  `rest` drops by 8.1.  So it defaults **off**; it remains as the A/B and as a
+  possible lever on a config where the selector's host cost is much larger.
+  Correctness is good: the selected set is identical at both depths (512/512),
+  the score max abs is 6.4e-5 at 14.6k, and the 32-token stream md5 is
+  identical.  Its VRAM is the pool `(max_seq/kp+1)*idx_head_dim*4 B` per
+  (layer, slot) - 25 MB per active slot at 16k, 50 MB at 32k, 75 MB at 48k -
+  plus a 2 KB ring and a per-device score/pool scratch (~65 KB at 32k); the
+  one-time host->device pool handoff uses a pinned staging of
+  `(pos/kp)*idx_head_dim` floats per device (1.9 MB at 14.6k).  The host
+  ring/pool update (the step-2 path) is what runs with the default.
+
 ## 5. PLE and the engram cache
 
 The PLE layer hashes the token and its 16 n-gram context into 16 rows of a
@@ -1013,6 +1060,9 @@ slower at 512, and cannot hold a 48k context.
 | `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
 | `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` host Stage 1; see §7.1 |
+| `PF_QSA_IDX_DEV=0` | on | host indexer projection + 10 KB `mixed` D2H; `=1` runs the BF16 GEMV + q norm/RoPE on the card and D2Hs 2.5 KB (step 2, see §4) |
+| `PF_QSA_SEL_DEV=1` | off | device ring/pool + canonical device selector + no-H2D selection (step 3, see §4); measured a wash at 14.6k and +3.2 ms at 3.6k, so opt-in |
+| `PF_QSA_EARLY=0` | on | old `mixed` placement and the blocking `sel` H2D |
 | `PF_Q4_HIST=1`, `PF_Q4_TIME`, `PF_Q4_PHASE`, `PF_Q4_HCTIME`, `PF_Q4_HOT_TIME` | off | routing histogram / phase attribution |
 | `PF_Q4_PREFAULT=0` / `PF_Q4_NOPLE=1` / `PF_Q4_FFCMP=<layer>` | on / off / off | skip prefault / skip PLE / routed-FFN host oracle |
 

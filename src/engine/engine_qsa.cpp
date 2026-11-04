@@ -224,7 +224,315 @@ void engine::qsa_early_mixed(int a, const layer_t & L, int dev, int mode, int n_
     qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
     ec.ev = dev_queue(dev).memcpy(st.mixed, mixed, (size_t)n_tok * (size_t)hp.n_embd * sizeof(float));
     ec.dev = dev;
+    ec.kind = 0;
     ec.valid = true;
+}
+
+// PF_QSA_IDX_DEV pinned staging: the two small D2H results.  The selector only
+// reads the normed+RoPEd q (inh*id) and the pool update the raw k (id), so this
+// is 2.5 KB/token/layer, not the 10 KB `mixed` copy it replaces.
+void engine::qsa_idx_stage_ensure(int a, int n_tok, int dev) {
+    const hparams & hp = m.hp;
+    if ((int)qsa_stage_.size() <= a) {
+        qsa_stage_.resize((size_t)a + 1);
+    }
+    qsa_stage & st = qsa_stage_[(size_t)a];
+    if (st.dev < 0) {
+        st.dev = dev;
+    }
+    sycl::queue & qd = dev_queue(dev);
+    auto realloc_to = [&](float *& p, size_t elems) {
+        float * np = (float *)sycl::malloc_host(elems * sizeof(float), qd);
+        if (!np) {
+            throw std::runtime_error("qwen4exp: QSA indexer staging allocation failed");
+        }
+        if (p) {
+            sycl::free(p, qd);
+        }
+        p = np;
+    };
+    if (st.cap_i < (size_t)n_tok) {
+        size_t nc = st.cap_i ? st.cap_i : 1;
+        while (nc < (size_t)n_tok) {
+            nc <<= 1;
+        }
+        realloc_to(st.iq, nc * (size_t)hp.idx_n_head * (size_t)hp.idx_head_dim);
+        realloc_to(st.ik, nc * (size_t)hp.idx_head_dim);
+        st.cap_i = nc;
+    }
+}
+
+// PF_QSA_IDX_DEV device output buffers, per device and grown to the largest
+// batch served (decode: one row).  A single buffer per device is safe even
+// though every layer writes it: the D2H copy is enqueued on the same in-order
+// queue right after the kernel and before the next layer's kernel, so the copy
+// has consumed it before it can be overwritten.
+void engine::qsa_idx_dev_ensure(int dev, int n_tok) {
+    const hparams & hp = m.hp;
+    if ((int)qsa_idx_dev_buf_.size() <= dev) {
+        qsa_idx_dev_buf_.resize((size_t)dev + 1);
+    }
+    qsa_idx_dev_buf & b = qsa_idx_dev_buf_[(size_t)dev];
+    if (b.dev == dev && b.cap >= n_tok) {
+        return;
+    }
+    const size_t qn = (size_t)n_tok * (size_t)hp.idx_n_head * (size_t)hp.idx_head_dim;
+    const size_t kn = (size_t)n_tok * (size_t)hp.idx_head_dim;
+    if (b.q) {
+        sycl::free(b.q, dev_queue(dev));
+    }
+    if (b.k) {
+        sycl::free(b.k, dev_queue(dev));
+    }
+    b.q = (float *)dev_alloc_on(dev, qn * sizeof(float));
+    b.k = (float *)dev_alloc_on(dev, kn * sizeof(float));
+    if (!b.q || !b.k) {
+        throw std::runtime_error("qwen4exp: QSA indexer device buffer allocation failed");
+    }
+    b.cap = n_tok;
+    b.dev = dev;
+}
+
+// PF_QSA_EARLY (indexer form): run the indexer projection on the device right
+// after `mixed` is final and enqueue only the 2.5 KB the host needs.  The host
+// wait in qsa_attention is then on this tiny chain, not on the layer's
+// QKV/rope cells.  Every shape this does not serve falls back to the old
+// `mixed` copy + host projection.
+void engine::qsa_early_indexer(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
+                               const float * mixed) {
+    const bool usable = qsa_idx_dev_ && qsa_early_ && qsa_on_ && qsa_devattn_ && mode == 0 && n_tok == 1 && a >= 0
+                        && a < (int)qsa_cache_.size() && a < (int)qsa_early_ev_.size() && L.idx.ok()
+                        && L.idx.q_proj.type == 30 && L.idx.k_proj.type == 30
+                        && std::getenv("PF_QSA_MIX") == nullptr;
+    const bool is_cpu_dev = multi_dev ? (dev_kind_[(size_t)dev] == 1) : cpu_mode;
+    const hparams & hp = m.hp;
+    const int slot = inf->slot[0];
+    const int pos = inf->pos[0];
+    if (!usable || is_cpu_dev || hp.head_dim != 256 || kv_k_dtype() != kv_dtype_t::f16
+        || kv_v_dtype() != kv_dtype_t::f16 || slot < 0 || slot >= (int)qsa_cache_[(size_t)a].size()
+        || pos + 1 <= hp.idx_top_k) {
+        qsa_early_mixed(a, L, dev, mode, n_tok, inf, mixed);
+        return;
+    }
+    // PF_QSA_SEL_DEV: the ring/pool and the selector live on the card.  The
+    // host cache must already hold the prefill's pools; it does for every
+    // sparse token (a prompt that crossed top_k built it, and a decode that
+    // crossed it flushed the deferred dense update at the end of that step).
+    const bool have_host = slot < (int)qsa_cache_[(size_t)a].size() && qsa_cache_[(size_t)a][(size_t)slot] != nullptr;
+    if (qsa_sel_dev_ && have_host) {
+        qsa_idx_dev_ensure(dev, n_tok);
+        qsa_idx_dev_buf & b = qsa_idx_dev_buf_[(size_t)dev];
+        sycl::queue & q = dev_queue(dev);
+        qsa_indexer_launch(q, mixed, wptr(dev, L.idx.q_proj.data), wptr(dev, L.idx.k_proj.data), hp.n_embd,
+                           hp.idx_n_head, hp.idx_head_dim, hp.n_rot, hp.rope_base, pos, wf32(dev, L.idx.q_norm), b.q,
+                           b.k, hp.rms_eps);
+        qsa_idx_device_chain(a, L, dev, slot, pos);
+        qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
+        ec.dev = dev;
+        ec.kind = 2;
+        ec.valid = true;
+        return;
+    }
+    qsa_idx_stage_ensure(a, n_tok, dev);
+    qsa_idx_dev_ensure(dev, n_tok);
+    qsa_stage & st = qsa_stage_[(size_t)a];
+    qsa_idx_dev_buf & b = qsa_idx_dev_buf_[(size_t)dev];
+    sycl::queue & q = dev_queue(dev);
+    qsa_indexer_launch(q, mixed, wptr(dev, L.idx.q_proj.data), wptr(dev, L.idx.k_proj.data), hp.n_embd, hp.idx_n_head,
+                       hp.idx_head_dim, hp.n_rot, hp.rope_base, pos, wf32(dev, L.idx.q_norm), b.q, b.k, hp.rms_eps);
+    qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
+    // The second copy's event covers the first on the in-order queue.
+    (void)q.memcpy(st.iq, b.q, (size_t)n_tok * (size_t)hp.idx_n_head * (size_t)hp.idx_head_dim * sizeof(float));
+    ec.ev = q.memcpy(st.ik, b.k, (size_t)n_tok * (size_t)hp.idx_head_dim * sizeof(float));
+    ec.dev = dev;
+    ec.kind = 1;
+    ec.valid = true;
+}
+
+// PF_QSA_SEL_DEV device ring/pool, per (attention layer, slot) and allocated
+// lazily on the first sparse decode token.  The pool holds the host's
+// f16-rounded f32 values, so the device and host selectors see identical
+// numbers; `ready` means the host state up to this token has been handed off.
+void engine::qsa_idx_slot_ensure(int a, int slot, int dev) {
+    if ((int)qsa_idx_slot_.size() <= a) {
+        qsa_idx_slot_.resize((size_t)a + 1);
+    }
+    auto & v = qsa_idx_slot_[(size_t)a];
+    if ((int)v.size() <= slot) {
+        v.resize((size_t)slot + 1);
+    }
+    auto & p = v[(size_t)slot];
+    if (!p) {
+        p = std::make_unique<qsa_idx_slot_dev>();
+    }
+    if (p->pool && p->dev == dev) {
+        return;
+    }
+    if (p->pool) {
+        dev_queue(p->dev).wait();
+        sycl::free(p->pool, dev_queue(p->dev));
+        sycl::free(p->ring, dev_queue(p->dev));
+    }
+    const hparams & hp = m.hp;
+    const int id = hp.idx_head_dim;
+    const int kp = qsa_pool_div(hp);
+    const size_t npool = (size_t)qsa_max_seq_ / (size_t)kp + 2;
+    sycl::queue & q = dev_queue(dev);
+    p->pool = (float *)dev_alloc_on(dev, npool * (size_t)id * sizeof(float));
+    p->ring = (float *)dev_alloc_on(dev, (size_t)kp * (size_t)id * sizeof(float));
+    if (!p->pool || !p->ring) {
+        throw std::runtime_error("qwen4exp: QSA device ring/pool allocation failed");
+    }
+    q.memset(p->pool, 0, npool * (size_t)id * sizeof(float));
+    q.memset(p->ring, 0, (size_t)kp * (size_t)id * sizeof(float));
+    p->dev = dev;
+    p->ready = false;
+}
+
+void engine::qsa_idx_slot_release(int a, int slot) {
+    if (a < 0 || a >= (int)qsa_idx_slot_.size()) {
+        return;
+    }
+    auto & v = qsa_idx_slot_[(size_t)a];
+    if (slot < 0) {
+        for (auto & p : v) {
+            if (p && p->pool) {
+                dev_queue(p->dev).wait();
+                sycl::free(p->pool, dev_queue(p->dev));
+                sycl::free(p->ring, dev_queue(p->dev));
+            }
+            p.reset();
+        }
+        return;
+    }
+    if (slot >= (int)v.size() || !v[(size_t)slot]) {
+        return;
+    }
+    auto & p = v[(size_t)slot];
+    if (p->pool) {
+        dev_queue(p->dev).wait();
+        sycl::free(p->pool, dev_queue(p->dev));
+        sycl::free(p->ring, dev_queue(p->dev));
+    }
+    p.reset();
+}
+
+void engine::qsa_idx_slot_release_all() {
+    for (int a = 0; a < (int)qsa_idx_slot_.size(); a++) {
+        qsa_idx_slot_release(a, -1);
+    }
+    qsa_idx_slot_.clear();
+}
+
+void engine::qsa_handoff_ensure(int dev, size_t n) {
+    if ((int)qsa_handoff_.size() <= dev) {
+        qsa_handoff_.resize((size_t)dev + 1);
+    }
+    qsa_handoff & h = qsa_handoff_[(size_t)dev];
+    if (h.stage && h.cap >= n) {
+        return;
+    }
+    if (h.stage) {
+        if (h.ev_valid) {
+            h.ev.wait();
+            h.ev_valid = false;
+        }
+        sycl::free(h.stage, dev_queue(dev));
+    }
+    h.stage = (float *)sycl::malloc_host(n * sizeof(float), dev_queue(dev));
+    if (!h.stage) {
+        throw std::runtime_error("qwen4exp: QSA handoff staging allocation failed");
+    }
+    h.cap = n;
+    h.dev = dev;
+    h.ev_valid = false;
+}
+
+// One sparse decode token's full device QSA chain, enqueued right after the
+// indexer projection and before the layer's QKV GEMVs: hand the host pool/ring
+// over once, update the ring/pool, score the pools and select.  The gather and
+// attention stay in qsa_attention (they need this layer's paged K/V, which
+// qk_norm_rope produces later); the in-order queue orders them.
+void engine::qsa_idx_device_chain(int a, const layer_t & L, int dev, int slot, int pos) {
+    const hparams & hp = m.hp;
+    const int id = hp.idx_head_dim;
+    const int kp = qsa_pool_div(hp);
+    qsa_idx_slot_ensure(a, slot, dev);
+    qsa_idx_dev_buf & b = qsa_idx_dev_buf_[(size_t)dev];
+    qsa_idx_slot_dev & sd = *qsa_idx_slot_[(size_t)a][(size_t)slot];
+    qsa_devattn_ensure(dev);
+    qsa_dev_buf & d = qsa_dev_[(size_t)dev];
+    sycl::queue & q = dev_queue(dev);
+    if (!sd.ready) {
+        const int npool = pos / kp;
+        const size_t npo = (size_t)npool * (size_t)id;
+        const size_t nr = (size_t)kp * (size_t)id;
+        qsa_handoff_ensure(dev, npo + nr);
+        qsa_handoff & h = qsa_handoff_[(size_t)dev];
+        if (h.ev_valid) {
+            h.ev.wait();
+            h.ev_valid = false;
+        }
+        const qsa_slot_state * hs = nullptr;
+        if (a < (int)qsa_cache_.size() && slot < (int)qsa_cache_[(size_t)a].size()) {
+            hs = qsa_cache_[(size_t)a][(size_t)slot].get();
+        }
+        if (hs) {
+            if (npo) {
+                std::memcpy(h.stage, hs->pool.data(), npo * sizeof(float));
+            }
+            std::memcpy(h.stage + npo, hs->ring.data(), nr * sizeof(float));
+        } else {
+            std::memset(h.stage, 0, (npo + nr) * sizeof(float));
+        }
+        (void)q.memcpy(sd.pool, h.stage, npo * sizeof(float));
+        h.ev = q.memcpy(sd.ring, h.stage + npo, nr * sizeof(float));
+        h.ev_valid = true;
+        sd.ready = true;
+    }
+    qsa_idx_update_launch(q, b.k, pos, sd.ring, sd.pool, wf32(dev, L.idx.k_norm), id, kp, hp.n_rot, hp.rope_base,
+                          hp.rms_eps);
+    const int n_vis = pos + 1;
+    const int n_pool_vis = n_vis / kp;
+    const int n_pool_max = hp.idx_top_k / kp;
+    const int n_top = std::min(n_pool_vis, n_pool_max);
+    if (n_top > 0) {
+        qsa_score_launch(q, b.q, sd.pool, n_pool_vis, id, hp.idx_n_head, 1.0f / std::sqrt((float)id), d.scores);
+        qsa_topk_launch(q, d.scores, n_pool_vis, n_top, kp, n_vis, d.dpools, d.dsel);
+    }
+}
+
+// Stage 3 consumption with the selection already on the device: same gather +
+// attention as qsa_devattn_run, without the host `sel` vector or its H2D.
+void engine::qsa_devattn_run_dev(int a, int dev, int slot, int pos, int nsel, const float * qbuf, float * attn_out) {
+    (void)pos;
+    const hparams & hp = m.hp;
+    const int nh = hp.n_head, nkv = hp.n_head_kv, hd = hp.head_dim;
+    if (nsel <= 0) {
+        return;
+    }
+    qsa_devattn_aux(a, dev);
+    qsa_dev_buf & d = qsa_dev_[(size_t)dev];
+    qsa_dev_aux & x = qsa_aux_[(size_t)a];
+    if (nsel > d.cap_keys) {
+        throw std::runtime_error("qwen4exp: QSA Stage 2 sel exceeds the compact-pool capacity");
+    }
+    const int nblk = (nsel + kBlockSize - 1) / kBlockSize;
+    sycl::queue & q = dev_queue(dev);
+    const char * kp = nullptr;
+    const char * vp = nullptr;
+    const char * ksc = nullptr;
+    const char * vsc = nullptr;
+    kv_layer_ptrs(a, kp, vp, ksc, vsc);
+    qsa_sinfo_launch(q, x.sinfo, nsel);
+    qsa_gather_launch(q, kp, vp, d_tables + (size_t)slot * max_blocks, d.dsel, nsel, nkv, hd, kBlockSize, d.ck,
+                      d.cv);
+    float * part = multi_dev ? as_[(size_t)dev].partials_dec : d_partials_dec;
+    const int nsp = std::max(1, dec_splits);
+    compute_backend & cbe = multi_dev ? *backends_[(size_t)dev] : *be;
+    cbe.attn(qbuf, qbuf, d.ck, d.cv, part, d.tab, nh, nkv, hd, nsp, x.sinfo, hp.attn_scale, nblk, 1, 1, nullptr, 0,
+             nullptr, nullptr);
+    cbe.attn_combine(part, qbuf, attn_out, x.sinfo, nh, hd, nsp, 1, 1);
 }
 
 // Put the main queue's dependency on the deferred K/V copy back before the
@@ -257,7 +565,7 @@ void engine::qsa_copy_guard(int a, int dev) {
 // end of the forward from host-staged copies (see qsa_flush).
 void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
                               const float * mh, const float * kh, const float * vh, float * qpos, bool with_q,
-                              bool update_mirror) {
+                              bool update_mirror, const float * iq_pre, const float * ik_pre) {
     const hparams & hp = m.hp;
     const int id = hp.idx_head_dim, inh = hp.idx_n_head;
     const int kvd = hp.n_head_kv * hp.head_dim;
@@ -272,20 +580,30 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
     // arbitrary-K GEMV.  The q projection is 80% of it (512 of 640 rows) and is
     // read only by the selector, so a dense-equivalent token skips it: this
     // token's q is never scored, and the next token computes its own.
-    std::vector<float> iq(with_q ? (size_t)n_tok * inh * id : 0);
-    std::vector<float> ik((size_t)n_tok * id);
-    if (L.idx.k_proj.type == 30) {
-        if (with_q) {
-            cpu_qsa_bf16_gemv(L.idx.q_proj.data, mh, n_embd, iq.data(), inh * id, n_tok, n_embd, inh * id);
+    // PF_QSA_IDX_DEV instead supplies iq (already normed+RoPEd) and the raw ik
+    // from the device; the ring/pool/mirror update below is unchanged.
+    std::vector<float> iq((with_q && !iq_pre) ? (size_t)n_tok * inh * id : 0);
+    std::vector<float> ik(ik_pre ? 0 : (size_t)n_tok * id);
+    if (!iq_pre || !ik_pre) {
+        if (L.idx.k_proj.type == 30) {
+            if (with_q && !iq_pre) {
+                cpu_qsa_bf16_gemv(L.idx.q_proj.data, mh, n_embd, iq.data(), inh * id, n_tok, n_embd, inh * id);
+            }
+            if (!ik_pre) {
+                cpu_qsa_bf16_gemv(L.idx.k_proj.data, mh, n_embd, ik.data(), id, n_tok, n_embd, id);
+            }
+        } else {
+            if (with_q && !iq_pre) {
+                cpu_q4_up_gemv(L.idx.q_proj.data, L.idx.q_proj.type, mh, n_embd, iq.data(), inh * id, n_tok, n_embd,
+                               inh * id);
+            }
+            if (!ik_pre) {
+                cpu_q4_up_gemv(L.idx.k_proj.data, L.idx.k_proj.type, mh, n_embd, ik.data(), id, n_tok, n_embd, id);
+            }
         }
-        cpu_qsa_bf16_gemv(L.idx.k_proj.data, mh, n_embd, ik.data(), id, n_tok, n_embd, id);
-    } else {
-        if (with_q) {
-            cpu_q4_up_gemv(L.idx.q_proj.data, L.idx.q_proj.type, mh, n_embd, iq.data(), inh * id, n_tok, n_embd,
-                           inh * id);
-        }
-        cpu_q4_up_gemv(L.idx.k_proj.data, L.idx.k_proj.type, mh, n_embd, ik.data(), id, n_tok, n_embd, id);
     }
+    const float * iqs = iq_pre ? iq_pre : iq.data();
+    const float * iks = ik_pre ? ik_pre : ik.data();
     if (qtime) {
         qsa_gemv_ms_ += qsa_now_ms() - q_t0;
         q_t0 = qsa_now_ms();
@@ -294,21 +612,22 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
     for (int i = 0; i < n_tok; i++) {
         const int pos = posv[i];
         const int slot = slotv[i];
-        float * qr = with_q ? iq.data() + (size_t)i * inh * id : nullptr;
-        if (with_q) {
+        float * qrw = (with_q && !iq_pre) ? iq.data() + (size_t)i * inh * id : nullptr;
+        const float * qr = with_q ? iqs + (size_t)i * inh * id : nullptr;
+        if (qrw) {
             for (int h = 0; h < inh; h++) {
-                head_norm(qr + h * id, L.idx.q_norm, id, hp.rms_eps);
-                head_rope(qr + h * id, hp.n_rot, hp.rope_base, pos);
+                head_norm(qrw + h * id, L.idx.q_norm, id, hp.rms_eps);
+                head_rope(qrw + h * id, hp.n_rot, hp.rope_base, pos);
             }
-            if (qpos) {
-                std::memcpy(qpos + (size_t)i * inh * id, qr, (size_t)inh * id * sizeof(float));
-            }
+        }
+        if (with_q && qpos) {
+            std::memcpy(qpos + (size_t)i * inh * id, qr, (size_t)inh * id * sizeof(float));
         }
         // The cache stores the *raw* indexer key: the reference pools the raw
         // keys of a block and only then applies k_norm + RoPE to the mean.
         // Normalising/rotating each member first and pooling those gives a
         // different (and wrong) selector score.
-        float * kr = ik.data() + (size_t)i * id;
+        const float * kr = iks + (size_t)i * id;
 
         if (slot < 0 || slot >= (int)qsa_cache_[(size_t)a].size()) {
             continue;
@@ -425,6 +744,18 @@ void engine::qsa_reset_slot(int slot) {
             }
         }
     }
+    // The device ring/pool mirrors the host state; it must not survive a slot
+    // handoff either (a deferred update or a device chain could still read it).
+    if (qsa_sel_dev_) {
+        if (slot < 0) {
+            qsa_idx_slot_release_all();
+            qsa_idx_slot_.resize((size_t)attn_layers());
+        } else {
+            for (int a = 0; a < (int)qsa_idx_slot_.size(); a++) {
+                qsa_idx_slot_release(a, slot);
+            }
+        }
+    }
     if (qdbg) {
         fprintf(stderr, "[qsa] reset slot=%d: cleared %d layer mirror(s)\n", slot, had);
     }
@@ -476,7 +807,7 @@ void engine::qsa_devattn_ensure(int dev) {
         qsa_dev_.resize((size_t)dev + 1);
     }
     qsa_dev_buf & d = qsa_dev_[(size_t)dev];
-    if (d.dev == dev && d.cap_keys > 0) {
+    if (d.dev == dev && d.cap_keys > 0 && d.cap_pool > 0) {
         return;
     }
     const int per = qsa_pool_div(hp);
@@ -498,7 +829,10 @@ void engine::qsa_devattn_ensure(int dev) {
     d.dcounts = (int32_t *)dev_alloc_on(dev, (size_t)ntok_max * sizeof(int32_t));
     d.tab = (int32_t *)dev_alloc_on(dev, pool_blocks * sizeof(int32_t));
     d.htab = (int32_t *)sycl::malloc_host(pool_blocks * sizeof(int32_t), q);
-    if (!d.ck || !d.cv || !d.dsel || !d.dcounts || !d.tab || !d.htab) {
+    const int npool_cap = qsa_max_seq_ / per + 2;
+    d.scores = (float *)dev_alloc_on(dev, (size_t)npool_cap * sizeof(float));
+    d.dpools = (int32_t *)dev_alloc_on(dev, (size_t)npool_cap * sizeof(int32_t));
+    if (!d.ck || !d.cv || !d.dsel || !d.dcounts || !d.tab || !d.htab || !d.scores || !d.dpools) {
         throw std::runtime_error("qwen4exp: QSA Stage 2 scratch allocation failed");
     }
     for (size_t i = 0; i < pool_blocks; i++) {
@@ -508,6 +842,7 @@ void engine::qsa_devattn_ensure(int dev) {
     d.cap_keys = cap;
     d.cap_blocks = blocks;
     d.cap_wave = wave;
+    d.cap_pool = npool_cap;
     d.dev = dev;
     if (si::env::flag("PF_Q4_QSADBG")) {
         fprintf(stderr, "[qsa] devattn scratch dev=%d keys=%d blocks=%d wave=%d\n", dev, cap, blocks, wave);
@@ -734,6 +1069,71 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         }
     }
 
+    // PF_QSA_SEL_DEV: the early chain already produced the selected key list
+    // on the device (and the host pool was handed over before the current
+    // token's update).  No host wait is needed: the gather/attention are
+    // enqueued here, after qk_norm_rope, on the same in-order queue.
+    bool dev_sel = false;
+    if (qsa_sel_dev_ && need && n_tok == 1 && a < (int)qsa_early_ev_.size()) {
+        qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
+        if (ec.valid && ec.kind == 2 && ec.dev == dev) {
+            dev_sel = true;
+            ec.valid = false;
+        }
+    }
+    if (dev_sel) {
+        const int pos0 = posv[0];
+        const int slot0 = slotv[0];
+        const int n_vis = pos0 + 1;
+        const int n_pool_vis = n_vis / kp;
+        const int n_top = std::min(n_pool_vis, n_pool_max);
+        const int nsel = n_top * kp + (n_vis - n_pool_vis * kp);
+        const double q_att0 = qtime ? qsa_now_ms() : 0.0;
+        qsa_devattn_run_dev(a, dev, slot0, pos0, nsel, qbuf, attn_out);
+        if (qtime) {
+            qsa_attn_ms_ += qsa_now_ms() - q_att0;
+            qsa_rows_++;
+            qsa_nsel_ += nsel;
+        }
+        if (a == 0) {
+            const char * sp_path = std::getenv("PF_QSA_SCORE");
+            const char * pp = std::getenv("PF_QSA_POOLS");
+            const char * qp = std::getenv("PF_QSA_Q");
+            if (sp_path || pp || qp) {
+                sycl::queue & q = dev_queue(dev);
+                qsa_dev_buf & d = qsa_dev_[(size_t)dev];
+                if (sp_path) {
+                    std::vector<float> h((size_t)n_pool_vis);
+                    q.memcpy(h.data(), d.scores, h.size() * sizeof(float));
+                    q.wait();
+                    if (FILE * fp = fopen(sp_path, "wb")) {
+                        fwrite(h.data(), sizeof(float), h.size(), fp);
+                        fclose(fp);
+                    }
+                }
+                if (pp) {
+                    std::vector<int32_t> h((size_t)n_top);
+                    q.memcpy(h.data(), d.dpools, h.size() * sizeof(int32_t));
+                    q.wait();
+                    if (FILE * fp = fopen(pp, "wb")) {
+                        fwrite(h.data(), sizeof(int32_t), h.size(), fp);
+                        fclose(fp);
+                    }
+                }
+                if (qp) {
+                    std::vector<float> h((size_t)inh * id);
+                    q.memcpy(h.data(), qsa_idx_dev_buf_[(size_t)dev].q, h.size() * sizeof(float));
+                    q.wait();
+                    if (FILE * fp = fopen(qp, "wb")) {
+                        fwrite(h.data(), sizeof(float), h.size(), fp);
+                        fclose(fp);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     // Dense-equivalent forwards (decode, and a prefill tail of up to kMaxB
     // tokens) enqueue the copies and let the end of the forward apply the
     // update.  A dense prefill chunk larger than kMaxB defers the same way, but
@@ -848,16 +1248,18 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     // from the device (update_mirror is off), so the old full queue drain was
     // only waiting for the QKV/rope chain the host does not need yet.
     bool early = false;
+    bool idx_early = false;
     sycl::event early_ev;
     if (qsa_early_ && dev_attn && !is_cpu(dev) && a < (int)qsa_early_ev_.size()) {
         qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
         if (ec.valid && ec.dev == dev) {
             early = true;
+            idx_early = ec.kind == 1;
             early_ev = ec.ev;
             ec.valid = false;
         }
     }
-    if (!early) {
+    if (!early && !idx_early) {
         (void)to_host_async(st.mixed, mixed, mb);
     }
     if (need && !dev_attn) {
@@ -880,7 +1282,8 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     }
 
     std::vector<float> qpos((size_t)n_tok * inh * id);
-    qsa_apply_update(a, L, n_tok, posv.data(), slotv.data(), st.mixed, st.k, st.v, qpos.data(), need, !dev_attn);
+    qsa_apply_update(a, L, n_tok, posv.data(), slotv.data(), st.mixed, st.k, st.v, qpos.data(), need, !dev_attn,
+                     idx_early ? st.iq : nullptr, idx_early ? st.ik : nullptr);
 
     if (qdbg) {
         fprintf(stderr, "[qsa] caches updated need=%d\n", (int)need);
@@ -949,8 +1352,14 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                 idx[(size_t)p] = p;
             }
             const int n_top = std::min(n_pool_vis, n_pool_max);
-            std::partial_sort(idx.begin(), idx.begin() + n_top, idx.end(),
-                              [&](int a, int b) { return scores[(size_t)a] > scores[(size_t)b]; });
+            // Canonical order: score descending, pool index ascending on a tie.
+            // The device selector uses the same rank key (score, inverted
+            // index), so the two select the same set by construction; only
+            // fp-noise boundary scores can move a pool.
+            std::partial_sort(idx.begin(), idx.begin() + n_top, idx.end(), [&](int a, int b) {
+                const float sa = scores[(size_t)a], sb = scores[(size_t)b];
+                return sa > sb || (sa == sb && a < b);
+            });
             std::vector<int> pools(idx.begin(), idx.begin() + n_top);
             if (a == 0 && i == n_tok - 1) {
                 if (const char * pp = std::getenv("PF_QSA_POOLS")) {

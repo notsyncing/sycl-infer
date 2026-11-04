@@ -266,6 +266,22 @@ void engine::q4_alloc() {
         // qsa_early_mixed).  Default on after validation; =0 restores the old
         // placement and waits so one binary measures both arms.
         qsa_early_ = SI_ENV_I32("PF_QSA_EARLY", 1) != 0;
+        // Device indexer projection (step 2): the BF16 GEMV + q norm/RoPE run
+        // on the card and only iq/ik come back.  PF_QSA_IDX_DEV=0 restores the
+        // host projection (and the `mixed` D2H it reads).
+        qsa_idx_dev_ = SI_ENV_I32("PF_QSA_IDX_DEV", 1) != 0;
+        // Step 3: device ring/pool + selector.  It needs the device indexer and
+        // the device attention the selection feeds, and the canonical selector
+        // caps at 512 pools (the shipped model's top_k 2048 / pool 4).
+        const int kp_cfg = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+        const bool sel_cap = hp.idx_top_k / kp_cfg <= 512 && hp.idx_head_dim <= 256;
+        const int sel_env = SI_ENV_I32("PF_QSA_SEL_DEV", 0);
+        qsa_sel_dev_ = sel_env != 0 && qsa_idx_dev_ && qsa_devattn_ && sel_cap;
+        if (sel_env != 0 && !qsa_sel_dev_) {
+            fprintf(stderr, "[q4] QSA: device selector disabled (needs PF_QSA_IDX_DEV, PF_QSA_DEVATTN, "
+                            "%d pools <= 512, idx_head_dim %d <= 256)\n",
+                    hp.idx_top_k / kp_cfg, hp.idx_head_dim);
+        }
         // Sparse prefill on the device (the selector stays on the host).  The
         // wave is bounded by kMaxB because the scratch step_info is kMaxB rows.
         qsa_pf_dev_ = SI_ENV_I32("PF_QSA_PF_DEV", 1) != 0;
@@ -276,6 +292,7 @@ void engine::q4_alloc() {
         }
         qsa_pending_.resize((size_t)attn_layers());
         qsa_early_ev_.resize((size_t)attn_layers());
+        qsa_idx_slot_.resize((size_t)attn_layers());
         fprintf(stderr, "[q4] QSA: host indexer, top-%d of %d-key pools (ctx %d > %d)\n", hp.idx_top_k, hp.idx_kpool,
                 max_seq, hp.idx_top_k);
     }
@@ -2434,7 +2451,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             // copy lands instead of after the whole chain is drained in
             // qsa_attention.  `PF_QSA_EARLY=0` disables it (old placement).
             if (!abl_nomix) {
-                qsa_early_mixed(attn_idx, L, dev, mode, n_tok, inf, b.mixed);
+                qsa_early_indexer(attn_idx, L, dev, mode, n_tok, inf, b.mixed);
             }
             // A dense prefill chunk's K/V copies ride a separate queue; put the
             // dependency back before the qkv GEMV overwrites KBUF/VBUF.
