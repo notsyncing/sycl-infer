@@ -2380,7 +2380,7 @@ the checks that catch them.
 | `PF_Q4_STAGE=0` | on | direct pageable expert uploads instead of the pinned ring (ring size = profile `moe.upload_ring`, 32) |
 | `PF_Q4_INJECT=0` | on | old one-lane HC inject dot |
 | `PF_Q4_GEMV8=0` | on | generic Q8_0 GEMV |
-| `PF_Q4_GEMV8_SPLIT_ROWS` / `PF_Q4_GEMV8_WPR` | profile `shape.q8_rows` (512) / `split.max` (8) | K-split row gate / warps per row for the Q8_0 decode GEMV; `-1` = profile |
+| `PF_Q4_GEMV8_SPLIT_ROWS` / `PF_Q4_GEMV8_WPR` | profile `shape.q8_rows` (512) / `split.max` (8) | K-split row gate / warps per row for the Q8_0 decode GEMV; `-1` = profile. A 4096/8 sweep measured **84.8-85.1 vs 88.6-88.7 ms (3.8 ms, 4.2%)** but changes the sum order and flips a near-tie (KL 4.9e-5 at step 12); the default stays 512/8 and the flag is the opt-in |
 | `PF_Q4_GEMVSEG=0` | on | blocking per-call segment copy |
 | `PF_Q4_F32_SPLIT=0` | profile `split.max` (8) | generic GDN beta/alpha GEMV; `-1` = profile, `0` = off |
 | `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` / `PF_MOE_CFG_DEC` | profile `moe.cfg_*` (43/43/0) | grouped expert GEMM tile case; `_DEC` 0 = auto (one row per expert, two when batched) |

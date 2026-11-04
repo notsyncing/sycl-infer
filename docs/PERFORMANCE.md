@@ -265,6 +265,14 @@ with the prefetch vs `3.67 ms` without.  The fusion and overlap save less on the
 critical path than their device time because the shared work now rides under the
 routed expert's H2D wait and contends with it for bandwidth.
 
+**Q8_0 split-row opt-in (2026-11-04).**  In the same cell,
+`PF_Q4_GEMV8_SPLIT_ROWS=4096` (with `PF_Q4_GEMV8_WPR=8`) measures
+**84.8-85.1 vs 88.6-88.7 ms/step** (3.8 ms, 4.2%): `ssm_out`/`wo` (N=2560)
+are occupancy-bound at 0.625 warps/EU with the 512-row gate.  It changes the
+sum order: the 96-token stream diverges at step 12 on a 0.0015 top-2 margin
+(KL 4.9e-5 there).  **The default stays the profile's 512/8**; the flag is the
+opt-in.
+
 #### 4.4.1 By context depth, one stream
 
 | depth | prompt | pp | tg | ms/step |
