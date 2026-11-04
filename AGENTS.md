@@ -1791,7 +1791,7 @@ bound.  The recommended run is all-GPU with a per-expert LRU bank:
 ```bash
 ./build/sycl-infer \
   --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 --cpu-threads 28 \
+  --layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 --cpu-threads 28 \
   --ctx 2048 --kv-type f16 gen --prompt "..."
 ```
 
@@ -2049,38 +2049,83 @@ counters are printed with the q4 time report.
   device-buffer path; the kernels must stay
   `const gemv_seg * segs, int n_segs`.
 
-**Measured (2x Arc A770, AOT Release).**  Prefill numbers used
-`--ctx 4096 --kv-type i8`; the recommended decode uses `--ctx 2048 --kv-type f16`
-(both KV types work and both answer `Paris`).  The architecture and the
-placement rationale are in
+**Measured (2x Arc A770, AOT Release).**  Current state, recommended config
+(`--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 --cpu-threads 28
+--kv-type f16 --max-slots 16`, tail-skip 0): the warm 3,660-token prefill is
+**65.4 s (55.9 tok/s)** (468 tokens: **9.05 s / 51.7 tok/s**); decode is
+**88.2 ms/token (11.34 tok/s)** at depth 512,
+110.2 ms (9.07 tok/s) at 3.6k and 119.7 ms (8.35 tok/s) at 14.6k.  Startup is
+**28.0-28.7 s warm / 109.4 s cold**, peak RSS **5.8 GiB**.  The architecture
+and the placement rationale are in
 [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md).
+
+The table below is the **2026-10-27 archive** (former `0-23/24-47` map, the
+former tail-skip-7 default, an older indexer and no QSA device prefill); it is
+kept only to show how the configurations compared then and is not the current
+default.
 
 | configuration | 512-token prefill | decode |
 |---|---:|---:|
 | host experts, bank off | 48.7 s (10.5 tok/s) | ~500 ms/token (~2 tok/s) |
 | whole-layer bank, 18000 MB | 45.5 s (11.25 tok/s) | ~470 ms/token (~2 tok/s) |
 | per-expert LRU, all-GPU, 16000 MB, pinned source | ~12.0 s (45 tok/s) | ~101 ms/token (9.9 tok/s) |
-| **per-expert LRU, all-GPU, 17500 MB, pinned source** | **~11.4 s cold / 9.6 s warm (47-56 tok/s)** | **~93.3 ms/token (10.7 tok/s)** |
+| per-expert LRU, all-GPU, 17500 MB, pinned source | ~11.4 s cold / 9.6 s warm (47-56 tok/s) | ~93.3 ms/token (10.7 tok/s) |
 | per-expert LRU, all-GPU, 18000 MB, pinned source | – | ~93.3 ms/token (10.7 tok/s) |
 
 The per-expert LRU is the default.  The pinned expert source is 69.8 GiB of
 host RAM copied once at startup; a **cold first prefill is ~10.6 s** (the bank
-calibrates on it).  At 537 prompt tokens the steady decode is **93.6
-ms/token (10.7 tok/s)**; the first decode step after a prefill is 1.5-2x
+calibrates on it).  In the archive, at 537 prompt tokens the steady decode is
+**93.6 ms/token (10.7 tok/s)**; the first decode step after a prefill is 1.5-2x
 slower while the bank warms, so a short generation reads high.
 `PF_Q4_PIN_SRC=0` (staging) and `PF_Q4_BANK_Q5K=1` (layer 2 decode-only,
 107.2 ms, so off) are the A/Bs.
 
+**The current dense/shared/PLE/QSA wins (all default on; the dense/shared/PLE
+items are bit-identical, the QSA device paths are numerically reordered and
+gated on the measured cells).**
+
+* **Shared expert (`PF_Q4_SHFUSE` / `PF_Q4_SHOVER` / `PF_Q4_SHPREF`).**  One
+  `gemm_i8_quant_group` launch for gate+up and one for down (5.13 vs 6.74
+  ms/token), the shared GEMVs submitted under the routed expert's H2D wait, and
+  an 8-pair register prefetch in `moe_gate_add` (1.64 vs 3.67 ms).  Together
+  **2.85 ms/token** (89.67 vs 92.52) on the 96-token cell.
+* **Dense exact subset (`PF_Q4_HCFUSE` / `PF_Q4_GEMV_SEGTYPE` /
+  `PF_Q4_ARGMAX_DEV`).**  The HC inject is a second group range of the `hc_mix`
+  dispatch, `gemv_many` dispatches each segment's actual type (one fused
+  Q8_0+F32 launch instead of a mixed group taking segment 0's kernel), and the
+  greedy token comes from `mtp_argmax_launch` instead of a 993 KB D2H + host
+  scan.  Together **92.46 -> 90.97 ms/token (-1.48)**; the 96 per-step logits,
+  stdout and 4k prefill logits are unchanged.
+* **PLE host chunking (`PF_Q4_PLE_CHUNK` / `PF_Q4_PLE_APPLY_IDIV`).**  16 rows
+  per pool job (key+value fused into one two-segment call) removes the per-row
+  `fetch_add` from the 12 800-row projection, and `cpu_q4_ple_apply` derives its
+  element index by nested `(i,s)`/`(i,c)` loops instead of two divisions per
+  element.  Decode **88.90 -> 88.20 ms/step** (proj 1.619 -> 1.168, apply 0.447
+  -> 0.281); on its build the 4k prefill measured **70.1 -> 67.9 s**, and the current warm 3,660-token prefill is **65.4 s (55.9 tok/s)**.
+* **QSA device indexer / selector (`PF_QSA_IDX_DEV` default on;
+  `PF_QSA_SEL_DEV` default off).**  The indexer BF16 GEMV + q norm/RoPE run on
+  the card and D2H 2.5 KB instead of 10 KB of `mixed` plus a host GEMV:
+  **-3.34 ms/token at 3.6k and -3.76 at 14.6k**, identical selected pools and
+  stream.  The device selector is correct (512/512 pools, identical stream) but
+  **+3.1 ms at 3.6k and a wash at 14.6k**, because its device work contends with
+  the routed experts, so it stays opt-in.  `PF_QSA_EARLY` (default on) issues
+  the `mixed` D2H after `hc_mix` and the `sel` H2D without a host wait:
+  **-3.5 ms/token at 3.6k**, bit-identical.
+
 **Cold start is the pinned-source read, and it is now parallel (2026-11-04).**
-The 69.8 GiB pinned source used to be one serial `std::memcpy` per expert plane
-(141 calls, one host thread) from the mmap, and `page_out_host` evicted the
-shards with `POSIX_FADV_DONTNEED` afterwards, so every start paid the disk pass
-again.  Three changes, all default on:
+The current headline is **28.0-28.7 s warm / 109.4 s cold** to first token with
+a peak process RSS of **5.8 GiB**; the 69.8 GiB pinned source is filled warm in
+**7.1 s** (parallel `pread`, 8 workers, **10.49 GB/s**).  It used to be one
+serial `std::memcpy` per expert plane (141 calls, one host thread) from the
+mmap, and `page_out_host` evicted the shards with `POSIX_FADV_DONTNEED`
+afterwards, so every start paid the disk pass again.  Three changes, all default
+on:
 
 * `PF_Q4_PREAD=1` preads each plane from its shard fd straight into the pinned
   destination over `PF_Q4_PREAD_WORKERS` (8) workers; a range not wholly inside
   one shard falls back to `memcpy`, so the reservation's `PROT_NONE` gaps are
-  never read.  `=0` restores the serial memcpy.
+  never read.  Warm, this is 69.8 GiB in 7.1 s (10.49 GB/s); `=0` restores the
+  serial memcpy.
 * the prefault **skips** a banked layer's expert planes (they are in the pinned
   source, not the mmap) and the GPU-resident shared/router tensors;
   `PF_Q4_PREFAULT_ALL=1` restores the old every-tensor touch.
@@ -2158,7 +2203,7 @@ ring/pool, the score and a canonical (score desc, index asc) radix top-k to the
 card and feeds the Stage 3 gather without an H2D; the host selector uses the
 same canonical rule.  It selects the identical set (512/512 at both depths,
 stream md5 identical), but it is **a wash at 14.6k (118.70 -> 119.02 ms) and
-+3.2 ms/token at 3.6k** because the device chain competes with the routed
++3.1 ms/token at 3.6k** because the device chain competes with the routed
 experts, so it stays off.  Its pool costs `(max_seq/kp+1)*idx_head_dim*4 B` per
 (attention layer, slot) - 25 MB per active slot at 16k, 50 MB at 32k, 75 MB at
 48k - plus a 2 KB ring and a ~65 KB/device score+pool scratch (32k); the
@@ -2176,7 +2221,7 @@ order.  The guard is an `assert(kp >= 2)` plus the comment; a grep for
 `/ 4`, `% 4`, `* 4 +` in `engine_qsa.cpp` must find no pool arithmetic.
 
 **The recommended `--ctx 2048` decode does not run QSA at all**:
-`qsa_on_` requires `max_seq > idx_top_k` and both are 2 048, so the 93.3 ms/token
+`qsa_on_` requires `max_seq > idx_top_k` and both are 2 048, so the 88.2 ms/token
 cell has zero QSA cost and the QSA numbers below are measured at `--ctx 4096`
 with the same weights/bank and the same 96-token TCP prompt.
 
@@ -2359,7 +2404,7 @@ the checks that catch them.
 | `--moe-vram-mb MB` | 0 | per-expert LRU bank budget; **17500** is the measured knee (121 slots), 0 = all experts on the host |
 | `--engram-ram-mb MB` | profile (4096) | PLE row cache in host RAM; unset = the model profile's `policy.engram_ram_mb_default`, 0 = off |
 | `--moe-ram-mb MB` | 0 | generic ncmoe host tier; **not used by qwen4exp** (the experts are always host-resident) |
-| `--layer-map` | auto | recommended `0-23:gpu.0,24-47:gpu.1`; the profile synthesises one when absent |
+| `--layer-map` | auto | recommended `0-19:gpu.0,20-47:gpu.1`; the profile synthesises one when absent |
 | `--kv-type` | i8 | f16 and i8 both work; f16 is the recommended decode |
 | `PF_Q4_HEAD_W4=1` | off | read the qwen4exp decode head from the pre-existing native u4 store (opt-in, lossy; head span 1.885 -> 1.006 ms, first step +12 ms); falls back to the raw head when `PF_HEAD_U4=0` |
 | `PF_Q4_HEAD_TIME=1` | off | head-only device span (barrier pair), one `[q4head]` line per decode forward |
@@ -2384,6 +2429,7 @@ the checks that catch them.
 | `PF_Q4_DOWN_I8_ALL=1` | off | build the routed-down int8 host store for every layer (42.2 GiB / ~110 s) instead of only the non-banked ones; forced on by `PF_Q4_FFCMP`/`PF_Q4_CPU_MISS`, which read it as their reference |
 | `PF_Q4_Q5NPB=8` | **1** | rows per warp for `moe_down_q5_1_launch`; the COLD sweep gives 73.8 GB/s at 8 and 81-85 at 1 (and 0.1875 -> 0.167 ms/layer in the AOT engine, 90.71 -> 89.41 ms/token, identical md5). The old default 8 came from an L2-warm probe. **Only 1 and 8 are instantiated** (2/4 measure no better and each costs another AOT device image; any other value runs 1) |
 | `PF_Q4_Q5_LANE=1` | off | one lane per 32-value group for that kernel: +1.15-1.25x over NPB=1, **not bit-identical** (fp32 reassociation; a 32-token greedy stream flips a near-tie), so it stays opt-in. NPB is fixed at 1 (its measured optimum); one instantiation |
+| `PF_Q4_Q5SB=1` | off | byte-neutral 128-value panel repack of the Q5_1 down plane (`q5_1_sb_pack` + `moe_down_q5_1_sb_launch`): bit-identical, but **slower** (0.1797 -> 0.2073 ms/layer); A/B only |
 | `PF_Q4_PLE_SER_MAX` | 65536 | run a `cpu_q4_ple_apply` region on the calling thread when its WORK is at most this many elements instead of `par()`. The 28-thread pool wake costs ~0.5 ms for a 10 240-element decode loop; `0` restores `par()` everywhere |
 | `PF_Q4_KTIME=1` | off | routed gate/up and down **kernel-only** device time from `ext_oneapi_submit_barrier` pairs (the `dn` column in `PF_Q4_HOT_TIME` is a composite that also holds quant_h, the memset and the DMA wait) |
 | `PF_Q4_SEGTIME=1` | off | 13 barrier segments per layer for the whole decode forward; the wall is inflated ~1.5-2x so only quote shares |
@@ -2399,6 +2445,11 @@ the checks that catch them.
 | `PF_Q4_PLEGPU_TIME=1` | 0 | `[q4pleg]` device time of those two GEMV launches (barrier pairs) |
 | `PF_Q4_STAGE=0` | on | direct pageable expert uploads instead of the pinned ring (ring size = profile `moe.upload_ring`, 32) |
 | `PF_Q4_INJECT=0` | on | old one-lane HC inject dot |
+| `PF_Q4_HCFUSE=0` | on | one dispatch carries HC inject + `hc_mix` (bit-identical to the two launches); requires the F32 workgroup inject and `n_embd % 256 == 0`, otherwise the launcher falls back |
+| `PF_Q4_GEMV_SEGTYPE=0` | on | dispatch a GEMV call group per segment's actual type; `0` keeps the per-type runs but skips the fused Q8_0+F32 launch (`gemv_mix_q8_f32`). Either way a mixed group no longer takes segment 0's kernel |
+| `PF_Q4_ARGMAX_DEV=0` | on | greedy q4 decode takes its token from the device argmax (`mtp_argmax_launch`, lowest-index ties) instead of the 993 KB D2H + host scan; logprobs/penalties/`PF_DUMP_DEC_LOGITS` and CPU keep the host path |
+| `PF_Q4_PLE_CHUNK=N` | 1 (16 rows) | rows per pool job for the PLE key/value host GEMV dispatch; `0` = one job per row (the old 12 800-atomic shape), `1` = 16, `N>1` = N. Every row still runs `gemv_row` with the same arguments, so it is bit-identical |
+| `PF_Q4_PLE_APPLY_IDIV=0` | on | nested `(i,s)`/`(i,c)` loops in `cpu_q4_ple_apply` instead of per-element `% n_embd` / `/ hc_dim`; same arithmetic and 4-tap conv order |
 | `PF_Q4_GEMV8=0` | on | generic Q8_0 GEMV |
 | `PF_Q4_GEMV8_SPLIT_ROWS` / `PF_Q4_GEMV8_WPR` | profile `shape.q8_rows` (512) / `split.max` (8) | K-split row gate / warps per row for the Q8_0 decode GEMV; `-1` = profile. A 4096/8 sweep measured **84.8-85.1 vs 88.6-88.7 ms (3.8 ms, 4.2%)** but changes the sum order and flips a near-tie (KL 4.9e-5 at step 12); the default stays 512/8 and the flag is the opt-in |
 | `PF_Q4_GEMVSEG=0` | on | blocking per-call segment copy |
@@ -2413,8 +2464,9 @@ the checks that catch them.
 | `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` keeps host Stage 1; see design 18 §4 |
 | `PF_QSA_IDX_DEV=0` | on | host indexer projection + 10 KB `mixed` D2H; `=1` (default) runs the BF16 GEMV + q norm/RoPE on the card and D2Hs 2.5 KB |
-| `PF_QSA_SEL_DEV=1` | off | device ring/pool + canonical device selector, no selection H2D (step 3); a wash at 14.6k, +3.2 ms at 3.6k |
-| `PF_QSA_PF_DEV=0` | on | Stage 3 device sparse *prefill* attention for f16 GPU (`n_tok>1`), host selector and byte-identical selected sets; `=0` keeps the host path; measured 75.5 -> 67.8 s prefill on the 3660-token q4 cell, see design 18 §4 |
+| `PF_QSA_SEL_DEV=1` | off | device ring/pool + canonical device selector, no selection H2D (step 3); a wash at 14.6k, +3.1 ms at 3.6k |
+| `PF_QSA_EARLY=0` | on | issue the per-layer `mixed` D2H right after `hc_mix` and the `sel` H2D without a host wait; `=0` restores the old placement and blocking waits. Bit-identical, -3.5 ms/token at 3.6k (117.5 -> 114.0) |
+| `PF_QSA_PF_DEV=0` | on | Stage 3 device sparse *prefill* attention for f16 GPU (`n_tok>1`), host selector and byte-identical selected sets; `=0` keeps the host path; QSA-call wall 75.5 -> 67.8 s (post-load 80.9 -> 72.9 s) on the 3,660-token cell; current warm prefill 65.4 s = 55.9 tok/s |
 | `PF_QSA_PF_WAVE=N` | 8 | prefill rows per compact pool; VRAM `N*65*n_head_kv*32*head_dim*2*2 B` per device (77 MB at 8) |
 | `PF_QSA_PF_NSP=N` | 0 (dec_splits) | override the prefill attention split count (may only lower `dec_splits`) |
 | `PF_QSA_F16RND=1` / `PF_QSA_ATTN_DUMP_ALL=1` | off | diagnostics: round the host K/V mirror like the device `sycl::half` store (the shipped mirror truncates) / dump every attention row |
@@ -2434,7 +2486,9 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
   *not* run in the VRAM bank ever read (one layer in this config), plus the
   `PF_Q4_FFCMP`/`PF_Q4_CPU_MISS` diagnostics.  It is now built only for those
   layers (**1 layer, 0.9 GiB, 0.5 s**); the whole run went from ~200 s to
-  **56 s** wall and the resident set from ~122 GiB to **80 GiB**.  The oracle
+  **56 s** wall and the resident set from ~122 GiB to **80 GiB** at that point
+  (after the 2026-11-04 I/O pass the current headline is **28.0-28.7 s warm /
+  109.4 s cold** at **5.8 GiB**; see the cold-start section).  The oracle
   forces the full build (`PF_Q4_FFCMP` implies `PF_Q4_DOWN_I8_ALL`), so its
   reference is unchanged: cos **0.999985** at `PF_Q4_TAIL_SKIP=0`.  (With the
   tail-skip 7 (the former default) the same oracle reports 0.96-0.98 - it compares a bank
@@ -3780,8 +3834,8 @@ from a slow launch; this is what found the `wg_clamped` regression below),
 `PF_Q4_TIME=1` (qwen4exp: one line per forward with the host-MoE / router /
 shared-expert / GPU-handoff split), `PF_QSA_TIME=1` (the host QSA split:
 `copy/gemv/upd/sel/attn`; `PF_QSA_ISA`, `PF_QSA_DEFER`, `PF_QSA_F16MIR`,
-`PF_QSA_COPYQ`, `PF_QSA_DEVATTN`, `PF_QSA_IDX_DEV` and `PF_QSA_SEL_DEV` are the
-A/B knobs),
+`PF_QSA_COPYQ`, `PF_QSA_DEVATTN`, `PF_QSA_IDX_DEV`, `PF_QSA_SEL_DEV` and
+`PF_QSA_EARLY` are the A/B knobs),
 `PF_Q4_HIST=1` (routing histogram: per-layer
 expert pair counts, top-B coverage and whole-layer coverage, printed at exit;
 `PF_Q4_BANK_TYPES`/`_MAX`/`_SKIP`/`_BANKCHK` are the bank diagnostics), `PF_Q4_DUMP=1` (per-stage rms/max/first),

@@ -255,6 +255,14 @@ out_i = x_i * (1/sqrt(mean(x²)+eps)) * w_i
 kernel。`GEMV_CFG1/8/16/32` 是实验性的 `RPS*100+SGW` 配置码（104/204/208/216/404/408/416/808）。
 默认由 `GEMV_DISPATCH_TB` 选择 `NSB ∈ {4,8,14,0}` 与 `TB ∈ {1,8,16,32}`。
 
+**`gemv_mix_q8_f32_launch`（`gemv.cpp`，`PF_Q4_GEMV_SEGTYPE`，默认开）——一个 call group 里的
+Q8_0 段与 F32 段合成一次 launch。** 以前 `gemv_many` 只按 segment 0 的类型选 kernel，混合类型组
+会把所有行都送进第一个段的 kernel（GDN 的 Q8_0 `wqkv`/`wgate` + F32 `ssm_beta`/`alpha` 就是这种组）。
+现在先按每个 segment 的实际类型连续分组；当组内恰好是 Q8_0 + F32 时走融合 kernel：Q8_0 每 warp
+一行（`q8_0_dot_vec` / `q8_0_dot_scalar`），F32 每 `wpr0` 个 warp 一行、K 切成 `wpr0` 份、子组
+归约后 SLM 合并。与“每段一次 launch”**逐位相同**；`PF_Q4_GEMV_SEGTYPE=0` 保留按类型的分组，但
+跳过这个融合 launch。
+
 ### 5.2 DP4A GEMV（`dp4a_gemv.cpp`）
 
 `dp4a_gemv_impl<QT,SPLIT>`（`dp4a_gemv.cpp:18-76`）：
@@ -588,6 +596,12 @@ qwen4exp 新增的逐层 kernel 很少：GDN、attention 和原生权重 GEMV �
   取代了原来的单 work-item 串行点积；**求和顺序会变**（L0/L1 相对差 ≤4.4e-6，后面逐层到 ulp），
   所以它用 token 流和 27B decode-vs-prefill 判据验证，而不是假设位相等。`PF_Q4_INJECT=0` 回退旧
   kernel。
+* `q4_hc_inject_mix_launch`（`PF_Q4_HCFUSE`，默认开）把 inject 与 `hc_mix` 合成一次
+  `nd_range`：前 `n_tok*N` 个工作组跑 inject（与 `inject_f32_impl` 相同的 256-lane float4
+  块、四个累加器、warp 归约 + SLM 折叠），其余跑 mixer 的 per-`(token, channel)` s-loop。
+  两者都只读 `xn`，inject 的输出由后面的 `hc_combine` 消费，所以与两次 launch **逐位相同**
+  （`PF_Q4_HCFUSE=0` 是 A/B）。要求 F32 workgroup inject 且 `n_embd % 256 == 0`，否则
+  launcher 回落到原路径。
 
 **PLE（主机，`cpu/kernels/q4exp.cpp`）**
 
@@ -596,6 +610,14 @@ qwen4exp 新增的逐层 kernel 很少：GDN、attention 和原生权重 GEMV �
 是 `w[k + kern*c]`，不是 `w[k*hc_dim + c]`。PLE 表行的 dequantize 走主机；已解量化的行由
 engine 的 engram 缓存（直接映射、`row & (cap-1)`）缓存，见
 [design/18-qwen4exp.md §5](18-qwen4exp.md)。
+
+`cpu_gemv_group(..., chunk)` 的 `chunk` 是每个 pool job 处理的连续行数。默认是每个 job 一行，
+而 PLE 的 key/value 投影一次 12 800 行，28 线程池共享的 `next_` 原子成了主成本。chunked 版本
+每个 job 处理一段连续 flat `(token,row)` 索引，每行仍调用同一个 `gemv_row`、参数不变，所以
+**逐位相同**；PLE 的 key+value 还合成一次两 segment 调用。`cpu_q4_ple_apply` 的两个
+per-element `% n_embd` / `/ hc_dim` 改成嵌套 `(i,s)`/`(i,c)` 循环，算术和 4-tap 卷积顺序不变。
+实测（2x A770）decode **88.90 -> 88.20 ms/step**（proj 1.619 -> 1.168、apply 0.447 ->
+0.281），其构建上 4k prefill **70.1 -> 67.9 s**；当前 warm 3,660-token prefill 是 **65.4 s (55.9 tok/s)**。`PF_Q4_PLE_CHUNK` / `PF_Q4_PLE_APPLY_IDIV` 是 A/B。
 
 **Q5_1 down（`moe_down_q5_1_launch`，`moe.cpp`）**
 
@@ -608,6 +630,14 @@ engine 的 engram 缓存（直接映射、`row & (cap-1)`）缓存，见
   零点被算了 8 遍（cos 0.08、rms 16x）。
 
 hermetic 测试对 K=32/64/160/640、N=64/2560 与主机参考完全一致（cos 1.0）。
+
+`q5_1_sb_pack` + `moe_down_q5_1_sb_launch`（`PF_Q4_Q5SB=1`，默认关）是 128 值 panel 重排的 A/B：
+每行 20 个 24 B Q5_1 block 变成 5 个 96 B panel（`qs[64]` 用 Q4_K 的 split-half nibble 序、
+`qh[16]`、`meta[16]`），layout 仍是一个 lane 一个 32 值组、4 B `qs`，FMA 顺序不变，所以
+**逐位相同**；启动时 43 层重排 25.2 GiB 约 3.4-4.1 s。但它 **更慢**：down 0.1797 -> 0.2073
+ms/layer（~70 -> ~61 GB/s），因为 bit-identity 固定了 `qs` 的 4 B/lane 加载形状，panel 只让
+`qh`/`meta` 变得更宽、更频繁地被读。16 B/lane 的 `moe_row_gemv_impl` 能到 ~100 GB/s，但会改变
+归约/分解，不是逐位相同。
 
 **Q8_0 down（`moe_down_q8_0_launch`，`moe.cpp`）**
 
@@ -653,6 +683,27 @@ ids/wts/logits 都是 `bad=0`）。实测 router **0.43 → 0.07 ms/layer**；`P
 layer-0 `mixed` 逐位相同；96-token decode 的三档 ISA 端到端相同（`[q4]` 和 97.3-97.5，
 真机 wall 约 101 ms，±0.2 的跑间差异），因为主机工作被 LM head 盖住。详见 [18-qwen4exp.md §4](18-qwen4exp.md) 与
 [PERFORMANCE.md §4.4](../PERFORMANCE.md)。
+
+**QSA 设备 kernel（`gpu/kernels/qsa.cpp`）**
+
+* Stage 2（`PF_QSA_DEVATTN`，默认开）：`qsa_sinfo_launch` 写一个 scratch `step_info`，把选中 key
+  的紧凑池表示成一行 `nsel`-position 序列；`qsa_gather_launch` 把选中的 paged f16 行压进紧凑池
+  （布局与 paged 池相同），再交给普通 `attn`/`attn_combine`。两者都是设备 kernel，因为 host-USM
+  的 `step_info` 会在下一个 token 被覆写。
+* Stage 3（`PF_QSA_PF_DEV`，默认开）：`qsa_sinfo_multi_launch` 为一个 prefill 波次写 `step_info`，
+  行 `r` 的 `pos[r] = counts[r]-1`、`slot[r] = r`，于是紧凑池对 `attn` 是一段 `counts[r]` 个
+  key 的序列；`qsa_gather_rows_launch` 让行 `r` 拥有 block `[r*cap_blocks, (r+1)*cap_blocks)`
+  （identity block table），把每行选中的 paged 行压进自己的 slice。
+* Stage 4 indexer（`PF_QSA_IDX_DEV`，默认开）：`qsa_indexer_launch` 对 live `mixed` 跑两个 BF16
+  indexer 投影（每 32-lane 子组一行，四个累加器；BF16→f32 用位移拼接），再对 q 行做 per-head
+  RMSNorm + RoPE，只写回 `iq`（512 float）与 raw `ik`（128）。它取代了 10 KB `mixed` D2H + host
+  GEMV，实测 -3.34 ms/token at 3.6k、-3.76 at 14.6k。
+* Stage 4 selector（`PF_QSA_SEL_DEV`，默认关）：`qsa_idx_update_launch` 写 raw-key ring，并在
+  `pos%kp == kp-1` 时按 host 顺序求平均、`k_norm`+RoPE、f16 舍入写 pool；`qsa_score_launch` 是
+  每个 pool 的 `sum_h max(dot,0)`；`qsa_topk_launch` 用一个 work-group 的 8 字节 rank-key radix
+  select（score 降序、pool 索引升序）选出 top pools，再按索引排序并展开成 host selector 的 `sel`
+  顺序。它与 host selector 选同一集合（512/512），但设备工作与 routed experts 竞争，实测比 host
+  selector **慢 +3.1 ms/token at 3.6k**，所以默认关。
 
 **LRU / 两遍 prefill（engine 侧，不新增 kernel）**
 
@@ -1170,6 +1221,9 @@ ms/cycle**，占整个 MTP cycle 的 24 %。
 * 实测 **33.7 → 1.2 ms/cycle（28×）**。`PF_MTP_AMCHK` 做 device/host 对拍（0 失配）。
   它是唯一的入口（GPU backend 的 `mtp_argmax.cpp`，全 `cpu` 时是 `cpu_backend.cpp` 里的主机循环），
   旧的 `PF_MTP_ARGMAX_CPU` 主机扫描已删除。
+* **greedy qwen4exp decode 复用同一个 kernel**（`PF_Q4_ARGMAX_DEV`，默认开）：它取代
+  993 KB logits 的 D2H + host 扫描，平票规则与 `sample_token` 相同，所以 token 流不变；
+  logprobs/penalties/`PF_DUMP_DEC_LOGITS` 与 CPU 仍走 host 路径。`PF_Q4_ARGMAX_DEV=0` 是 A/B。
 
 ### 15.3 候选受限的 draft head（默认关，`mtp_argmax.cpp:44-168`）
 

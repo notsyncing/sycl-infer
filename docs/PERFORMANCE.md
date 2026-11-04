@@ -191,159 +191,88 @@ over a 16k KV is what the extra 25.6 ms/step buys.
 
 `Qwen3.8-Flash-Next-UD-Q4_K_XL` (4 shards, `qwen4exp`): 48 layers, 512 routed
 experts (top-10), a 5.3 GiB dense trunk and a 71.7 GiB host-resident expert bank
-behind a per-expert LRU on the cards.  AOT Release, 2x Arc A770, f16 KV
-(except the 512 prefill), `--cpu-threads 28`, `PF_PREFIX_CACHE=0`, one process
-per cell.
+behind a per-expert LRU on the cards.  **Current configuration** (AOT Release,
+2x Arc A770): `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
+--cpu-threads 28 --kv-type f16 --max-slots 16`, tail-skip 0 (the exact expert
+set), `PF_QSA_IDX_DEV=1`, `PF_QSA_PF_DEV=1`, `PF_QSA_SEL_DEV=0`,
+`PF_Q4_GEMV8_SPLIT_ROWS`/`WPR` at the profile's 512/8, `PF_HEAD_U4=1` store but
+`PF_Q4_HEAD_W4=0` (the raw Q8_0 head read), and `PF_PREFIX_CACHE=0`.  Device 0
+is the x8 slot, so the 20/28 layer split gives the x16 card more layers; the
+17 500 MB bank is per device (152 slots/layer on device 0, 104 on device 1).
+One process per cell; the box drifts ~3 % between runs, so only cells measured
+in the same run are compared.
 
-The cells below were measured (2026-10-27) with
-`--layer-map 0-23:gpu.0,24-47:gpu.1` and a 17 500 MB bank (121 slots/layer),
-except the 48k cell, which needs 16 000 MB to allocate at `--ctx 65536`.
-**The recommended map for new runs is `0-19:gpu.0,20-47:gpu.1`**: device 0 is
-the x8 slot, so giving the x16 card more layers pays, and the bank's slot count
-is per device (152 on device 0, 104 on device 1, 17.0 GiB) rather than one
-shared minimum.
+**Startup and footprint.**  Warm restart to first token: **28.0-28.7 s**.  A
+cold start with the four shard page caches dropped
+(`posix_fadvise(DONTNEED)` after `sync`): **109.4 s**.  Peak process RSS is
+**5.8 GiB** and the shards stay in the page cache (**~99 GiB**), because the
+pinned expert source is locked physical memory.  The 69.8 GiB pinned source is
+filled in **7.1 s** warm by parallel `pread` over 8 workers (**10.49 GB/s**);
+the prefault touches 1.9 GiB and skips the other **70.3 GiB** that is already
+pinned or device-resident.  The cold floor is the drive (~1.0-1.15 GB/s
+sequential), not the engine.  The routed-down int8 host store is built only for
+the layers that do not run in the bank (0.9 GiB); the 71.7 GiB routed bank stays
+host-resident.
 
-**Startup and footprint.**  With the 2026-11-04 I/O pass (parallel `pread` into
-the pinned source, prefault skip, page-cache retention) a **cold** start reaches
-its first token in **109-115 s** (285 s before) and a **warm restart in 28-29 s**
-(56 s before); the process's peak RSS is **5.8 GiB** (76 GiB before), because the
-pinned source is locked physical memory and the shards stay in the page cache
-rather than being faulted into the process.  The cold floor is the drive
-(~1.0-1.15 GB/s cold, so 69.8 GiB is ~60 s), not the engine.  The routed-down
-int8 host store is built only for the layers that do not run in the bank
-(0.9 GiB), and the 71.7 GiB routed bank stays host-resident as before.  The
-per-stage device budget of one decode step - dense GEMV 13.40 ms, GDN and
-attention cores 1.52, PLE 2.50, routed gate/up and down, router - is in
-[`design/18-qwen4exp.md`](design/18-qwen4exp.md) §7.2.
-
-**Column definitions.** `pp` is `prompt tokens / warm prefill`, taken from the
+**Column definitions.** `pp` is `prompt tokens / warm prefill`, from the
 engine's own `[q4] fwd n=<rows>` prefill rows (a repeat in the same process;
 the first prefill of a process also calibrates the expert bank and is 2-3 s
 slower).  `ms/step` is the mean wall clock of one decode forward, i.e. the
-engine's `[q4] fwd n=1` line, and `tg = 1000 / ms/step`.  **The first decode
-step after a prefill is 1.5-2x slower while the bank warms**, so a short
-generation reads high: the same 512-depth cell measures 103 ms/step with a cold
-bank and 73 ms/step once warm, and the table's 93.3 is the steady value a
-64-token generation reports.
-
-**Tail-skip default is now 0 (exact).**  The 2026-10-27/11-01 cells in this
-section were measured at the former default `PF_Q4_TAIL_SKIP=7`; they are kept
-as historical measurements and are **no longer the default behaviour**.  On the
-2026-11-03 build (same 2x Arc A770, `--layer-map 0-19:gpu.0,20-47:gpu.1
---moe-vram-mb 17500 --cpu-threads 28 --ctx 2048 --kv-type f16 --max-slots 16`,
-468-token prose prompt, 48-token greedy decode, one process per cell, bank 104
-slots/layer / 17.0 GiB):
-
-| tail-skip | decode | expert upload | copy-queue time |
-|---|---:|---:|---:|
-| **0 (default, exact)** | **110.3 ms/step** | 233.3 MiB/token | 34.7 ms |
-| 7 (former default) | 83.7-86.4 ms/step | 128.7-164.8 MiB/token | 19.0-24.1 ms |
-
-At N=7 the emitted stream can flip at near-ties; the two-prompt KL/top-1 gate
-is in [`design/18-qwen4exp.md`](design/18-qwen4exp.md) §7.1.
-`--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N` opts back in (1..9 meaningful).
-
-**Shared-expert launch fusion, overlap and `moe_gate_add` prefetch (2026-11-04).**
-Same 2x A770 / AOT Release cell as above (`--layer-map 0-19:gpu.0,20-47:gpu.1
---moe-vram-mb 17500 --cpu-threads 28 --ctx 2048 --kv-type f16 --max-slots 16
---q4-tail-skip 0`, 96-token greedy on a 537-token prompt, `PF_PREFIX_CACHE=0
-PF_HEAD_U4=0`, one process per cell, two alternating reps).  Decode is the mean
-of the engine's `[q4] fwd n=1` line; all arms emit the same stdout and the same
-96 per-step `PF_DUMP_DEC_LOGITS`, and the 4k prefill logits are unchanged.
-
-| arm | decode ms/step |
-|---|---:|
-| `PF_Q4_SHFUSE=1 PF_Q4_SHOVER=1 PF_Q4_SHPREF=1` (default) | **89.67** |
-| `PF_Q4_SHFUSE=0` (unfused shared expert) | 90.32 (+0.64) |
-| `PF_Q4_SHOVER=0` (shared after the reduce) | 89.93 (+0.25) |
-| `PF_Q4_SHPREF=0` (plain gate/add loops) | 91.53 (+1.86) |
-| all three off | 92.52 (+2.85) |
-
-`PF_Q4_SHTIME=1` splits the shared block with barrier pairs (read after the
-final sync): `gemv=5.13 ms` fused vs `6.74 ms` unfused, and `gate_add=1.64 ms`
-with the prefetch vs `3.67 ms` without.  The fusion and overlap save less on the
-critical path than their device time because the shared work now rides under the
-routed expert's H2D wait and contends with it for bandwidth.
-
-**Q8_0 split-row opt-in (2026-11-04).**  In the same cell,
-`PF_Q4_GEMV8_SPLIT_ROWS=4096` (with `PF_Q4_GEMV8_WPR=8`) measures
-**84.8-85.1 vs 88.6-88.7 ms/step** (3.8 ms, 4.2%): `ssm_out`/`wo` (N=2560)
-are occupancy-bound at 0.625 warps/EU with the 512-row gate.  It changes the
-sum order: the 96-token stream diverges at step 12 on a 0.0015 top-2 margin
-(KL 4.9e-5 there).  **The default stays the profile's 512/8**; the flag is the
-opt-in.
+engine's `[q4] fwd n=1` line, and `tg = 1000 / ms/step`.  The first decode
+step after a prefill is 1.5-2x slower while the bank warms, so a short
+generation reads high; the cells below are steady-state values.
 
 #### 4.4.1 By context depth, one stream
 
-| depth | prompt | pp | tg | ms/step |
-|---:|---:|---:|---:|---:|
-| 512 | 537 | 50.7 tok/s (10.6 s) | 10.68 tok/s | 93.6 |
-| 16 037 | 16 037 | 48.9 tok/s (327.7 s) | 9.22 tok/s | 108.5 |
-| 48 222 | 48 222 | 42.8 tok/s (1 126.8 s) | 9.21 tok/s | 108.5 |
+| depth | prompt | pp | tg | ms/step | conditions |
+|---:|---:|---:|---:|---:|---|
+| 512 | 468-token prose | **51.7 tok/s** (9.05 s warm) | **11.34 tok/s** | **88.2** | `--ctx 2048`, 95 decode steps, raw head (`PF_Q4_HEAD_W4=0`); pp at `--ctx 4096` |
+| 3 660 | 3 660-token prose | **55.9 tok/s** (65.4 s warm) | 9.07 tok/s | 110.2 | `--ctx 4096`, QSA sparse prefill on device (`PF_QSA_PF_DEV=1`) |
+| 14 607 | 14 607-token repeated text | – | 8.35 tok/s | 119.7 | `--ctx 32768`, sparse QSA decode |
 
-All three are f16 KV, `--context 4096 / 20 480 / 65 536`, 24 / 24 / 12 decode
-steps, and the bank is 17 500 MB (104 slots/layer on the 20/28 map) except the
-48k cell, which needs 16 000 MB (95 slots).  The 512 and 16k cells take a prose
-prompt; **the 48k cell's prompt is synthetic** (a repeated one-token word,
-because a 48k-token prose prompt exceeds the 128 KB single-argument limit), so
-its routing is degenerate and its decode is not directly comparable to a real
-document.
+The 14.6k prompt is **synthetic** (a repeated phrase, because a 14.6k-token
+prose prompt exceeds the 128 KB single-argument limit), so its routing is
+degenerate and it is not directly comparable to a document.  The 512 cell is
+the dense QSA path (the selector is dense-equivalent under 2 048 keys and its
+deferred update is hidden under the LM head); the 3.6k and 14.6k cells take the
+sparse path, which selects the top 2 048 pooled keys and attends to those on the
+device.  The 3.6k decode includes the device indexer projection
+(`PF_QSA_IDX_DEV=1`, -3.3 ms/token against the host projection at this depth);
+the prefill row is the 3,660-token cell and the 468-token cell is 9.05 s
+(51.7 tok/s), so neither is an isolated 512-token chunk.
 
-`tg` is flat from 16k to 48k (9.2 tok/s) because the decode is weight-bound and
-the extra attention at 48k costs less than the bank's routing noise; the prefill
-falls 48.9 -> 42.8 tok/s over the same range.  The 512 cell is the dense QSA
-path (the selector is dense-equivalent under 2 048 keys and its deferred update
-is hidden under the LM head); the deep cells are the sparse path, which selects
-the top 2 048 pooled keys and attends to those on the device.
+**Numerics.**  Tail-skip 0 is the exact expert set.  The two QSA device paths
+are numerically reordered: the sparse prefill attention can flip a near-tie on
+a full prompt (the dense <=2,048-key path is byte-identical), and the indexer is
+a device dot (its selected pools and 32-token stream are identical on the
+measured cells).  `PF_QSA_PF_DEV=0` / `PF_QSA_IDX_DEV=0` restore the host paths.
 
-#### 4.4.2 By batch size, at depth 512
+#### 4.4.2 Batching
 
-qwen4exp decodes one row per forward; the scheduler caps it at one row and runs
-its sequences one at a time.  The prefill is one sequence at a time too, so `pp`
-is the same one-stream rate and is not listed per row.
+qwen4exp decodes **one row per forward**; the scheduler caps it at one row and
+runs its sequences one at a time.  A 2-row forward is correct but **0.85x** the
+throughput of decoding the two sequences serially, because two prompts select
+~20 distinct experts per layer against ~10 each and the routed-expert weight
+read doubles.  The 2-row form is therefore not used, and there is no batched
+q4 path at depth.  MTP is gated off for this model (the model profile declares
+it unsupported), so there is no speculative path to measure.
 
-| N | pp | tg (aggregate) | ms/step | note |
-|---:|---:|---:|---:|---|
-| 1 | 53 tok/s | 10.70 tok/s | 93.3 | one row |
-| 2 | – | 9.61 tok/s | 208.1 | one 2-row forward; 0.85x the two rows run serially (11.33 tok/s) |
-| 2 (serial) | – | 11.33 tok/s | 176.5 | shipped: two one-row forwards |
-| 4 / 8 | – | – | – | no batched path; the scheduler serializes |
+#### 4.4.3 Opt-in settings (non-default)
 
-The 2-row forward is correct (both rows match their own baseline, top-1 12/12)
-but 0.85x, because two prompts select ~20 distinct experts per layer against
-~10 each, so the routed-expert weight read doubles.  Two concurrent server
-requests measure 5.40 tok/s aggregate against 6.09 for one at a time;
-`PF_SCHED_MAX_DECODE` overrides the cap for tests.
+| setting | measured | note |
+|---|---|---|
+| `PF_Q4_GEMV8_SPLIT_ROWS=4096` (with `PF_Q4_GEMV8_WPR=8`) | depth 512, 96-token greedy: 84.8-85.1 vs 88.6-88.7 ms/step | -3.8 ms (4.2 %); changes the sum order and flips a near-tie (KL 4.9e-5 at step 12) |
+| `PF_Q4_HEAD_W4=1` | same 96-token cell: head span 1.885 -> 1.006 ms; decode -0.879 ms/token | reads the native-u4 head store; lossy (KL 0.0165 at step 12); the first decode step pays ~12 ms |
+| `PF_QSA_SEL_DEV=1` | 3.6k: +3.1 ms/step; 14.6k: a wash | correct (512/512 pools, identical 32-token stream); its device work contends with the routed experts |
+| `PF_Q4_Q5SB=1` | Q5_1 down: 0.1797 -> 0.2073 ms/layer | byte-neutral 128-value panel repack; bit-identical but slower |
+| `--q4-tail-skip 7` | 3.6k: 105.8 ms/step (9.45 tok/s) | drops a miss whose best batch rank is >= 7; approximate (can flip a near-tie) |
 
-#### 4.4.3 Batched at depth 16 384
+The default is 0 (the exact expert set); `--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N`
+opts in (1..9 meaningful).  Every row in this table was measured on the same
+A/B binary as the default cell it is compared with.
 
-Not run: the policy is one row per forward, and the 2-row forward is already
-0.85x at depth 512.
-
-#### 4.4.4 One card only (the x16 slot)
-
-The bank's expert H2D runs at **9.96 GB/s** on the x16 card and **5.17 GB/s**
-on the x8 one, so it is worth asking whether putting every layer on the x16
-card wins.  It does not:
-
-| depth | pp (dual -> one card) | tg (dual -> one card) | ms/step |
-|---:|---:|---:|---:|
-| 512 | 50.7 -> 48.8 tok/s | 10.68 -> 9.84 tok/s | 93.6 -> 101.6 |
-| 16 037 | 48.9 -> 44.5 tok/s | 9.22 -> 9.37 tok/s | 108.5 -> 106.8 |
-| 48 222 | 42.8 -> - | 9.21 -> - | - |
-
-`--layer-map 0-47:gpu.0` with the second card hidden
-(`ONEAPI_DEVICE_SELECTOR=level_zero:1`) fits **5 250 MB of dense weights plus
-only a 4 000 MB bank = 28 slots/layer** (3.8 GiB) in 15.5 GiB - the 16 GB of
-VRAM, not the link, is the constraint, and 5 000 MB fails to allocate.  With a
-quarter of the slots the bank misses far more often, which cancels the faster
-link: the single card is **8 % slower at 512 depth**, a wash at 16k, and
-**cannot run a 48k context at all** (the 1.1 GB KV plus a working bank does not
-fit).  The dual card remains the configuration to run.
-
-Detailed logs - QSA Stage 1/2, the 2-row breakdown, tail-skip, the MTP no-go,
-the prefill ceiling, the dense/routed stage budget and the dead ends of this
-pass - are in
+Detailed logs - the QSA stages, the 2-row breakdown, tail-skip, the MTP no-go,
+the prefill ceiling, the per-stage budget and the dead ends - are in
 [`design/18-qwen4exp.md`](design/18-qwen4exp.md) §4, §6, §7 and §9.
 
 ### 4.5 On the Arc 140V (Lunar Lake), one card
@@ -700,14 +629,11 @@ head_dim 256 over 4 kv heads (each kv head is read six times per layer), while
 the 35B's 20 attention layers have head_dim 128 over 8 kv heads.
 
 **qwen4exp is the exception: its decode steps up at the sparse-QSA boundary and
-is not depth-flat above it.**  The 512-token cell (QSA off/dense) is 93.3 ms;
-the sparse path measures 135-137 ms at 2.4k, 121 ms at 16k and 154 ms at 48k.
-The selector scores every pooled key before choosing the top 2 048, so its host
-cost grows with the key count while the device attention stays fixed at 2 048
-rows; the 2.4k-versus-16k difference is not a depth effect (both read 2 048 keys)
-and was not bisected.  Its
-prefill falls monotonically with prompt length (53 -> 41 -> 36 tok/s) because
-each chunk attends to all the KV before it.
+grows with depth.**  The 512-depth cell (QSA off/dense) is 88.2 ms; the sparse
+path is 110.2 ms at 3.6k and 119.7 ms at 14.6k.  The selector scores every
+pooled key before choosing the top 2 048, so its cost grows with the key count
+while the device attention stays fixed at 2 048 rows.  Prefill is 51.7 tok/s at
+468 tokens and 55.9 tok/s at 3,660 tokens on the current build.
 
 **Batching amortises the weight pass, and the marginal row gets dearer.**  The
 aggregate throughput grows with the batch; the per-row cost falls at first (the
@@ -772,10 +698,9 @@ PF_MTP_TIME=1 ./dev/bench_mtp "$M35" "$LM35" 128 4 3
 # the request's [q4] fwd n>1 lines, tg the mean of its n=1 lines.
 M4=/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 PF_Q4_TIME=1 PF_PREFIX_CACHE=0 ./build/sycl-infer \
-  --model "$M4" --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
-  --cpu-threads 28 --ctx 32768 --kv-type f16 --port 18082 serve
+  --model "$M4" --layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 \
+  --cpu-threads 28 --ctx 32768 --kv-type f16 --q4-tail-skip 0 --port 18082 serve
 python3 /tmp/sse_client.py 18082 "$(cat 16k.txt)" 10
-# the 48k cell: --ctx 65536 --moe-vram-mb 16000 (17 500 does not allocate)
 ```
 
 **One process per cell**, and never two GPU jobs at once: a prefix-cache hit

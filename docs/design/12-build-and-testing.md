@@ -418,25 +418,26 @@ M27=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf
 
    ```bash
    ./build/sycl-infer --model "$Q4" \
-     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+     --layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 \
      --ctx 2048 --kv-type f16 gen --raw --temp 0 --max-tokens 16 \
      --prompt "What is 12 multiplied by 9?"
    ./build/sycl-infer --model "$Q4" \
-     --layer-map 0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500 \
+     --layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 \
      --ctx 2048 --kv-type f16 gen --raw --temp 0 --max-tokens 48 \
      --prompt "What is the difference between TCP and UDP?"
    ```
 
-3. **Prefill 重复性**：同一个 512-token raw prompt 跑两次，第一次约 11.4 s（校准），稳定后
-   **~9.6 s = 56 tok/s**；`PF_Q4_PF_STATS=1` 应打印每层的 `act/hot/kept/batches/copies`，
-   且 `batches > 1` 表示两遍路径确实被触发。`dev/bench_pf`（gitignored）是这条的 harness：
-   `PF_MOE_VRAM_MB=17500 ./dev/bench_pf "$Q4" 512 1 "0-23:gpu.0,24-47:gpu.1"`。
+3. **Prefill 重复性**：3,660-token prompt 的 warm prefill 是 **65.4 s = 55.9 tok/s**（468-token: 9.05 s / 51.7 tok/s）
+   （第一次会校准 bank，慢 2-3 s）；`PF_Q4_PF_STATS=1` 应打印每层的
+   `act/hot/kept/batches/copies`，且 `batches > 1` 表示两遍路径确实被触发。
+   `dev/bench_pf`（gitignored）是这条的 harness：
+   `PF_MOE_VRAM_MB=17500 ./dev/bench_pf "$Q4" 512 1 "0-19:gpu.0,20-47:gpu.1"`。
 
-4. **Layer map / bank**：推荐 `0-23:gpu.0,24-47:gpu.1 --moe-vram-mb 17500`，启动打印
-   `hot expert bank: 121 slots/layer, 47 layers, 16.5 GiB`；decode 在 ~16 token 后稳定在
-   **~93.3 ms/token（10.7 tok/s）**。`PF_Q4_FFCMP=<layer>`（例如 `1`）给出 routed GPU FFN
+4. **Layer map / bank**：推荐 `0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500`，启动打印
+   `hot expert bank: 152 / 104 slots/layer, 47 layers, 17.0 GiB`；decode 在 ~16 token 后稳定在
+   **~88.2 ms/token（11.34 tok/s）**（512 depth；3.6k 110.2 ms，14.6k 119.7 ms）。`PF_Q4_FFCMP=<layer>`（例如 `1`）给出 routed GPU FFN
    对主机参考的 cosine **0.99998**。20000 MB 必须在加载时失败；18000 MB 能加载
-   （125 slots，17.0 GiB）但**不比 17500 快**，不要当成回归。
+   但**不比 17500 快**，不要当成回归。
 
 **0.8B 不在 bench 机上**：`test_decode_vs_prefill` 的默认模型和 §3.4 的 tied-embedding 用例
 需要另找一台有 0.8B GGUF 的机器；bench-host 上只跑 27B / 35B / qwen4exp。
