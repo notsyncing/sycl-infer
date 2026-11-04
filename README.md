@@ -177,6 +177,15 @@ its first token** (351 tok/s): the difference is the HTTP round trip, the chat
 template, the lazily grown KV pool and the first token's own head — see
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
+The same 35B also runs **single-device on an Arc 140V (Lunar Lake)**: **641
+tok/s** prefill (3.4k-token prompt) and **~30 tok/s** decode, i.e. **1.14-1.23x**
+the OpenVINO reference engine on prefill and 0.68-0.76x on decode.  There the
+device's 28.12 GiB is shared with the host and Level Zero does not enforce it, so
+the context capacity is a host-memory question: **448k tokens at i8 / 896k at
+i4** is the safe maximum, with the trained 262k window leaving 2.5-3.1 GiB free.
+The budget, the measured maxima and the adaptive expert-bank governor are in
+[`AGENTS.md`](AGENTS.md) (*Long context on the Arc 140V*).
+
 ## Requirements
 
 * Linux, C++17, CMake ≥ 3.20

@@ -286,6 +286,36 @@ i4 的 16）拿到接近 i8 的精度，并能装下 262144 上下文；`i8:i4` 
 * 前缀缓存开启时预留至少 `pc_max_states` 块：每个**有状态**的缓存节点还占一个 KV 块
   （`engine.cpp:489-494`）。这仍然是地址空间而非已提交内存。
 
+### 8.1 共享显存设备上的上下文上限（Arc 140V）
+
+在共享 LPDDR 的 iGPU 上（Lunar Lake / Arc 140V，`global_mem_size` 28.12 GiB，与
+30 GB 主机共享同一块内存），**Level Zero 不强制 `global_mem_size`**：它会一直授予
+device USM 直到主机 RAM 耗尽（约 29 GB 总量），超限表现为
+`UR_RESULT_ERROR_DEVICE_LOST`（主机 `MemAvailable` 0-300 MB），而不是干净的
+`device alloc failed`。驱动自报的 `free_memory` 在两次运行间摆动 ±2.5 GB，不能当
+容量依据；`PF_MEM_REPORT=1` 打印引擎自己的 `dev_used_bytes_` 记账，是确定性的。
+
+每 token 的 KV（35B A3B：10 层 full attention × 2 个 kv head × 256）：
+**i8 = 10 625 B/token**（10 240 数据 + 640 scale），**i4 = 5 625 B/token**。
+`--max-slots` 只缩循环状态：**62.7 MiB/slot**。
+
+启动预算（ctx 1024、`--max-slots 1`、双 bank）：gate/up u4 bank 12 800 MiB +
+down int8 bank 10 656 + dense/u4 head/norms 1 656 + KV 170 + 激活/状态/scratch
+~1 323 = **27 235 MiB**，只剩 ~1.1 GiB 给同一块内存上的主机。
+
+实测最大上下文（能分配**且**输出连贯；`--layer-map 0-39:gpu.0`）：
+
+| 配置 | KV | 绝对上限 | 安全（留 2 GiB 给主机） |
+|---|---|---:|---:|
+| 双 bank | i8 | 196 608 | 无（基线只剩 ~1.1 GiB） |
+| 砍 down bank | i8 | 704k | **458 752** |
+| 双 raw（连 u4 也砍） | i4 | **1 310 720** | **917 504** |
+
+训练窗口 262 144 在 i8 下留 2.5-3.1 GiB、i4 下 3.8-4.4 GiB。超过训练窗口需要
+`--yarn`（空间够，质量另说）。512 块的启动 floor 在短上下文多占 ≤150 MiB，
+`--blocks` 可精确设置；`PF_KV_GROW` 对固定池无效。专家 bank 的自适应削减见
+[15-moe-ncmoe.md](15-moe-ncmoe.md) §7.4。
+
 ---
 
 ## 9. 相关环境变量

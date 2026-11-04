@@ -944,6 +944,62 @@ and no amount of overlap recovers more than the 5.8% above.
   returns 1 for any mismatch, which the scan keeps on disk, counts in the budget
   and never parses, so a layout change costs a cold cache and nothing else.
 
+### Long context on the Arc 140V (Lunar Lake)
+
+The 35B A3B also runs single-device on an Arc 140V (64 EU Xe2, Lunar Lake).
+The device reports 28.12 GiB of `global_mem_size`, but **Level Zero does not
+enforce it on this shared-memory part**: it keeps granting device USM until the
+host is out of RAM (~29 GB total), and an over-commit surfaces as
+`UR_RESULT_ERROR_DEVICE_LOST` with host `MemAvailable` at 0-300 MB, not as a
+clean `device alloc failed` (that appears only for absurd sizes).  The driver's
+`free_memory` swings by +-2.5 GB between runs and is not a capacity oracle;
+`PF_MEM_REPORT=1` prints the engine's own `dev_used_bytes_` accounting, which is
+deterministic and is what the numbers below use.
+
+Startup budget (measured, ctx 1024, `--max-slots 1`, `PF_W4_ALL=1`, G=32):
+
+| item | MiB |
+|---|---:|
+| gate/up u4 bank, 40 layers | 12 800 |
+| down int8 bank, 37 Q5_K layers | 10 656 |
+| dense u4 + u4 LM head + norms | 1 656 |
+| KV, 512-block floor | 160 + 10 (scales) |
+| raw non-expert uploads + activations + state + scratch | ~1 323 |
+| **own total** | **27 235** of 28 795 |
+
+KV is **10 625 B/token at i8** (10 240 data + 640 scales) and **5 625 at i4**;
+`--max-slots` costs **62.7 MiB per slot** (the recurrent state).  The 512-block
+KV floor over-allocates by <=150 MiB at a short context; `--blocks` sizes it
+exactly and `PF_KV_GROW` does not apply to a fixed pool.
+
+**The two banks are 23.4 GiB of the 28.1 GiB device**, leaving ~1.1 GiB for a
+host on the same LPDDR.  `PF_MOE_BANK_AUTO` (default on) defers the raw
+gate/up/down planes until the KV pool and the activation buffers exist, then
+keeps the banks that fit in `global_mem_size - PF_MOE_BANK_RESERVE_MB (2048) -
+own`, shedding the down bank first (4.1 GiB net for ~12-14% prefill) and the
+gate/up bank only if even that does not fit (1.3 GiB for ~25% prefill), and
+uploads the shed planes raw.  `=0` restores the eager both-bank setup;
+`PF_MOE_DOWN_I8=0` / `PF_MOE_U4BANK=0` still force one off.
+
+Measured max context (the largest `--ctx` that allocates *and* answers
+coherently; one stream, `--layer-map 0-39:gpu.0`):
+
+| config | KV | absolute | safe (>=2 GiB host reserve) |
+|---|---|---:|---:|
+| both banks | i8 | 196 608 | none (the baseline leaves ~1.1 GiB) |
+| down bank shed | i8 | 704k | **458 752** |
+| both raw (u4 shed too) | i4 | **1 310 720** | **917 504** |
+
+At the trained 262 144 window the governor leaves 2.5-3.1 GiB (i8) or 3.8-4.4
+(i4).  Contexts beyond 262 144 are outside the trained window and need
+`--yarn` - the space is not the constraint, the quality is.  Cost of the
+governor at a normal context: own 27 235 -> 23 091 MiB, prefill +13.7%, decode
+-5% (the raw down plane is 6.5 GiB against the int8 bank's 10.4, and it decodes
+faster here).  Recommended: `--ctx 458752 --kv-type i8` or `--ctx 917504
+--kv-type i4` for the largest safe context; `PF_MOE_BANK_RESERVE_MB=0` keeps
+both banks for a prefill/RAG workload (and leaves the ~1.1 GiB that is the crash
+class).
+
 ### Benchmarking on the 2x A770 box
 
 Everything in the two drafter sections below, and the throughput table in
@@ -3268,6 +3324,15 @@ name.
   `PF_MOE_HIST` schedule model prices; the old "cfg 43 means 8, else 16" guess
   mis-priced every makespan.  The Iris Xe row copies all of them and marks them
   inherited.
+* **The `arc_140v` (Lunar Lake, 64 EU) values that ARE swept on that part**:
+  `moe.gu_tile` = **32** (5.46 s against the cost model's 5.65 s on a
+  3.3k-token 35B prefill - the cost model's rate table is isolated-GEMM data
+  and over-values 96/128 in situ), `moe.dn_tile` = **96** (5.36 s against 128's
+  5.46; 192/256 lose), `moe.w4_qfuse` = **1** (the M=1 quantize+u4-GEMV fusion;
+  it took the decode's launches from 552 to 142 per step), plus the earlier
+  `attn.xmx_min_keys` 512, `gdn_cols` 8, `moe.row_gemv`/`tiled` 1 and
+  `hw.sub_group8` 0.  The A770 and Iris Xe rows keep `gu_tile`/`dn_tile` 0
+  (the old cost model / 128) and `w4_qfuse` 0, marked unmeasured there.
 * **What stays a literal**: hardware facts SYCL already reports and that cannot
   change with tuning — they are queried, with the profile as the fallback.  And
   anything a *model* dictates rather than a card (`kBlockSize`, `kI8Q`,
@@ -3618,7 +3683,10 @@ addresses - an internal media server, and SSRF exposure again),
 **Diagnostics**
 `PF_MODEL_INFO=1` (print the resolved model profile, its policy/weight/
 capability fields and its provenance at load; the model-side counterpart of
-`PF_DEVICE_INFO`), `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
+`PF_DEVICE_INFO`), `PF_MEM_REPORT=1` (the engine's own device accounting:
+`dev_used_bytes_` per device and the deducted free memory, which is
+deterministic - the driver's `free_memory` on a shared-memory iGPU swings by
++-2.5 GB between runs and is not a capacity oracle), `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
 `PF_TIME`, `PF_DBG_MID` (stop after embedding/norm/attn/ffn), `PF_DBG_GEMV`,
 `PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`,
 `PF_HOSTPROF=1` (the `PF_PROF` block breakdown *without* the per-stamp device
@@ -3772,7 +3840,15 @@ pp512 for +6% tg128 and -2.1 GB/card),
 `PF_W4_ALL` (`1` re-quantizes every
 other type onto the same 4-bit grid: 16.0 vs 24.5 GB read per 27B decode token,
 measured tg128 12.6 -> 16.2 t/s but -20% prefill and ~8x weight error vs fp32),
-`PF_SI4` (SIn 4-bit), `PF_META`.
+`PF_W4_GROUP` (the u4 scale/off plane's group width, `32|64|128`, default 32;
+128 is 0.53125 B/w against 0.625 - measured decode +5.4% and 1.88 vs 2.08
+GB/token, but the 288-token greedy stream diverges at step 24 (G=64 at 36) as a
+near-tie, so it is opt-in), `PF_HEAD_U4` (**default on**: an extra u4 store for
+the LM head beside the int8 one; the head is 29% of this model's decode stream,
+5.05 -> 2.90 ms/token and +6.5% decode, top-1 identical on 3/3 prompts),
+`PF_W4_QFUSE` (default: the queue profile's `moe.w4_qfuse`; fuse a mode-0
+call's activation quantizer into its u4 GEMV - 552 -> 142 launches/step,
+-0.4 ms/token), `PF_SI4` (SIn 4-bit), `PF_META`.
 
 **Expert split / ncmoe / three-tier expert cache** (`--moe-resident N`,
 `--moe-vram-mb MB`, `--moe-ram-mb MB`; routed-MoE models only, see
@@ -3813,7 +3889,18 @@ resident, the default and what a model that fits does anyway),
 count, and the bank's *content* is the measured hot set from `moe_calibrate()`,
 not an index range), `PF_MOE_RAM_MB` (host budget for the RAM tier of expert
 blocks, an LRU keyed by (layer, expert); 0 = off. Measured 48-66 % hit rate at
-150 MB on the 35B A3B). Diagnostics: `PF_MOE_CPUDBG` (per-layer
+150 MB on the 35B A3B). `PF_MOE_BANK_AUTO` (**default on**: defer the raw
+gate/up/down planes and keep only the expert banks that fit in `global_mem_size
+- PF_MOE_BANK_RESERVE_MB - own`, shedding the down int8 bank first and the
+gate/up u4 bank only if even that does not fit - see *Long context on the Arc
+140V*), `PF_MOE_BANK_RESERVE_MB` (the host reserve for that decision, default
+2048; `0` keeps both banks when they physically fit), `PF_MOE_DOWN_I8` (`0`
+keeps the down plane raw; the int8 bank is 10.4 GiB against the raw 6.5, and on
+the 140V dropping it is 4.1 GiB net for +12-14% prefill and -5% decode),
+`PF_MOE_U4BANK` (`0` keeps gate/up raw: 11.25 GiB against the u4 bank's 12.8;
+measured decode-positive on the 140V, prefill-negative), `PF_MOE_GU_TILE` /
+`PF_MOE_DN_TILE` (the banked prefill expert GEMM's M; default the queue
+profile, 0 = the cost model). Diagnostics: `PF_MOE_CPUDBG` (per-layer
 `spilled of n_pairs`), `PF_MOE_REFDUMP` (per-layer routed fingerprint
 sum/sumsq/max), `PF_MOE_REFDUMP_ALL` (every layer instead of layer 0 -
 **the only switch worth trusting**: a layer-0-only dump cannot see the layers
@@ -3900,6 +3987,35 @@ Measurements are on the 2x A770 box (two Arc A770, driver 12.55.8) unless
 stated.  The 35B A3B is `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` with
 `--layer-map 0-19:gpu.0,20-39:gpu.1`; the 27B is `Qwen3.8-27B-UD-Q4_K_M.gguf`
 with `--layer-map 0-31:gpu.0,32-63:gpu.1`.
+
+### The 35B A3B on the Arc 140V: what the numbers are
+
+The same model runs **single-device** on an Arc 140V (64 EU Xe2, 107.4 GB/s
+measured read, shared LPDDR5X) with `PF_W4_ALL=1` (a u4 store for the whole
+dense half, which the file ships as Q8_0), the resident per-expert u4 gate/up
+bank + raw or int8 down, and the u4 LM head:
+
+| cell | measured | note |
+|---|---:|---|
+| prefill, 3.4k tokens | **641 tok/s** (5.35 s) | 3.2k cell 618-641; OVMS ~550 |
+| prefill, 11.5k / 24k | ~540 / ~466 tok/s | OVMS 473 / 398 (1.14x / 1.17x) |
+| decode, short | **~30 tok/s** (33 ms/token) | 2.07 GB/token; OVMS 40 |
+| decode, 11.5k / 24k | ~23 / ~19 tok/s | attention grows with depth |
+
+* **Decode is 70% weight stream**: 2.07 GB/token (dense u4 1.20, expert bank
+  0.63 + raw down 0.24, u4 head 0.32) at 87-92 GB/s of the 107.4 peak = ~23 ms of
+  the 33.  The absolute floor is 19.3 ms (52 tok/s); the rest is GDN 2.0 ms
+  (112 MiB/token of recurrent state at the memory floor), router 1.1, attention
+  0.7, norm 0.6 and ~4-5 ms of host/launch/sampling.
+* **The dense u4 store is quality-neutral here**: `PF_W4_ALL=1` (a re-quantization
+  of Q8_0 at ~8% weight error) reproduces the 288-token greedy stream
+  byte-identically to the int8 path, top-1 identical on every prompt tried.
+  "4-bit dense derails the model" was the `residual == out` aliasing bug in
+  `gemm_w4`'s correction path (`0b8eda1`), not precision.
+* **The banks are a prefill vs decode trade on this part**: the u4 gate/up bank
+  is +25% prefill / decode-negative (raw Q4_K is 0.5625 B/w against the bank's
+  0.625), and the down int8 bank is +12-14% prefill / -5% decode.  See *Long
+  context on the Arc 140V* for the governor that sheds them for context.
 
 ### The routed experts: the state, and the wall they are against
 
@@ -4544,6 +4660,20 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   `keep` set of `release_host_weight_pages` - including the globals
   (`tok_embd` / `output` / `output_norm`) when backend 0 is a CPU partition (an
   all-`cpu` map, where they are never uploaded).
+
+* **A tensor that is converted to oneDNN must have a device copy *or* a plan
+  `xq` entry, never neither.**  `PerfHead`-era regression (`955045d`): the
+  vision tower needed F16/F32/BF16 sources, so `add_weight` began accepting
+  them unconditionally; the *text* loop then converted GDN's F32
+  `ssm_beta`/`ssm_alpha`.  `build_plan` gives those tensors their own call with
+  no `xq` (they were never oneDNN-convertible), so the call keeps the fp32
+  fallback - but their weight was converted, `page_out_tensor` released the
+  host mmap and `upload_device_weights` skipped the raw copy.  The GPU then
+  read a released host VA: 64 KB-stride page faults, `Engine reset: ccs`,
+  `DEVICE_LOST` on the first forward.  The fix is
+  `t.type != 0/1/30` in the text weight loop; the invariant is the sentence
+  above.  A defence-in-depth assertion in `build_plan`/`gemv_at` (a converted
+  weight implies `xq` or a device map entry) would make it unrepeatable.
 
 * **Graph capture**: a value read on the host during `record_forward` is frozen
   into the graph.  Per-step state (positions, token ids, `n_real`, active rows)

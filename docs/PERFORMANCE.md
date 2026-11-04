@@ -333,6 +333,37 @@ the prefill ceiling, the dense/routed stage budget and the dead ends of this
 pass - are in
 [`design/18-qwen4exp.md`](design/18-qwen4exp.md) §4, §6, §7 and §9.
 
+### 4.5 On the Arc 140V (Lunar Lake), one card
+
+`--layer-map 0-39:gpu.0`, i8 KV, `PF_W4_GROUP=32 PF_W4_ALL=1
+PF_PREFIX_CACHE=0`, u4 dense + u4 LM head + the resident u4 gate/up bank and the
+down int8 bank (the `PF_MOE_BANK_AUTO` governor keeps both only when they fit;
+see [AGENTS.md](../AGENTS.md) *Long context on the Arc 140V*).  Prefill is the
+`e2e_ttft` of a prose prompt minus the first token; decode is the SSE
+chunk-to-chunk rate, 32-vs-288 differencing, temperature 0, 2026-11.
+
+| cell | prefill | rate | decode | vs OVMS |
+|---|---:|---:|---:|---:|
+| 3.4k prompt | 5.35 s (best of 3, warm) | **641 tok/s** | ~30 tok/s | 1.17x / 0.76x |
+| 11.5k | 21.3 s | ~540 tok/s | ~23 tok/s | 1.14x / 0.68x |
+| 24k | 51.6 s | ~466 tok/s | ~19 tok/s | 1.17x / 0.70x |
+
+The 11.5k/24k prefill cells predate the `moe.gu_tile=32`/`dn_tile=96` sweep
+(-4.6% at 3.4k), so the shipped build is a little faster than the column.  OVMS
+(OpenVINO GPU plugin, int4 group-64 everywhere, FP32 MatMuls) is **40 tok/s
+short** / 473 @11.5k / 398 @24k: the prefill is **1.14-1.23x** the reference
+engine and the decode is **0.68-0.76x**, because our per-token stream is
+2.07 GB of mostly 0.625 B/w u4 against its ~0.54 B/w int4 plus a smaller
+non-stream share.  Decode's own split: dense 1.20 GB (13 ms), routed bank
+0.87 GB (11 ms), GDN 2.0 ms (state floor), router 1.1, attention 0.7, norm 0.6
+and ~4-5 ms host/launch/sampling - 70% of the step is the weight stream at
+87-92 GB/s of the 107.4 GB/s measured peak.
+
+Context capacity on this part is in
+[AGENTS.md](../AGENTS.md) *Long context on the Arc 140V* (the device's 28.12
+GiB is not enforced by Level Zero; 448k at i8 / 896k at i4 are the safe
+maxima, 262k the trained window).
+
 ## 5. Qwen3.8-27B — the dense model
 
 `Qwen3.8-27B-UD-Q4_K_M.gguf`, `qwen35`: 64 layers, 16 full-attention (24 query

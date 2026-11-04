@@ -284,6 +284,26 @@ LRU 的淘汰单位是**一整个专家**（三个平面一起）。
 实测 `--moe-resident 64` 时释放量从 21603 MB 降到 2396 MB——差额就是保住的主机侧
 专家页。
 
+### 7.4 共享显存上的自适应 bank（`PF_MOE_BANK_AUTO`，默认开）
+
+在共享 LPDDR 的设备上（Arc 140V，`global_mem_size` 28.12 GiB 与 30 GB 主机共用），
+两个专家 bank 合计 23.4 GiB，只剩 ~1.1 GiB 给同一块内存上的主机——一个额外分配
+就会 `UR_RESULT_ERROR_DEVICE_LOST`（L0 不强制 `global_mem_size`，见
+[05-kv-cache.md](05-kv-cache.md) §8.1）。
+
+`finalize_moe_banks()` 在 `alloc_buffers()` 末尾（KV 池与激活/状态缓冲已分配之后）
+用 `global_mem_size - PF_MOE_BANK_RESERVE_MB(2048) - dev_used_bytes_` 算余量，按
+价值/字节保留：先保 gate/up u4（1.3 GiB 换 ~25% prefill），不够再连它一起砍；
+被砍的平面改为 raw 上传（`upload_raw_tensor`，在主机页释放之前）。
+
+down int8 bank **先砍**：净占 4.1 GiB（int8 10.4 vs raw 6.5），只换 ~12-14%
+prefill，而 decode 反而慢 5%（raw Q5_K 0.6875 B/w 对 int8 1.125）。`=0` 恢复旧的
+eager 双 bank；`PF_MOE_DOWN_I8`/`PF_MOE_U4BANK` 仍可单独强制关；`PF_MOE_BANK_RESERVE_MB=0`
+在物理放得下时保双 bank。
+
+实测：普通 ctx 下自身占用 27 235 -> 23 091 MiB，prefill +13.7%、decode -5%；
+最大安全上下文从"无"（基线 1.1 GiB 余量）变为 **448k (i8) / 896k (i4)**。
+
 ---
 
 ## 8. 多设备与 CPU 分区
