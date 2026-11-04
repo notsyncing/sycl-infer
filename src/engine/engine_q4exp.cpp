@@ -167,6 +167,10 @@ void engine::q4_alloc() {
         // faster on the 2412-token cell with the same 32-token stream and
         // byte-identical selector.  PF_QSA_DEVATTN=0 keeps the host Stage 1.
         qsa_devattn_ = SI_ENV_I32("PF_QSA_DEVATTN", 1) != 0;
+        // Early `mixed` D2H + non-blocking `sel` H2D (scheduling only; see
+        // qsa_early_mixed).  Default on after validation; =0 restores the old
+        // placement and waits so one binary measures both arms.
+        qsa_early_ = SI_ENV_I32("PF_QSA_EARLY", 1) != 0;
         // Sparse prefill on the device (the selector stays on the host).  The
         // wave is bounded by kMaxB because the scratch step_info is kMaxB rows.
         qsa_pf_dev_ = SI_ENV_I32("PF_QSA_PF_DEV", 1) != 0;
@@ -176,6 +180,7 @@ void engine::q4_alloc() {
             v.resize((size_t)state_slots_);
         }
         qsa_pending_.resize((size_t)attn_layers());
+        qsa_early_ev_.resize((size_t)attn_layers());
         fprintf(stderr, "[q4] QSA: host indexer, top-%d of %d-key pools (ctx %d > %d)\n", hp.idx_top_k, hp.idx_kpool,
                 max_seq, hp.idx_top_k);
     }
@@ -2091,6 +2096,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             ph1(dev, ph_t, t_go, true);
         } else {
             n_attn_l++;
+            // Enqueue this layer's `mixed` D2H before the QKV GEMVs.  `mixed`
+            // is already final after hc_mix and the QKV/rope chain does not
+            // touch it, so the host indexer/selector can start as soon as the
+            // copy lands instead of after the whole chain is drained in
+            // qsa_attention.  `PF_QSA_EARLY=0` disables it (old placement).
+            if (!abl_nomix) {
+                qsa_early_mixed(attn_idx, L, dev, mode, n_tok, inf, b.mixed);
+            }
             // A dense prefill chunk's K/V copies ride a separate queue; put the
             // dependency back before the qkv GEMV overwrites KBUF/VBUF.
             if (qsa_on_) {

@@ -187,6 +187,46 @@ void engine::qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int 
     }
 }
 
+// PF_QSA_EARLY: enqueue the per-layer `mixed` D2H before the QKV GEMVs.  The
+// copy writes the same pinned staging that qsa_attention used to fill after
+// qk_norm_rope, and it is submitted on the main in-order queue after hc_mix
+// (its producer) and before the next layer's hc_mix (which rewrites the
+// source), so the queue ordering provides both dependencies.  The event is
+// consumed by qsa_attention, which then waits for this 10 KB copy alone instead
+// of draining the whole QKV/rope chain.
+void engine::qsa_early_mixed(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
+                             const float * mixed) {
+    if (!qsa_early_ || !qsa_on_ || !qsa_devattn_ || mode != 0 || n_tok != 1 || a < 0
+        || a >= (int)qsa_cache_.size() || a >= (int)qsa_early_ev_.size()) {
+        return;
+    }
+    const bool is_cpu_dev = multi_dev ? (dev_kind_[(size_t)dev] == 1) : cpu_mode;
+    if (is_cpu_dev || !L.idx.ok()) {
+        return;
+    }
+    const hparams & hp = m.hp;
+    if (hp.head_dim != 256 || kv_k_dtype() != kv_dtype_t::f16 || kv_v_dtype() != kv_dtype_t::f16) {
+        return;
+    }
+    const int slot = inf->slot[0];
+    const int pos = inf->pos[0];
+    if (slot < 0 || slot >= (int)qsa_cache_[(size_t)a].size()) {
+        return;
+    }
+    // Dense-equivalent tokens are deferred by qsa_attention, not waited for.
+    if (pos + 1 <= hp.idx_top_k) {
+        return;
+    }
+    // Stage first so qsa_attention's own qsa_stage_ensure(a, 1, ...) is a
+    // no-op and the pointer the copy wrote is the one the host update reads.
+    qsa_stage_ensure(a, n_tok, false, false, dev);
+    qsa_stage & st = qsa_stage_[(size_t)a];
+    qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
+    ec.ev = dev_queue(dev).memcpy(st.mixed, mixed, (size_t)n_tok * (size_t)hp.n_embd * sizeof(float));
+    ec.dev = dev;
+    ec.valid = true;
+}
+
 // Put the main queue's dependency on the deferred K/V copy back before the
 // next attention layer's qkv GEMV overwrites KBUF/VBUF.  It is a device-side
 // barrier (not a host wait), so the three GDN layers and FFNs in between still
@@ -488,8 +528,12 @@ void engine::qsa_devattn_aux(int a, int dev) {
     const size_t ntok_max = (size_t)kMaxB * kMaxT;
     x.hsel = (int32_t *)sycl::malloc_host(ntok_max * (size_t)d.cap_keys * sizeof(int32_t), q);
     x.hcnt = (int32_t *)sycl::malloc_host(ntok_max * sizeof(int32_t), q);
+    // The decode `sel` staging is one row, so two buffers of cap_keys are tiny
+    // next to the prefill staging above.
+    x.dsel_stage[0] = (int32_t *)sycl::malloc_host((size_t)d.cap_keys * sizeof(int32_t), q);
+    x.dsel_stage[1] = (int32_t *)sycl::malloc_host((size_t)d.cap_keys * sizeof(int32_t), q);
     x.sinfo = (step_info *)dev_alloc_on(dev, sizeof(step_info));
-    if (!x.hsel || !x.hcnt || !x.sinfo) {
+    if (!x.hsel || !x.hcnt || !x.sinfo || !x.dsel_stage[0] || !x.dsel_stage[1]) {
         throw std::runtime_error("qwen4exp: QSA Stage 2 aux allocation failed");
     }
     x.dev = dev;
@@ -512,12 +556,30 @@ void engine::qsa_devattn_run(int a, int dev, int slot, int pos, const std::vecto
     }
     const int nblk = (nsel + kBlockSize - 1) / kBlockSize;
     sycl::queue & q = dev_queue(dev);
-    // The pinned staging is per layer, but it is reused by the next token; wait
-    // for the (small) copy so the host write cannot race it.  The queue is
-    // already drained by the mixed-copy wait, so this is the copy alone.
-    std::memcpy(x.hsel, sel.data(), (size_t)nsel * sizeof(int32_t));
-    sycl::event e = q.memcpy(d.dsel, x.hsel, (size_t)nsel * sizeof(int32_t));
-    e.wait();
+    // PF_QSA_EARLY: issue the `sel` H2D without a host wait so it does not
+    // drain the layer's QKV/rope chain.  Two pinned buffers are round-robined;
+    // before a buffer is rewritten, the copy that last read it (two calls
+    // earlier, i.e. the previous token's use of this parity) is waited for.
+    // That event is ordinarily long complete, and an event wait only covers
+    // its own copy, not the queue tail.  The gather below is submitted after
+    // this H2D on the same in-order queue, so the device still orders it.
+    if (qsa_early_) {
+        const int par = x.dsel_par;
+        x.dsel_par ^= 1;
+        if (x.dsel_ev_valid[par]) {
+            x.dsel_ev[par].wait();
+            x.dsel_ev_valid[par] = false;
+        }
+        std::memcpy(x.dsel_stage[par], sel.data(), (size_t)nsel * sizeof(int32_t));
+        x.dsel_ev[par] = q.memcpy(d.dsel, x.dsel_stage[par], (size_t)nsel * sizeof(int32_t));
+        x.dsel_ev_valid[par] = true;
+    } else {
+        // The pinned staging is per layer, but it is reused by the next token;
+        // wait for the (small) copy so the host write cannot race it.
+        std::memcpy(x.hsel, sel.data(), (size_t)nsel * sizeof(int32_t));
+        sycl::event e = q.memcpy(d.dsel, x.hsel, (size_t)nsel * sizeof(int32_t));
+        e.wait();
+    }
     const char * kp = nullptr;
     const char * vp = nullptr;
     const char * ksc = nullptr;
@@ -780,7 +842,24 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     const size_t mb = (size_t)n_tok * (size_t)n_embd * sizeof(float);
     const size_t qb = (size_t)n_tok * (size_t)nh * (size_t)stride * sizeof(float);
     const size_t kb = (size_t)n_tok * (size_t)kvd * sizeof(float);
-    (void)to_host_async(st.mixed, mixed, mb);
+    // PF_QSA_EARLY: the dev-attn sparse path's `mixed` D2H was enqueued by
+    // qsa_early_mixed() before this layer's QKV GEMVs.  Consume that event and
+    // wait for the 10 KB copy alone.  The dev-attn path reads nothing else
+    // from the device (update_mirror is off), so the old full queue drain was
+    // only waiting for the QKV/rope chain the host does not need yet.
+    bool early = false;
+    sycl::event early_ev;
+    if (qsa_early_ && dev_attn && !is_cpu(dev) && a < (int)qsa_early_ev_.size()) {
+        qsa_early_copy & ec = qsa_early_ev_[(size_t)a];
+        if (ec.valid && ec.dev == dev) {
+            early = true;
+            early_ev = ec.ev;
+            ec.valid = false;
+        }
+    }
+    if (!early) {
+        (void)to_host_async(st.mixed, mixed, mb);
+    }
     if (need && !dev_attn) {
         (void)to_host_async(st.q, qbuf, qb);
     }
@@ -789,7 +868,11 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         (void)to_host_async(st.v, vbuf, kb);
     }
     if (!is_cpu(dev)) {
-        dev_queue(dev).wait();
+        if (early) {
+            early_ev.wait();
+        } else {
+            dev_queue(dev).wait();
+        }
     }
     if (qtime) {
         qsa_copy_ms_ += qsa_now_ms() - q_t0;

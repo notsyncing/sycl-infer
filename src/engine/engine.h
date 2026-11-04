@@ -785,6 +785,22 @@ struct engine {
         float * v = nullptr;
     };
     std::vector<qsa_pending> qsa_pending_;
+    // PF_QSA_EARLY (default on): enqueue the per-layer `mixed` D2H right after
+    // hc_mix, i.e. before the QKV GEMVs, and consume its event in
+    // qsa_attention instead of draining the in-order queue there.  `mixed` is
+    // produced by hc_mix and the QKV/rope chain never touches it, so this is a
+    // scheduling change only: the copy source/destination and the host update
+    // read the same bytes.  `PF_QSA_EARLY=0` restores the old placement (copy
+    // inside qsa_attention) and the blocking `sel` H2D wait for the A/B.
+    bool qsa_early_ = true;
+    struct qsa_early_copy {
+        bool valid = false;
+        int dev = -1;
+        sycl::event ev;
+    };
+    std::vector<qsa_early_copy> qsa_early_ev_;
+    void qsa_early_mixed(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
+                         const float * mixed);
     // Per-attention-layer pinned staging for the D2H inputs (mixed/q/k/v) and
     // the sparse attention's H2D output.  Allocated lazily and grown to the
     // largest chunk seen; a pageable std::vector makes the copy synchronous
@@ -838,6 +854,15 @@ struct engine {
         int32_t * hsel = nullptr; // pinned staging, [kMaxB*kMaxT][cap_keys]
         int32_t * hcnt = nullptr; // pinned staging, [kMaxB*kMaxT]
         step_info * sinfo = nullptr; // device, one wave of rows
+        // PF_QSA_EARLY decode path: the `sel` H2D is issued without waiting, so
+        // its pinned source must not be overwritten while the copy is in
+        // flight.  Two cap_keys-wide buffers are round-robined; before writing
+        // one, the copy that last read it (two calls ago) is waited for.  The
+        // prefill staging above is separate, so the two paths cannot collide.
+        int32_t * dsel_stage[2] = {nullptr, nullptr};
+        sycl::event dsel_ev[2];
+        bool dsel_ev_valid[2] = {false, false};
+        int dsel_par = 0;
     };
     std::vector<qsa_dev_aux> qsa_aux_;
     void qsa_devattn_ensure(int dev);
