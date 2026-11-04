@@ -1841,6 +1841,87 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         }
     };
 
+    // PF_Q4_SHTIME: the shared block's device time, split into its three (or
+    // two fused) GEMVs and moe_gate_add.  Barrier pairs are the only
+    // attribution that is not host-wait smeared (see the DFlash2 "A/B
+    // subtraction is not attribution" note in AGENTS.md); the events are read
+    // once after the final synchronise, so the probe never waits mid-forward.
+    // Each entry is {device, kind, start barrier, end barrier}; kind 0 = the
+    // shared GEMVs, 1 = moe_gate_add.
+    struct sh_ev {
+        int dev;
+        int kind;
+        sycl::event a;
+        sycl::event b;
+    };
+    static const bool shtime_flag = si::env::flag("PF_Q4_SHTIME");
+    const bool shtime = shtime_flag && mode == 0;
+    std::vector<sh_ev> sh_evs;
+    if (shtime) {
+        sh_evs.reserve((size_t)hp.n_layer * 2);
+    }
+    // The shared expert's three linears (gate, up, down) on this device.
+    // Fused path (PF_Q4_SHFUSE, default on), M == 1 only:
+    // gemm_i8_quant_group quantizes the activation inside the launch and runs
+    // the whole call's int8 segments in one kernel, so gate+up is one launch
+    // and down is one instead of quantize + GEMV per segment.  The kernel
+    // reproduces act_quant_grp_launch and i8_grp_gemv_impl's arithmetic
+    // exactly, so the output is bit-identical; it is used only when every
+    // weight is a plain grouped-int8 store and the ordinary GEMV path is
+    // active, which is what the old code would have run.  PF_Q4_SHFUSE=0
+    // restores quantize + one gemm per segment in the same binary.
+    static const bool shfuse = si::env::i32("PF_Q4_SHFUSE", 1) != 0;
+    auto shared_gemms = [&](int d, const layer_t & L, int ntok, float * mixed, moe_act & A,
+                            std::vector<sh_ev> * evs) -> bool {
+        dnnl_gemm * D = dnnl_for(d);
+        if (!D || !D->has_weight(L.ffn_gate.data) || !D->has_weight(L.ffn_up.data)
+            || !D->has_weight(L.ffn_down.data)) {
+            return false;
+        }
+        sycl::event ev_a;
+        if (evs) {
+            ev_a = DQ(d).ext_oneapi_submit_barrier();
+        }
+        bool ok = false;
+        const bool plain = !D->has_weight_w4(L.ffn_gate.data) && !D->has_weight_k5(L.ffn_gate.data)
+                           && !D->has_weight_cb4(L.ffn_gate.data) && !D->has_weight_w4(L.ffn_up.data)
+                           && !D->has_weight_k5(L.ffn_up.data) && !D->has_weight_cb4(L.ffn_up.data)
+                           && !D->has_weight_w4(L.ffn_down.data) && !D->has_weight_k5(L.ffn_down.data)
+                           && !D->has_weight_cb4(L.ffn_down.data);
+        if (shfuse && ntok == 1 && plain && !si::env::flag("PF_I8_NOGEMV")) {
+            const void * k2[2] = {L.ffn_gate.data, L.ffn_up.data};
+            const int n2[2] = {hp.n_ff, hp.n_ff};
+            const float * o2[2] = {A.sh, A.sh + hp.n_ff};
+            const float * r2[2] = {nullptr, nullptr};
+            const float a2[2] = {1.0f, 1.0f};
+            if (D->gemm_i8_quant_group(mixed, nullptr, k2, n2, o2, r2, a2, 2, n_embd)) {
+                const void * k1[1] = {L.ffn_down.data};
+                const int n1[1] = {n_embd};
+                const float * o1[1] = {A.shout};
+                const float * r1[1] = {nullptr};
+                const float a1[1] = {1.0f};
+                ok = D->gemm_i8_quant_group(A.sh, A.sh + hp.n_ff, k1, n1, o1, r1, a1, 1, hp.n_ff);
+            }
+            // A failed fused call may have written A.sh; the unfused path
+            // below rewrites it from scratch, so falling through is safe.
+        }
+        if (!ok) {
+            act_view v = D->quantize(mixed, nullptr, n_embd, 0, ntok, n_embd, false);
+            ok = v.valid() && D->gemm(v, L.ffn_gate.data, nullptr, 1.0f, ntok, n_embd, A.sh, 2 * hp.n_ff)
+                 && D->gemm(v, L.ffn_up.data, nullptr, 1.0f, ntok, n_embd, A.sh + hp.n_ff, 2 * hp.n_ff);
+            if (ok) {
+                act_view vd =
+                    D->quantize(A.sh, A.sh + hp.n_ff, 2 * hp.n_ff, 2 * hp.n_ff, ntok, hp.n_ff, false);
+                ok = vd.valid()
+                     && D->gemm(vd, L.ffn_down.data, nullptr, 1.0f, ntok, hp.n_ff, A.shout, n_embd);
+            }
+        }
+        if (evs) {
+            evs->push_back({d, 0, ev_a, DQ(d).ext_oneapi_submit_barrier()});
+        }
+        return ok;
+    };
+
     int cur_dev = d0;
     int attn_idx = 0;
     static bool warned_qsa = false;
@@ -2914,6 +2995,10 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                                     hp.n_ff_exp, A.acc, n_embd, n_embd, hp.n_ff_exp, L.moe.down_exps.type);
                 }
             };
+            // Set when the shared expert's GEMVs were submitted early
+            // (PF_Q4_SHOVER).  Declared out here because the gate add that
+            // consumes them runs after the routed chain.
+            bool sh_pre = false;
             if (!two_pass) {
                 // PF_Q4_KTIME: the routed gate/up and down KERNELS alone, in
                 // device time.  The existing PF_Q4_HOT_TIME `gu`/`dn` columns are
@@ -2933,6 +3018,20 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     const double t = now_ms();
                     fprintf(stderr, " aq=%.1f", t - thl);
                     thl = t;
+                }
+                // PF_Q4_SHOVER (default on): submit the shared expert's three
+                // linears here, before the host blocks on the routed expert's
+                // H2D.  The shared expert is dense Q8_0 with its own weights
+                // and buffers (b.mixed is read-only, A.sh/A.shout belong to no
+                // routed kernel), so it is independent of the expert copies
+                // and of the routed GEMMs, and its device work runs under the
+                // pre_ev wait.  Only moe_gate_add stays after moe_reduce,
+                // because it accumulates into the routed b.block.
+                // PF_Q4_SHOVER=0 restores the old order (shared expert after
+                // the reduce).  Decode M == 1 only; prefill keeps its order.
+                static const bool shover = si::env::i32("PF_Q4_SHOVER", 1) != 0;
+                if (shover && mode == 0 && n_tok == 1 && !si::env::flag("PF_Q4_NO_SHGPU")) {
+                    sh_pre = shared_gemms(dev, L, n_tok, b.mixed, A, shtime ? &sh_evs : nullptr);
                 }
                 // Wait for the gate/up (+ slot map) H2D here, not before
                 // quant_x: the CSR + activation-quantisation kernels were
@@ -3297,23 +3396,35 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 thl = t;
             }
             const double tsh0 = htt ? now_ms() : 0.0;
-            // Shared expert: oneDNN on the same card (it has its own converted
-            // weights), otherwise the host path with two small copies.
-            dnnl_gemm * D = dnnl_for(dev);
+            // Shared expert: its GEMVs were submitted before the routed H2D
+            // wait when PF_Q4_SHOVER is on (sh_pre), so only the gate add -
+            // which accumulates into the routed b.block - is left here.
+            // Otherwise run the whole block now, as before.  The host fallback
+            // needs the routed b.block too and is unchanged.
             bool sh_gpu = false;
-            if (!si::env::flag("PF_Q4_NO_SHGPU") && D && D->has_weight(L.ffn_gate.data)
-                && D->has_weight(L.ffn_up.data) && D->has_weight(L.ffn_down.data)) {
-                act_view v = D->quantize(b.mixed, nullptr, n_embd, 0, n_tok, n_embd, false);
-                if (v.valid() && D->gemm(v, L.ffn_gate.data, nullptr, 1.0f, n_tok, n_embd, A.sh, 2 * hp.n_ff)
-                    && D->gemm(v, L.ffn_up.data, nullptr, 1.0f, n_tok, n_embd, A.sh + hp.n_ff, 2 * hp.n_ff)) {
-                    act_view vd = D->quantize(A.sh, A.sh + hp.n_ff, 2 * hp.n_ff, 2 * hp.n_ff, n_tok, hp.n_ff, false);
-                    if (vd.valid()
-                        && D->gemm(vd, L.ffn_down.data, nullptr, 1.0f, n_tok, hp.n_ff, A.shout, n_embd)) {
-                        moe_gate_add_launch(qd, wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type, b.mixed,
-                                            n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
-                        sh_gpu = true;
-                    }
+            if (sh_pre) {
+                if (shtime) {
+                    const sycl::event ga = qd.ext_oneapi_submit_barrier();
+                    moe_gate_add_launch(qd, wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type, b.mixed,
+                                        n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
+                    sh_evs.push_back({dev, 1, ga, qd.ext_oneapi_submit_barrier()});
+                } else {
+                    moe_gate_add_launch(qd, wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type, b.mixed,
+                                        n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
                 }
+                sh_gpu = true;
+            } else if (!si::env::flag("PF_Q4_NO_SHGPU")
+                       && shared_gemms(dev, L, n_tok, b.mixed, A, shtime ? &sh_evs : nullptr)) {
+                if (shtime) {
+                    const sycl::event ga = qd.ext_oneapi_submit_barrier();
+                    moe_gate_add_launch(qd, wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type, b.mixed,
+                                        n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
+                    sh_evs.push_back({dev, 1, ga, qd.ext_oneapi_submit_barrier()});
+                } else {
+                    moe_gate_add_launch(qd, wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type, b.mixed,
+                                        n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
+                }
+                sh_gpu = true;
             }
             if (!sh_gpu) {
                 to_host(dev, q4_host_mix_, b.mixed, (size_t)n_tok * n_embd * sizeof(float));
@@ -3426,22 +3537,20 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         // host GEMV read 3.4 MB/token/layer (5.8 s of a 512-token prefill).
         bool sh_gpu = false;
         if (!is_cpu(dev)) {
-            dnnl_gemm * D = dnnl_for(dev);
             moe_act & A = moe_as_[(size_t)dev];
-            if (D && D->has_weight(L.ffn_gate.data) && D->has_weight(L.ffn_up.data)
-                && D->has_weight(L.ffn_down.data)) {
-                act_view v = D->quantize(b.mixed, nullptr, n_embd, 0, n_tok, n_embd, false);
-                if (v.valid() && D->gemm(v, L.ffn_gate.data, nullptr, 1.0f, n_tok, n_embd, A.sh, 2 * hp.n_ff)
-                    && D->gemm(v, L.ffn_up.data, nullptr, 1.0f, n_tok, n_embd, A.sh + hp.n_ff, 2 * hp.n_ff)) {
-                    act_view vd = D->quantize(A.sh, A.sh + hp.n_ff, 2 * hp.n_ff, 2 * hp.n_ff, n_tok, hp.n_ff, false);
-                    if (vd.valid()
-                        && D->gemm(vd, L.ffn_down.data, nullptr, 1.0f, n_tok, hp.n_ff, A.shout, n_embd)) {
-                        from_host(dev, b.block, q4_host_out_, (size_t)n_tok * n_embd * sizeof(float));
-                        moe_gate_add_launch(DQ(dev), wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type,
-                                            b.mixed, n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
-                        sh_gpu = true;
-                    }
+            if (!si::env::flag("PF_Q4_NO_SHGPU")
+                && shared_gemms(dev, L, n_tok, b.mixed, A, shtime ? &sh_evs : nullptr)) {
+                from_host(dev, b.block, q4_host_out_, (size_t)n_tok * n_embd * sizeof(float));
+                if (shtime) {
+                    const sycl::event ga = DQ(dev).ext_oneapi_submit_barrier();
+                    moe_gate_add_launch(DQ(dev), wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type,
+                                        b.mixed, n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
+                    sh_evs.push_back({dev, 1, ga, DQ(dev).ext_oneapi_submit_barrier()});
+                } else {
+                    moe_gate_add_launch(DQ(dev), wptr(dev, L.moe.gate_inp_shexp), L.moe.gate_inp_shexp_type,
+                                        b.mixed, n_embd, n_tok, n_embd, A.shout, n_embd, b.block, n_embd);
                 }
+                sh_gpu = true;
             }
         }
         if (!sh_gpu) {
@@ -3631,6 +3740,36 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         sync_all();
     } else {
         BE(0).synchronize();
+    }
+    if (shtime && !sh_evs.empty()) {
+        // Barrier a is submitted before the shared work and b after it, so
+        // b.command_start - a.command_start is that work's device span.  The
+        // events were queued, never waited on inside the forward, so this
+        // measurement does not change its schedule.
+        double gemv = 0.0, gadd = 0.0;
+        int ngemv = 0, ngadd = 0;
+        for (const sh_ev & e : sh_evs) {
+            try {
+                const double a =
+                    (double)e.a.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
+                const double b =
+                    (double)e.b.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
+                if (e.kind == 0) {
+                    gemv += b - a;
+                    ngemv++;
+                } else {
+                    gadd += b - a;
+                    ngadd++;
+                }
+            } catch (...) {
+            }
+        }
+        static const bool shover_flag = si::env::i32("PF_Q4_SHOVER", 1) != 0;
+        static const bool shpref_flag = si::env::i32("PF_Q4_SHPREF", 1) != 0;
+        fprintf(stderr,
+                "[q4sh] n=%d shared gemv=%.3f ms (%d) gate_add=%.3f ms (%d) total=%.3f ms"
+                " | fuse=%d over=%d pref=%d\n",
+                n_tok, gemv, ngemv, gadd, ngadd, gemv + gadd, (int)shfuse, (int)shover_flag, (int)shpref_flag);
     }
     if (q4seg && !q4seg_evs.empty()) {
         static const char * kSegName[15] = {"handoff/emb", "ple",       "hc_attn",   "mixer",    "hc_comb1",

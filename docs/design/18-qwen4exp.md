@@ -941,6 +941,9 @@ slower at 512, and cannot hold a 48k context.
 | `PF_Q4_DOWN_I8_ALL=1` | off | build the routed-down int8 store for every layer (42.2 GiB / ~110 s) instead of only the non-banked ones |
 | `PF_Q4_Q5NPB=8` | 1 | rows per warp for `moe_down_q5_1_launch`; 1 and 8 are the only instantiations |
 | `PF_Q4_Q5_LANE=1` | off | one lane per 32-value block in that kernel (+1.15-1.25x, **not bit-identical**) |
+| `PF_Q4_SHFUSE=0` | on | unfused shared expert (quantize + one gemm per segment, 5 launches) instead of the fused 2-launch path |
+| `PF_Q4_SHOVER=0` | on | run the shared GEMVs after `moe_reduce` instead of under the routed-expert H2D wait |
+| `PF_Q4_SHPREF=0` | on | plain strided `moe_gate_add` loops instead of the 8-pair register prefetch |
 | `PF_Q4_PLE_SER_MAX` | 65536 | run a `cpu_q4_ple_apply` region on the calling thread when its WORK is below this |
 | `PF_Q4_PLEGPU=1` | off | device PLE projections (-1.60 ms/token, 183 GB/s; **not byte-identical**) |
 | `PF_MOE_RT_FAST=0` | on | batched SLM loads in the fused router selection (bit-identical, -0.22 ms/token) |
@@ -1042,10 +1045,20 @@ The full knob list (including the `PF_QSA_*` dumps) is in
   matmuls with the raw GEMV loses **1.3-1.8 ms/token**: oneDNN is already at
   86-88 GiB/s at this shape, the raw gate/up matches it (91) but the swiglu
   **down** falls to the generic `lane=k` scalar dot at **33 GiB/s** because
-  K=640 is not a multiple of 256.  The 48-layer shared FFN is 6.3 ms/token, of
-  which ~3.6 ms is `moe_gate_add` (48 one-warp launches) - a 76 us one-warp
-  launch is almost certainly the barrier-pair gap rather than the kernel, so
-  do not quote it without a cleaner measurement.
+  K=640 is not a multiple of 256.  **The launch count, not the math, is what
+  costs at M=1, and it is now measured** (`PF_Q4_SHTIME`, barrier pairs over
+  48 layers on the §7.2 cell): the shared GEMVs are **5.13 ms/token** fused
+  (`PF_Q4_SHFUSE`: `gemm_i8_quant_group` does gate+up in one launch and down
+  in one, bit-identical to quantize + one gemm per segment) against **6.74
+  ms** unfused, and `moe_gate_add` is **1.64 ms** with `PF_Q4_SHPREF`
+  (prefetch eight gate/mixed and shared/out pairs, same add order) against
+  **3.67 ms** without.  The earlier "6.3 ms shared FFN, ~3.6 ms of it
+  `moe_gate_add`" was the pre-prefetch number and its 3.6 ms was mostly the
+  launch gap.  `PF_Q4_SHOVER` submits the shared GEMVs before the routed
+  expert's `pre_ev.wait()` and leaves the gate add after `moe_reduce` (decode
+  M=1 only).  All three knobs default on, are bit-identical (96-step
+  `PF_DUMP_DEC_LOGITS` md5 and the prefill logits match with each on and
+  off), and together are worth **2.85 ms/token** (89.67 vs 92.52).
 * **Router restructurings that lost** (all bit-identical): SLM max merge
   +65 %, 64-bit retire mask +29 %, full-lane rank scan +12 %.  The GEMV is
   already fully split over N (512 work-groups, one warp/EU) at 286 GB/s, so

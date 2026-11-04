@@ -238,6 +238,28 @@ At N=7 the emitted stream can flip at near-ties; the two-prompt KL/top-1 gate
 is in [`design/18-qwen4exp.md`](design/18-qwen4exp.md) §7.1.
 `--q4-tail-skip N` / `PF_Q4_TAIL_SKIP=N` opts back in (1..9 meaningful).
 
+**Shared-expert launch fusion, overlap and `moe_gate_add` prefetch (2026-11-04).**
+Same 2x A770 / AOT Release cell as above (`--layer-map 0-19:gpu.0,20-47:gpu.1
+--moe-vram-mb 17500 --cpu-threads 28 --ctx 2048 --kv-type f16 --max-slots 16
+--q4-tail-skip 0`, 96-token greedy on a 537-token prompt, `PF_PREFIX_CACHE=0
+PF_HEAD_U4=0`, one process per cell, two alternating reps).  Decode is the mean
+of the engine's `[q4] fwd n=1` line; all arms emit the same stdout and the same
+96 per-step `PF_DUMP_DEC_LOGITS`, and the 4k prefill logits are unchanged.
+
+| arm | decode ms/step |
+|---|---:|
+| `PF_Q4_SHFUSE=1 PF_Q4_SHOVER=1 PF_Q4_SHPREF=1` (default) | **89.67** |
+| `PF_Q4_SHFUSE=0` (unfused shared expert) | 90.32 (+0.64) |
+| `PF_Q4_SHOVER=0` (shared after the reduce) | 89.93 (+0.25) |
+| `PF_Q4_SHPREF=0` (plain gate/add loops) | 91.53 (+1.86) |
+| all three off | 92.52 (+2.85) |
+
+`PF_Q4_SHTIME=1` splits the shared block with barrier pairs (read after the
+final sync): `gemv=5.13 ms` fused vs `6.74 ms` unfused, and `gate_add=1.64 ms`
+with the prefetch vs `3.67 ms` without.  The fusion and overlap save less on the
+critical path than their device time because the shared work now rides under the
+routed expert's H2D wait and contends with it for bandwidth.
+
 #### 4.4.1 By context depth, one stream
 
 | depth | prompt | pp | tg | ms/step |

@@ -2269,6 +2269,10 @@ the checks that catch them.
 | `PF_Q4_PLE_SER_MAX` | 65536 | run a `cpu_q4_ple_apply` region on the calling thread when its WORK is at most this many elements instead of `par()`. The 28-thread pool wake costs ~0.5 ms for a 10 240-element decode loop; `0` restores `par()` everywhere |
 | `PF_Q4_KTIME=1` | off | routed gate/up and down **kernel-only** device time from `ext_oneapi_submit_barrier` pairs (the `dn` column in `PF_Q4_HOT_TIME` is a composite that also holds quant_h, the memset and the DMA wait) |
 | `PF_Q4_SEGTIME=1` | off | 13 barrier segments per layer for the whole decode forward; the wall is inflated ~1.5-2x so only quote shares |
+| `PF_Q4_SHTIME=1` | off | barrier-pair split of the shared block (`gemv` vs `gate_add`) over the decode forward; events are read after the final sync, so it does not wait mid-forward |
+| `PF_Q4_SHFUSE=0` | on | unfused shared expert (quantize + one gemm per segment) instead of the fused 2-launch `gemm_i8_quant_group` path |
+| `PF_Q4_SHOVER=0` | on | run the shared GEMVs after `moe_reduce` instead of under the routed-expert H2D wait |
+| `PF_Q4_SHPREF=0` | on | plain strided `moe_gate_add` loops instead of the 8-pair register prefetch |
 | `PF_Q4_PLEFAULT=1` / `PF_Q4_PLE_PREFAULT=1` / `PF_Q4_PLEAPPLY_TIME=1` | off | PLE page-fault split, prefault the 26.8 GiB PLE table, and the four loop timers inside `cpu_q4_ple_apply` |
 | `PF_Q4_ABL_NOGEMV=1` / `PF_Q4_ABL_NOMIX=1` | off | ablation for attributing `pre`: drop the dense GEMV launches / the GDN+attention cores. **Wrong output by design**, timing only |
 | `PF_MOE_RT_FAST=0` | **1** | batch the fused router selection's dependent SLM loads into registers (top-k scan, cross-warp max fold, weight-sum tail). Bit-identical (`PF_MOE_RT_CHK`): fused kernel 0.0422 -> 0.0377 ms/layer, router device 0.0627 -> 0.0582, -0.22 ms/token |
@@ -2427,11 +2431,21 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
   1.3-1.8 ms/token: oneDNN already runs at **86-88 GiB/s** at this shape, the
   raw gate/up matches it (91 GiB/s) but the swiglu **down** falls to the generic
   `lane=k` scalar dot at **33 GiB/s** because K=640 is not a multiple of 256, so
-  `q8_0_dot_vec`'s 8-values-per-lane mapping cannot be used.  The 48-layer
-  shared FFN is 6.3 ms/token of which **3.6 ms is `moe_gate_add`** (48 one-warp
-  launches) and only 2.7 ms is the three matmuls - a 76 us one-warp launch is
-  almost certainly the barrier-pair gap, not the kernel, so do not quote it
-  without a cleaner measurement.  `PF_Q4_SHTIME` is the probe.
+  `q8_0_dot_vec`'s 8-values-per-lane mapping cannot be used.  **Measured with
+  the `PF_Q4_SHTIME` barrier-pair probe** (48 layers, decode, AOT, the §7.2
+  cell): the shared GEMVs are **5.13 ms/token** fused (`PF_Q4_SHFUSE`, one
+  `gemm_i8_quant_group` for gate+up and one for down, bit-identical to
+  quantize + one gemm per segment) against **6.74 ms** unfused, and
+  `moe_gate_add` is **1.64 ms** with `PF_Q4_SHPREF` (prefetch eight gate/mixed
+  and shared/out pairs into registers, then the same adds in the same order)
+  against **3.67 ms** without.  The earlier "3.6 ms `moe_gate_add` / 6.3 ms
+  shared FFN" was the pre-prefetch launch-gap number.  `PF_Q4_SHOVER` submits
+  the shared GEMVs before the routed expert's `pre_ev.wait()` and leaves only
+  the gate add after `moe_reduce` (decode M=1 only; the gate add needs the
+  routed `b.block`).  All three knobs are bit-identical (96-step
+  `PF_DUMP_DEC_LOGITS` and stdout md5 identical with each on and off, and the
+  prefill logits unchanged) and together are worth **2.85 ms/token**
+  (89.67 vs 92.52 ms/token on the §7.2 cell).
 * **The non-bank layer's shared expert used to be silently discarded.**  The
   non-bank path ended with an **unconditional** `from_host(dev, b.block,
   q4_host_out_, ...)`; on the `sh_gpu` path that copies a stale host scratch

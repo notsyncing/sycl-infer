@@ -3194,7 +3194,8 @@ void moe_reduce_csr_launch(queue & q, const float * acc, const float * wts, cons
 // the factor, which is what a model without a shared-expert gate needs.
 template <uint32_t GT>
 static void moe_gate_add_impl(queue & q, const char * gate, const float * x, int x_stride, int n_tok, int n_embd,
-                              const float * shared, int sh_stride, float * out, int out_stride, bool have_gate) {
+                              const float * shared, int sh_stride, float * out, int out_stride, bool have_gate,
+                              bool prefetch) {
     // ONE SUB-GROUP PER TOKEN, and every lane strides by the sub-group width.
     // This used to be a 256-wide work-group whose gate reduction was
     // `reduce_over_group(sub_group)` - so each of the eight sub-groups reduced
@@ -3212,29 +3213,106 @@ static void moe_gate_add_impl(queue & q, const char * gate, const float * x, int
         float g = 1.f;
         if (have_gate) {
             float a = 0.f;
-            for (int k = lane; k < n_embd; k += 32) {
-                a += moe_rd<GT>(gate, k) * xr[k];
+            if (prefetch) {
+                // PF_Q4_SHPREF: load eight gate/mixed pairs into registers,
+                // then do the eight adds in the original k order.  Same
+                // per-lane summation order, so the reduced dot is identical;
+                // only the load issue is batched.
+                int k = lane;
+                for (; k + 7 * 32 < n_embd; k += 8 * 32) {
+                    const float g0 = moe_rd<GT>(gate, k);
+                    const float g1 = moe_rd<GT>(gate, k + 32);
+                    const float g2 = moe_rd<GT>(gate, k + 64);
+                    const float g3 = moe_rd<GT>(gate, k + 96);
+                    const float g4 = moe_rd<GT>(gate, k + 128);
+                    const float g5 = moe_rd<GT>(gate, k + 160);
+                    const float g6 = moe_rd<GT>(gate, k + 192);
+                    const float g7 = moe_rd<GT>(gate, k + 224);
+                    const float x0 = xr[k];
+                    const float x1 = xr[k + 32];
+                    const float x2 = xr[k + 64];
+                    const float x3 = xr[k + 96];
+                    const float x4 = xr[k + 128];
+                    const float x5 = xr[k + 160];
+                    const float x6 = xr[k + 192];
+                    const float x7 = xr[k + 224];
+                    a += g0 * x0;
+                    a += g1 * x1;
+                    a += g2 * x2;
+                    a += g3 * x3;
+                    a += g4 * x4;
+                    a += g5 * x5;
+                    a += g6 * x6;
+                    a += g7 * x7;
+                }
+                for (; k < n_embd; k += 32) {
+                    a += moe_rd<GT>(gate, k) * xr[k];
+                }
+            } else {
+                for (int k = lane; k < n_embd; k += 32) {
+                    a += moe_rd<GT>(gate, k) * xr[k];
+                }
             }
             a = reduce_over_group(it.get_sub_group(), a, plus<float>());
             g = sigmoid_f(a);
         }
-        for (int e = lane; e < n_embd; e += 32) {
-            out[(size_t)t * out_stride + e] += g * shared[(size_t)t * sh_stride + e];
+        float * orow = out + (size_t)t * out_stride;
+        const float * srow = shared + (size_t)t * sh_stride;
+        if (prefetch) {
+            int e = lane;
+            for (; e + 7 * 32 < n_embd; e += 8 * 32) {
+                const float s0 = srow[e];
+                const float s1 = srow[e + 32];
+                const float s2 = srow[e + 64];
+                const float s3 = srow[e + 96];
+                const float s4 = srow[e + 128];
+                const float s5 = srow[e + 160];
+                const float s6 = srow[e + 192];
+                const float s7 = srow[e + 224];
+                const float o0 = orow[e];
+                const float o1 = orow[e + 32];
+                const float o2 = orow[e + 64];
+                const float o3 = orow[e + 96];
+                const float o4 = orow[e + 128];
+                const float o5 = orow[e + 160];
+                const float o6 = orow[e + 192];
+                const float o7 = orow[e + 224];
+                orow[e] = o0 + g * s0;
+                orow[e + 32] = o1 + g * s1;
+                orow[e + 64] = o2 + g * s2;
+                orow[e + 96] = o3 + g * s3;
+                orow[e + 128] = o4 + g * s4;
+                orow[e + 160] = o5 + g * s5;
+                orow[e + 192] = o6 + g * s6;
+                orow[e + 224] = o7 + g * s7;
+            }
+            for (; e < n_embd; e += 32) {
+                orow[e] += g * srow[e];
+            }
+        } else {
+            for (int e = lane; e < n_embd; e += 32) {
+                orow[e] += g * srow[e];
+            }
         }
     });
 }
 
 void moe_gate_add_launch(queue & q, const void * gate, uint32_t gtype, const float * x, int x_stride, int n_tok,
                          int n_embd, const float * shared, int sh_stride, float * out, int out_stride) {
+    // PF_Q4_SHPREF (default on): prefetch eight gate/mixed (and shared/out)
+    // pairs into registers before doing the adds in their original order.
+    // The per-lane summation order is unchanged, so the result is exact;
+    // =0 restores the plain strided loops.
+    static const bool prefetch = si::env::i32("PF_Q4_SHPREF", 1) != 0;
     if (!gate) {
         moe_gate_add_impl<GGML_TYPE_F32>(q, nullptr, x, x_stride, n_tok, n_embd, shared, sh_stride, out, out_stride,
-                                         false);
+                                         false, prefetch);
     } else if (gtype == GGML_TYPE_BF16) {
         moe_gate_add_impl<GGML_TYPE_BF16>(q, (const char *)gate, x, x_stride, n_tok, n_embd, shared, sh_stride, out,
-                                          out_stride, true);
+                                          out_stride, true, prefetch);
     } else {
         moe_gate_add_impl<GGML_TYPE_F32>(q, (const char *)gate, x, x_stride, n_tok, n_embd, shared, sh_stride, out,
-                                         out_stride, true);
+                                         out_stride, true, prefetch);
     }
 }
 
