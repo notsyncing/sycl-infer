@@ -2341,6 +2341,8 @@ the checks that catch them.
 | `--moe-ram-mb MB` | 0 | generic ncmoe host tier; **not used by qwen4exp** (the experts are always host-resident) |
 | `--layer-map` | auto | recommended `0-23:gpu.0,24-47:gpu.1`; the profile synthesises one when absent |
 | `--kv-type` | i8 | f16 and i8 both work; f16 is the recommended decode |
+| `PF_Q4_HEAD_W4=1` | off | read the qwen4exp decode head from the pre-existing native u4 store (opt-in, lossy; head span 1.885 -> 1.006 ms, first step +12 ms); falls back to the raw head when `PF_HEAD_U4=0` |
+| `PF_Q4_HEAD_TIME=1` | off | head-only device span (barrier pair), one `[q4head]` line per decode forward |
 | `PF_Q4_BANK=0` | on | all-host expert path (A/B) |
 | `PF_Q4_BANK_LAYER=1` | off | whole-layer bank instead of the per-expert LRU |
 | `PF_Q4_BANK_Q5K=1` | off | layer 2 bank, decode-only (48 layers, 107.2 ms vs 93.3, off) |
@@ -2478,7 +2480,8 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
   GB/s) changes the reduction/decomposition and is not bit-identical.  Do not
   re-derive this; `--q4-tail-skip`/bank tuning are the levers that remain.
 * **The dense (non-expert) part is at its M=1 floor, and the store is not u4.**
-  `rep.raw_gemv_decode` on qwen4exp means there is **no u4/k5/cb4 store at all**:
+  `rep.raw_gemv_decode` on qwen4exp means there is **no u4/k5/cb4 store for the
+  `pre` linears at all**:
   every dense linear is read in its raw GGUF type at M=1, and they are Q8_0
   (1.0625 B/w) or F32 - the `126/175 int8` tensors the startup line counts are
   the oneDNN prefill copies.  The `pre` stage reads **3559.9 MB/token** (not
@@ -2494,6 +2497,26 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
   "1.45x off a 14 ms floor" was wrong twice**: the floor was taken at the
   376 GB/s streaming peak (the M=1 rate is 294-364), and the whole `pre` was
   compared against the GEMV-only part.
+* **The LM head is the one dense tensor with a native u4 store, and reading it
+  is opt-in (`PF_Q4_HEAD_W4`, default 0).**  `setup_md_dnnl` already registers
+  the `PF_HEAD_U4` store for `m.output` (default on), keyed by the **host**
+  pointer; qwen4exp is the path that also keeps the raw head upload (`!m.q4exp`
+  skips the page-out and the upload's converted-tensor skip), so the q4 head
+  path keys the store on `m.output.data`, not `wkey()`.  With the flag on the
+  mode-0 head quantizes the activation in the split form (`do_split=true`, as
+  `run_head` does) and calls `gemm_w4` at M=1 (`K=2560`, `N=248320`); with it
+  off the raw Q8_0 GEMV is untouched.  Measured on the §7.2 cell, same binary,
+  96-token greedy: head-only device span (`PF_Q4_HEAD_TIME`, barrier pair)
+  **1.885 -> 1.006 ms** steady (**-0.879 ms/token**), 675 -> 397 MB of head
+  stream; the first decode step pays a one-time ~12 ms first-use cost, so a
+  96-token run averages **-0.75 ms/token** (a run shorter than ~14 decode
+  tokens is net slower).  The end-to-end wall is **not** the A/B number: after
+  the step-12 divergence the two streams route different experts, so their MoE
+  time differs by more than the head.  It is **lossy**: per-step logits
+  before the streams split are mean|d| 0.136 / rms 0.17 / cos 0.997, and the
+  greedy stream first diverges at step 12 on a raw-head top-2 margin of
+  **0.0015** (KL 0.017 there); both outputs stay coherent and on-topic.  The
+  1.85 ms head line above is the default raw path and is unchanged.
 * **The PLE engram cache's 1.5 % hit rate is capacity, not a bug, and the
   gather is free - but the PLE host block was 3.9 ms and half of it was a
   thread-pool artefact.**  `per_layer_token_embd` is IQ4_NL, **320,001,536 rows

@@ -3935,6 +3935,13 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         q4_hc_mix_launch(DQ(d0), b0.xn, b0.gate, b0.mixed, n_tok, n_embd, hc);
     }
     dbg_stats("result_norm", d0, b0.mixed, (size_t)n_tok * n_embd, 0);
+    // PF_Q4_HEAD_TIME: device span of the LM-head call alone (a barrier pair on
+    // device 0, read after the forward's sync).  The `head` line in
+    // PF_Q4_SEGTIME is *not* head-only: it starts from device 0's last layer
+    // barrier, so on a split map it also spans device 1's tail and the handoff.
+    static const bool head_time = si::env::flag("PF_Q4_HEAD_TIME");
+    sycl::event htime0, htime1;
+    bool head_w4_done = false;
     if (mode != 0) {
         // a prefill (mode 1 tail or mode 2 rows) only needs the last token's
         // head; a decode (mode 0) needs one row per sequence below
@@ -3954,7 +3961,53 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         } else {
             DQ(d0).memcpy(d_last_hidden, b0.mixed, (size_t)n_embd * sizeof(float));
         }
-        gemv(d0, m.output, b0.mixed, n_embd, d_logits, hp.n_vocab, tb, 1);
+        // PF_Q4_HEAD_W4 (default 0): read the LM head from the native u4 store
+        // that setup_md_dnnl already registers (PF_HEAD_U4, default on) instead
+        // of the raw Q8_0 device copy.  Q8_0 -> per-32 u4 is 1.0625 -> 0.625
+        // B/weight, i.e. ~675 -> ~397 MB of head traffic per decode step, but
+        // it is LOSSY: the head is re-quantized, and the in-tree analogue is
+        // the Q5_K -> u4 store at 4.60 % mean rel-L2 (coherent, but the greedy
+        // stream can flip at a near-tie).  Hence opt-in, and the default path
+        // below is untouched when the flag is 0.
+        //
+        // The key is the *host* pointer: add_weight_w4() was called with
+        // m.output.data in setup_md_dnnl.  wkey() cannot be used here because
+        // qwen4exp keeps the raw head upload (`!m.q4exp` skips the page-out and
+        // the upload's converted-tensor skip), so wkey resolves to the device
+        // copy that is not in the u4 table.
+        //
+        // The M == 1 u4 GEMV reads the even/odd activation planes, so this call
+        // must quantize in the split form exactly as run_head does.  That
+        // scratch is the existing dnnl activation buffer (the head u4 store
+        // already makes the instance allocate it); the flag adds no allocation.
+        static const bool q4_head_w4 = si::env::flag("PF_Q4_HEAD_W4");
+        if (head_time && !is_cpu(d0)) {
+            htime0 = DQ(d0).ext_oneapi_submit_barrier();
+        }
+        if (q4_head_w4 && n_tok == 1 && !is_cpu(d0)) {
+            if (dnnl_gemm * D = dnnl_for(d0)) {
+                const void * hk = m.output.data;
+                if (D->has_weight_w4(hk)) {
+                    const act_view av =
+                        D->quantize(b0.mixed, nullptr, n_embd, n_embd, 1, n_embd, /*do_split=*/true);
+                    head_w4_done = av.valid()
+                                   && D->gemm_w4(av, hk, nullptr, 1.0f, 1, n_embd, d_logits, hp.n_vocab);
+                }
+            }
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                fprintf(stderr, "[q4] PF_Q4_HEAD_W4=%s (u4 LM head, opt-in/lossy)\n",
+                        head_w4_done ? "on"
+                                     : "requested but unavailable (no u4 store or M>1) - using the raw head");
+            }
+        }
+        if (!head_w4_done) {
+            gemv(d0, m.output, b0.mixed, n_embd, d_logits, hp.n_vocab, tb, 1);
+        }
+        if (head_time && !is_cpu(d0)) {
+            htime1 = DQ(d0).ext_oneapi_submit_barrier();
+        }
         // Greedy decode's readout: enqueue the argmax and its 4-byte copy here,
         // under the same submission as the head, so the per-step round trip is
         // one kernel on an already-active queue instead of a separate launch
@@ -4002,6 +4055,16 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         sync_all();
     } else {
         BE(0).synchronize();
+    }
+    if (head_time && mode == 0 && !is_cpu(d0)) {
+        try {
+            const double hms =
+                (double)(htime1.get_profiling_info<sycl::info::event_profiling::command_end>()
+                         - htime0.get_profiling_info<sycl::info::event_profiling::command_start>())
+                / 1.0e6;
+            fprintf(stderr, "[q4head] n=%d head=%.3f ms w4=%d\n", n_tok, hms, (int)head_w4_done);
+        } catch (...) {
+        }
     }
     if (shtime && !sh_evs.empty()) {
         // Barrier a is submitted before the shared work and b after it, so

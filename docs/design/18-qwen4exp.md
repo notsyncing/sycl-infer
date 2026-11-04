@@ -861,6 +861,29 @@ repack of the Q5_1 down plane - was implemented and measured: it is
 bit-identical and **slower** (0.1797 -> 0.2073 ms/layer), because bit-identity
 pins the 4-byte-per-lane `qs` load shape; §9.1 has the numbers.
 
+**Opt-in exception: the LM head has a native-u4 read (`PF_Q4_HEAD_W4`, default
+0), and it is lossy.**  `setup_md_dnnl` already registers the `PF_HEAD_U4`
+store for the head (default on), keyed by the host pointer; qwen4exp is the one
+path that also keeps the raw head upload (`!m.q4exp` skips both the page-out and
+the upload's converted-tensor skip), so the q4 head keys the store on
+`m.output.data`, not `wkey()`.  With the flag on, the mode-0 head quantizes the
+activation in the split form (`do_split=true`, as `run_head` does) and runs
+`gemm_w4` at M=1 (`K=2560`, `N=248320`); with it off the raw Q8_0 GEMV is
+untouched.  Same binary, 96-token greedy on the cell above: the head-only
+device span (`PF_Q4_HEAD_TIME`, barrier pair) is **1.885 -> 1.006 ms** steady
+(**-0.879 ms/token**), 675 -> 397 MB of head stream at ~360-395 GB/s; the first
+decode step pays a one-time ~12 ms first-use cost, so the 96-token average is
+**-0.75 ms/token** (a run shorter than ~14 decode tokens is net slower; the
+end-to-end wall is not the A/B number, because after the step-12 divergence the
+two streams route different experts and their MoE time differs by more than the
+head).  No VRAM/RSS growth: the store predates this change and the
+split activation is the existing dnnl scratch (peak RSS 6 672 MB both arms).
+Quality: before the streams split, per-step logits are mean|d| 0.136 / rms 0.17
+/ cos 0.997; the greedy stream first diverges at step 12, where the raw head's
+top-2 margin is **0.0015** (KL 0.017 at that step), and both outputs remain
+coherent and on-topic.  The 1.85 ms head line in the table is the default raw
+path and is unchanged.
+
 #### Cold start: the pinned-source read was one serial memcpy (2026-11-04)
 
 The 69.8 GiB pinned expert source was populated by one `std::memcpy` per expert
