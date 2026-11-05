@@ -102,7 +102,7 @@ int main() {
     const model_profile & q4 = kQwen4ExpProfile;
     CHECK(q4.fwd == model_profile::fwd_kind::hc_ple_qsa, "forward kind is hc_ple_qsa");
     CHECK(q4.policy.max_decode_rows == 1, "max_decode_rows is 1 (2 rows measured 0.85x)");
-    CHECK(!q4.policy.prefix_cache, "prefix cache is off (PLE/QSA state is not in the blob)");
+    CHECK(q4.policy.prefix_cache, "prefix cache is on (PLE/QSA state is checkpointed)");
     CHECK(q4.policy.prefill == model_profile::prefill_kind::whole_prompt, "prefill is whole_prompt");
     CHECK(q4.policy.auto_layer_map, "auto layer map is on (split GGUF needs per-tensor upload)");
     CHECK(q4.policy.md_splits, "md_splits keeps the attention K-split");
@@ -118,7 +118,9 @@ int main() {
           "weights are raw GGUF, not SIn/oneDNN int8");
     CHECK(q4.rep.split_per_tensor_upload, "split GGUF uses the per-tensor upload");
     CHECK(q4.moe == model_profile::moe_owner::runtime_bank, "routed experts are owned by the runtime bank");
-    CHECK(!q4.spec.mtp && !q4.spec.dflash && !q4.spec.multimodal, "MTP/DFlash/MM are declared unsupported");
+    CHECK(q4.vision == model_profile::vision_kind::qwen3vl,
+          "qwen4exp uses the qwen3vl mmproj tower");
+    CHECK(!q4.spec.mtp && !q4.spec.dflash && q4.spec.multimodal, "MTP/DFlash off, multimodal on");
     CHECK(std::strlen(q4.spec.why) > 0u, "the unsupported capabilities carry a reason");
 
     printf("generic profiles\n");

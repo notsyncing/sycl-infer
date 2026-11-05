@@ -256,8 +256,6 @@ void engine::q4_alloc() {
         qsa_max_seq_ = max_seq;
         // Default on where the f16 read is a hardware conversion; the scalar
         // fallback keeps the f32 mirror unless F16MIR is set explicitly.
-        qsa_f16mir_ = si::env::str("PF_QSA_F16MIR") ? (si::env::i32("PF_QSA_F16MIR", 1) != 0) : cpu_qsa_f16_ok();
-        qsa_copyq_ = SI_ENV_I32("PF_QSA_COPYQ", 1) != 0;
         // Stage 2: on by default for the f16 GPU sparse path; it is 6.6%
         // faster on the 2412-token cell with the same 32-token stream and
         // byte-identical selector.  PF_QSA_DEVATTN=0 keeps the host Stage 1.
@@ -329,6 +327,9 @@ void engine::q4_alloc() {
             q4_ple_prev_[i] = hp.ple_eos;
         }
     }
+    // Prefix-cache extras (PLE history + QSA pool/ring) live in host vectors
+    // indexed by the generic checkpoint slot.
+    q4_pc_alloc();
 }
 
 // The routed bank, the routers and the shared expert are read from the host
@@ -1197,6 +1198,196 @@ void engine::q4_zero_state(int slot) {
     }
 }
 
+// ---- qwen4exp prefix-cache extras -----------------------------------------
+//
+// See the declaration in engine.h.  The generic checkpoint pool only carries the
+// GDN/conv state; a qwen4exp resume also needs the PLE rolling history and the
+// QSA indexer pool/ring.  Both are host state and are indexed by the same
+// checkpoint slot, so the RAM/disk tiers simply append them to the serialized
+// blob (pc_serialize_state).
+void engine::q4_pc_alloc() {
+    if (!hc_fwd() || !pc_enabled) {
+        return;
+    }
+    q4_pc_ple_.resize((size_t)std::max(pc_max_states, 0));
+    q4_pc_qsa_.resize((size_t)std::max(pc_max_states, 0));
+}
+
+void engine::q4_pc_clear(int st) {
+    if (st < 0) {
+        return;
+    }
+    if ((size_t)st < q4_pc_ple_.size()) {
+        q4_pc_ple_[(size_t)st].valid = false;
+    }
+    if ((size_t)st < q4_pc_qsa_.size()) {
+        q4_pc_qsa_[(size_t)st].valid = false;
+    }
+}
+
+size_t engine::q4_pc_extra_floats(int depth_blocks) const {
+    if (!hc_fwd()) {
+        return 0;
+    }
+    const hparams & hp = m.hp;
+    size_t n = 0;
+    if (q4_ple_hist_) {
+        const int hist_rows = (hp.ple_conv - 1) * hp.ple_ngram;
+        n += (size_t)hist_rows * (size_t)(hp.hc_mult * hp.n_embd);
+        n += 8 + 1; // previous-token ring + nhist
+    }
+    if (qsa_on_ && depth_blocks > 0) {
+        const int kp = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+        const size_t np = (size_t)(depth_blocks * kBlockSize) / (size_t)kp;
+        n += (size_t)attn_layers() * (np * (size_t)hp.idx_head_dim + (size_t)kp * (size_t)hp.idx_head_dim);
+    }
+    return n;
+}
+
+void engine::q4_pc_ple_store(const step_info & info, int slot, int base_pos, int n_tok, const int32_t * toks,
+                             const float * hist_before, int nhist_before, const int32_t * prev_before,
+                             const float * normed) {
+    const hparams & hp = m.hp;
+    if (!q4_ple_hist_ || !normed || slot < 0 || slot >= state_slots_) {
+        return;
+    }
+    const int hr = (hp.ple_conv - 1) * hp.ple_ngram;
+    const int hc_dim = hp.hc_mult * hp.n_embd;
+    const int ng = hp.ple_ngram;
+    // Boundaries completed by this chunk: positions base_pos+kBlockSize ..
+    // base_pos+n_tok (inclusive), all multiples of kBlockSize.
+    for (int p = base_pos + kBlockSize; p <= base_pos + n_tok; p += kBlockSize) {
+        const int st = info.pc_row_slot[p / kBlockSize];
+        if (st < 0 || (size_t)st >= q4_pc_ple_.size()) {
+            continue;
+        }
+        q4_pc_ple_state & s = q4_pc_ple_[(size_t)st];
+        s.hist.assign((size_t)hr * (size_t)hc_dim, 0.f);
+        s.prev.assign((size_t)std::max(0, ng - 1), hp.ple_eos);
+        // The history at a boundary is the last min(p, hist_rows) normalised
+        // rows ending at p-1 (the right-aligned invariant cpu_q4_ple_apply
+        // maintains).  Rows in this chunk come from `normed`; older ones from
+        // the pre-call copy of the slot's history.
+        const int valid = std::min(p, hr);
+        for (int k = 0; k < valid; k++) {
+            const int tp = p - valid + k;
+            const float * src = nullptr;
+            if (tp >= base_pos) {
+                src = normed + (size_t)(tp - base_pos) * (size_t)hc_dim;
+            } else {
+                const int idx = hr - nhist_before + (tp - (base_pos - nhist_before));
+                if (idx >= 0 && idx < hr && hist_before) {
+                    src = hist_before + (size_t)idx * (size_t)hc_dim;
+                }
+            }
+            float * dst = s.hist.data() + (size_t)(hr - valid + k) * (size_t)hc_dim;
+            if (src) {
+                std::memcpy(dst, src, (size_t)hc_dim * sizeof(float));
+            }
+        }
+        s.nhist = valid;
+        // Previous-token ring at the boundary: the last ngram-1 token ids.
+        for (int j = 0; j < ng - 1; j++) {
+            const int tp = p - (ng - 1) + j;
+            int32_t v = hp.ple_eos;
+            if (tp >= base_pos) {
+                v = (tp - base_pos < n_tok && toks) ? toks[tp - base_pos] : hp.ple_eos;
+            } else {
+                const int idx = tp - (base_pos - (ng - 1));
+                if (idx >= 0 && idx < ng - 1 && prev_before) {
+                    v = prev_before[idx];
+                }
+            }
+            s.prev[(size_t)j] = v;
+        }
+        s.valid = true;
+    }
+}
+
+void engine::q4_pc_qsa_store(int st, int a, const float * pool, int n_pool, const float * ring) {
+    if (st < 0 || (size_t)st >= q4_pc_qsa_.size() || a < 0) {
+        return;
+    }
+    const hparams & hp = m.hp;
+    const int id = hp.idx_head_dim;
+    const int kp = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+    q4_pc_qsa_state & s = q4_pc_qsa_[(size_t)st];
+    if ((int)s.pool.size() < attn_layers()) {
+        s.pool.resize((size_t)attn_layers());
+        s.ring.resize((size_t)attn_layers());
+    }
+    if (a >= (int)s.pool.size()) {
+        return;
+    }
+    s.pool[(size_t)a].assign(pool, pool + (size_t)std::max(n_pool, 0) * (size_t)id);
+    s.ring[(size_t)a].assign(ring, ring + (size_t)kp * (size_t)id);
+    s.valid = true;
+}
+
+void engine::q4_pc_restore(int slot, int st, int depth_blocks) {
+    if (!hc_fwd() || slot < 0 || slot >= state_slots_) {
+        return;
+    }
+    if (q4_ple_hist_ && st >= 0 && (size_t)st < q4_pc_ple_.size()) {
+        const q4_pc_ple_state & s = q4_pc_ple_[(size_t)st];
+        if (s.valid) {
+            const int hr = (m.hp.ple_conv - 1) * m.hp.ple_ngram;
+            const int hc_dim = m.hp.hc_mult * m.hp.n_embd;
+            std::memcpy(q4_ple_hist_ + (size_t)slot * hr * hc_dim, s.hist.data(),
+                        (size_t)hr * hc_dim * sizeof(float));
+            q4_ple_nhist_[slot] = s.nhist;
+            for (int j = 0; j < 8; j++) {
+                q4_ple_prev_[(size_t)slot * 8 + j] = j < (int)s.prev.size() ? s.prev[(size_t)j] : m.hp.ple_eos;
+            }
+        }
+    }
+    if (!qsa_on_) {
+        return;
+    }
+    // Drop whatever this slot held for a previous sequence (pool, ring, device
+    // copies, deferred updates) before installing the checkpoint.
+    qsa_reset_slot(slot);
+    const hparams & hp = m.hp;
+    const int id = hp.idx_head_dim;
+    const int kp = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+    const int np_restore = depth_blocks * kBlockSize / kp;
+    if (st >= 0 && (size_t)st < q4_pc_qsa_.size() && q4_pc_qsa_[(size_t)st].valid) {
+        const q4_pc_qsa_state & s = q4_pc_qsa_[(size_t)st];
+        for (int a = 0; a < attn_layers() && a < (int)s.pool.size(); a++) {
+            if (s.pool[(size_t)a].empty()) {
+                continue;
+            }
+            auto & layers = qsa_cache_[(size_t)a];
+            if (slot >= (int)layers.size()) {
+                continue;
+            }
+            auto & sp = layers[(size_t)slot];
+            if (!sp) {
+                sp = std::make_unique<qsa_slot_state>();
+            }
+            sp->pool.assign(((size_t)qsa_max_seq_ / (size_t)kp + 1) * (size_t)id, 0.f);
+            sp->ring.assign((size_t)kp * (size_t)id, 0.f);
+            const size_t np = std::min<size_t>((size_t)np_restore, s.pool[(size_t)a].size() / (size_t)id);
+            std::memcpy(sp->pool.data(), s.pool[(size_t)a].data(), np * (size_t)id * sizeof(float));
+            std::memcpy(sp->ring.data(), s.ring[(size_t)a].data(), (size_t)kp * (size_t)id * sizeof(float));
+            sp->n_pool = (int)np;
+        }
+    } else {
+        // A checkpoint from a run without QSA state cannot be resumed with the
+        // selector: the pool for the prefix would be all zeros.  qsa_on_ is a
+        // process-level decision, so this should be unreachable; keep the slot
+        // empty rather than resurrect stale rows from an earlier sequence.
+        for (int a = 0; a < attn_layers(); a++) {
+            if (slot < (int)qsa_cache_[(size_t)a].size()) {
+                qsa_cache_[(size_t)a][(size_t)slot].reset();
+            }
+        }
+    }
+    // The main K/V needs no restore: the host attention reads the restored
+    // paged blocks and the device attention gathers from them.  Only the
+    // selector's pool/ring above is host state.
+}
+
 void engine::q4_prefill_common(const std::vector<int> & toks, int slot, int n, int start, const mm_prompt * mm) {
     // The CPU kernels do not bound their loops by row_nr, so a partial last row
     // in the mode-2 layout would process padding tokens (and pollute the KV and
@@ -1231,6 +1422,39 @@ void engine::q4_prefill_common(const std::vector<int> & toks, int slot, int n, i
     }
     CH = std::max(kMaxT, (CH / kMaxT) * kMaxT);
     const int R = std::min(kMaxB * kMaxT, CH);
+    // The generic prefix-cache capture targets pf_info_ when a multi-device
+    // pipeline owns the chunk; the q4 path always fills d_info directly.
+    pf_info_ = nullptr;
+    // Prefix-cache capture is per internal chunk, and each chunk is *committed*
+    // before the next one starts.  Waiting for the scheduler's commit after the
+    // whole prompt would leave every chunk's checkpoint pending (owner -1), so
+    // the state pool could not recycle its slots and only the first chunk would
+    // ever be checkpointed.  Committing here also advances the hash chain so the
+    // next chunk's capture sees the preceding blocks as registered.
+    auto pc_capture = [&](int cpos, int cn, bool aligned) {
+        if (!pc_enabled || slot < 0 || slot >= state_slots_ || !pc_slot_[slot].tracking) {
+            return;
+        }
+        // A resume is only exact at a cold chunk boundary, so checkpoint the
+        // chunk's *last* boundary and nothing narrower.  Capturing the deepest
+        // eight boundaries of every chunk would steal the previous chunk's
+        // end checkpoint (the only resumable one) as the prompt advances.
+        if (!aligned) {
+            return;
+        }
+        pc_capture_begin(slot, toks, cpos, cpos, cn, /*single_boundary=*/true);
+    };
+    auto pc_commit_chunk = [&](int done_abs) {
+        if (!pc_enabled || slot < 0 || slot >= state_slots_ || !pc_slot_[slot].tracking) {
+            return;
+        }
+        const int need_blocks = (done_abs + kBlockSize - 1) / kBlockSize;
+        std::vector<int> blocks((size_t)std::max(need_blocks, 1));
+        for (int i = 0; i < need_blocks; i++) {
+            blocks[(size_t)i] = h_tables[(size_t)slot * (size_t)max_blocks + (size_t)i];
+        }
+        pc_commit(slot, toks, blocks, done_abs);
+    };
     int done = 0;
     while (done < n) {
         const int c = std::min(R, n - done);
@@ -1265,9 +1489,15 @@ void engine::q4_prefill_common(const std::vector<int> & toks, int slot, int n, i
                 inf->pos[r] = 0;
                 inf->slot[r] = slot;
             }
+            // Only a full-width chunk ends on a boundary the cold run would
+            // have split at; a short mode-2 chunk (the 960-token remainder of a
+            // 3 032-token prompt) ends inside a chunk and is not resumable.
+            pc_capture(start + done, full, ((start + done) % CH) == 0 && (full % CH) == 0);
             const bool last = (done + full == n);
             q4_forward(2, full, last);
+            inf->pc_active = 0;
             done += full;
+            pc_commit_chunk(start + done);
             // Do not fall through with the rest of the prompt as a "tail": the
             // tail path is a single mode-1 row of at most kMaxT tokens, and a
             // 1038-token remainder here wrote past step_info::tokens and then
@@ -1306,8 +1536,11 @@ void engine::q4_prefill_common(const std::vector<int> & toks, int slot, int n, i
                 inf->pos[r] = 0;
                 inf->slot[r] = slot;
             }
+            pc_capture(start + done, rem, ((start + done) % CH) == 0);
             q4_forward(1, rem, true);
+            inf->pc_active = 0;
             done += rem;
+            pc_commit_chunk(start + done);
         }
     }
     // The per-expert bank's LRU starts empty and only learns from the decode
@@ -2332,9 +2565,31 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 slots[(size_t)i] = slot_of(i);
                 poss[(size_t)i] = pos_of(i);
             }
+            // Prefix cache: the PLE history is host state the device checkpoint
+            // pool cannot hold.  Keep the pre-call copy so q4_pc_ple_store can
+            // rebuild the history at every block boundary this chunk completes
+            // (the caller's normed rows are still in q4_ple_b_ afterwards).
+            std::vector<float> ple_hist_before;
+            std::vector<int32_t> ple_prev_before;
+            int ple_nhist_before = 0;
+            const bool ple_pc = inf->pc_active && q4_ple_hist_ != nullptr;
+            if (ple_pc) {
+                const int hr = (hp.ple_conv - 1) * hp.ple_ngram;
+                const int hcd = hp.hc_mult * hp.n_embd;
+                const int slot0 = slots[0];
+                ple_hist_before.assign(q4_ple_hist_ + (size_t)slot0 * hr * hcd,
+                                       q4_ple_hist_ + (size_t)(slot0 + 1) * hr * hcd);
+                ple_nhist_before = q4_ple_nhist_[slot0];
+                ple_prev_before.assign(q4_ple_prev_ + (size_t)slot0 * 8,
+                                       q4_ple_prev_ + (size_t)slot0 * 8 + (hp.ple_ngram - 1));
+            }
             cpu_q4_ple_apply(q4_ple_val_, q4_ple_gate_, L.ple.norm_conv, L.ple.conv, q4_host_res_, q4_ple_a_,
                              q4_ple_b_, q4_ple_hist_, q4_ple_nhist_, nullptr, slots.data(), poss.data(), n_tok, n_embd,
                              hc, hp.ple_ngram, hp.ple_conv, hp.rms_eps);
+            if (ple_pc) {
+                q4_pc_ple_store(*inf, slots[0], poss[0], n_tok, inf->tokens, ple_hist_before.data(),
+                                ple_nhist_before, ple_prev_before.data(), q4_ple_b_);
+            }
             const double pl_ap = plef ? now_ms() : 0.0;
             dbg_stats("ple_gated", dev, q4_ple_a_, (size_t)n_tok * hc_dim, 0);
             from_host(dev, b.res, q4_host_res_, (size_t)n_tok * hc_dim * sizeof(float));
@@ -2413,24 +2668,38 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
             float * cs = (multi ? as_[(size_t)dev].conv_state : d_conv_state) + (size_t)gl * state_slots_ * conv_per;
             float * gs = (multi ? as_[(size_t)dev].gdn_state : d_gdn_state) + (size_t)gl * state_slots_ * gdn_per;
+            // Prefix cache: the kernels snapshot the GDN state and conv window
+            // at every completed 32-token block into the checkpoint pool that
+            // pc_capture_begin filled.  The checkpoint is global (layer `gi`,
+            // not the partition-local `gl`) and d_pc_states is host USM on the
+            // multi-device path (host_act), so every partition can write it.
+            pc_snap snap{};
+            if (pc_enabled && d_pc_states) {
+                snap.base = d_pc_states;
+                snap.stride = (int64_t)pc_state_floats;
+                snap.layer_off = (int64_t)gi * ((int64_t)gdn_per + (int64_t)conv_per);
+                snap.gdn_per = (int32_t)gdn_per;
+                snap.conv_per = (int32_t)conv_per;
+                snap.cap_floats = (int64_t)pc_max_states * (int64_t)pc_state_floats;
+            }
             ph_t = ph0(dev);
             if (mode == 2) {
                 const int NCH = (n_tok + kMaxT - 1) / kMaxT;
                 be.conv_l2(QKV, cs, wf32(dev, L.ssm_conv1d), CONVOUT, inf, hp.qkv_dim(), hp.conv_k, hp.d_state,
                            hp.n_group, hp.rms_eps, NCH, kMaxT, 0, kMaxT, true);
-                be.conv_state_update(QKV, cs, inf, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT, true, {});
+                be.conv_state_update(QKV, cs, inf, hp.qkv_dim(), hp.conv_k, NCH, 0, kMaxT, kMaxT, true, snap);
                 be.gdn(CONVOUT, ALPHA, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), BETA, gs, ATTNPRE, inf, hp.d_state,
                        hp.n_group, hp.dt_rank, hp.qkv_dim(), 1.0f / std::sqrt((float)hp.d_state), state_slots_, 1, 0,
-                       n_tok, n_tok, {});
+                       n_tok, n_tok, snap);
             } else if (!abl_nomix) {
                 const int nrows = inf->n_rows;
                 const int nreal_call = (mode == 1) ? n_tok : 1;
                 be.conv_l2(QKV, cs, wf32(dev, L.ssm_conv1d), CONVOUT, inf, hp.qkv_dim(), hp.conv_k, hp.d_state,
                            hp.n_group, hp.rms_eps, nrows, nreal_call, 0, -1, false);
-                be.conv_state_update(QKV, cs, inf, hp.qkv_dim(), hp.conv_k, nrows, 0, -1, nreal_call, false, {});
+                be.conv_state_update(QKV, cs, inf, hp.qkv_dim(), hp.conv_k, nrows, 0, -1, nreal_call, false, snap);
                 be.gdn(CONVOUT, ALPHA, wf32(dev, L.ssm_dt), wf32(dev, L.ssm_a), BETA, gs, ATTNPRE, inf, hp.d_state,
                        hp.n_group, hp.dt_rank, hp.qkv_dim(), 1.0f / std::sqrt((float)hp.d_state), state_slots_, nrows,
-                       0, -1, nreal_call, {});
+                       0, -1, nreal_call, snap);
             }
             ph1(dev, ph_t, t_gc, true);
             dbg_stats("conv_out", dev, CONVOUT, (size_t)n_tok * hp.qkv_dim(), 0);
@@ -2452,11 +2721,6 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             // qsa_attention.  `PF_QSA_EARLY=0` disables it (old placement).
             if (!abl_nomix) {
                 qsa_early_indexer(attn_idx, L, dev, mode, n_tok, inf, b.mixed);
-            }
-            // A dense prefill chunk's K/V copies ride a separate queue; put the
-            // dependency back before the qkv GEMV overwrites KBUF/VBUF.
-            if (qsa_on_) {
-                qsa_copy_guard(attn_idx, dev);
             }
             float * QBUF = multi ? as_[(size_t)dev].qbuf : d_qbuf;
             float * KBUF = multi ? as_[(size_t)dev].kbuf : d_kbuf;

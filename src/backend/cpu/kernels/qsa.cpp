@@ -31,10 +31,11 @@ namespace {
 
 #ifdef SI_QSA_X86
 
-// A 16-value f16 load is exactly the f32 value the f32 mirror held: ggml's
-// f16 round-trip is exact, so the arithmetic below is unchanged.  Templating
-// the attention on the element type keeps one instruction sequence for both
-// PF_QSA_F16MIR settings.
+// A 16-value f16 load is exactly the f32 value an f32 buffer would hold:
+// ggml's f16 round-trip is exact, so the arithmetic below is unchanged.
+// Templating the attention on the element type keeps one instruction sequence
+// for both element widths; the engine gathers compact f32 rows and uses the
+// f32 form, and the f16 form remains for tests.
 template <typename T> struct qsa_ld512;
 template <> struct qsa_ld512<float> {
     __attribute__((target("avx512f,avx512bw,avx512vl"))) static __m512 load(const float * p) {
@@ -568,8 +569,8 @@ bool cpu_qsa_f16_ok() {
     // The f16 read is an F16C cvtph in the AVX2/AVX-512 forms.  The scalar form
     // has to call ggml_half_to_float per element, which stops the compiler
     // auto-vectorising the loops: measured 4.6x slower on the 128-token sparse
-    // prefill (12 477 vs 2 721 ms), so PF_QSA_F16MIR defaults off there and an
-    // explicit =1 still forces it.
+    // prefill (12 477 vs 2 721 ms).  The engine's compact gather is f16 and
+    // only calls the `_h` form when this is true.
     return qsa_isa().attn_head != attn_head_scalar;
 }
 

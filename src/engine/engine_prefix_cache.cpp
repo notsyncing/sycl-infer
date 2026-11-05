@@ -55,7 +55,7 @@ void engine::pc_disk_init() {
     };
     const hparams & hp = m.hp;
     mix_str("sycl-infer-pc");
-    mix_u64(1); // on-disk generation (bump with a format change)
+    mix_u64(2); // on-disk generation (bump with a format change)
     mix_u64((uint64_t)kv_k_dtype());
     mix_u64((uint64_t)kv_v_dtype());
     mix_u64((uint64_t)kBlockSize);
@@ -239,14 +239,99 @@ void engine::pc_deserialize_block(const uint8_t * blob, int block) {
 }
 
 void engine::pc_serialize_state(int st, std::vector<float> & out) {
-    out.resize(pc_state_floats);
+    // The device pool carries the GDN/conv state.  qwen4exp appends its
+    // host-side PLE history and QSA indexer pool/ring to the same blob so the
+    // RAM/disk tiers round-trip a complete resume point.  The extra size is a
+    // function of the node's depth (the QSA pool only has depth*32/kp entries).
+    int depth = 0;
+    if (st >= 0 && st < (int)pc_state_owner.size() && pc_state_owner[(size_t)st] >= 0
+        && pc_state_owner[(size_t)st] < (int)pc_nodes_.size()) {
+        depth = pc_nodes_[(size_t)pc_state_owner[(size_t)st]].depth;
+    }
+    const size_t extra = q4_pc_extra_floats(depth);
+    out.resize(pc_state_floats + extra);
     q.memcpy(out.data(), d_pc_states + (size_t)st * pc_state_floats, pc_state_floats * sizeof(float)).wait();
+    if (!hc_fwd() || extra == 0) {
+        return;
+    }
+    const hparams & hp = m.hp;
+    float * w = out.data() + pc_state_floats;
+    if (q4_ple_hist_ && st >= 0 && (size_t)st < q4_pc_ple_.size()) {
+        const int hist_rows = (hp.ple_conv - 1) * hp.ple_ngram;
+        const int hc_dim = hp.hc_mult * hp.n_embd;
+        const q4_pc_ple_state & p = q4_pc_ple_[(size_t)st];
+        if (p.valid && p.hist.size() == (size_t)hist_rows * (size_t)hc_dim) {
+            std::memcpy(w, p.hist.data(), p.hist.size() * sizeof(float));
+        } else {
+            std::memset(w, 0, (size_t)hist_rows * (size_t)hc_dim * sizeof(float));
+        }
+        w += (size_t)hist_rows * (size_t)hc_dim;
+        for (int j = 0; j < 8; j++) {
+            w[j] = (size_t)j < p.prev.size() ? (float)p.prev[(size_t)j] : (float)hp.ple_eos;
+        }
+        w += 8;
+        *w++ = (float)(p.valid ? p.nhist : 0);
+    }
+    if (qsa_on_ && depth > 0) {
+        const int id = hp.idx_head_dim;
+        const int kp = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+        const size_t np = (size_t)(depth * kBlockSize) / (size_t)kp;
+        for (int a = 0; a < attn_layers(); a++) {
+            const q4_pc_qsa_state * q = st >= 0 && (size_t)st < q4_pc_qsa_.size() ? &q4_pc_qsa_[(size_t)st] : nullptr;
+            if (q && a < (int)q->pool.size() && q->pool[(size_t)a].size() >= np * (size_t)id) {
+                std::memcpy(w, q->pool[(size_t)a].data(), np * (size_t)id * sizeof(float));
+            } else {
+                std::memset(w, 0, np * (size_t)id * sizeof(float));
+            }
+            w += np * (size_t)id;
+            if (q && a < (int)q->ring.size() && q->ring[(size_t)a].size() >= (size_t)kp * (size_t)id) {
+                std::memcpy(w, q->ring[(size_t)a].data(), (size_t)kp * (size_t)id * sizeof(float));
+            } else {
+                std::memset(w, 0, (size_t)kp * (size_t)id * sizeof(float));
+            }
+            w += (size_t)kp * (size_t)id;
+        }
+    }
 }
 
-void engine::pc_deserialize_state(const float * in, int st) {
+void engine::pc_deserialize_state(const float * in, int st, int depth_blocks) {
     q.memcpy(d_pc_states + (size_t)st * pc_state_floats, in, pc_state_floats * sizeof(float));
     // the caller's state is a temporary: the copy must complete before it dies
     q.wait();
+    if (!hc_fwd() || (size_t)st >= q4_pc_ple_.size()) {
+        return;
+    }
+    const hparams & hp = m.hp;
+    const float * r = in + pc_state_floats;
+    if (q4_ple_hist_) {
+        const int hist_rows = (hp.ple_conv - 1) * hp.ple_ngram;
+        const int hc_dim = hp.hc_mult * hp.n_embd;
+        q4_pc_ple_state & p = q4_pc_ple_[(size_t)st];
+        p.hist.assign(r, r + (size_t)hist_rows * (size_t)hc_dim);
+        r += (size_t)hist_rows * (size_t)hc_dim;
+        p.prev.resize(8);
+        for (int j = 0; j < 8; j++) {
+            p.prev[(size_t)j] = (int32_t)r[j];
+        }
+        r += 8;
+        p.nhist = (int32_t)(*r++);
+        p.valid = true;
+    }
+    if (qsa_on_ && depth_blocks > 0) {
+        const int id = hp.idx_head_dim;
+        const int kp = hp.idx_kpool > 1 ? hp.idx_kpool : 4;
+        const size_t np = (size_t)(depth_blocks * kBlockSize) / (size_t)kp;
+        q4_pc_qsa_state & q = q4_pc_qsa_[(size_t)st];
+        q.pool.resize((size_t)attn_layers());
+        q.ring.resize((size_t)attn_layers());
+        for (int a = 0; a < attn_layers(); a++) {
+            q.pool[(size_t)a].assign(r, r + np * (size_t)id);
+            r += np * (size_t)id;
+            q.ring[(size_t)a].assign(r, r + (size_t)kp * (size_t)id);
+            r += (size_t)kp * (size_t)id;
+        }
+        q.valid = true;
+    }
 }
 
 // Write a node straight to disk, bypassing the RAM tier (used by the shutdown
@@ -387,8 +472,9 @@ void engine::pc_ram_to_disk(pc_ram_entry e) {
 // Create a fresh VRAM node from an already-loaded serialized record.  The host
 // buffers must stay alive across the call (the device copies are synchronous).
 int engine::pc_promote_bytes(const pc_disk_meta & meta, const uint8_t * blob, const float * state) {
-    if (meta.blob_bytes != (int32_t)pc_block_blob_bytes() ||
-        (meta.has_state && meta.state_bytes != (int32_t)(pc_state_floats * sizeof(float)))) {
+    const size_t want_state = (pc_state_floats + q4_pc_extra_floats(meta.depth)) * sizeof(float);
+    if (meta.blob_bytes != (int32_t)pc_block_blob_bytes()
+        || (meta.has_state && (size_t)meta.state_bytes < want_state)) {
         return -1; // layout changed: the record is not loadable
     }
     const int block = alloc_block();
@@ -440,7 +526,7 @@ int engine::pc_promote_bytes(const pc_disk_meta & meta, const uint8_t * blob, co
             free_block(block); // caller keeps the lower-tier record for a retry
             return -1;
         }
-        pc_deserialize_state(state, st);
+        pc_deserialize_state(state, st, meta.depth);
     }
     const int ni = pc_add_node(meta.hash, meta.toks, block, meta.depth);
     if (ni < 0) {
@@ -485,7 +571,7 @@ int engine::pc_promote_disk(pc_disk_meta meta) {
         return -1;
     }
     std::vector<uint8_t> blob((size_t)std::max(meta.blob_bytes, 0));
-    std::vector<float> state(meta.has_state ? pc_state_floats : 0);
+    std::vector<float> state(meta.has_state ? (size_t)meta.state_bytes / sizeof(float) : 0);
     if (!pcd->load(meta, blob.empty() ? nullptr : blob.data(), state.empty() ? nullptr : state.data())) {
         pcd->erase(meta.hash);
         return -1;
@@ -508,10 +594,12 @@ bool engine::pc_attach_state_from_lower(int ni, uint64_t hash, const int32_t * t
     if (pcr_enabled && pcr) {
         pc_ram_entry e;
         if (pcr->take(hash, e)) {
-            if (e.meta.has_state && e.meta.state_bytes == (int32_t)(pc_state_floats * sizeof(float))) {
+            if (e.meta.has_state
+                && (size_t)e.meta.state_bytes
+                       >= (pc_state_floats + q4_pc_extra_floats(e.meta.depth)) * sizeof(float)) {
                 const int st = pc_state_take();
                 if (st >= 0) {
-                    pc_deserialize_state(e.state.data(), st);
+                    pc_deserialize_state(e.state.data(), st, e.meta.depth);
                     pc_nodes_[ni].state = st;
                     pc_state_owner[st] = ni;
                     pc_state_stamp[st] = ++pc_clock;
@@ -525,12 +613,13 @@ bool engine::pc_attach_state_from_lower(int ni, uint64_t hash, const int32_t * t
     }
     if (pcd_enabled && pcd) {
         const pc_disk_meta * e = pcd->find(hash, toks);
-        if (e && e->has_state && e->state_bytes == (int32_t)(pc_state_floats * sizeof(float))) {
-            std::vector<float> buf(pc_state_floats);
+        if (e && e->has_state
+            && (size_t)e->state_bytes >= (pc_state_floats + q4_pc_extra_floats(e->depth)) * sizeof(float)) {
+            std::vector<float> buf((size_t)e->state_bytes / sizeof(float));
             if (pcd->load(*e, nullptr, buf.data())) {
                 const int st = pc_state_take();
                 if (st >= 0) {
-                    pc_deserialize_state(buf.data(), st);
+                    pc_deserialize_state(buf.data(), st, e->depth);
                     pc_nodes_[ni].state = st;
                     pc_state_owner[st] = ni;
                     pc_state_stamp[st] = ++pc_clock;
@@ -604,6 +693,18 @@ void engine::pc_restore_state(int slot, int st) {
         q.memcpy(d_gdn_state + ((size_t)gi * state_slots_ + slot) * gp, src + (size_t)gi * per, gp * 4);
         q.memcpy(d_conv_state + ((size_t)gi * state_slots_ + slot) * cp, src + (size_t)gi * per + gp, cp * 4);
     }
+    // qwen4exp: install the PLE history and QSA selector state that the device
+    // pool cannot hold (and mark the QSA mirror for a lazy rebuild).  This runs
+    // before the caller sets the block table, so the mirror rebuild itself is
+    // deferred to the next prefill.
+    if (hc_fwd()) {
+        int depth = 0;
+        if (st >= 0 && st < (int)pc_state_owner.size() && pc_state_owner[(size_t)st] >= 0
+            && pc_state_owner[(size_t)st] < (int)pc_nodes_.size()) {
+            depth = pc_nodes_[(size_t)pc_state_owner[(size_t)st]].depth;
+        }
+        q4_pc_restore(slot, st, depth);
+    }
     // `src` is the caller's temporary (a just-deserialized state buffer) and the
     // memcpys above read from it asynchronously, so this must wait on both paths -
     // the multi-device branch used to be covered by sync_all() but the single-device
@@ -644,6 +745,12 @@ int engine::pc_state_take() {
         return -1;
     }
     const int ni = pc_state_owner[best];
+    static const bool pcdbg = si::env::flag("PF_PC_DEBUG");
+    if (pcdbg) {
+        fprintf(stderr, "[pcdbg] state_take st=%d node=%d ref=%d depth=%d demote=%d\n", best, ni,
+                pc_nodes_[ni].refcount, pc_nodes_[ni].depth,
+                (int)((pcr_enabled || pcd_enabled) && pc_nodes_[ni].refcount <= 0));
+    }
     if ((pcr_enabled || pcd_enabled) && pc_nodes_[ni].refcount <= 0) {
         // With a lower tier the whole node moves out: its checkpoint survives
         // there, so the slot can be handed out without losing the resume point.
@@ -671,6 +778,9 @@ void engine::pc_state_drop(int st) {
     }
     pc_state_owner[st] = -1;
     pc_state_free.push_back(st);
+    if (hc_fwd()) {
+        q4_pc_clear(st);
+    }
 }
 
 // a slot reserved by pc_capture_begin whose forward never reached pc_commit
@@ -838,18 +948,43 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
     {
         std::vector<int> prefixes;
         prefixes.push_back(0);
-        int ppos = 0;
-        while (ppos < L) {
-            const int prem = L - ppos;
-            const int pfit = cpu_mode ? 0 : batched_prefill_fit(prem);
-            int step = 0;
-            if (pfit >= 1 && pfit <= prem) {
-                step = pfit;
-            } else {
-                step = std::min<int>(kMaxT, prem);
+        if (hc_fwd()) {
+            // qwen4exp chunks its own prefill at a fixed size (kMaxB*kMaxT,
+            // or PF_Q4_PF_CHUNK when the expert bank is active).  Resuming at
+            // one of those boundaries replays the exact suffix batching the
+            // cold run used; resuming at an arbitrary 32-token boundary would
+            // prefill the remainder in a differently sized batch and change M,
+            // which moves the activation quantization and can flip a near tie.
+            int ch = kMaxB * kMaxT;
+            if (q4_hot_) {
+                if (const char * e = si::env::str("PF_Q4_PF_CHUNK")) {
+                    ch = std::max(kMaxT, atoi(e));
+                }
             }
-            ppos += step;
-            prefixes.push_back(ppos);
+            ch = std::max(kMaxT, (ch / kMaxT) * kMaxT);
+            // q4_prefill_common caps its chunk at kMaxB*kMaxT (R), so an
+            // oversized PF_Q4_PF_CHUNK still runs in 1024-token chunks.
+            ch = std::min<int>(ch, kMaxB * kMaxT);
+            int ppos = ch;
+            while (ppos < L) {
+                prefixes.push_back(ppos);
+                ppos += ch;
+            }
+            prefixes.push_back(L);
+        } else {
+            int ppos = 0;
+            while (ppos < L) {
+                const int prem = L - ppos;
+                const int pfit = cpu_mode ? 0 : batched_prefill_fit(prem);
+                int step = 0;
+                if (pfit >= 1 && pfit <= prem) {
+                    step = pfit;
+                } else {
+                    step = std::min<int>(kMaxT, prem);
+                }
+                ppos += step;
+                prefixes.push_back(ppos);
+            }
         }
         int aligned = 0;
         for (int b = deep; b >= 1; b--) {
@@ -999,7 +1134,8 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
 // before the forward; the map is read by the conv/GDN kernels, which write the
 // state at each marked boundary straight into the checkpoint pool.  pc_commit
 // links the slots to the cache nodes afterwards.
-void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_off, int pos0, int n) {
+void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_off, int pos0, int n,
+                              bool single_boundary) {
     step_info * inf = pf_info_ ? pf_info_ : d_info;
     // a previous forward's pending reservations (no commit) must not leak
     for (auto & p : pc_pending_) {
@@ -1017,15 +1153,32 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     if (n <= 0 || pos0 < 0 || pos0 % kBlockSize != 0) {
         return;
     }
-    // every preceding block must already be registered: the chained hash (and
-    // thus the node identity) is only known from a contiguous chain
-    if ((int)ps.registered * kBlockSize != pos0) {
-        return;
-    }
+    // The chained hash (and thus a node's identity) is only known from a
+    // contiguous chain.  `ps.registered` is where the last *commit* stopped,
+    // which lags this forward when the caller chunks one prompt internally
+    // (qwen4exp's q4_prefill_common) or commits only after a whole prompt.
+    // If the vector holds the full prompt - every caller passes one - the
+    // intermediate hashes can be recomputed from the block tokens.
     const int first = pos0 / kBlockSize;      // first block index of this forward
     const int last = (pos0 + n) / kBlockSize; // boundaries first+1 .. last
     if (last <= first || last >= kPcMapLen) {
         return;
+    }
+    // Only a forward that ends on a block boundary can hand a resumable
+    // checkpoint: a partial end's last complete block is inside this forward's
+    // batch, and replaying from it would use a different M than the cold run.
+    if (single_boundary && ((pos0 + n) % kBlockSize) != 0) {
+        return;
+    }
+    if ((int)ps.registered > first) {
+        return;
+    }
+    if (first > 0 && (int)toks.size() < first * kBlockSize) {
+        return; // the prefix tokens are not available: cannot rebuild the chain
+    }
+    uint64_t chain = ps.chain;
+    for (int i = (int)ps.registered; i < first; i++) {
+        chain = pc_hash_block(chain, toks.data() + (size_t)i * kBlockSize);
     }
     for (int b = first + 1; b <= last; b++) {
         inf->pc_row_slot[b] = -1;
@@ -1039,10 +1192,12 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     const int cap = std::min<int>(kMaxB * kMaxT / kBlockSize + 1, kPcMapLen / 4);
     std::vector<cand> need;
     need.reserve(std::min(last - first, cap));
-    uint64_t chain = ps.chain;
     for (int b = first + 1; b <= last; b++) {
         const int32_t * tk = toks.data() + (size_t)tok_off + (size_t)(b - 1 - first) * kBlockSize;
         chain = pc_hash_block(chain, tk);
+        if (single_boundary && b != last) {
+            continue;
+        }
         const int ni = pc_find(chain, tk);
         if (ni < 0 || pc_nodes_[ni].state < 0) {
             need.push_back({b, chain});
@@ -1061,6 +1216,9 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
         const int st = pc_state_take();
         if (st < 0) {
             break;
+        }
+        if (hc_fwd()) {
+            q4_pc_clear(st);
         }
         pc_state_stamp[st] = ++pc_clock;
         inf->pc_row_slot[need[k].b] = st;

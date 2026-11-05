@@ -6,8 +6,10 @@
 // incomplete tail.  This implementation keeps the selector and the attention
 // on the host:
 //   * the indexer weights are small and already in the host mmap;
-//   * full-attention layers keep a host mirror of their own K/V (allocated
-//     lazily per layer and slot), so the selected keys need no device gather;
+//   * there is no host K/V mirror: the selected rows are gathered from the
+//     paged pool and dequantized (`qsa_gather_positions`), so the host and
+//     device paths see the same stored values and a prefix-cache resume works
+//     for any KV type;
 //   * the result is written back to the layer's ATTN_OUT buffer and the
 //     existing wo GEMV runs on the device.
 //
@@ -71,24 +73,6 @@ inline float f16r(float x) {
     return ggml_half_to_float(ggml_float_to_half(x));
 }
 
-// PF_QSA_F16RND (diagnostic): the host attention mirror's f16 conversion.
-// `ggml_float_to_half` *truncates* the mantissa, while the device KV store
-// (`kv_st`'s `(sycl::half)` cast) rounds to nearest; the two differ by one ulp
-// on about half the values, which is the ~6e-4 attention difference the
-// device/host prefill A/B measures.  This knob makes the host mirror round so
-// the two are comparable; the shipped host path keeps the truncating form its
-// Stage 1 numbers were measured with.
-inline uint16_t f16_store(float x) {
-    static const bool rnd = si::env::flag("PF_QSA_F16RND");
-    if (!rnd) {
-        return ggml_float_to_half(x);
-    }
-    const sycl::half h = (sycl::half)x;
-    uint16_t u;
-    std::memcpy(&u, &h, sizeof(u));
-    return u;
-}
-
 // One-layer Stage 2 probe: PF_QSA_ATTN_LAYER selects the attention index and
 // PF_QSA_ATTN_DUMP is the path prefix.  The .qsa file is the gated attention
 // row; engine_q4exp writes the matching .wo file after the projection.
@@ -119,21 +103,6 @@ int qsa_pool_div(const hparams & hp) {
 
 } // namespace
 
-// Same context as the compute queue: the pinned staging and the device K/V the
-// copies read belong to it, and a queue in another context cannot use them.
-sycl::queue & engine::qsa_copy_queue(int dev) {
-    if ((int)qsa_copy_q_.size() <= dev) {
-        qsa_copy_q_.resize((size_t)dev + 1);
-    }
-    auto & p = qsa_copy_q_[(size_t)dev];
-    if (!p) {
-        sycl::queue & qd = dev_queue(dev);
-        p = std::make_unique<sycl::queue>(qd.get_context(), qd.get_device(),
-                                          sycl::property_list{sycl::property::queue::in_order()});
-    }
-    return *p;
-}
-
 // Per-layer pinned staging, grown to the largest chunk seen.  A pageable
 // std::vector makes the copy synchronous on this backend, so the four D2H
 // inputs and the sparse H2D output live in USM host memory.
@@ -157,7 +126,6 @@ void engine::qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int 
         }
         p = np;
     };
-    const size_t kvd = (size_t)hp.n_head_kv * hp.head_dim;
     const size_t n_embd = (size_t)hp.n_embd;
     if (st.cap < (size_t)n_tok) {
         size_t nc = st.cap ? st.cap : 1;
@@ -165,25 +133,38 @@ void engine::qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int 
             nc <<= 1;
         }
         realloc_to(st.mixed, nc * n_embd);
-        realloc_to(st.k, nc * kvd);
-        realloc_to(st.v, nc * kvd);
         st.cap = nc;
     }
-    if (need_q && st.cap_q < (size_t)n_tok) {
-        size_t nc = st.cap_q ? st.cap_q : 1;
-        while (nc < (size_t)n_tok) {
-            nc <<= 1;
+    if (need_q || need_out) {
+        if ((int)qsa_host_stage_.size() <= dev) {
+            qsa_host_stage_.resize((size_t)dev + 1);
         }
-        realloc_to(st.q, nc * (size_t)hp.n_head * 2 * (size_t)hp.head_dim);
-        st.cap_q = nc;
-    }
-    if (need_out && st.cap_out < (size_t)n_tok) {
-        size_t nc = st.cap_out ? st.cap_out : 1;
-        while (nc < (size_t)n_tok) {
-            nc <<= 1;
+        qsa_host_stage & hs = qsa_host_stage_[(size_t)dev];
+        hs.dev = dev;
+        auto realloc_hs = [&](float *& p, size_t & cap, size_t elems) {
+            if (cap >= elems) {
+                return;
+            }
+            size_t nc = cap ? cap : 1;
+            while (nc < elems) {
+                nc <<= 1;
+            }
+            float * np = (float *)sycl::malloc_host(nc * sizeof(float), qd);
+            if (!np) {
+                throw std::runtime_error("qwen4exp: QSA staging allocation failed");
+            }
+            if (p) {
+                sycl::free(p, qd);
+            }
+            p = np;
+            cap = nc;
+        };
+        if (need_q) {
+            realloc_hs(hs.q, hs.cap_q, (size_t)n_tok * (size_t)hp.n_head * 2 * (size_t)hp.head_dim);
         }
-        realloc_to(st.out, nc * (size_t)hp.n_head * (size_t)hp.head_dim);
-        st.cap_out = nc;
+        if (need_out) {
+            realloc_hs(hs.out, hs.cap_out, (size_t)n_tok * (size_t)hp.n_head * (size_t)hp.head_dim);
+        }
     }
 }
 
@@ -535,40 +516,15 @@ void engine::qsa_devattn_run_dev(int a, int dev, int slot, int pos, int nsel, co
     cbe.attn_combine(part, qbuf, attn_out, x.sinfo, nh, hd, nsp, 1, 1);
 }
 
-// Put the main queue's dependency on the deferred K/V copy back before the
-// next attention layer's qkv GEMV overwrites KBUF/VBUF.  It is a device-side
-// barrier (not a host wait), so the three GDN layers and FFNs in between still
-// execute and the copy overlaps them.
-void engine::qsa_copy_guard(int a, int dev) {
-    if (!qsa_on_ || !qsa_copyq_ || qsa_pending_.empty()) {
-        return;
-    }
-    const qsa_pending * last = nullptr;
-    for (auto & p : qsa_pending_) {
-        if (p.active && p.copyq && p.has_ev && p.dev == dev && p.a < a) {
-            last = &p; // the copy queue is in-order: the latest event covers all
-        }
-    }
-    if (!last) {
-        return;
-    }
-    const sycl::event ev = last->ev;
-    dev_queue(dev).submit([&](sycl::handler & h) {
-        h.depends_on(ev);
-        h.ext_oneapi_barrier();
-    });
-}
-
 // The per-token QSA state update: the two indexer projections, their norm+RoPE,
 // the raw-key ring/pool and the main K/V mirror.  It is split out of
 // qsa_attention so a decode that is still dense-equivalent can run it at the
 // end of the forward from host-staged copies (see qsa_flush).
 void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
-                              const float * mh, const float * kh, const float * vh, float * qpos, bool with_q,
-                              bool update_mirror, const float * iq_pre, const float * ik_pre) {
+                              const float * mh, float * qpos, bool with_q, const float * iq_pre,
+                              const float * ik_pre, const step_info * pcinf) {
     const hparams & hp = m.hp;
     const int id = hp.idx_head_dim, inh = hp.idx_n_head;
-    const int kvd = hp.n_head_kv * hp.head_dim;
     const int n_embd = hp.n_embd;
     const int kp = qsa_pool_div(hp);
     static const bool qtime = si::env::flag("PF_QSA_TIME");
@@ -635,13 +591,6 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
         auto & sp = qsa_cache_[(size_t)a][(size_t)slot];
         if (!sp) {
             sp = std::make_unique<qsa_slot_state>();
-            if (qsa_f16mir_) {
-                sp->k16.assign((size_t)qsa_max_seq_ * kvd, 0);
-                sp->v16.assign((size_t)qsa_max_seq_ * kvd, 0);
-            } else {
-                sp->k.assign((size_t)qsa_max_seq_ * kvd, 0.f);
-                sp->v.assign((size_t)qsa_max_seq_ * kvd, 0.f);
-            }
             sp->pool.assign(((size_t)qsa_max_seq_ / (size_t)kp + 1) * id, 0.f);
             sp->ring.assign((size_t)kp * id, 0.f);
             sp->n_pool = 0;
@@ -671,25 +620,14 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
             }
             sp->n_pool = std::max(sp->n_pool, pos / kp + 1);
         }
-        if (update_mirror) {
-            const float * ks = kh + (size_t)i * kvd;
-            const float * vs = vh + (size_t)i * kvd;
-            // f16r() is exactly one rounding: the f16 store is the same value
-            // the f32 mirror held, and the read converts it back bit-for-bit.
-            if (qsa_f16mir_) {
-                uint16_t * kd = sp->k16.data() + (size_t)pos * kvd;
-                uint16_t * vd = sp->v16.data() + (size_t)pos * kvd;
-                for (int d = 0; d < kvd; d++) {
-                    kd[d] = f16_store(ks[d]);
-                    vd[d] = f16_store(vs[d]);
-                }
-            } else {
-                float * kd = sp->k.data() + (size_t)pos * kvd;
-                float * vd = sp->v.data() + (size_t)pos * kvd;
-                for (int d = 0; d < kvd; d++) {
-                    kd[d] = f16r(ks[d]);
-                    vd[d] = f16r(vs[d]);
-                }
+        // Prefix cache: the raw indexer pool/ring is not in the paged KV and
+        // cannot be recomputed from a restored prefix, so checkpoint it at each
+        // completed 32-token block (the boundary's checkpoint slot is in the
+        // forward's step_info).
+        if (pcinf && pcinf->pc_active && (pos + 1) % kBlockSize == 0) {
+            const int st = pcinf->pc_row_slot[(pos + 1) / kBlockSize];
+            if (st >= 0) {
+                q4_pc_qsa_store(st, a, sp->pool.data(), sp->n_pool, sp->ring.data());
             }
         }
     }
@@ -733,7 +671,7 @@ void engine::qsa_reset_slot(int slot) {
         }
         p.active = false;
         p.has_ev = false;
-        p.mixed = p.k = p.v = nullptr;
+        p.mixed = nullptr;
         p.pos.clear();
         p.slot.clear();
     }
@@ -757,7 +695,7 @@ void engine::qsa_reset_slot(int slot) {
         }
     }
     if (qdbg) {
-        fprintf(stderr, "[qsa] reset slot=%d: cleared %d layer mirror(s)\n", slot, had);
+        fprintf(stderr, "[qsa] reset slot=%d: cleared %d layer state(s)\n", slot, had);
     }
 }
 
@@ -792,7 +730,8 @@ double engine::qsa_flush() {
         if (!p.active) {
             continue;
         }
-        qsa_apply_update(p.a, *p.L, p.n_tok, p.pos.data(), p.slot.data(), p.mixed, p.k, p.v, nullptr, false, true);
+        qsa_apply_update(p.a, *p.L, p.n_tok, p.pos.data(), p.slot.data(), p.mixed, nullptr, false, nullptr, nullptr,
+                         p.inf);
         p.active = false;
     }
     return qtime ? qsa_now_ms() - t0 : 0.0;
@@ -1005,6 +944,209 @@ void engine::qsa_devattn_prefill_run(int a, int dev, int n_tok, int slot, const 
     }
 }
 
+// Gather `npos` (ascending) token positions of one (layer, slot) from the
+// paged K/V into compact f32 rows [npos][n_head_kv*head_dim].  The paged pool is
+// the only K/V copy the host path reads: there is no per-slot mirror, so the
+// same values the device attention would see are what the host attention sees,
+// and a prefix-cache resume with a quantized KV type is exact.  One D2H copy
+// per touched block (and its scale plane) makes this O(npos/32) copies instead
+// of O(npos); a prefill chunk passes the union of its rows' selections.
+void engine::qsa_gather_positions(int a, int slot, const int32_t * positions, int npos) {
+    if (npos <= 0 || a < 0 || a >= (int)qsa_stage_.size() || slot < 0 || slot >= state_slots_) {
+        return;
+    }
+    qsa_stage & st = qsa_stage_[(size_t)a];
+    const hparams & hp = m.hp;
+    const int hd = hp.head_dim, nkv = hp.n_head_kv;
+    const int kvd = nkv * hd, kbs = kBlockSize;
+    const int nq = hd / kI8Q;
+    const kv_dtype_t kdt = kv_k_dtype(), vdt = kv_v_dtype();
+    const bool ksc = kv_dtype_has_scales(kdt), vsc = kv_dtype_has_scales(vdt);
+    const size_t krow = kv_dtype_row_bytes(kdt, hd), vrow = kv_dtype_row_bytes(vdt, hd);
+    const size_t kblk = kv_block_bytes(), vblk = kv_v_block_bytes();
+    const size_t kscblk = (size_t)nkv * (size_t)kbs * (size_t)nq * sizeof(sycl::half);
+    const size_t vscblk = (size_t)nkv * (size_t)kbs * (size_t)nq * sizeof(sycl::half);
+    const char * kp = nullptr, * vp = nullptr, * ks = nullptr, * vs = nullptr;
+    kv_layer_ptrs(a, kp, vp, ks, vs);
+    if (!kp || !vp) {
+        return;
+    }
+    const int dev = attn_dev(a);
+    const bool cpu = multi_dev ? (dev_kind_[(size_t)dev] == 1) : cpu_mode;
+    sycl::queue & qd = dev_queue(dev);
+    static const bool qdbg = si::env::flag("PF_Q4_QSADBG");
+    if (qdbg) {
+        fprintf(stderr,
+                "[qsa] gather a=%d slot=%d npos=%d kdt=%d vdt=%d kblk=%zu vblk=%zu krow=%zu vrow=%zu "
+                "kp=%p vp=%p ks=%p vs=%p cpu=%d\n",
+                a, slot, npos, (int)kdt, (int)vdt, kblk, vblk, krow, vrow, (const void *)kp, (const void *)vp,
+                (const void *)ks, (const void *)vs, (int)cpu);
+    }
+
+    // Group the (ascending) positions by physical block.  A selected pool never
+    // straddles a block boundary because kBlockSize is a multiple of kp.
+    st.gblk.clear();
+    st.grange.clear();
+    for (int j = 0; j < npos;) {
+        const int b = h_tables[(size_t)slot * max_blocks + (size_t)(positions[j] / kbs)];
+        const int j0 = j;
+        while (j < npos && h_tables[(size_t)slot * max_blocks + (size_t)(positions[j] / kbs)] == b) {
+            j++;
+        }
+        st.gblk.push_back(b);
+        st.grange.push_back(j0);
+        st.grange.push_back(j);
+    }
+    const int nb = (int)st.gblk.size();
+    if (nb <= 0) {
+        return;
+    }
+    // Coalesce consecutive physical block ids into runs.  A sequence's block
+    // table is normally one contiguous run (blocks are handed out lowest-first),
+    // so this turns ~nblocks D2H calls per layer into one and is what keeps the
+    // host gather from costing ~20 ms/layer in copy-call overhead.
+    st.gstage.assign((size_t)nb, 0);
+    st.grun_start.clear();
+    st.grun_len.clear();
+    int stage_blocks = 0;
+    for (int i = 0; i < nb;) {
+        int j = i + 1;
+        while (j < nb && st.gblk[(size_t)j] == st.gblk[(size_t)(j - 1)] + 1) {
+            j++;
+        }
+        const int b0 = st.gblk[(size_t)i];
+        for (int k = i; k < j; k++) {
+            st.gstage[(size_t)k] = stage_blocks + (st.gblk[(size_t)k] - b0);
+        }
+        st.grun_start.push_back(i);
+        st.grun_len.push_back(j - i);
+        stage_blocks += j - i;
+        i = j;
+    }
+    auto grow = [&](uint8_t *& p, size_t & cap, size_t need) {
+        if (p && cap >= need) {
+            return;
+        }
+        if (p) {
+            sycl::free(p, qd);
+        }
+        p = (uint8_t *)sycl::malloc_host(need ? need : 1, qd);
+        if (!p) {
+            throw std::runtime_error("qwen4exp: QSA gather staging allocation failed");
+        }
+        cap = need;
+    };
+    grow(st.sbk, st.cap_sbk, (size_t)stage_blocks * kblk);
+    grow(st.sbv, st.cap_sbv, (size_t)stage_blocks * vblk);
+    if (ksc) {
+        grow(st.sbsk, st.cap_sbsk, (size_t)stage_blocks * kscblk);
+    }
+    if (vsc) {
+        grow(st.sbsv, st.cap_sbsv, (size_t)stage_blocks * vscblk);
+    }
+    for (size_t r = 0; r < st.grun_start.size(); r++) {
+        const int i = st.grun_start[r];
+        const int b = st.gblk[(size_t)i];
+        const size_t bytes_k = (size_t)st.grun_len[r] * kblk;
+        const size_t bytes_v = (size_t)st.grun_len[r] * vblk;
+        uint8_t * dk = st.sbk + (size_t)st.gstage[(size_t)i] * kblk;
+        uint8_t * dv = st.sbv + (size_t)st.gstage[(size_t)i] * vblk;
+        if (cpu) {
+            std::memcpy(dk, kp + (size_t)b * kblk, bytes_k);
+            std::memcpy(dv, vp + (size_t)b * vblk, bytes_v);
+            if (ksc) {
+                std::memcpy(st.sbsk + (size_t)st.gstage[(size_t)i] * kscblk, ks + (size_t)b * kscblk,
+                            (size_t)st.grun_len[r] * kscblk);
+            }
+            if (vsc) {
+                std::memcpy(st.sbsv + (size_t)st.gstage[(size_t)i] * vscblk, vs + (size_t)b * vscblk,
+                            (size_t)st.grun_len[r] * vscblk);
+            }
+        } else {
+            qd.memcpy(dk, kp + (size_t)b * kblk, bytes_k);
+            qd.memcpy(dv, vp + (size_t)b * vblk, bytes_v);
+            if (ksc) {
+                qd.memcpy(st.sbsk + (size_t)st.gstage[(size_t)i] * kscblk, ks + (size_t)b * kscblk,
+                          (size_t)st.grun_len[r] * kscblk);
+            }
+            if (vsc) {
+                qd.memcpy(st.sbsv + (size_t)st.gstage[(size_t)i] * vscblk, vs + (size_t)b * vscblk,
+                          (size_t)st.grun_len[r] * vscblk);
+            }
+        }
+    }
+    if (!cpu) {
+        qd.wait();
+    }
+    if (qdbg) {
+        fprintf(stderr, "[qsa] gather copied nb=%d runs=%d first_blk=%d last_blk=%d\n", nb,
+                (int)st.grun_start.size(), st.gblk.front(), st.gblk.back());
+    }
+    st.gk.resize((size_t)npos * (size_t)kvd);
+    st.gv.resize((size_t)npos * (size_t)kvd);
+    auto put_row = [&](const uint8_t * data, const uint8_t * scales, size_t rowb, kv_dtype_t dt, int so, int h,
+                       float * dst) {
+        const uint8_t * row = data + ((size_t)h * (size_t)kbs + (size_t)so) * rowb;
+        const sycl::half * sc = scales ? (const sycl::half *)(scales + ((size_t)h * (size_t)kbs + (size_t)so)
+                                                                           * (size_t)nq * sizeof(sycl::half))
+                                       : nullptr;
+        switch (dt) {
+        case kv_dtype_t::f32:
+            std::memcpy(dst, row, (size_t)hd * sizeof(float));
+            break;
+        case kv_dtype_t::f16:
+            for (int d = 0; d < hd; d++) {
+                uint16_t u;
+                std::memcpy(&u, row + (size_t)d * 2, sizeof(u));
+                dst[d] = ggml_half_to_float(u);
+            }
+            break;
+        case kv_dtype_t::bf16:
+            for (int d = 0; d < hd; d++) {
+                uint16_t u;
+                std::memcpy(&u, row + (size_t)d * 2, sizeof(u));
+                dst[d] = ggml_bf16_to_float(u);
+            }
+            break;
+        case kv_dtype_t::i8:
+            // One scale per 32 values: keep the scale in a register across the
+            // group so the loop auto-vectorises to a cvt + multiply.
+            for (int d = 0; d < hd; d += kI8Q) {
+                const float s = (float)sc[d / kI8Q];
+                for (int k = 0; k < kI8Q; k++) {
+                    dst[d + k] = (float)((const int8_t *)row)[d + k] * s;
+                }
+            }
+            break;
+        case kv_dtype_t::i4:
+            for (int d = 0; d < hd; d += kI8Q) {
+                const float s = (float)sc[d / kI8Q];
+                for (int k = 0; k < kI8Q; k++) {
+                    const int dd = d + k;
+                    const uint8_t byte = row[dd >> 1];
+                    const int v = (dd & 1) ? (byte >> 4) : (byte & 0xF);
+                    dst[dd] = (float)((v ^ 8) - 8) * s;
+                }
+            }
+            break;
+        }
+    };
+    for (int i = 0; i < nb; i++) {
+        const int j0 = st.grange[(size_t)i * 2], j1 = st.grange[(size_t)i * 2 + 1];
+        const uint8_t * bkd = st.sbk + (size_t)st.gstage[(size_t)i] * kblk;
+        const uint8_t * bvd = st.sbv + (size_t)st.gstage[(size_t)i] * vblk;
+        const uint8_t * bks = ksc ? st.sbsk + (size_t)st.gstage[(size_t)i] * kscblk : nullptr;
+        const uint8_t * bvs = vsc ? st.sbsv + (size_t)st.gstage[(size_t)i] * vscblk : nullptr;
+        for (int j = j0; j < j1; j++) {
+            const int so = positions[j] % kbs;
+            for (int h = 0; h < nkv; h++) {
+                put_row(bkd, bks, krow, kdt, so, h, st.gk.data() + (size_t)j * (size_t)kvd + (size_t)h * (size_t)hd);
+                put_row(bvd, bvs, vrow, vdt, so, h, st.gv.data() + (size_t)j * (size_t)kvd + (size_t)h * (size_t)hd);
+            }
+        }
+    }
+}
+
 bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const step_info * inf, const float * mixed,
                            float * qbuf, const float * kbuf, const float * vbuf, float * attn_out) {
     if (!qsa_on_ || !L.idx.ok() || a < 0 || a >= (int)qsa_cache_.size()) {
@@ -1035,12 +1177,12 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     // until the next attention layer.  The source is this layer's pinned
     // staging, which outlives the copy (the engine syncs before the next
     // forward).
-    auto from_host_async = [&](void * dst, const void * src, size_t bytes) {
+    auto from_host_async = [&](void * dst, const void * src, size_t bytes) -> sycl::event {
         if (is_cpu(dev)) {
             std::memcpy(dst, src, bytes);
-        } else {
-            dev_queue(dev).memcpy(dst, src, bytes);
+            return {};
         }
+        return dev_queue(dev).memcpy(dst, src, bytes);
     };
 
     static const bool qdbg = std::getenv("PF_Q4_QSADBG") != nullptr;
@@ -1052,10 +1194,10 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     }
     const int n_embd = hp.n_embd;
     // `need` depends only on the positions, so it is known before any copy.
-    // The main K/V mirror is needed at every token (the indexer cache must be
-    // warm when the context crosses the budget), but Q is read only by the
-    // sparse attention, so its 49 KB/token/layer copy is skipped while the
-    // selector is dense-equivalent.
+    // The indexer pool/ring must be warm at every token (so the selector is
+    // ready when the context crosses the budget), but Q is read only by the
+    // sparse attention, so its copy is skipped while the selector is
+    // dense-equivalent.
     bool need = false;
     std::vector<int> posv((size_t)n_tok), slotv((size_t)n_tok);
     for (int i = 0; i < n_tok; i++) {
@@ -1134,16 +1276,13 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         return true;
     }
 
-    // Dense-equivalent forwards (decode, and a prefill tail of up to kMaxB
-    // tokens) enqueue the copies and let the end of the forward apply the
-    // update.  A dense prefill chunk larger than kMaxB defers the same way, but
-    // K/V go on the per-device copy queue so they overlap the following layers;
-    // only the per-token update moves - the selector still has to see this
-    // token, so the sparse path keeps the inline form.
+    // Dense-equivalent forwards (decode and a prefill tail/chunk) defer the
+    // indexer update to the end of the forward.  Only `mixed` (10 KB/token) is
+    // copied now: the main K/V is not mirrored, so there is no K/V D2H to
+    // overlap.  The copy rides the main in-order queue, which orders it after
+    // this layer's hc_mix (the source) and before the next layer's hc_mix.
     static const bool defer_on = SI_ENV_I32("PF_QSA_DEFER", 1) != 0;
-    const bool defer_small = defer_on && !need && n_tok <= kMaxB;
-    const bool defer_big = defer_on && qsa_copyq_ && !need && n_tok > kMaxB;
-    const bool defer = (defer_small || defer_big) && a < (int)qsa_pending_.size();
+    const bool defer = defer_on && !need && a < (int)qsa_pending_.size();
     if (defer) {
         qsa_stage_ensure(a, n_tok, false, false, dev);
         qsa_stage & st = qsa_stage_[(size_t)a];
@@ -1154,42 +1293,14 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         p.dev = dev;
         p.pos.assign(posv.begin(), posv.end());
         p.slot.assign(slotv.begin(), slotv.end());
+        p.inf = inf;
         p.mixed = st.mixed;
-        p.k = st.k;
-        p.v = st.v;
         const size_t mb = (size_t)n_tok * (size_t)n_embd * sizeof(float);
-        const size_t kb = (size_t)n_tok * (size_t)kvd * sizeof(float);
         if (is_cpu(dev)) {
             std::memcpy(p.mixed, mixed, mb);
-            std::memcpy(p.k, kbuf, kb);
-            std::memcpy(p.v, vbuf, kb);
-            p.copyq = false;
             p.has_ev = false;
-        } else if (defer_big) {
-            // mixed stays on the main queue: its source b.mixed is rewritten by
-            // the next layer's hc_mix, and the in-order queue orders that after
-            // the copy.  The barrier marks the point K/V may start from, and
-            // (because it is submitted after the mixed copy) its event also
-            // covers that copy for qsa_flush.
-            (void)to_host_async(p.mixed, mixed, mb);
-            sycl::event mark = dev_queue(dev).submit([&](sycl::handler & h) { h.ext_oneapi_barrier(); });
-            sycl::queue & cq = qsa_copy_queue(dev);
-            // One explicit memory operation per command group.
-            sycl::event ekm = cq.submit([&](sycl::handler & h) {
-                h.depends_on(mark);
-                h.memcpy(p.k, kbuf, kb);
-            });
-            p.ev = cq.submit([&](sycl::handler & h) {
-                h.depends_on(ekm);
-                h.memcpy(p.v, vbuf, kb);
-            });
-            p.copyq = true;
-            p.has_ev = true;
         } else {
-            (void)to_host_async(p.mixed, mixed, mb);
-            (void)to_host_async(p.k, kbuf, kb);
-            p.ev = to_host_async(p.v, vbuf, kb);
-            p.copyq = false;
+            p.ev = dev_queue(dev).memcpy(p.mixed, mixed, mb);
             p.has_ev = true;
         }
         p.active = true;
@@ -1197,7 +1308,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
             qsa_copy_ms_ += qsa_now_ms() - q_t0;
         }
         if (qdbg) {
-            fprintf(stderr, "[qsa] deferred a=%d n_tok=%d copyq=%d\n", a, n_tok, (int)p.copyq);
+            fprintf(stderr, "[qsa] deferred a=%d n_tok=%d\n", a, n_tok);
         }
         return false;
     }
@@ -1238,10 +1349,14 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     qsa_flush();
     qsa_stage_ensure(a, n_tok, need && !dev_attn, need && !dev_attn, dev);
     qsa_stage & st = qsa_stage_[(size_t)a];
+    qsa_host_stage * hs = (!dev_attn && dev >= 0 && dev < (int)qsa_host_stage_.size())
+                              ? &qsa_host_stage_[(size_t)dev]
+                              : nullptr;
 
     const size_t mb = (size_t)n_tok * (size_t)n_embd * sizeof(float);
     const size_t qb = (size_t)n_tok * (size_t)nh * (size_t)stride * sizeof(float);
-    const size_t kb = (size_t)n_tok * (size_t)kvd * sizeof(float);
+    (void)kbuf;
+    (void)vbuf;
     // PF_QSA_EARLY: the dev-attn sparse path's `mixed` D2H was enqueued by
     // qsa_early_mixed() before this layer's QKV GEMVs.  Consume that event and
     // wait for the 10 KB copy alone.  The dev-attn path reads nothing else
@@ -1263,11 +1378,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         (void)to_host_async(st.mixed, mixed, mb);
     }
     if (need && !dev_attn) {
-        (void)to_host_async(st.q, qbuf, qb);
-    }
-    if (!dev_attn) {
-        (void)to_host_async(st.k, kbuf, kb);
-        (void)to_host_async(st.v, vbuf, kb);
+        (void)to_host_async(hs->q, qbuf, qb);
     }
     if (!is_cpu(dev)) {
         if (early) {
@@ -1282,8 +1393,8 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     }
 
     std::vector<float> qpos((size_t)n_tok * inh * id);
-    qsa_apply_update(a, L, n_tok, posv.data(), slotv.data(), st.mixed, st.k, st.v, qpos.data(), need, !dev_attn,
-                     idx_early ? st.iq : nullptr, idx_early ? st.ik : nullptr);
+    qsa_apply_update(a, L, n_tok, posv.data(), slotv.data(), st.mixed, qpos.data(), need,
+                     idx_early ? st.iq : nullptr, idx_early ? st.ik : nullptr, inf);
 
     if (qdbg) {
         fprintf(stderr, "[qsa] caches updated need=%d\n", (int)need);
@@ -1384,7 +1495,11 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     };
     bool used_dev = false;
     if (!dev_attn) {
-        std::memset(st.out, 0, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
+        if (hs->out_pending) {
+            hs->out_ev.wait();
+            hs->out_pending = false;
+        }
+        std::memset(hs->out, 0, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
     }
     if (dev_pf) {
         qsa_devattn_aux(a, dev);
@@ -1420,44 +1535,158 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         }
         used_dev = true;
     }
-    for (int i = 0; !dev_pf && i < n_tok; i++) {
-        const int pos = posv[(size_t)i];
-        const int slot = slotv[(size_t)i];
-        const double q_row0 = qtime ? qsa_now_ms() : 0.0;
-        std::vector<int> sel;
-        if (!select_row(i, sel)) {
-            continue;
-        }
-        const qsa_slot_state & sp = *qsa_cache_[(size_t)a][(size_t)slot];
-        const int nsel = (int)sel.size();
-        if (qtime) {
-            qsa_sel_ms_ += qsa_now_ms() - q_row0;
-            qsa_rows_++;
-            qsa_nsel_ += nsel;
-        }
-        if (qdbg) {
-            fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, pos, slot, nsel);
-        }
-        const int kvh_stride = kvd;
-        const double q_att0 = qtime ? qsa_now_ms() : 0.0;
-        if (dev_path) {
+    if (dev_path) {
+        for (int i = 0; i < n_tok; i++) {
+            const int pos = posv[(size_t)i];
+            const int slot = slotv[(size_t)i];
+            const double q_row0 = qtime ? qsa_now_ms() : 0.0;
+            std::vector<int> sel;
+            if (!select_row(i, sel)) {
+                continue;
+            }
+            const int nsel = (int)sel.size();
+            if (qtime) {
+                qsa_sel_ms_ += qsa_now_ms() - q_row0;
+                qsa_rows_++;
+                qsa_nsel_ += nsel;
+            }
+            if (qdbg) {
+                fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, pos, slot, nsel);
+            }
+            const double q_att0 = qtime ? qsa_now_ms() : 0.0;
             qsa_devattn_run(a, dev, slot, pos, sel, qbuf, attn_out);
             used_dev = true;
-        } else {
-            // one job per query head, ~nsel*2*head_dim MAC each; the kernel
-            // picks the scalar / AVX2 / AVX-512 form on the host ISA.
-            par(nh, [&](int h) {
-                const int kvh = h / gqa;
-                const float * q = st.q + (size_t)i * nh * stride + (size_t)h * stride;
-                float * o = st.out + (size_t)i * nh * hd + (size_t)h * hd;
-                if (qsa_f16mir_) {
-                    cpu_qsa_attn_head_h(q, sp.k16.data() + (size_t)kvh * hd, sp.v16.data() + (size_t)kvh * hd,
-                                        kvh_stride, sel.data(), nsel, hd, hp.attn_scale, o);
-                } else {
-                    cpu_qsa_attn_head(q, sp.k.data() + (size_t)kvh * hd, sp.v.data() + (size_t)kvh * hd, kvh_stride,
-                                      sel.data(), nsel, hd, hp.attn_scale, o);
+            if (qtime) {
+                qsa_attn_ms_ += qsa_now_ms() - q_att0;
+            }
+        }
+    } else if (!dev_pf) {
+        // Host sparse attention.  There is no host K/V mirror: the selected
+        // rows are gathered from the paged pool and dequantized into a compact
+        // f16 buffer.  A prefill chunk gathers the UNION of its rows'
+        // selections once per layer (the alternative, one gather per row, is
+        // O(n_tok * top_k) D2H traffic), then every row maps its own selection
+        // into that compact buffer.
+        int n_vis_max = 0;
+        for (int i = 0; i < n_tok; i++) {
+            n_vis_max = std::max(n_vis_max, posv[(size_t)i] + 1);
+        }
+        bool one_slot = n_tok > 0;
+        for (int i = 1; i < n_tok; i++) {
+            if (slotv[(size_t)i] != slotv[0]) {
+                one_slot = false;
+            }
+        }
+        const double q_sel0 = qtime ? qsa_now_ms() : 0.0;
+        if (one_slot && n_tok > 0) {
+            st.gused.assign((size_t)n_vis_max, 0);
+            st.goff.assign((size_t)n_tok + 1, 0);
+            st.gcnt.assign((size_t)n_tok, 0);
+            st.gsel_all.clear();
+            std::vector<int> sel;
+            for (int i = 0; i < n_tok; i++) {
+                sel.clear();
+                if (!select_row(i, sel)) {
+                    st.goff[(size_t)i + 1] = st.goff[(size_t)i];
+                    continue;
                 }
-            });
+                st.gcnt[(size_t)i] = (int)sel.size();
+                st.goff[(size_t)i + 1] = st.goff[(size_t)i] + (int)sel.size();
+                st.gsel_all.insert(st.gsel_all.end(), sel.begin(), sel.end());
+                for (int p : sel) {
+                    if (p >= 0 && p < n_vis_max) {
+                        st.gused[(size_t)p] = 1;
+                    }
+                }
+            }
+            st.gpos.clear();
+            for (int p = 0; p < n_vis_max; p++) {
+                if (st.gused[(size_t)p]) {
+                    st.gpos.push_back(p);
+                }
+            }
+            if (!st.gpos.empty()) {
+                qsa_gather_positions(a, slotv[0], st.gpos.data(), (int)st.gpos.size());
+                st.gmap.assign((size_t)n_vis_max, -1);
+                for (int j = 0; j < (int)st.gpos.size(); j++) {
+                    st.gmap[(size_t)st.gpos[(size_t)j]] = j;
+                }
+            }
+        }
+        if (qtime) {
+            qsa_sel_ms_ += qsa_now_ms() - q_sel0;
+            qsa_rows_ += n_tok;
+        }
+        const double q_att0 = qtime ? qsa_now_ms() : 0.0;
+        if (one_slot && n_tok > 0) {
+            for (int i = 0; i < n_tok; i++) {
+                const int nsel = st.gcnt[(size_t)i];
+                if (nsel <= 0) {
+                    continue;
+                }
+                if (qdbg) {
+                    fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d (union=%d)\n", i, posv[(size_t)i],
+                            slotv[(size_t)i], nsel, (int)st.gpos.size());
+                }
+                st.gsel.resize((size_t)nsel);
+                for (int j = 0; j < nsel; j++) {
+                    st.gsel[(size_t)j] = st.gmap[(size_t)st.gsel_all[(size_t)st.goff[(size_t)i] + (size_t)j]];
+                }
+                if (qtime) {
+                    qsa_nsel_ += nsel;
+                }
+                par(nh, [&](int h) {
+                    const int kvh = h / gqa;
+                    const float * q = hs->q + (size_t)i * nh * stride + (size_t)h * stride;
+                    float * o = hs->out + (size_t)i * nh * hd + (size_t)h * hd;
+                    cpu_qsa_attn_head(q, st.gk.data() + (size_t)kvh * hd, st.gv.data() + (size_t)kvh * hd, kvd,
+                                      st.gsel.data(), nsel, hd, hp.attn_scale, o);
+                });
+            }
+        } else {
+            // Batched rows on different slots (not used by qwen4exp's one-row
+            // decode, but the host path is generic): gather each row alone.
+            for (int i = 0; i < n_tok; i++) {
+                std::vector<int> sel;
+                if (!select_row(i, sel)) {
+                    continue;
+                }
+                const int nsel = (int)sel.size();
+                if (nsel <= 0) {
+                    continue;
+                }
+                const int nv = posv[(size_t)i] + 1;
+                st.gused.assign((size_t)nv, 0);
+                for (int p : sel) {
+                    st.gused[(size_t)p] = 1;
+                }
+                st.gpos.clear();
+                for (int p = 0; p < nv; p++) {
+                    if (st.gused[(size_t)p]) {
+                        st.gpos.push_back(p);
+                    }
+                }
+                qsa_gather_positions(a, slotv[(size_t)i], st.gpos.data(), (int)st.gpos.size());
+                st.gmap.assign((size_t)nv, -1);
+                for (int j = 0; j < (int)st.gpos.size(); j++) {
+                    st.gmap[(size_t)st.gpos[(size_t)j]] = j;
+                }
+                st.gsel.resize((size_t)nsel);
+                for (int j = 0; j < nsel; j++) {
+                    st.gsel[(size_t)j] = st.gmap[(size_t)sel[(size_t)j]];
+                }
+                if (qtime) {
+                    qsa_rows_++;
+                    qsa_nsel_ += nsel;
+                }
+                par(nh, [&](int h) {
+                    const int kvh = h / gqa;
+                    const float * q = hs->q + (size_t)i * nh * stride + (size_t)h * stride;
+                    float * o = hs->out + (size_t)i * nh * hd + (size_t)h * hd;
+                    cpu_qsa_attn_head(q, st.gk.data() + (size_t)kvh * hd, st.gv.data() + (size_t)kvh * hd, kvd,
+                                      st.gsel.data(), nsel, hd, hp.attn_scale, o);
+                });
+            }
         }
         if (qtime) {
             qsa_attn_ms_ += qsa_now_ms() - q_att0;
@@ -1487,7 +1716,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                     q.wait();
                     fwrite(hout.data(), sizeof(float), nout, fp);
                 } else {
-                    fwrite(st.out + off, sizeof(float), nout, fp);
+                    fwrite(hs->out + off, sizeof(float), nout, fp);
                 }
                 fclose(fp);
             }
@@ -1498,9 +1727,10 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         // no host buffer written (the slot guard above skipped it), and the
         // Stage 1 host path would have left that row zeroed.
         if (dev_path) {
-            std::memset(st.out, 0, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
+            std::memset(hs->out, 0, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
         }
-        from_host_async(attn_out, st.out, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
+        hs->out_ev = from_host_async(attn_out, hs->out, (size_t)n_tok * (size_t)nh * (size_t)hd * sizeof(float));
+        hs->out_pending = !is_cpu(dev);
     }
     if (qdbg) {
         fprintf(stderr, "[qsa] out written\n");

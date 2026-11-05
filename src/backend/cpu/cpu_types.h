@@ -262,8 +262,8 @@ void cpu_qsa_score_pools(const float * q, const float * pool, int n_pool, int id
 // sel[j] * kv_stride floats.  `q` is [2*head_dim] (query then gate).
 void cpu_qsa_attn_head(const float * q, const float * kbase, const float * vbase, int kv_stride, const int * sel,
                        int nsel, int hd, float scale, float * out);
-// PF_QSA_F16MIR: the mirror is stored as f16 (the value the reference cache
-// holds), so the kernel converts at read.  The arithmetic is the f32 form's:
+// The QSA engine gathers compact rows as f32 (the dequantized paged K/V); the
+// f16 form below remains for the scalar/tests A/B and converts at read.  The arithmetic is the f32 form's:
 // every f16 converts back to exactly the float the old f32 mirror held.
 void cpu_qsa_attn_head_h(const float * q, const uint16_t * kbase, const uint16_t * vbase, int kv_stride,
                          const int * sel, int nsel, int hd, float scale, float * out);

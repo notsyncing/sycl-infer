@@ -761,17 +761,54 @@ struct engine {
     std::vector<int32_t> engram_tag_;
     std::vector<float> engram_row_;
     size_t engram_hits_ = 0, engram_misses_ = 0;
+    // ---- qwen4exp prefix-cache extras -----------------------------------
+    // The generic checkpoint pool (`d_pc_states`) holds only the GDN/conv
+    // state, which a kernel can snapshot at a block boundary.  qwen4exp also
+    // needs two pieces of *host* state:
+    //   * the PLE rolling history (the last (conv_k-1)*ngram normalised rows)
+    //     plus the previous-token ring; and
+    //   * the QSA indexer pool/ring (the raw indexer keys, which are not in the
+    //     paged KV and cannot be recomputed without the prefix hidden states).
+    // Both are indexed by the same checkpoint slot as `d_pc_states`; the QSA
+    // host mirror is *not* stored - it is the same K/V the paged pool holds and
+    // is rebuilt from the restored blocks when the host path needs it.
+    struct q4_pc_ple_state {
+        std::vector<float> hist;   // hist_rows*hc_dim, right-aligned
+        std::vector<int32_t> prev; // ngram-1 previous token ids
+        int32_t nhist = 0;
+        bool valid = false;
+    };
+    std::vector<q4_pc_ple_state> q4_pc_ple_;
+    struct q4_pc_qsa_state {
+        std::vector<std::vector<float>> pool; // [attn layer][n_pool*idx_head_dim]
+        std::vector<std::vector<float>> ring; // [attn layer][kp*idx_head_dim]
+        bool valid = false;
+    };
+    std::vector<q4_pc_qsa_state> q4_pc_qsa_;
+    void q4_pc_alloc();
+    void q4_pc_clear(int st);
+    size_t q4_pc_extra_floats(int depth_blocks) const;
+    // Snapshot the PLE history at every block boundary this forward completed
+    // (the checkpoint slot comes from `info->pc_row_slot`).
+    void q4_pc_ple_store(const step_info & info, int slot, int base_pos, int n_tok, const int32_t * toks,
+                         const float * hist_before, int nhist_before, const int32_t * prev_before,
+                         const float * normed);
+    void q4_pc_qsa_store(int st, int a, const float * pool, int n_pool, const float * ring);
+    // Install a checkpoint's PLE/QSA extras into `slot` (pc_restore_state).
+    void q4_pc_restore(int slot, int st, int depth_blocks);
     // QSA: host-side indexer cache/mirror and the sparse attention.  The main
     // KV stays on the device; full-attention layers keep a host copy of their
     // own K/V so the selected keys can be attended on the CPU without a gather
     // kernel.  Allocated lazily per (attention layer, slot).
     struct qsa_slot_state {
-        // PF_QSA_F16MIR (default on) keeps the mirror as the f16 the reference
-        // cache holds; the f32 vectors are the A/B and are not allocated then.
-        std::vector<uint16_t> k16, v16; // [max_seq][n_head_kv*head_dim]
-        std::vector<float> k, v;        // the PF_QSA_F16MIR=0 mirror
-        std::vector<float> pool;        // [(max_seq/4+1)][idx_head_dim]
-        std::vector<float> ring;        // [4][idx_head_dim]
+        // Only the selector's indexer pool/ring is per-sequence host state.  The
+        // main K/V is read straight from the paged pool (and dequantized) by the
+        // host sparse attention, so there is no host K/V mirror: it used to cost
+        // max_seq*n_head_kv*head_dim*2 bytes per attention layer per slot (48 MB
+        // at 4k, 3.2 GB at 256k) and made a prefix-cache resume impossible for a
+        // quantized KV type (the mirror holds pre-quantization values).
+        std::vector<float> pool; // [(max_seq/kp+1)][idx_head_dim]
+        std::vector<float> ring; // [kp][idx_head_dim]
         int n_pool = 0;
     };
     std::vector<std::vector<std::unique_ptr<qsa_slot_state>>> qsa_cache_;
@@ -790,12 +827,12 @@ struct engine {
         int dev = -1;
         bool active = false;
         bool has_ev = false;
-        bool copyq = false; // the K/V copies ride the per-device copy queue
         sycl::event ev;
         std::vector<int> pos, slot;
+        // The forward's step_info, for the prefix cache's per-block checkpoints
+        // (the deferred update runs after the head, inside the same forward).
+        const step_info * inf = nullptr;
         float * mixed = nullptr; // per-layer pinned staging
-        float * k = nullptr;
-        float * v = nullptr;
     };
     std::vector<qsa_pending> qsa_pending_;
     // PF_QSA_EARLY (default on): enqueue the per-layer `mixed` D2H right after
@@ -866,30 +903,49 @@ struct engine {
     // and the q4 box's in-order queue drain was the cost.
     struct qsa_stage {
         float * mixed = nullptr;
-        float * q = nullptr;
-        float * k = nullptr;
-        float * v = nullptr;
-        float * out = nullptr;
         float * iq = nullptr; // PF_QSA_IDX_DEV: normed+RoPEd q, [cap_i][inh*id]
         float * ik = nullptr; // PF_QSA_IDX_DEV: raw indexer key, [cap_i][id]
-        size_t cap = 0;     // tokens: mixed/k/v
-        size_t cap_q = 0;   // tokens: q
-        size_t cap_out = 0; // tokens: out
+        size_t cap = 0;     // tokens: mixed
         size_t cap_i = 0;   // tokens: iq/ik
         int dev = -1;
+        // Host sparse attention's scratch.  The selected rows are gathered from
+        // the paged pool (dequantized) into a compact f32 buffer; a prefill chunk
+        // gathers the union of its rows' selections once per layer.
+        std::vector<float> gk, gv; // compact rows: [npos][n_head_kv*head_dim]
+        // Pinned per-block staging for the gather's D2H copies (K/V data and,
+        // for i8/i4, their scale planes).  Grown on demand; freed with the
+        // rest of the per-layer staging in ~engine.
+        uint8_t * sbk = nullptr, * sbv = nullptr, * sbsk = nullptr, * sbsv = nullptr;
+        size_t cap_sbk = 0, cap_sbv = 0, cap_sbsk = 0, cap_sbsv = 0;
+        std::vector<int32_t> gpos;  // union of selected positions (ascending)
+        std::vector<uint8_t> gused; // per-position membership bitmap
+        std::vector<int32_t> gmap;  // position -> compact row (-1 = absent)
+        std::vector<int32_t> gblk;  // unique blocks in gpos
+        std::vector<int32_t> grange; // [start,end) in gpos per gblk entry
+        std::vector<int32_t> gstage; // staging block index per gblk entry
+        std::vector<int32_t> grun_start, grun_len; // coalesced block runs
+        std::vector<int32_t> gsel;  // one row's mapped selection
+        std::vector<int32_t> gsel_all, goff, gcnt; // every row's selection
     };
     std::vector<qsa_stage> qsa_stage_;
+    // The host sparse path's Q and output staging is shared across the
+    // attention layers of one device: only one layer runs inline at a time, and
+    // per-layer copies cost ~30 MB x 12 of pinned USM (which the Level Zero
+    // driver charges against the card) at a 1024-token chunk.
+    struct qsa_host_stage {
+        float * q = nullptr;
+        float * out = nullptr;
+        size_t cap_q = 0, cap_out = 0;
+        int dev = -1;
+        // The H2D of the host attention output is asynchronous; the buffer is
+        // shared by the device's attention layers, so the next layer's memset
+        // must not overwrite it before the copy has read it.
+        sycl::event out_ev;
+        bool out_pending = false;
+    };
+    std::vector<qsa_host_stage> qsa_host_stage_;
     void qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int dev);
     void qsa_idx_stage_ensure(int a, int n_tok, int dev);
-    // Per-device in-order copy queue for the deferred dense-prefill K/V D2H.
-    // It rides beside the compute queue, so the copy overlaps the next layers
-    // instead of being ordered into the queue; qsa_copy_guard() puts the
-    // dependency back before the buffers it reads are rewritten.
-    std::vector<std::unique_ptr<sycl::queue>> qsa_copy_q_;
-    sycl::queue & qsa_copy_queue(int dev);
-    void qsa_copy_guard(int a, int dev);
-    bool qsa_f16mir_ = false;  // PF_QSA_F16MIR (default on)
-    bool qsa_copyq_ = false;   // PF_QSA_COPYQ (default on)
     bool qsa_devattn_ = true; // PF_QSA_DEVATTN (default on, Stage 2; =0 keeps host)
     bool qsa_pf_dev_ = true;  // PF_QSA_PF_DEV: device sparse *prefill* (see docs 18 §4)
     int qsa_pf_wave_ = 8;     // PF_QSA_PF_WAVE: prefill rows per compact pool
@@ -940,8 +996,13 @@ struct engine {
     void qsa_devattn_prefill_run(int a, int dev, int n_tok, int slot, const int32_t * hsel, const int32_t * hcnt,
                                  const float * qbuf, float * attn_out);
     void qsa_apply_update(int a, const layer_t & L, int n_tok, const int * posv, const int * slotv,
-                          const float * mixed_host, const float * kh, const float * vh, float * qpos, bool with_q,
-                          bool update_mirror, const float * iq_pre = nullptr, const float * ik_pre = nullptr);
+                          const float * mixed_host, float * qpos, bool with_q,
+                          const float * iq_pre = nullptr, const float * ik_pre = nullptr,
+                          const step_info * pcinf = nullptr);
+    // Gather/dequantize `npos` selected positions of (layer a, slot) from the
+    // paged K/V into compact f32 rows [npos][n_head_kv*head_dim].  The host QSA
+    // attention reads only this buffer, so no per-slot K/V mirror is kept.
+    void qsa_gather_positions(int a, int slot, const int32_t * pos, int npos);
     double qsa_flush();
     // A slot is about to be handed to a new sequence (or the engine is being
     // reset): drop its host mirror/pool/ring and any deferred update that names
@@ -1667,7 +1728,8 @@ struct engine {
     // (called from prefill_chunk/prefill_batch); the conv/GDN kernels write the
     // snapshots, pc_commit links them to the cache nodes afterwards.
     // `tok_off` is where token position `pos0` lives in `toks`.
-    void pc_capture_begin(int slot, const std::vector<int> & toks, int tok_off, int pos0, int n);
+    void pc_capture_begin(int slot, const std::vector<int> & toks, int tok_off, int pos0, int n,
+                          bool single_boundary = false);
     // register the blocks of the just-prefilled prompt [0, done) as cache nodes
     // and attach the checkpoint slots captured by the forward
     void pc_commit(int slot, const std::vector<int> & toks, const std::vector<int> & blocks, int done);
@@ -1851,7 +1913,7 @@ private:
     void pc_serialize_block(int block, std::vector<uint8_t> & blob);
     void pc_deserialize_block(const uint8_t * blob, int block);
     void pc_serialize_state(int st, std::vector<float> & out);
-    void pc_deserialize_state(const float * in, int st);
+    void pc_deserialize_state(const float * in, int st, int depth_blocks);
     // demote a node to the next enabled tier (RAM, else disk); returns true
     // when the record is stored in a lower tier
     bool pc_demote_node(int ni);

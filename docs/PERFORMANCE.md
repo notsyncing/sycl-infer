@@ -199,7 +199,8 @@ behind a per-expert LRU on the cards.  **Current configuration** (AOT Release,
 --cpu-threads 28 --kv-type f16 --max-slots 16`, tail-skip 0 (the exact expert
 set), `PF_QSA_IDX_DEV=1`, `PF_QSA_PF_DEV=1`, `PF_QSA_SEL_DEV=0`,
 `PF_Q4_GEMV8_SPLIT_ROWS`/`WPR` at the profile's 512/8, `PF_HEAD_U4=1` store but
-`PF_Q4_HEAD_W4=0` (the raw Q8_0 head read), and `PF_PREFIX_CACHE=0`.  Device 0
+`PF_Q4_HEAD_W4=0` (the raw Q8_0 head read), and `PF_PREFIX_CACHE=0` (a
+benchmark condition: a warm cache inside one process would change the cells).
 is the x8 slot, so the 20/28 layer split gives the x16 card more layers; the
 17 500 MB bank is per device (152 slots/layer on device 0, 104 on device 1).
 One process per cell; the box drifts ~3 % between runs, so only cells measured
@@ -259,6 +260,32 @@ throughput of decoding the two sequences serially, because two prompts select
 read doubles.  The 2-row form is therefore not used, and there is no batched
 q4 path at depth.  MTP is gated off for this model (the model profile declares
 it unsupported), so there is no speculative path to measure.
+
+**Prefix cache (text-only, enabled by default).**  Measured on the same 2x
+A770 box with the JIT Release build that shipped the feature (one process, one
+run per cell, so these are not best-of): `--ctx 2048 --kv-type f16`, a
+1 710-token prompt prefills in **14.4-14.6 s with 1 024 tokens resumed**
+(31.8-64.0 s cold in the same process), and the 32-token greedy stream is
+byte-identical.  `--ctx 4096`, a
+3 032-token prompt (the QSA sparse path is live above 2 048), f16:
+**76.9 s cold / 17.8 s with 2 048 tokens resumed** with the device QSA path,
+and **88.2 s / 27.2 s** with `PF_QSA_DEVATTN=0` (the host path gathers and
+dequantizes the selected rows from the paged KV), all byte-identical.
+`--ctx 4096 --kv-type i8` (QSA host path, the mirror-free gather) is
+**87.2 s / 26.5 s**, also byte-identical; that cell needs
+`--moe-vram-mb 12000`, because the 17 500 bank is already over the card and the
+sparse chunk's expert uploads fault.  The cache resumes only at qwen4exp's own
+prefill chunk boundaries (`kMaxB*kMaxT` = 1 024 tokens), so a prompt shorter
+than that has no resumable prefix.  The state blob is 112.2 MB per checkpoint
+(GDN/conv) plus the PLE history and QSA pool, and the default VRAM pool holds
+8.  The host QSA path keeps **no K/V mirror** (the old mirror was 48 MB/slot at
+4k and 3.2 GB/slot at 256k).  Its cost is measured per step at ~2.5k context
+(ctx 4096, 2 300-token prompt): the f16 **device** path decodes at
+**0.11-0.15 s/token (6.7-9.1 tok/s)**, the i8 **host** path at
+**0.15-0.22 s/token (4.5-6.7 tok/s)**, and the host QSA split is ~45 ms/token
+(gather ~19, f32 attention ~14, indexer/update ~8, copies ~5).  The i8 sparse
+480-token prefill chunk is 12.7 s against the device path's 8.5 s.  The
+default/recommended f16 device path is unchanged by the mirror removal.
 
 #### 4.4.3 Opt-in settings (non-default)
 

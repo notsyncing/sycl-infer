@@ -864,14 +864,29 @@ engine::~engine() {
             }
         };
         fq(st.mixed);
-        fq(st.q);
-        fq(st.k);
-        fq(st.v);
-        fq(st.out);
         fq(st.iq);
         fq(st.ik);
+        for (uint8_t * p : {st.sbk, st.sbv, st.sbsk, st.sbsv}) {
+            if (p) {
+                sycl::free(p, qd);
+            }
+        }
     }
     qsa_stage_.clear();
+    for (auto & hs : qsa_host_stage_) {
+        sycl::queue & qd = dev_queue(hs.dev < 0 ? 0 : hs.dev);
+        if (hs.out_pending) {
+            hs.out_ev.wait();
+            hs.out_pending = false;
+        }
+        if (hs.q) {
+            sycl::free(hs.q, qd);
+        }
+        if (hs.out) {
+            sycl::free(hs.out, qd);
+        }
+    }
+    qsa_host_stage_.clear();
     for (auto & b : qsa_idx_dev_buf_) {
         if (b.q) {
             sycl::free(b.q, dev_queue(b.dev < 0 ? 0 : b.dev));
@@ -4365,7 +4380,7 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
         sync_all();
     }
     pf_info_ = nullptr;
-    pc_capture_begin(slot, toks, start, start, n);
+    pc_capture_begin(slot, toks, start, start, n, /*single_boundary=*/true);
     d_info->n_rows = 1;
     d_info->tpb = kMaxT;
     d_info->n_real = n;
@@ -4546,7 +4561,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
         // pc_capture_begin/pc_commit must target this chunk's step_info; it stays
         // set until the scheduler commits the chunk (device 1 has not run yet).
         pf_info_ = inf;
-        pc_capture_begin(slot, toks, start, pos0, n);
+        pc_capture_begin(slot, toks, start, pos0, n, /*single_boundary=*/true);
         if (dbg_pfb) {
             fprintf(stderr, "[pfb] pipe n=%d NCH=%d parity=%d\n", n, NCH, parity);
         }
@@ -4558,7 +4573,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     }
     pf_info_ = nullptr;
     setup_pf_info(d_info, toks, start, n, slot, pos0);
-    pc_capture_begin(slot, toks, start, pos0, n);
+    pc_capture_begin(slot, toks, start, pos0, n, /*single_boundary=*/true);
     if (dbg_pfb) {
         fprintf(stderr, "[pfb] n=%d NCH=%d segs=%zu x8=%p\n", n, NCH, plan_pfb_.segs.size(), (void *)d_x8);
     }

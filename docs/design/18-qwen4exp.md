@@ -46,12 +46,11 @@ shard's own file range before `posix_fadvise`.
 `q4_forward` walks the 48 layers itself.  HC/PLE do not fit the generic
 `seg_plan` (one GEMV list per layer plus fixed epilogues), but the forward
 reuses the existing GDN, attention, GEMV and paged-KV machinery.  The plan
-builders, recorded decode graphs and the prefix cache are deliberately skipped;
-the profile's `policy.prefix_cache == false` forces `pc_enabled = false`
-(M0+M1; M2 delegates the walk to a runtime object).
+builders and recorded decode graphs are deliberately skipped; the prefix cache
+has its own hooks inside the walk (§3.4).
 MTP is declared unsupported and gated with a printed reason; DFlash has no q4
 draft/verify path in this build; multimodal is routed through the model's own
-chunker (§3.1).  The server's
+chunker (§3.2).  The server's
 q4 `prefill_batch` has no recorded variant, and batched q4exp decode is now
 **measured and rejected**: two rows select ~20 distinct experts per layer
 against ~10 each, so the routed-expert weight read doubles and the pair is
@@ -101,15 +100,15 @@ const, and `model::load` requires the profile's key to be the GGUF's exact
 | `fwd` | `hc_ple_qsa` (the model-owned walk; `generic_plan` is the shared `seg_plan`) |
 | `residual` | hyper-connections, 4 streams, low rank 320 |
 | `extras` | PLE on; QSA on, top_k 2048, pool 4, indexer 4 heads x 128 |
-| `policy` | `max_decode_rows = 1`, prefill `whole_prompt`, prefix cache **no**, auto layer map **yes**, md_splits **yes**, engram default 4096 MiB |
+| `policy` | `max_decode_rows = 1`, prefill `whole_prompt`, prefix cache **yes**, auto layer map **yes**, md_splits **yes**, engram default 4096 MiB |
 | `rep` | `sin_w8 = false`, `dnnl_int8 = false`, `raw_gemv_decode = true`, `split_per_tensor_upload = true` |
-| `spec` | `mtp`/`dflash` declared false with one `why` (no NextN block in the trunk, and the walk does not produce the per-token GDN/conv snapshots the verify needs); multimodal is a *capability* of the model-owned chunker (the loader's `mm_model_prefill`), while the `spec.multimodal` field is the declarative report |
+| `spec` | `mtp`/`dflash` declared false with one `why` (no NextN block in the trunk, and the walk does not produce the per-token GDN/conv snapshots the verify needs); multimodal **on**, `vision = qwen3vl`, routed through the model-owned chunker (the loader's `mm_model_prefill`) |
 | `moe` | `runtime_bank` (not the generic three-tier cache) |
 
 The engine stores `mp_ = m.prof` and every policy branch reads it:
 `moe != engine_cache` turns the generic cache off (qwen4exp's bank owns every
-slot), `policy.prefix_cache` is a capability (`PF_PREFIX_CACHE=1` cannot enable
-it - the checkpoint cannot represent PLE/QSA state), `policy.auto_layer_map`
+slot), `policy.prefix_cache` turns on the checkpoint hooks of §3.4,
+`policy.auto_layer_map`
 synthesises a map when none is given, `policy.md_splits` keeps the multi-device
 K-split on, `policy.engram_ram_mb_default` is the unset `--engram-ram-mb`
 default, `rep.sin_w8` gates the `md_int8` path, `spec.mtp` prints the declared
@@ -150,6 +149,20 @@ prompt expansion with a clear message instead of a forward on an impossible
 prompt.  `test_mm_step` (hermetic) pins the slice, a chunk boundary inside an
 image block, and the error paths.
 
+The shipped profile declares `vision = qwen3vl` and `spec.multimodal = true`;
+the mmproj is the same `qwen3vl_merger` tower as the 27B (`clip.projector_type
+= qwen3vl_merger`, `projection_dim 2560` = text `n_embd`).  Verified on the 2x
+A770 box with `gen --image` and with `/v1/chat/completions` image parts: an
+800x473 image produced 375 embedding rows and the text model consumed them.
+**VRAM is the constraint**: the vision blob is ~866 MB and is uploaded to the
+primary card.  A text-only `--moe-vram-mb 17500` run already sits at dev 0 own
+15.9 GiB of a 15.47 GiB card, so a media request there dies with
+`UR_RESULT_ERROR_DEVICE_LOST` in the first vision kernel (not a clean
+allocation error).  Use `--moe-vram-mb 12000` for multimodal on 2x16 GB
+(measured dev 0 own 13.15 GiB; the 800x473 image encoded in 6.5 s).  The
+multimodal path bypasses the prefix cache (it is the single-sequence
+`generate_mm` path).
+
 ### 3.3 Device-profile provenance (M0)
 
 The qwen4exp-specific per-card numbers no longer live at the call sites:
@@ -166,17 +179,65 @@ prints the resolved groups.  The env remains the A/B; a field whose 0 is a
 measured value (`cfg_dec` auto, `PF_Q4_F32_SPLIT=0`) reads the raw env with a
 `-1` sentinel because `profile_int` folds env 0 into "unset".
 
+### 3.4 Prefix-cache checkpoint
+
+The generic checkpoint blob holds the GDN/conv state; qwen4exp appends its own
+per-slot state to the same numbered checkpoint slot:
+
+* the **PLE rolling history** (the last `(conv_k-1)*ngram` normalised rows,
+  right-aligned, plus the previous-token ring).  A boundary's history is
+  reconstructed from the chunk's `normed` rows and the pre-call copy of the
+  slot's history, so no extra kernel is needed;
+* the **QSA indexer pool and ring** (the raw 128-wide indexer keys, which are
+  not in the paged KV and cannot be recomputed without the prefix hidden
+  states).  `qsa_apply_update` snapshots them at each completed block whose
+  `step_info::pc_row_slot` names a checkpoint;
+* there is **no host attention mirror at all**: the host sparse path gathers
+  the selected rows from the paged pool and dequantizes them, so a resume reads
+  the same K/V the cold run did for any `--kv-type`.  The device sparse paths
+  gather from the same pool.
+
+`pc_serialize_state` appends both to the serialized record, so the RAM and disk
+tiers round-trip a complete resume point.  A checkpoint resumes at **q4's own
+chunk boundaries** (`kMaxB*kMaxT`, or `PF_Q4_PF_CHUNK` when the expert bank is
+active) because the suffix must be prefilled with the same M the cold run used;
+each internal chunk commits its end boundary as it finishes, and `pc_admit`
+only accepts those prefixes.  Checking the deepest eight boundaries of every
+chunk instead would steal the previous chunk's end checkpoint as the prompt
+advances, leaving the cache with no resumable point.
+
+Because the host sparse path reads the paged KV directly, a quantized KV type
+is fully supported too (there is no pre-quantization mirror to lose).
+Measured on 2x A770, text-only: `--ctx 2048 --kv-type f16`, a 1710-token
+prompt prefills in 14.4-14.6 s with 1024 tokens resumed (31.8-64.0 s cold in the
+same process), 32 tokens byte-identical.  `--ctx 4096 --kv-type f16`, a
+3032-token prompt resumes 2048 tokens in 17.8 s (device QSA, 76.9 s cold) and
+27.2 s with `PF_QSA_DEVATTN=0` (host gather, 88.2 s cold), identical streams.
+`--ctx 4096 --kv-type i8`, the same prompt resumes 2048 tokens in 26.5 s
+(87.2 s cold), identical.  The i8 host path decodes at ~0.15-0.22 s/token
+(~5.3 tok/s at ~2.5k context; QSA ~45 ms/token, gather ~19 and f32 attention
+~14) against the f16 device path's ~0.11-0.15 s/token (~7.7 tok/s); its
+480-token sparse prefill chunk is 12.7 s against 8.5 s.  The i8 cell needs `--moe-vram-mb 12000` at ctx 4096:
+the 17500 bank is already over the 15.47 GiB card by ~0.4 GiB and the sparse
+chunk's expert uploads fault (`UR_RESULT_ERROR_DEVICE_LOST`).  The server
+reports the match in `usage.prompt_tokens_details.cached_tokens` /
+`prompt_cache_hit_tokens`.
+
 ## 4. QSA
 
 The selector runs on the host (`engine_qsa.cpp`).  The attention over the
 selected keys runs on the host for CPU, non-f16 KV, a non-256 head and the
 `PF_QSA_DEVATTN=0` / `PF_QSA_PF_DEV=0` A/Bs, and on the device for the f16 GPU
 sparse paths (one token via Stage 2, a whole prefill chunk via Stage 3 below).
-The host path keeps a mirror of each full-attention layer's K/V, so it needs no
-device gather; either path writes the result back for the existing `wo` GEMV.
-The cache stores the **raw** indexer key (the reference pools raw keys before
-`k_norm`+RoPE), the mirror rounds to f16 like the reference's cache, and the
-top-2048 selection is a `std::partial_sort` with ggml's comparator.
+The host path keeps **no** K/V mirror: `qsa_gather_positions` copies the
+selected rows out of the paged pool (one D2H per touched block, plus the scale
+plane for i8/i4) and dequantizes them into a compact f32 buffer, so the host
+and device paths see the same stored values.  A prefill chunk gathers the
+union of its rows' selections once per layer, then maps each row's selection
+into that buffer.  Either path writes the result back for the existing `wo`
+GEMV.  The cache stores the **raw** indexer key (the reference pools raw keys
+before `k_norm`+RoPE), and the top-2048 selection is a `std::partial_sort` with
+ggml's comparator.
 
 Up to 2 048 keys the reference's selection covers every key, so the dense path
 is exactly equivalent.  Above it the sparse path runs and appends the
@@ -257,18 +318,22 @@ wins are pinned per-layer staging, splitting the `mixed` copy from the selector
 (the selector only needs `mixed` and the indexer q), storing the host K/V
 mirror as f16 (it is already f16-rounded; attention 16.0 -> ~9-11 ms), and
 putting the deferred dense-prefill K/V copies on a per-device copy queue
-(~1.2 s per 1024-token chunk).  Removing the 16 ms host sparse attention needs
+(~1.2 s per 1024-token chunk).  **The mirror and both K/V copy queues were
+later removed**: the host sparse path now gathers/dequantizes the selected rows
+from the paged pool in `qsa_gather_positions` (§3.4), which is why a prefix
+cache resume works for a quantized KV type.  Removing the 16 ms host sparse attention needs
 the device gather + `attn` path (Stage 2) with the selector left host-side;
 that changes the accumulation order and needs a sparse-stream oracle.
 (`PF_CPU_ISA` also scalarises the MoE/HC/PLE and is not an A/B of this path).
 
-**Stage 1 (2026-10-27).**  The low-risk items are implemented in
-`engine_qsa.cpp`/`qsa.cpp`: per-layer pinned USM staging for the four D2H
-buffers and `attn_out` (a pageable `std::vector` D2H is synchronous, so even the
-deferred copies blocked the host), an f16 host K/V mirror (`PF_QSA_F16MIR`,
-default on for AVX2/AVX-512 and off for scalar, where f16 is 4.6x slower), and
-`PF_QSA_COPYQ` (default on) putting the dense big-chunk K/V copies on a
-per-device in-order copy queue with a guard before the next attention layer.
+**Stage 1 (2026-10-27, mirror later removed).**  The low-risk items were
+implemented in `engine_qsa.cpp`/`qsa.cpp`: per-layer pinned USM staging for the
+four D2H buffers and `attn_out` (a pageable `std::vector` D2H is synchronous, so
+even the deferred copies blocked the host), an f16 host K/V mirror
+(`PF_QSA_F16MIR`, since removed) and `PF_QSA_COPYQ` (since removed) putting the
+dense big-chunk K/V copies on a per-device in-order copy queue with a guard
+before the next attention layer.  The current host path keeps no mirror: it
+gathers the selected rows from the paged pool.
 The `--ctx 4096` numbers: short dense QSA call 7.17 -> **1.67 ms**; 1024-token
 dense chunk 1434 -> **56 ms steady** (first chunk 279-322 including the mirror
 allocation; ~1.38 s saved per chunk); sparse decode attention 13.0 -> **8.0 ms**;
@@ -293,13 +358,14 @@ scalar/AVX2/AVX-512.  The 93.3 ms `--ctx 2048` cell is unchanged (QSA off); at
 96-token cell also stays at 93.4 ms.  A
 pre-existing lifecycle bug was found and fixed: `qsa_cache_` was not cleared by
 `engine::zero_slot`, so a server reusing a slot above `idx_top_k` could read the
-previous sequence's mirror.  `engine::qsa_reset_slot` now flushes, clears the
-pending entries and destroys the per-slot mirror/pool from `zero_slot` and
+previous sequence's state.  `engine::qsa_reset_slot` now flushes, clears the
+pending entries and destroys the per-slot pool/ring from `zero_slot` and
 `reset_state`; QSA-off is a no-op.  Verified on the q4 server with three
 sequential slot-0 requests: B1 == B2, A differs, 12 layers cleared, B1/B2
 selector dumps byte-identical; the QSA-off and short QSA-on md5s are unchanged.
-A prefix-cache resume at position > 0 would need saved QSA state (qwen4exp has
-the prefix cache off).  The q4 server now uses the whole-prompt q4 prefill
+A prefix-cache resume at position > 0 needs saved QSA state, which §3.4 now
+checkpoints (the indexer pool/ring); the attention reads the restored paged KV
+directly.  The q4 server uses the whole-prompt q4 prefill
 (no `PF_PFB_MAX_M`; 2.2x; §7.1).
 
 **Stage 2 (`PF_QSA_DEVATTN=1`, default on for f16 GPU sparse decode).**  The host selector/indexer/raw-key
@@ -313,11 +379,11 @@ device `be.attn`/`attn_combine` runs with a device scratch `step_info`;
 the 16-token logits agree 16/16 top-1 (max KL 0.00391), the selector score/pools
 are byte-identical, and the one-layer ATTN_OUT/`wo` cos is 0.999999919 /
 0.999999788.  `--ctx 2048` QSA-off and `--ctx 4096` short md5s are unchanged.
-Caveats: device tokens skip the main K/V mirror update, so a post-decode sparse
-prefill on the same slot would need a mirror rebuild (the q4 prompt->decode
-flows never do; `zero_slot` clears); `head_dim != 256`, i8 and CPU use the host
-Stage 1 path (sparse prefill has its own device path, Stage 3 below); the
-first device token allocates ~17 MB/device (~9.8 ms).
+Caveats: there is no main K/V mirror, so a post-decode sparse prefill needs no
+rebuild (the host path and the device prefill path both read the paged pool);
+`head_dim != 256`, i8 and CPU use the host Stage 1 path, which gathers and
+dequantizes the selected rows (sparse prefill has its own device path for f16,
+Stage 3 below); the first device token allocates ~17 MB/device (~9.8 ms).
 Default on for f16 GPU sparse decode on prompt->decode flows; `PF_QSA_DEVATTN=0`
 keeps the host Stage 1 path.
 
@@ -368,22 +434,22 @@ its ~2 080 keys) and the existing paged attention.  Decode is unchanged (its
 113 ms matches the cell without the new path; the 131-149 ms spread of the
 host-prefill cells is the expert bank state the different prefill leaves).
 
-**Correctness and the f16 rounding caveat.**  On a 2560-token prompt the only
-sparse chunk is the final 512-token one, so chunks 1-2 take the same dense path
-in both cells: `PF_QSA_SCORE`/`POOLS`/`MIX` are byte-identical, and the layer-0
-attention over all 512 rows matches the host attention to cosine
-**0.99999976** (mean 1.0, rel-RMS max **1.2e-6**) - but only when both read the
-same f16 K/V.  The shipped host mirror uses `ggml_float_to_half`, which
-**truncates** the mantissa, while the device KV store casts to `sycl::half`
-(round-to-nearest); that one-ulp disagreement is ~6e-4 relative RMS and is
-about half of the final-logit difference on that prompt (KL 0.20 with the
-truncating mirror, 0.045 with `PF_QSA_F16RND=1`, which makes the host mirror
-round and is a diagnostic only).  On the full 3660-token prompt the first-token
+**Correctness and the old f16 rounding caveat (superseded).**  This paragraph
+described the removed host mirror: it used `ggml_float_to_half` (truncating)
+while the device KV store casts to `sycl::half` (round-to-nearest), a one-ulp
+~6e-4 disagreement.  The current host path has no mirror; it dequantizes the
+same paged K/V the device path reads, so that difference is gone and a
+prefix-cache resume is exact for every KV type.  The historical measurement:
+on a 2560-token prompt the only sparse chunk is the final 512-token one, so
+chunks 1-2 take the same dense path in both cells: `PF_QSA_SCORE`/`POOLS`/`MIX`
+are byte-identical, and the layer-0 attention over all 512 rows matched the
+host attention to cosine **0.99999976** (mean 1.0, rel-RMS max **1.2e-6**) when
+both read the same f16 K/V.  On the full 3660-token prompt the first-token
 logits land on a near-tie - 760 vs 27775, margins 0.13 / 0.19, KL 0.0127 - so
 the continuation differs; that is the same accumulation-order sensitivity the
 Stage 2 decode already has.  A dense 512-token prompt's stdout is md5-identical
 between the two cells.  `PF_QSA_ATTN_DUMP_ALL=1` writes every attention row (the
-per-row oracle used above); `PF_QSA_F16RND` is not the shipped host path.
+per-row oracle used above); the old `PF_QSA_F16RND` knob was removed with the mirror.
 
 **Stage 4: device indexer (default on) and device selector (opt-in).**  The
 host indexer GEMV read 39 MB/token of BF16 weights from the mmap and the host
@@ -1095,8 +1161,7 @@ slower at 512, and cannot hold a 48k context.
 | `PF_QSA_TIME=1` | off | QSA host split per forward (`copy/gemv/upd/sel/attn`) |
 | `PF_QSA_ISA=scalar\|avx2\|avx512` | auto | force only the QSA host kernels' ISA |
 | `PF_QSA_DEFER=0` | on | inline update instead of the end-of-forward deferred update |
-| `PF_QSA_F16MIR=0` | on (AVX2/AVX-512) | f32 host K/V mirror; scalar defaults to f32 (f16 scalar is 4.6x slower) |
-| `PF_QSA_COPYQ=0` | on | inline dense-big-chunk K/V wait instead of the per-device copy queue |
+| ~~`PF_QSA_F16MIR`~~ / ~~`PF_QSA_COPYQ`~~ | — | **removed with the host K/V mirror**: the host sparse path gathers/dequantizes from the paged pool (no mirror, no K/V copy queue) |
 | `PF_QSA_DEVATTN=1` | on | Stage 2 device sparse attention for f16 GPU decode; host selector unchanged; `=0` host Stage 1; see §7.1 |
 | `PF_QSA_IDX_DEV=0` | on | host indexer projection + 10 KB `mixed` D2H; `=1` runs the BF16 GEMV + q norm/RoPE on the card and D2Hs 2.5 KB (step 2, see §4) |
 | `PF_QSA_SEL_DEV=1` | off | device ring/pool + canonical device selector + no-H2D selection (step 3, see §4); measured a wash at 14.6k and +3.1 ms at 3.6k, so opt-in |
