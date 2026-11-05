@@ -143,12 +143,15 @@ cmake --build build -j$(nproc)
   matches the host's glibc.  AOT needs IGC's `ocloc`, which the toolkit image
   does not contain: it and the Level Zero/OpenCL runtime come from
   `ppa:kobuk-team/intel-graphics` (`intel-ocloc`, `intel-opencl-icd`,
-  `libze1`, `libze-intel-gpu1`).  Measured on Arc 140V (2026-11): the 2026.2
-  SYCL runtime is ~16% slower for the 35B prefill than 2026.1 (467 vs 544-558
-  tok/s, decode unchanged), so pin `ONEAPI_VERSION=2026.1.1` when the
-  documented prefill rate matters.  The `docker/` files take the proxy and
-  Ubuntu mirror as build args (`HTTP_PROXY`/`UBUNTU_MIRROR`) so a restricted
-  egress does not change the image.
+  `libze1`, `libze-intel-gpu1`).  The 2026.2 image's 35B prefill was 467 tok/s
+  on the Arc 140V with the engine's old unconditional `enable_profiling`
+  queue property; that property costs 24x per launch on the 2026.2 runtime
+  and is now opt-in (see the invariant below).  With it off the same 2026.2
+  image measures **546.4 tok/s on the 140V** (vs 558.4 on 2026.1) and
+  **699.7 tok/s on 2x A770**; the 2026.2 image is the deployed one.  The
+  `docker/` files take the proxy and Ubuntu mirror as build args
+  (`HTTP_PROXY`/`UBUNTU_MIRROR`) so a restricted egress does not change the
+  image.
 * `-DSYCL_INFER_AOT=ON` AOT-compiles the device image for `adl-p`
   (`-DSYCL_INFER_AOT_DEVICE=` overrides the target).  The device lowering
   (`llvm-foreach -> ocloc`/IGC) only runs at the **final link**, never at `-c`,
@@ -4867,6 +4870,21 @@ the point where the experts' depth-independent share stops shrinking.
 
 The rules that are not obvious from the code, and what breaks when they are
 broken.  Each one is a thing that *was* broken, or that fails silently.
+
+* **A profiling-enabled SYCL queue is not free on oneAPI 2026.2.**  A launch
+  on an in-order queue with `enable_profiling` costs **0.133 ms instead of
+  0.0055 ms (24x)**; the mode-2 prefill submits ~10^5 kernels individually, so
+  leaving the property on measured **109 vs 700 tok/s** for the 35B on 2x A770
+  (decode is recorded into a command graph and was unchanged).  The property
+  was unconditional in `engine.cpp` on the theory that "it costs nothing when
+  unused" - true on 2026.1, false on 2026.2.  It is now created only when a
+  device-timeline diagnostic needs it (`PF_DFLASH_SEGTIME`, `PF_Q4_KTIME`,
+  `PF_Q4_SEGTIME`, `PF_Q4_SHTIME`, `PF_Q4_PLEGPU_TIME`, `PF_Q4_HEAD_TIME`),
+  with `PF_QUEUE_PROF=1/0` as a forced override.  The compiler, IGC/ocloc and
+  oneDNN are not the cause: the 2026.2 objects are slow with either ocloc, the
+  oneDNN JIT dump is byte-identical across runtimes, and the 2026.2 build with
+  the property off is 699.7 tok/s.  **Re-measure a new queue property on every
+  runtime version; an "unused" property can be the whole regression.**
 
 * **Each child process has exactly one owner, and the owner is the only one
   that waits for it.**  The router's supervisor thread `waitpid`s its own

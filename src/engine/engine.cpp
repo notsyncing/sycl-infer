@@ -93,9 +93,33 @@ static int resolve_device(int device, const std::string & layer_map) {
 // whichever one happens to wait next, and no-op A/B cannot repair it (removing
 // the heavy kernels just lets the queue drain with nothing blocking).  A barrier
 // pair's interval is the sound measurement there - submit a barrier at each
-// boundary and read the interval after one wait.  It costs nothing when unused.
-static const sycl::property_list in_order_prof{sycl::property::queue::in_order(),
-                                               sycl::property::queue::enable_profiling{}};
+// boundary and read the interval after one wait.
+//
+// On oneAPI 2026.2 this property is NOT free: a launch on a profiling-enabled
+// in-order queue costs 0.133 ms instead of 0.0055 ms (24x), and the mode-2
+// prefill submits ~1e5 kernels individually, which measured a 6.5x prefill
+// regression (700 tok/s -> 108 tok/s on the 35B / 2x A770).  Decode replays a
+// recorded command graph and is unaffected, which is why only prefill paid.
+// The device-timeline diagnostics therefore enable it for their own run; a
+// plain run leaves it off.  PF_QUEUE_PROF=1 forces it on (a new probe),
+// PF_QUEUE_PROF=0 forces it off (the diagnostics cannot run).
+static bool queue_profiling_enabled() {
+    static const bool on = [] {
+        if (const char * e = si::env::str("PF_QUEUE_PROF")) {
+            return !(e[0] == '0' && e[1] == '\0');
+        }
+        return si::env::flag("PF_DFLASH_SEGTIME") || si::env::flag("PF_Q4_SEGTIME") ||
+               si::env::flag("PF_Q4_SHTIME") || si::env::flag("PF_Q4_PLEGPU_TIME") ||
+               si::env::flag("PF_Q4_KTIME") || si::env::flag("PF_Q4_HEAD_TIME");
+    }();
+    return on;
+}
+
+static const sycl::property_list in_order_prof =
+    queue_profiling_enabled()
+        ? sycl::property_list{sycl::property::queue::in_order(),
+                              sycl::property::queue::enable_profiling{}}
+        : sycl::property_list{sycl::property::queue::in_order()};
 
 static sycl::queue make_queue(int device_req, sycl::context * ctx) {
     if (device_req == 1) {
@@ -3740,10 +3764,12 @@ void engine::setup_multi_device(const std::string & layer_map) {
             } else {
                 target = sycl::device(sycl::gpu_selector_v);
             }
-            // enable_profiling on the per-partition queues too, not just the primary
-            // one: this is the queue the DFlash2 draft runs on, and without it a
-            // barrier-based device timer throws "Profiling information is
-            // unavailable" rather than silently reading zero.
+            // Carry the queue properties (including enable_profiling when a
+            // device-timeline diagnostic asked for it) on the per-partition
+            // queues too, not just the primary one: this is the queue the
+            // DFlash2 draft runs on, and without it a barrier-based device
+            // timer throws "Profiling information is unavailable" rather than
+            // silently reading zero.
             if (md_ctx_) {
                 // all GPU partitions share the primary context
                 owned_queues_.push_back(std::make_unique<sycl::queue>(*md_ctx_, target, in_order_prof));

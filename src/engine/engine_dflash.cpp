@@ -79,7 +79,8 @@ static auto ms_t = [](auto a, auto b) { return std::chrono::duration<double, std
 // submitted between them.  This is the only sound attribution here: host-side timers
 // charge an op with whichever one happens to wait when the queue fills, and no-op A/B
 // cannot repair it (removing the heavy kernels just lets the queue drain with nothing
-// blocking).  Needs the queue's enable_profiling property, which engine.cpp now sets.
+// blocking).  Needs the queue's enable_profiling property, which engine.cpp
+// sets when PF_DFLASH_SEGTIME (or PF_QUEUE_PROF=1) is on.
 static bool df_seg_on = false;
 static double df_seg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // device-side span of the whole layer stack (first layer's start barrier -> last

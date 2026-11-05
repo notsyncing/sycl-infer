@@ -190,6 +190,41 @@ Against the same batch at depth 512 (101.12 tok/s, 79.11 ms/step), the batched
 decode is **24 % slower** at 16k of context: eight rows' worth of attention
 over a 16k KV is what the extra 25.6 ms/step buys.
 
+### 4.3.1 oneAPI 2026.2 vs 2026.1 on the 2x A770 (2026-11-05)
+
+Same model, same source, same AOT target (`acm-g10`), same host and the same
+server flags (`--layer-map 0-19:gpu.0,20-39:gpu.1 --kv-type i8 --max-slots 4
+--cpu-threads 28 --ctx 16384`, `PF_PREFIX_CACHE=0
+PF_MOE_BANK_RESERVE_MB=0`; both cards keep the u4 gate/up + int8 down bank):
+
+| stack | 3.4k prefill | 10.3k prefill | decode |
+|---|---:|---:|---:|
+| oneAPI 2026.1 | **700.6 tok/s** | **714.7-721.0** | 39.6-42.1 |
+| oneAPI 2026.2 | **107.4-108.4** | **108.5-108.9** | 39.9-41.9 |
+| oneAPI 2026.2, queue profiling off | **699.7 tok/s** | not measured | 42.6 |
+
+**The 6.5x is the engine's `enable_profiling` queue property, not the 2026.2
+compiler, IGC or oneDNN.**  On oneAPI 2026.2 a launch on a profiling-enabled
+in-order queue costs **0.133 ms instead of 0.0055 ms (24x)**; mode-2 prefill
+submits ~10^5 kernels individually, while decode replays a recorded command
+graph, which is why only prefill paid.  The A/B is decisive: the 2026.2 objects
+relinked with the host IGC/ocloc 26.31 are still slow; the 2026.1 binary on the
+2026.2 runtime is slow (98.7 tok/s) while the same binary on the 2026.1 runtime
+is fast (697.3); and the 2026.2 build with the profiling property off is
+**699.7 tok/s**.  The oneDNN JIT dump is byte-identical across the runtimes and
+the `jit:gemm:any` primitive is the same - this is per-submission bookkeeping,
+not codegen.
+
+The property is now opt-in (`src/engine/engine.cpp`): a plain run leaves it
+off, the device-timeline diagnostics (`PF_DFLASH_SEGTIME`, `PF_Q4_KTIME`,
+`PF_Q4_SEGTIME`, `PF_Q4_SHTIME`, `PF_Q4_PLEGPU_TIME`, `PF_Q4_HEAD_TIME`)
+enable it automatically, and `PF_QUEUE_PROF=1/0` forces it.  The cells above
+that say 2026.2 were measured before the fix and must not be quoted as a
+runtime regression.  At the default 131k context the 2026.2 runtime's larger
+device footprint still makes the bank governor shed to raw experts (281 tok/s
+with profiling on); that bank-choice difference needs a fresh measurement with
+the queue property off before deciding whether 2026.2 can be used on the A770.
+
 ### 4.4 Qwen3.8-Flash-Next
 
 `Qwen3.8-Flash-Next-UD-Q4_K_XL` (4 shards, `qwen4exp`): 48 layers, 512 routed
@@ -357,6 +392,14 @@ regression.
 | 4 concurrent text requests, 107 completion tokens | 28.2 tok/s aggregate (3.79 s) |
 | 2 concurrent image requests | both correct (`hello`, `red`), 18.6 s wall |
 
+The table is the **2026.1** image (`lnl-aot`).  The **2026.2 image with the
+profiling fix** (`lnl-aot-2026.2`) measures, at the same flags: 3.4k warm
+**546.4 tok/s** (first 434.7), 10.3k **522.6-523.9 tok/s**, decode **30.5**
+(3.4k) / **27.1-27.2** (10.3k), 8 concurrent **44.4 tok/s aggregate** (4:
+32.5).  That is within 2.1% of the 2026.1 image at 3.4k and better at
+concurrency; the text and image APIs work.  **The deployed image is now
+`lnl-aot-2026.2`.**
+
 The 558 tok/s is the governor-shed number and matches the 641 tok/s both-bank
 figure times (1 - 0.137).  **The 641 figure is not reachable with image input
 on this part**: keeping both banks leaves ~1.5 GiB and the 866 MiB projector
@@ -382,17 +425,17 @@ part and it found the interleaved/blocked M-RoPE discriminator bug recorded in
 same 768x768 `WORLD` image read `VOWEL`, and a 384x384 `WORLD` read `BQ`.
 
 **The official Dockerfile build (`intel/oneapi-toolkit:2026.2.0-devel-ubuntu26.04`)
-is functionally correct but its prefill is 16% slower than the numbers above.**
-The same 3.4k prompt measures **467 tok/s warm** with the image's own 2026.2
-binary.  The cause is the **2026.2 SYCL runtime**, not the compiler, oneDNN or
-the model: the build's own binary with the 2026.2 libs is 467; that same binary
-with the host's 2026.1 `libsycl`/UR is **558.4**; and the 2026.2 `libsycl` with
-the host's oneDNN 2026.0 and the host-built binary is 470.2.  The decode is
-unaffected (30.5-31.1 tok/s in both).  The deployed image therefore uses the
-measured 2026.1 runtime; pin `ONEAPI_VERSION=2026.1.1` (also on Docker Hub) when
-building the official image if the documented prefill rate matters.  A
-version-dependent near-tie was also visible in OCR: the 2026.2 image read the
-768x768 `WORLD` as ` volid` once while the 2026.1 image read `WORLD`, and both
+measured 467 tok/s warm with the engine's old unconditional
+`enable_profiling` queue property.**  The A770 A/B in §4.3.1 shows that on
+oneAPI 2026.2 this property costs 0.133 ms per launch instead of 0.0055 ms
+(24x); with it off the same 35B build measures **699.7 tok/s** on the A770 and
+**546.4 tok/s** on this 140V, so the 16% gap was the same queue cost, not a
+general runtime regression.  The engine now leaves the property off by
+default; the device-timeline diagnostics turn it on automatically and
+`PF_QUEUE_PROF=1/0` overrides.  The 2026.2 image is now the deployed one; the
+2026.1 image remains an A/B.  Decode is unaffected (30.5-31.1 tok/s in both).
+A version-dependent near-tie is still visible in OCR: the 2026.2 image read
+the 768x768 `WORLD` as ` volid` while the 2026.1 image read `WORLD`, and both
 read the 1024x1024 image as `Hello World 2025`.
 
 ## 5. Qwen3.8-27B — the dense model
