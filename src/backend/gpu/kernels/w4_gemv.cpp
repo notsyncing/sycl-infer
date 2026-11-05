@@ -2432,7 +2432,7 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
     // says what it means (device_registry's unknown_profile() should carry
     // sub_group8 = 0; this is the in-launcher guard until it does).
     const si::dev::profile & dp = si::dev::for_queue(q);
-    const bool sg8 = dp.hw.sub_group8 != 0 && std::strcmp(dp.key, "unknown") != 0;
+    const bool sg8 = dp.hw.sub_group8 != 0;
     // PF_NAT overrides the card's default.  The batched native GEMM beats
     // oneDNN's grouped-scale int8 matmul by a wide margin on Xe-LP/Xe-HPG
     // (oneDNN 3.11 there has no XMX GEMM kernel compiled in at all) and loses

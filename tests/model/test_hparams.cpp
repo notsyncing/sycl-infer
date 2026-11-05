@@ -87,16 +87,29 @@ int main() {
         accepts("no recurrent layers", hp);
     }
 
-    // The one that used to corrupt memory
-    rejects("head_dim 128", [&] {
+    // head_dim is supported for any multiple of the 32-lane sub-group width up
+    // to 256: the generic attention's partial stride follows head_dim, and the
+    // specialised kernels guard on 256 and fall back.  Qwen2-VL's 64-wide heads
+    // are the reason 64 must be accepted, not rejected.
+    accepts("head_dim 128", [&] {
         hparams hp = good();
         hp.head_dim = 128;
         hp.n_embd = 2048;
         return hp;
-    }(), "head_dim");
-    rejects("head_dim 64", [&] {
+    }());
+    accepts("head_dim 64", [&] {
         hparams hp = good();
         hp.head_dim = 64;
+        return hp;
+    }());
+    rejects("head_dim 48 (not a 32 multiple)", [&] {
+        hparams hp = good();
+        hp.head_dim = 48;
+        return hp;
+    }(), "head_dim");
+    rejects("head_dim 288 (above the 256 ceiling)", [&] {
+        hparams hp = good();
+        hp.head_dim = 288;
         return hp;
     }(), "head_dim");
 

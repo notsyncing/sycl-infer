@@ -391,6 +391,7 @@ router_config parse_config(const std::string & text) {
     }
 
     std::set<std::string> ids;
+    std::set<std::string> pipeline_ids;
     std::set<int> ports;
     for (const auto & e : *ms) {
         if (!e.is_object()) {
@@ -473,6 +474,24 @@ router_config parse_config(const std::string & text) {
 
         m.args = get_str_list(e, "args");
         m.env = get_kv_map(e, "env");
+        m.pipelines = get_str_list(e, "pipelines");
+        {
+            std::set<std::string> local;
+            for (const std::string & pid : m.pipelines) {
+                if (pid.empty()) {
+                    cfg_err(where + ": a pipeline id must not be empty");
+                }
+                if (pid.find_first_of(" \t\n/") != std::string::npos) {
+                    cfg_err(where + ": pipeline id '" + pid + "' must not contain whitespace or '/'");
+                }
+                if (!local.insert(pid).second) {
+                    cfg_err(where + ": duplicate pipeline id '" + pid + "'");
+                }
+                if (!pipeline_ids.insert(pid).second) {
+                    cfg_err("duplicate pipeline id '" + pid + "' across models");
+                }
+            }
+        }
 
         const json * dev = member(e, "device");
         bool count_set = false;

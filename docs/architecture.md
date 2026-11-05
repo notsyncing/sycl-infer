@@ -67,6 +67,10 @@ flowchart LR
     PYBIND --> CAPI
     MAIN --> MM[src/mm vision / video / audio]
     SRV --> MM
+    SRV --> PIPE[src/pipeline 请求级多步编排]
+    MAIN --> PIPE
+    PIPE --> ENG
+    PIPE --> MM
     ENG --> KERN[src/backend/gpu/kernels]
     ENG --> MODEL[src/model]
     ENG --> PC[prefix cache\npc_ram / pc_disk]
@@ -137,6 +141,10 @@ src/backend/gpu/kernels/    kernels.h      公开启动 API + step_info + gemv_s
                 attn_xmx（oneDNN int8 matmul 的 prefill attention）,
                 mtp / mtp_argmax（MTP draft head 输入准备、accept argmax、
                         候选受限 draft head）,
+                dflash（DFlash2 block drafter 的 top-k / conv / selector）,
+                moe（router / CSR / grouped expert GEMM / reduce）,
+                qsa（QSA indexer / pool / sparse attention）,
+                q4exp（HC / PLE / QSA 的设备算子）,
                 vit（视觉编码器）, at（音频塔辅助：at_conv1d / at_rope1d）
 
 src/model/      gguf.{h,cpp}       GGUF 解析 + mmap
@@ -145,6 +153,10 @@ src/model/      gguf.{h,cpp}       GGUF 解析 + mmap
                 model_profile.h    声明式模型策略（fwd/policy/rep/spec/moe）
                 profiles/<arch>.cpp 每个架构一份完整 profile（key/值/provenance）
                 qwen35.cpp         Qwen3.5 混合架构加载器
+                qwen35moe.cpp      Qwen3.6-35B-A3B（routed MoE）
+                qwen2vl.cpp        Qwen2-VL / MinerU dense decoder
+                qwen4exp.cpp       Qwen3.8-Flash-Next（HC + PLE + QSA）
+                dflash.cpp         DFlash2 draft GGUF 加载器
                 model_w8.cpp       SIn int8 权重副本的构建/释放
                 tokenizer.{h,cpp}  BPE 分词器
 
@@ -160,13 +172,29 @@ src/engine/     engine.{h,cpp}             编排、缓冲区、单序列 API、
                                            多设备 decode / MTP verify 的分段 command graph
                 engine_mtp.cpp             MTP plan / draft / verify / commit / rollback +
                                            投机循环
+                engine_dflash.cpp          DFlash2 block drafter / 验证 / 提交
+                engine_q4exp.cpp           qwen4exp 自己的 forward（HC/PLE/QSA + LRU bank）
+                engine_qsa.cpp             QSA host selector / mirror / sparse attention
+                moe_cache.{h,cpp}          三层 expert cache
                 engine_kvpool.cpp          动态 KV 块池
                 engine_prefix_cache.cpp    前缀缓存（VRAM 层 + 三层调度）
                 pc_ram.{h,cpp}             主机 RAM 层
                 pc_disk.{h,cpp}            磁盘层（记录格式、索引、LRU）
                 sampler.{h,cpp}            采样
 
+src/pipeline/   请求级多步编排（见 design/22-pipelines.md）：
+                pipeline.h / registry.{h,cpp}（接口、id 注册、available 过滤）
+                registry 默认为空；MinerU 是 tools/mineru 的客户端工具
+                src/server/pipeline_http.{h,cpp} 提供 GET /v1/pipelines 与
+                POST /v1/pipelines/{id}/run
+                依赖方向 server -> pipeline -> engine/mm，model 不依赖它们
+src/router/     多模型前端（独立二进制 sycl-infer-router，链接 -fno-sycl）：
+                config / registry / rpc_client / supervisor / proxy
 src/server/     server.{h,cpp}         httplib 服务、JSON、SSE、多模态接入
+                control.cpp             worker 控制面（JSON-RPC over TCP）
+src/server/onnx/ ONNX HTTP 服务（sycl-infer-onnx）
+src/model/onnx/  自研 ONNX protobuf 读取 / graph build / transforms
+src/backend/onnx/ ONNX 算子库、kernel、executor、constant fold
                 scheduler.{h,cpp}      连续批处理调度器
                 chat.{h,cpp}           渲染 + 内置 ChatML 回退
                 chat_template.{h,cpp}  minja Jinja 封装
@@ -267,7 +295,8 @@ classDiagram
 系统的核心。持有 `sycl::queue`（**in_order**）、所有激活缓冲区、paged KV 池、递归状态、录制好的
 command graph、前缀缓存三层，以及可选的 MTP 草稿层与它自己的 KV 切片。`mp_`（`= m.prof`）是
 它读取策略的入口：prefix cache、auto layer map、`md_splits`、`md_int8`、MTP 能力、engram 默认和
-scheduler 的 decode 行数/prefill 粒度都从这里来；前向派发仍读 `m.q4exp`（M0+M1）。对外提供两类 API：
+scheduler 的 decode 行数/prefill 粒度都从这里来；前向派发也走 `engine::hc_fwd()`（`mp_->fwd ==
+hc_ple_qsa`），`m.q4exp` 只剩加载期一致性标志。对外提供两类 API：
 
 * **批处理 API**（调度器使用）：`prefill_chunk`、`prefill_batch`、`decode_batch`、`fetch_logits`，
   调用者必须持有 `engine::mtx`。
@@ -513,6 +542,11 @@ attn+combine ms）nsp = 64/128/**160**/168/176 → 3.05/2.18/1.70/1.74/2.68，17
 * **新增多模态模态**：[design/10-multimodal.md](design/10-multimodal.md)、
   [design/13-audio-video.md](design/13-audio-video.md)。
 * **新增服务端点**：[design/09-server.md](design/09-server.md)。
+* **新增请求级多步 pipeline**（不是模型）：先过 [design/22-pipelines.md](design/22-pipelines.md)
+  §2 的准入规则；只有需要进程内引擎状态/实测收益/资源账本时才在 `src/pipeline/<name>/`
+  实现 `pipeline` 接口，并在 `serve()` 的 registry 注册。只通过 `GET /v1/pipelines` 与
+  `POST /v1/pipelines/{id}/run` 暴露；不要加进 `/v1/models` 或 `/v1/chat/completions`。
+  MinerU 这类“裁图+换 prompt+多次调用”的客户端编排应放在 `tools/` 或调用方。
 * **前缀缓存策略**：[design/06-prefix-cache.md](design/06-prefix-cache.md)。
 
 任何改动都应遵守 [AGENTS.md](../AGENTS.md) 的“Quick verification”流程：构建无警告、
@@ -684,8 +718,8 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 
 引擎的 policy 分支读 `engine::mp_`（`= m.prof`），不再用 `m.q4exp`：prefix cache、auto layer map、
 `md_splits`、`md_int8`、MTP 能力、engram 默认和 scheduler 的 decode 行数/prefill 粒度都从
-profile 来；前向派发仍读 `m.q4exp`（在 M0+M1 中与 `fwd == hc_ple_qsa` 断言一致），M2 才把 walk
-交给 runtime 对象。**model profile 与 device profile 的边界**：前者说“这是什么模型、允许用什么”，
+profile 来；前向派发也读 profile（`engine::hc_fwd()`，加载时断言 `m.q4exp` 一致），M2 才把
+walk 交给 runtime 对象。**model profile 与 device profile 的边界**：前者说“这是什么模型、允许用什么”，
 后者说“这张卡怎么跑它”；per-layer stride、budget、KV 类型、layer map、`TB` 桶和 prefill chunk
 属于文件/运行，不属于任何一个 profile。
 

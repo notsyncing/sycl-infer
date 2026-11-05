@@ -31,8 +31,10 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
   are dequantized on the fly inside the kernels.
 * **Pluggable architectures** — the model type is read from
   `general.architecture` and dispatched to a per-architecture loader (one source
-  file plus one registry entry); `qwen35` (hybrid Gated DeltaNet + full
-  attention) is implemented today.
+  file plus one registry entry).  Implemented: `qwen35` / `qwen35moe` (hybrid
+  Gated DeltaNet + full attention, dense or routed MoE), `qwen4exp`
+  (hyper-connections + PLE + QSA) and `qwen2vl` (the dense Qwen2-VL/MinerU
+  trunk).  Adding one is a loader plus a model profile.
 * **Paged KV cache + continuous batching** — 32-token physical blocks with
   per-sequence block tables; chunked prefill and batched decode (up to 16
   concurrent sequences by default, 32 with `--max-slots`).  Batched decode
@@ -101,9 +103,11 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
   freely mixed in one prompt; the vision and audio encoders run on the GPU
   (`src/backend/gpu/kernels/vit.cpp`, `at.cpp`).  The CLI takes `--mmproj`
   `--image` / `--video` / `--audio` + `--audio-mmproj`, and the server accepts
-  `image_url` / `video_url` / `input_audio` content parts (base64 `data:` URLs or
-  remote `http(s)://` URLs, bounded to 10 s / 10 MB).  Media tokens carry 4-section
-  M-RoPE positions and bypass the prefix cache.
+  `image_url` / `video_url` / `input_audio` content parts.  Base64 `data:` URLs
+  always work; remote `http(s)://` URLs are **off by default** and require
+  `PF_MM_URL_FETCH=1` (10 s / 10 MB per fetch; private addresses additionally
+  need `PF_MM_URL_ALLOW_PRIVATE=1`).  Media tokens carry 4-section M-RoPE
+  positions and bypass the prefix cache.
 * **MTP speculative decoding (`--mtp N`)** — drafts up to N tokens with the
   model's own NextN head and verifies them in one batched forward.  Measured
   **1.35x - 1.9x** single-request decode on the 27B depending on how much the
@@ -143,12 +147,13 @@ to a per-architecture loader; the engine itself is not tied to any model family.
 | Qwen3.8-27B (UD-Q4_K_M) | `qwen35` | supported | dense, 64 layers; 15.4 GiB of weights, so it needs the two-card split |
 | Qwen3.6-35B-A3B (UD-Q4_K_M) | `qwen35moe` | supported | routed MoE, 256 experts / 8 active, 40 layers; 21.1 GiB of weights, so it needs the two-card split too |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL, 4 shards) | `qwen4exp` | **supported** | hyper-connections + n-gram PLE + 512-expert MoE + QSA.  The routed bank and PLE table are host-resident (with a pinned 69.8 GiB source mirror); the dense trunk plus a 17 500 MB per-expert LRU bank (47 layers, Q8_0-down layers included) run on the GPUs.  Recommended: `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 --ctx 2048 --kv-type f16`.  See [Design 18](docs/design/18-qwen4exp.md) |
+| MinerU2.5-Pro-2605-1.2B | `qwen2vl` | supported | dense Qwen2-VL decoder (24 layers, head_dim 64, Q5_0/Q8_0) behind the MinerU two-step document extraction (`sycl-infer-mineru`, the standalone `tools/mineru/` client); needs its mmproj.  See [Design 21](docs/design/21-mineru-qwen2vl.md) |
 
 | | |
 |---|---|
 | file format | GGUF (memory-mapped; single file **or split shards**, merged into one virtual mapping) |
 | weight quantization | Q4_K, Q5_K, Q6_K, Q3_K, Q5_1, IQ4_XS, IQ4_NL, IQ3_S, Q8_0, F16, BF16, F32; Q4_K uses the native 4-bit (u4) path by default |
-| architecture registry | selected via `general.architecture`; `qwen35`, `qwen35moe` (routed MoE) and `qwen4exp` (Qwen3.8-Flash-Next) implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry |
+| architecture registry | selected via `general.architecture`; `qwen35`, `qwen35moe`, `qwen4exp` and `qwen2vl` implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry and a `src/model/profiles/<arch>.cpp` policy |
 | expert placement | routed-MoE models can keep part of the experts on the GPU and compute the rest on the host per step (llama.cpp's ncmoe), with a disk → host-RAM → VRAM three-tier expert cache (`--moe-resident` / `--moe-vram-mb` / `--moe-ram-mb`) |
 | KV cache dtype | `i8` (default), `i4`, `bf16`, `f16`, `f32`; `--kv-type K:V` sizes K and V independently (`i4:i8`) |
 | tokenizer | GPT-2 byte-level BPE from the GGUF vocabulary + special tokens / chat template |
@@ -191,9 +196,10 @@ The budget, the measured maxima and the adaptive expert-bank governor are in
 ## Requirements
 
 * Linux, C++17, CMake ≥ 3.20
-* Intel oneAPI DPC++ compiler (`icpx`) — tested with oneAPI 2026.1
-* oneDNN 2026.0 (optional prefill path; `/opt/intel/oneapi/dnnl/2026.0`,
-  override with `-DDNNL_ROOT=`)
+* Intel oneAPI DPC++ compiler (`icpx`) — tested with oneAPI 2026.2
+* oneDNN 2026.0 (optional prefill path; the CMake default
+  `/opt/intel/oneapi/dnnl/2026.0`, override with `-DDNNL_ROOT=`; 2026.1 also
+  works)
 * An Intel GPU with SYCL support (developed against Iris Xe-LP; 27B-class models
   were run on two Arc A770).  The CPU backend (`--device cpu`) runs without a
   GPU, using the AVX2 / AVX-VNNI / AVX-512 kernel variants selected at run time.
@@ -208,8 +214,11 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-Optional: AOT-compile the device image with `-DSYCL_INFER_AOT=ON` (defaults to
-`adl-p`; edit `CMakeLists.txt` for another target).
+Optional: AOT-compile the device image with `-DSYCL_INFER_AOT=ON`.  The device
+target defaults to `adl-p`; select another with
+`-DSYCL_INFER_AOT_DEVICE=acm-g10` (it must agree with the profile the binary
+will select at run time).  `-DSYCL_INFER_AOT_JOBS=N` bounds the parallel IGC
+translations.
 
 The **router** (the multi-model front end) builds on its own, without SYCL,
 oneDNN or even `icpx`:
@@ -279,7 +288,10 @@ Common flags:
 | `--pc-dir DIR` | – | enable the disk prefix-cache tier in `DIR` (model-scoped) |
 | `--pc-disk-mb N` | 1024 | disk prefix-cache budget (`0` = unbounded) |
 | `--pc-mem-mb N` | – | alias for `--pc-vram-mb` (or set `PF_PC_STATES` directly) |
-| `--host H` / `--port N` | 0.0.0.0 / 8080 | server bind address |
+| `--host H` / `--port N` | **127.0.0.1** / 8080 | server bind address; the API has no authentication, so expose it behind a reverse proxy |
+| `--control-port N` / `--control-host H` | off / 127.0.0.1 | JSON-RPC control plane used by the router (identity, device memory, graceful stop) |
+| `--control-token T` / `--control-token-file P` | – | shared secret the router must present (a mounted secret file is preferred) |
+| `--yarn` / `--yarn-factor F` | off / derive | YaRN NTK-by-parts context extension; the factor defaults to `--ctx / <arch>.context_length`.  Extends the window but does not save KV memory |
 | `--max-tokens` / `--temp` / `--top-p` / `--top-k` | 256 / 0.7 / 0.95 / 40 | `gen` sampling |
 | `--raw` | off | `gen`: send the prompt verbatim (no chat template) |
 | `--thinking` | off | `gen`: set the chat template `enable_thinking` (reasoning on); `--enable-thinking` is an accepted alias; the server takes this from each request instead |
@@ -552,8 +564,10 @@ detector and recogniser, the table classifiers and structurers, the formula
 recogniser.  The runtime is this project's own: an ONNX protobuf reader, a
 graph IR with a fixed-point pipeline of independent transform passes
 (`src/model/onnx/transforms/`), an operator library, a SYCL kernel library and
-an executor that plans the memory - **all ahead-of-time compiled**, so there
-is no per-shape kernel compilation and no runtime JIT.
+an executor that plans the memory.  **Every kernel takes its shapes as runtime
+arguments**, so there is no per-shape kernel compilation and no graph JIT.  The
+SYCL runtime's own kernel JIT still applies to a non-AOT build (the first call
+pays ~1.2-2.6 s); `-DSYCL_INFER_AOT=ON` removes it, as it does for the LLM path.
 
 The source follows the project's layering rather than a private tree:
 `src/model/onnx/` is the graph and its transforms, `src/backend/onnx/` is the
@@ -606,12 +620,9 @@ exact command and the date; this section is the summary and the caveats.
 
 ### At a glance, at context depth 0
 
-| model | placement | prefill (512 tokens) | decode, one stream | decode, 32 streams |
-|---|---|---:|---:|---:|
-| Qwen3.5-0.8B | 1 card | **6 336 tok/s** | **78.7 tok/s** (12.7 ms/token) | – |
-| Qwen3.8-27B | 2 cards | **507 tok/s** | **13.4 tok/s** (74.6 ms/token) | **76.5 tok/s** |
-| Qwen3.6-35B-A3B | 2 cards | **779 tok/s** | **26.4 tok/s** (37.9 ms/token) | **168 tok/s** |
-| Qwen3.8-Flash-Next | 2 cards, LRU expert bank, pinned source; 28 s warm / 109 s cold start | **55.9 tok/s** (3,660-token prompt) | **11.3 tok/s** (88.2 ms/token) | – |
+The summary table is in [Supported models](#supported-models) above (the same
+cells, not a second measurement); [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+holds the full depth/batch tables.
 
 **Qwen3.8-Flash-Next is the exception in both columns**: its file is 104 GiB,
 of which the 512-expert routed bank is 71.7 GiB and the n-gram PLE table 26.8
@@ -639,7 +650,7 @@ Current numbers on the recommended config: the warm 3,660-token prefill is
 110.2 ms (9.07 tok/s) at 3.6k and 119.7 ms (8.35 tok/s) at 14.6k.  Startup is
 **28.0-28.7 s warm** and **109.4 s cold** (page caches dropped), with a peak
 process RSS of **5.8 GiB**.  The tail-skip default is 0 (the exact expert set);
-`--q4-tail-skip 7` is opt-in and measures 105.9 ms/step at 3.6k.
+`--q4-tail-skip 7` is opt-in and measures 105.8 ms/step at 3.6k.
 `PF_Q4_PIN_SRC=0` (staging) and `PF_Q4_BANK_Q5K=1` (layer 2, 48 layers,
 17.0 GiB, slower) are the A/Bs.  The deep-context cells are f16; both KV types
 work.  `--device cpu` and a plain `--device gpu` also work, but are slower.
@@ -716,14 +727,14 @@ prompts before enabling either path.  Neither composes with batching (the
 server keeps them off by default), and the full tables are in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md#6-speculative-decoding).
 
-| path (27B, one stream) | technical | story | code |
+| 27B, one stream | technical | story | code |
 |---|---:|---:|---:|
-| plain decode | 69.7 ms/token | 69.7 | 69.7 |
-| MTP, k=4 | 39.3 ms/token (1.78x) | 52.6 (1.32x) | 36.5 (1.91x) |
-| DFlash2, n_max=5 | 35.8 ms/token (1.88x) | 77.0 (**0.92x**) | 21.8 (3.08x) |
+| MTP k=4 (plain baseline 69.70 ms/token) | 39.25 ms (1.78x) | 52.63 (1.32x) | 36.46 (1.91x) |
+| DFlash2 n_max=5 vs **its own** plain baseline (67.3 / 70.7 / 67.2 ms) | 35.8 ms (1.88x) | 77.0 (**0.92x**) | 21.8 (3.08x) |
 
-The MTP row is from 2026-10-20; the DFlash2 row is from 2026-10-09, and the
-DFlash2 path **does not run in the current build** (the verify's USM copy
+**Do not compare across the two rows**: they are separate passes with separate
+plain baselines.  The MTP row is 2026-10-20; the DFlash2 row is 2026-10-09, and
+the DFlash2 path **does not run in the current build** (the verify's USM copy
 segfaults inside the driver) — see
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md#62-dflash2--the-block-drafter)
 before trusting a number from it.
@@ -762,9 +773,13 @@ Runtime behavior is controlled by environment variables.  The most useful ones:
 | `PF_MTP_SERVER` | off | `1` routes greedy server requests into the single-sequence MTP loop instead of the batching scheduler |
 | `PF_DFLASH_NMAX` | 5 | draft tokens per cycle for `--spec-type dflash2` (overrides `--spec-draft-n-max`) |
 | `PF_DFLASH_TIME` | off | DFlash2 cycle phase breakdown in ms |
-| `PF_DFLASH_SEGTIME` | off | device-side breakdown of the draft block forward (needs `PF_DFLASH_DEBUG`-free; see `AGENTS.md`) |
+| `PF_DFLASH_SEGTIME` | off | device-side breakdown of the draft block forward; it enables profile timing itself and does not need `PF_DFLASH_DEBUG` |
 | `PF_DFLASH_SLICES` | 8 | top-k slices per row; the measured optimum, *not* the occupancy-maximising value |
 | `PF_DEVICE_PROFILE` / `PF_DEVICE_INFO` | – | pin a tuning profile / dump the resolved one with its provenance |
+| `PF_MODEL_INFO` | off | print the resolved model profile (forward kind, policy, weight representation, capabilities, provenance) at load |
+| `PF_MM_URL_FETCH` | off | allow remote `http(s)://` media URLs (`data:` URLs always work) |
+| `PF_MM_URL_ALLOW_PRIVATE` | off | with `PF_MM_URL_FETCH=1`, also allow loopback/private media hosts (SSRF exposure) |
+| `PF_YARN` / `PF_YARN_FACTOR` | off / derive | YaRN context extension; `PF_YARN_FACTOR=0` derives `--ctx / <arch>.context_length` |
 
 The full tuning/diagnostics knob list and internals are documented in
 [`AGENTS.md`](AGENTS.md).
@@ -774,39 +789,44 @@ The full tuning/diagnostics knob list and internals are documented in
 ```bash
 source /opt/intel/oneapi/setvars.sh
 cmake --build build -j
-./build/test_tokenizer    # tokenizer round-trips (CPU)
-./build/test_chat_template # GGUF chat template vs reference Jinja2 output (CPU)
-./build/test_response_parser # reasoning_content / tool_call splitter (CPU)
-./build/test_sampler      # logit_bias + logprob reporting (CPU)
-./build/test_multimodal   # image preprocessing, vision encoder (host + device), positions (CPU+GPU)
+
+# hermetic layer (no GPU, no model): the default CTest set
+ctest --test-dir build -L hermetic --output-on-failure
+
+# a few of them directly
+./build/test_model_profile  # registry <-> model profile exact keys and pinned policy
+./build/test_dev_profile    # device-profile selection, moe./shape./attn. values, unknown fallback
+./build/test_hparams        # geometry validation the kernels can actually run
+./build/test_kv_type        # --kv-type parsing, K:V mixing, element geometry
+./build/test_quant_synth    # synthetic Q8_0/Q5_0/Q5_1/F16/BF16 dequant, SIn size guards
+./build/test_f16conv        # f16 subnormal contract
+./build/test_yarn           # YaRN anchors are bit-exact
+./build/test_chat_builtin   # the no-template ChatML fallback
+./build/test_sampler        # greedy/top-k/top-p/min-p/penalties/logprobs
+./build/test_pc_disk        # disk prefix-cache format / LRU / reopen
+./build/test_pc_ram         # RAM prefix-cache tier / LRU
+./build/test_control        # the worker control plane (JSON-RPC + auth)
+./build/test_url_fetch_*    # SSRF policy for remote media
+./build/test_router_*       # the router: config, proxy, supervisor, control (no SYCL)
+
+# model/GPU tests are opt-in: pass the GGUFs at configure time
+cmake -S . -B build -DSI_REGISTER_GPU_TESTS=ON \
+      -DSI_TEST_08B_MODEL=/path/to/Qwen3.5-0.8B-Q4_K_M.gguf
+ctest --test-dir build -L gpu --output-on-failure
 ./build/test_gpu_stages   # every kernel vs the CPU reference (GPU)
-./build/test_gemv         # per-tensor GEMV vs CPU dequant reference (GPU)
-./build/test_dp4a         # SIn repack + DP4A GEMM vs CPU reference (GPU)
-./build/test_gpu_vs_ref   # end-to-end logits vs CPU reference (GPU)
-./build/test_forward      # end-to-end logits / top-k (GPU)
 ./build/test_decode_vs_prefill  # single-token decode == re-prefill (GPU)
 ./build/test_sched        # the scheduler's token-stream path + a 20-row batched decode (GPU)
 ./build/test_spec         # the MTP and DFlash2 streams == the plain greedy decode (GPU, 27B)
-./build/test_dflash_kernels # the DFlash2 top-k and conv vs the host references (GPU)
-./build/test_w4*          # native-width u4 packing / GEMM / vs int8 (CPU+GPU)
-./build/test_k5_gemv      # native 5-bit (Q5_K) store GEMV vs a host reference (GPU, 27B)
 ./build/test_w4_vs_cpuref # u4 end-to-end logits vs the fp32 reference (GPU, 27B)
-./build/test_pc_disk      # disk prefix-cache format / LRU / reopen (CPU)
-./build/test_pc_ram       # RAM prefix-cache tier / LRU (CPU)
-./build/test_cpu_gemv     # CPU fp32 + int8 GEMV/RMSNorm vs dequant reference (CPU)
-./build/test_pc_cpu       # host-backend paged attention + prefix-cache round-trip (CPU)
-./build/test_pc_gpu       # prefix-cache disk spill + promote round-trip (GPU)
-./build/test_pc_ram_gpu   # prefix-cache VRAM->RAM->VRAM round-trip (GPU)
-./build/test_cpuref       # CPU reference head output (CPU)
-./build/test_compare      # CPU reference vs llama.cpp dumps (CPU)
-./build/test_control      # the worker's control plane: the protocol + its auth (CPU)
 ```
 
-Each test takes an optional model path as its first argument and otherwise falls
-back to a built-in default; the GPU tests need the model and a working device.
-The weight-path audits (`test_w4*`, `test_k5_gemv`, `test_w4_vs_cpuref`,
-`test_w4_topk`, `test_iq_dequant`, `test_quant_audit`, `test_gemv_stride`) default
-to the 27B instead.
+The hermetic tests need no model and no GPU (the router tests need neither SYCL
+nor oneDNN; `test_kv_type`/`test_spec` compile against the SYCL core but do not
+touch a device).  Tests that need a model take its path as `argv[1]` (or use
+their built-in default); the weight-path audits (`test_w4*`, `test_k5_gemv`,
+`test_w4_vs_cpuref`, `test_w4_topk`, `test_iq_dequant`, `test_quant_audit`,
+`test_gemv_stride`) default to the 27B.  The ONNX tests take a `.onnx` fixture
+or a model path, not a GGUF.  `ctest -N` lists the exact names and labels.
 
 ## Notes
 

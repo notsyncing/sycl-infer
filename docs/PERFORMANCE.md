@@ -99,6 +99,8 @@ to compare builds with; the server's is the number a user feels.
 | Qwen3.5-0.8B | `Qwen3.5-0.8B-Q4_K_M.gguf` | `qwen35` - hybrid Gated DeltaNet + full attention | one card |
 | Qwen3.8-27B | `Qwen3.8-27B-UD-Q4_K_M.gguf` | `qwen35` - dense | two cards: `--layer-map 0-31:gpu.0,32-63:gpu.1` |
 | Qwen3.6-35B-A3B | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `qwen35moe` - routed MoE, 256 experts, 8 active | two cards: `--layer-map 0-19:gpu.0,20-39:gpu.1` |
+| Qwen3.8-Flash-Next | `Qwen3.8-Flash-Next-UD-Q4_K_XL-0000N-of-00004.gguf` | `qwen4exp` - HC + PLE + QSA, 512 routed experts (top-10) | two cards; host-resident expert bank (§4.4) |
+| MinerU2.5-Pro-2605-1.2B | `MinerU2.5-Pro-2605-1.2B-*.gguf` + mmproj | `qwen2vl` - dense Qwen2-VL decoder | one card (§7.4) |
 
 The 27B and the 35B do not fit on one 16 GB card, so the two-card split is not
 an optimisation for them - it is the only way to run them at all.
@@ -118,9 +120,10 @@ test suite runs against; the numbers are here as a scale reference.
 
 `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, `qwen35moe`: 40 layers, 256 experts with 8
 active per token, 21.1 GiB of weights, `--layer-map 0-19:gpu.0,20-39:gpu.1`.
-The GGUF bundles the model's own NextN head (`blk.40.nextn.*`), so the engine
-*builds* an MTP plan for it — but the speculative path itself does not run on
-this model in the current build; see [§6.1](#61-mtp--the-models-own-nextn-head).
+The GGUF bundles the model's own NextN head (`blk.40.nextn.*`).  The
+speculative path now runs after the 2026-11-05 recurrent-state fix (an 8-token
+`--mtp 4 --max-slots 4` run is coherent), but no MTP throughput cells have been
+measured for this model; see [§6.1](#61-mtp--the-models-own-nextn-head).
 
 ### 4.1 By context depth, one stream
 
@@ -292,8 +295,8 @@ chunk-to-chunk rate, 32-vs-288 differencing, temperature 0, 2026-11.
 
 The 11.5k/24k prefill cells predate the `moe.gu_tile=32`/`dn_tile=96` sweep
 (-4.6% at 3.4k), so the shipped build is a little faster than the column.  OVMS
-(OpenVINO GPU plugin, int4 group-64 everywhere, FP32 MatMuls) is **40 tok/s
-short** / 473 @11.5k / 398 @24k: the prefill is **1.14-1.23x** the reference
+(OpenVINO GPU plugin, int4 group-64 everywhere, FP32 MatMuls) is **~550 tok/s
+at 3.4k** / 473 @11.5k / 398 @24k: the prefill is **1.14-1.23x** the reference
 engine and the decode is **0.68-0.76x**, because our per-token stream is
 2.07 GB of mostly 0.625 B/w u4 against its ~0.54 B/w int4 plus a smaller
 non-stream share.  Decode's own split: dense 1.20 GB (13 ms), routed bank
@@ -406,16 +409,17 @@ cells; only how many of the four drafted tokens the NextN head got right.  The
 ceiling on the speedup is `1 + acceptance`, so a drafter that accepts 2.08
 drafts per cycle cannot beat 3.08x no matter how cheap the cycle gets.
 
-> **Known issue, measured 2026-10-20: MTP does not work on the 35B A3B.**  Its
-> GGUF bundles the NextN head (`blk.40.nextn.*`), the engine's gate passes and
-> the verify's command graphs are built ("[mtp] verify command graphs: 3
-> phase(s), 5 rows"), and the *plain* decode is fine (38.7 ms/token, matching
-> the table above) — but the first speculative cycle fails: with the default
-> 16 slots the driver reports `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`, and with
-> `PF_MAX_SLOTS=1` it **segfaults in the same place as the DFlash2 crash
-> below** (a USM `memcpy` inside the Level Zero driver, reached from
-> `engine::mtp_verify`).  So MTP is a 27B feature in this build, and the
-> routed-MoE model's MTP numbers do not exist yet.
+> **Fixed 2026-11-05: the MTP/DFlash2 USM-copy crashes were one recurrent-state
+> stride bug, not driver bugs.**  `mtp_verify`/`mtp_rollback` addressed the
+> GDN/conv state with `kMaxB` as the slot stride while the buffers are allocated
+> with `state_slots_` (`--max-slots`, default 16).  Raising the compile-time
+> ceiling from 16 to 32 made every GDN layer after the first read past its
+> allocation; the Level Zero USM copy then faulted at enqueue.  The five sites
+> now use `state_slots_`.  After the fix, the 27B MTP `test_spec` passes
+> (stream-equal and deterministic), DFlash2 `test_spec` passes, and a 35B A3B
+> `--mtp 4 --max-slots 4` run emits coherent text.  The 2026-10-09 throughput
+> cells below were not re-measured; they are the last measured pass, not a
+> statement that the path is broken.
 
 ### 6.2 DFlash2 — the block drafter
 
@@ -426,8 +430,10 @@ plus every ordered pair, so the host walks one coherent path through the
 lattice instead of re-drawing per token.  It needs a matching draft GGUF
 (`--spec-draft-model`).
 
-The numbers below are from the 2026-10-09 pass (the DFlash2 CLI path is
-currently the one that segfaults, see the note at the end of this section);
+The numbers below are the **last measured pass (2026-10-09)** and are kept as the
+record of what the drafter costs.  The path crashed on HEAD from the
+recurrent-state stride bug above and runs again after the 2026-11-05 fix, but
+these cells have not been re-measured.
 `n_max` is the draft tokens per cycle and the ceiling on the speedup is
 `1 + acceptance`:
 
@@ -451,22 +457,16 @@ the whole sweep above is worse in ms/token than 21.8 on the story prompt.
 Acceptance has to be checked per workload before enabling this, and a single
 speedup figure for the drafter is not a property of the drafter.
 
-> **Known issue, measured 2026-10-20: the DFlash2 path does not run at all in
-> the current build.**  The drafter requires the draft on device 0 ("[dflash]
-> needs a multi-device oneDNN GPU partition with draft on device 0 - disabled"),
-> and with the draft on device 0 it dies with SIGSEGV *inside the Level Zero
-> driver*, in a USM `memcpy` reached from `engine::mtp_verify` — the DFlash2's
-> verify reuses the MTP's verify machinery.  It reproduces with a 32-token
-> generation and a 45-token prompt, and it is **not** a VRAM shortage on the
-> default configuration (`PF_MAX_SLOTS` 1 / 4 / 8 / 16 all crash, and the 27B's
-> card 0 holds 9 072 MiB of weights plus the 1 050 MiB draft).
+> **Fixed 2026-11-05: the DFlash2 path runs again.**  Its verify reuses
+> `engine::mtp_verify`, and the SIGSEGV was the same `kMaxB` vs `state_slots_`
+> recurrent-state stride bug (see §6.1).  `test_spec` (DFlash config) now
+> passes: stream-equal to the plain greedy decode on both prompts and
+> deterministic.  The numbers in this subsection are still the 2026-10-09
+> pass; they were not re-measured after the fix.
 >
-> **The measurement trap**: with `--spec-draft-device 1` the drafter is
-> *disabled* and the run is a plain decode — it still exits 0 and still
-> produces text, at the plain decode's rate.  That is how a "put the draft on
-> the other device and it works" reading gets formed; it does not work, it
-> stops drafting.  The numbers in this subsection are therefore the
-> 2026-10-09 pass, the last one where the path ran.
+> **The measurement trap remains**: with `--spec-draft-device 1` the drafter is
+> *disabled* and the run is a plain decode — it exits 0 and produces text at the
+> plain decode's rate.  That is not a working speculative path.
 
 ## 7. The ONNX document pipeline
 
@@ -523,11 +523,15 @@ output is integer-equal to ONNXRuntime's on five real formula crops.
 
 The other document workload: MinerU2.5-Pro-2605-1.2B (`qwen2vl`: a Qwen2-VL
 dense decoder behind a 32-layer, 1280-wide vision tower with 80-wide heads),
-run as the two-step extraction (`mineru`).  Conditions: **one Arc A770 16 GB**,
+run as the two-step extraction (`sycl-infer-mineru`, the standalone
+`tools/mineru/` reference client).  Conditions: **one Arc A770 16 GB**,
 AOT Release (`acm-g10`), clocks fixed at **2400 MHz**
 (`xpu-smi config -d 0 --standby never`), a quiet window, one 1036x1036 page
-(`layout_original_image_01.png`, 21 blocks), greedy, `--max-tokens 256` per
-block, one process per rep, 2026-11-02.  Warm page cache unless stated: a
+(`layout_original_image_01.png`, 21 blocks), greedy, `--max-tokens 1024` per
+call (256 truncates the layout decode to 11 blocks), one process per rep,
+2026-11-02.  The page md5 was re-baselined after the 2026-11 sampler
+presence/frequency penalty-sign fix; `--max-tokens 1024` and the AOT/JIT builds
+agree.  Warm page cache unless stated: a
 concurrent GPU job time-slices the card and inflates a run up to 50x.
 
 | phase | warm |
@@ -544,7 +548,7 @@ concurrent GPU job time-slices the card and inflates a run up to 50x.
 | cold file cache | **11.89 / 12.28 s** |
 
 The output is the reference output at every step: page md5
-`10eed240936226fd4696d943aaabc44b`, 21 blocks; text-only `gen` md5
+`c79d2d222d6d90763f0d25c5ffb5269a`, 21 blocks; text-only `gen` md5
 `bfc55c543af1d1aecae5da0b1f9b99e5`; vision self-check cos 0.999104.  The
 per-stage numbers come from `PF_MINERU_TIME=1` (prep / vision / prefill /
 decode / total per image) and `PF_VISION_TIME=1` (a `q.wait()` per vision
@@ -673,7 +677,7 @@ repository; the commands below are what produced the tables above.
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
-export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2026.1/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.2/lib:/opt/intel/oneapi/compiler/2026.2/lib:$LD_LIBRARY_PATH
 export PF_PREFIX_CACHE=0
 
 M35=/path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf

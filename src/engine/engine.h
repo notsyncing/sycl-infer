@@ -215,16 +215,12 @@ struct engine_config {
     float yarn_beta_slow = 1.0f;
     float yarn_attn_factor = 0.0f;
 
-    // Split the LM head's output rows across every GPU partition instead of
-    // pinning the whole head to backend 0.  The head is int8 oneDNN and is the
-    // single largest tensor on card 0 (248320x5120 int8 = 1.26 GiB on the 27B,
-    // measured 1248 MiB of card 0's 9072 MiB total); halving it frees half of
-    // that on the card that has the least room.  Default off (measured neutral
-    // end to end, and it only pays when card 0 is the binding card).
+    // Reserved for the C ABI.  The CLI no longer accepts `--head-split` and
+    // the engine does not implement it (AGENTS.md lists the split as a change
+    // deliberately not made); a caller must leave this 0.
     bool head_split = false;
 
-    // Three states, which the bare int never conveyed - the comment explaining
-    // them used to live 430 lines away, at the pool sizing:
+    // KV pool cap.  Three states:
     //   > 0  explicit cap in MB
     //   < 0  auto: reserve exactly what max_seq needs (the pool still commits
     //        lazily, so the extra range is only virtual address space)
@@ -278,6 +274,11 @@ struct engine {
     // loaded the model.  Policy branches read this instead of m.q4exp; it is
     // never null after construction.
     const model_profile * mp_ = nullptr;
+
+    // Does this model own its forward pass (the qwen4exp HC/PLE/QSA walk)?
+    // The single predicate every dispatch site uses; the loader's `q4exp` flag
+    // stays only as the consistency assertion in model::load.
+    bool hc_fwd() const { return mp_ && mp_->fwd == model_profile::fwd_kind::hc_ple_qsa; }
     tokenizer tk;
     int device_req = -1; // resolved device request (0 = gpu, 1 = cpu)
     // A pipeline-parallel run over several GPUs shares one SYCL context: USM

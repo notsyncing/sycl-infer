@@ -16,9 +16,11 @@
 #include <memory>
 #include <mutex>
 #include <ratio>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 
 
@@ -229,6 +231,13 @@ void proxy::install(httplib::Server & srv) {
         res.status = 204;
     });
 
+    srv.Get("/v1/pipelines", [this](const httplib::Request & req, httplib::Response & res) {
+        handle_pipelines(req, res);
+    });
+    srv.Post(R"(/v1/pipelines/([^/]+)/run)", [this](const httplib::Request & req, httplib::Response & res) {
+        handle_pipeline_run(req, res);
+    });
+
     srv.Post("/v1/onnx/run", [this](const httplib::Request & req, httplib::Response & res) {
         handle_onnx_run(req, res);
     });
@@ -383,7 +392,6 @@ void proxy::install(httplib::Server & srv) {
 }
 
 void proxy::handle_completions(const httplib::Request & req, httplib::Response & res, const char * path) {
-    const auto t0 = std::chrono::steady_clock::now();
     set_cors(res);
 
     if (!authorized(req)) {
@@ -448,6 +456,103 @@ void proxy::handle_completions(const httplib::Request & req, httplib::Response &
         }
     }
 
+    forward(req, res, slot, path, body, model);
+}
+
+void proxy::handle_pipelines(const httplib::Request & req, httplib::Response & res) {
+    if (!authorized(req)) {
+        set_error(res, 401, "missing or invalid bearer token", "invalid_request_error");
+        return;
+    }
+    set_cors(res);
+    ojson data = ojson::array();
+    std::set<std::string> seen;
+    for (const auto & slot : reg_.all()) {
+        if (slot->cfg.pipelines.empty()) {
+            continue;
+        }
+        if (!slot->is_up()) {
+            continue; // an unavailable worker contributes no available pipeline
+        }
+        std::set<std::string> declared(slot->cfg.pipelines.begin(), slot->cfg.pipelines.end());
+        httplib::Client cli(slot->cfg.http_host, slot->cfg.http_port);
+        cli.set_read_timeout(5, 0);
+        cli.set_connection_timeout(2, 0);
+        auto out = cli.Get("/v1/pipelines");
+        if (!out || out->status != 200) {
+            continue;
+        }
+        try {
+            const ojson j = ojson::parse(out->body);
+            const auto it = j.find("data");
+            if (it == j.end() || !it->is_array()) {
+                continue;
+            }
+            for (const auto & p : *it) {
+                if (!p.is_object()) {
+                    continue;
+                }
+                const auto idit = p.find("id");
+                if (idit == p.end() || !idit->is_string()) {
+                    continue;
+                }
+                const std::string id = idit->get<std::string>();
+                if (declared.find(id) == declared.end()) {
+                    continue;
+                }
+                if (seen.insert(id).second) {
+                    data.push_back(p);
+                }
+            }
+        } catch (...) {
+        }
+    }
+    ojson j;
+    j["object"] = "list";
+    j["data"] = std::move(data);
+    res.set_content(j.dump(), "application/json");
+}
+
+void proxy::handle_pipeline_run(const httplib::Request & req, httplib::Response & res) {
+    set_cors(res);
+    if (!authorized(req)) {
+        set_error(res, 401, "missing or invalid bearer token", "invalid_request_error");
+        return;
+    }
+    const std::string id = req.matches[1];
+    std::shared_ptr<model_slot> owner;
+    for (const auto & slot : reg_.all()) {
+        for (const std::string & pid : slot->cfg.pipelines) {
+            if (pid == id) {
+                owner = slot;
+                break;
+            }
+        }
+        if (owner) {
+            break;
+        }
+    }
+    if (!owner) {
+        set_error(res, 404, "pipeline '" + id + "' not found", "pipeline_not_found");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(owner->mtx);
+        if (owner->state != model_state::up) {
+            set_error(res, 503,
+                      "pipeline '" + id + "' is unavailable (state: " + model_state_name(owner->state) + ")",
+                      "server_error");
+            return;
+        }
+    }
+    const std::string path = "/v1/pipelines/" + id + "/run";
+    forward(req, res, owner, path, req.body, id);
+}
+
+void proxy::forward(const httplib::Request & req, httplib::Response & res,
+                    const std::shared_ptr<model_slot> & slot, const std::string & path,
+                    const std::string & body, const std::string & model) {
+    const auto t0 = std::chrono::steady_clock::now();
     httplib::Headers headers;
     for (const auto & kv : req.headers) {
         if (!is_hop_by_hop(kv.first)) {
@@ -647,8 +752,8 @@ void proxy::handle_completions(const httplib::Request & req, httplib::Response &
                 stream->client->stop();
             }
         });
-
 }
+
 
 } // namespace router
 } // namespace si

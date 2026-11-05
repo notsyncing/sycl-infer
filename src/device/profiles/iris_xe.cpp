@@ -112,6 +112,11 @@ static const profile iris_xe = {
         .xmx_min_keys = 2048,
         .split_keys = 512,
         .dec_group = 0,
+        // 70 is 1024 threads and this part caps a work-group at 512, so the
+        // launcher's fallback would pick 0 anyway; state it (INHERITED).
+        .vit_tile = 0,
+        .xmx_gather_q = 8,   // INHERITED (unmeasured here)
+        .dflash_slices = 8,  // INHERITED (unmeasured here)
     },
 
     .wt = {

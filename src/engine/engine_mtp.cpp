@@ -624,7 +624,11 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
                 continue;
             }
             const int gl = layer_gdn_local_[(size_t)il];
-            float * src = cstate + (size_t)gl * kMaxB * conv_per + conv_dim; // slot 0, row 1
+            // The recurrent state's slot axis is state_slots_ (the clamped
+            // --max-slots), not kMaxB: the ceiling is 32 and the default is 16,
+            // so kMaxB here walks past the allocation for every layer after the
+            // first.  This was the 27B/35B/DFlash verify USM-copy crash.
+            float * src = cstate + (size_t)gl * (size_t)state_slots_ * conv_per + conv_dim; // slot 0, row 1
             qd.memcpy(mtp.d_mtp_convsave_[(size_t)dev] + (size_t)gl * 2 * conv_dim, src, conv_dim * 4);
             qd.memcpy(mtp.d_mtp_convsave_[(size_t)dev] + ((size_t)gl * 2 + 1) * conv_dim, src + conv_dim, conv_dim * 4);
         }
@@ -805,11 +809,11 @@ void engine::mtp_rollback(int j) {
             // GDN state: the dry verify snapshotted the state after every token
             // into mtp.d_mtp_hist_[token]; row j is the last committed token, so its
             // snapshot is exactly the committed state.
-            qd.memcpy(as_[(size_t)dev].gdn_state + (size_t)gl * kMaxB * gdn_per,
+            qd.memcpy(as_[(size_t)dev].gdn_state + (size_t)gl * (size_t)state_slots_ * gdn_per,
                       hist + (size_t)j * (size_t)ng * per + (size_t)gl * per, gdn_per * 4);
             // conv window of the last three committed tokens: rows j-2..j come
             // from the verify's own taps, older ones from the pre-verify window.
-            float * cs = as_[(size_t)dev].conv_state + (size_t)gl * kMaxB * conv_per; // slot 0
+            float * cs = as_[(size_t)dev].conv_state + (size_t)gl * (size_t)state_slots_ * conv_per; // slot 0
             const float * v2 = qtap + (size_t)gl * mtp.mtp_nsnap * conv_dim + (size_t)j * conv_dim;
             const float * v1 = j >= 1 ? qtap + (size_t)gl * mtp.mtp_nsnap * conv_dim + (size_t)(j - 1) * conv_dim
                                       : save + (size_t)gl * 2 * conv_dim + conv_dim;
@@ -1428,8 +1432,8 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 if (ng == 0) {
                     continue;
                 }
-                nst[d] = ng * kMaxB * gdn_per;
-                ncv[d] = ng * kMaxB * conv_per;
+                nst[d] = ng * (size_t)state_slots_ * gdn_per;
+                ncv[d] = ng * (size_t)state_slots_ * conv_per;
                 st_save[d].resize(nst[d]);
                 cv_save[d].resize(ncv[d]);
                 dev_queue((int)d).memcpy(st_save[d].data(), as_[d].gdn_state, nst[d] * 4).wait();

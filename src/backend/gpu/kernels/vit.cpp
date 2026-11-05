@@ -1101,7 +1101,7 @@ void vit_attn_launch(queue & q, const float * qkv, int qkv_stride, float * out, 
     // sub-groups per EU (SG=32 gives two) for latency hiding; SG=8 loses.
     // PF_VIT_ATTN picks an alternative tile for the sweep.
     case 80: {
-        int cfg = SI_ENV_I32("PF_VIT_ATTN", 70);
+        int cfg = si::dev::profile_int(q, "PF_VIT_ATTN", si::dev::for_queue(q).attn.vit_tile);
         // The 1024-thread variants fill a 512-EU A770 core; an Iris Xe caps a
         // work-group at 512, so fall back to the 32/32/512 tile there (the
         // launcher's own device query is cached by si::dev).

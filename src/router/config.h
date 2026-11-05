@@ -35,6 +35,10 @@ struct model_config {
     std::vector<std::string> args; // extra worker CLI args
     bool is_onnx() const { return backend == "onnx"; }
     std::vector<std::string> env;  // "K=V" pairs for the child
+    // Request-level pipelines this worker provides.  This is a pipeline-id
+    // table, not a model alias: the ids never enter /v1/models and never
+    // change model routing (docs/design/22-pipelines.md §7).
+    std::vector<std::string> pipelines;
 
     // Device placement.  `device_group` is the budget grouping key (two models
     // in the same group are assumed to share one card); `device_filter` is

@@ -600,7 +600,7 @@ SYI_API syi_status  syi_model_shutdown(syi_model *model, uint32_t timeout_ms);
 * `max_queue_depth`/`max_queue_tokens`：0 表示不限制；队列满时提交返回
   `SYI_QUEUE_FULL`。
 * `n_splits`/`dec_splits` 是高级调优；一般留 0，由 device profile 决定。
-* `head_split` 对应 `--head-split`；默认 0。
+* `head_split` 是保留字段：引擎**未实现** LM head 跨卡切分，CLI 也不再接受 `--head-split`；调用方必须保持 0（非 0 目前是 no-op）。
 * `pc_*` 的 `-1` 表示“使用 `PF_PC_*` 或引擎默认”，C API 不读环境变量也能工作。
 * `log_fn` 的 level：0=error，1=warn，2=info，3=debug。默认不输出到 stderr；
   宿主需要时自己接日志。
@@ -1130,7 +1130,7 @@ C API 不改变引擎的容量模型。`max_seq`/`max_slots`/`kv_type`/`moe_vram
 
 | 维度 | 值 |
 |---|---|
-| 编译器 | icpx 2026.1/2026.2 |
+| 编译器 | icpx 2026.2（2026.1 亦可） |
 | 构建 | Release JIT、Release AOT（acm-g10） |
 | backend | CPU、单 GPU、双 GPU layer-map |
 | 模型 | 0.8B（tied embedding）、27B（multi-device）、35B A3B（MoE）、qwen4exp（split） |

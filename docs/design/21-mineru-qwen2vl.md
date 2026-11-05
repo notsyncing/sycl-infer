@@ -142,10 +142,34 @@ norms/biases（1.32 GB 文件里的 3.7 MB），所以 `PF_VISION_COMPACT=1`（�
 `MTMD_DEBUG_EMBEDDINGS` 输出逐元素比较：1369 个 merged token × 896 维，
 cos **0.999997**，max|diff| 33.4（值域 ~69，约 0.05%），RMS 比值 1.0000。
 这说明 patch 顺序、temporal 权重相加、2D RoPE、attention、merger 都是对的。
-int8 线性层之后页面输出 md5 不变（`10eed240936226fd4696d943aaabc44b`），
+int8 线性层之后页面输出 md5 不变（`c79d2d222d6d90763f0d25c5ffb5269a`，2026-11 采样器
+presence/frequency 惩罚符号修正后的新基线；旧值 `10eed240...` 已作废），
 host-vs-device 自检 cos 0.9991（fp32 device 路径本身是 0.9994）。
 
-## 4. MinerU 两步抽取（`src/mineru.*`）
+## 4. MinerU 两步抽取（客户端工具）
+
+**当前结构**：`tools/mineru/`（独立二进制 `sycl-infer-mineru`），见
+[22-pipelines.md](22-pipelines.md) §9。`mineru.{h,cpp}` 是两步编排与图像几何，
+`layout.{h,cpp}` 是纯 prompt/版面语法，`main.cpp` 是独立 CLI。`sycl-infer` 的
+`mineru` 命令和 `--mineru-*` 参数已经移除。它**不是**服务端 pipeline：客户端流程
+只需模型能力，按 22 的准入规则留在 `tools/`。
+
+**来源与定位**：`tools/mineru/` 是 `opendatalab/mineru-vl-utils` 的
+`MinerUClient.two_step_extract` 的 C++ 复刻（prompt、block 语法、JSON 形状均来自
+上游，2026-11-02）。它不是模型能力，也不是引擎必须内置的文档流水线；默认应作为
+**reference client** 由调用方驱动，服务端只提供 qwen2vl 的图片
+`/v1/chat/completions`。是否把它注册成服务端 pipeline 需过
+[22-pipelines.md](22-pipelines.md) §1.3 的准入规则（进程内状态复用 / 实测收益 /
+资源账本），并且要与上游版本做 parity 测试。
+
+MinerU 不是一个模型，而是构建在 `qwen2vl` 模型 + 视觉塔之上的**请求级编排**。
+因此：
+
+* `GET /v1/models` 只列 qwen2vl 模型，不列 `mineru`；
+* `POST /v1/chat/completions` 仍按标准 OpenAI 语义工作（调用方自己给 prompt，
+  拿模型原始输出），不暴露任何 MinerU 专用字段；
+* 两步抽取由客户端调用 qwen2vl 的图片 `/v1/chat/completions`（或 `tools/mineru`
+  直接驱动 engine）；服务端不内置 MinerU pipeline，也不加模型别名。
 
 完全按 `opendatalab/mineru-vl-utils` 的 `MinerUClient.two_step_extract`：
 
@@ -171,17 +195,20 @@ You are a helpful assistant.<|im_end|>
 <|im_start|>assistant
 ```
 
-CLI：
+CLI（独立参考工具，不进入 server，也不经过 pipeline registry）：
 
 ```bash
-./build-aot/sycl-infer \
-  --model  /data/models/MinerU2.5-Pro-2605-1.2B-GGUF/MinerU2.5-Pro-2605-1.2B.Q4_K_M.gguf \
-  --mmproj /data/models/MinerU2.5-Pro-2605-1.2B-GGUF/MinerU2.5-Pro-2605-1.2B.mmproj-f16.gguf \
+./build/sycl-infer-mineru \
+  --model  /path/to/MinerU2.5-Pro-2605-1.2B.Q4_K_M.gguf \
+  --mmproj /path/to/MinerU2.5-Pro-2605-1.2B.mmproj-f16.gguf \
   --ctx 8192 \
-  mineru --image page.png --max-tokens 256 > page.json
+  --image page.png --max-tokens 1024 > page.json
 ```
 
-可选：`--mineru-only-type T`（调试单个类型）、`--mineru-layout-side N`。
+可选：`--only-type T`（调试单个类型）、`--layout-side N`、`--device cpu|gpu|auto`、
+`--layer-map`、`--kv-type`、`--debug`。layout 解码需要足够 token：在本页上
+`--max-tokens 256` 会截断到 11 个 block，1024（或 4096）给出完整的 21 个；工具默认
+是 4096。
 image/chart block **总是**被裁剪分析（`\nImage Analysis:`），不再有
 `--mineru-image-analysis` 开关；参考实现的默认 `false` 是有意不复刻的。
 
@@ -197,9 +224,10 @@ block）在单张 A770 上现在是 **10.99/11.23 s 热缓存、11.89/12.28 s �
 ### 5.1 历史：113.1 s -> 15.8 s -> 11.0 s
 
 同一张 1036×1036 页面（`layout_original_image_01.png`，5476 patch，21 个
-block）、单卡 A770、AOT Release、贪心、每个 block `--max-tokens 256`、每个
-rep 一个进程，2026-11-02。两轮优化的输出始终逐字节不变（页面 md5
-`10eed240936226fd4696d943aaabc44b`；纯文本 `gen` md5
+block）、单卡 A770、AOT Release、贪心、每次调用 `--max-tokens 1024`、每个
+rep 一个进程，2026-11-02。两轮优化的输出始终逐字节不变（当时的页面 md5
+`10eed240936226fd4696d943aaabc44b`，2026-11 采样器惩罚符号修正后重测为
+`c79d2d222d6d90763f0d25c5ffb5269a`；纯文本 `gen` md5
 `bfc55c543af1d1aecae5da0b1f9b99e5`；视觉自检 cos 0.999104）。
 
 * **113.1 s -> 15.8 s（第一轮）。** 视觉线性层换 oneDNN int8、80 维头
@@ -334,7 +362,8 @@ SIGSEGV，所以整页差距远大于单步差距；单请求的保守数字引�
 * 文本 top-1：`"The capital of France is "` → 220，与 llama.cpp 相同；
 * 视觉：cos 0.999997（对 `MTMD_DEBUG_EMBEDDINGS`）；
 * layout + text：与 llama.cpp 的框和文本一致；
-* 整页 md5 `10eed240936226fd4696d943aaabc44b`、21 个 block，与优化前逐字节相同。
+* 整页 md5 `c79d2d222d6d90763f0d25c5ffb5269a`、21 个 block（采样器惩罚符号修正后的
+  新基线；旧值 `10eed240...` 已作废），`--max-tokens 1024`。
 
 ## 6. 诊断开关
 

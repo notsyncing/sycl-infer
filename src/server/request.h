@@ -58,6 +58,11 @@ std::string parse_tools_json(const json & body);
 // is what the renderers branch on.
 std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> & media);
 
+// The single-model worker accepts its own GGUF id or the configured fallback;
+// another id is not an alias (a pipeline id must not silently reach the model).
+// An absent/empty model is accepted: the caller gets the only model.
+bool model_id_accepted(const std::string & requested, const std::string & model_id, const std::string & fallback);
+
 // The completions `prompt` in any of its four shapes.
 struct completion_prompts {
     std::vector<std::vector<int>> tokens;

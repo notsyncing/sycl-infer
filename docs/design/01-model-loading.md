@@ -510,7 +510,7 @@ int8 副本。格式与数学见 [02-quantization.md](02-quantization.md)。这�
 | `--spec-draft-device N` | 草稿跑在哪个设备分区 | 0（env `PF_MTP_DEV` / `PF_DFLASH_DEV`） |
 | `--mtp [N]` | `--spec-type mtp --spec-draft-n-max N` 的别名；**长度可选**，裸 `--mtp` = 4（引擎侧再把 >12 截到 12） | 关（env `PF_MTP` 可覆盖） |
 | `--mtp-device N` | `--spec-draft-device` 的别名 | 0（env `PF_MTP_DEV`） |
-| `--host H` / `--port N` | serve 绑定 | 0.0.0.0 / 8080 |
+| `--host H` / `--port N` | serve 绑定 | **127.0.0.1** / 8080（API 无鉴权，对外暴露请用反向代理） |
 | `--prompt <text>` / `--raw` | `gen` 提示词 / 原样发送（不套 chat 模板） | 空 / off |
 | `--thinking`（别名 `--enable-thinking`） | `gen` 传给 chat 模板的 `enable_thinking` | off |
 | `--image <file>` / `--video <file>` / `--audio <file>` | `gen` 多模态输入（各自可重复、可混用） | 空 |

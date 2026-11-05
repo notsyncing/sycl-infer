@@ -45,7 +45,12 @@ int main(int argc, char ** argv) {
     // kernel then runs somewhere the test is not looking and reads back the
     // allocation's initial contents, which is every id and weight zero.  That
     // reads exactly like "the router picked expert 0 for every token".
-    queue q{sycl::gpu_selector_v};
+    // In-order: every probe in this file queues a kernel and then reads its
+    // output with a bare memcpy.  A default (out-of-order) queue does not order
+    // the two, so the read can see the allocation's initial contents - which is
+    // exactly the "the kernel produced nothing" failure this test was written to
+    // detect, but here it is the harness, not the kernel.
+    queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
     // ---- host reference data
     // one expert plane is [N][K]: gate/up are n_ff_exp rows of n_embd, down is
     // n_embd rows of n_ff_exp.  Sizing these by n_expert*K alone under-allocates

@@ -82,6 +82,109 @@ int main() {
     }
 
     {
+        // A temperature-0 tie goes to the lowest index (strict `>`), which is
+        // also the device argmax's rule on the qwen4exp path.
+        std::vector<float> lg = {2.f, 2.f, 1.f};
+        gen_params gp;
+        gp.temperature = 0.f;
+        sampler_state ss;
+        ss.seed(5);
+        check(sample_token(lg.data(), 3, gp, {}, ss) == 0, "greedy tie -> lowest index");
+    }
+    {
+        std::vector<float> lg = {1.f, 5.f, 2.f};
+        gen_params gp;
+        gp.temperature = 1.f;
+        gp.top_k = 1; // top_k == 1 is the greedy branch even above temperature 0
+        sampler_state ss;
+        ss.seed(6);
+        check(sample_token(lg.data(), 3, gp, {}, ss) == 1, "top_k=1 is greedy argmax");
+    }
+    {
+        // min_p is relative to the *maximum* probability, not to 1: p =
+        // {0.667, 0.333}, threshold 0.9*0.667 = 0.6, so the second is dropped.
+        std::vector<float> lg = {0.f, std::log(0.5f)};
+        gen_params gp;
+        gp.temperature = 1.f;
+        gp.top_k = 0;
+        gp.top_p = 1.f;
+        gp.min_p = 0.9f;
+        sampler_state ss;
+        ss.seed(7);
+        bool all_first = true;
+        for (int i = 0; i < 64; i++) {
+            all_first = all_first && sample_token(lg.data(), 2, gp, {}, ss) == 0;
+            ss.seed(7u + (uint64_t)i);
+        }
+        check(all_first, "min_p drops the low-probability tail");
+    }
+    {
+        // p = {0.6, 0.3, 0.1}: the cumulative mass is already past 0.5 after
+        // the first token, so nucleus sampling keeps exactly it.
+        std::vector<float> lg = {std::log(0.6f), std::log(0.3f), std::log(0.1f)};
+        gen_params gp;
+        gp.temperature = 1.f;
+        gp.top_k = 0;
+        gp.top_p = 0.5f;
+        sampler_state ss;
+        ss.seed(8);
+        bool all_first = true;
+        for (int i = 0; i < 64; i++) {
+            all_first = all_first && sample_token(lg.data(), 3, gp, {}, ss) == 0;
+            ss.seed(8u + (uint64_t)i);
+        }
+        check(all_first, "top_p keeps the nucleus");
+    }
+    {
+        // repeat_penalty > 1 divides a positive logit, so a recently seen token
+        // loses the argmax.
+        std::vector<float> lg = {4.f, 4.f};
+        gen_params gp;
+        gp.temperature = 0.f;
+        gp.repeat_penalty = 4.f;
+        sampler_state ss;
+        ss.seed(9);
+        check(sample_token(lg.data(), 2, gp, {1}, ss) == 0, "repeat_penalty demotes a recent token");
+    }
+    {
+        // A positive presence penalty must demote, not promote (OpenAI).
+        std::vector<float> lg = {0.f, 0.f};
+        gen_params gp;
+        gp.temperature = 0.f;
+        gp.presence_penalty = 5.f;
+        sampler_state ss;
+        ss.seed(10);
+        check(sample_token(lg.data(), 2, gp, {1}, ss) == 0, "presence_penalty demotes a seen token");
+    }
+    {
+        // The frequency term multiplies the occurrence count.
+        std::vector<float> lg = {0.f, 0.f};
+        gen_params gp;
+        gp.temperature = 0.f;
+        gp.frequency_penalty = 1.f;
+        sampler_state ss;
+        ss.seed(11);
+        check(sample_token(lg.data(), 2, gp, {1, 1}, ss) == 0, "frequency_penalty counts repeats");
+    }
+    {
+        // Same seed, same distribution -> same token (the scheduler relies on
+        // this for a deterministic replay with a pinned seed).
+        std::vector<float> lg = {1.f, 1.f, 1.f, 1.f};
+        gen_params gp;
+        gp.temperature = 1.f;
+        gp.top_k = 0;
+        gp.top_p = 1.f;
+        sampler_state a, b;
+        a.seed(1234);
+        b.seed(1234);
+        bool same = true;
+        for (int i = 0; i < 32; i++) {
+            same = same && sample_token(lg.data(), 4, gp, {}, a) == sample_token(lg.data(), 4, gp, {}, b);
+        }
+        check(same, "same seed -> same stream");
+    }
+
+    {
         gen_params gp;
         gp.temperature = 0.f;
         check(gp.speculative_greedy(), "plain greedy eligible for speculation");

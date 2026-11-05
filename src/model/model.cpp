@@ -111,7 +111,7 @@ void report(const model_profile & p) {
             "[model]   policy: max_decode_rows %d, prefill %s, prefix_cache %s, auto_layer_map %s, "
             "md_splits %s, engram %zu MiB\n"
             "[model]   weights: sin_w8 %s, dnnl_int8 %s, raw_gemv_decode %s, split_per_tensor_upload %s\n"
-            "[model]   capabilities: mtp %s, dflash %s, multimodal %s%s%s\n"
+            "[model]   capabilities: mtp %s, dflash %s, multimodal %s%s%s%s\n"
             "[model]   provenance: %s\n",
             p.key, p.name, fwd_kind_name(p.fwd), moe_owner_name(p.moe), yn(p.residual.hyper),
             p.residual.streams, p.residual.low_rank, yn(p.extras.ple), yn(p.extras.qsa), p.extras.qsa_top_k,
@@ -197,6 +197,37 @@ void validate_hparams(const hparams & hp, const std::string & arch) {
 // ---------------------------------------------------------------------------
 // Generic model lifecycle.  Architecture-specific hparams and tensor bindings
 // are delegated to the loader selected by `general.architecture`.
+void validate_model_profile(const hparams & hp, const model_profile & prof, bool split_file) {
+    // The model-owned forward's geometry is declared in the profile and read
+    // from the GGUF metadata by the loader.  They are two views of the same
+    // facts, so refuse a file whose geometry contradicts the architecture's
+    // declaration instead of letting one view silently win at a use site.
+    if (prof.fwd != model_profile::fwd_kind::hc_ple_qsa) {
+        // The generic plan has no geometric assumptions beyond validate_hparams.
+    } else {
+        auto expect = [&](const char * what, long got, long want) {
+            if (got != want) {
+                throw std::runtime_error("model profile " + std::string(prof.key) + ": " + what + " is " +
+                                         std::to_string(got) + " in the GGUF but " + std::to_string(want) +
+                                         " in the profile");
+            }
+        };
+        expect("hyper-connection streams", hp.hc_mult, prof.residual.streams);
+        expect("hyper-connection low rank", hp.hc_low_rank, prof.residual.low_rank);
+        expect("QSA top-k", hp.idx_top_k, prof.extras.qsa_top_k);
+        expect("QSA pool", hp.idx_kpool, prof.extras.qsa_pool);
+        expect("QSA indexer heads", hp.idx_n_head, prof.extras.idx_heads);
+        expect("QSA indexer head_dim", hp.idx_head_dim, prof.extras.idx_head_dim);
+    }
+    // A split GGUF cannot use the single-blob upload; the profile has to
+    // declare the per-tensor path, otherwise the split check in upload() is a
+    // surprise at the first layer-map-less run.
+    if (split_file && !prof.rep.split_per_tensor_upload) {
+        throw std::runtime_error("model profile " + std::string(prof.key) +
+                                 ": the file is split but the profile does not declare the per-tensor upload");
+    }
+}
+
 void model::load(const std::string & path) {
     gguf.load(path);
     if (const std::string * ct = gguf.get_str("tokenizer.chat_template")) {
@@ -230,6 +261,7 @@ void model::load(const std::string & path) {
                                  ": forward kind disagrees with the loader (q4exp=" +
                                  (q4exp ? "true" : "false") + ", hp.q4exp=" + (hp.q4exp ? "true" : "false") + ")");
     }
+    validate_model_profile(hp, *prof, gguf.is_split());
     report(*prof);
 }
 

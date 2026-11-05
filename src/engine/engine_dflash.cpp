@@ -717,7 +717,7 @@ void engine::setup_dflash(const std::string & draft_path) {
         // the S*K candidates it reduces cost more than the extra parallelism buys, so
         // the kernel is latency-bound on its per-lane SLM insertion chain, not on
         // bandwidth.  1.39 ms for 5.96 MB is still ~4 GB/s.
-        dfl.df_slices_ = 8;
+        dfl.df_slices_ = si::dev::for_queue(dq_s).attn.dflash_slices;
     }
     dfl.df_pcap_ = M * dfl.df_slices_ * hp.sel_top_k;
     dfl.d_df_pids = alloc_elems<int32_t>((size_t)dfl.df_pcap_);

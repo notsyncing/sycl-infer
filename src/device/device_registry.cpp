@@ -144,7 +144,7 @@ const dev_record & fill(sycl::device d) {
             rec.prof = &unknown_profile();
         }
         if (rec.prof) {
-            report(*rec.prof, "forced by PF_DEVICE_PROFILE / build (per queue)");
+            report(*rec.prof, "forced by PF_DEVICE_PROFILE / build (per queue)", d.is_gpu());
         }
     }
     if (!rec.prof) {
@@ -154,7 +154,9 @@ const dev_record & fill(sycl::device d) {
         } catch (...) {
         }
         rec.prof = &for_name(name);
-        report(*rec.prof, ("resolved from this queue's device: " + name).c_str());
+        // Only a real GPU gets the unknown-card warning; a CPU queue has no
+        // card to profile and must stay quiet in a --device cpu run.
+        report(*rec.prof, ("resolved from this queue's device: " + name).c_str(), d.is_gpu());
     }
     try {
         rec.max_wg = (int)d.get_info<sycl::info::device::max_work_group_size>();
@@ -319,7 +321,7 @@ bool profile_flag(const sycl::queue & q, const char * env_name, bool profile_def
     return v >= 0 ? (v != 0) : profile_default;
 }
 
-void report(const profile & p, const char * how) {
+void report(const profile & p, const char * how, bool warn_unknown) {
     if (si::env::flag("PF_DEVICE_INFO")) {
         fprintf(stderr,
                 "[dev] profile=%s  (%s)\n"
@@ -333,7 +335,7 @@ void report(const profile & p, const char * how) {
                 "      moe: cfg gate=%d down=%d dec=%d flat=%d/%d dp4a=%d/%d "
                 "ring=%d pf_wmin=%d\n"
                 "      attn: gather_red=%d (max %d) vec=%d xmx=%d xmx_min_keys=%d "
-                "split_keys=%d dec_group=%d\n"
+                "split_keys=%d dec_group=%d vit_tile=%d gather_q=%d dflash_slices=%d\n"
                 "      weights: w4=%d k5=%d cb4=%d dp4a=%d gemm_dnnl=%d dpas=%d\n",
                 p.key, how, p.provenance, p.hw.compute_units, p.hw.max_work_group_size,
                 p.hw.local_mem_size, p.hw.has_dpas, p.occ.warps_per_eu_x2 / 2.0, p.occ.warps_per_eu_x2,
@@ -345,10 +347,11 @@ void report(const profile & p, const char * how) {
                 p.moe.dp4a, p.moe.dp4a_dec, p.moe.upload_ring, p.moe.pf_wmin,
                 p.attn.xmx_gather_red,
                 p.attn.xmx_gather_red_max, p.attn.vec, p.attn.xmx, p.attn.xmx_min_keys,
-                p.attn.split_keys, p.attn.dec_group, p.wt.w4, p.wt.k5, p.wt.cb4, p.wt.dp4a,
-                p.wt.gemm_dnnl, p.wt.dpas_in_gemm);
+                p.attn.split_keys, p.attn.dec_group, p.attn.vit_tile, p.attn.xmx_gather_q,
+                p.attn.dflash_slices, p.wt.w4, p.wt.k5, p.wt.cb4, p.wt.dp4a, p.wt.gemm_dnnl,
+                p.wt.dpas_in_gemm);
     }
-    if (std::strcmp(p.key, "unknown") == 0) {
+    if (warn_unknown && std::strcmp(p.key, "unknown") == 0) {
         fprintf(stderr,
                 "[dev] WARNING: no device profile matches this GPU; tuned values are guesses "
                 "copied from arc_a770.  Add a file under src/device/profiles/ and a row in "
@@ -397,6 +400,14 @@ const profile & active() {
             }
         } catch (...) {
             // no GPU visible (build-time tooling, a CPU-only run) -> unknown
+        }
+        if (name.empty()) {
+            // A CPU-only run has no GPU to profile.  Report the fallback only
+            // under PF_DEVICE_INFO; the unknown-card warning is for a card we
+            // failed to recognise, not for "there is no card".
+            const profile & p = unknown_profile();
+            report(p, "no GPU visible (CPU-only run)", false);
+            return &p;
         }
         const profile & p = for_name(name);
         report(p, "resolved from device name");

@@ -36,13 +36,15 @@ static int g_fail = 0;
 static bool same_policy(const model_profile & a, const model_profile & b) {
     return a.policy.max_decode_rows == b.policy.max_decode_rows && a.policy.prefill == b.policy.prefill
            && a.policy.prefix_cache == b.policy.prefix_cache && a.policy.auto_layer_map == b.policy.auto_layer_map
+           && a.policy.auto_layer_map_one_gpu == b.policy.auto_layer_map_one_gpu
            && a.policy.md_splits == b.policy.md_splits
-           && a.policy.engram_ram_mb_default == b.policy.engram_ram_mb_default;
+           && a.policy.engram_ram_mb_default == b.policy.engram_ram_mb_default
+           && a.policy.keep_file_cache == b.policy.keep_file_cache;
 }
 
 static bool same_rep(const model_profile & a, const model_profile & b) {
     return a.rep.sin_w8 == b.rep.sin_w8 && a.rep.dnnl_int8 == b.rep.dnnl_int8
-           && a.rep.raw_gemv_decode == b.rep.raw_gemv_decode
+           && a.rep.raw_gemv_decode == b.rep.raw_gemv_decode && a.rep.f32_gemm == b.rep.f32_gemm
            && a.rep.split_per_tensor_upload == b.rep.split_per_tensor_upload;
 }
 
@@ -105,6 +107,7 @@ int main() {
     CHECK(q4.policy.auto_layer_map, "auto layer map is on (split GGUF needs per-tensor upload)");
     CHECK(q4.policy.md_splits, "md_splits keeps the attention K-split");
     CHECK(q4.policy.engram_ram_mb_default == 4096u, "engram default is 4096 MiB");
+    CHECK(q4.policy.keep_file_cache, "shard page cache is kept across page_out_host");
     CHECK(q4.residual.hyper && q4.residual.streams == 4 && q4.residual.low_rank == 320,
           "hyper-connections are 4 streams / low_rank 320");
     CHECK(q4.extras.ple, "PLE is declared");
@@ -128,6 +131,8 @@ int main() {
     CHECK(g35.policy.max_decode_rows == 0 && gmoe.policy.max_decode_rows == 0,
           "generic decode row cap defers to the engine ceiling");
     CHECK(g35.policy.prefix_cache && gmoe.policy.prefix_cache, "generic prefix cache is on");
+    CHECK(!g35.policy.keep_file_cache && !gmoe.policy.keep_file_cache,
+          "generic models evict the GGUF page cache (no second read)");
     CHECK(g35.policy.prefill == model_profile::prefill_kind::chunk32
               && gmoe.policy.prefill == model_profile::prefill_kind::chunk32,
           "generic prefill is chunked");
@@ -169,6 +174,51 @@ int main() {
     {
         const arch::loader * a = arch::find("qwen35moe");
         CHECK(a != nullptr && a->prof == &kQwen35MoeProfile, "qwen35moe row points at kQwen35MoeProfile");
+    }
+
+    printf("profile geometry validation\n");
+    {
+        hparams hp{};
+        hp.hc_mult = 4;
+        hp.hc_low_rank = 320;
+        hp.idx_top_k = 2048;
+        hp.idx_kpool = 4;
+        hp.idx_n_head = 4;
+        hp.idx_head_dim = 128;
+        bool ok = true;
+        try {
+            validate_model_profile(hp, kQwen4ExpProfile, /*split_file=*/true);
+        } catch (const std::exception & e) {
+            ok = false;
+            fprintf(stderr, "FAIL matching qwen4exp geometry rejected: %s\n", e.what());
+        }
+        CHECK(ok, "matching qwen4exp geometry is accepted");
+
+        hp.hc_mult = 3;
+        bool threw = false;
+        try {
+            validate_model_profile(hp, kQwen4ExpProfile, false);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        CHECK(threw, "a hyper-connection stream mismatch is rejected");
+
+        hparams generic{};
+        bool generic_ok = true;
+        try {
+            validate_model_profile(generic, kQwen35Profile, false);
+        } catch (...) {
+            generic_ok = false;
+        }
+        CHECK(generic_ok, "the generic plan has no geometry constraints");
+
+        bool split_threw = false;
+        try {
+            validate_model_profile(generic, kQwen35Profile, /*split_file=*/true);
+        } catch (const std::exception &) {
+            split_threw = true;
+        }
+        CHECK(split_threw, "a split file without split_per_tensor_upload is rejected");
     }
 
     // Be honest about what a profile is: a static declaration.  A model object

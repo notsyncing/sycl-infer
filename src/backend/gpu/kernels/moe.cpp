@@ -987,13 +987,10 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
         // token.  Print both with the card's compute-unit count so the wave
         // occupancy is arithmetically visible in the same line as the device
         // times.
-        static const int cu = [&q] {
-            try {
-                return (int)q.get_device().get_info<sycl::info::device::max_compute_units>();
-            } catch (...) {
-                return 0;
-            }
-        }();
+        // Cached per device by si::dev::for_queue; a get_info() in a launcher
+        // is a driver round trip (the rmsnorm 3.2 ms/launch regression), and a
+        // function-local static would pin this to the first card.
+        const int cu = si::dev::for_queue(q).hw.compute_units;
         const size_t lgroups = (size_t)n_tok * (size_t)n_expert;
         fprintf(stderr,
                 "[moert] n=%d ne=%d wg=%d cu=%d lgroups=%zu lwarps=%zu fgroups=%d fwg=%d fwarps=%d "

@@ -47,8 +47,8 @@ shard's own file range before `posix_fadvise`.
 `seg_plan` (one GEMV list per layer plus fixed epilogues), but the forward
 reuses the existing GDN, attention, GEMV and paged-KV machinery.  The plan
 builders, recorded decode graphs and the prefix cache are deliberately skipped;
-`q4exp` forces `pc_enabled = false` while the policy still reads `m.q4exp`
-(the model profile below is M0+M1; M2 delegates the walk to a runtime object).
+the profile's `policy.prefix_cache == false` forces `pc_enabled = false`
+(M0+M1; M2 delegates the walk to a runtime object).
 MTP is declared unsupported and gated with a printed reason; DFlash has no q4
 draft/verify path in this build; multimodal is routed through the model's own
 chunker (§3.1).  The server's
@@ -118,9 +118,9 @@ reason and disables MTP before the `has_mtp` check, and the scheduler reads
 qwen35/qwen35moe profiles are `generic_plan`, engine-cache, chunk32 prefill,
 prefix cache on, so their behaviour is unchanged.  `PF_MODEL_INFO=1` prints the
 profile, policy, weights, capabilities and provenance; `test_model_profile`
-pins the values.  The forward dispatch still reads `m.q4exp` (asserted equal to
-`fwd == hc_ple_qsa`), which is the M0+M1 line: the policy is declarative, the
-walk is not yet a runtime object.
+pins the values.  The forward dispatch reads `engine::hc_fwd()`
+(`mp_->fwd == hc_ple_qsa`, with `m.q4exp` asserted equal at load), which is the
+M0+M1 line: the policy is declarative, the walk is not yet a runtime object.
 
 The profile is not a tuning store: per-card constants remain in the device
 profile, and per-file/run values (expert plane strides, bank budget, KV type,
@@ -941,7 +941,7 @@ pins the 4-byte-per-lane `qs` load shape; §9.1 has the numbers.
 **Opt-in exception: the LM head has a native-u4 read (`PF_Q4_HEAD_W4`, default
 0), and it is lossy.**  `setup_md_dnnl` already registers the `PF_HEAD_U4`
 store for the head (default on), keyed by the host pointer; qwen4exp is the one
-path that also keeps the raw head upload (`!m.q4exp` skips both the page-out and
+path that also keeps the raw head upload (`rep.raw_gemv_decode` skips both the page-out and
 the upload's converted-tensor skip), so the q4 head keys the store on
 `m.output.data`, not `wkey()`.  With the flag on, the mode-0 head quantizes the
 activation in the split form (`do_split=true`, as `run_head` does) and runs

@@ -343,7 +343,8 @@ Qwen3.8-Flash-Next（`qwen4exp`，104 GiB，512 专家/top-10）走的是**另�
 和上面的 `moe_cache` 三级缓存不共用：
 
 * **所有 routed 专家始终在主机 mmap 里**（71.7 GiB），没有"哪部分留在设备"的通用切分。
-  `engine.cpp` 对 `m.q4exp` 直接设 `moe_host_only_ = true` 与 `moe_cfg_.host_only = true`，
+  `engine.cpp` 对 model profile 的 `moe != engine_cache` 直接设 `moe_host_only_ = true` 与
+  `moe_cfg_.host_only = true`，
   `moe_cache` 因此算出 `total = 0`、启动打印 `bank 0/512 resident per layer`；它的设备路径在
   `record_forward` 的 `seg_plan` 分支，而 q4exp 在 `q4_forward` 里自己走层。**两条路径不会相遇。**
 * q4 的 GPU bank 是 `engine_q4exp.cpp` 自己分配的**每专家 LRU**：`--moe-vram-mb 16000` 给出

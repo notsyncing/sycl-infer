@@ -319,6 +319,16 @@ static void test_media_bytes() {
     }
 }
 
+static void test_model_id() {
+    printf("model id\n");
+    check(si::model_id_accepted("", "Qwen3.5-0.8B", "sycl-infer"), "absent model is accepted");
+    check(si::model_id_accepted("Qwen3.5-0.8B", "Qwen3.5-0.8B", "sycl-infer"), "GGUF id is accepted");
+    check(si::model_id_accepted("sycl-infer", "Qwen3.5-0.8B", "sycl-infer"), "configured fallback is accepted");
+    check(!si::model_id_accepted("mineru", "Qwen3.5-0.8B", "sycl-infer"),
+          "a pipeline id is not a model alias");
+    check(!si::model_id_accepted("gpt-3.5-turbo", "Qwen3.5-0.8B", "sycl-infer"), "an unknown model is rejected");
+}
+
 int main() {
     test_params();
     test_counts();
@@ -327,6 +337,7 @@ int main() {
     test_messages();
     test_prompt_rejection();
     test_media_bytes();
+    test_model_id();
 
     if (g_fail) {
         printf("\n%d check(s) FAILED\n", g_fail);

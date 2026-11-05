@@ -19,6 +19,29 @@ that way: nothing under it is ever committed, so **no document here may link to
 it** — not this file, not `README.md`, not `docs/`.  A `reports/` reference in a
 committed doc is a dead link for everyone who clones the tree.
 
+## Contents
+
+| | |
+|---|---|
+| [What this is](#what-this-is) | the engine in one paragraph |
+| [Documentation](#documentation) | the design-doc index |
+| [Build](#build) / [Run](#run) | toolchain, AOT, CLI |
+| [Testing](#testing) | hermetic layer, GPU layer, the five mandatory tests |
+| [Repository layout](#repository-layout) | where each module lives |
+| [How to extend](#how-to-extend) | a model, a kernel, a stage test, multimodal |
+| [The ONNX model service](#the-onnx-model-service-the-document-pipeline) | the document pipeline |
+| [Device profiles](#device-profiles-where-a-gpu-specific-number-belongs) | per-card tuning |
+| [Model profiles](#model-profiles-where-an-architectures-policy-belongs) | per-architecture policy |
+| [Conventions](#conventions) | style and repo rules |
+| [Environment variables](#environment-variables) | every `PF_*` knob |
+| [Measured results and dead ends](#measured-results-and-dead-ends) | what not to retry |
+| [Invariants and gotchas](#invariants-and-gotchas) | rules that fail silently |
+| [Quick verification](#quick-verification-before-finishing-a-change) | the pre-commit run |
+
+Throughput numbers live in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md); the
+subsystem rationale lives in [`docs/design/`](docs/design/).  This file keeps
+the *conclusions* and the invariants, not a second copy of every table.
+
 ## What this is
 
 A general-purpose from-scratch C++17 + SYCL LLM inference engine for quantized
@@ -87,13 +110,18 @@ measurements and gotchas.
 * [`docs/design/17-onnx-service.md`](docs/design/17-onnx-service.md) — the ONNX
   model service for the document pipeline: the protobuf reader, the graph
   transforms, the operator library and executor, and the wire protocol.
+* [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md) — Qwen3.8-Flash-Next:
+  split GGUF loading, hyper-connections, PLE and its engram cache, QSA, and the
+  per-expert LRU with the two-pass prefill.
 * [`docs/design/21-mineru-qwen2vl.md`](docs/design/21-mineru-qwen2vl.md) — MinerU2.5 /
   Qwen2-VL (`qwen2vl`): the dense Qwen2 decoder with head_dim 64, the
   no-gate q layout, Q5_0, the 14-patch vision tower selected by the model
   profile, and the MinerU two-step prompts/JSON.
-* [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.md) — Qwen3.8-Flash-Next:
-  split GGUF loading, hyper-connections, PLE and its engram cache, QSA, and the
-  per-expert LRU with the two-pass prefill.
+* [`docs/design/22-pipelines.md`](docs/design/22-pipelines.md) — the request-level
+  pipeline mechanism: the admission rule, the `pipeline` interface and registry,
+  the worker's `/v1/pipelines/{id}/run`, the router's dedicated proxy, and the
+  boundary with `/v1/models` / `/v1/chat/completions`.  MinerU is deliberately
+  *not* a pipeline; it is a client/reference tool under `tools/mineru/`.
 * [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **the measured throughput
   table**: prefill and decode by context depth and batch size, per model and
   per speculative path, each with the hardware, the build, the harness and the
@@ -184,7 +212,7 @@ Binary/test startup needs the oneAPI runtime libraries.  `source
 runs is:
 
 ```bash
-export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2026.1/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.2/lib:/opt/intel/oneapi/compiler/2026.2/lib:$LD_LIBRARY_PATH
 ```
 
 ```bash
@@ -293,8 +321,21 @@ from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
                            # qwen4exp policy, qwen35/qwen35moe agree (CPU only)
 ./build/test_mm_step       # per-token M-RoPE / img_row slicing, a chunk boundary
                            # inside an image block, bad slices (CPU only)
-./build/test_dev_profile   # device-profile selection, the moe.*/shape.* values,
-                           # and the unknown-card fallback (CPU only)
+./build/test_dev_profile   # device-profile selection, the moe.*/shape.*/attn.*
+                           # values, and the unknown-card fallback (CPU only)
+./build/test_hparams       # validate_hparams accepts/rejects geometry (CPU only)
+./build/test_f16conv       # f16 subnormal contract, including the range property
+./build/test_yarn          # YaRN anchors bit-exact + monotonicity + degenerate input
+./build/test_kv_type       # --kv-type names, K:V mixing, row bytes, i4 nibbles,
+                           # scoped override and nested restore (no device)
+./build/test_quant_synth   # synthetic Q8_0/Q5_0/Q5_1/F16/BF16 blocks and the
+                           # SIn size/rejection guards (no GGUF, no GPU)
+./build/test_chat_builtin  # the no-template ChatML fallback: roles, thinking,
+                           # tools, tool_calls, media placeholders (no GGUF)
+./build/test_request_parse / test_response_json / test_control
+                           # OpenAI request/usage JSON and the worker control plane
+./build/test_url_fetch_*   # remote-media SSRF classification (three processes)
+./build/test_router_*      # router config/proxy/supervisor/control (no SYCL, no model)
 ./build/test_sched         # scheduler streaming path: greedy, logprobs, max_tokens,
                            # ignore_eos=>"length", cancel, empty prompt,
                            # concurrent sequences, and a twenty-row batched
@@ -338,6 +379,12 @@ from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
 ./build/test_q4_verify     # qwen4exp MTP verify-cost gate: warm n=3/n=5
                               # (q4 model; AOT build, argv[1])
 ```
+
+The hermetic layer is `ctest --test-dir build -L hermetic --output-on-failure`
+(no GPU, no model); `-L gpu` requires `-DSI_REGISTER_GPU_TESTS=ON` and a model
+path, and `test_moe_kernels` / `test_moe_tiled` / `test_enc_own` /
+`test_dflash_kernels` are now registered there (GPU, no model) instead of only
+being built.
 
 **Five of these are mandatory after touching a kernel or the engine**:
 `test_gpu_stages`, `test_gpu_vs_ref`, `test_forward`, `test_decode_vs_prefill`
@@ -446,8 +493,7 @@ src/server/onnx/ service.{h,cpp} (the HTTP service), main.cpp
 src/common/     ... plus onnx_wire.{h,cpp} (the binary protocol, shared with
                 the router), onnx_activation.h and onnx_types.h (host-only
                 ONNX semantics shared by the graph and the executor)
-src/mineru.{h,cpp} MinerU two-step document extraction (layout + per-block prompts/JSON)
-src/main.cpp    CLI
+src/main.cpp    CLI (serve/gen only; MinerU lives in tools/mineru/)
 include/sycl_infer/sycl_infer.h  the C ABI header (opaque model/request handles)
 include/sycl_infer/onnx.h       the in-process ONNX ABI (no HTTP/subprocess)
 src/capi/       the C ABI implementation + the thread-local kv_scope and the
@@ -464,10 +510,9 @@ tests/backend/gpu/  test_forward.cpp, test_gpu_vs_ref.cpp,
                 test_pc_gpu.cpp (disk spill + promote round-trip),
                 test_pc_ram_gpu.cpp (VRAM->RAM->VRAM round-trip)
 tests/backend/cpu/  test_cpuref.cpp, test_pc_cpu.cpp (paged attention + disk
-                tier on the host backend; **known failure**, registered as
-                `test_pc_cpu_known_fail` with a CTest `WILL_FAIL` waiver - a
-                CPU-partition prefix-cache warm resume gives argmax
-                248046/198, max|diff| 3.2-3.8; do not call it passing),
+                tier on the host backend; was a known failure under a
+                `WILL_FAIL` waiver, fixed when `cpu_backend::synchronize()`
+                stopped being an empty override - now an ordinary test),
                 test_pc_disk.cpp / test_pc_ram.cpp
                 (tier stores), test_dev_profile.cpp (profile selection and the
                 moe.*/shape.* field values, no GPU)
@@ -497,6 +542,21 @@ tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
                 prompts, audio kernels, positions), test_mm_step.cpp (the
                 per-token M-RoPE / image-row slice the generic and model-owned
                 prefill chunkers share)
+src/pipeline/   request-level multi-step orchestration (see
+                docs/design/22-pipelines.md).  `pipeline.h` / `registry.{h,cpp}`
+                define the interface, id registry and availability filter.  The
+                registry is empty by default: there is no built-in pipeline.
+                The dependency direction is server -> pipeline -> engine/mm;
+                the model layer never depends on a pipeline.  A pipeline is
+                admitted only when it needs in-process engine state, has a
+                measured server-side win, or shares the server's resource/
+                cancel account.  `src/server/pipeline_http.{h,cpp}` owns
+                `GET /v1/pipelines` and `POST /v1/pipelines/{id}/run`.
+tools/mineru/   MinerU reference client (separate binary `sycl-infer-mineru`,
+                not part of `sycl-infer`): `mineru.{h,cpp}` is the two-step
+                orchestration, `layout.{h,cpp}` the pure prompt/grammar, and
+                `main.cpp` the standalone CLI.  It is a test/reference tool,
+                not a server pipeline.
 src/router/     the multi-model front end (a SEPARATE binary, `sycl-infer-router`:
                 config.cpp (JSON with comments), registry.cpp (the model table and
                 its state machine), rpc_client.cpp (the control-plane client),
@@ -555,6 +615,39 @@ third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
 See [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
 [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) for the full
 loading design.
+
+### Add a pipeline
+
+A pipeline is a request-level, multi-step orchestration that genuinely needs the
+engine in-process.  It is **not** a model: `src/model/` stays free of
+`engine`/`mm` dependencies, and a pipeline is not listed by `/v1/models`.
+**Admission rule** (docs/design/22-pipelines.md §2): only add one when it needs
+KV/prefix-cache/verify state that cannot cross the OpenAI boundary, has a
+measured server-side performance win, or must share the server's concurrency/
+cancel/resource account.  A client-side "call the model several times and parse
+the output" workflow (MinerU is the example) belongs in `tools/` or the caller,
+not here.
+
+1. Create `src/pipeline/<name>/` and implement the `pipeline` interface
+   (`src/pipeline/pipeline.h`): a `pipeline_desc` (required vision kind, accepted
+   inputs, output formats), `available(const model_profile&)` and
+   `run(request, sink)`.
+2. Keep the pure parts (prompts, grammars, formatters) in a TU that does not
+   include `engine`/SYCL, so it can be tested hermetically.
+3. Register it at `serve()` startup in the `pipeline_registry`; reuse the
+   server's already-loaded `vision_model`/`audio_model` rather than loading a
+   second tower.
+4. Expose it only through `GET /v1/pipelines` and `POST /v1/pipelines/{id}/run`.
+   `/v1/models`, `/v1/chat/completions` and `/v1/completions` keep their standard
+   semantics; do not add a model alias and do not add pipeline-specific fields
+   to the OpenAI chat body.
+5. For router exposure add the id to that model's `pipelines` config list; the
+   router gets a dedicated `/v1/pipelines/{id}/run` proxy, not an alias.
+6. Add hermetic tests for the pure logic, registry and server routing; the
+   end-to-end test belongs in the GPU/model layer.
+
+See [`docs/design/22-pipelines.md`](docs/design/22-pipelines.md) for the full
+interface, request/response shapes and migration plan.
 
 ### Add a kernel
 
@@ -697,9 +790,14 @@ window, one process per rep).**  Warm page cache:
 | page text decode (676 tokens) | **4.60 s** (6.81 ms/token) |
 | **page wall** | **10.99 / 11.23 s**; cold file cache **11.89 / 12.28 s** |
 
-Output is byte-identical throughout: page md5 `10eed240936226fd4696d943aaabc44b`
-(21 blocks), text-only `gen` md5 `bfc55c543af1d1aecae5da0b1f9b99e5`, vision
-self-check cos 0.999104.
+Output is byte-identical throughout: page md5 `c79d2d222d6d90763f0d25c5ffb5269a`
+(21 blocks; `--max-tokens 1024`, see the sampler note below), text-only `gen` md5
+`bfc55c543af1d1aecae5da0b1f9b99e5`, vision self-check cos 0.999104.
+The old page md5 `10eed240...` predates the sampler presence/frequency
+penalty-sign fix (2026-11): MinerU uses `presence=1`, `frequency=0.005/0.05`,
+and the corrected OpenAI semantics subtract them, so the reference output
+changed.  `--max-tokens 256` truncates the layout decode on this page (11
+blocks); use 1024 or higher.
 
 **The ceiling is the bit-exact one.**  The per-phase floor with the current
 exact-order math is ~5.0 s one-shot / ~3.7 s with the process reused; the
@@ -1161,39 +1259,36 @@ the engine differs between those cells; only how many of the 4 drafted tokens th
 NextN head gets right.  So **acceptance is the entire story**, and it is a property
 of the prompt, not of the engine.
 
-**The verify's USM copies are where the speculative paths die, and they die in
-the driver, not in the engine.**  Two failures, both measured 2026-10-20 on the
-2x A770 box and both silent until the first speculative cycle:
+**The verify's USM-copy crashes were one engine bug, not three driver bugs, and
+they are fixed.**  The 2026-10-20/2026-11-05 reports (DFlash2 SIGSEGV, 35B MTP
+OOM/SIGSEGV, 27B MTP SIGSEGV) all reached `urEnqueueUSMMemcpy` from
+`engine::mtp_verify`.  The cause was a **recurrent-state stride bug**:
+`mtp_verify`, `mtp_rollback` and `PF_MTP_DECCHK` addressed the GDN/conv state
+with `gl * kMaxB * per`, but the buffers are allocated with `state_slots_`
+slots (`--max-slots`, default 16).  `kMaxB` is the compile-time *ceiling* (32),
+so after the ceiling was raised from 16 every GDN layer after the first read or
+wrote past the allocation; the USM copy's source/destination was outside the
+buffer, and the Level Zero driver faulted at enqueue.  The five sites in
+`engine_mtp.cpp` now use `state_slots_` (the same invariant every other
+`[layer][slot]` stride follows).
 
-* **The DFlash2 drafter segfaults, and its only working configuration is the
-  broken one.**  The drafter requires the draft on device 0 ("[dflash] needs a
-  multi-device oneDNN GPU partition with draft on device 0 - disabled"), and
-  with the draft on device 0 it dies with SIGSEGV *inside the Level Zero
-  driver*, in `urEnqueueUSMMemcpy` reached from `engine::mtp_verify` (the
-  DFlash2's verify reuses the MTP's verify machinery).  It reproduces with a
-  32-token generation and a 45-token prompt, and it is not a VRAM shortage:
-  `PF_MAX_SLOTS` 1 / 4 / 8 / 16 all crash, and card 0 holds 9 072 MiB of
-  weights plus the 1 050 MiB draft.  **So the DFlash2 path does not run at all
-  in this build** — and the numbers in the table below are the 2026-10-09 pass,
-  the last one where it did.  (Beware the measurement trap: with
-  `--spec-draft-device 1` the drafter is *disabled* and the run is a plain
-  decode, so it still exits 0 and still produces text — at the plain decode's
-  rate, which is how a "the drafter works if you put it on the other device"
-  reading gets formed.)
-* **The 35B A3B's MTP does not run at all.**  Its GGUF bundles the NextN head,
-  the engine's gate passes and the verify's command graphs are recorded
-  ("[mtp] verify command graphs: 3 phase(s), 5 rows"), and the plain decode is
-  fine (38.7 ms/token) - but the first speculative cycle fails: with the
-  default 16 slots (and with 4) the driver reports
-  `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`, and with `PF_MAX_SLOTS=1` it
-  segfaults in the same place as the DFlash2 crash.  The MTP layer's own KV
-  slice, the draft's ring and the verify's partials all come out of a card the
-  routed experts have already filled.
+Measured after the fix (2x A770, 2026-11-05):
 
-A USM copy that dies in the driver is a *pointer* or an *ordering* bug, not a
-performance one, and the engine's own gates do not catch either: the plan
-builds, the graphs are recorded and the plain decode is fine.  **So the MTP
-path is a 27B feature in this build, and the DFlash2 path needs a fix.**
+* **27B MTP**: `test_spec` (MTP config) passes - 32-token streams equal the
+  plain greedy decode on both prompts, the n=1 commit edge is equal, and two
+  runs of one process are identical.
+* **DFlash2**: `test_spec` (DFlash config) passes the same stream-equality and
+  determinism checks.
+* **35B A3B MTP**: an 8-token greedy `--mtp 4 --max-slots 4` run emits
+  `The capital of France is **Paris**.`; the old `PF_MAX_SLOTS=1` crash and the
+  default-16-slots OOM are gone.  The MTP layer still needs its KV slice and the
+  verify partials, so a long context can still be memory-bound.
+* The 2026-10-09 DFlash2/MTP throughput tables are still the last *measured*
+  numbers; the paths now run, but those cells were not re-measured.
+
+The old workaround note still stands as a trap: with `--spec-draft-device 1` the
+drafter is disabled and the run is a plain decode, so it exits 0 and produces
+text at the plain decode's rate.  It is not a working speculative path.
 
 `PF_MTP_ADAPT` (default on) shrinks the draft length by one on a cycle that accepts
 nothing and grows it back on a full-acceptance cycle, never changing the emitted
@@ -1303,8 +1398,9 @@ The critical batch size follows: with the u4 store's 0.625 B/weight and the rate
 real 497-call list: `53.93 ms` of streaming `+ (M-1) x 3.67 ms` of dp4a),
 `M* ~= 0.625 x 7.6e12 / 405e9 ~= 12`.  Below `M*` extra rows are nearly free; above
 it each costs real time.  The equivalent DPAS crossover is ~122, so an XMX/DPAS unit
-only wins for **M in [12, 122]** — and `kMaxB = 16` caps every batched forward at
-M = 16, the first shape inside that window.  **Take `M*` from `bench_wpass`, not from
+only wins for **M in [12, 122]** — and `kMaxB = 32` caps every batched forward at
+M = 32, still inside that window (the ceiling used to be 16; see the capacity
+note above).  **Take `M*` from `bench_wpass`, not from
 `bench_dp4a_peak`**: the latter understates the real kernel by 1.4-2x, and an `M*`
 derived from it is too small.  (The older 6.4 figure came from the 4.9 T-MAC/s
 number and is wrong.)
@@ -1870,10 +1966,18 @@ forwarding uninitialised rows.  At startup one `[mm]` line reports a tokenizer
 with none of the three pad tokens, so the failure is named before the first
 request.  `test_mm_step` (hermetic) pins the slice
 mapping, a chunk boundary inside an image block, and the out-of-range /
-too-small-stride errors.  The model profile's `spec.multimodal` is the
-declarative report field; the *routing* capability is the loader's
+too-small-stride errors.  The model profile's `spec.multimodal` is both
+reported and enforced (`engine::generate_impl` throws for a media prompt on a
+model that declares false); the *routing* capability is the loader's
 `mm_model_prefill`, so a model can only take the model-owned path when its
-loader says it has one.
+loader says it has one.  **The qwen4exp profile currently declares
+`vision = none` and `spec.multimodal = false`**, and `vision_model::load`
+refuses a `none` tower, so a media request against the shipped profile stops
+with "the model profile declares no vision tower" before this chunker runs.
+The chunker, the per-chunk M-RoPE slicing and `mm_decode_rope_` are the
+plumbing for the day a vision kind (and its `clip.projector_type`
+cross-check) is declared; do not describe the path as working until that
+profile field exists and the tower is verified.
 
 **The card-specific q4 numbers are in the device profile (M0).**  The expert
 GEMM's tile case and grid gates (`moe.cfg_gate`/`cfg_down`/`cfg_dec`),
@@ -2794,7 +2898,9 @@ n_embd 896, n_ff 4864, 14 query / 2 KV heads, head_dim 64, RoPE sections
 [8,12,12,0], every layer full attention, tied output).  Files:
 `src/model/qwen2vl.cpp`, `src/model/profiles/qwen2vl.cpp`,
 `src/mm/vision.{h,cpp}` (the one vision module, here in its qwen2vl mode), and
-`src/mineru.{h,cpp}` (the MinerU two-step prompts/JSON).  `vision_model` serves
+`tools/mineru/` (`mineru.{h,cpp}` for the two-step orchestration, `layout.{h,cpp}`
+for the pure prompts/JSON grammar, and `main.cpp` for the standalone
+`sycl-infer-mineru` binary).  `vision_model` serves
 both towers: Qwen2-VL's `model_profile::vision = qwen2vl` selects patch 14 +
 temporal 2, separate `attn_q/k/v` weights and biases (combined into one
 `[3E][E]` f32 view on demand; `PF_VISION_DEFER_QKV=0` restores the eager load),
@@ -3439,9 +3545,14 @@ name.
   tile case and grid gates (`moe.cfg_gate`/`cfg_down`/`cfg_dec`, `moe.flat`/
   `flat_dec`, `moe.dp4a`/`dp4a_dec`), the qwen4exp expert-upload ring and
   two-pass workspace (`moe.upload_ring`, `moe.pf_wmin`), the narrow-GEMV row
-  gates (`shape.w4_rows_per_wg`, `shape.q8_rows`, `shape.f32_rows`), and the
-  *default* for any on/off feature whose value was chosen by measurement
-  (`wt.w4`, `wt.k5`, `wt.cb4`, `attn.xmx`, `attn.dec_group`, ...).
+  gates (`shape.w4_rows_per_wg`, `shape.q8_rows`, `shape.f32_rows`), the
+  vision-tower attention tile (`attn.vit_tile`, 70 on a 1024-thread card and 0
+  on a 512-thread one), the xmx gather width (`attn.xmx_gather_q`) and the
+  DFlash top-k slice count (`attn.dflash_slices`), and the *default* for any
+  on/off feature whose value was chosen by measurement (`wt.w4`, `wt.k5`,
+  `wt.cb4`, `wt.dp4a`, `attn.xmx`, `attn.dec_group`, ...).  A launcher reads
+  the per-queue profile (`si::dev::for_queue(q)`), never `active()`, so a
+  heterogeneous layer map tunes each card separately.
 * **What deliberately does not belong**: a number that is a property of the
   model file, the run, or the host rather than the card.  `PF_Q4_TAIL_SKIP`
   (a quality/algorithm trade, one value for every card), `--moe-vram-mb` (a run
@@ -3608,7 +3719,8 @@ The use site asks for it by name.
   shared `seg_plan`/`record_forward`, `hc_ple_qsa` for qwen4exp's own walk), the
   HC/PLE/QSA geometry, the policy the architecture wants unasked
   (`policy.max_decode_rows`, `policy.prefill`, `policy.prefix_cache`,
-  `policy.auto_layer_map`, `policy.md_splits`, `policy.engram_ram_mb_default`),
+  `policy.auto_layer_map`, `policy.md_splits`, `policy.engram_ram_mb_default`,
+  `policy.keep_file_cache`),
   which weight representations the file can use (`rep.sin_w8`, `rep.dnnl_int8`,
   `rep.raw_gemv_decode`, `rep.split_per_tensor_upload`), which mechanisms it is
   wired for (`spec.mtp`/`dflash`/`multimodal` plus one `why`), and which owner
@@ -3627,9 +3739,13 @@ The use site asks for it by name.
   `general.architecture`, and only then (c) calls the loader.  `arch::registry()`
   exposes the same table, so the report and the test cannot read a second list.
   While `hparams::q4exp` / `model::q4exp` still exist, `model::load` also
-  asserts they agree with `fwd_kind::hc_ple_qsa`; the forward dispatch still
-  reads `m.q4exp` until the walk is delegated to a runtime object, but every
-  *policy* branch reads the profile.
+  asserts they agree with `fwd_kind::hc_ple_qsa`.  The engine now dispatches
+  every forward/policy branch through `engine::hc_fwd()` (`mp_->fwd ==
+  hc_ple_qsa`), so `m.q4exp` is only the loader/consistency flag.  For a
+  model-owned forward, `model::load` also validates the profile's declared
+  geometry (HC streams/low rank, QSA top-k/pool/heads) against the GGUF's
+  `hparams` and refuses a file that contradicts it; a split GGUF must declare
+  `rep.split_per_tensor_upload`.
 * **Provenance.**  Each profile carries a `provenance` string, the same contract
   as a card file: quote the GGUF metadata a geometry came from and the measured
   document for a policy value.  `PF_MODEL_INFO=1` prints the resolved profile,
@@ -3642,8 +3758,9 @@ The use site asks for it by name.
   tests).  A false *capability* is a ceiling: `policy.prefix_cache == false`
   cannot be turned on by `PF_PREFIX_CACHE=1` (the checkpoint cannot represent
   the state); `spec.mtp == false` prints `[mtp] <key>: <why> - MTP disabled` and
-  stays off even if the file happens to bundle a NextN block; and
-  `policy.md_splits == true` keeps the multi-device K-split on, so
+  stays off even if the file happens to bundle a NextN block; `spec.dflash ==
+  false` prints `[dflash] <key>: <why> - DFlash disabled` before any drafter is
+  loaded; and `policy.md_splits == true` keeps the multi-device K-split on, so
   `PF_MD_SPLITS=0` does not turn it back off.
 * **There is no `PF_MODEL_PROFILE` pin**, deliberately: a card's name is
   reported by a driver and may be renamed, but a GGUF states its own
@@ -4342,18 +4459,10 @@ its dense layers are affected.  **This is the same M > 13 boundary the native
 GEMM's extension was measured against, and on a dense model it is not a
 rounding detail but a 28 % loss of aggregate throughput.**
 
-**The concurrency curve, on the fixed engine** (35B A3B, depth 512, 128 decode
-steps, one process per cell; the full table with the prefill column and the
-conditions is in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)):
-
-| N | decode (aggregate) | ms/step |
-|---:|---:|---:|
-| 1 | 26.38 tok/s | 37.91 |
-| 2 | 35.70 tok/s | 56.03 |
-| 4 | 60.91 tok/s | 65.67 |
-| 8 | 101.12 tok/s | 79.11 |
-| 16 | 122.05 tok/s | 131.09 |
-| 32 | 168.33 tok/s | 190.11 |
+**The concurrency curve is in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+§4.2** (35B A3B, depth 512, 128 decode steps, one process per cell, prefill and
+decode columns).  The shape: **pp saturates at 16** and **tg does not stop at
+32**.
 
 **pp saturates at 16** (+2.4% for twice the concurrency) and **tg does not stop
 at 32** (+41.5% over the same doubling, a marginal row of 3.86 ms against
@@ -4527,54 +4636,9 @@ cannot price the fix**, so the next step there is a counter, not a kernel.
 
 ### Long context: the capacity, and where the time goes at depth
 
-**The capacity table (2x A770, card 0; the 1248 MiB of imbalance is the int8 LM
-head, pinned to backend 0):**
-
-| item | MiB | source |
-|---|---:|---|
-| usable VRAM | 15 541 | `global_mem_size` |
-| weights (incl. the int8 head) | 9 072 | startup report |
-| activations + recurrent state | 1 484 | `alloc_act_set`; **1 125 of it is `gdn_state`** |
-| oneDNN + attn_xmx scratch | 318 | `dnnl_gemm.cpp`, `attn_xmx.cpp` |
-| **left for KV** | **4 667** | |
-
-So the KV at 256k/`i8` is 4.36 GiB/card against 4.46 GiB of headroom - it fits
-by 0.10 GiB, and **one extra allocation fails the whole load**
-(`dev_alloc_on` throws `device alloc failed`).  **`--max-slots` is the cheapest
-headroom there is**: `gdn_state` is `state_slots_ * n_gdn_local *
-(dt_rank*d_state*d_state)` f32 = 1.125 GiB per card at 16 slots, and a
-single-stream long-context run uses one slot.
-
-| card 0 | KV budget | i8:i8 | i4:i8 | i4:i4 |
-|---|---:|---:|---:|---:|
-| as shipped (16 slots) | 4.46 GiB | 275k | 360k | 519k |
-| `--max-slots 1` | 5.51 GiB | 339k | 443k | 640k |
-
-Measured A/B on the box, `--ctx 327680 --kv-type i8` (320k needs 5.45 GiB/card,
-i.e. above the 4.46 GiB budget and below the 5.51 GiB one):
-
-```
-$ sycl-infer --model ... --layer-map 0-31:gpu.0,32-63:gpu.1 --ctx 327680 --kv-type i8 gen ...
-error: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
-$ ... --ctx 327680 --kv-type i8 --max-slots 1 gen ...
-The capital of France is **Paris**.            exit=0
-```
-
-So `--max-slots 1` is not a projection: it converts a context that does not
-allocate into one that does.  **The table was re-verified on the `kMaxB = 32`
-ceiling** (the activation rows double with the ceiling): 262144 at `i8` with 16
-slots, at `i8` with 1 slot and at `i4:i4` with 16 slots all still allocate, and
-327680 at `i8` with 16 slots still fails - **the ceiling did not move the
-boundary.**
-
-**1M is not reachable on 2x16 GB at >=4-bit KV, and the weights are why.**  1M
-tokens need, per card (8 of the 16 attention layers), 16.6 GiB at `i8:i8`, 12.7 at
-`i4:i8`, **8.80 at `i4:i4`** - against 6.14 GiB of budget even after
-`--max-slots 1`.  It takes **four cards** (`--layer-map 0-15:gpu.0,16-31:gpu.1,
-32-47:gpu.2,48-63:gpu.3`): weights/card drop to ~5.7 GiB and the budget rises
-to ~8.9 GiB, so `i4:i4` fits with 0.09 GiB spare.  Decode does not get slower
-with more cards - the weight pass is the same total bytes and each card reads
-at full speed - but the KV budget per card is what buys the context.
+The capacity table, the `--max-slots` headroom arithmetic and the 1M/4-card
+conclusion are in *Long context: what actually fits on 2x A770* above; they are
+not repeated here, so there is only one copy to keep current.
 
 **The decode's cost is linear in depth and has no knee** (N=1, 128 decode steps
 at the depth, best of 2, depth 512 run first and last as the drift control):
@@ -5596,6 +5660,7 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
 
 ```bash
 cmake --build build -j$(nproc)          # must be warning-free (except the linker notes)
+ctest --test-dir build -L hermetic --output-on-failure   # profiles, kv_type, quant, chat, sampler, CLI
 ./build/test_gpu_stages                 # all stages OK
 ./build/test_gpu_vs_ref                 # argmax SAME
 ./build/test_forward                    # default prompt predicted_argmax=248068
@@ -5605,7 +5670,7 @@ cmake --build build -j$(nproc)          # must be warning-free (except the linke
                                         # result + a two-request batch (CPU, low memory)
 ./build/test_onnx_api <model.onnx> GPU  # in-process ONNX ABI: load + ports
 python3 -m sycl_infer.doctor            # wheel/runtime self-check (no model)
-clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include -checks='-*,misc-include-cleaner' <changed files>
+clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.2/include -checks='-*,misc-include-cleaner' <changed files>
 ```
 
 If the change touches `src/router/`, the router's own tests are the ones that

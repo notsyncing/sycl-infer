@@ -54,6 +54,7 @@ struct fake_worker {
     std::atomic<int> sse_chunks{0};
     std::string last_model;
     std::string last_onnx_model;
+    std::string last_pipeline;
     std::mutex mtx;
 
     // How many chunks the stream carries and how long it waits between them.
@@ -80,6 +81,47 @@ struct fake_worker {
             res.set_content(reinterpret_cast<const char *>(out.data()), out.size(),
                             "application/octet-stream");
         });
+        srv.Get("/v1/pipelines", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content(
+                "{\"object\":\"list\",\"data\":[{\"id\":\"fake-pipeline\",\"object\":\"pipeline\"}]}",
+                "application/json");
+        });
+        srv.Post(R"(/v1/pipelines/([^/]+)/run)",
+                 [this](const httplib::Request & req, httplib::Response & res) {
+                     json body;
+                     try {
+                         body = json::parse(req.body);
+                     } catch (...) {
+                     }
+                     {
+                         std::lock_guard<std::mutex> lk(mtx);
+                         last_model = body.value("model", std::string());
+                         last_pipeline = req.matches[1];
+                     }
+                     if (body.value("stream", false)) {
+                         auto n = std::make_shared<int>(0);
+                         res.set_chunked_content_provider(
+                             "text/event-stream",
+                             [n](size_t, httplib::DataSink & sink) -> bool {
+                                 if (*n >= 3) {
+                                     sink.done();
+                                     return true;
+                                 }
+                                 const std::string payload =
+                                     "data: {\"object\":\"pipeline.delta\",\"pipeline\":\"fake-pipeline\","
+                                     "\"delta\":{\"content\":\"c" + std::to_string(*n) + "\"}}\n\n";
+                                 (*n)++;
+                                 return sink.write(payload.data(), payload.size());
+                             },
+                             [](bool) {});
+                         return;
+                     }
+                     json out = {{"object", "pipeline.result"},
+                                 {"pipeline", req.matches[1]},
+                                 {"output", {{"format", "json"}, {"content", "ok"}}},
+                                 {"usage", {{"prompt_tokens", 1}, {"completion_tokens", 1}, {"total_tokens", 2}}}};
+                     res.set_content(out.dump(), "application/json");
+                 });
         srv.Post("/v1/chat/completions", [this](const httplib::Request & req, httplib::Response & res) {
             json body;
             try {
@@ -161,6 +203,7 @@ struct router_fixture {
         m.id = "router-model";
         m.http_host = "127.0.0.1";
         m.http_port = worker.port;
+        m.pipelines = {"fake-pipeline"};
         slot = reg.add(m);
         slot->advertised_id = "worker-model";
         slot->advertised_json = "{\"id\":\"worker-model\",\"object\":\"model\"}";
@@ -341,7 +384,90 @@ void test_models_aggregate() {
         CHECK(j["data"].is_array() && j["data"].size() == 1, "one model");
         if (j["data"].is_array() && !j["data"].empty()) {
             CHECK(j["data"][0].value("id", "") == "worker-model", "the worker's own id is advertised");
+            for (const auto & e : j["data"]) {
+                CHECK(e.value("id", "") != "fake-pipeline", "a pipeline id must never appear in /v1/models");
+            }
         }
+    }
+    fx.stop();
+}
+
+void test_pipelines_list() {
+    router_fixture fx;
+    fx.start();
+    httplib::Client cli("127.0.0.1", fx.port);
+    auto res = cli.Get("/v1/pipelines");
+    CHECK(!!res, "the pipeline list must answer");
+    if (res) {
+        json j = json::parse(res->body);
+        CHECK(j.value("object", "") == "list", "the pipeline list shape");
+        CHECK(j["data"].is_array() && j["data"].size() == 1, "one declared pipeline");
+        if (j["data"].is_array() && !j["data"].empty()) {
+            CHECK(j["data"][0].value("id", "") == "fake-pipeline", "the worker's pipeline id");
+        }
+    }
+    fx.stop();
+}
+
+void test_pipeline_run_nonstream() {
+    router_fixture fx;
+    fx.start();
+    httplib::Client cli("127.0.0.1", fx.port);
+    auto res = cli.Post("/v1/pipelines/fake-pipeline/run",
+                        "{\"model\":\"router-model\",\"input\":{\"text\":\"hi\"},\"options\":{}}",
+                        "application/json");
+    CHECK(!!res, "the pipeline run must answer");
+    if (res) {
+        CHECK(res->status == 200, "pipeline run status: %d", res->status);
+        json j = json::parse(res->body);
+        CHECK(j.value("object", "") == "pipeline.result", "pipeline result object");
+        CHECK(j.value("pipeline", "") == "fake-pipeline", "pipeline id");
+        CHECK(j["output"].value("content", "") == "ok", "pipeline content");
+    }
+    {
+        std::lock_guard<std::mutex> lk(fx.worker.mtx);
+        // The pipeline request has no model-selection semantics; the router
+        // must forward the body verbatim.
+        CHECK(fx.worker.last_model == "router-model", "pipeline body must not be rewritten (saw '%s')",
+              fx.worker.last_model.c_str());
+        CHECK(fx.worker.last_pipeline == "fake-pipeline", "worker saw '%s'", fx.worker.last_pipeline.c_str());
+    }
+    fx.stop();
+}
+
+void test_pipeline_sse() {
+    router_fixture fx;
+    fx.start();
+    httplib::Client cli("127.0.0.1", fx.port);
+    std::string all;
+    auto res = cli.Post("/v1/pipelines/fake-pipeline/run", httplib::Headers(),
+                        "{\"input\":{\"text\":\"hi\"},\"stream\":true}", "application/json",
+                        [&](const char * data, size_t len) {
+                            all.append(data, len);
+                            return true;
+                        });
+    CHECK(!!res, "the streaming pipeline run must answer");
+    CHECK(all.find("pipeline.delta") != std::string::npos, "the delta frame must pass through");
+    CHECK(all.find("c2") != std::string::npos, "the whole stream must arrive");
+    fx.stop();
+}
+
+void test_pipeline_unknown_and_down() {
+    router_fixture fx;
+    fx.start();
+    httplib::Client cli("127.0.0.1", fx.port);
+    auto res = cli.Post("/v1/pipelines/nope/run", "{}", "application/json");
+    CHECK(!!res, "unknown pipeline must answer");
+    if (res) {
+        CHECK(res->status == 404, "unknown pipeline status: %d", res->status);
+        json j = json::parse(res->body);
+        CHECK(j["error"].value("type", "") == "pipeline_not_found", "error type");
+    }
+    fx.slot->set_state(model_state::failed, "the worker died");
+    res = cli.Post("/v1/pipelines/fake-pipeline/run", "{}", "application/json");
+    CHECK(!!res, "a down worker must answer");
+    if (res) {
+        CHECK(res->status == 503, "a down worker is 503, got %d", res->status);
     }
     fx.stop();
 }
@@ -396,6 +522,10 @@ int main() {
     test_sse_is_not_buffered();
     test_cancel_propagates();
     test_models_aggregate();
+    test_pipelines_list();
+    test_pipeline_run_nonstream();
+    test_pipeline_sse();
+    test_pipeline_unknown_and_down();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

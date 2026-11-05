@@ -220,6 +220,10 @@ add_library(sycl_infer_core STATIC
     src/server/control.cpp
     src/server/server.cpp
     src/server/url_fetch.cpp
+    # request-level pipelines + their HTTP endpoints (mechanism only; the
+    # registry is empty by default)
+    src/pipeline/registry.cpp
+    src/server/pipeline_http.cpp
 )
 target_include_directories(sycl_infer_core PUBLIC
     src                       # so "device/device_profile.h" resolves everywhere
@@ -231,6 +235,7 @@ target_include_directories(sycl_infer_core PUBLIC
     src/mm
     src/engine
     src/server
+    src/pipeline
     third_party
 )
 
@@ -294,8 +299,19 @@ endif()
 
 # ------------------------------------------------------------------- binaries
 if(NOT SI_ROUTER_ONLY)
-add_executable(sycl-infer src/main.cpp src/mineru.cpp)
+add_executable(sycl-infer src/main.cpp)
 target_link_libraries(sycl-infer PRIVATE sycl_infer_core)
+
+# The MinerU two-step extraction is a reference/test client, not a server
+# pipeline and not part of sycl-infer: it only uses the public model
+# capabilities.  See docs/design/21-mineru-qwen2vl.md.
+add_executable(sycl-infer-mineru
+    tools/mineru/main.cpp
+    tools/mineru/mineru.cpp
+    tools/mineru/layout.cpp
+)
+target_include_directories(sycl-infer-mineru PRIVATE tools/mineru)
+target_link_libraries(sycl-infer-mineru PRIVATE sycl_infer_core)
 endif()
 
 # --------------------------------------------------------------------- router
@@ -532,12 +548,41 @@ function(si_add_test name)
     target_include_directories(${name} PRIVATE ${SI_TEST_INCLUDE_DIRS})
 endfunction()
 
+# Hermetic host-only tests: compile their own small source list with -fno-sycl
+# and do not link sycl_infer_core.  That is what keeps the pipeline registry,
+# its HTTP endpoints and the MinerU layout grammar runnable with no GPU, no
+# GGUF and no device pass.
+function(si_add_host_test name)
+    add_executable(${name} ${ARGN})
+    if(NOT SI_ROUTER_ONLY)
+        # Target-scoped, not set_source_files_properties: a source-property
+        # -fno-sycl is directory-scoped and leaks into sycl_infer_core when the
+        # same .cpp (media_fetch/url_fetch/pipeline_http) is also a core source,
+        # which makes an AOT build fail with "-fsycl-targets must be used in
+        # conjunction with -fsycl".
+        target_compile_options(${name} PRIVATE -fno-sycl)
+        target_link_options(${name} PRIVATE -fno-sycl)
+    endif()
+    target_include_directories(${name} PRIVATE
+        ${SI_TEST_INCLUDE_DIRS}
+        third_party
+        src
+        src/pipeline
+        src/model
+        src/engine
+        src/server
+        tools/mineru)
+    target_link_libraries(${name} PRIVATE Threads::Threads)
+endfunction()
+
 # The router's tests link si_router_core, not sycl_infer_core: they must run
 # without a GPU, without a model and without the SYCL runtime.
 function(si_add_router_test name)
     add_executable(${name} ${ARGN})
     if(NOT SI_ROUTER_ONLY)
-        set_source_files_properties(${ARGN} PROPERTIES COMPILE_OPTIONS "-fno-sycl")
+        # Target-scoped for the same reason as si_add_host_test: onnx_wire.cpp
+        # is also a sycl_infer_core / si_onnx_core source.
+        target_compile_options(${name} PRIVATE -fno-sycl)
         target_link_options(${name} PRIVATE -fno-sycl)
     endif()
     target_include_directories(${name} PRIVATE ${SI_TEST_INCLUDE_DIRS} third_party src/router)
@@ -591,6 +636,9 @@ si_add_test(test_hparams     tests/model/test_hparams.cpp)
 si_add_test(test_model_profile tests/model/test_model_profile.cpp)
 si_add_test(test_f16conv     tests/model/test_f16conv.cpp)
 si_add_test(test_yarn        tests/common/test_yarn.cpp)
+si_add_test(test_kv_type     tests/backend/gpu/kernels/test_kv_type.cpp)
+si_add_test(test_chat_builtin tests/server/test_chat_builtin.cpp)
+si_add_test(test_quant_synth tests/model/test_quant_synth.cpp)
 si_add_test(test_w4_gemm     tests/backend/gpu/kernels/test_w4_gemm.cpp)
 si_add_test(test_k5_gemv     tests/backend/gpu/kernels/test_k5_gemv.cpp)
 si_add_test(test_w4_vs_i8    tests/backend/gpu/kernels/test_w4_vs_i8.cpp)
@@ -603,6 +651,20 @@ si_add_test(test_moe_tiled   tests/backend/gpu/kernels/test_moe_tiled.cpp)
 si_add_test(test_moe_ref tests/model/test_moe_ref.cpp)
 si_add_test(test_dflash_kernels tests/backend/gpu/kernels/test_dflash_kernels.cpp)
 si_add_test(test_spec        tests/engine/test_spec.cpp)
+
+# Pipeline mechanism and the MinerU grammar: hermetic and engine-free.
+si_add_host_test(test_pipeline_registry
+    src/pipeline/registry.cpp
+    tests/pipeline/test_pipeline_registry.cpp)
+si_add_host_test(test_pipeline_route
+    src/server/pipeline_http.cpp
+    src/pipeline/registry.cpp
+    src/server/media_fetch.cpp
+    src/server/url_fetch.cpp
+    tests/server/test_pipeline_route.cpp)
+si_add_host_test(test_mineru_layout
+    tools/mineru/layout.cpp
+    tests/tools/test_mineru_layout.cpp)
 
 si_add_test(test_gpu_stages
     tests/backend/gpu/kernels/test_gpu_stages.cpp
@@ -626,7 +688,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_dev_profile test_mm_step)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()
@@ -637,6 +699,23 @@ if(BUILD_TESTING)
         set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
     endforeach()
     if(NOT SI_ROUTER_ONLY)
+        # The CLI's own contract: --help exits 0 and documents the flags a
+        # script would use; an unknown flag is an error, not silently ignored.
+        add_test(NAME test_cli_help COMMAND sycl-infer --help)
+        set_tests_properties(test_cli_help PROPERTIES LABELS "hermetic;cli"
+            PASS_REGULAR_EXPRESSION "--max-slots")
+        add_test(NAME test_cli_unknown COMMAND sycl-infer --not-a-real-flag)
+        set_tests_properties(test_cli_unknown PROPERTIES LABELS "hermetic;cli"
+            PASS_REGULAR_EXPRESSION "unknown option")
+        # The opt-in --head-split was parsed but never implemented (AGENTS.md
+        # records the change as deliberately not made); it must not look like a
+        # working switch.
+        add_test(NAME test_cli_head_split_gone COMMAND sycl-infer --head-split)
+        set_tests_properties(test_cli_head_split_gone PROPERTIES LABELS "hermetic;cli"
+            PASS_REGULAR_EXPRESSION "unknown option")
+        add_test(NAME test_cli_bad_device COMMAND sycl-infer --device tpu)
+        set_tests_properties(test_cli_bad_device PROPERTIES LABELS "hermetic;cli"
+            PASS_REGULAR_EXPRESSION "expects cpu")
         add_test(NAME test_video_hermetic COMMAND test_multimodal --video-only)
         set_tests_properties(test_video_hermetic PROPERTIES LABELS "hermetic;media")
     endif()
@@ -666,6 +745,19 @@ if(BUILD_TESTING)
             add_test(NAME ${name} COMMAND ${name} "${SI_TEST_08B_MODEL}")
             set_tests_properties(${name} PROPERTIES LABELS "gpu;model-0.8b")
         endforeach()
+        # These kernel tests need the GPU but no model; they were built and
+        # never registered, so a regression could only be found by running the
+        # binary by hand.
+        foreach(name IN ITEMS test_moe_kernels test_moe_tiled test_enc_own test_dflash_kernels)
+            add_test(NAME ${name} COMMAND ${name})
+            # GPU-only (no model), and test_moe_tiled is >15 min under JIT:
+            # keep them out of -L hermetic so that label stays CPU-only and fast.
+            set_tests_properties(${name} PROPERTIES LABELS "gpu;kernel")
+        endforeach()
+        if(SI_C_API)
+            add_test(NAME test_capi COMMAND test_capi "${SI_TEST_08B_MODEL}")
+            set_tests_properties(test_capi PROPERTIES LABELS "cpu;model-0.8b")
+        endif()
         # Was a known failure with a WILL_FAIL waiver: a prefix-cache warm resume
         # on the CPU partition gave argmax 248046/198 with logits max|diff| ~3.2-3.8.
         # Root cause: cpu_backend::synchronize() was an empty override, so
@@ -674,6 +766,11 @@ if(BUILD_TESTING)
         # std::vector it was reading from - a heap use-after-free, reported by glibc
         # as a corrupted chunk at an unrelated free.  It now passes, so the waiver
         # is gone and it is an ordinary test like the rest.
+        if(SI_ONNX)
+            add_test(NAME test_onnx_batch COMMAND test_onnx_batch)
+            add_test(NAME test_onnx_pv COMMAND test_onnx_pv)
+            set_tests_properties(test_onnx_batch test_onnx_pv PROPERTIES LABELS "hermetic;gpu;onnx")
+        endif()
         add_test(NAME test_pc_cpu COMMAND test_pc_cpu "${SI_TEST_08B_MODEL}")
         set_tests_properties(test_pc_cpu PROPERTIES LABELS "cpu;model-0.8b")
         if(SI_TEST_27B_MODEL)

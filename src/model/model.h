@@ -283,6 +283,12 @@ struct arch_profile {
 // so a new loader inherits it; exposed so a test can drive it without a GGUF.
 void validate_hparams(const hparams & hp, const std::string & arch);
 
+// Cross-check a loader's GGUF-derived geometry against the architecture's
+// declarative profile.  A mismatch is a loader/profile drift (or a file that
+// looks like the architecture but is not), and the two views must not diverge
+// silently.  Exposed so a test can drive it without a GGUF.
+void validate_model_profile(const hparams & hp, const model_profile & prof, bool split_file);
+
 struct model {
     gguf_file gguf;
     hparams hp;

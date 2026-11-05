@@ -180,6 +180,16 @@ struct profile {
         int xmx_min_keys; // below this the classic kernel wins
         int split_keys;   // PF_ATTN_SPLIT_KEYS
         int dec_group;    // PF_DEC_GROUP (grouped decode attention)
+        // Vision-tower attention tile (PF_VIT_ATTN).  The default 70 shape is
+        // 1024 threads; a card capped at 512 gets the 32/32/512 fallback, but
+        // the *choice* is a per-card measurement, so it lives here.
+        int vit_tile;
+        // Gather lanes per key row in attn_xmx's stage 2 (PF_XMX_GQ).
+        int xmx_gather_q;
+        // DFlash2 top-k slices per row (PF_DFLASH_SLICES).  8 is the measured
+        // optimum on the A770 and deliberately not the occupancy-maximising
+        // value; it is a latency/merge trade that differs per card.
+        int dflash_slices;
     } attn;
 
     // Feature defaults.  The native 4/5-bit stores cut bytes per weight, so
@@ -339,7 +349,7 @@ profile_split check_profiles_homogeneous(const std::vector<std::string> & device
 // PF_DEVICE_PROFILE both report themselves; returning early from the forced
 // branch used to skip this, which made a forced profile look like it had not
 // been applied.
-void report(const profile & p, const char * how);
+void report(const profile & p, const char * how, bool warn_unknown = true);
 
 // Clamp a work-group width to what the device actually accepts.  This is what
 // makes a profile safe on a card nobody claims: the profile supplies the *wanted*

@@ -1261,7 +1261,7 @@ logits 内的 token，`ids[0]` 恒为源行的精确 argmax，所以受限 argma
 原始实现是一个 workgroup/行，top-16 的每 lane 私有表放在 SLM。对 `[M=6][n_vocab=248320]`
 （5.96 MB）实测 **2.06 ms ≈ 2.8 GB/s**，地板约 300 GB/s——即 512 个 EU 上只起了 6 个工作组。
 
-现在每行切成 `S` 片（`PF_DFLASH_SLICES`，默认 8），一次 launch 覆盖 `M*S` 个工作组、各自
+现在每行切成 `S` 片（`PF_DFLASH_SLICES`，默认来自 device profile 的 `attn.dflash_slices`，A770 上是 8），一次 launch 覆盖 `M*S` 个工作组、各自
 归约成 `[M][S][K]` 的 partial，再由一个 workgroup/行合并。两点：
 
 * **切片必须在一次 launch 里**，边界由 group 下标算。第一个版本每片单独 submit（好让边界是

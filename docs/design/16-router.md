@@ -218,6 +218,7 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
 | `models[].device.count` | 否 | 这个模型跑在几张卡上（用 `--layer-map` 切分的模型是多张）。预算是**跨这些卡的总和**，所以静态检查用 `budget / count` 与单卡容量比较；省略时由 `layer_map` 推导；ONNX 没有 layer map，必须为 1 |
 | `models[].onnx.drop_outputs` | 否 | ONNX 模型不读回的输出（→ `--drop-outputs`）；layout 的 48 MB mask 就是这里丢掉的 |
 | `models[].onnx.dnnl` | 否 | ONNX 的 oneDNN f32 卷积/matmul 开关（→ `--dnnl 0/1`，默认 1） |
+| `models[].pipelines` | 否 | 该 worker 提供的 pipeline id 列表（如 `["<pipeline-id>"]`）。这是 pipeline→worker 的归属声明，**不是模型别名**；pipeline id 不进入 `/v1/models`，也不改变 `model` 路由 |
 | `models[].control` | 否 | worker 的控制面地址 `host:port`（JSON-RPC over TCP）。给了它，路由器就用它拿模型身份与显存、并优雅停机；不给就退回 HTTP + 信号 |
 | `models[].control_token` | 否 | 控制面的共享密钥（路由器在握手里出示）。**本地模型**：路由器会把它以 `--control-token` 传给 worker；**远程模型**：worker 自己起，令牌要一致 |
 | `models[].control_token_file` | 否 | 从文件读密钥。容器里推荐这个：两端读同一个文件，令牌从不出现在命令行上 |
@@ -350,6 +351,8 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
 | `POST` | `/v1/onnx/run` | ONNX 二进制协议：从请求体读出 `model`，原样转发到对应 worker（无重试，§6.3） |
 | `GET` | `/v1/onnx/models` | 汇总各 ONNX worker 的模型表 |
 | `GET` | `/v1/models/{id}` | 单条；未知 id → 404 |
+| `GET` | `/v1/pipelines` | 汇总所有 worker 的可用 pipeline（见 [22-pipelines.md](22-pipelines.md)）；**不并入 `/v1/models`** |
+| `POST` | `/v1/pipelines/{id}/run` | 按 pipeline id 找到 owning worker，原样转发（含 SSE）；未知 pipeline → 404 |
 | `GET` | `/health` | 路由器自身 + 各模型状态（`up` / `starting` / `down` / `degraded`） |
 | `GET` | `/router/status` | 监督视图：重启次数、显存记账、每个模型的最近错误（运维用，不在 OpenAI 规范内） |
 | `OPTIONS` | 任意 | CORS 预检，返回 204（对齐 worker 的 `cors()` 行为） |
@@ -372,7 +375,23 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
   | worker 不在 `up` | 503 | `{"error":{"message":"model 'x' is unavailable (state: down)","type":"server_error"}}` |
   | 上游超时 | 504 | `server_error` |
 
-### 6.2.1 ONNX 二进制路由
+### 6.2.1 Pipeline 代理
+
+pipeline 是**独立的路由表**，与 `model` 路由互不干扰（设计见
+[22-pipelines.md](22-pipelines.md)）：
+
+* `GET /v1/pipelines`：并行查询各 worker 的 `GET /v1/pipelines`，按
+  `models[].pipelines` 过滤后汇总；重复 id 视为配置错误。
+* `POST /v1/pipelines/{id}/run`：在 pipeline 表中找到 owning worker，原样转发方法、
+  请求体和查询串；**不改写任何 `model` 字段**（pipeline 请求没有模型选择语义）。
+  响应按 `stream` 走普通透传或 SSE，取消链与 §6.4 相同。
+* 未知 pipeline → 404 `pipeline_not_found`；worker 不在 `up` → 503。
+* `/v1/models`、`/v1/chat/completions`、`/v1/completions` 的行为完全不变；pipeline
+  不会作为模型 id 出现，也不会被当成 alias 路由。
+* MinerU 不是 pipeline：它是 `tools/mineru/` 的参考客户端，不进入 router 的
+  pipeline 表，也不影响模型路由。
+
+### 6.2.2 ONNX 二进制路由
 
 `/v1/onnx/run` 的请求体是 `src/common/onnx_wire.h` 的二进制帧。路由器只读帧头的
 `(version, model name)`（`peek_request_model`），不复制张量载荷；随后把整个 body 原样转给

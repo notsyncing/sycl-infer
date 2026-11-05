@@ -95,7 +95,7 @@ static constexpr int QG_WG = 64;
 // exactly one f16 scale group.  Above 8 lanes idle, so the range stops there, and
 // only powers of two are accepted so `QG_WG/qg` rows per work-group is exact.
 static int gather_q(const sycl::queue & q) {
-    const int want = si::dev::profile_int(q, "PF_XMX_GQ", 8);
+    const int want = si::dev::profile_int(q, "PF_XMX_GQ", si::dev::for_queue(q).attn.xmx_gather_q);
     if (want < 1) {
         return 1;
     }

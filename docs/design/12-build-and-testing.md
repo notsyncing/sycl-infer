@@ -160,6 +160,15 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 必须用它；0.8B 只有一个量化类型，测不出格式差异。`test_multimodal` 是唯一多参数的：
 `argv[1]` 文本 GGUF、`argv[2]` mmproj GGUF、`argv[3]` **音频 mmproj** GGUF（默认空，即跳过音频编码器测试）。
 
+> 下表是代表性清单；`CMakeLists.txt` 的 `si_add_test` 与 `ctest --test-dir build -N`
+> 是权威来源。2026-11 新增的 hermetic 用例包括 `test_kv_type`、
+> `test_quant_synth`、`test_chat_builtin`、`test_hparams`、`test_f16conv`、
+> `test_yarn`，以及 CLI 的 `test_cli_help` / `test_cli_unknown`。
+> Pipeline 机制已经落地：`test_pipeline_registry`、`test_pipeline_route`
+> （hermetic，无 GPU/无模型）；MinerU 作为 `tools/mineru/` 的参考工具，另有
+> `test_mineru_layout`（prompt/版面语法/bbox/角度/IoU，hermetic）。设计见
+> [22-pipelines.md](22-pipelines.md) §10。
+
 | 目标 | 默认 | 类型 | 覆盖 |
 |---|---|---|---|
 | `test_tokenizer` | 0.8B | CPU | 词表加载、特殊 id、ASCII/CJK/空白/emoji/特殊 token 往返 |
@@ -169,6 +178,12 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_cpuref` | 0.8B | CPU | CPU 参考 forward head on token ids（默认 `{9419}`） |
 | `test_sampler` | 无 | CPU | `logit_bias` 强制/封禁 token、logprob log-softmax 与归一化、best_of 打分路径 |
 | `test_cpu_gemv` | 0.8B | CPU | CPU 融合 fp32 + 整数 int8 GEMV/RMSNorm vs `quant.h` 主机反量化参考，多类型多 TB；`PF_CPU_ISA=scalar\|avx2\|avx512` 钉住变体 |
+| `test_kv_type` | 无 | 无设备 | `--kv-type` 名称/别名、`K:V` 允许与拒绝的组合、row/bits/scales 几何、i4 二补码 nibble、`kv_scope` 嵌套恢复 |
+| `test_quant_synth` | 无 | 无设备 | 手写 Q8_0/Q5_0/Q5_1/F16/BF16 block 的 `dequantize_row`、Q5_1 交错半区、f16 subnormal、`w8_*` 尺寸与拒绝规则 |
+| `test_chat_builtin` | 无 | CPU | 无模板时的 ChatML 回退：角色、thinking、tool block、tool_calls XML、多模态占位符 |
+| `test_hparams` | 无 | CPU | `validate_hparams` 接受/拒绝 geometry |
+| `test_f16conv` | 无 | CPU | f16 subnormal 契约与范围性质 |
+| `test_yarn` | 无 | CPU | YaRN anchor 逐位一致、单调性、退化输入 |
 | `test_cpu_gdn` | 无 | CPU | `cpu_gdn` 用**非对称 head 数**（`n_k_heads=2, n_heads=6`）对照测试内标量参考，覆盖 `head % n_k_heads` 配对与状态写回（0.8B 的真实维度是恒等映射，测不出该 bug） |
 | `test_w4` | 0.8B | CPU | w4 原生宽度打包：unpack(pack(Q4_K)) 往返（~0.077% rel L2，int8 转换是 ~0.98%）+ prefill 的 grouped-scale 恒等式 |
 | `test_pc_cpu` | 0.8B | CPU | 主机后端的 paged 注意力 + 前缀缓存磁盘 spill/promote 往返（日志逐位一致） |
@@ -214,16 +229,22 @@ decode 路径上**唯一**的覆盖——decode 是每 token 全量重读 KV 的
 
 ### 2.1 CTest 分层注册
 
-默认 `ctest --test-dir build -L hermetic --output-on-failure` 仅运行不依赖
-GGUF 的 hermetic CPU 测试（含 `test_model_profile`、`test_mm_step`、
-`test_dev_profile`）及 `test_multimodal --video-only` 的合成视频/视觉宽度
-测试（ffmpeg 可缺席，AVI 测试仍运行）；它们必须已构建。模型测试必须显式配置
+默认 `ctest --test-dir build -L hermetic --output-on-failure` 运行不依赖
+GGUF 的 hermetic 测试：模型/设备 profile 一致性、`validate_hparams`、
+YaRN、f16 转换、量化块的合成反量化、KV 类型解析、内置 ChatML、
+sampler、请求/响应解析、前缀缓存存储层、控制面、URL/SSRF 策略、
+CLI 的 `--help`/未知参数契约，以及 `test_multimodal --video-only` 的
+合成视频/视觉宽度测试（ffmpeg 可缺席，AVI 测试仍运行）；它们必须已构建。
+`test_kv_type` / `test_quant_synth` / `test_chat_builtin` 是 2026-11 新增的
+三条完全无模型用例。模型测试必须显式配置
 `-DSI_REGISTER_GPU_TESTS=ON -DSI_TEST_08B_MODEL=/path/to/0.8b.gguf`；
 另外给 `SI_TEST_27B_MODEL`（可再给 `SI_TEST_DFLASH_MODEL`）才注册双卡 27B
 测试，自动设置 `TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1`。用
 `ctest --test-dir build -L model-0.8b` / `-L model-27b` 分档运行，
-不得把没注册或没运行的模型档称为通过。`test_pc_cpu` 是已知失败，
-修复前没有纳入 hermetic 默认档。
+不得把没注册或没运行的模型档称为通过。`test_pc_cpu` 现在**是普通测试**：
+根因（`cpu_backend::synchronize()` 空实现，导致异步 `queue::memcpy` 读到
+已释放的 `std::vector`）已修，`WILL_FAIL` 豁免已删除，它在 CPU 档以
+`cpu;model-0.8b` 注册。
 
 ### 2.2 stage 测试脚手架
 
@@ -266,20 +287,15 @@ cmake --build build -j$(nproc)
 所以**任何影响单 token 路径的改动都必须跑 `test_decode_vs_prefill`**；而 `test_sched` 是**批量** decode
 的唯一覆盖——单 token 判据看不见"多行时只算了其中一部分"。
 
-### 3.2.1 已知失败（2026-10-03，两台机器都复现，与当次改动无关）
+### 3.2.1 `test_pc_cpu`
 
-`test_pc_cpu`（CPU 后端的前缀缓存往返）**当前是失败的**，在本地 Iris Xe-LP 与 2x A770 上都复现：
-最后一行是 `pc_cpu: 2-3 check(s) failed` /
-`matched=96 logits max|diff|=3.2-3.8 argmax 248046/198 DIFFERENT`——命中了 96 个 token 的前缀，但
-从缓存恢复后的 logits 与参考不一致（`max|diff|` 在两台机器与多次重跑上分别落在 3.2~3.84，说明这条 CPU
-路径本身还有随线程数/ISA 变化的数值成分；逐位 KV 比对 `d == 0.0` 有时也失败、有时不失败，失败项数因此会在
-2 与 3 之间摆动）。改动前（`6d77f95` 的 AOT 二进制）同样失败，所以它是一个**尚未跟踪的既存缺陷**，不是回归；
-CPU 分区的 `pc_restore_state` / 主机反量化路径值得单独查。
-
-2026-10-07 复核确认仍然失败，且测试**本身的退出码 gating 是正确的**（失败返回 1，不存在"打印失败但
-返回 0"）。现在它以 `test_pc_cpu_known_fail` 注册，带 `known-fail` 标签并设 CTest `WILL_FAIL`：
-豁免是显式记录的，所以谁把它修好时 CTest 会反而报失败，提示去掉豁免，而不是悄悄转绿。它**不在**
-`hermetic` 或 `model-0.8b` 的选择里，避免被当成通过的测试。
+**不再是已知失败。** 2026-10-03 时它在两台机器上分别给出 argmax
+248046/198、logits max|diff| 3.2-3.8；根因是 `cpu_backend::synchronize()`
+是空 override，`engine::sync_all()` 在 CPU 分区上是 no-op，前缀缓存的
+异步 `queue::memcpy` 在宿主 `std::vector` 析构后仍在读它（堆 UAF）。
+修复后它是普通测试（`cpu;model-0.8b`），原先的 `test_pc_cpu_known_fail`
+和 CTest `WILL_FAIL` 都已删除。看到旧文档说它"预期失败"时，以
+`CMakeLists.txt` 为准。
 
 其余测试（0.8B 全套 + 27B 的 `test_27b_prefill` / `test_w4_topk` / `test_w4_gemm` /
 `test_w4_vs_cpuref` / `test_decode_vs_prefill`）在 2x A770 上全部通过。
@@ -445,7 +461,7 @@ M27=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf
 ### 3.5 include-cleaner lint（`Diagnostics.UnusedIncludes: Strict` 必须干净）
 
 ```bash
-clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.1/include \
+clang-tidy -p build --extra-arg=-I/opt/intel/oneapi/compiler/2026.2/include \
   -checks='-*,misc-include-cleaner' <changed files>
 ```
 
@@ -466,7 +482,7 @@ find src tests -name '*.cpp' -o -name '*.h' | xargs touch
 CI 式的最小覆盖是：
 
 ```bash
-export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.1/lib:/opt/intel/oneapi/compiler/2026.1/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/opt/intel/oneapi/2026.2/lib:/opt/intel/oneapi/compiler/2026.2/lib:$LD_LIBRARY_PATH
 ```
 
 `ld.bfd` 关于 `libsvml.so` / `libimf.so` / `libintlc.so.5`（`libdnnl.so` 需要）的告警是**良性**的：它们

@@ -17,6 +17,7 @@
 | Chat 模板 | `chat.cpp` / `chat_template.cpp` | minja Jinja 渲染 + 内置 ChatML 回退 |
 | 响应构建 | `response.{h,cpp}` | OpenAI 响应体与 SSE 帧（纯函数，见 §2.6/§2.7） |
 | 响应拆分 | `response_parser.cpp` | `reasoning_content` / `content` / `tool_calls` 流式状态机 |
+| Pipeline | `src/pipeline/` + `src/server/pipeline_http.{h,cpp}`（见 [22-pipelines.md](22-pipelines.md)） | 请求级多步编排；server 只按 pipeline id 调用，不认识具体流程。registry 默认为空；MinerU 是 `tools/mineru/` 的客户端工具 |
 | 流式辅助 | `chat_util.h` | UTF-8 边界安全的 token piece 缓冲 |
 | 采样 | `sampler.cpp` | 采样算法 |
 | 引擎 | `engine.h` | prefill/decode/logits、前缀缓存 API、`generate`（含内部 MTP 分流）、`generate_mm` |
@@ -29,6 +30,8 @@
   **绕过调度器与前缀缓存**，`n` 个 choice 顺序生成。
 * **MTP**（`PF_MTP_SERVER=1` 且引擎开了 `--mtp`）：在生产者线程 `engine::generate`，**同样绕过调度器**；
   见 §2.4 的 `mtp_direct` 门控与 §3.6。
+* **Pipeline**（`/v1/pipelines/{id}/run`，见 [22-pipelines.md](22-pipelines.md)）：
+  独立的请求级多步编排路径，不进 `/v1/chat/completions` 的分派，也不假装成一个模型。
 
 后两条路径与批处理互斥的原因写在 §3.6：MTP 是单序列循环，运行它等于在整个生成期占住 `engine::mtx`。
 
@@ -71,7 +74,15 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 | GET | `/v1/models/{id}` | 单个模型（`srv.Get(R"(/v1/models/(.+))")`，`server.cpp` 的 `serve`）；id 既可等于 GGUF `general.name` 也可等于 CLI 默认 `model_id`，否则 404 |
 | POST | `/v1/chat/completions` | 流式 + 非流式；reasoning_content、工具调用/结果、`n`、stop、`stream_options.include_usage`、图片输入 |
 | POST | `/v1/completions` | 纯文本补全；string/string[]/token 数组 prompt、`n`、`echo`、`suffix`、流式 + 非流式 |
+| GET | `/v1/pipelines` | 列出可用 pipeline（见 [22-pipelines.md](22-pipelines.md)）；**模型列表不包含 pipeline**；registry 默认为空 |
+| POST | `/v1/pipelines/{id}/run` | 运行一条 pipeline；专用请求/响应形状，不是 OpenAI 标准端点。MinerU 不在这里，走 `tools/mineru/` 或调用方 |
 | OPTIONS | `.*` | 204 + CORS |
+
+**边界约定（2026-11 明确）**：`/v1/models` 始终只列模型；`/v1/chat/completions`
+与 `/v1/completions` 保持标准语义，不接受 pipeline id、也不暴露 MinerU 专用字段。
+pipeline 端点只用于满足 [22-pipelines.md](22-pipelines.md) §2 准入规则的进程内编排；
+MinerU 这类纯客户端流程不属于这里。只想做普通 qwen2vl 图片对话的客户端继续用
+`/v1/chat/completions`，自己提供 prompt，拿模型原始输出。
 
 无鉴权，无 `/v1/embeddings`、`/tokenize`。
 
@@ -105,8 +116,10 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 * `/v1/completions` 另有 `parse_best_of`（默认等于 `n`，clamp 到 1..16）、
   `parse_include_usage`（只读 `stream_options.include_usage`）、
   `echo`、`suffix`（`parse_completion_prompts`，`request.cpp`）。
-* `model` 只被回显进响应（`body.value("model", model_id)`，`server.cpp` 的 `handle_completion`）；请求里写错 model 名
-  **不报错**。`created` 是每次请求 `time(nullptr)`。
+* `model` 被回显进响应，并且现在会**校验**（`model_id_accepted`，`request.cpp`）：
+  单模型 worker 只接受 GGUF 的 `general.name` 或配置的 `model_id` 回退；其他 id
+  返回 404 `model not found`。这样 pipeline id（如 `mineru`）不会因为 worker
+  忽略 `model` 而看起来像一个可用的模型别名。`created` 是每次请求 `time(nullptr)`。
 * **`seed`**：`gp.seed == 0` 表示“不指定”，此时每条序列用 `steady_clock` 计数播种
   （`scheduler.cpp:55`；单序列路径用 `std::random_device{}()`，`engine.cpp:2371`），即不可复现。
   非 0 时第 `c` 个 choice 用 `seed + c`（`gp_for_choice`，`server.cpp`）。
@@ -666,7 +679,7 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 
 | 字段 | 状态 | 说明 |
 |---|---|---|
-| `model` | ✅ | 仅回显/用于选择（单模型）；未知 id 不报错 |
+| `model` | ✅ | 回显；单模型接受 GGUF id 或配置回退，未知 id 返回 404（不是别名） |
 | `messages` | ✅ | 见 8.4 |
 | `stream` | ✅ | SSE；纯文本路径每 choice 一个生产者线程，多模态/MTP 路径一个线程顺序生成全部 choice（§2.7） |
 | `stream_options.include_usage` | ✅ | 最后一个 choice 发 usage chunk |
@@ -724,7 +737,7 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 
 | 字段 | 状态 | 说明 |
 |---|---|---|
-| `model` | ✅ | 回显 |
+| `model` | ✅ | 回显；校验规则与 chat 相同，未知 id 返回 404 |
 | `prompt` | ✅ | `string` / `string[]` / `int[]`（token id）/ `int[][]` |
 | `n` | ✅ | 1..16；多 prompt × n 展开为多个 choice，`index` 顺序编号 |
 | `stream` | ✅ | 流式 completion chunk |

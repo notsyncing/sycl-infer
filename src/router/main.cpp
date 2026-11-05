@@ -60,11 +60,15 @@ void usage(const char * prog) {
             "  memory              {vram_budget_mb, kv_cap_mb, max_slots,\n"
             "                      prefix_cache_vram_mb, prefix_cache_dir}\n"
             "  args                extra worker arguments\n"
+            "  pipelines           the request-level pipeline ids this worker\n"
+            "                      provides (a separate routing table; not a\n"
+            "                      model alias and never listed by /v1/models)\n"
             "  remote              {http}: a worker on another machine (the\n"
             "                      router connects instead of starting it)\n"
             "\n"
             "The router's HTTP face: /v1/chat/completions, /v1/completions,\n"
-            "/v1/models, /health and /router/status.  It has no authentication\n"
+            "/v1/models, /v1/pipelines, /health and /router/status.  It has no\n"
+            "authentication\n"
             "of its own unless `router.auth.bearer_tokens` is set, so bind it\n"
             "to the loopback and put a reverse proxy in front of it.\n",
             prog);

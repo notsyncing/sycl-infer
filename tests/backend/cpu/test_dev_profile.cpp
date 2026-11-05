@@ -70,7 +70,7 @@ static void expect_int(const char * what, int got, int want) {
 // the card files: a field that silently keeps a literal at its use site reads
 // as "the profile decided", and a card that omits one gets the compiler's zero.
 static void profile_values(const char * who, const dev::profile & p, int row_gemv = 0, int tiled = 0,
-                           int gu_tile = 0, int dn_tile = 128, int qfuse = 0) {
+                           int gu_tile = 0, int dn_tile = 128, int qfuse = 0, int vit_tile = 70) {
     expect_int((std::string(who) + " moe.cfg_gate").c_str(), p.moe.cfg_gate, 43);
     expect_int((std::string(who) + " moe.cfg_down").c_str(), p.moe.cfg_down, 43);
     // 0 is the measured value: "auto" picks one row per expert for a
@@ -90,6 +90,11 @@ static void profile_values(const char * who, const dev::profile & p, int row_gem
     expect_int((std::string(who) + " shape.w4_rows_per_wg").c_str(), p.shape.w4_rows_per_wg, 16);
     expect_int((std::string(who) + " shape.q8_rows").c_str(), p.shape.q8_rows, 512);
     expect_int((std::string(who) + " shape.f32_rows").c_str(), p.shape.f32_rows, 128);
+    // The vision tile is a launch capability as well as a tuning: 70 uses a
+    // 1024-thread work-group, which an Iris Xe cannot launch, so its row says 0.
+    expect_int((std::string(who) + " attn.vit_tile").c_str(), p.attn.vit_tile, vit_tile);
+    expect_int((std::string(who) + " attn.xmx_gather_q").c_str(), p.attn.xmx_gather_q, 8);
+    expect_int((std::string(who) + " attn.dflash_slices").c_str(), p.attn.dflash_slices, 8);
     // Invariants a card file cannot express: only 8/16/32 are instantiated for
     // the native-weight GEMV, and a ring/workspace of 0 would disable a path
     // rather than tune it.
@@ -141,7 +146,7 @@ int main() {
     // The Iris profile inherits these from the A770 and SAYS SO in its
     // provenance; the values still have to be present and identical, because a
     // missing field is a zero tile, not "unmeasured".
-    profile_values("iris_xe", dev::for_name(iris));
+    profile_values("iris_xe", dev::for_name(iris), 0, 0, 0, 128, 0, 0);
     // Xe2 is the one card that turns the warp-per-row expert GEMV on; every
     // other field is inherited, so it must still agree.
     profile_values("arc_140v", dev::for_name(arc140v), 1, 1, 32, 96, 1);

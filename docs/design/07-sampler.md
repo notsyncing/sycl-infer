@@ -71,7 +71,9 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
    - 统计 recent 尾部 repeat_last_n 个 token 的出现次数                         (:65-69)
    - 对每个出现过的 id t（unordered_map 的遍历顺序）：
        repeat_penalty != 1:  v > 0 ? v / repeat_penalty : v * repeat_penalty    (:72-74)
-       v += presence_penalty + frequency_penalty * count                        (:75)
+       v -= presence_penalty + frequency_penalty * count                        (:75)
+       （OpenAI 语义：正的 presence/frequency penalty 降低已出现 token 的分数；
+        2026-11 前这里是 `+=`，正惩罚反而鼓励重复，已修正并加测试）
    - 每个 logit_bias 条目 scr[id] += bias，id 必须落在 [0, n_vocab)              (:78-84)
    ★ logit_bias 就加在这里：在温度缩放之前，也在 20-nat 候选过滤与
      top_k / top_p / min_p 之前 —— 所以它一定影响采样结果，贪心（T<=0）时同样生效。

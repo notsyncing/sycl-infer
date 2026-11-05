@@ -29,7 +29,8 @@
 | 20 | [design/19-c-api.md](design/19-c-api.md) | 嵌入式 C ABI：句柄/生命周期、批量窗口与 FIFO 排队、多线程提交、请求隔离、停止串/超时/取消、ABI 版本与错误模型、与现有 `engine`/`scheduler` 的映射 |
 | 21 | [design/20-python-binding.md](design/20-python-binding.md) | Python binding 与 wheel：ctypes（v0.1）、流式/批量 API、setuptools、SYCL/oneDNN/oneAPI runtime 打包、JIT/AOT wheel、doctor |
 | 22 | [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md) | MinerU2.5 / Qwen2-VL 解码器（`qwen2vl`）：head_dim 64 的 classic attention、无 QK norm/门的 q 布局、Q5_0、视觉塔（patch 14 / 80 维头 / quick_gelu / 2D RoPE / 保序 ILP attention）、MinerU 两步抽取与特殊 prompt、性能历史 |
-| 23 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+| 23 | [design/22-pipelines.md](design/22-pipelines.md) | **请求级 Pipeline 机制**：`src/pipeline/` 接口与注册表、准入规则（进程内状态/实测收益/资源账本）、worker 的 `/v1/pipelines/{id}/run`、router 的专用代理、与 `/v1/models`/`/v1/chat/completions` 的边界；MinerU 明确不是 pipeline，迁到 `tools/mineru/` |
+| 24 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 面向使用者的说明：
 
@@ -43,7 +44,9 @@
 * 想新增一张 GPU 卡的调优，或改 launch 形状 → [architecture.md §11](architecture.md)、[design/03-kernels.md §1.3](design/03-kernels.md)
 * 想加图像/视频/音频输入 → [design/10-multimodal.md](design/10-multimodal.md)、[design/13-audio-video.md](design/13-audio-video.md)
 * 想动视觉塔（`vit_attn` 形状、紧凑上传、oneDNN 线性层）→ [design/10-multimodal.md](design/10-multimodal.md)、[design/03-kernels.md §12](design/03-kernels.md)
-* 想跑 MinerU 的两步抽取 → [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md)
+* 想跑 MinerU 的两步抽取 → [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md)、`tools/mineru/`（[design/22-pipelines.md](design/22-pipelines.md) 说明为什么它不是 pipeline）
+* 想新增一条请求级多步流程（不只是单次 chat）→ [design/22-pipelines.md](design/22-pipelines.md)
+* 想跑 MinerU 参考客户端/复现页面输出 → `tools/mineru/`（独立二进制 `sycl-infer-mineru`）
 * 想理解图捕获与模式 0/1/2 → [design/04-engine.md](design/04-engine.md)
 * 想看设备选择 / CPU 后端 / 多设备（`--device`、`--layer-map`）→ [architecture.md §11](architecture.md)、[design/04-engine.md §11](design/04-engine.md)
 * 想动权重存储（u4 / k5 / cb4 / 2-bit）或多设备 oneDNN 权重路径 → [design/02-quantization.md](design/02-quantization.md)、[design/03-kernels.md §5](design/03-kernels.md)
@@ -51,7 +54,8 @@
 * 想动 DFlash2 块草稿器（卷积下标、RoPE 宽度、lattice、top-k）→ [design/14-dflash2.md](design/14-dflash2.md)
 * 想动 MoE / 专家切分 / 三级专家缓存 → [design/15-moe-ncmoe.md](design/15-moe-ncmoe.md)
 * 想跑 Qwen3.8-Flash-Next（104 GiB、split GGUF、HC/PLE/QSA、512 专家）→ [design/18-qwen4exp.md](design/18-qwen4exp.md)
-* 想跑 MinerU2.5 / Qwen2-VL 文档抽取（`mineru --image`）→ [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md)
+* 想跑 MinerU2.5 / Qwen2-VL 文档抽取 → [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md)；当前形态是独立二进制 `sycl-infer-mineru`（`tools/mineru/`）
+* 想在客户端做 MinerU 两步抽取 → 用 qwen2vl 的图片 `/v1/chat/completions`；服务端不内置 MinerU pipeline
 * 想把引擎嵌进自己的 C/C++ 程序、做自动 batching 的批量推理 → [design/19-c-api.md](design/19-c-api.md)、[guides/c-api.md](guides/c-api.md)
 * 想用 Python/wheel，或需要把 SYCL runtime 一起分发 → [design/20-python-binding.md](design/20-python-binding.md)、[guides/python.md](guides/python.md)
 * 想动 MoE 专家 GEMM 的 tile（prefill 的 M=8 与 decode 的 M=1/M=2）→ [design/15-moe-ncmoe.md §3.4](design/15-moe-ncmoe.md)、[design/03-kernels.md §5.10](design/03-kernels.md)

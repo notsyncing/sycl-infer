@@ -72,7 +72,11 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
                 if (gp.repeat_penalty != 1.0f) {
                     v = v > 0 ? v / gp.repeat_penalty : v * gp.repeat_penalty;
                 }
-                v += gp.presence_penalty + gp.frequency_penalty * kv.second;
+                // OpenAI semantics: a POSITIVE presence/frequency penalty
+                // demotes a token that already appeared.  The old `+=` did the
+                // opposite (a positive penalty promoted repetition), which is
+                // the one direction no client would expect.
+                v -= gp.presence_penalty + gp.frequency_penalty * kv.second;
             }
         }
         if (do_bias) {

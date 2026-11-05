@@ -118,7 +118,7 @@ typedef struct syi_model_options {
     float yarn_beta_slow;
     float yarn_attn_factor;
 
-    int32_t head_split;
+    int32_t head_split; // reserved: not implemented, leave 0
     uint64_t flags;
     syi_log_fn log_fn;
     void *log_user_data;

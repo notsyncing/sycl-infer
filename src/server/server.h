@@ -6,7 +6,7 @@
 namespace si {
 
 struct server_config {
-    std::string model_id = "qwen3.5-0.8b";
+    std::string model_id = "sycl-infer"; // fallback when the GGUF has no general.name
     // loopback by default; the API is unauthenticated, so a routable bind
     // address exposes the engine to anyone who can reach the port
     std::string host = "127.0.0.1";

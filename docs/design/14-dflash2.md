@@ -323,7 +323,7 @@ non-uniform work-group，以及 `df_topk_launch` 的 `K` 上界（SLM 预算其�
 | `PF_DFLASH_BTIME` | off | draft 块前向：embed+layers vs outnorm+head+topk+selector |
 | `PF_DFLASH_TOPTIME` | off | 读出尾部的**设备侧**拆分：topk / selector_hidden / selector |
 | `PF_DFLASH_DTTAIL` | off | 同上但从**主机侧**：块前向 / 阻塞拷贝 / lattice 行走 |
-| `PF_DFLASH_SLICES` | 8 | top-k 每行的切片数（实测最优，非占满机器的值） |
+| `PF_DFLASH_SLICES` | profile `attn.dflash_slices`（A770 = 8） | top-k 每行的切片数（实测最优，非占满机器的值） |
 | `PF_DFLASH_DEBUG` | off | 下面所有探针的总开关 |
 | `PF_DFLASH_SIG` / `PF_DFLASH_BIN` / `PF_DFLASH_SIGALL` | off | 逐位置指纹 / 全张量 dump |
 | `PF_DFLASH_GEMMCHK` / `PROJCHK` / `CONVCHK` / `CONVCHKALL` / `BASECHK` / `ROWRMS` / `EMBCHK` / `INJCHK` | off | 各自的 host/device 对拍探针 |

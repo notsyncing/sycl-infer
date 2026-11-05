@@ -184,6 +184,10 @@ std::string parse_tools_json(const json & body) {
     return out.empty() ? std::string() : dump_json(out);
 }
 
+bool model_id_accepted(const std::string & requested, const std::string & model_id, const std::string & fallback) {
+    return requested.empty() || requested == model_id || requested == fallback;
+}
+
 std::vector<chat_msg> parse_messages(const json & body, std::vector<media_part> & media) {
     std::vector<chat_msg> msgs;
     if (!body.contains("messages") || !body["messages"].is_array()) {

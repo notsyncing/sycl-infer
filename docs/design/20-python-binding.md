@@ -152,7 +152,7 @@ class Model:
         yarn_beta_fast: float = 32.0,
         yarn_beta_slow: float = 1.0,
         yarn_attn_factor: float = 0.0,
-        head_split: bool = False,
+        head_split: bool = False,  # reserved; must stay False (not implemented)
         log: Callable[[int, str], None] | None = None,
     ) -> None: ...
 

@@ -13,10 +13,13 @@
 // The prompts and the sampling parameters (greedy with presence/frequency
 // penalties) come from that project; the block grammar and the JSON shape are
 // the same, so existing MinerU consumers can read the output.
+//
+// This is a client/reference tool (sycl-infer-mineru), not a server pipeline:
+// its steps need only the public image-input/text-output model capability.
+// The pure prompt/grammar half lives in layout.h.
 // ---------------------------------------------------------------------------
 #include <cstdio>
 #include <string>
-#include <vector>
 
 namespace si {
 
@@ -29,20 +32,9 @@ struct mineru_options {
     std::string only_type; // debug: run only one block type (empty = all)
 };
 
-struct mineru_block {
-    std::string type;
-    float bbox[4] = {0, 0, 0, 0};
-    int angle = 0; // 0/90/180/270
-    bool merge_prev = false;
-    std::string content;
-};
-
 // Run the full two-step extraction.  Returns 0 on success.  The JSON array of
 // blocks (type, bbox, angle, content) is written to `out`.
 int run_mineru(engine & e, const std::string & mmproj_path, const std::string & image_path,
                const mineru_options & opt, FILE * out);
-
-// Exposed for tests: parse a layout response into blocks.
-std::vector<mineru_block> mineru_parse_layout(const std::string & text);
 
 } // namespace si

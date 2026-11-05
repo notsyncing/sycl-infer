@@ -21,6 +21,17 @@
 
 namespace si {
 
+// PF_DP4A is a per-card default with an explicit env override in BOTH
+// directions.  si::dev::profile_flag only lets env=0 beat a true default
+// (it cannot force a card whose profile measured 0 back on), so read the env
+// directly here and fall back to the queue's profile.
+static bool dp4a_enabled(const sycl::queue & q) {
+    if (const char * e = si::env::str("PF_DP4A")) {
+        return atoi(e) != 0;
+    }
+    return si::dev::for_queue(q).wt.dp4a != 0;
+}
+
 // PF_LOAD_TIME: a one-line-per-phase wall-clock breakdown of engine startup.
 // The engine constructor is the whole startup (GGUF parse/bind, the int8
 // conversion + primitive creation, H2D, plans and graph capture), so without
@@ -192,21 +203,22 @@ engine::engine(const engine_config & cfg)
     cpu_mode = dev_kind == device_kind::cpu;
     m.load(model_path);
     lt.lap("model::load (gguf+bind)");
-    // qwen4exp loads 111.5 GB of shards and copies 69.8 GiB of it into a pinned
-    // expert source.  The explicit POSIX_FADV_DONTNEED in page_out_host would
-    // evict every byte of that from the page cache right after it was read, so
-    // the next start pays the whole disk pass again.  Keep the cache instead;
-    // the PTEs are still dropped, so the process RSS boundary is unchanged.
-    if (m.q4exp) {
-        m.keep_file_cache = si::env::i32("PF_Q4_KEEPCACHE", 1) != 0;
-    }
+    // The profile is selected by the GGUF's exact architecture, so it is valid
+    // as soon as load returns.  Resolve it before any policy branch reads it.
     mp_ = m.prof;
+    if (!mp_) {
+        throw std::runtime_error("model loaded without a model profile");
+    }
+    // A model whose startup copies tens of GiB into a pinned expert source
+    // reads the file more than once; the explicit POSIX_FADV_DONTNEED in
+    // page_out_host would evict every byte from the page cache right after it
+    // was read, so the next start pays the disk pass again.  The profile says
+    // whether to keep the cache; the PTEs are still dropped, so RSS is
+    // unchanged.  The env is the A/B.
+    m.keep_file_cache = si::env::i32("PF_Q4_KEEPCACHE", mp_->policy.keep_file_cache ? 1 : 0) != 0;
     {
         const char * e = si::env::str("PF_F32");
         f32_path_ = e && atoi(e) != 0 ? true : (e && atoi(e) == 0 ? false : mp_->rep.f32_gemm);
-    }
-    if (!mp_) {
-        throw std::runtime_error("model loaded without a model profile");
     }
     // The PLE engram budget is a model-profile default (qwen4exp 4096 MB); an
     // explicit --engram-ram-mb / engine_config value still wins.  Resolved after
@@ -327,7 +339,7 @@ engine::engine(const engine_config & cfg)
         } else {
             layer_map = "0-" + std::to_string(n - 1) + ":gpu.0";
         }
-        fprintf(stderr, "[q4] no --layer-map: using %s\n", layer_map.c_str());
+        fprintf(stderr, "[%s] no --layer-map: using %s\n", mp_->key, layer_map.c_str());
     }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
@@ -400,7 +412,14 @@ engine::engine(const engine_config & cfg)
     if (cfg.draft_dev > 0) {
         dfl.df_dev_ = cfg.draft_dev;
     }
-    if (!cfg.draft_path.empty()) {
+    if (!cfg.draft_path.empty() && !mp_->spec.dflash) {
+        // A declared capability, not a silent fallback: a model whose forward
+        // does not produce the draft/verify state says so once and stays on the
+        // plain decode, exactly as the MTP gate above does.
+        fprintf(stderr, "[dflash] %s: %s - DFlash disabled\n", mp_->key,
+                mp_->spec.why && *mp_->spec.why ? mp_->spec.why : "unsupported");
+        draft_requested_ = false;
+    } else if (!cfg.draft_path.empty()) {
         if (mtp.mtp_on) {
             fprintf(stderr, "[dflash] --spec-draft-model and --mtp are exclusive; MTP off\n");
             mtp.mtp_on = false;
@@ -457,9 +476,8 @@ engine::engine(const engine_config & cfg)
         // int8 GEMM is on by default on both backends.  The GPU packs the SIn
         // w8 copies; the CPU's integer kernel reads the GGUF blocks directly,
         // so it does not build (or pay for) the w8 copies.
-        const char * env = si::env::str("PF_DP4A");
-        const bool dp4a_env_off = env && atoi(env) == 0;
-        pf8 = !multi_dev && !dp4a_env_off;
+        const bool dp4a_on = dp4a_enabled(q);
+        pf8 = !multi_dev && dp4a_on;
         // PF_DP4A_DEC=0 forces the fp32 decode (both backends)
         const char * envd = si::env::str("PF_DP4A_DEC");
         pf8_dec = pf8 && !(envd && atoi(envd) == 0);
@@ -669,10 +687,7 @@ engine::engine(const engine_config & cfg)
             dnnl->warmup();
         }
     } else if (multi_dev && !md_int8 && !md_xmx && dnnl_gemm_enabled(q) &&
-               [&] {
-                   const char * en = si::env::str("PF_DP4A");
-                   return !(en && atoi(en) == 0); // PF_DP4A=0 forces the fp32 path
-               }()) {
+               dp4a_enabled(q)) {
         // one dnnl_gemm per GPU backend, holding only the layers that device
         // computes (the CPU partitions keep the fp32/i8 host path).  Every
         // prefill GEMM tensor of a GPU layer is converted - including the
@@ -770,7 +785,7 @@ engine::engine(const engine_config & cfg)
     n_blocks = pool_cap;
     alloc_buffers();
     lt.lap("alloc_buffers (KV/act)");
-    if (m.q4exp) {
+    if (hc_fwd()) {
         q4_alloc();
         lt.lap("q4_alloc (banks+pin)");
     } else {
@@ -816,7 +831,7 @@ engine::engine(const engine_config & cfg)
     if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
         q4_hist_report();
     }
-    if (m.q4exp) {
+    if (hc_fwd()) {
         q4_prefault();
     }
 }
@@ -2664,7 +2679,7 @@ void engine::upload_device_weights(int dev) {
         addp(m.tok_embd.data);
         addp(m.output.data);
         addp(m.output_norm);
-        if (m.q4exp) {
+        if (hc_fwd()) {
             addp(m.hc_head.norm);
             addp(m.hc_head.down.data);
             addp(m.hc_head.up.data);
@@ -2723,7 +2738,7 @@ void engine::upload_device_weights(int dev) {
             addp(L.k_bias);
             addp(L.v_bias);
         }
-        if (m.q4exp) {
+        if (hc_fwd()) {
             // the router and the shared-expert gate stay on the device even when
             // every routed expert is computed on the host
             addp(L.moe.gate_inp);
@@ -2802,7 +2817,7 @@ void engine::upload_device_weights(int dev) {
             // the int8 (SIn) view replaces the raw device copy
             continue;
         }
-        if (!m.q4exp && dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
+        if (mp_->rep.dnnl_int8 && dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
             && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data)
                 || dnnl_dev_[(size_t)dev]->has_weight_k5(t.data) || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
             // the oneDNN int8 (XMX) copy - or the u4 (4-bit) copy - replaces the
@@ -3061,7 +3076,7 @@ void engine::release_host_weight_pages() {
             keep.insert(m.tok_embd.data);
             keep.insert(m.output.data);
             keep.insert(m.output_norm);
-            if (m.q4exp) {
+            if (hc_fwd()) {
                 keep.insert(m.hc_head.norm);
                 keep.insert(m.hc_head.down.data);
                 keep.insert(m.hc_head.up.data);
@@ -3080,7 +3095,7 @@ void engine::release_host_weight_pages() {
             };
             kp(L.attn_norm);
             kp(L.post_attn_norm);
-            if (m.q4exp) {
+            if (hc_fwd()) {
                 kp(L.hc_attn.norm);
                 kp(L.hc_attn.down.data);
                 kp(L.hc_attn.up.data);
@@ -3127,7 +3142,7 @@ void engine::release_host_weight_pages() {
             }
         }
     }
-    if (m.q4exp && m.ple_table.data) {
+    if (hc_fwd() && m.ple_table.data) {
         // gathered by the host on the PLE layer's step: keep it out of page-out
         keep.insert(m.ple_table.data);
     }
@@ -3189,8 +3204,8 @@ bool engine::setup_md_dnnl() {
     if (!dnnl_gemm_enabled(q)) {
         return false;
     }
-    if (const char * en = si::env::str("PF_DP4A"); en && atoi(en) == 0) {
-        return false; // PF_DP4A=0 forces the fp32 path
+    if (!dp4a_enabled(q)) {
+        return false; // PF_DP4A=0 / the card's default forces the fp32 path
     }
     load_timer lt;
     dnnl_dev_.clear();
@@ -3299,7 +3314,7 @@ bool engine::setup_md_dnnl() {
                 n_i8++;
                 converted = true;
             }
-            if (converted && !m.q4exp) {
+            if (converted && !mp_->rep.raw_gemv_decode) {
                 // the host read is done and the tensor lives on the device now,
                 // so drop its file pages immediately: this keeps the load-time
                 // peak at one tensor's worth instead of the whole GGUF (the
@@ -3432,7 +3447,7 @@ bool engine::setup_md_dnnl() {
                     dev_ok = true;
                     n_w4++;
                 }
-                if (!m.q4exp) {
+                if (!mp_->rep.raw_gemv_decode) {
                     m.page_out_tensor(m.output);
                 }
                 fprintf(stderr, "[w4] LM head u4 store: %s (K=%d N=%d G=%d, %.4f B/weight; int8 fallback kept)\n",
@@ -3807,8 +3822,8 @@ void engine::setup_multi_device(const std::string & layer_map) {
     // support: oneDNN int8 (XMX, both prefill and decode) -> SIn/w8 dp4a (when
     // oneDNN is unavailable or PF_GEMM_DNNL=0) -> raw fp32 (PF_DP4A=0).
     {
-        const char * env = si::env::str("PF_DP4A");
-        const bool dp4a_env_off = env && atoi(env) == 0;
+        const bool dp4a_on = dp4a_enabled(q);
+        const bool dp4a_env_off = !dp4a_on;
         // qwen4exp keeps the raw GGUF weights: its file mixes Q8_0/Q5_1/BF16,
         // which neither the oneDNN grouped-scale converter nor the SIn packer
         // accepts, and the fp32 dequant GEMV handles them all.  The profile says
@@ -4295,7 +4310,7 @@ void engine::reset_state() {
         q.memset(d_conv_state, 0, (size_t)state_slots_ * n_gdn * conv_per * 4);
         q.wait();
     }
-    if (m.q4exp) {
+    if (hc_fwd()) {
         const int hist_rows = (m.hp.ple_conv - 1) * m.hp.ple_ngram;
         const int hc_dim = m.hp.hc_mult * m.hp.n_embd;
         if (q4_ple_hist_) {
@@ -4339,7 +4354,7 @@ void engine::reset_single() {
 // ---------------------------------------------------------------------------
 void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head) {
     kv_scope kv_scope_(kv_k_, kv_v_);
-    if (m.q4exp) {
+    if (hc_fwd()) {
         q4_prefill_text(toks, slot, n, start);
         return;
     }
@@ -4412,7 +4427,7 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // is ~2x the chunked throughput for the same tokens
 void engine::prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
     kv_scope kv_scope_(kv_k_, kv_v_);
-    if (m.q4exp) {
+    if (hc_fwd()) {
         q4_prefill_text(toks, slot, n, start);
         return;
     }
@@ -4598,7 +4613,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
 
 void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows) {
     kv_scope kv_scope_(kv_k_, kv_v_);
-    if (m.q4exp) {
+    if (hc_fwd()) {
         prefill_flush();
         pf_info_ = nullptr;
         d_info->pc_active = 0;
@@ -4732,7 +4747,7 @@ int engine::fetch_argmax(int row) {
 }
 
 std::vector<float> engine::run_head() {
-    if (m.q4exp) {
+    if (hc_fwd()) {
         q.memcpy(h_logits, d_logits, (size_t)m.hp.n_vocab * 4).wait();
         if (const char * dp = si::env::str("PF_DUMP_Q4LOG")) {
             if (FILE * fp = fopen(dp, "wb")) {
@@ -4886,6 +4901,13 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     }
 
     if (mm) {
+        if (!mp_->spec.multimodal) {
+            // A declared capability, not a silent fallback.  The server refuses
+            // a media request earlier (there is no tower to load); this is the
+            // in-process API's clear answer for the same mistake.
+            throw std::runtime_error("model profile " + std::string(mp_->key) + " declares no multimodal path" +
+                                     (mp_->spec.why && *mp_->spec.why ? std::string(": ") + mp_->spec.why : ""));
+        }
         // A prompt with media rows must carry the rows the tower produced.  The
         // planners hand out row offsets before anything is encoded, so a caller
         // that skipped phase 2 (the usual cause: no --mmproj / --audio-mmproj)
@@ -5000,7 +5022,7 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // the q4 forward synchronises before it returns, so a GPU partition is
     // required (CPU falls back).
     static const bool argmax_dev = si::env::i32("PF_Q4_ARGMAX_DEV", 1) != 0;
-    const bool use_dev_argmax = argmax_dev && m.q4exp && !cpu_mode
+    const bool use_dev_argmax = argmax_dev && hc_fwd() && !cpu_mode
                                 && !(multi_dev && dev_kind_[(size_t)0] == static_cast<int>(device_kind::cpu))
                                 && dbg_lg == nullptr && gp.speculative_greedy() && !gp.wants_logprobs();
     // q4_forward reads this to enqueue the argmax into the same submission as
@@ -5016,7 +5038,7 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // PF_Q4_ARGMAX_TIME: split the per-step logits acquisition (sample/fetch on
     // the host vs the device argmax, plus the host logits download) so the A/B
     // is measured inside the engine rather than inferred from wall clock.
-    static const bool arg_time = m.q4exp && si::env::flag("PF_Q4_ARGMAX_TIME");
+    static const bool arg_time = hc_fwd() && si::env::flag("PF_Q4_ARGMAX_TIME");
     double arg_ms = 0.0, fetch_ms = 0.0;
     int arg_n = 0;
     const auto t_loop = arg_time ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

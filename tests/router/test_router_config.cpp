@@ -313,6 +313,25 @@ void test_bearer_tokens() {
     CHECK(c.bearer_tokens.size() == 2, "token count: %zu", c.bearer_tokens.size());
 }
 
+void test_pipelines() {
+    router_config c = parse_config(one_model(", \"pipelines\": [\"doc-a\", \"doc-b\"]"));
+    CHECK(c.models.size() == 1, "one model");
+    CHECK(c.models[0].pipelines.size() == 2, "pipeline count: %zu", c.models[0].pipelines.size());
+    if (c.models[0].pipelines.size() == 2) {
+        CHECK(c.models[0].pipelines[0] == "doc-a", "pipeline id: %s", c.models[0].pipelines[0].c_str());
+    }
+    CHECK(parse_fails(one_model(", \"pipelines\": [\"dup\", \"dup\"]")),
+          "a duplicate pipeline id in one model is a config error");
+    const std::string across = R"({
+  "models": [
+    { "id": "a", "path": "/etc/hostname", "http": "127.0.0.1:18081", "pipelines": ["shared"] },
+    { "id": "b", "path": "/etc/hostname", "http": "127.0.0.1:18082", "pipelines": ["shared"] }
+  ]
+})";
+    CHECK(parse_fails(across), "a pipeline id may belong to exactly one worker");
+    CHECK(parse_fails(one_model(", \"pipelines\": 42")), "'pipelines' must be a string or an array of strings");
+}
+
 } // namespace
 
 int main() {
@@ -323,6 +342,7 @@ int main() {
     test_validation();
     test_remote();
     test_bearer_tokens();
+    test_pipelines();
     test_onnx_backend();
     test_onnx_wire_peek();
     if (g_fail) {

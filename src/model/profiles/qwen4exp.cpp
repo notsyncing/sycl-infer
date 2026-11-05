@@ -55,6 +55,7 @@ extern const model_profile kQwen4ExpProfile = {
         .auto_layer_map_one_gpu = false,
         .md_splits = true,
         .engram_ram_mb_default = 4096,
+        .keep_file_cache = true,
     },
 
     .rep = {

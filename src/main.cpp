@@ -15,7 +15,6 @@
 #include "image.h"
 #include "model.h"
 #include "multimodal.h"
-#include "mineru.h"
 #include "server.h"
 #include "vision.h"
 #include "common/env.h"
@@ -54,7 +53,6 @@ static void usage(const char * prog) {
             "commands:\n"
             "  serve                        OpenAI-compatible HTTP server\n"
             "  gen                          generate once from --prompt\n"
-            "  mineru                       two-step MinerU document extraction (Qwen2-VL)\n"
             "\n"
             "common (both commands):\n"
             "  --model <gguf>               model path (default: %s)\n"
@@ -167,8 +165,6 @@ static void usage(const char * prog) {
             "  --temp T                     sampling temperature (default 0.7)\n"
             "  --top-p P                    nucleus sampling (default 0.95)\n"
             "  --top-k K                    top-k sampling (default 40)\n"
-            "  --mineru-only-type T         debug: extract only one block type\n"
-            "  --mineru-layout-side N       layout input side (default 1036)\n"
             "\n"
             "prefix cache (three LRU tiers; lookups promote, evictions demote\n"
             "VRAM -> RAM -> disk -> dropped):\n"
@@ -181,12 +177,25 @@ static void usage(const char * prog) {
             "  --pc-disk-mb N               disk budget (default 1024, env PF_PC_DISK_MB;\n"
             "                               0 = unbounded)\n"
             "\n"
-            "  -h, --help                   this message\n"
+            "profiles and diagnostics (env only; see AGENTS.md for the full list):\n"
+            "  PF_MODEL_INFO=1              print the resolved model profile (key, policy,\n"
+            "                               weight representation, capabilities, provenance)\n"
+            "  PF_DEVICE_INFO=1             print the resolved device profile and provenance\n"
+            "  PF_DEVICE_PROFILE=<key>      force a device profile (arc_a770, iris_xe, ...)\n"
+            "  PF_MM_URL_FETCH=1            allow remote http(s) image/video/audio URLs\n"
+            "                               (base64 data: URLs always work; the bind address\n"
+            "                               and this switch are the security boundary)\n"
+            "  PF_PREFIX_CACHE=0            disable the three-tier prefix cache\n"
+            "  PF_NOGRAPH=1 PF_PROF=1       replay kernels directly with a per-stage profile\n"
+            "  PF_MEM_REPORT=1              the engine's own per-device allocation accounting\n"
+            "\n"
+            "  -h, --help                   this message (exit 0; an unknown option exits 1)\n"
             "\n"
             "env: PF_CTX, PF_KV_CAP_MB, PF_KV_TYPE, PF_PREFIX_CACHE, PF_PC_STATES,\n"
             "  PF_DEVICE, PF_CPU_ISA, PF_CPU_THREADS, PF_DP4A, PF_DP4A_DEC,\n"
             "  PF_GEMM_DNNL, PF_W4, PF_K5, PF_CB4, PF_ATTN_XMX, PF_MTP,\n"
             "  PF_NOGRAPH, PF_PROF, PF_TIME, PF_MAX_SLOTS, PF_YARN,\n"
+            "  PF_MODEL_INFO, PF_DEVICE_INFO, PF_DEVICE_PROFILE, PF_MM_URL_FETCH,\n"
             "  PF_MOE_BANK_AUTO (expert-bank governor, default on),\n"
             "  PF_MOE_BANK_RESERVE_MB (device MB to keep free, default 2048),\n"
             "  PF_MOE_DOWN_I8, PF_MOE_U4BANK, PF_MEM_REPORT.\n"
@@ -225,7 +234,6 @@ int main(int argc, char ** argv) {
     int yarn_orig_ctx = 0;      // 0 = the GGUF's declared context_length
     float yarn_factor = 0.0f;   // 0 = derive from --ctx / trained context
     float yarn_beta_fast = 32.0f, yarn_beta_slow = 1.0f, yarn_attn_factor = 0.0f;
-    bool head_split = false;    // --head-split: spread the LM head's rows over both cards
     if (const char * e = si::env::str("PF_MAX_SLOTS")) {
         max_slots = atoi(e);
     }
@@ -236,8 +244,6 @@ int main(int argc, char ** argv) {
     bool raw = false;
     bool thinking = false; // --thinking: chat template `enable_thinking`
     std::string mmproj_path;
-    std::string mineru_only_type;
-    int mineru_layout_side = 1036;
     std::string audio_mmproj_path;
     std::vector<std::string> image_paths;
     std::vector<std::string> audio_paths;
@@ -317,10 +323,6 @@ int main(int argc, char ** argv) {
             thinking = true;
         } else if (a == "--mmproj") {
             mmproj_path = next();
-        } else if (a == "--mineru-only-type") {
-            mineru_only_type = next();
-        } else if (a == "--mineru-layout-side") {
-            mineru_layout_side = atoi(next().c_str());
         } else if (a == "--audio-mmproj") {
             audio_mmproj_path = next();
         } else if (a == "--image") {
@@ -439,8 +441,6 @@ int main(int argc, char ** argv) {
             yarn_beta_slow = (float)std::atof(next().c_str());
         } else if (a == "--yarn-attn-factor") {
             yarn_attn_factor = (float)std::atof(next().c_str());
-        } else if (a == "--head-split") {
-            head_split = true;
         } else if (a == "--device") {
             const std::string v = next();
             if (v == "cpu" || v == "host") {
@@ -561,7 +561,6 @@ int main(int argc, char ** argv) {
         ec.yarn_beta_fast = yarn_beta_fast;
         ec.yarn_beta_slow = yarn_beta_slow;
         ec.yarn_attn_factor = yarn_attn_factor;
-        ec.head_split = head_split;
         // INT_MIN is this file's "flag absent" marker; the config speaks -1
         ec.kv_cap_mb = kv_cap_mb == INT_MIN ? -1 : kv_cap_mb;
         ec.pc_dir = pc_dir;
@@ -662,22 +661,6 @@ int main(int argc, char ** argv) {
             cfg.max_video_side = max_video_side;
             return serve(e, cfg);
         }
-        if (cmd == "mineru") {
-            if (mmproj_path.empty()) {
-                fprintf(stderr, "error: mineru needs --mmproj <mmproj.gguf>\n");
-                return 1;
-            }
-            if (image_paths.empty()) {
-                fprintf(stderr, "error: mineru needs --image <page.png>\n");
-                return 1;
-            }
-            mineru_options mo;
-            mo.layout_side = mineru_layout_side;
-            mo.max_tokens = max_tokens > 256 ? max_tokens : 4096;
-            mo.only_type = mineru_only_type;
-            mo.debug = si::env::flag("PF_MINERU_DEBUG");
-            return run_mineru(e, mmproj_path, image_paths[0], mo, stdout);
-        }
         if (cmd == "gen") {
             gen_params gp;
             gp.max_tokens = max_tokens;
@@ -715,7 +698,7 @@ int main(int argc, char ** argv) {
                         if (mmproj_path.empty()) {
                             throw std::runtime_error("--image/--video requires --mmproj <mmproj.gguf>");
                         }
-                        vm_owned.load(mmproj_path, e.m.prof ? e.m.prof->vision : model_profile::vision_kind::qwen3vl);
+                        vm_owned.load(mmproj_path, e.m.prof ? e.m.prof->vision : model_profile::vision_kind::none);
                         // "loaded" is not "can run": ask before anything else is
                         // allocated, so an unsupported projector geometry is a
                         // message instead of a device fault inside the first

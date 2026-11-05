@@ -33,6 +33,8 @@
 #include "kernels.h"
 #include "media_fetch.h"
 #include "multimodal.h"
+#include "pipeline/registry.h"
+#include "pipeline_http.h"
 #include "request.h"
 #include "response.h"
 #include "response_parser.h"
@@ -635,7 +637,7 @@ int serve(engine & e, const server_config & cfg) {
     mm_server mm;
     if (!cfg.mmproj_path.empty()) {
         try {
-            mm.vm.load(cfg.mmproj_path, e.m.prof ? e.m.prof->vision : model_profile::vision_kind::qwen3vl);
+            mm.vm.load(cfg.mmproj_path, e.m.prof ? e.m.prof->vision : model_profile::vision_kind::none);
             if (mm.vm.hp.proj_dim != e.m.hp.n_embd) {
                 throw std::runtime_error("vision projector output width != text n_embd");
             }
@@ -689,6 +691,12 @@ int serve(engine & e, const server_config & cfg) {
                         {"owned_by", "local"},
                         {"meta", {{"n_ctx", e.max_seq}, {"n_vocab", e.m.hp.n_vocab}, {"n_layer", e.m.hp.n_layer}}}};
 
+    // Request-level pipelines are registered here, at startup, and only here.
+    // The registry is empty by default: every pipeline has to pass the
+    // admission rule in docs/design/22-pipelines.md before it belongs in the
+    // worker process.
+    pipeline_registry pipelines;
+
     httplib::Server srv;
     srv.set_read_timeout(3600, 0);
     srv.set_write_timeout(3600, 0);
@@ -710,6 +718,26 @@ int serve(engine & e, const server_config & cfg) {
     };
     auto bad_request = [&](httplib::Response & res, const std::string & msg, const std::string & type) {
         set_json(res, 400, {{"error", {{"message", msg}, {"type", type}}}});
+    };
+    // A pipeline id must not become a model alias by accident: the worker has
+    // always ignored the chat body's `model`, which made any string "work".
+    // Accept the model's own id (or the configured fallback) and reject the
+    // rest; the router rewrites the id before forwarding, so its clients are
+    // unaffected.
+    auto reject_model = [&](const json & body, httplib::Response & res) {
+        if (!body.contains("model") || body["model"].is_null()) {
+            return false;
+        }
+        if (!body["model"].is_string()) {
+            bad_request(res, "'model' must be a string", "invalid_request_error");
+            return true;
+        }
+        const std::string m = body["model"].get<std::string>();
+        if (model_id_accepted(m, model_id, cfg.model_id)) {
+            return false;
+        }
+        set_json(res, 404, {{"error", {{"message", "model '" + m + "' not found"}, {"type", "invalid_request_error"}}}});
+        return true;
     };
     // The prompt-length/emptiness policy lives in request.cpp so it can be
     // asserted without a socket; only the status and content type are here.
@@ -735,20 +763,14 @@ int serve(engine & e, const server_config & cfg) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
     });
 
-    srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
-        cors(res);
-        set_json(res, 200, {{"object", "list"}, {"data", json::array({model_entry})}});
-    });
-    srv.Get(R"(/v1/models/(.+))", [&](const httplib::Request & req, httplib::Response & res) {
-        cors(res);
-        const std::string id = req.matches[1];
-        if (id != model_id && id != cfg.model_id) {
-            set_json(res, 404,
-                     {{"error", {{"message", "model '" + id + "' not found"}, {"type", "invalid_request_error"}}}});
-            return;
-        }
-        set_json(res, 200, model_entry);
-    });
+    // Model discovery stays models-only.  The pipeline table is a separate
+    // endpoint; a pipeline id must never appear here or become a model alias.
+    pipeline_http_config pcfg;
+    pcfg.model_id = model_id;
+    pcfg.fallback_model_id = cfg.model_id;
+    pcfg.model_entry_json = dump_json(model_entry);
+    register_model_list_http(srv, pcfg);
+    register_pipeline_http(srv, pipelines, e.m.prof, model_id);
 
     auto cors_sse = [](httplib::Response & res) {
         res.set_header("Cache-Control", "no-cache");
@@ -762,6 +784,9 @@ int serve(engine & e, const server_config & cfg) {
             body = json::parse(req.body);
         } catch (...) {
             bad_request(res, "invalid json", "invalid_request_error");
+            return;
+        }
+        if (reject_model(body, res)) {
             return;
         }
         std::vector<media_part> media;
@@ -988,6 +1013,9 @@ int serve(engine & e, const server_config & cfg) {
             body = json::parse(req.body);
         } catch (...) {
             bad_request(res, "invalid json", "invalid_request_error");
+            return;
+        }
+        if (reject_model(body, res)) {
             return;
         }
         static const bool srv_t = si::env::flag("PF_SRV_TIME");

@@ -119,6 +119,11 @@ struct model_profile {
         // Default for the PLE engram row cache (`--engram-ram-mb`).  Only read
         // by a forward that has PLE; 0 = no cache.
         size_t engram_ram_mb_default = 0;
+        // Keep the GGUF page cache across `page_out_host` (`PF_Q4_KEEPCACHE`).
+        // A model whose startup copies tens of GiB into a pinned expert source
+        // reads the file more than once and would otherwise pay the disk pass
+        // on every start.  The PTEs are still dropped, so RSS is unchanged.
+        bool keep_file_cache = false;
     } policy;
 
     // Weight representation the file can actually use.  These are capabilities,
