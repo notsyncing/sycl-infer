@@ -59,6 +59,13 @@ struct hparams {
     int n_mtp = 0;
     // M-RoPE pair counts per section (t, h, w, e); all-zero = plain RoPE
     int rope_sections[4] = {0, 0, 0, 0};
+    // Qwen3.5-family text models (qwen35, qwen35moe, qwen4exp) use Qwen3-VL's
+    // *interleaved* M-RoPE: sector = pair % sect_dims and the temporal/row/col
+    // axis cycles by sector % 3.  Qwen2-VL uses blocked sections instead.
+    // The two are indistinguishable from `rope_sections` alone on the 27B/35B
+    // (sections sum to n_rot/2 there too), so the layout is an explicit
+    // architecture fact rather than a derived one.
+    int mrope_interleaved = 0;
 
     // ---- Mixture of Experts (`qwen35moe` and friends) ----------------------
     // n_expert == 0 means the FFN is dense and n_ff is its width.  When it is

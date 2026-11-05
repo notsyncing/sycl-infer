@@ -730,7 +730,7 @@ int main(int argc, char ** argv) {
                         img_cfg.patch_size = vm.hp.patch_size;
                         img_cfg.merge = vm.hp.merge;
                         const int patch_area = img_cfg.patch_size * img_cfg.patch_size * img_cfg.merge * img_cfg.merge;
-                        img_cfg.min_pixels = 8 * patch_area;
+                        img_cfg.min_pixels = vm.hp.min_pixels;
                         img_cfg.max_pixels = kMaxImgTokens * patch_area;
                         for (int c = 0; c < 3; c++) {
                             img_cfg.mean[c] = vm.hp.mean[c];

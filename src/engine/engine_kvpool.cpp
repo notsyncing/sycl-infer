@@ -789,6 +789,7 @@ bool engine::ensure_block_headroom(std::vector<int> & blocks, int pos, int looka
 void engine::reset_step_info(step_info * inf) {
     std::memset(inf, 0, sizeof(step_info));
     std::memcpy(inf->mrope_sections, m.hp.rope_sections, sizeof(m.hp.rope_sections));
+    inf->mrope_interleaved = m.hp.mrope_interleaved;
 }
 
 } // namespace si

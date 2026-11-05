@@ -35,6 +35,7 @@ cpu_step_info to_cpu_info(const step_info * in) {
     std::memcpy(c.pc_row_slot, in->pc_row_slot, sizeof(c.pc_row_slot));
     c.mrope_on = in->mrope_on;
     std::memcpy(c.mrope_sections, in->mrope_sections, sizeof(c.mrope_sections));
+    c.mrope_interleaved = in->mrope_interleaved;
     std::memcpy(c.mrope, in->mrope, sizeof(c.mrope));
     c.img_embd = in->img_embd;
     std::memcpy(c.img_row, in->img_row, sizeof(c.img_row));

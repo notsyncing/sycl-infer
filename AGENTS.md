@@ -138,6 +138,17 @@ cmake --build build -j$(nproc)
 
 * `icpx` is required; CMake sets `CMAKE_CXX_COMPILER` to it and links with `-fsycl`.
 * oneDNN is expected at `/opt/intel/oneapi/dnnl/2026.0` (`-DDNNL_ROOT=` to override).
+* **The Docker base is `intel/oneapi-toolkit`** (the 2026 rename of
+  `intel/oneapi-basekit`); the 2026.2 tag is `2026.2.0-devel-ubuntu26.04` and
+  matches the host's glibc.  AOT needs IGC's `ocloc`, which the toolkit image
+  does not contain: it and the Level Zero/OpenCL runtime come from
+  `ppa:kobuk-team/intel-graphics` (`intel-ocloc`, `intel-opencl-icd`,
+  `libze1`, `libze-intel-gpu1`).  Measured on Arc 140V (2026-11): the 2026.2
+  SYCL runtime is ~16% slower for the 35B prefill than 2026.1 (467 vs 544-558
+  tok/s, decode unchanged), so pin `ONEAPI_VERSION=2026.1.1` when the
+  documented prefill rate matters.  The `docker/` files take the proxy and
+  Ubuntu mirror as build args (`HTTP_PROXY`/`UBUNTU_MIRROR`) so a restricted
+  egress does not change the image.
 * `-DSYCL_INFER_AOT=ON` AOT-compiles the device image for `adl-p`
   (`-DSYCL_INFER_AOT_DEVICE=` overrides the target).  The device lowering
   (`llvm-foreach -> ocloc`/IGC) only runs at the **final link**, never at `-c`,
@@ -186,6 +197,19 @@ cmake --build build --target sycl-infer -j$(nproc)   # only the binary, not ever
 * `CMakeLists.txt` also passes `-fsycl-device-code-split=per_kernel`: the
   default (`auto`) merges a whole module into one image, which serialises the
   lowering; per-kernel images can run in parallel and be skipped individually.
+* **An Xe2 AOT target (`lnl`/`bmg`) must omit `nat_gemm`'s SG=8 image.**  ocloc
+  rejects `reqd_sub_group_size(8)` when lowering for Lunar Lake/Battlemage (the
+  part advertises only 16 and 32), and AOT lowers every *instantiated* kernel
+  whether or not the runtime profile (`hw.sub_group8 = 0`) would dispatch it.
+  That is why a `lnl` build of a JIT-clean tree failed at the final link with
+  "required subgroup size 8, which is unsupported on this platform".  CMake
+  defines `SI_NO_SG8` for an Xe2 AOT build and the launcher takes SG=16, which
+  is numerically identical; a JIT build still instantiates both and dispatches
+  per card.
+* A fresh configure must select `icpx`: `CMakeLists.txt` finds it and sets
+  `CMAKE_CXX_COMPILER` **before** `project()`.  Setting it after `project()`
+  leaves the system `g++` cached and the first `-fsycl` flag fails; only a
+  build directory that already had `icpx` in its cache worked.
 * Use `-DCMAKE_BUILD_TYPE=Release`.  A Debug build's `-g` adds device debug
   info that makes each image several times larger and slower to lower (measured
   ~2.3x and 4.4x the binary size on one GEMV TU); the forced `-O2` does not
@@ -591,6 +615,31 @@ third_party/    httplib.h, json.hpp, minja/ (Jinja chat template engine, MIT),
 ## How to extend
 
 ### Add a model architecture
+
+**Before writing the loader, decide what is architecture-specific and declare
+it; never hardcode it at the use site.**  A new model is not a new `if` in the
+engine or in a kernel.  Enumerate the facts that can differ from the
+architectures already supported - RoPE layout (blocked vs interleaved, partial
+rotary sections), M-RoPE axis mapping, image preprocessing floors/ceilings,
+attention geometry, tokenizer/pad tokens, KV or recurrent layout, which
+mechanisms it supports - and give each one a name: `model_profile` for policy
+and capabilities, the loader-filled `hparams` for file/geometry facts.  The use
+site reads that field.  It must not branch on the model name, on a GGUF
+metadata key, or on an accidental numeric coincidence.  If a fact is only known
+after parsing the GGUF, set it in the loader's `hparams` and copy it into the
+POD the kernel sees; do not make the engine or a kernel re-read the file.
+
+This is not cosmetic.  The 35B deployment's Qwen3.5/3.6 image path failed
+because `rope.dimension_sections = [11,11,10,0]` sums to `n_rot/2`, exactly as
+Qwen2-VL's *blocked* sections do, so a predicate "`sum == n_rot/2` means
+blocked" silently sent Qwen3.5 image prompts through the wrong M-RoPE (`WORLD`
+came out `VOWEL`).  The fix was `hparams::mrope_interleaved`, set by the loader
+and carried in `step_info`/`cpu_step_info`, not a cleverer predicate.  The same
+class of fact is the Qwen3-VL preprocessing floor (`shortest_edge = 65536`,
+now `vision_hparams::min_pixels`): it used to be the same `8 * patch_area` for
+every vision tower, which is wrong for a Qwen3-VL file.  If a future
+architecture differs in a way no field represents, add the field to the model
+profile or `hparams` in the same change - do not leave the difference implicit.
 
 1. Create `src/model/<arch>.cpp` defining `si::arch::load_<arch>(model & m)` that
    fills `m.hp` and binds the layer tensors (copy the structure of
@@ -3752,6 +3801,14 @@ name.
 architecture's model profile, not in an `m.q4exp` ternary at its use site.**
 The use site asks for it by name.
 
+Every new model must have a profile.  Architecture facts that are *geometry or
+file properties* rather than policy - RoPE layout, image preprocessing floors,
+pad tokens, KV/recurrent layout - belong in the loader-filled `hparams` instead
+of the profile's policy fields, and are read by name from the engine or the POD
+the kernel sees.  The rule is the same for both: **declare the difference where
+the architecture is loaded; never hardcode it, infer it from a GGUF key, or
+branch on the model name at the use site.**
+
     src/model/model_profile.h       the `model_profile` struct: the declaration
     src/model/profiles/<arch>.cpp   one architecture's COMPLETE profile: its key,
                                     values and provenance
@@ -5269,18 +5326,30 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   cancelled generation still finishes the decode step it is in (~65 ms).
 
 * **Multimodal**: an image consumes `max(nx, ny)` positions, not one per token,
-  and the text model uses **interleaved** M-RoPE (`rope.dimension_sections`, e.g.
-  `[11,11,10,0]`) where the pair index picks the temporal/row/col position
-  (`src/backend/gpu/kernels/qk_norm_rope.cpp`).  Image tokens never reach
-  `tok_embd`: the embed kernel copies `step_info::img_embd[img_row[t]]` instead.
-  Video blocks add a temporal axis (M-RoPE `(frame,row,col)`) and audio blocks
-  are a pure time stream (`(pos,0,0)`, `n_pos = n_out`); both reuse the same
-  `img_embd` rows and `img_row` mapping.  The multimodal path bypasses the
-  prefix cache and uses the single-sequence `engine::generate_mm`; `kMaxImgTokens`
-  bounds one request's merged tokens.  Because an image consumes `max(nx, ny)`
-  positions for `4*nx*ny` tokens, the KV slot index (token count) and the RoPE
-  position diverge: decode keeps `info->pos` = token count and carries the
-  running RoPE position in `step_info::mrope` with `mrope_on` set.
+  and Qwen3.5-family text models (`qwen35`, `qwen35moe`, `qwen4exp`) use
+  **interleaved** M-RoPE (`rope.dimension_sections`, e.g. `[11,11,10,0]`) where
+  the pair index picks the temporal/row/col position by `sector % 3`
+  (`src/backend/gpu/kernels/qk_norm_rope.cpp`).  **The layout is a loader fact,
+  not a derived one**: Qwen2-VL's blocked sections and Qwen3.5's interleaved
+  sections can have the same sum, and on the 27B/35B `{11,11,10,0}` sums to
+  exactly `n_rot/2` (32).  An earlier `sect_dims == n_rot/2` test therefore
+  silently ran the 35B's image prompts through blocked M-RoPE: text-only answers
+  were unaffected (all positions equal) and a uniform colour still described,
+  but OCR came out as garbage (`WORLD` -> `VOWEL`, a clear 1024x1024 page read a
+  wrong year).  `hparams::mrope_interleaved` is now set to 1 by the three
+  Qwen3.5 loaders and 0 by `qwen2vl`, and `step_info`/`cpu_step_info` carry it
+  to both kernels.  Image tokens never reach `tok_embd`: the embed kernel copies
+  `step_info::img_embd[img_row[t]]` instead.  The Qwen3-VL preprocessing floor
+  is the official `shortest_edge = 65536` (`vision_hparams::min_pixels`);
+  without it a small image is encoded at a token count far below the model's
+  reliable floor.  Video blocks add a temporal axis (M-RoPE `(frame,row,col)`)
+  and audio blocks are a pure time stream (`(pos,0,0)`, `n_pos = n_out`); both
+  reuse the same `img_embd` rows and `img_row` mapping.  The multimodal path
+  bypasses the prefix cache and uses the single-sequence `engine::generate_mm`;
+  `kMaxImgTokens` bounds one request's merged tokens.  Because an image consumes
+  `max(nx, ny)` positions for `4*nx*ny` tokens, the KV slot index (token count)
+  and the RoPE position diverge: decode keeps `info->pos` = token count and
+  carries the running RoPE position in `step_info::mrope` with `mrope_on` set.
 
 * **A MoE model's expert strides are per *layer*, not per tensor, and the file
   decides.**  The 35B A3B has Q4_K gate/up everywhere but Q5_K down for 37 layers

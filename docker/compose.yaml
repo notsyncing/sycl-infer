@@ -20,8 +20,9 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.all
       args:
-        ONEAPI_VERSION: "2026.2"
-        AOT_DEVICE: "acm-g10"      # 'adl-p' for the Iris Xe
+        ONEAPI_VERSION: "2026.2.0"
+        UBUNTU_TAG: "ubuntu26.04"
+        AOT_DEVICE: "acm-g10"      # 'adl-p' for the Iris Xe, 'lnl' for the Arc 140V
     image: sycl-infer/all:latest
     ports:
       - "8080:8080"

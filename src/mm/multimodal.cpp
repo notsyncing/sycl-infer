@@ -234,7 +234,7 @@ image_preproc_cfg vision_cfg(const vision_model & vm) {
     cfg.patch_size = vm.hp.patch_size;
     cfg.merge = vm.hp.merge;
     const int patch_area = cfg.patch_size * cfg.patch_size * cfg.merge * cfg.merge;
-    cfg.min_pixels = 8 * patch_area;
+    cfg.min_pixels = vm.hp.min_pixels;
     cfg.max_pixels = kMaxImgTokens * patch_area;
     for (int c = 0; c < 3; c++) {
         cfg.mean[c] = vm.hp.mean[c];

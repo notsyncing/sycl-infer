@@ -232,6 +232,14 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         pos_embd = pos_embd_host.data();
     }
 
+    {
+        const int patch_area = hp.patch_size * hp.patch_size * hp.merge * hp.merge;
+        // Qwen3-VL's preprocessor_config.json: shortest_edge = 65536.  The
+        // Qwen2-VL reference (MinerU) uses a much smaller floor and its verified
+        // page path never reaches it, so keep its existing 8-token floor.
+        hp.min_pixels = (kind == model_profile::vision_kind::qwen3vl ? 64 : 8) * patch_area;
+    }
+
     post_ln = bind_f32_opt(f, "v.post_ln.weight");
     post_ln_b = bind_f32_opt(f, "v.post_ln.bias");
     if (!post_ln) {

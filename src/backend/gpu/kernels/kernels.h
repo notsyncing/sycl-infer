@@ -115,6 +115,10 @@ struct step_info {
     // token's embedding with row `img_row[t]` of `img_embd` (n_embd floats).
     int32_t mrope_on;
     int32_t mrope_sections[4]; // text-model rope sections (pairs)
+    // 1 = Qwen3-VL interleaved M-RoPE (qwen35/qwen35moe/qwen4exp), 0 = blocked
+    // (Qwen2-VL).  This is an architecture fact, not derivable from the
+    // section widths: on the 27B/35B the sections sum to n_rot/2 as well.
+    int32_t mrope_interleaved;
     int32_t mrope[4 * kMaxB * kMaxT];
     const float * img_embd;
     int32_t img_row[kMaxB * kMaxT];

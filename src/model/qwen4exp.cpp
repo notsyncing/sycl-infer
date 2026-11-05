@@ -83,6 +83,8 @@ void load_qwen4exp(model & m) {
             hp.rope_sections[i] = sec->arr[i].as_i32();
         }
     }
+    // Qwen3.5/3.6's text model is Qwen3-VL-style: interleaved M-RoPE.
+    hp.mrope_interleaved = 1;
 
     hp.n_expert = (int)f.get_u32(key("expert_count"));
     hp.n_expert_used = (int)f.get_u32(key("expert_used_count"));

@@ -56,6 +56,11 @@ struct vision_hparams {
     int proj_dim = 0;
     int merge = 2;
     int n_pos_side = 0; // sqrt(position_embd rows)
+    // Preprocessing pixel floor.  Qwen3-VL's official processor uses
+    // shortest_edge = 65536 (64 merged tokens); the engine previously used
+    // 8 * patch_area for every tower, which let a small image through at a
+    // token count far below the model's reliable floor.
+    int min_pixels = 0;
     float eps = 1e-6f;
     float rope_base = 10000.0f;
     float mean[3] = {0.5f, 0.5f, 0.5f};

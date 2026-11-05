@@ -7,13 +7,31 @@
 #     runtime) must match the host's kernel driver;
 #   * with AOT, the device image is compiled for one SKU, so
 #     SYCL_INFER_AOT_DEVICE must be that SKU's ocloc target ('acm-g10' for
-#     the A770, 'adl-p' for the Iris Xe).  Check `ocloc query` rather than
-#     inheriting a default.
+#     the A770, 'adl-p' for the Iris Xe, 'lnl' for the Arc 140V / Lunar Lake).
+#     Check `ocloc query` rather than inheriting a default.
+#
+# The base image was renamed from `intel/oneapi-basekit` to
+# `intel/oneapi-toolkit`; the 2026.2 tag is `2026.2.0-devel-ubuntu26.04`.
+# Ubuntu 26.04 matches the host's glibc (2.43), so the binary does not need a
+# second build for the container.
+#
+# Measured on Arc 140V (2026-11): oneAPI 2026.2's SYCL runtime is ~16% slower
+# for the 35B prefill than 2026.1 (467 vs 544-558 tok/s on the same prompt and
+# binary).  Pin `--build-arg ONEAPI_VERSION=2026.1.1` when the documented rate
+# matters (and set DNNL_VERSION to that toolkit's bundled oneDNN, 2026.0 on the
+# host's 2026.1 install); 2026.2 is the default because it is the newest tag.
+#
+# `intel-ocloc` is NOT part of the toolkit image: AOT lowering is done by IGC's
+# ocloc, which ships in the Intel graphics PPA.  The same PPA provides the
+# Level Zero driver / OpenCL ICD the runtime needs (the old `intel-level-zero-gpu`
+# and `level-zero` apt names are gone; the current names are `libze-intel-gpu1`,
+# `libze1`, `libigdgmm12`, `intel-opencl-icd`).
 #
 # Build (from the repository root):
 #   docker build -f docker/Dockerfile.worker \
-#     --build-arg ONEAPI_VERSION=2026.2 \
-#     --build-arg AOT_DEVICE=acm-g10 \
+#     --build-arg ONEAPI_VERSION=2026.2.0 \
+#     --build-arg UBUNTU_TAG=ubuntu26.04 \
+#     --build-arg AOT_DEVICE=lnl \
 #     -t sycl-infer/worker:latest .
 #
 # Run:
@@ -22,28 +40,39 @@
 #     sycl-infer/worker:latest --model /models/x.gguf --port 8081 \
 #       --control-host 0.0.0.0 --control-port 8082 serve
 
-ARG ONEAPI_VERSION=2026.2
-ARG UBUNTU_TAG=ubuntu24.04
+ARG ONEAPI_VERSION=2026.2.0
+ARG UBUNTU_TAG=ubuntu26.04
+# The runtime base is normally the slim oneAPI runtime.  A network or
+# registry restriction can make that image unavailable; the toolkit image
+# carries the same runtime plus the GPU stack, so it can be substituted with
+# RUNTIME_IMAGE=intel/oneapi-toolkit INSTALL_GPU=0.
+ARG RUNTIME_IMAGE=intel/oneapi-runtime
 
-FROM intel/oneapi-basekit:${ONEAPI_VERSION}-devel-${UBUNTU_TAG} AS build
+FROM intel/oneapi-toolkit:${ONEAPI_VERSION}-devel-${UBUNTU_TAG} AS build
 ARG ONEAPI_VERSION
 ARG UBUNTU_TAG
 ARG DNNL_VERSION=2026.1
 ARG AOT=ON
 ARG AOT_DEVICE=acm-g10
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
- && apt-get install -y --no-install-recommends cmake git wget gnupg \
- && wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list" \
- && wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list \
+# The caller supplies the build-time proxy; an address is never baked into the
+# image.  Docker's predefined proxy build args are not enough on the legacy
+# builder, so make them explicit environment variables for apt/wget/launchpad.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG UBUNTU_MIRROR=archive.ubuntu.com
+ENV http_proxy=${HTTP_PROXY} https_proxy=${HTTPS_PROXY} no_proxy=${NO_PROXY}
+# Some egress proxies cannot reach archive.ubuntu.com; point the image's
+# deb822 sources at a reachable Ubuntu mirror at build time.
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|https://${UBUNTU_MIRROR}/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://${UBUNTU_MIRROR}/ubuntu|g" /etc/apt/sources.list.d/ubuntu.sources \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-      dnnl-${DNNL_VERSION}--devel \
-      intel-level-zero-gpu \
-      intel-opencl-icd \
-      level-zero \
- && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
+      cmake git wget gnupg software-properties-common ca-certificates \
+ && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends intel-ocloc \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . /src
 # The AOT device image is lowered at the final link, which is the expensive
@@ -55,23 +84,38 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DSYCL_INFER_AOT=${AOT} -DSYCL_INFER_AOT_DEVICE=${AOT_DEVICE} \
  && cmake --build build --target sycl-infer -j"$(nproc)"
 
-FROM intel/oneapi-runtime:${ONEAPI_VERSION}-${UBUNTU_TAG}
+FROM ${RUNTIME_IMAGE}:${ONEAPI_VERSION}-devel-${UBUNTU_TAG}
 ARG ONEAPI_VERSION
 ARG UBUNTU_TAG
+ARG INSTALL_GPU=1
 ENV DEBIAN_FRONTEND=noninteractive
-RUN wget -qO /tmp/oneapi.list "https://apt.repos.intel.com/oneapi/all/intel-oneapi.list" \
- && wget -qO- "https://apt.repos.intel.com/oneapi/gpgkey" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi/all ${UBUNTU_TAG} main" > /etc/apt/sources.list.d/oneapi.list \
- && apt-get update \
- && apt-get install -y --no-install-recommends \
-      dnnl-${ONEAPI_VERSION}-runtime \
-      intel-level-zero-gpu \
-      intel-opencl-icd \
-      level-zero \
- && rm -rf /var/lib/apt/lists/* /tmp/oneapi.list
+# The caller supplies the build-time proxy; an address is never baked into the
+# image.  Docker's predefined proxy build args are not enough on the legacy
+# builder, so make them explicit environment variables for apt/wget/launchpad.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG UBUNTU_MIRROR=archive.ubuntu.com
+ENV http_proxy=${HTTP_PROXY} https_proxy=${HTTPS_PROXY} no_proxy=${NO_PROXY}
+# Some egress proxies cannot reach archive.ubuntu.com; point the image's
+# deb822 sources at a reachable Ubuntu mirror at build time.
+RUN if [ "${INSTALL_GPU}" = "1" ]; then \
+      sed -i "s|http://archive.ubuntu.com/ubuntu|https://${UBUNTU_MIRROR}/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://${UBUNTU_MIRROR}/ubuntu|g" /etc/apt/sources.list.d/ubuntu.sources \
+      && apt-get update \
+      && apt-get install -y --no-install-recommends \
+           wget gnupg software-properties-common ca-certificates \
+      && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+      && apt-get update \
+      && apt-get install -y --no-install-recommends \
+           intel-opencl-icd \
+           libze1 \
+           libze-intel-gpu1 \
+           libigdgmm12 \
+      && rm -rf /var/lib/apt/lists/* ; \
+    fi
 COPY --from=build /src/build/sycl-infer /usr/local/bin/sycl-infer
-# The dynamic loader needs the runtime's libraries; the router adds these to
-# the workers it starts, but a worker started by hand needs them here.
-ENV LD_LIBRARY_PATH=/opt/intel/oneapi/${ONEAPI_VERSION}/lib:/opt/intel/oneapi/dnnl/${ONEAPI_VERSION}/lib:${LD_LIBRARY_PATH}
+# The oneAPI runtime image keeps its libraries in /opt/intel/oneapi/redist/lib.
+# The GPU stack (libze, IGC) is in the normal loader path from the PPA.
+ENV LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:/opt/intel/oneapi/compiler/${ONEAPI_VERSION}/lib:${LD_LIBRARY_PATH}
 ENTRYPOINT ["/usr/local/bin/sycl-infer"]
 CMD ["--help"]

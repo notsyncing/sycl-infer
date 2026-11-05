@@ -1,4 +1,24 @@
 cmake_minimum_required(VERSION 3.20)
+
+# The router is a plain host program: it needs neither SYCL nor oneDNN.  This
+# option builds ONLY it, with the system compiler, so its container image does
+# not need the oneAPI toolchain at all (and the build does not pay for the
+# device pass).  See docs/design/16-router.md §11.
+option(SI_ROUTER_ONLY "build only the router (no SYCL, no oneDNN, no GPU)" OFF)
+
+# The compiler must be selected BEFORE project(): project() enables the CXX
+# language and locks in whatever compiler is current.  This used to run after
+# project(), so a fresh tree configured with the system g++ and then failed on
+# its first -fsycl flag; only a build directory that already had icpx cached
+# worked.
+if(NOT SI_ROUTER_ONLY)
+    find_program(ICXX NAMES icpx PATHS /opt/intel/oneapi/compiler/latest/bin ENV PATH)
+    if(NOT ICXX)
+        message(FATAL_ERROR "icpx not found")
+    endif()
+    set(CMAKE_CXX_COMPILER ${ICXX} CACHE FILEPATH "oneAPI DPC++ compiler" FORCE)
+endif()
+
 project(sycl-infer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -26,19 +46,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_options(-O2)
 endif()
 
-# The router is a plain host program: it needs neither SYCL nor oneDNN.  This
-# option builds ONLY it, with the system compiler, so its container image does
-# not need the oneAPI toolchain at all (and the build does not pay for the
-# device pass).  See docs/design/16-router.md §11.
-option(SI_ROUTER_ONLY "build only the router (no SYCL, no oneDNN, no GPU)" OFF)
-
 if(NOT SI_ROUTER_ONLY)
-    find_program(ICXX NAMES icpx PATHS /opt/intel/oneapi/compiler/latest/bin ENV PATH)
-    if(NOT ICXX)
-        message(FATAL_ERROR "icpx not found")
-    endif()
-    set(CMAKE_CXX_COMPILER ${ICXX})
-
     add_compile_options(-fsycl)
     add_link_options(-fsycl)
 endif()
@@ -107,6 +115,16 @@ if(NOT SI_ROUTER_ONLY)
     if(SI_XE2_TARGET)
         add_compile_definitions(SI_MOE_TILED_WIDE=1)
         message(STATUS "sycl-infer: Xe2 wide device kernels enabled (SI_MOE_TILED_WIDE)")
+        if(SYCL_INFER_AOT)
+            # ocloc rejects a reqd_sub_group_size(8) kernel when lowering for
+            # an Xe2 target (Lunar Lake/Battlemage advertise only 16 and 32),
+            # and AOT lowers every instantiated kernel whether or not the
+            # runtime would dispatch it.  nat_gemm's SG=8 form is therefore
+            # omitted from an Xe2 AOT image; the launcher takes SG=16, which
+            # is numerically identical.
+            add_compile_definitions(SI_NO_SG8=1)
+            message(STATUS "sycl-infer: Xe2 AOT - SG=8 kernel images omitted (SI_NO_SG8)")
+        endif()
     endif()
 endif()
 

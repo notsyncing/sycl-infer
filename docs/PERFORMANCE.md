@@ -336,6 +336,65 @@ Context capacity on this part is in
 GiB is not enforced by Level Zero; 448k at i8 / 896k at i4 are the safe
 maxima, 262k the trained window).
 
+#### 4.5.1 The 35B deployed with the vision projector and 8 slots
+
+`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` + `mmproj-BF16.gguf`, one Arc 140V, inside
+the project worker image (Ubuntu 26.04 runtime, AOT `lnl`, 2026-11-05):
+`--layer-map 0-39:gpu.0 --ctx 16384 --kv-type i8 --max-slots 8
+--cpu-threads 8`, `PF_W4_ALL=1 PF_PREFIX_CACHE=0`, OpenAI server on `:8080`.
+The `PF_MOE_BANK_AUTO` governor keeps the u4 gate/up bank and keeps the down
+plane **raw** here: vision (866 MiB), 16k KV and 8 recurrent-state slots do not
+fit both banks, and the shed is the documented +13.7% prefill cost, not a
+regression.
+
+| cell | measured |
+|---|---:|
+| 3.4k prose prompt, warm | **6.14 s = 558 tok/s** (two runs 557.6 / 558.4) |
+| same, first request after start | 7.6 s = 450 tok/s (oneDNN primitive creation) |
+| 10.3k prose prompt (10 273 tokens), warm | **19.41 s = 529 tok/s** |
+| short-prompt decode | **32.5 tok/s** (30.7-31.1 on the 3.4k cell, 28.0 at 10.3k) |
+| 8 concurrent text requests, 215 completion tokens | **35.0 tok/s aggregate** (6.14 s wall) |
+| 4 concurrent text requests, 107 completion tokens | 28.2 tok/s aggregate (3.79 s) |
+| 2 concurrent image requests | both correct (`hello`, `red`), 18.6 s wall |
+
+The 558 tok/s is the governor-shed number and matches the 641 tok/s both-bank
+figure times (1 - 0.137).  **The 641 figure is not reachable with image input
+on this part**: keeping both banks leaves ~1.5 GiB and the 866 MiB projector
+plus activations turns the shared-memory overcommit into
+`UR_RESULT_ERROR_DEVICE_LOST`, which is the failure mode AGENTS.md warns about.
+
+Image results on the same build: a 768x768 rendered word reads correctly
+(`WORLD`, `HELLO` -> `hello`); a 1024x1024 three-line image reads
+`Hello World 2025` where the rendered text is `HELLO / WORLD 2026 / QWEN TEST`.
+That is **not an engine bug**: a CPU `llama-mtmd-cli` reference on the same
+GGUF + mmproj also read the first two lines only and invented the third
+(`HELLO`, `WORLD`, `WORLD`), so the remaining error is the Q4_K_M model.  A
+384x384 image (144 merged tokens) is below the model's reliable grounding
+floor and misreads; llama.cpp prints the same warning and recommends >=1024
+image tokens.  The Qwen3-VL preprocessing floor is now the official
+`shortest_edge = 65536` (`vision_hparams::min_pixels`), which is not enough to
+upscale a 384x384 image (147k pixels) but is the correct reference value for
+smaller inputs.
+
+This deployment is the first image test of the Qwen3.5-family text path on this
+part and it found the interleaved/blocked M-RoPE discriminator bug recorded in
+[AGENTS.md](../AGENTS.md) *Invariants and gotchas*: with the old heuristic the
+same 768x768 `WORLD` image read `VOWEL`, and a 384x384 `WORLD` read `BQ`.
+
+**The official Dockerfile build (`intel/oneapi-toolkit:2026.2.0-devel-ubuntu26.04`)
+is functionally correct but its prefill is 16% slower than the numbers above.**
+The same 3.4k prompt measures **467 tok/s warm** with the image's own 2026.2
+binary.  The cause is the **2026.2 SYCL runtime**, not the compiler, oneDNN or
+the model: the build's own binary with the 2026.2 libs is 467; that same binary
+with the host's 2026.1 `libsycl`/UR is **558.4**; and the 2026.2 `libsycl` with
+the host's oneDNN 2026.0 and the host-built binary is 470.2.  The decode is
+unaffected (30.5-31.1 tok/s in both).  The deployed image therefore uses the
+measured 2026.1 runtime; pin `ONEAPI_VERSION=2026.1.1` (also on Docker Hub) when
+building the official image if the documented prefill rate matters.  A
+version-dependent near-tie was also visible in OCR: the 2026.2 image read the
+768x768 `WORLD` as ` volid` once while the 2026.1 image read `WORLD`, and both
+read the 1024x1024 image as `Hello World 2025`.
+
 ## 5. Qwen3.8-27B — the dense model
 
 `Qwen3.8-27B-UD-Q4_K_M.gguf`, `qwen35`: 64 layers, 16 full-attention (24 query

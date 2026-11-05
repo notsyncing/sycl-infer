@@ -644,7 +644,7 @@ int serve(engine & e, const server_config & cfg) {
             mm.cfg.patch_size = mm.vm.hp.patch_size;
             mm.cfg.merge = mm.vm.hp.merge;
             const int patch_area = mm.cfg.patch_size * mm.cfg.patch_size * mm.cfg.merge * mm.cfg.merge;
-            mm.cfg.min_pixels = 8 * patch_area;
+            mm.cfg.min_pixels = mm.vm.hp.min_pixels;
             mm.cfg.max_pixels = kMaxImgTokens * patch_area;
             for (int c = 0; c < 3; c++) {
                 mm.cfg.mean[c] = mm.vm.hp.mean[c];

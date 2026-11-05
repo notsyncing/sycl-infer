@@ -174,13 +174,12 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                     const int sector = sect_dims > 0 ? lane % sect_dims : lane;
                     // Two layouts share this field.  Qwen3.5 (Qwen3-VL's
                     // "imrope") cycles temporal/row/col by sector%3 over the
-                    // whole pair list.  Qwen2-VL uses *blocked* sections: its
-                    // mrope_section sums to exactly n_rot/2, and pairs
-                    // [0,s0) are temporal, [s0,s0+s1) row, [s0+s1,...) col -
-                    // exactly ggml's non-imrope branch.  The sum is the
-                    // discriminator: Qwen3.5's sections sum to 32 while its
-                    // n_rot/2 is 128.
-                    const bool blocked = sect_dims == n_rot / 2;
+                    // whole pair list; Qwen2-VL uses *blocked* sections.  The
+                    // sum is NOT a safe discriminator: the 27B/35B Qwen3.5
+                    // models also have sections summing to n_rot/2 (they are
+                    // {11,11,10,0} over 32 pairs), so the loader records the
+                    // layout explicitly in `mrope_interleaved`.
+                    const bool blocked = info->mrope_interleaved ? false : (sect_dims == n_rot / 2);
                     int sec = 3;
                     if (blocked) {
                         if (sector < s0) {

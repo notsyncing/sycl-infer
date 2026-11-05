@@ -50,6 +50,7 @@ struct cpu_step_info {
     int32_t pc_row_slot[1024];
     int32_t mrope_on;
     int32_t mrope_sections[4];
+    int32_t mrope_interleaved;
     int32_t mrope[4 * 16 * 32];
     const float * img_embd;
     int32_t img_row[16 * 32];

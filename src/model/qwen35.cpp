@@ -42,6 +42,8 @@ void load_qwen35(model & m) {
             hp.rope_sections[i] = sec->arr[i].as_i32();
         }
     }
+    // Qwen3.5/3.6's text model is Qwen3-VL-style: interleaved M-RoPE.
+    hp.mrope_interleaved = 1;
 
     const auto * toks = f.meta("tokenizer.ggml.tokens");
     hp.n_vocab = toks ? (int)toks->arr.size() : 0;

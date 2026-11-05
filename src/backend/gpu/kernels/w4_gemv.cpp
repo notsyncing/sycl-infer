@@ -2470,6 +2470,16 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
     }
     const uint8_t * b0 = (const uint8_t *)w0;
     const uint8_t * b1 = (const uint8_t *)w1;
+#ifdef SI_NO_SG8
+    // An AOT build for an Xe2 target must not instantiate the SG=8 image at
+    // all: ocloc rejects reqd_sub_group_size(8) on Lunar Lake/Battlemage at
+    // *link* time, even though the runtime profile (hw.sub_group8 = 0) would
+    // never dispatch it.  A JIT build keeps both images because an unlaunched
+    // kernel is not compiled.
+    (void)sg8;
+    nat_gemm_fmt<16>(q, fmt, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
+                     residual, alpha, M, K, N);
+#else
     if (sg8) {
         nat_gemm_fmt<8>(q, fmt, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
                         residual, alpha, M, K, N);
@@ -2477,6 +2487,7 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
         nat_gemm_fmt<16>(q, fmt, b0, b1, w8, scale, off, lut16, bit_lut, axe, axo, axg, asa, xs, out, out_stride,
                          residual, alpha, M, K, N);
     }
+#endif
     return true;
 }
 

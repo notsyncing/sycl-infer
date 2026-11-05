@@ -120,10 +120,11 @@ inline int mrope_section(const cpu_step_info * info, int pair, int n_rot) {
     const int s3 = info->mrope_sections[3];
     const int sect = s0 + s1 + s2 + s3;
     const int sector = sect > 0 ? (pair % sect) : pair;
-    // Qwen2-VL's sections sum to n_rot/2 and are *blocked* (t, then row, then
-    // col); Qwen3.5's interleave by sector%3.  Same discriminator as the device
-    // kernel.
-    if (sect == n_rot / 2) {
+    // Qwen2-VL's sections are *blocked* (t, then row, then col); Qwen3.5's
+    // interleave by sector%3.  The section sum is not a discriminator on the
+    // 27B/35B (their Qwen3.5 sections also sum to n_rot/2), so the loader
+    // records the layout in `mrope_interleaved`.
+    if (!info->mrope_interleaved && sect == n_rot / 2) {
         if (sector < s0) {
             return 0;
         }
