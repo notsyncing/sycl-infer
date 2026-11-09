@@ -15,6 +15,7 @@
 #     sycl-infer/router:latest --config /etc/sycl-infer/router.json
 
 FROM debian:bookworm-slim AS build
+ARG BUILD_JOBS=
 RUN apt-get update \
  && apt-get install -y --no-install-recommends g++ cmake make ca-certificates libssl-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -23,7 +24,7 @@ COPY . /src
 # SI_ROUTER_ONLY=ON: no icpx, no device pass, no oneDNN.  The router's tests
 # are built here too, and they need neither a GPU nor a model.
 RUN cmake -S . -B build -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build -j"$(nproc)" \
+ && cmake --build build -j"${BUILD_JOBS:-$(nproc)}" \
  && ctest --test-dir build --output-on-failure
 
 FROM debian:bookworm-slim

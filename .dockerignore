@@ -5,8 +5,20 @@ build-*/
 cmake-build-*/
 .git/
 .gitignore
+.cache/
 reports/
 dev/
+logs/
+dist/
+python/dist/
+python/build/
+python/*.egg-info/
+python/sycl_infer/_lib/
+__pycache__/
+# Never bake a mounted secret into a build layer (docker/compose.yaml mounts
+# this file) or a local environment file.
+docker/control-token
+.env
 *.o
 *.gguf
 .vscode/

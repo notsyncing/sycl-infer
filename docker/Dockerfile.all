@@ -42,6 +42,9 @@ ARG UBUNTU_TAG
 ARG DNNL_VERSION=2026.1
 ARG AOT=ON
 ARG AOT_DEVICE=acm-g10
+# Parallel compile/link jobs.  Empty = $(nproc); lower it on a memory-constrained
+# build host (the AOT ocloc pass scales its RAM with the job count).
+ARG BUILD_JOBS=
 ENV DEBIAN_FRONTEND=noninteractive
 # The caller supplies the build-time proxy; an address is never baked into the
 # image.  Docker's predefined proxy build args are not enough on the legacy
@@ -66,17 +69,18 @@ COPY . /src
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DDNNL_ROOT=/opt/intel/oneapi/dnnl/${DNNL_VERSION} \
       -DSYCL_INFER_AOT=${AOT} -DSYCL_INFER_AOT_DEVICE=${AOT_DEVICE} \
- && cmake --build build --target sycl-infer sycl-infer-onnx -j"$(nproc)"
+ && cmake --build build --target sycl-infer sycl-infer-onnx -j"${BUILD_JOBS:-$(nproc)}"
 
 # ---- stage 2: the router (a plain host binary) ------------------------------
 FROM debian:bookworm-slim AS router
+ARG BUILD_JOBS=
 RUN apt-get update \
  && apt-get install -y --no-install-recommends g++ cmake make ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . /src
 RUN cmake -S . -B build -DSI_ROUTER_ONLY=ON -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build -j"$(nproc)"
+ && cmake --build build -j"${BUILD_JOBS:-$(nproc)}"
 
 # ---- the combined image -----------------------------------------------------
 FROM ${RUNTIME_IMAGE}:${ONEAPI_VERSION}-devel-${UBUNTU_TAG}

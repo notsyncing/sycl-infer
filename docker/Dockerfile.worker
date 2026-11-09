@@ -54,6 +54,9 @@ ARG UBUNTU_TAG
 ARG DNNL_VERSION=2026.1
 ARG AOT=ON
 ARG AOT_DEVICE=acm-g10
+# Parallel compile/link jobs.  Empty = $(nproc); lower it on a memory-constrained
+# build host (the AOT ocloc pass scales its RAM with the job count).
+ARG BUILD_JOBS=
 ENV DEBIAN_FRONTEND=noninteractive
 # The caller supplies the build-time proxy; an address is never baked into the
 # image.  Docker's predefined proxy build args are not enough on the legacy
@@ -82,7 +85,7 @@ COPY . /src
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DDNNL_ROOT=/opt/intel/oneapi/dnnl/${DNNL_VERSION} \
       -DSYCL_INFER_AOT=${AOT} -DSYCL_INFER_AOT_DEVICE=${AOT_DEVICE} \
- && cmake --build build --target sycl-infer -j"$(nproc)"
+ && cmake --build build --target sycl-infer -j"${BUILD_JOBS:-$(nproc)}"
 
 FROM ${RUNTIME_IMAGE}:${ONEAPI_VERSION}-devel-${UBUNTU_TAG}
 ARG ONEAPI_VERSION
