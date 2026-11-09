@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -53,8 +54,19 @@ struct chat_msg {
 // ChatML renderer when the template is empty or uses unsupported syntax.
 // `tools_json` is the request's OpenAI `tools` array serialized as JSON (empty
 // when no tools are offered); it is passed to the template as `tools`.
+//
+// `enable_thinking` is the request's choice.  When it is `nullopt` the variable
+// is NOT passed to the template, so the template's own default applies (a
+// Qwen3.6 template opens a `<think>` block; the 0.8B reference does not).  The
+// built-in fallback has no template to consult, so it treats `nullopt` as off.
 std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
-                        bool enable_thinking, const std::string & tools_json = "");
+                        std::optional<bool> enable_thinking, const std::string & tools_json = "");
+
+// After rendering: did the template open a reasoning block for the reply?
+// This is how the caller learns what the template's default was when the
+// request left `enable_thinking` unspecified: thinking is on when the last
+// assistant-generation header opens a `<think>` and does not close it.
+bool prompt_opens_thinking(const std::string & prompt);
 
 // Built-in ChatML fallback (see render_chat).
 std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_generation_prompt, bool enable_thinking,

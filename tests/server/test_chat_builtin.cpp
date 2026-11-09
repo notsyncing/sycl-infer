@@ -7,6 +7,7 @@
 // cases pin the roles, the tool block, the thinking marker and the multimodal
 // placeholders that the server's prompt expansion depends on.
 #include <cstdio>
+#include <optional>
 #include <string>
 
 #include "chat.h"
@@ -145,6 +146,42 @@ int main() {
         // the renderer must always open with ChatML, never with an assistant turn.
         std::vector<chat_msg> m = {chat_msg("user", "q")};
         check(starts_with(render_chat_builtin(m, true, false), "<|im_start|>user\n"), "starts with the first role");
+    }
+
+    printf("thinking: unspecified follows the template, explicit wins\n");
+    {
+        // Same shape as the Qwen3.6 generation suffix: the variable is only
+        // consulted when the request defines it.
+        const char * tmpl = "{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}"
+                            "{% if add_generation_prompt %}<|im_start|>assistant\n"
+                            "{% if enable_thinking is defined and enable_thinking is false %}"
+                            "<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}";
+        const std::vector<chat_msg> m = {chat_msg("user", "hi")};
+
+        const std::string unspecified = render_chat(tmpl, m, true, std::nullopt);
+        check_has("unspecified -> template default (thinking on)", unspecified, "<think>\n");
+        check(prompt_opens_thinking(unspecified), "unspecified prompt opens thinking");
+
+        const std::string off = render_chat(tmpl, m, true, false);
+        check_has("explicit false -> closed block", off, "<think>\n\n</think>");
+        check(!prompt_opens_thinking(off), "closed prompt does not open thinking");
+
+        const std::string on = render_chat(tmpl, m, true, true);
+        check(prompt_opens_thinking(on), "explicit true opens thinking");
+    }
+
+    printf("prompt_opens_thinking markers\n");
+    {
+        check(prompt_opens_thinking("<|im_start|>assistant\n<think>\n"), "ChatML open");
+        check(!prompt_opens_thinking("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "ChatML closed");
+        check(prompt_opens_thinking("<|Assistant|><think>\n"), "DeepSeek open");
+        check(!prompt_opens_thinking("<|Assistant|></think>"), "DeepSeek closed");
+        check(!prompt_opens_thinking("plain prompt with no marker"), "no marker -> off");
+        // Only the LAST assistant header counts: an earlier turn's think block
+        // must not make a non-thinking reply look like reasoning.
+        check(!prompt_opens_thinking(
+                  "<|im_start|>assistant\n<think>\n\n</think>\n\nx<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+              "earlier open turn does not count");
     }
 
     printf(g_fail ? "chat builtin test FAILED (%d)\n" : "chat builtin test OK\n", g_fail);

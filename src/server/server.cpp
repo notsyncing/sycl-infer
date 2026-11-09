@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ratio>
 #include <stdexcept>
 #include <string>
@@ -791,10 +792,13 @@ int serve(engine & e, const server_config & cfg) {
         }
         std::vector<media_part> media;
         auto msgs = parse_messages(body, media);
-        const bool thinking = parse_thinking(body);
+        const std::optional<bool> thinking_req = parse_thinking(body);
+        // The template's own default applies when the request did not choose;
+        // the effective value is read back from the rendered prompt below.
+        bool thinking = thinking_req.value_or(false);
         const std::string tools_json = parse_tools_json(body);
         const bool parse_tools = !tools_json.empty();
-        gen_params gp = parse_params(body);
+        gen_params gp = parse_params(body, e.max_seq);
         auto stops = parse_stop(body);
         const int n = parse_n(body);
         const bool stream = body.value("stream", false);
@@ -857,7 +861,8 @@ int serve(engine & e, const server_config & cfg) {
                         order.push_back({MM_KIND_AUDIO, (int)auds.size() - 1});
                     }
                 }
-                const std::string rendered = render_chat(e.m.chat_template, msgs, true, thinking, tools_json);
+                const std::string rendered = render_chat(e.m.chat_template, msgs, true, thinking_req, tools_json);
+                thinking = prompt_opens_thinking(rendered);
                 // Vision/audio encoding shares the engine queue and embedding
                 // buffer with generation; do not enqueue it alongside a
                 // scheduler forward even though only MM requests use that buffer.
@@ -914,7 +919,8 @@ int serve(engine & e, const server_config & cfg) {
             return;
         }
 
-        std::string text = render_chat(e.m.chat_template, msgs, true, thinking, tools_json);
+        std::string text = render_chat(e.m.chat_template, msgs, true, thinking_req, tools_json);
+        thinking = prompt_opens_thinking(text);
         static const bool srv_t = si::env::flag("PF_SRV_TIME");
         const auto t_tok0 = std::chrono::steady_clock::now();
         auto prompt = e.tk.encode(text);
@@ -1030,7 +1036,7 @@ int serve(engine & e, const server_config & cfg) {
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0).count(),
                     chars, cp.tokens.size());
         }
-        gen_params gp = parse_params(body);
+        gen_params gp = parse_params(body, e.max_seq);
         auto stops = parse_stop(body);
         const int n = parse_n(body);
         const bool stream = body.value("stream", false);

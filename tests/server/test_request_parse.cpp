@@ -52,8 +52,14 @@ static void test_params() {
     // both max_tokens spellings, and the non-positive fallback
     check(si::parse_params(J(R"({"max_tokens": 7})")).max_tokens == 7, "max_tokens honoured");
     check(si::parse_params(J(R"({"max_completion_tokens": 9})")).max_tokens == 9, "max_completion_tokens alias");
-    check(si::parse_params(J(R"({"max_tokens": 0})")).max_tokens == 256, "max_tokens 0 falls back to 256");
-    check(si::parse_params(J(R"({"max_tokens": -5})")).max_tokens == 256, "negative max_tokens falls back to 256");
+    check(si::parse_params(J(R"({"max_tokens": 0})")).max_tokens == 256, "max_tokens 0 falls back to the default");
+    check(si::parse_params(J(R"({"max_tokens": -5})")).max_tokens == 256, "negative max_tokens falls back");
+    // The server passes the context window: a request with no limit gets the
+    // model's maximum, not the struct's 256.
+    check(si::parse_params(J("{}"), 262144).max_tokens == 262144, "unspecified max_tokens uses the caller's default");
+    check(si::parse_params(J(R"({"max_tokens": 0})"), 262144).max_tokens == 262144,
+          "max_tokens 0 uses the caller's default");
+    check(si::parse_params(J(R"({"max_tokens": 100})"), 262144).max_tokens == 100, "explicit max_tokens wins");
 
     // both repetition-penalty spellings (OpenAI's, then llama.cpp's)
     check(si::parse_params(J(R"({"repetition_penalty": 1.1})")).repeat_penalty == 1.1f, "repetition_penalty");
@@ -115,17 +121,20 @@ static void test_stop_and_thinking() {
     }
 
     // precedence: chat_template_kwargs, then enable_thinking, then thinking,
-    // then reasoning_effort
-    check(!si::parse_thinking(J("{}")), "thinking defaults off");
-    check(si::parse_thinking(J(R"({"chat_template_kwargs": {"enable_thinking": true}})")), "kwargs enable_thinking");
-    check(!si::parse_thinking(J(R"({"chat_template_kwargs": {"enable_thinking": false}, "enable_thinking": true})")),
+    // then reasoning_effort.  Unspecified is nullopt: the template's own
+    // default applies (Qwen3.6 opens a think block; the 0.8B does not).
+    check(!si::parse_thinking(J("{}")).has_value(), "thinking unspecified by default");
+    check(si::parse_thinking(J(R"({"chat_template_kwargs": {"enable_thinking": true}})")) == true,
+          "kwargs enable_thinking");
+    check(si::parse_thinking(J(R"({"chat_template_kwargs": {"enable_thinking": false}, "enable_thinking": true})"))
+              == false,
           "chat_template_kwargs wins over enable_thinking");
-    check(si::parse_thinking(J(R"({"enable_thinking": true})")), "enable_thinking");
-    check(!si::parse_thinking(J(R"({"enable_thinking": false, "thinking": true})")),
+    check(si::parse_thinking(J(R"({"enable_thinking": true})")) == true, "enable_thinking");
+    check(si::parse_thinking(J(R"({"enable_thinking": false, "thinking": true})")) == false,
           "enable_thinking wins over thinking");
-    check(si::parse_thinking(J(R"({"thinking": true})")), "thinking");
-    check(si::parse_thinking(J(R"({"reasoning_effort": "high"})")), "reasoning_effort high -> on");
-    check(!si::parse_thinking(J(R"({"reasoning_effort": "none"})")), "reasoning_effort none -> off");
+    check(si::parse_thinking(J(R"({"thinking": true})")) == true, "thinking");
+    check(si::parse_thinking(J(R"({"reasoning_effort": "high"})")) == true, "reasoning_effort high -> on");
+    check(si::parse_thinking(J(R"({"reasoning_effort": "none"})")) == false, "reasoning_effort none -> off");
 }
 
 static void test_tools() {

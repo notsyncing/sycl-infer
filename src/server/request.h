@@ -10,6 +10,7 @@
 // What this file deliberately does NOT do is decide whether a media part may be
 // read: parse_messages only records what a part was, and media_fetch decides.
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,8 +29,11 @@ constexpr size_t kMaxStops = 16;
 
 // Sampling / decoding parameters, with the API's aliases and defaults applied
 // (`max_completion_tokens`, both repetition_penalty spellings, chat's boolean
-// `logprobs` vs completions' count, logit_bias clamped to +-100).
-gen_params parse_params(const json & body);
+// `logprobs` vs completions' count, logit_bias clamped to +-100).  A request
+// that omits `max_tokens` / `max_completion_tokens` (or sends a value <= 0)
+// gets `default_max_tokens`; the server passes the context window, so a client
+// that does not ask for a limit gets the model's maximum.
+gen_params parse_params(const json & body, int default_max_tokens = 256);
 
 // number of choices, clamped to [1, kMaxN]
 int parse_n(const json & body);
@@ -46,8 +50,10 @@ std::vector<std::string> parse_stop(const json & body);
 
 // `enable_thinking` for the chat template.  `chat_template_kwargs` wins (that is
 // the llama.cpp convention), then the flat `enable_thinking`/`thinking` flags,
-// then `reasoning_effort` (anything but "none" turns reasoning on).
-bool parse_thinking(const json & body);
+// then `reasoning_effort` (anything but "none" turns reasoning on).  `nullopt`
+// means the request did not choose: the template's own default applies (for a
+// Qwen3.5/3.6 template that is thinking on).
+std::optional<bool> parse_thinking(const json & body);
 
 // The OpenAI `tools` array serialized back to JSON, filtered by `tool_choice`.
 // Returns "" when no tool is offered (so the template omits the tools block).

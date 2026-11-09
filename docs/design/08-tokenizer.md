@@ -96,7 +96,8 @@ vendored 的 llama.cpp Unicode 实现（`third_party/unicode.{h,cpp}`，MIT）�
   失败的判定是 **`tmpl` 非空 且 minja 的 `ct.apply` 不抛异常**（`chat_template.cpp:23-25`、`:99-106`）。
 * 传给模板的输入（`chat_template.cpp:30-97`）：`messages`（转 `nlohmann::ordered_json`；带 part 的消息
   把 content 变成数组，IMAGE/VIDEO/AUDIO 分别写成 `{"type":"image"|"video"|"input_audio"}`，见 `:39-45`）、
-  `tools`（解析 `tools_json`）、`add_generation_prompt`、`extra_context = {"enable_thinking": bool}`。
+  `tools`（解析 `tools_json`）、`add_generation_prompt`、`extra_context`——`enable_thinking` **只在请求
+  显式选择时写入**，未指定就保持 undefined，让模板用自己的默认（Qwen3.6 开、0.8B 关）。
   `bos_token`/`eos_token` 有意留空（`:28`），因为渲染结果是完整 prompt 文本，交给
   `encode(parse_special=true)` 自己切 —— 这也是 §4 不加 BOS 的原因。
 * `ct.apply(inputs)` 用默认 `chat_template_options`（`third_party/minja/chat-template.hpp:55-61`、

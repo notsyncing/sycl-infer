@@ -11,22 +11,25 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace si {
 
-gen_params parse_params(const json & body) {
+gen_params parse_params(const json & body, int default_max_tokens) {
     gen_params gp;
     auto getf = [&](const char * k, float d) {
         return body.contains(k) && body[k].is_number() ? body[k].get<float>() : d;
     };
     auto geti = [&](const char * k, int d) { return body.contains(k) && body[k].is_number() ? body[k].get<int>() : d; };
     if (body.contains("max_tokens")) {
-        gp.max_tokens = geti("max_tokens", 256);
+        gp.max_tokens = geti("max_tokens", default_max_tokens);
     } else if (body.contains("max_completion_tokens")) {
-        gp.max_tokens = geti("max_completion_tokens", 256);
+        gp.max_tokens = geti("max_completion_tokens", default_max_tokens);
+    } else {
+        gp.max_tokens = default_max_tokens;
     }
     gp.temperature = getf("temperature", 1.0f);
     gp.top_p = getf("top_p", 0.95f);
@@ -42,7 +45,7 @@ gen_params parse_params(const json & body) {
         gp.seed = (uint64_t)s;
     }
     if (gp.max_tokens <= 0) {
-        gp.max_tokens = 256;
+        gp.max_tokens = default_max_tokens;
     }
     // logit_bias: {"123": -100, ...} (token id -> additive bias, clamped)
     if (body.contains("logit_bias") && body["logit_bias"].is_object()) {
@@ -130,7 +133,7 @@ std::vector<std::string> parse_stop(const json & body) {
     return stops;
 }
 
-bool parse_thinking(const json & body) {
+std::optional<bool> parse_thinking(const json & body) {
     if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
         const json & k = body["chat_template_kwargs"];
         if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean()) {
@@ -146,7 +149,7 @@ bool parse_thinking(const json & body) {
     if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string()) {
         return body["reasoning_effort"].get<std::string>() != "none";
     }
-    return false;
+    return std::nullopt;
 }
 
 std::string parse_tools_json(const json & body) {

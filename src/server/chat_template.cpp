@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,7 +21,7 @@
 namespace si {
 
 bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
-                          bool enable_thinking, std::string & out, const std::string & tools_json) {
+                          std::optional<bool> enable_thinking, std::string & out, const std::string & tools_json) {
     if (tmpl.empty()) {
         return false;
     }
@@ -95,7 +96,9 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
         }
         inputs.add_generation_prompt = add_generation_prompt;
         inputs.extra_context = nlohmann::ordered_json::object();
-        inputs.extra_context["enable_thinking"] = enable_thinking;
+        if (enable_thinking.has_value()) {
+            inputs.extra_context["enable_thinking"] = *enable_thinking;
+        }
 
         out = ct.apply(inputs);
         return true;

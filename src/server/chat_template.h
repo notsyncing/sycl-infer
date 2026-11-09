@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -11,10 +12,14 @@ namespace si {
 // (third_party/minja).  `tools_json` is the OpenAI `tools` array as JSON text
 // (empty or `[]` when none are offered).
 //
+// `enable_thinking` is passed to the template only when the request chose it;
+// `nullopt` leaves the variable undefined so the template's own default applies.
+//
 // Returns false when the template cannot be parsed/rendered (or raises through
 // raise_exception), leaving `out` unspecified so the caller can fall back to
 // the built-in renderer.
 bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
-                          bool enable_thinking, std::string & out, const std::string & tools_json = "");
+                          std::optional<bool> enable_thinking, std::string & out,
+                          const std::string & tools_json = "");
 
 } // namespace si

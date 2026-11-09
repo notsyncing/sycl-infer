@@ -107,7 +107,10 @@ MinerU 这类纯客户端流程不属于这里。只想做普通 qwen2vl 图片�
   若某消息**没有任何媒体 part**（`!media.empty()`，`server.cpp` 的 `handle_chat`；`parse_messages` 把四种媒体都 push 进 `media`，所以"有任一种媒体"与"有全部四种"在这里是同一个测试），
   则清空 `parts` 走纯文本快速路径（`server.cpp` 的 `handle_chat`）。
 * `thinking`（`parse_thinking`）：`chat_template_kwargs.enable_thinking` 优先，其次平铺的
-  `enable_thinking`/`thinking`，最后 `reasoning_effort`（非 `"none"` 即开启）。
+  `enable_thinking`/`thinking`，最后 `reasoning_effort`（非 `"none"` 即开启）。**都没给时是 `nullopt`：
+  `enable_thinking` 不传给模板，由模板自己的默认决定**（Qwen3.6 的模板默认开启思考；0.8B 参考模型默认关闭）。
+  渲染后 `prompt_opens_thinking` 从最后一个 assistant 生成头读回实际结果，它同时驱动 `response_parser`
+  的 reasoning/content 拆分。
 * `tools_json`（`parse_tools_json`）：把请求 `tools` 数组回传给模板；`tool_choice == "none"`
   时清空，指定函数对象时只保留该函数，其它字符串值（`auto`/`required`/`any`）原样放行全部工具。
   `parse_tools = !tools_json.empty()`（`parse_tools_json`，`request.cpp`）——它同时决定 response_parser 是否拆工具调用。
@@ -130,7 +133,7 @@ MinerU 这类纯客户端流程不属于这里。只想做普通 qwen2vl 图片�
 
 | JSON key | 字段 | 默认 |
 |---|---|---|
-| `max_tokens` / `max_completion_tokens` | `max_tokens` | 256（≤0 强制 256） |
+| `max_tokens` / `max_completion_tokens` | `max_tokens` | 上下文窗口 `max_seq`（请求未给或 ≤0）；显式值照用 |
 | `temperature` / `top_p` / `top_k` / `min_p` | 同名 | 1.0 / 0.95 / 40 / 0.0 |
 | `repetition_penalty` / `repeat_penalty` | `repeat_penalty` | 1.0 |
 | `repeat_last_n` | `repeat_last_n` | 64 |
@@ -684,7 +687,7 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 | `stream` | ✅ | SSE；纯文本路径每 choice 一个生产者线程，多模态/MTP 路径一个线程顺序生成全部 choice（§2.7） |
 | `stream_options.include_usage` | ✅ | 最后一个 choice 发 usage chunk |
 | `stream_options.continuous_usage_stats` | ❌ | 忽略 |
-| `max_tokens` / `max_completion_tokens` | ✅ | 默认 256，`≤0` 强制 256 |
+| `max_tokens` / `max_completion_tokens` | ✅ | 默认上下文窗口 `max_seq`（请求未给或 ≤0），即模型允许的最大输出；显式值照用 |
 | `n` | ✅ | 1..16（超出截断）；choice index 0..n-1 |
 | `temperature` | ✅ | |
 | `top_p` | ✅ | |
@@ -701,7 +704,7 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 | `tool_choice` | ⚠️ | `none` 清空工具；字符串/指定函数对象按名过滤；`required` 只透传不强制 |
 | `parallel_tool_calls` | ❌ | 忽略；始终允许模型并行调用 |
 | `functions` / `function_call`（旧式） | ❌ | 请求级旧接口未实现；消息级旧 `function_call` 仅用于输入解析 |
-| `chat_template_kwargs.enable_thinking` | ✅ | 控制模板 `<think>`；也是推理拆分开关 |
+| `chat_template_kwargs.enable_thinking` | ✅ | 控制模板 `<think>`；也是推理拆分开关；未给时由模板默认决定 |
 | `enable_thinking` / `thinking` | ✅ | 平铺别名 |
 | `reasoning_effort` | ⚠️ | 仅映射为“开/关思考”（`"none"` 关闭），无等级 |
 | `metadata` / `store` / `user` / `service_tier` | ❌ | 忽略 |

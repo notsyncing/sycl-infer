@@ -2,6 +2,7 @@
 #include "chat_util.h"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -11,12 +12,34 @@
 namespace si {
 
 std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
-                        bool enable_thinking, const std::string & tools_json) {
+                        std::optional<bool> enable_thinking, const std::string & tools_json) {
     std::string out;
     if (render_chat_template(tmpl, msgs, add_generation_prompt, enable_thinking, out, tools_json)) {
         return out;
     }
-    return render_chat_builtin(msgs, add_generation_prompt, enable_thinking, tools_json);
+    return render_chat_builtin(msgs, add_generation_prompt, enable_thinking.value_or(false), tools_json);
+}
+
+bool prompt_opens_thinking(const std::string & prompt) {
+    // ChatML: the reply header is the last `<|im_start|>assistant`; a thinking
+    // template writes `<think>\n` after it, a non-thinking one writes the
+    // closed empty block (`<think>\n\n</think>\n\n`).
+    size_t p = prompt.rfind("<|im_start|>assistant");
+    if (p != std::string::npos) {
+        const size_t nl = prompt.find('\n', p);
+        if (nl == std::string::npos) {
+            return false;
+        }
+        const std::string tail = prompt.substr(nl + 1);
+        return tail.find("<think>") != std::string::npos && tail.find("</think>") == std::string::npos;
+    }
+    // DeepSeek-V4.1: `<|Assistant|>` followed by `<think>` in thinking mode.
+    p = prompt.rfind("<|Assistant|>");
+    if (p != std::string::npos) {
+        const std::string tail = prompt.substr(p);
+        return tail.find("<think>") != std::string::npos && tail.find("</think>") == std::string::npos;
+    }
+    return false;
 }
 
 // Built-in fallback description of the tools (mirrors the Qwen3.5 template's
