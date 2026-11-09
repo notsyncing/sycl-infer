@@ -347,7 +347,7 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
 |---|---|---|
 | `POST` | `/v1/chat/completions` | 按 `model` 路由，代理到 worker |
 | `POST` | `/v1/completions` | 同上 |
-| `GET` | `/v1/models` | 汇总所有 worker 的模型条目（每个 worker 一条，用路由器的 `id`；ONNX 条目带 `backend: onnx`） |
+| `GET` | `/v1/models` | 汇总所有 worker 的模型条目（每个 worker 一条，**id 用配置里的 `models[].id`**，其余元数据取 worker 自报的 `general.name` 条目；ONNX 条目带 `backend: onnx`） |
 | `POST` | `/v1/onnx/run` | ONNX 二进制协议：从请求体读出 `model`，原样转发到对应 worker（无重试，§6.3） |
 | `GET` | `/v1/onnx/models` | 汇总各 ONNX worker 的模型表 |
 | `GET` | `/v1/models/{id}` | 单条；未知 id → 404 |
@@ -364,7 +364,9 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
   （ONNX 一次可以带多张大图；OpenAI 的 base64 图片远小于它）。
 * **`model` 字段**：路由器是路由的权威。它按 `model` 找到 worker，然后**把请求体里的 `model` 改写成
   worker 自报的 id**（`general.name`，见 `src/server/server.cpp:615`），避免 worker 侧的
-  `/v1/models/{id}` 语义与路由器的别名不一致。
+  `/v1/models/{id}` 语义与路由器的别名不一致。**路由键与公布的 id 都以配置文件为准**：
+  `/v1/models`（含 `/v1/models/{id}`）公布的 `id` 是 `models[].id`，worker 自报的 id 只用于
+  上游改写。作为兼容，路由也接受 worker 自报的 id（旧客户端可能记下过它），两者撞车时配置的 id 优先。
 * **响应**：非流式直接透传状态码与响应体。流式（`stream: true`）走 SSE 透传（§6.4）。
 * **错误映射**：
   | 情况 | 状态码 | 响应体 |

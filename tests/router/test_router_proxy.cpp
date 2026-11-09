@@ -383,7 +383,10 @@ void test_models_aggregate() {
         CHECK(j.value("object", "") == "list", "the shape must be an OpenAI model list");
         CHECK(j["data"].is_array() && j["data"].size() == 1, "one model");
         if (j["data"].is_array() && !j["data"].empty()) {
-            CHECK(j["data"][0].value("id", "") == "worker-model", "the worker's own id is advertised");
+            // The router publishes the configured routing key, not the worker's
+            // own `general.name`: discovery must hand out a routable id.
+            CHECK(j["data"][0].value("id", "") == "router-model", "the configured id is advertised");
+            CHECK(j["data"][0].value("object", "") == "model", "the worker's metadata is kept");
             for (const auto & e : j["data"]) {
                 CHECK(e.value("id", "") != "fake-pipeline", "a pipeline id must never appear in /v1/models");
             }
@@ -449,6 +452,39 @@ void test_pipeline_sse() {
     CHECK(!!res, "the streaming pipeline run must answer");
     CHECK(all.find("pipeline.delta") != std::string::npos, "the delta frame must pass through");
     CHECK(all.find("c2") != std::string::npos, "the whole stream must arrive");
+    fx.stop();
+}
+
+// `/v1/models` publishes the configured routing key.  The worker's own id (its
+// GGUF `general.name`) is still accepted as a compatibility alias, because an
+// older client may have discovered it before the list was fixed.
+void test_advertised_id_routes() {
+    router_fixture fx;
+    fx.start();
+
+    const std::string body = post_json(fx.port, "/v1/chat/completions",
+                                       "{\"model\":\"worker-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+    CHECK(!body.empty(), "the worker's advertised id must still route");
+    if (!body.empty()) {
+        json j = json::parse(body);
+        CHECK(j.value("echo_model", std::string()) == "worker-model",
+              "the worker must see its own advertised id, got '%s'", j.value("echo_model", "").c_str());
+    }
+
+    {
+        // The published entry is the configured id even when resolved by the
+        // worker's id, so a client never sees two names for one model.
+        httplib::Client cli("127.0.0.1", fx.port);
+        auto res = cli.Get("/v1/models/worker-model");
+        CHECK(!!res, "the single-model endpoint must answer");
+        if (res) {
+            CHECK(res->status == 200, "the alias must resolve on /v1/models/{id}, got %d", res->status);
+            json j = json::parse(res->body);
+            CHECK(j.value("id", "") == "router-model", "the single entry publishes the configured id, got '%s'",
+                  j.value("id", "").c_str());
+        }
+    }
+
     fx.stop();
 }
 
@@ -526,6 +562,7 @@ int main() {
     test_pipeline_run_nonstream();
     test_pipeline_sse();
     test_pipeline_unknown_and_down();
+    test_advertised_id_routes();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

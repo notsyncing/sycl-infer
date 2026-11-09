@@ -35,9 +35,10 @@ struct model_slot {
     long long pid = -1;
     long long ready_at = 0;  // epoch seconds, 0 while not up
     // What the worker advertised on /v1/models once it became ready.  The
-    // router's aggregated /v1/models is built from these, and the proxy
-    // rewrites the request's `model` field to the advertised id so the
-    // worker's own /v1/models/{id} stays consistent.
+    // proxy rewrites the request's `model` field to the advertised id so the
+    // worker's own /v1/models/{id} stays consistent.  This is NOT the id the
+    // router publishes or routes by (that is cfg.id); registry lookup accepts
+    // it as a compatibility alias only.
     std::string advertised_id;
     std::string advertised_json;
 

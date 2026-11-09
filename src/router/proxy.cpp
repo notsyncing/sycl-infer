@@ -119,6 +119,34 @@ bool body_is_streaming(const std::string & body) {
     return false;
 }
 
+// The entry the router publishes for a model.  The worker's own entry carries
+// the worker's id (its GGUF `general.name`), which is NOT the routing key: the
+// config's `models[].id` is.  Keep the worker's metadata (created/owned_by)
+// but publish the configured id, so discovery and routing agree.
+ojson advertised_entry(const model_slot & slot) {
+    ojson e = ojson::object();
+    {
+        std::lock_guard<std::mutex> lk(slot.mtx);
+        if (!slot.advertised_json.empty()) {
+            try {
+                ojson v = ojson::parse(slot.advertised_json);
+                if (v.is_object()) {
+                    e = std::move(v);
+                }
+            } catch (...) {
+            }
+        }
+    }
+    e["id"] = slot.cfg.id;
+    if (!e.contains("object")) {
+        e["object"] = "model";
+    }
+    if (!e.contains("owned_by")) {
+        e["owned_by"] = "local";
+    }
+    return e;
+}
+
 } // namespace
 
 proxy::proxy(registry & reg, const router_config & cfg) : reg_(reg), cfg_(cfg) {
@@ -331,25 +359,7 @@ void proxy::install(httplib::Server & srv) {
                 data.push_back(e);
                 continue;
             }
-            std::string advertised;
-            {
-                std::lock_guard<std::mutex> lk(slot->mtx);
-                advertised = slot->advertised_json;
-            }
-            if (!advertised.empty()) {
-                try {
-                    data.push_back(ojson::parse(advertised));
-                    continue;
-                } catch (...) {
-                }
-            }
-            // Not ready yet: advertise the router's own view so a client can
-            // still discover the model.
-            ojson e;
-            e["id"] = slot->cfg.id;
-            e["object"] = "model";
-            e["owned_by"] = "local";
-            data.push_back(e);
+            data.push_back(advertised_entry(*slot));
         }
         ojson j;
         j["object"] = "list";
@@ -369,22 +379,8 @@ void proxy::install(httplib::Server & srv) {
             set_error(res, 404, "model '" + id + "' not found", "invalid_request_error");
             return;
         }
-        std::string advertised;
-        {
-            std::lock_guard<std::mutex> lk(slot->mtx);
-            advertised = slot->advertised_json;
-        }
-        if (!advertised.empty()) {
-            res.set_content(advertised, "application/json");
-            return;
-        }
-        ojson e;
-        e["id"] = slot->cfg.id;
-        e["object"] = "model";
-        e["owned_by"] = "local";
-        res.set_content(e.dump(), "application/json");
+        res.set_content(advertised_entry(*slot).dump(), "application/json");
     });
-
     srv.Post("/v1/chat/completions",
              [this](const httplib::Request & req, httplib::Response & res) { handle_completions(req, res, "/v1/chat/completions"); });
     srv.Post("/v1/completions",
