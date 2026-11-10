@@ -58,7 +58,8 @@ struct chat_msg {
 // `enable_thinking` is the request's choice.  When it is `nullopt` the variable
 // is NOT passed to the template, so the template's own default applies (a
 // Qwen3.6 template opens a `<think>` block; the 0.8B reference does not).  The
-// built-in fallback has no template to consult, so it treats `nullopt` as off.
+// two structural fallbacks have no template to consult, so they treat
+// `nullopt` as off.
 std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
                         std::optional<bool> enable_thinking, const std::string & tools_json = "");
 
@@ -69,6 +70,9 @@ std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & 
 bool prompt_opens_thinking(const std::string & prompt);
 
 // Built-in ChatML fallback (see render_chat).
+// Structural fallback for the DeepSeek-V4.1 template (minja cannot parse it).
+std::string render_chat_deepseek(const std::vector<chat_msg> & msgs, bool add_generation_prompt, bool enable_thinking);
+
 std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_generation_prompt, bool enable_thinking,
                                 const std::string & tools_json = "");
 

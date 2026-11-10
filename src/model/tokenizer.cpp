@@ -37,6 +37,9 @@ void tokenizer::load(const gguf_file & f) {
     if (!toks || !toks->is_arr()) {
         throw std::runtime_error("gguf: missing tokenizer tokens");
     }
+    if (auto * p = f.meta("tokenizer.ggml.pre")) {
+        pre = p->str;
+    }
 
     n_vocab = (int)toks->arr.size();
     token_text.resize(n_vocab);
@@ -78,6 +81,12 @@ void tokenizer::load(const gguf_file & f) {
     eos_id = tid("<|im_end|>");
     eot_id = tid("<|endoftext|>");
     pad_id = tid("<|vision_pad|>");
+    if (pad_id < 0) {
+        pad_id = (int)f.get_u32("tokenizer.ggml.padding_token_id", 0xFFFFFFFFu);
+        if (pad_id < 0 || pad_id >= n_vocab) {
+            pad_id = -1;
+        }
+    }
     im_start_id = tid("<|im_start|>");
     im_end_id = tid("<|im_end|>");
     think_id = tid("<think>");
@@ -125,10 +134,22 @@ std::vector<std::string> bpe_one(const tokenizer & tk, const std::string & word)
 }
 
 void encode_plain(const tokenizer & tk, const std::string & raw_text, std::vector<int> & out) {
-    static const std::vector<std::string> regex_exprs = {
+    // Pre-tokenizer regex families.  `tokenizer.ggml.pre` selects one; an
+    // unknown value keeps the Qwen default, which is also llama.cpp's fallback.
+    static const std::vector<std::string> qwen_exprs = {
         "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| "
         "?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
     };
+    // DeepSeek V3/V4 / joyai: numbers in groups of up to 3, CJK as its own
+    // class, and punctuation-led words.  llama.cpp's
+    // LLAMA_VOCAB_PRE_TYPE_{DEEPSEEK3_LLM,JOYAI_LLM} table.
+    static const std::vector<std::string> joyai_exprs = {
+        "\\p{N}{1,3}",
+        "[一-龥぀-ゟ゠-ヿ]+",
+        "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+    };
+    const std::vector<std::string> & regex_exprs =
+        (tk.pre == "joyai-llm" || tk.pre == "deepseek3-llm") ? joyai_exprs : qwen_exprs;
     auto words = unicode_regex_split(raw_text, regex_exprs, /*byte_encode=*/true);
     for (const auto & word : words) {
         auto syms = bpe_one(tk, word);

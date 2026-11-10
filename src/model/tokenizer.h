@@ -20,6 +20,11 @@ struct tokenizer {
     std::unordered_map<std::string, int> token_to_id;
     std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_rank;
     std::vector<int> special_ids; // sorted by text length desc
+    // `tokenizer.ggml.pre`: the pre-tokenizer regex family.  Two models can
+    // share one BPE vocabulary and still split text differently (DeepSeek's
+    // `joyai-llm` vs Qwen's default), so this is an architecture/file fact, not
+    // a constant.
+    std::string pre;
     int n_vocab = 0;
     int eos_id = -1; // <|im_end|>
     int eot_id = -1; // <|endoftext|>

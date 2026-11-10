@@ -14,10 +14,21 @@
 //            view at load), no position embeddings, quick_gelu FFN, exact-erf
 //            GELU merger, `v.post_ln` per patch before the 2x2 concat, head_dim
 //            80.
+//   deepseek41v: patch 14, fused `attn_qkv`, no position embeddings, RMSNorm
+//            (eps 1e-6) instead of LayerNorm, SwiGLU FFN (ffn_gate * ffn_up),
+//            2D vision RoPE over the 32 half-split pairs (pairs 0-15 row,
+//            16-31 column), bidirectional attention, head_dim 64.  The
+//            projector is a 3x3 patch-merge (unfold on a grid zero-padded to
+//            multiples of 3) -> mm.1 (9216->5120, erf GELU) -> mm.2
+//            (5120->5120).  The token block is plain reading order with the
+//            learned sentinel rows: [img_start] then each row's cells followed
+//            by [image_newline], then [img_end].
 //
-// Both variants use a 2x2 patch merger.  `vision_model::encode_host` implements
-// the reference forward on the host; the SYCL path in
-// src/backend/gpu/kernels/vit.cpp mirrors it on the device.
+// The qwen variants use a 2x2 patch merger; deepseek41v a 3x3 one.
+// `vision_model::encode_host` implements the reference forward on the host;
+// the SYCL path in src/backend/gpu/kernels/vit.cpp (plus the ds41-specific
+// RMSNorm/unfold/assemble kernels in src/backend/gpu/kernels/ds41_vision.cpp)
+// mirrors it on the device.
 //
 // The token order after the "spatial merge" reorder is the one the text model
 // sees: 2x2 patch groups (dy,dx) are laid out contiguously, so the merger can
@@ -61,6 +72,9 @@ struct vision_hparams {
     // 8 * patch_area for every tower, which let a small image through at a
     // token count far below the model's reliable floor.
     int min_pixels = 0;
+    // deepseek41v: the cap is on the whole token block (newlines + sentinels),
+    // not on a pixel count.  0 for the other towers.
+    int max_n_token = 0;
     float eps = 1e-6f;
     float rope_base = 10000.0f;
     float mean[3] = {0.5f, 0.5f, 0.5f};
@@ -74,6 +88,10 @@ struct vision_layer {
     vt up, down;
     const float * up_b = nullptr;
     const float * down_b = nullptr;
+    // deepseek41v's SwiGLU gate projection (`v.blk.N.ffn_gate`); null for the
+    // qwen towers, whose FFN is a single up projection + GELU.
+    vt gate;
+    const float * gate_b = nullptr;
     const float * ln1 = nullptr;
     const float * ln1_b = nullptr;
     const float * ln2 = nullptr;
@@ -91,6 +109,15 @@ struct vision_input {
     int out_w = 0;     // merged grid width (pw / merge)
     int out_h = 0;     // merged grid height (ph / merge)
     int n_out = 0;     // merged tokens (out_w * out_h)
+    // deepseek41v: the emitted token block is not out_w*out_h.  `n_llm_w` /
+    // `n_llm_h` are the 3x3-merged grid, `n_grid` its cell count, and `n_out`
+    // is the *block* length (n_llm_h*(n_llm_w+1)+2, sentinels included).
+    // `n_pos` is how many text positions the block consumes (plain 1-D, so =
+    // n_out for deepseek41v; for the qwen towers it is max(out_w,out_h)).
+    int n_llm_w = 0;
+    int n_llm_h = 0;
+    int n_grid = 0;
+    int n_pos = 0;
 };
 
 struct vision_model {
@@ -113,6 +140,12 @@ struct vision_model {
     vt mm0, mm2;
     const float * mm0_b = nullptr;
     const float * mm2_b = nullptr;
+    // deepseek41v's learned sentinel embeddings (5120-wide f32 rows):
+    // appended after the projector grid in the order img_start, img_end,
+    // image_newline and then gathered by the reading-order layout.
+    const float * img_start = nullptr;
+    const float * img_end = nullptr;
+    const float * img_newline = nullptr;
 
     // `kind` is the text model's declared vision tower; `none` is refused.  The
     // mmproj's `clip.projector_type` is cross-checked and a disagreement throws.
@@ -251,10 +284,26 @@ struct vision_model {
     void * d_patch_w = nullptr;
     float *d_patch_in = nullptr, *d_x = nullptr, *d_ln = nullptr, *d_qkv = nullptr;
     float *d_attn = nullptr, *d_ffn = nullptr, *d_mm0 = nullptr, *d_pos = nullptr;
+    // deepseek41v only: SwiGLU gate, and the projector's intermediate grid
+    float *d_gate = nullptr, *d_grid = nullptr;
     int scratch_patches = 0;
 };
 
 // dequantize helpers shared with the device path
 float vt_get(const vt & t, int row, int k);
+
+// DeepSeek-V4.1-Flash ("deepseek41v") preprocessing.  This is deliberately a
+// separate entry point rather than an `mm_image_preprocess` option: its plan is
+// a min-pixel upscale + patch-14 align + a single token-block solver, its
+// resize is a letterbox on RGB 127 (not a stretch), and every normalized value
+// is rounded to bf16 before the tower sees it.  The caller decodes the RGB8
+// buffer and passes `vm.hp`; the result is planar RGB f32 in [0,1]-normalized
+// form, already bf16-rounded.
+mm_image mm_image_preprocess_deepseek41v(const uint8_t * rgb, int w, int h, const vision_hparams & hp);
+// Dispatch the architecture's preprocessing: deepseek41v has its own plan
+// (min-pixel upscale, pad-to-42, bf16 rounding); the qwen towers use the shared
+// smart-resize.  Callers that already have the loaded vision_model use this.
+mm_image mm_image_preprocess_vision(const vision_model & vm, const uint8_t * rgb, int w, int h,
+                                    const image_preproc_cfg & cfg);
 
 } // namespace si

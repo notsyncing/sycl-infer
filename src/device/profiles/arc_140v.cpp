@@ -60,7 +60,7 @@ static const profile arc_140v = {
     .occ = {.warps_per_eu_x2 = 15},
 
     // INHERITED budget of the measured 128 KB SLM (the kernels were sized
-    // against 48 KB on both Xe-LP parts and that reserve still fits).
+    // against 48 KB on both Arc parts (Xe-HPG A770 / Xe-LP Iris) and that reserve still fits).
     .slm = {.budget_bytes = 48 * 1024},
 
     // INHERITED, and the group most likely to be wrong: these thresholds size a
@@ -90,7 +90,7 @@ static const profile arc_140v = {
 
     // INHERITED.  attn.xmx is oneDNN's int8 prefill attention and needs
     // head_dim 256, so it does not apply to the 35B A3B (head_dim 128) either
-    // way.  dec_group stays off (both Xe-LP parts measured it off, for opposite
+    // way.  dec_group stays off (both Arc parts measured it off, for opposite
     // reasons); it has not been re-measured on Xe2.
     .attn = {
         .xmx_gather_red = 64,

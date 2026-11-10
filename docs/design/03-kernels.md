@@ -133,11 +133,11 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
 **每张卡必须自己写全，包括 provenance。** `arc_a770.cpp` 的 `.provenance` 串与逐字段注释给出
 了测量条件（1-2x A770 16 GB、512 EU、`--layer-map 0-31:gpu.0,32-63:gpu.1`、attn+combine 在 64k 深度下
 nsp 64/128/144/160/168/176 → 3.05/2.18/1.75/1.70/1.74/2.68 ms 等）。`iris_xe.cpp` 里绝大多数字段标
-**INHERITED**：两卡同属 Xe-LP，所以 8-warp/EU 的子组格子相同，但**最优点没有重扫**——原因写在
+**INHERITED**：Iris Xe 是 Xe-LP、A770 是 Xe-HPG（同属 Gen12 Xe 家族），所以 8-warp/EU 的子组格子相同，但**最优点没有重扫**——原因写在
 `iris_xe.cpp`，这类集成卡与 host 共享内存，本地未跟踪的压测工具（`dev/` 在 `.gitignore` 中）
 `bench_attn27 --dec-only` 在有负载的机器上同一配置三次重复给出 2.1-4.4 ms，噪声大于效应。
 **`moe.*` 全组和 `shape.w4_rows_per_wg` / `q8_rows` / `f32_rows` 也是 INHERITED 且未在 Iris Xe
-上测量**：expert tile 的约束（每 lane 寄存器）同属 Xe-LP，但选 M=8 的带宽/占用平衡在集显上不
+上测量**：expert tile 的约束（每 lane 寄存器）同属 Gen12 Xe 家族（Xe-LP/Xe-HPG），但选 M=8 的带宽/占用平衡在集显上不
 一样，K-split 的行门槛还随 EU 数缩放。未测量要写出来，不要假装测过。同一个值、两份相反的证据，
 正是这个拆分存在的理由（`attn.dec_group` 见 §7.4）。
 

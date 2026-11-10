@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -268,6 +269,31 @@ struct engine_config {
     int draft_dev = 0;
 };
 
+// DeepSeek-V4.1-Flash's model-owned forward (engine_ds41.cpp).  It owns its
+// per-sequence window / compressed caches and its Engram history, so it does
+// not use the paged KV pool or the seg_plan machinery.  Greedy/sampled token
+// generation, one sequence at a time (the profile caps decode rows at 1).
+std::vector<int> ds41_generate(model & m, tokenizer & tk, const std::vector<int> & prompt, const mm_prompt * mm,
+                               const gen_params & gp, const std::function<bool(int)> & cb,
+                               std::vector<float> * first_logits = nullptr, size_t * cached_tokens = nullptr);
+
+// ---- DeepSeek-V4.1-Flash GPU forward (engine_ds41_gpu.cpp) ----------------
+// The host forward above is the oracle.  When the run is on GPUs this state
+// owns the device weight views (through engine::weight_maps_), the per-layer
+// window / group-shared compressed caches, the routed-expert bank and the
+// per-token scratch, and drives every dense GEMV, the mHC, the MLA attention,
+// the compressor/indexer and the routed/shared experts on the card.  The
+// Engram n-gram hash and its 24-row table gather stay on the host (the table
+// is ~100 GiB and never uploaded).
+struct engine;
+struct ds41_gpu_state;
+ds41_gpu_state * ds41_gpu_create(engine & e);
+void ds41_gpu_destroy(ds41_gpu_state * st);
+std::vector<int> ds41_gpu_generate(model & m, tokenizer & tk, const std::vector<int> & prompt, const mm_prompt * mm,
+                                   const gen_params & gp, const std::function<bool(int)> & cb,
+                                   std::vector<float> * first_logits, size_t * cached_tokens,
+                                   ds41_gpu_state & st);
+
 struct engine {
     model m;
     // The model's declarative profile (== m.prof), set once the engine has
@@ -279,6 +305,14 @@ struct engine {
     // The single predicate every dispatch site uses; the loader's `q4exp` flag
     // stays only as the consistency assertion in model::load.
     bool hc_fwd() const { return mp_ && mp_->fwd == model_profile::fwd_kind::hc_ple_qsa; }
+    // DeepSeek-V4.1-Flash owns a completely different forward (MLA + compressed
+    // cross-layer KV + DSA + mHC + Engram).  It has no paged KV pool and no
+    // seg_plan; generate_impl hands the whole request to engine_ds41.cpp.
+    bool ds41_fwd() const { return mp_ && mp_->fwd == model_profile::fwd_kind::deepseek41; }
+    // The GPU implementation of that forward (engine_ds41_gpu.cpp); null on a
+    // CPU run, for a non-ds41 model, or when PF_DS41_GPU=0.
+    ds41_gpu_state * ds41g_ = nullptr;
+    bool ds41_gpu() const { return ds41g_ != nullptr; }
     tokenizer tk;
     int device_req = -1; // resolved device request (0 = gpu, 1 = cpu)
     // A pipeline-parallel run over several GPUs shares one SYCL context: USM
@@ -1605,6 +1639,13 @@ struct engine {
     // embeddings and the M-RoPE positions of the prompt
     std::vector<int> generate_mm(const mm_prompt & p, const gen_params & gp, const std::function<bool(int)> & cb,
                                  std::vector<float> * first_logits = nullptr);
+    // Prompt tokens served from the model-owned prefix cache on the most recent
+    // generate()/generate_mm() call (ds41 today; 0 for every other forward).
+    // Reset per call, and atomic so the server's post-generate read cannot race
+    // a concurrent request's reset.
+    size_t last_cached_tokens() const {
+        return last_cached_tokens_.load(std::memory_order_relaxed);
+    }
     bool is_eos(int tok) const {
         return tok == tk.eos_id || tok == tk.eot_id;
     }
@@ -1836,6 +1877,9 @@ private:
     std::vector<int> generate_impl(const std::vector<int> & prompt, const mm_prompt * mm, const gen_params & gp,
                                    const std::function<bool(int)> & cb, std::vector<float> * first_logits,
                                    bool allow_spec = true);
+    // Prompt tokens the model-owned forward reused from its own prefix cache
+    // (ds41).  Every other architecture reports through sequence::reused.
+    std::atomic<size_t> last_cached_tokens_{0};
 
     // dynamic pool internals
     struct kv_extent {

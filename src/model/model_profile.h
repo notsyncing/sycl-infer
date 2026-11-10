@@ -45,14 +45,14 @@ struct model_profile {
     // How the forward pass is executed.  `generic_plan` is the shared
     // seg_plan/record_forward path; `hc_ple_qsa` is the qwen4exp walk
     // (engine_q4exp.cpp), which cannot be expressed as the generic plan.
-    enum class fwd_kind { generic_plan, hc_ple_qsa };
+    enum class fwd_kind { generic_plan, hc_ple_qsa, deepseek41 };
 
     // Which vision tower an mmproj for this architecture is.  The loader
     // (src/mm/vision.cpp) is one module that implements every variant; this
     // field selects the per-architecture differences (fused vs separate q/k/v,
     // position embeddings, FFN/merger activation, head width) and is
     // cross-checked against the mmproj's own `clip.projector_type`.
-    enum class vision_kind { none, qwen3vl, qwen2vl };
+    enum class vision_kind { none, qwen3vl, qwen2vl, deepseek41v };
 
     // How the scheduler feeds a prompt to prefill.  `chunk32` is the shared
     // chunker (kMaxT chunks, the batched mode-2 path); `whole_prompt` asks
@@ -162,5 +162,6 @@ extern const model_profile kQwen35Profile;    // qwen35
 extern const model_profile kQwen35MoeProfile; // qwen35moe
 extern const model_profile kQwen4ExpProfile;  // qwen4exp
 extern const model_profile kQwen2VlProfile;   // qwen2vl
+extern const model_profile kDeepseek41Profile; // deepseek41
 
 } // namespace si

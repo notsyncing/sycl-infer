@@ -55,6 +55,9 @@ size_t ggml_blck_size(uint32_t t) {
     case GGML_TYPE_IQ3_XXS:
     case GGML_TYPE_IQ3_S:
     case GGML_TYPE_IQ4_XS: return 256;
+    case GGML_TYPE_IQ2_XXS:
+    case GGML_TYPE_IQ2_XS:
+    case GGML_TYPE_IQ2_S: return 256;
     case GGML_TYPE_IQ4_NL: return 32;
     default: throw std::runtime_error("unsupported ggml type");
     }
@@ -78,6 +81,9 @@ size_t ggml_type_size(uint32_t t) {
     case GGML_TYPE_Q6_K: return 2 + 16 + 128 + 64;
     case GGML_TYPE_Q8_K: return 4 + 256 + 32;
     case GGML_TYPE_IQ3_XXS: return 2 + 32 + 64; // 2 + QK_K/8 + QK_K/4
+    case GGML_TYPE_IQ2_XXS: return 2 + 32 * 2; // 2 + QK_K/8 uint16 codes
+    case GGML_TYPE_IQ2_XS: return 2 + 32 * 2 + 8; // + QK_K/32 scales
+    case GGML_TYPE_IQ2_S: return 2 + 64 + 8 + 8;
     case GGML_TYPE_IQ4_NL: return 2 + 16; // 2 + 16
     case GGML_TYPE_IQ3_S: return 2 + 64 + 32 + 8 + 4; // 2 + QK_K/4 + QK_K/8 + QK_K/32 + 4
     case GGML_TYPE_IQ4_XS: return 2 + 2 + 128 + 4; // 2 + 2 + QK_K/2 + QK_K/64

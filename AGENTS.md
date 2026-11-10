@@ -1442,8 +1442,9 @@ pre-biased codebook and pre-shifted LUTs all measured worse).
 DPAS u4 K=64); fp32 FMA peak ~5.0 T-FMA/s (`dev/alu_probe2.cpp` — the older
 `alu_probe.cpp` is dead, the compiler folds its loop and it reports 1.5 PFLOP/s).
 So the memory system's intensity is **~13 MAC/byte** against a tensor-core card's
-20-30x, and **dp4a is not a hardware unit on Xe-LP** — it sits at 70-98 % of the
-vector ALU, so DPAS really is a separate ~16x unit.
+20-30x, and **dp4a is a vector-ALU instruction, not the tensor unit, on the Arc
+(Xe-HPG)** — it sits at 70-98 % of the vector ALU; DPAS/XMX is the separate
+instruction (its measured gain here is the K-ratio, not 16x — see below).
 
 The critical batch size follows: with the u4 store's 0.625 B/weight and the rate the
 *real* kernel achieves (**7.1-7.6 T-MAC/s**, from `dev/bench_wpass.cpp` replaying the
@@ -1457,16 +1458,33 @@ note above).  **Take `M*` from `bench_wpass`, not from
 derived from it is too small.  (The older 6.4 figure came from the 4.9 T-MAC/s
 number and is wrong.)
 
-**XMX / DPAS was re-implemented and rejected on measured grounds — do not re-derive.**
+**oneDNN's Xe-HPG systolic GEMM DOES use the XMX unit (2026-11-08) — the
+hand-written path is the thing that was rejected.**  On this box's current
+library (oneDNN 3.13.2 from `/opt/intel/oneapi/dnnl/2026.1/lib`; the 2026.0
+RUNPATH target is gone) `ONEDNN_VERBOSE=all` selects `jit:xe_hp:gemm:any`
+(`jit_xe_hp_systolic.cpp`) for the ds41 shapes and measures **40.9-44.3 T-MAC/s
+plain s8 (81.7-88.6 TOPS, 34 % of the 262 TOPS spec)** and **22.4-29.5 T-MAC/s
+with per-32 grouped f16 scales** at M=512 (K=5120/N=2304 and K=2304/N=5120); at
+M=1 the same path is **266-280 GB/s** (bandwidth-bound).  The original "no XMX
+kernel" measurement was oneDNN **3.11.4**, where `strings | grep -c xmx` was 0
+and every impl was `jit:gemm:any` - that is version-specific, and any prefill
+number taken before the library change is stale.  Verdict from the 2026-11-08
+XMX study: **do not hand-write DPAS; route large-M GEMMs through oneDNN.**  (For ds41 that means a batched prefill: the current walk is
+per-token M=1, and the MoE expert format cannot go to s8/u4 without tripling
+the bank footprint.)
+
+**Hand-written XMX / DPAS was re-implemented and rejected on measured grounds — do not re-derive.**
 The earlier rejection rested on "DPAS K is fixed at 32 = our group width", which is
 too narrow: the native `esimd::dpas<8,8,int32_t,int32_t,uint32_t,uint32_t,u4,s8,64,
-32,64>` takes a **u4** operand with **K=64**, i.e. two 32-wide groups chained without
-a drain, and it is bit-exact for a per-32 u4 stream (0/64 and 0/200 mismatches).
-Raw throughput with register-resident operands (`dev/probe_dpas_occ`): the XMX has
-**no K=64 int8 form**, only K=32, so the int8 path delivers half the MACs per
-instruction at the same instruction rate - `u4 x s8` (K=64) measures 7.7 T-MAC/s and
-`s8 x s8` (K=32) **3.8**, both at 1.9 G-dpas/s.  That is **2x, not 16x**, and it is the
-*K ratio*, not a missing capability.  (An earlier revision of this file recorded 254
+32,64>` takes a **u4** operand; **only `u4 x u4` reaches K=64** (two 32-wide groups
+chained without a drain) and it is bit-exact for a per-32 u4 stream (0/64 and
+0/200 mismatches).  **The mixed `u4 x s8` form is K=32**: `K = SD x
+OpsPerChannel` and `OpsPerChannel = 32/max(bitwidth)` = 4 with 8-bit activations,
+so the repo's old "u4 K=64 = 7.7 T-MAC/s" was a **2x MAC overcount on a K=32
+instruction**.  The true register-resident numbers (`dev/probe_dpas_occ` /
+`dev/probe_dpas_wg`) are **3.8 T-MAC/s for s8 x s8 (K=32) and 7.7 for u4 x u4
+(K=64, 4-bit activations)**; that is **2x, not 16x**, and it is the *K ratio*,
+not a missing capability.  (An earlier revision of this file recorded 254
 T-MAC/s for u4 and a 16x ratio; both came from a probe whose u4 arm and dp4a's measured
 instruction rate disagree by 10x, and are superseded.)
 It still loses by a wide margin in a real GEMM.  `dev/bench_dpas_gemm.cpp` does the
@@ -1479,6 +1497,10 @@ measured: K-split regresses exactly linearly (1/2/4/8/16/32 → 7.69/14.80/28.92
 the two 64/32-element cross-lane **offset vectors** (a runtime element write or a
 union'd array write into a cross-lane simd is serialised through local memory) and
 spilling the `NT x 8 x 8` accumulators.  `NT` sweep 1/2/4/8 → 13.27/9.16/**7.44**/8.93.
+A 2026-11-08 re-study confirms it: the best ESIMD GEMM here is **0.18-0.21
+T-MAC/s** at M=512 (150-210x slower than oneDNN at the same shape), and an
+**8-warp DPAS work-group hangs in the IGC/AOT toolchain** (1- and 4-warp groups
+run).  The unit is neither unused nor broken - the hand-written route is.
 Three ways to build those offsets that **do not work**: an initialiser list
 (`esimd::simd<int,64>{0,4,8,...}`) has no matching constructor at either length; the
 `VS`-blocked `gather<VS>(p, simd<OffsetT, N/VS>)` overloads require a `simd_view`
@@ -2989,6 +3011,138 @@ Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.m
   At `--ctx 2048` QSA is off entirely.  The q4 server's long-prompt prefill now
   uses the whole-prompt q4 path (no `PF_PFB_MAX_M`; 2.2x; see design 18 §7.1).
 
+### DeepSeek-V4.1-Flash (`deepseek41`)
+
+`DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS` (6 shards, ~155 GiB text + a 110 GiB
+Engram shard + a `deepseek41v` mmproj) is a 40-layer, all-MoE decoder with a
+model-owned forward.  Geometry: 64 query heads / **1** KV head, key = value =
+512, `rope.dimension_count = 64`; q is `5120→1280→32768`; output is 8 groups of
+`4096→1024` then `8192→5120`; 128-token sliding window on every layer;
+compressed KV owners `[2,8,14,20]` with `compress_ratios = [0,0,2×18,1×20]`;
+DSA indexer 32×128, top 512, sources `[2,8,14,20,24,28,32,36]`, a candidate
+stage only at layer 20 (block 8, top 2048); mHC 4 streams / 24 mix outputs /
+Sinkhorn 20 / eps 1e-6; 384 experts top-6 + 1 ungated shared expert, FFN 2304,
+`expert_weights_scale 1.5`; Engram on layers 1 and 14 (n-gram 4, 8 heads per
+n-gram, 256-wide rows from a 110 GiB IQ4_NL table); RMSNorm eps **1e-20**.
+
+Files: `src/model/deepseek41.cpp` (loader), `src/model/profiles/deepseek41.cpp`
+(profile), `src/engine/engine_ds41.cpp` (host forward + incremental `DecState` +
+prefix cache), `src/engine/engine_ds41_gpu.cpp` (2×A770 path),
+`src/backend/gpu/kernels/ds41_{iq2,attn,hc,ops}.*`, `src/mm/vision.cpp`
+(`deepseek41v`), `src/server/chat.cpp` (`render_chat_deepseek`).
+Docs: `docs/design/23-deepseek41.md`, `docs/PERFORMANCE.md` §5.5.
+
+**Forward facts that fail silently if changed.**
+* RoPE rotates the **last 64 of 512 dims**, not the first; ratio-0 layers
+  (0, 1) use base 10000 with no scaling, ratio>0 uses
+  `compress_rope_freq_base` + YaRN 16/65536/32/1 with mscale cancelled to 1.0.
+* **K == V** (a 512-wide latent), K-only cache; the attention output is
+  de-roped before `wo_a`.
+* Compressed rows are **group-shared**: only the 4 owners write; a consumer
+  reads the owner's rows even when its own ratio is 0.  A row is
+  `[K512 | indexK128]`, RoPE'd at the **block start**; the index key comes from
+  the **pre-RoPE** latent.
+* Candidate blocks exist **only at layer 20**, with the newest partial block
+  pinned.
+* mHC's attention pre-mix is **lagged one sublayer**; the final norm uses the
+  last layer's ffn pre-mix.
+* Router: `sqrt(softplus)`, bias affects **selection only**, weights
+  `score/(Σ+1e-20)·1.5`; do not reuse the softmax router.  SwiGLU clamp is
+  **one-sided** on the gate.
+* The Engram table is 110 GiB: never upload it; read rows on demand and skip
+  Engram on image rows.
+* **IQ3_XXS is a real type here** (layer 23's `ffn_down_exps`): it is now in
+  `quant.h` and in the device `dequant_elem_iq` + GEMV dispatch (type 18, 98 B /
+  256).  Missing it left a stale buffer in the host path and NaN from layer 23
+  on the GPU.
+* The GGUF chat template's assistant transition is
+  `<|Assistant|>` + (`<think>` when thinking, `</think>` otherwise); a bare
+  assistant marker leaves chat-mode image prompts with an unclosed think block
+  and the model answers EOS.
+* `mm_prompt::n_rows` is the embedding-row count, not `n_img`; an image
+  contributes many rows (202 for a 640×320 page).
+
+**Measured (2×A770 box).**  Host: raw `The capital of France is` ->
+` Paris.`; incremental decode ~0.93 s/token; exact-prefix reuse 2.7×.  GPU
+(`--device gpu --layer-map 0-19:gpu.0,20-39:gpu.1 --moe-vram-mb 16000
+--ctx 512 --max-slots 1`): dense 5.74 GiB resident, expert bank 14.6 GiB
+(card0 20 / card1 22 slots for its expert half, **60 % hit**), chat `2+2`->`4`,
+image (640×320) -> `HELLO 123`.
+
+**Performance pass (2026-11-07): decode 353 -> 276 ms/token (2.8 -> 3.6 tok/s),
+prefill 165-180 ms/token at 16000 MB and 156-175 at 18000 MB (5.6-6.4 tok/s),
+greedy text byte-identical.**  Three
+changes, all measured on the 2×A770:
+
+* **The routed experts are split across both cards** (`PF_DS41_SPLIT`, default
+  on for 2 GPUs): ids `< 0.34·E` live on card 0, the rest on card 1
+  (`PF_DS41_SPLIT_RATIO`), so a layer's misses upload over **both** PCIe links
+  concurrently.  The box's links are asymmetric (5.18 vs 9.98 GB/s), so the id
+  split follows that ratio while the *budget* split is 0.47/0.53
+  (`PF_DS41_SPLIT_BUDGET_RATIO`, or `PF_DS41_BANK0_MB`/`PF_DS41_BANK1_MB`) -
+  card 0 also carries the dense MLA weights, the LM head and three of the four
+  compressed caches.  Both banks cover every layer, and each card's budget is
+  reduced by that card's window/compressed-cache bytes plus 512 MiB
+  (`card_reserve`), so ctx 512..262144 all allocate at 16000 MB (1.4-1.7 GiB
+  free/card; text-only 19000 is the measured max, 20000 dies, and 19000 leaves
+  no room for the vision tower).  The owner replays the six `yadd`s in top-k
+  order from per-expert output slots, so the split is **bit-identical** to the
+  unsplit path (32-token greedy md5 equal; router selection is untouched).
+* **The staging memcpy runs on a 4-way spin-waited crew** (the calling thread
+  copies too).  A miss copies 9.2 MB from the page-cache mmap into pinned
+  memory before its H2D; one host thread cost 72 ms/token unsplit and 119 ms
+  split, erasing the link win.  The crew (a spin generation handshake, not
+  condvars - a condvar wake for a 0.3 ms copy cost ~0.5 ms/miss) takes it to
+  22/35 ms, and the ring is 8 slots deep because a layer selects up to 6
+  experts.
+* **The generic paged-KV pool is not allocated for ds41** (`kv_setup` skips
+  it): the forward owns its window/compressed caches, but the multi-device
+  branch re-derived `n_blocks` from `pool_cap` and committed 10.6 KB/token/card
+  - **1.28 GB per card at ctx 128k**, which is what made the bank fault at
+  depth.  `[mem] kv=1` now.
+
+Same-stream phase split (`PF_DS41_TIME=2` adds per-phase waits): 275 ms =
+**attention 90 + MoE 173 + head 2.2** + ~10 ms of hc/rms/embed/handoff/sampler.
+The head is **not** the 60 ms the `nohead` ablation suggested: removing it
+leaves stale logits, the same token repeats and routing stops changing, cutting
+miss bytes by 6.7 GB - the ablation changed the workload.  The head is 4.1 ms
+at 110 GB/s.  **The remaining headroom is the dense Q5_K decode GEMV**: the
+attention's ~3.6 GB/token of projections run at 110 GB/s
+(`gemv_dec_vec_kernel<13>`) against the native u4 store's 223-294 GB/s; u4 is
+also smaller (0.625 vs 0.6875 B/w) but lossy (4.6 % weight error), so it is an
+accuracy decision, and prefetching the staging would recover another ~20-30 ms.
+**Prefill (same build):** 320-token prompt 164.2 ms/token at 16000 MB and
+**156.4 (6.39 tok/s) at 18000 MB** (hit 88.0 -> 90.7 %); 80-token cell 180.5 /
+174.5.  Phase split (80-token, 16000): attention 68 + MoE 107 + other ~9; the
+MoE is ~65 of uploads (42 misses/token, each a 9.2 MB H2D, ~1 miss/layer so the
+H2Ds are serialized by the layer dependency) and ~30 of expert GEMVs.
+**Batching the prefill MoE by token does not pay**: 384 experts with top-6 and
+strong adjacent-token locality means the per-layer union over 8 tokens is only
+~29 experts (most already resident, 82-91 % hit), so the pair count per expert
+is ~1 and there is no M to amortize - the same dispersed-routing result as
+qwen4exp's 2-row decode.  Making a miss ONE H2D instead of three (one padded
+[gate|up|down] slot) is **neutral** (decode 276.6 vs 274.5, prefill 182.8 vs
+180.5) and was reverted: the three copies were already pipelined.  The prefill
+levers that remain are the same dense-Q5_K store question and the attention
+core.  Recommended: **18000 MB text-only** (ctx 32768 still fits: 495+838 MB
+free on card 0), 16000 when the vision tower's ~866 MB must fit.
+
+Bank hit is saturated at ~60 % decode (R 20-24 against 384 experts);
+17000-19000 MB buys 1 % decode and 3-5 % prefill.  Two GEMV experiments bound it: growing the vec GEMV's work-group
+(16/32 rows instead of 8) is **neutral** (attention 89.8/90.4 vs 92.7 ms,
+identical text), and `#pragma unroll 2` on its superblock loop is **worse**
+(attention 126 ms, head 2.24 -> 6.17; register pressure).  So the 110 GB/s is
+the per-lane K-quant decode at a local optimum: the fix is a different weight
+store, not a bigger launch or more ILP.  `PF_DS41_ABL=nomoe|noattn|nohead|nostage` are
+wrong-output timing ablations.  Hot-set calibration (`PF_DS41_CAL=1`) remains opt-in (a net loss
+for short generations).
+
+**Tests.** Hermetic: `test_model_profile`, `test_hparams`, `test_mm_step`,
+`test_chat_builtin`, `test_chat_deepseek`, `test_ds41_pc`; GPU:
+`test_ds41_ops` (33 checks), `dev/ds41_iq2_probe`, `dev/ds41_attn_probe`,
+`dev/ds41_vision`; model-backed: `dev/ds41_gen` (golden ids),
+`dev/test_ds41_pc`, `dev/bench_ds41`.
+
 ### MinerU2.5-Pro-2605-1.2B (`qwen2vl`)
 
 `opendatalab/MinerU2.5-Pro-2605-1.2B` is a **Qwen2-VL dense decoder** (24 layers,
@@ -3709,16 +3863,16 @@ name.
   because the *classic* kernel is faster there — same value, opposite reasons.
   That is the case the split exists for.
 * **Say which numbers are inherited.**  A field marked INHERITED is a value
-  carried across from the other card because the two share an architecture (both
-  are Xe-LP, so the 8-warp/EU sub-group lattice is common) but which was *not*
-  re-measured.  Unmeasured is a liability; write it down rather than implying it
+  carried across from the other card because the two share an architecture (the
+  Iris Xe is Xe-LP and the A770 is Xe-HPG, but both are Gen12-family Xe with the
+  same 8-warp/EU sub-group lattice) but which was *not* re-measured.  Unmeasured is a liability; write it down rather than implying it
   was checked.  The Iris Xe profile currently marks most of its tuning inherited:
   the decode-split microbenchmark on an integrated part returned 2.1-4.4 ms for
   one configuration across three repeats, i.e. the noise exceeded the effect, so
   the sweep has to be redone on an idle box before those values are trusted.
   **The entire `moe.*` group and `shape.w4_rows_per_wg` / `q8_rows` / `f32_rows`
   are also INHERITED and unmeasured on the Iris Xe.**  The expert tile's binding
-  constraint (registers per lane) is the same Xe-LP file, so M=8 plausibly
+  constraint (registers per lane) is the same Xe-HPG register file, so M=8 plausibly
   transfers, but the bandwidth-vs-occupancy balance that chose it is not the
   same on an integrated part; the K-split row thresholds scale with the EU count.
   `test_dev_profile` requires the fields to be *present* and identical (a missing
@@ -5090,14 +5244,20 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
 * **oneDNN cannot be recorded** into a SYCL graph; the `PF_GEMM_DNNL` path
   replays mode-2 prefill directly (`prefill_batch`).
 
-* **"XMX" here is a name for oneDNN's int8 matmul, not the XMX unit.**
-  `attn_xmx.cpp` / `PF_ATTN_XMX` / `PF_ATTN_XMX_MIN` all date back to "use
-  oneDNN's int8 matmul for prefill attention"; the unit was never involved.
-  Measured: `ONEDNN_VERBOSE=2` names the impl `jit:gemm:any` for every matmul
-  the engine runs (a mode-2 prefill is 1154 of them, attention included), and in
-  this oneDNN 3.11.4 (`libdnnl.so.3.11`, Level Zero, DG2) `strings | grep -c
-  xmx` is 0 - all 498 `dpas` hits are `DUMMY_DPAS_*` JIT-generator placeholders,
-  so **no XMX GEMM kernel is compiled in at all**.  Do not read a win from
+* **"XMX" here is a name for oneDNN's int8 matmul, not (necessarily) the XMX
+  unit.**  `attn_xmx.cpp` / `PF_ATTN_XMX` / `PF_ATTN_XMX_MIN` all date back to
+  "use oneDNN's int8 matmul for prefill attention".  The original measurement
+  was on oneDNN **3.11.4** (`libdnnl.so.3.11`): `ONEDNN_VERBOSE=2` named the
+  impl `jit:gemm:any` for every matmul, `strings | grep -c xmx` was 0, and all
+  498 `dpas` hits were `DUMMY_DPAS_*` placeholders - no XMX kernel was compiled
+  into that library.  **That is version-specific and is no longer true.**  This
+  box's `/opt/intel/oneapi/dnnl/2026.0` (the binary's RUNPATH) was removed;
+  `setvars.sh` resolves **3.13.2** from `.../dnnl/2026.1/lib` (224 `xe_hp`
+  symbols), which **does** emit `jit:xe_hp:gemm:any` (measured 41-44 T-MAC/s
+  plain s8 / 22-30 grouped at M=512, 266-280 GB/s at M=1).  Without
+  `setvars.sh` `libdnnl.so.3` is not found at all (the RUNPATH points at the
+  deleted tree) - a silent way to measure the wrong library.  Re-check which
+  library a number came from before quoting it; do not read a win from
   `PF_ATTN_XMX` as evidence about the XMX unit.
 
 * **oneDNN int8 prefill attention (`attn_xmx.cpp`, `PF_ATTN_XMX`, default on

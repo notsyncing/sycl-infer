@@ -284,6 +284,16 @@ int engine::attn_dev(int a) const {
 }
 
 void engine::kv_setup(int n_attn, int initial_blocks) {
+    if (ds41_fwd()) {
+        // deepseek41 owns its sliding-window and group-shared compressed caches
+        // (engine_ds41.cpp / engine_ds41_gpu.cpp) and never touches the paged
+        // pool.  engine.cpp already sets n_blocks = 1, but the multi-device
+        // branch below re-derives n_blocks from pool_cap and commits the whole
+        // context: 4096 blocks x 16 KB x 20 attention layers = 1.28 GB per card
+        // at ctx 128k, which is what made the split bank miss at depth.
+        initial_blocks = 1;
+        pool_cap = 1;
+    }
     const size_t block_bytes = kv_block_bytes();
     const size_t v_block_bytes = kv_v_block_bytes();
     const bool has_scales = kv_dtype_has_scales(kv_k_dtype()) || kv_dtype_has_scales(kv_v_dtype());

@@ -268,13 +268,15 @@ engine::engine(const engine_config & cfg)
         // separate mmproj GGUFs, exactly as for every other architecture.  If the
         // tokenizer has no pad token at all, say so here rather than letting the
         // first media request fail at prompt expansion with a tokenizer message.
-        const bool has_img_pad = tk.token_to_id.count("<|image_pad|>") != 0;
+        const bool has_img_pad = tk.token_to_id.count("<|image_pad|>") != 0
+                                 || tk.token_to_id.count("<｜deepseek_image｜>") != 0;
         const bool has_vid_pad = tk.token_to_id.count("<|video_pad|>") != 0;
         const bool has_aud_pad = tk.token_to_id.count("<|audio_pad|>") != 0;
         if (!has_img_pad && !has_vid_pad && !has_aud_pad) {
             fprintf(stderr,
-                    "[mm] qwen4exp: this GGUF has no image/video/audio pad token, so multimodal input is "
-                    "unavailable (the text path is unaffected)\n");
+                    "[mm] %s: this GGUF has no image/video/audio pad token, so multimodal input is "
+                    "unavailable (the text path is unaffected)\n",
+                    mp_->key);
         }
     }
     // YaRN: build the per-pair frequency table here, before *anything* allocates a
@@ -807,14 +809,47 @@ engine::engine(const engine_config & cfg)
         }
     }
     n_blocks = pool_cap;
+    if (ds41_fwd() && !cpu_mode) {
+        // ds41 keeps its own window/compressed caches; the paged pool is unused
+        // (and its default 640 MB is a real loss on a 15.5 GiB card).
+        n_blocks = 1;
+    }
     alloc_buffers();
     lt.lap("alloc_buffers (KV/act)");
     if (hc_fwd()) {
         q4_alloc();
         lt.lap("q4_alloc (banks+pin)");
-    } else {
+    } else if (!ds41_fwd()) {
+        // deepseek41 has no seg_plan and no paged KV: its forward owns its
+        // window/compressed caches and is driven from generate_impl, so there
+        // is nothing to build (and the generic plan would dereference null
+        // wq/wk/wv/wo slots).
         build_graphs();
         lt.lap("build_graphs (plans+capture)");
+    }
+    if (ds41_fwd() && !cpu_mode) {
+        // The GPU forward is the default for a ds41 run on a GPU; PF_DS41_GPU=0
+        // keeps the validated host forward for an A/B.  The weights were
+        // uploaded by setup_multi_device -> upload_device_weights above; this
+        // allocates the ds41-owned caches, the expert bank and the scratch.
+        const char * eg = si::env::str("PF_DS41_GPU");
+        const bool gpu_default = !(eg && atoi(eg) == 0);
+        if (gpu_default && !multi_dev) {
+            fprintf(stderr, "[ds41] --device gpu without a layer map: keeping the host forward "
+                            "(pass --layer-map 0-%d:gpu.0)\n", m.hp.n_layer - 1);
+        } else if (gpu_default) {
+            bool any_cpu = false;
+            for (int d : dev_kind_) {
+                any_cpu = any_cpu || d != 0;
+            }
+            if (any_cpu) {
+                fprintf(stderr, "[ds41] the GPU forward needs an all-GPU --layer-map; "
+                                "keeping the host forward\n");
+            } else {
+                ds41g_ = ds41_gpu_create(*this);
+                lt.lap("ds41_gpu_create (caches+bank)");
+            }
+        }
     }
 
     // PF_MEM_REPORT: the engine's own device-allocation accounting against the
@@ -861,6 +896,10 @@ engine::engine(const engine_config & cfg)
 }
 
 engine::~engine() {
+    if (ds41g_) {
+        ds41_gpu_destroy(ds41g_);
+        ds41g_ = nullptr;
+    }
     if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
         q4_hist_report();
     }
@@ -2756,6 +2795,45 @@ void engine::upload_device_weights(int dev) {
         addp(L.ffn_gate.data);
         addp(L.ffn_up.data);
         addp(L.ffn_down.data);
+        if (m.ds41) {
+            // DeepSeek-V4.1-Flash's MLA / mHC / compressor / indexer / Engram
+            // tensors.  Everything is uploaded raw: the fp32 GEMV reads the
+            // GGUF type directly (Q5_K/Q8_0/Q4_K/Q6_K/BF16/F32/IQ4_NL), so
+            // there is no SIn/oneDNN conversion.  The routed experts are NOT
+            // here - the ds41 bank streams them - and neither is ple_table
+            // (100 GiB, gathered on the host).
+            const ds41_layer & D = L.ds;
+            addp(D.wq_a.data);
+            addp(D.wq_b.data);
+            addp(D.wkv.data);
+            addp(D.wo_a.data);
+            addp(D.wo_b.data);
+            addp(D.q_a_norm);
+            addp(D.kv_norm);
+            addp(D.attn_sinks);
+            addp(D.hc_attn_fn.data);
+            addp(D.hc_attn_base);
+            addp(D.hc_attn_scale);
+            addp(D.hc_ffn_fn.data);
+            addp(D.hc_ffn_base);
+            addp(D.hc_ffn_scale);
+            addp(L.moe.gate_inp);
+            if (m.hp.ds.kv_src_of[il] == il) {
+                addp(D.comp_wkv.data);
+                addp(D.comp_wgate.data);
+                addp(D.comp_norm);
+                addp(D.idx_attn_k.data);
+                addp(D.idx_k_norm);
+            }
+            if (m.hp.ds.topk_src_of[il] == il) {
+                addp(D.idx_attn_q_b.data);
+                addp(D.idx_proj.data);
+            }
+            if (m.hp.ds.is_ple[il]) {
+                addp(D.engram_kv.data);
+                addp(D.engram_gate);
+            }
+        }
         if (L.recurrent) {
             addp(L.wqkv.data);
             addp(L.wgate.data);
@@ -3209,6 +3287,21 @@ void engine::release_host_weight_pages() {
             keep.insert(M.gate_inp);
         }
     }
+    if (m.ds41) {
+        // The ds41 GPU path streams the routed experts from the mmap and
+        // gathers the 24 Engram rows per token on the host, so those pages are
+        // live even though they are never uploaded.  Everything else (the
+        // dense MLA/mHC/compressor/indexer tensors) is on the cards.
+        if (m.ple_table.data) {
+            keep.insert(m.ple_table.data);
+        }
+        for (int il = 0; il < m.hp.n_layer; il++) {
+            const moe_t & M = m.layers[(size_t)il].moe;
+            keep.insert(M.gate_exps.data);
+            keep.insert(M.up_exps.data);
+            keep.insert(M.down_exps.data);
+        }
+    }
     size_t dropped = 0;
     for (const auto & t : m.gguf.tensors) {
         if (keep.count(t.data)) {
@@ -3240,6 +3333,12 @@ void engine::release_host_weight_pages() {
 // int8.  Returns false if no device can run the int8 matmul (caller falls back
 // to the SIn/dp4a path).
 bool engine::setup_md_dnnl() {
+    if (ds41_fwd()) {
+        // The ds41 GPU forward reads the raw GGUF types through gemv_group and
+        // ds41_iq2; the oneDNN int8 partition and the native u4/k5/cb4 stores
+        // are pure VRAM on a card that already cannot hold the expert bank.
+        return false;
+    }
     if (!dnnl_gemm_enabled(q)) {
         return false;
     }
@@ -4919,6 +5018,45 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
                                        const std::function<bool(int)> & cb, std::vector<float> * first_logits,
                                        bool allow_spec) {
     kv_scope kv_scope_(kv_k_, kv_v_);
+    last_cached_tokens_.store(0, std::memory_order_relaxed);
+    // DeepSeek-V4.1-Flash: a model-owned forward with no paged KV and no
+    // seg_plan.  It carries its own per-sequence window/compressed caches and
+    // Engram history, so the whole request is handed to engine_ds41.cpp.
+    if (ds41_fwd()) {
+        size_t cached = 0;
+        std::vector<int> out;
+        auto run_fwd = [&](const mm_prompt * mmp) {
+            if (ds41g_) {
+                return ds41_gpu_generate(m, tk, prompt, mmp, gp, cb, first_logits, &cached, *ds41g_);
+            }
+            return ds41_generate(m, tk, prompt, mmp, gp, cb, first_logits, &cached);
+        };
+        if (!mm) {
+            out = run_fwd(nullptr);
+        } else {
+            if (!mm->has_encoded_embd()) {
+                throw std::runtime_error("multimodal: the prompt has media rows but no encoder output "
+                                         "(image/video need --mmproj)");
+            }
+            // The ds41 forward reads the image embeddings from host memory.  The
+            // device-built prompt keeps them in `d_embd`; copy once here.
+            mm_prompt local;
+            const mm_prompt * mmp = mm;
+            if (mm->embd.empty() && mm->d_embd && mm->n_img > 0) {
+                local = *mm;
+                // `n_img` counts media blocks, not embedding rows: an image
+                // contributes many rows.  `n_rows` is the buffer's first dimension.
+                const size_t rows = (size_t)(mm->n_rows > 0 ? mm->n_rows : (int)mm->img_row.size());
+                local.embd.resize(rows * (size_t)m.hp.n_embd);
+                q.memcpy(local.embd.data(), mm->d_embd, local.embd.size() * sizeof(float)).wait();
+                local.d_embd = nullptr;
+                mmp = &local;
+            }
+            out = run_fwd(mmp);
+        }
+        last_cached_tokens_.store(cached, std::memory_order_relaxed);
+        return out;
+    }
     // MTP speculative decoding: greedy requests only (the acceptance test is an
     // equality against the target's own next token; a sampled target would need
     // rejection sampling to stay exact).  Multimodal prompts bypass it too.

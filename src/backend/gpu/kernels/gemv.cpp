@@ -852,6 +852,7 @@ static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int
     case 11: GEMV_DISPATCH_CFG(11, TB_, CFG); break;                                                                   \
     case 20: GEMV_DISPATCH_CFG(20, TB_, CFG); break;                                                                   \
     case 21: GEMV_DISPATCH_CFG(21, TB_, CFG); break;                                                                   \
+    case 18: GEMV_DISPATCH_CFG(18, TB_, CFG); break;                                                                   \
     case 23: GEMV_DISPATCH_CFG(23, TB_, CFG); break;                                                                   \
     case 8: GEMV_DISPATCH_CFG(8, TB_, CFG); break;                                                                     \
     case 7: GEMV_DISPATCH_CFG(7, TB_, CFG); break;                                                                     \
@@ -912,6 +913,9 @@ static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int
         break;
     case 21:
         GEMV_TB_SWITCH(21);
+        break;
+    case 18:
+        GEMV_TB_SWITCH(18);
         break;
     case 23:
         GEMV_TB_SWITCH(23);

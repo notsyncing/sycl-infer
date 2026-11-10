@@ -286,6 +286,16 @@ void mm_piece(const std::string & piece, stop_filter & sf, response_parser * par
 // scheduler; set PF_MTP_SERVER=1 to route greedy requests through MTP instead
 // (only worth it for a strictly single-request workload).
 bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
+    // DeepSeek-V4.1-Flash has no batched/scheduler forward: its model-owned walk
+    // owns the per-sequence window + compressed caches.  Route it through the
+    // same direct generate() path MTP uses (one sequence, no logprobs).
+    if (e.ds41_fwd()) {
+        // All ds41 requests take the direct path: the scheduler's batched
+        // paged-KV forward does not exist for this model, so falling through
+        // would corrupt/crash.  The callers loop `n` choices; logprobs are
+        // reported as null (the model-owned sampler does not produce them).
+        return true;
+    }
     static const bool on = [] {
         const char * v = si::env::str("PF_MTP_SERVER");
         return v && atoi(v) != 0;
@@ -313,6 +323,9 @@ static void run_choice_engine(engine & e, const mm_prompt * mp, const std::vecto
     } else {
         e.generate(prompt, gp, cb);
     }
+    // The direct path bypasses the scheduler (and therefore sequence::reused);
+    // a model-owned forward reports its own prefix-cache hit here.
+    out.cached_tokens = (int)e.last_cached_tokens();
     const std::string tail = ub.flush();
     if (!tail.empty() && !sf.stopped) {
         mm_piece(tail, sf, &parser, out, chat);
@@ -503,6 +516,7 @@ void stream_chat_mtp_choices(std::shared_ptr<sse_session> sc, engine & e, std::v
                 return !sf.stopped && !sc->cancelled();
             };
             e.generate(prompt, gp_for_choice(gp, c), cb);
+            const int cached_tokens = (int)e.last_cached_tokens();
             const std::string tail = ub.flush();
             if (!tail.empty() && !sf.stopped) {
                 const std::string emit = sf.feed(tail);
@@ -519,9 +533,9 @@ void stream_chat_mtp_choices(std::shared_ptr<sse_session> sc, engine & e, std::v
             parser.finish();
             const std::string finish =
                 sf.stopped ? "stop" : (parser.tool_calls().empty() ? std::string("length") : std::string("tool_calls"));
-            sc->q->push(
-                "data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, json::object(), finish)) + "\n\n");
-            sc->choice_done((int)prompt.size(), n_gen, reasoning_tokens, 0);
+            sc->q->push("data: " + dump_json(chat_chunk(sc->id, sc->model, sc->created, c, json::object(), finish))
+                        + "\n\n");
+            sc->choice_done((int)prompt.size(), n_gen, reasoning_tokens, cached_tokens);
         } catch (const std::exception &) {
             sse_error(sc, c, "mtp generation failed");
             sc->choice_done(0, 0);
@@ -842,7 +856,7 @@ int serve(engine & e, const server_config & cfg) {
                         if (!mm_image_decode_mem(bytes.data(), bytes.size(), rgb, w, h, &err)) {
                             throw std::runtime_error(err);
                         }
-                        imgs.push_back(mm_image_preprocess(rgb.data(), w, h, mm.cfg));
+                        imgs.push_back(mm_image_preprocess_vision(mm.vm, rgb.data(), w, h, mm.cfg));
                         order.push_back({MM_KIND_IMAGE, (int)imgs.size() - 1});
                     } else if (p.kind == chat_part_kind::VIDEO) {
                         mm_video vid;

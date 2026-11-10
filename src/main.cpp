@@ -762,7 +762,7 @@ int main(int argc, char ** argv) {
                     if (!mm_image_decode_file(p, rgb, w, h, &err)) {
                         throw std::runtime_error("image: " + err);
                     }
-                    imgs.push_back(mm_image_preprocess(rgb.data(), w, h, img_cfg));
+                    imgs.push_back(mm_image_preprocess_vision(vm, rgb.data(), w, h, img_cfg));
                     order.push_back({MM_KIND_IMAGE, (int)imgs.size() - 1});
                 }
                 for (const std::string & p : video_paths) {

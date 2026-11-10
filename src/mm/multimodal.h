@@ -54,8 +54,9 @@ struct mm_prompt {
     std::vector<int32_t> mrope;     // 4 * n, section-major ([s * n + i])
     std::vector<int32_t> img_row;   // n, -1 or a row in `embd`
     std::vector<float> embd;        // n_img * text n_embd (host path)
-    const float * d_embd = nullptr; // device path: n_img * n_embd, owned by caller
-    int n_img = 0;
+    const float * d_embd = nullptr; // device path: n_rows * n_embd, owned by caller
+    int n_img = 0;     // number of media blocks (NOT embedding rows)
+    int n_rows = 0;    // total embedding rows (the buffer's first dimension)
     int pos_after = 0; // next decode position
     bool has_images() const {
         return n_img > 0;

@@ -20,6 +20,11 @@ const char * kPadName[3] = {"<|image_pad|>", "<|video_pad|>", "<|audio_pad|>"};
 
 int pad_tok_of(const tokenizer & tk, int kind) {
     auto it = tk.token_to_id.find(kPadName[kind]);
+    if (it == tk.token_to_id.end() && kind == MM_KIND_IMAGE) {
+        // DeepSeek-V4.1's image marker is a single special token rather than a
+        // vision_start/image_pad pair; the chat renderer emits this one.
+        it = tk.token_to_id.find("<｜deepseek_image｜>");
+    }
     if (it == tk.token_to_id.end()) {
         throw std::runtime_error(std::string("mm: tokenizer has no ") + kPadName[kind] + " token");
     }
@@ -60,6 +65,7 @@ mm_prompt mm_expand_prompt(const tokenizer & tk, const std::string & rendered, c
 
     mm_prompt p;
     p.n_img = (int)blocks.size();
+    p.n_rows = total_rows;
     // embedding row offset of each block (blocks fill the caller's embd buffer)
     std::vector<int> off(blocks.size());
     int rows = 0;
@@ -182,7 +188,7 @@ mm_image_plan mm_plan_images(const tokenizer & tk, const std::vector<mm_image> &
         b.out_w = pl.vin[k].out_w;
         b.out_h = pl.vin[k].out_h;
         b.n_tok = pl.vin[k].n_out;
-        b.n_pos = std::max(pl.vin[k].out_w, pl.vin[k].out_h);
+        b.n_pos = pl.vin[k].n_pos;
         pl.p.off[k] = pl.p.total_rows;
         pl.p.total_rows += b.n_tok;
     }

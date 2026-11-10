@@ -46,7 +46,7 @@ static const profile arc_a770 = {
         .sub_group8 = 1,
     },
 
-    // MEASURED: 7.5 of the 8 warps/EU a Xe-LP EU holds.  The cliff itself is
+    // MEASURED: 7.5 of the 8 warps/EU an Xe-HPG EU holds.  The cliff itself is
     // architectural (4 sub-schedulers x 2 warp slots).
     .occ = {.warps_per_eu_x2 = 15},
 

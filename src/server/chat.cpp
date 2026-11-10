@@ -13,6 +13,17 @@ namespace si {
 
 std::string render_chat(const std::string & tmpl, const std::vector<chat_msg> & msgs, bool add_generation_prompt,
                         std::optional<bool> enable_thinking, const std::string & tools_json) {
+    // The DeepSeek-V4.1 template uses Jinja features (namespace(), macro
+    // recursion, content_blocks) that minja does not implement.  Detect it
+    // before attempting minja: a failed render prints a large diagnostic dump
+    // on every request, and a ChatML fallback would give the model a prompt it
+    // was never trained on.  The structural renderer is the right path.
+    const bool deepseek = tmpl.find("｜DSML｜") != std::string::npos
+                          || tmpl.find("<｜deepseek_image｜>") != std::string::npos
+                          || tmpl.find("<｜User｜>") != std::string::npos;
+    if (deepseek) {
+        return render_chat_deepseek(msgs, add_generation_prompt, enable_thinking.value_or(false));
+    }
     std::string out;
     if (render_chat_template(tmpl, msgs, add_generation_prompt, enable_thinking, out, tools_json)) {
         return out;
@@ -80,6 +91,101 @@ static std::string builtin_tool_call_xml(const chat_tool_call & tc) {
     s += "</function>\n</tool_call>";
     return s;
 }
+
+// DeepSeek-V4.1's structural renderer.  The GGUF template is far beyond what
+// minja supports, but the text form is small: a <|System|> turn (with the
+// reasoning-effort preamble in thinking mode), <|User|>/<|Assistant|> turns,
+// `<|deepseek_image|>` for an image part, and `<think>` opening the assistant's
+// reasoning.  Tool results are folded into a user turn as the reference does.
+std::string render_chat_deepseek(const std::vector<chat_msg> & msgs, bool add_generation_prompt, bool enable_thinking) {
+    // The GGUF template's transition token is emitted *after* a user/tool
+    // message, before the assistant: `<|Assistant|>` + (`<think>` in thinking
+    // mode, `</think>` in chat mode).  A bare `<|Assistant|>` leaves chat-mode
+    // image prompts with an unclosed think block, and the model answers EOS.
+    // Assistant history is `content + <|end_of_sentence|>`; historical
+    // reasoning is dropped (the template's default drop_thinking=true).
+    const char * SYS = "<｜System｜>";
+    const char * USR = "<｜User｜>";
+    const char * ASST = "<｜Assistant｜>";
+    const char * IMG = "<｜deepseek_image｜>";
+    const char * EOS = "<｜end▁of▁sentence｜>";
+    const std::string effort =
+        "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    auto content_of = [&](const chat_msg & m) {
+        if (m.parts.empty()) {
+            return m.content;
+        }
+        std::string s;
+        bool first = true;
+        for (const chat_part & p : m.parts) {
+            if (!first) {
+                s += "\n\n";
+            }
+            first = false;
+            if (p.kind == chat_part_kind::IMAGE) {
+                s += IMG;
+            } else {
+                s += p.text;
+            }
+        }
+        return s;
+    };
+    int last_user = -1;
+    for (int i = 0; i < (int)msgs.size(); i++) {
+        if (msgs[i].role == "user") {
+            last_user = i;
+        }
+    }
+    std::string out;
+    for (int i = 0; i < (int)msgs.size(); i++) {
+        const chat_msg & m = msgs[i];
+        const bool first = i == 0;
+        if (m.role == "system") {
+            out += SYS;
+            if (enable_thinking) {
+                out += effort;
+            }
+            out += content_of(m);
+        } else if (m.role == "user") {
+            if (first && enable_thinking) {
+                out += SYS;
+                out += effort;
+            }
+            out += USR;
+            out += content_of(m);
+        } else if (m.role == "tool") {
+            if (first && enable_thinking) {
+                out += SYS;
+                out += effort;
+            }
+            out += USR;
+            out += "<tool_result>";
+            out += m.content;
+            out += "</tool_result>";
+        } else if (m.role == "assistant") {
+            // Historical reasoning is dropped; a future assistant turn (after
+            // the last user) carries its reasoning before the closing tag.
+            if (enable_thinking && i > last_user && !m.reasoning_content.empty()) {
+                out += m.reasoning_content;
+                out += "</think>";
+            }
+            out += content_of(m);
+            out += EOS;
+        }
+        const bool next_asst = i + 1 < (int)msgs.size() && msgs[i + 1].role == "assistant";
+        if ((m.role == "user" || m.role == "tool")
+            && (next_asst || (i + 1 == (int)msgs.size() && add_generation_prompt))) {
+            out += ASST;
+            if (enable_thinking && i == last_user) {
+                out += "<think>";
+            } else {
+                out += "</think>";
+            }
+        }
+    }
+    return out;
+}
+
 
 std::string render_chat_builtin(const std::vector<chat_msg> & msgs, bool add_generation_prompt, bool enable_thinking,
                                 const std::string & tools_json) {

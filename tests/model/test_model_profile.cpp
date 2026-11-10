@@ -163,8 +163,34 @@ int main() {
     CHECK(!q2.policy.prefix_cache && q2.policy.auto_layer_map && q2.policy.auto_layer_map_one_gpu,
           "qwen2vl takes the per-tensor upload and disables the prefix cache");
 
+    printf("deepseek41 profile values\n");
+    const model_profile & ds = kDeepseek41Profile;
+    CHECK(ds.fwd == model_profile::fwd_kind::deepseek41, "deepseek41 uses its own forward");
+    CHECK(ds.vision == model_profile::vision_kind::deepseek41v,
+          "deepseek41 mmproj uses the deepseek41v tower");
+    CHECK(ds.spec.multimodal && !ds.spec.mtp && !ds.spec.dflash, "deepseek41 declares MM only");
+    CHECK(ds.policy.max_decode_rows == 1, "deepseek41 caps a decode at one row");
+    CHECK(ds.policy.prefix_cache, "deepseek41 checkpoints its window + compressed state");
+    CHECK(ds.policy.prefill == model_profile::prefill_kind::whole_prompt, "deepseek41 prefill is whole_prompt");
+    CHECK(ds.policy.auto_layer_map && ds.policy.md_splits, "deepseek41 takes the per-tensor map and keeps splits");
+    CHECK(ds.policy.engram_ram_mb_default == 8192u, "deepseek41 engram default is 8192 MiB");
+    CHECK(ds.policy.keep_file_cache, "deepseek41 keeps the shard page cache");
+    CHECK(ds.residual.hyper && ds.residual.streams == 4 && ds.residual.low_rank == 24,
+          "deepseek41 mHC is 4 streams / 24 mix outputs");
+    CHECK(ds.extras.ple, "deepseek41 Engram is declared");
+    CHECK(ds.extras.qsa && ds.extras.qsa_top_k == 512, "deepseek41 DSA top_k is 512");
+    CHECK(ds.extras.idx_heads == 32 && ds.extras.idx_head_dim == 128, "indexer is 32 heads x 128");
+    CHECK(ds.rep.raw_gemv_decode && !ds.rep.sin_w8 && !ds.rep.dnnl_int8,
+          "deepseek41 weights are raw GGUF (IQ2_XXS/IQ2_XS/IQ2_S are not SIn/oneDNN)");
+    CHECK(ds.rep.split_per_tensor_upload, "deepseek41 split GGUF uses the per-tensor upload");
+    CHECK(ds.moe == model_profile::moe_owner::runtime_bank, "deepseek41 routed experts are runtime-owned");
+
     // The loader's registry rows must point at these exact objects, so the
     // profile report cannot print one object while the engine uses another.
+    {
+        const arch::loader * a = arch::find("deepseek41");
+        CHECK(a != nullptr && a->prof == &kDeepseek41Profile, "deepseek41 row points at kDeepseek41Profile");
+    }
     {
         const arch::loader * a = arch::find("qwen4exp");
         CHECK(a != nullptr && a->prof == &kQwen4ExpProfile, "qwen4exp row points at kQwen4ExpProfile");

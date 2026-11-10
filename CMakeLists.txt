@@ -192,6 +192,11 @@ add_library(sycl_infer_core STATIC
     src/backend/gpu/kernels/dp4a_gemv.cpp
     src/backend/gpu/kernels/dp4a_gemm.cpp
     src/backend/gpu/kernels/vit.cpp
+    src/backend/gpu/kernels/ds41_vision.cpp
+    src/backend/gpu/kernels/ds41_attn.cpp
+    src/backend/gpu/kernels/ds41_hc.cpp
+    src/backend/gpu/kernels/ds41_iq2.cpp
+    src/backend/gpu/kernels/ds41_ops.cpp
     src/backend/gpu/kernels/at.cpp
     src/backend/gpu/kernels/q4exp.cpp
     # model: GGUF loading, weights, tokenizer
@@ -202,9 +207,11 @@ add_library(sycl_infer_core STATIC
     src/model/qwen35moe.cpp
     src/model/qwen4exp.cpp
     src/model/qwen2vl.cpp
+    src/model/deepseek41.cpp
     src/model/profiles/generic.cpp
     src/model/profiles/qwen4exp.cpp
     src/model/profiles/qwen2vl.cpp
+    src/model/profiles/deepseek41.cpp
     src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
@@ -221,6 +228,8 @@ add_library(sycl_infer_core STATIC
     src/engine/engine_dflash.cpp
     src/engine/engine_q4exp.cpp
     src/engine/engine_qsa.cpp
+    src/engine/engine_ds41.cpp
+    src/engine/engine_ds41_gpu.cpp
     src/engine/engine_kvpool.cpp
     src/engine/moe_cache.cpp
     src/engine/engine_prefix_cache.cpp
@@ -656,6 +665,7 @@ si_add_test(test_f16conv     tests/model/test_f16conv.cpp)
 si_add_test(test_yarn        tests/common/test_yarn.cpp)
 si_add_test(test_kv_type     tests/backend/gpu/kernels/test_kv_type.cpp)
 si_add_test(test_chat_builtin tests/server/test_chat_builtin.cpp)
+si_add_test(test_chat_deepseek tests/server/test_chat_deepseek.cpp)
 si_add_test(test_quant_synth tests/model/test_quant_synth.cpp)
 si_add_test(test_w4_gemm     tests/backend/gpu/kernels/test_w4_gemm.cpp)
 si_add_test(test_k5_gemv     tests/backend/gpu/kernels/test_k5_gemv.cpp)
@@ -685,6 +695,11 @@ si_add_host_test(test_mineru_layout
     tools/mineru/layout.cpp
     tests/tools/test_mineru_layout.cpp)
 
+# ds41's model-owned prefix cache: the prefix hashing and LRU bookkeeping are
+# header-only, so this needs no GGUF and no GPU.
+si_add_host_test(test_ds41_pc tests/engine/test_ds41_pc.cpp)
+
+si_add_test(test_ds41_ops    tests/backend/gpu/kernels/test_ds41_ops.cpp)
 si_add_test(test_gpu_stages
     tests/backend/gpu/kernels/test_gpu_stages.cpp
     tests/backend/gpu/kernels/rmsnorm_stage.cpp
@@ -707,7 +722,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()
@@ -760,7 +775,7 @@ if(BUILD_TESTING)
         if(NOT EXISTS "${SI_TEST_08B_MODEL}")
             message(FATAL_ERROR "SI_REGISTER_GPU_TESTS requires SI_TEST_08B_MODEL")
         endif()
-        foreach(name IN ITEMS test_gpu_stages test_gpu_vs_ref test_forward test_decode_vs_prefill test_pc_gpu test_sched test_dev_resolve)
+        foreach(name IN ITEMS test_ds41_ops test_gpu_stages test_gpu_vs_ref test_forward test_decode_vs_prefill test_pc_gpu test_sched test_dev_resolve)
             add_test(NAME ${name} COMMAND ${name} "${SI_TEST_08B_MODEL}")
             set_tests_properties(${name} PROPERTIES LABELS "gpu;model-0.8b")
         endforeach()

@@ -44,6 +44,52 @@ struct moe_wt {
     }
 };
 
+// ---- DeepSeek-V4.1-Flash (`deepseek41`) --------------------------------
+// MLA attention (512-wide latent, K == V), compressed sparse attention with a
+// two-level DSA indexer, group-shared KV caches, 4-stream hyper-connections and
+// Engram.  The per-layer source/ratio arrays are resolved at load time
+// (`kv_src_of`/`topk_src_of`) so no use site re-derives the "greatest source
+// <= il" rule, and the hash constants are stored per Engram layer.
+struct ds41_hparams {
+    int q_lora_rank = 0;     // 1280
+    int out_group_count = 0; // 8
+    int out_lora_rank = 0;   // 1024
+    int sliding_window = 0;  // 128 (includes self)
+    int kv_dim = 0;          // 512 == key_length == value_length
+    int rot_off = 0;         // kv_dim - n_rot (448): RoPE on the LAST n_rot dims
+    float rope_base = 0.f;   // ratio-0 layers
+    float compress_rope_base = 0.f; // ratio>0 layers (160000)
+    float yarn_factor = 0.f;
+    int yarn_orig = 0;
+    float yarn_beta_fast = 0.f, yarn_beta_slow = 0.f;
+
+    int idx_n_head = 0, idx_head_dim = 0, idx_top_k = 0;
+    int cand_src = -1, cand_topk_blocks = 0, cand_block = 0;
+    int n_idx_src = 0, idx_src[64] = {0};
+    int topk_src_of[64] = {0}; // greatest index source <= il (-1 before the first)
+
+    int n_kv_src = 0, kv_src[64] = {0};
+    int kv_src_of[64] = {0}; // greatest KV source <= il (-1 before the first)
+    int compress_ratio[64] = {0};
+
+    int hc_mult = 0, hc_mix_dim = 0, hc_sinkhorn = 0;
+    float hc_eps = 0.f;
+
+    int n_expert_shared = 0;
+    float expert_scale = 1.f;
+    bool expert_norm = false;
+    float swiglu_clamp[64] = {0.f};
+    float swiglu_clamp_shexp[64] = {0.f};
+
+    bool is_ple[64] = {false};
+    int engram_index_of[64] = {0}; // number of Engram layers strictly before il
+    int ple_ngram = 0, ple_heads_per_ngram = 0, ple_head_dim = 0, ple_n_heads = 0;
+    uint64_t ple_mult[8] = {0};
+    uint32_t ple_off[64] = {0}, ple_vocab[64] = {0};
+    int engram_pad = 0;
+    int image_token_id = -1;
+};
+
 struct hparams {
     int n_layer = 0, n_embd = 0, n_ff = 0;
     int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
@@ -106,6 +152,10 @@ struct hparams {
     // projection).  Qwen2/Qwen2-VL do not: their q projection is exactly
     // n_head*head_dim wide and the attention output has no sigmoid gate.
     bool attn_gate = true;
+
+    // ---- DeepSeek-V4.1-Flash (`deepseek41`) ------------------------------
+    bool deepseek41 = false;
+    ds41_hparams ds;
 
     bool is_moe() const {
         return n_expert > 0;
@@ -185,6 +235,40 @@ struct indexer_wt {
     }
 };
 
+// DeepSeek-V4.1-Flash layer tensors.  The attention is MLA: `wq_a`/`wq_b` is a
+// low-rank q, `wkv` is the single 512-wide latent used as both K and V, and the
+// output is `wo_a` (8 groups of 1024) then `wo_b`.  `wo_a` is stored 3-D
+// [K=4096][N=1024][E=8], so one group is a plain 2-D weight.
+struct ds41_layer {
+    wt wq_a, wq_b, wkv, wo_b;
+    // attn_output_a is stored 2-D [K=4096][N=8192]; the eight output groups are
+    // consecutive 1024-row blocks of N (the reference reshapes it to
+    // [4096, 1024, 8] for the per-group GEMV).
+    wt wo_a;
+    const float * q_a_norm = nullptr;
+    const float * kv_norm = nullptr;
+    const float * attn_sinks = nullptr; // [n_head]
+    // compressed-KV owner only (kv_src_of[il] == il)
+    wt comp_wkv, comp_wgate; // comp_wgate absent at ratio 1
+    const float * comp_norm = nullptr;
+    wt idx_attn_k; // [512,128], owner only
+    const float * idx_k_norm = nullptr;
+    // index source only (topk_src_of[il] == il)
+    wt idx_attn_q_b, idx_proj;
+    // Engram layer only (1, 14)
+    wt engram_kv; // [6144, 5*n_embd]
+    const float * engram_gate = nullptr;
+    // hyper-connections
+    wt hc_attn_fn, hc_ffn_fn; // [hc*n_embd, (2+hc)*hc]
+    const float * hc_attn_base = nullptr;
+    const float * hc_attn_scale = nullptr;
+    const float * hc_ffn_base = nullptr;
+    const float * hc_ffn_scale = nullptr;
+    // router biases (the `_vl` variant is used for image-span tokens)
+    const float * exp_probs_b = nullptr;
+    const float * exp_probs_b_vl = nullptr;
+};
+
 struct layer_t {
     bool recurrent = false;
     // One slot of the canonical per-layer weight enumeration: the weight view
@@ -220,6 +304,8 @@ struct layer_t {
     hc_wt hc_attn, hc_ffn;
     ple_wt ple;
     indexer_wt idx;
+    // deepseek41 (MLA + compressor + indexer + Engram + mHC)
+    ds41_layer ds;
     const float * attn_norm = nullptr;
     const float * post_attn_norm = nullptr;
     wt ffn_gate, ffn_up, ffn_down;
@@ -318,6 +404,11 @@ struct model {
     hc_wt hc_head;
     wt ple_table;
     bool q4exp = false;
+    // deepseek41: the Engram table (110 GiB in the reference file) and the
+    // vocab -> n-gram-id map the hash uses (a GGUF metadata array, not a
+    // tensor).  Both are host-only; the forward reads rows on demand.
+    bool ds41 = false;
+    std::vector<int32_t> engram_token_map;
     // Keep the GGUF shards' page cache when page_out_host() releases the PTEs.
     // MADV_DONTNEED alone drops only this process's private mappings, so the
     // file pages stay cached; the explicit evictor is the POSIX_FADV_DONTNEED

@@ -30,7 +30,8 @@
 | 21 | [design/20-python-binding.md](design/20-python-binding.md) | Python binding 与 wheel：ctypes（v0.1）、流式/批量 API、setuptools、SYCL/oneDNN/oneAPI runtime 打包、JIT/AOT wheel、doctor |
 | 22 | [design/21-mineru-qwen2vl.md](design/21-mineru-qwen2vl.md) | MinerU2.5 / Qwen2-VL 解码器（`qwen2vl`）：head_dim 64 的 classic attention、无 QK norm/门的 q 布局、Q5_0、视觉塔（patch 14 / 80 维头 / quick_gelu / 2D RoPE / 保序 ILP attention）、MinerU 两步抽取与特殊 prompt、性能历史 |
 | 23 | [design/22-pipelines.md](design/22-pipelines.md) | **请求级 Pipeline 机制**：`src/pipeline/` 接口与注册表、准入规则（进程内状态/实测收益/资源账本）、worker 的 `/v1/pipelines/{id}/run`、router 的专用代理、与 `/v1/models`/`/v1/chat/completions` 的边界；MinerU 明确不是 pipeline，迁到 `tools/mineru/` |
-| 24 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+| 24 | [design/23-deepseek41.md](design/23-deepseek41.md) | **DeepSeek-V4.1-Flash（`deepseek41`）**：MLA 注意力（K==V、512 宽、64 头）、组共享压缩 KV、两级 DSA 索引、4 流 mHC、Engram、384 专家 sqrt-softplus 路由；loader/hparams、model profile、host 前向与增量 DecState、前缀缓存、`deepseek41v` 视觉塔、GPU 内核（IQ2 GEMV / MLA / mHC / ops）与不变量 |
+| 25 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 面向使用者的说明：
 

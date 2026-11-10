@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "kernels.h"
+#include "kernels/common.h"
 #include "quant.h"
 #include "enc_common.h"
 #include "dnnl_gemm.h"
@@ -15,6 +16,15 @@
 #include <chrono>
 
 namespace si {
+
+// deepseek41v-only kernels (src/backend/gpu/kernels/ds41_vision.cpp).  They are
+// not part of the shared vit_* API because only this tower uses them; keeping
+// the declarations here avoids adding a tower-specific header.
+void ds41_rmsnorm_launch(sycl::queue & q, const float * x, int x_stride, const float * w, float * out, int out_stride,
+                         int rows, int n, float eps);
+void ds41_unfold_launch(sycl::queue & q, const float * x, int pw, int ph, int nw, int nh, int E, float * fe);
+void ds41_assemble_launch(sycl::queue & q, const float * grid, int nw, int nh, int P, const float * img_start,
+                          const float * img_end, const float * img_newline, float * out);
 
 namespace {
 
@@ -106,6 +116,242 @@ void pos_sample(const float * pos, int n_side, int n_embd, int d, int pw, int ph
     out = (v00 * (1 - fx) + v01 * fx) * (1 - fy) + (v10 * (1 - fx) + v11 * fx) * fy;
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek-V4.1-Flash preprocessing helpers.  These mirror
+// tools/mtmd/mtmd-image.cpp's mtmd_image_preprocessor_deepseek41v exactly:
+// Pillow's bicubic a=-0.5, the fixed-point 22-bit separable resampler, the
+// centered letterbox on RGB 127, and the final round-to-nearest-even to bf16.
+// ---------------------------------------------------------------------------
+inline uint16_t ds41_f32_to_bf16(float v) {
+    uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) { // NaN: force quiet
+        return (uint16_t)((bits >> 16) | 64u);
+    }
+    return (uint16_t)((bits + (0x7fffu + ((bits >> 16) & 1u))) >> 16);
+}
+
+double ds41_bicubic(double x) {
+    if (x < 0.0) {
+        x = -x;
+    }
+    constexpr double a = -0.5;
+    if (x < 1.0) {
+        return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    }
+    if (x < 2.0) {
+        return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    }
+    return 0.0;
+}
+
+uint8_t ds41_clip8(int32_t v) {
+    return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+}
+
+// Pillow-compatible separable resampler (fixed point, 22 fractional bits),
+// copied in behaviour from llama.cpp's img_tool::resize_pillow so the
+// preprocessing matches the reference bit for bit.
+struct ds41_ktab {
+    int ksize = 0;
+    std::vector<int> bounds;
+    std::vector<int32_t> weights;
+};
+
+ds41_ktab ds41_precompute_weights(int in_size, int out_size) {
+    constexpr int kBits = 22;
+    ds41_ktab t;
+    double scale = (double)in_size / out_size;
+    double filterscale = scale < 1.0 ? 1.0 : scale;
+    const double support = 2.0 * filterscale;
+    t.ksize = (int)std::ceil(support) * 2 + 1;
+    std::vector<double> pre((size_t)out_size * t.ksize);
+    t.bounds.resize((size_t)out_size * 2);
+    for (int xx = 0; xx < out_size; xx++) {
+        const double center = (xx + 0.5) * scale;
+        const double ss = 1.0 / filterscale;
+        double ww = 0.0;
+        int xmin = (int)(center - support + 0.5);
+        if (xmin < 0) {
+            xmin = 0;
+        }
+        int xmax = (int)(center + support + 0.5);
+        if (xmax > in_size) {
+            xmax = in_size;
+        }
+        xmax -= xmin;
+        for (int x = 0; x < xmax; x++) {
+            const double w = ds41_bicubic((x + xmin - center + 0.5) * ss);
+            pre[(size_t)xx * t.ksize + x] = w;
+            ww += w;
+        }
+        for (int x = 0; x < xmax; x++) {
+            if (ww != 0.0) {
+                pre[(size_t)xx * t.ksize + x] /= ww;
+            }
+        }
+        for (int x = xmax; x < t.ksize; x++) {
+            pre[(size_t)xx * t.ksize + x] = 0.0;
+        }
+        t.bounds[xx * 2 + 0] = xmin;
+        t.bounds[xx * 2 + 1] = xmax;
+    }
+    const double fxp = std::ldexp(1.0, kBits);
+    t.weights.resize((size_t)out_size * t.ksize);
+    for (size_t i = 0; i < t.weights.size(); i++) {
+        // Pillow adds +/- 0.5 then truncates toward zero.
+        const double rounded = pre[i] * fxp + (pre[i] < 0 ? -0.5 : 0.5);
+        t.weights[i] = (int32_t)rounded;
+    }
+    return t;
+}
+
+void ds41_resize_pillow(const uint8_t * src, int sw, int sh, uint8_t * dst, int dw, int dh) {
+    constexpr int kBits = 22;
+    constexpr int32_t kRound = 1 << (kBits - 1);
+    const bool need_h = dw != sw, need_v = dh != sh;
+    if (!need_h && !need_v) {
+        std::memcpy(dst, src, (size_t)sw * sh * 3);
+        return;
+    }
+    ds41_ktab th, tv;
+    if (need_h) {
+        th = ds41_precompute_weights(sw, dw);
+    }
+    if (need_v) {
+        tv = ds41_precompute_weights(sh, dh);
+    }
+    std::vector<uint8_t> tmp;
+    const uint8_t * mid = src;
+    int mid_w = sw, mid_h = sh;
+    if (need_h) {
+        tmp.resize((size_t)sh * dw * 3);
+        for (int y = 0; y < sh; y++) {
+            const uint8_t * srow = src + (size_t)y * sw * 3;
+            uint8_t * drow = tmp.data() + (size_t)y * dw * 3;
+            for (int x = 0; x < dw; x++) {
+                const int xmin = th.bounds[x * 2 + 0];
+                const int xcnt = th.bounds[x * 2 + 1];
+                const int32_t * k = &th.weights[(size_t)x * th.ksize];
+                const uint8_t * p = srow + (size_t)xmin * 3;
+                int32_t a0 = kRound, a1 = kRound, a2 = kRound;
+                for (int i = 0; i < xcnt; i++, p += 3) {
+                    a0 += p[0] * k[i];
+                    a1 += p[1] * k[i];
+                    a2 += p[2] * k[i];
+                }
+                drow[x * 3 + 0] = ds41_clip8(a0 >> kBits);
+                drow[x * 3 + 1] = ds41_clip8(a1 >> kBits);
+                drow[x * 3 + 2] = ds41_clip8(a2 >> kBits);
+            }
+        }
+        mid = tmp.data();
+        mid_w = dw;
+        mid_h = sh;
+    }
+    if (!need_v) {
+        std::memcpy(dst, mid, (size_t)mid_w * mid_h * 3);
+        return;
+    }
+    const size_t row_elems = (size_t)mid_w * 3;
+    std::vector<int32_t> acc(row_elems);
+    for (int y = 0; y < dh; y++) {
+        const int ymin = tv.bounds[y * 2 + 0];
+        const int ycnt = tv.bounds[y * 2 + 1];
+        const int32_t * k = &tv.weights[(size_t)y * tv.ksize];
+        std::fill(acc.begin(), acc.end(), kRound);
+        for (int i = 0; i < ycnt; i++) {
+            const uint8_t * srow = mid + (size_t)(ymin + i) * row_elems;
+            const int32_t w = k[i];
+            for (size_t j = 0; j < row_elems; j++) {
+                acc[j] += srow[j] * w;
+            }
+        }
+        uint8_t * drow = dst + (size_t)y * row_elems;
+        for (size_t j = 0; j < row_elems; j++) {
+            drow[j] = ds41_clip8(acc[j] >> kBits);
+        }
+    }
+}
+
+struct ds41_grid_plan {
+    int W = 0, H = 0, nw = 0, nh = 0, n_tok = 0;
+};
+
+// plan_grid from the reference: min-pixel upscale (truncating multiply), align
+// UP to the patch size, then one closed-form solve when the block exceeds the
+// token cap.  `width`/`height` are the *upscaled* values in the solver, which
+// is why the ratio uses them; `n_tok` is the block length, sentinels included.
+ds41_grid_plan ds41_plan_grid(int width, int height, int p, int r, int max_n_token, int min_pixels) {
+    if (min_pixels > 0 && (int64_t)width * height > 0 && (int64_t)width * height < min_pixels) {
+        const double ratio = std::sqrt((double)min_pixels / ((double)width * (double)height));
+        width = (int)(width * ratio);
+        height = (int)(height * ratio);
+    }
+    int W = ((width + p - 1) / p) * p;
+    int H = ((height + p - 1) / p) * p;
+    auto n_tok = [&](int bh, int bw) {
+        const int nh = ((bh / p) + r - 1) / r;
+        const int nw = ((bw / p) + r - 1) / r;
+        return nh * (nw + 1) + 2;
+    };
+    if (n_tok(H, W) > max_n_token) {
+        const double ratio = (double)height / (double)width;
+        const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
+        const double max_h_f = max_w_f * ratio;
+        const int cell = p * r;
+        if (max_w_f < 1.0) {
+            H = (max_n_token - 2) / 2 * cell;
+            W = cell;
+        } else if (max_h_f < 1.0) {
+            H = cell;
+            W = (max_n_token - 3) * cell;
+        } else {
+            const double beta = std::min(std::floor(max_w_f) * cell / (double)width,
+                                         std::floor(max_h_f) * cell / (double)height);
+            H = (int)std::floor(height * beta / p) * p;
+            W = (int)std::floor(width * beta / p) * p;
+        }
+    }
+    ds41_grid_plan g;
+    g.W = W;
+    g.H = H;
+    g.nw = ((W / p) + r - 1) / r;
+    g.nh = ((H / p) + r - 1) / r;
+    g.n_tok = n_tok(H, W);
+    return g;
+}
+
+// RMSNorm (weight only) used by every deepseek41v block and the final `post_ln`.
+inline void ds41_rms_norm(const float * x, const float * w, float * out, int n, float eps) {
+    double ss = 0;
+    for (int i = 0; i < n; i++) {
+        ss += (double)x[i] * x[i];
+    }
+    const float inv = 1.0f / std::sqrt((float)(ss / n) + eps);
+    for (int i = 0; i < n; i++) {
+        out[i] = x[i] * inv * w[i];
+    }
+}
+
+// Host reference matmul with the same per-output accumulation order as
+// `matmul_all`, parallelised over output rows (the reference forward on a
+// 1036x1036 page would otherwise be minutes of one-thread work).  Each row's
+// dot is computed in index order, so the result is deterministic.
+void ds41_matmul_all(const vt & w, const float * bias, const float * x, float * out, int ntok) {
+    const int N = w.N, K = w.K;
+    par(N, [&](int o) {
+        std::vector<float> row((size_t)K);
+        dequant_row(w, o, row.data());
+        const float b = bias ? bias[o] : 0.f;
+        const float * wr = row.data();
+        for (int t = 0; t < ntok; t++) {
+            const float * xt = x + (size_t)t * K;
+            out[(size_t)t * N + o] = b + isa().dot_f32(wr, xt, K);
+        }
+    });
+}
+
 } // namespace
 
 float vt_get(const vt & t, int row, int k) {
@@ -116,6 +362,68 @@ float vt_get(const vt & t, int row, int k) {
     case GGML_TYPE_BF16: return bf16_to_f32(((const uint16_t *)t.data)[idx]);
     default: throw std::runtime_error("mmproj: unsupported weight type " + std::to_string(t.type));
     }
+}
+
+mm_image mm_image_preprocess_deepseek41v(const uint8_t * rgb, int w, int h, const vision_hparams & hp) {
+    mm_image out;
+    if (!rgb || w <= 0 || h <= 0) {
+        return out;
+    }
+    const int p = hp.patch_size > 0 ? hp.patch_size : 14;
+    const int r = hp.merge > 0 ? hp.merge : 3;
+    const int cap = hp.max_n_token > 0 ? hp.max_n_token : 1024;
+    const ds41_grid_plan g = ds41_plan_grid(w, h, p, r, cap, hp.min_pixels);
+
+    // PIL ImageOps.pad(color=127): contain-resize the ORIGINAL image, then
+    // center-paste on the planned canvas.  Round half to even.
+    auto round_half_even = [](double v) { return (int)std::nearbyint(v); };
+    int new_w = g.W, new_h = g.H;
+    const double im_ratio = (double)w / (double)h;
+    const double dest_ratio = (double)g.W / (double)g.H;
+    if (im_ratio != dest_ratio) {
+        if (im_ratio > dest_ratio) {
+            new_h = round_half_even((double)h / (double)w * g.W);
+        } else {
+            new_w = round_half_even((double)w / (double)h * g.H);
+        }
+    }
+    std::vector<uint8_t> resized((size_t)new_w * new_h * 3);
+    ds41_resize_pillow(rgb, w, h, resized.data(), new_w, new_h);
+
+    std::vector<uint8_t> canvas((size_t)g.W * g.H * 3, 127);
+    const int off_x = round_half_even((g.W - new_w) * 0.5);
+    const int off_y = round_half_even((g.H - new_h) * 0.5);
+    for (int y = 0; y < new_h; y++) {
+        const int dy = y + off_y;
+        if (dy < 0 || dy >= g.H) {
+            continue;
+        }
+        std::memcpy(canvas.data() + ((size_t)dy * g.W + off_x) * 3, resized.data() + (size_t)y * new_w * 3,
+                    (size_t)new_w * 3);
+    }
+
+    out.width = g.W;
+    out.height = g.H;
+    const size_t npix = (size_t)g.W * g.H;
+    out.chw.resize(npix * 3);
+    for (size_t i = 0; i < npix; i++) {
+        for (int c = 0; c < 3; c++) {
+            const float u = (float)canvas[i * 3 + c] / 255.0f;
+            float v = (u - hp.mean[c]) / hp.std[c];
+            const uint16_t b = ds41_f32_to_bf16(v);
+            v = bf16_to_f32(b);
+            out.chw[(size_t)c * npix + i] = v;
+        }
+    }
+    return out;
+}
+
+mm_image mm_image_preprocess_vision(const vision_model & vm, const uint8_t * rgb, int w, int h,
+                                    const image_preproc_cfg & cfg) {
+    if (vm.kind == model_profile::vision_kind::deepseek41v) {
+        return mm_image_preprocess_deepseek41v(rgb, w, h, vm.hp);
+    }
+    return mm_image_preprocess(rgb, w, h, cfg);
 }
 
 void vision_model::load(const std::string & path, model_profile::vision_kind requested) {
@@ -133,7 +441,9 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
     // profile, or a Qwen2-VL tower would run under Qwen3.5's layout rules.
     if (const std::string * pt = f.get_str("clip.projector_type")) {
         model_profile::vision_kind meta = model_profile::vision_kind::none;
-        if (pt->find("qwen2vl") != std::string::npos) {
+        if (pt->find("deepseek41v") != std::string::npos || pt->find("deepseek4v") != std::string::npos) {
+            meta = model_profile::vision_kind::deepseek41v;
+        } else if (pt->find("qwen2vl") != std::string::npos) {
             meta = model_profile::vision_kind::qwen2vl;
         } else if (pt->find("qwen3vl") != std::string::npos || pt->find("qwen3") != std::string::npos) {
             meta = model_profile::vision_kind::qwen3vl;
@@ -145,18 +455,23 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
     }
 
     const bool q2 = kind == model_profile::vision_kind::qwen2vl;
+    const bool ds = kind == model_profile::vision_kind::deepseek41v;
     hp.image_size = (int)f.get_u32("clip.vision.image_size");
-    hp.patch_size = (int)f.get_u32("clip.vision.patch_size", q2 ? 14u : 16u);
+    hp.patch_size = (int)f.get_u32("clip.vision.patch_size", (q2 || ds) ? 14u : 16u);
     hp.n_embd = (int)f.get_u32("clip.vision.embedding_length");
     hp.n_ff = (int)f.get_u32("clip.vision.feed_forward_length");
     hp.n_layer = (int)f.get_u32("clip.vision.block_count");
     hp.n_head = (int)f.get_u32("clip.vision.attention.head_count");
     hp.head_dim = hp.n_head > 0 ? hp.n_embd / hp.n_head : 0;
     hp.proj_dim = (int)f.get_u32("clip.vision.projection_dim");
-    hp.merge = (int)f.get_u32("clip.vision.spatial_merge_size", 2);
+    // deepseek41v's merge factor is the projector's 3x3 scale; the qwen
+    // towers use clip.vision.spatial_merge_size (2).
+    hp.merge = ds ? (int)f.get_u32("clip.vision.projector.scale_factor", 3u)
+                  : (int)f.get_u32("clip.vision.spatial_merge_size", 2);
     hp.eps = f.get_f32("clip.vision.attention.layer_norm_epsilon", 1e-6f);
     // Qwen2-VL's vision RoPE is fixed at 1e4; its metadata may carry no theta.
-    hp.rope_base = q2 ? 10000.0f : f.get_f32("clip.vision.rope_theta", 10000.0f);
+    // deepseek41v's graph sets rope_theta = 10000 explicitly.
+    hp.rope_base = (q2 || ds) ? 10000.0f : f.get_f32("clip.vision.rope_theta", 10000.0f);
     if (const gguf_kv * mean = f.meta("clip.vision.image_mean")) {
         for (int i = 0; i < 3 && i < (int)mean->arr.size(); i++) {
             hp.mean[i] = mean->arr[i].as_f32();
@@ -216,7 +531,7 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
 
     // learned absolute position embeddings (qwen3vl only)
     hp.n_pos_side = 0;
-    if (!q2) {
+    if (!q2 && !ds) {
         vt pe = bind_vt(f, "v.position_embd.weight");
         const int n_side = (int)std::lround(std::sqrt((double)pe.N));
         hp.n_pos_side = n_side;
@@ -234,10 +549,20 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
 
     {
         const int patch_area = hp.patch_size * hp.patch_size * hp.merge * hp.merge;
-        // Qwen3-VL's preprocessor_config.json: shortest_edge = 65536.  The
-        // Qwen2-VL reference (MinerU) uses a much smaller floor and its verified
-        // page path never reaches it, so keep its existing 8-token floor.
-        hp.min_pixels = (kind == model_profile::vision_kind::qwen3vl ? 64 : 8) * patch_area;
+        if (ds) {
+            // DeepSeek-V4.1: the floor is an absolute pixel area from the
+            // mmproj, and the ceiling is a *token-block* cap (newlines and
+            // both sentinels included), not a pixel count.
+            hp.min_pixels = (int)f.get_u32("clip.vision.image_min_pixels", 295936u);
+            hp.max_n_token = 1024;
+        } else {
+            // Qwen3-VL's preprocessor_config.json: shortest_edge = 65536.  The
+            // Qwen2-VL reference (MinerU) uses a much smaller floor and its
+            // verified page path never reaches it, so keep its existing
+            // 8-token floor.
+            hp.min_pixels = (kind == model_profile::vision_kind::qwen3vl ? 64 : 8) * patch_area;
+            hp.max_n_token = 0;
+        }
     }
 
     post_ln = bind_f32_opt(f, "v.post_ln.weight");
@@ -249,10 +574,11 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
     // Bind the block tensors first: the qwen2vl file has separate q/k/v, the
     // qwen3vl file one fused qkv.  Both end up in the same vision_layer view.
     struct raw_layer {
-        vt qkv, q, k, v, out, up, down;
+        vt qkv, q, k, v, out, up, down, gate;
         const float * qkv_b = nullptr;
         const float * q_b = nullptr, * k_b = nullptr, * v_b = nullptr;
         const float * out_b = nullptr, * up_b = nullptr, * down_b = nullptr;
+        const float * gate_b = nullptr;
         const float * ln1 = nullptr, * ln1_b = nullptr, * ln2 = nullptr, * ln2_b = nullptr;
     };
     std::vector<raw_layer> raw((size_t)hp.n_layer);
@@ -276,15 +602,28 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         R.up_b = bind_f32_opt(f, pre + "ffn_up.bias");
         R.down = bind_vt(f, pre + "ffn_down.weight");
         R.down_b = bind_f32_opt(f, pre + "ffn_down.bias");
+        if (ds) {
+            // SwiGLU: silu(ffn_gate(x)) * ffn_up(x).  This file carries no FFN
+            // biases, but bind them optionally so a sibling mmproj still runs.
+            R.gate = bind_vt(f, pre + "ffn_gate.weight");
+            R.gate_b = bind_f32_opt(f, pre + "ffn_gate.bias");
+        }
         R.ln1 = bind_f32_opt(f, pre + "ln1.weight");
         R.ln1_b = bind_f32_opt(f, pre + "ln1.bias");
         R.ln2 = bind_f32_opt(f, pre + "ln2.weight");
         R.ln2_b = bind_f32_opt(f, pre + "ln2.bias");
     }
-    mm0 = bind_vt(f, "mm.0.weight");
-    mm0_b = bind_f32_opt(f, "mm.0.bias");
+    // The first projector layer is `mm.0` for the qwen towers and `mm.1` for
+    // deepseek41v (the 3x3 unfold is the "mm.0").  Both are stored in mm0.
+    mm0 = bind_vt(f, ds ? "mm.1.weight" : "mm.0.weight");
+    mm0_b = bind_f32_opt(f, ds ? "mm.1.bias" : "mm.0.bias");
     mm2 = bind_vt(f, "mm.2.weight");
     mm2_b = bind_f32_opt(f, "mm.2.bias");
+    if (ds) {
+        img_start = bind_f32_opt(f, "v.token_embd.img_start");
+        img_end = bind_f32_opt(f, "v.token_embd.img_end");
+        img_newline = bind_f32_opt(f, "v.image_newline");
+    }
 
     // The Qwen2-VL mmproj's `clip.vision.feed_forward_length` says 896 (the text
     // hidden size) but ffn_up is [1280, 5120].  Trust the tensor for every
@@ -316,6 +655,9 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
             if (wants_f32(*t)) {
                 total += tsize(*t);
             }
+        }
+        if (wants_f32(R.gate)) {
+            total += tsize(R.gate);
         }
     }
     for (const vt * t : {&mm0, &mm2}) {
@@ -353,6 +695,7 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
     std::vector<size_t> qkv_off((size_t)hp.n_layer, kOffNone), qkv_b_off((size_t)hp.n_layer, kOffNone);
     std::vector<size_t> out_off((size_t)hp.n_layer, kOffNone), up_off((size_t)hp.n_layer, kOffNone);
     std::vector<size_t> down_off((size_t)hp.n_layer, kOffNone);
+    std::vector<size_t> gate_off((size_t)hp.n_layer, kOffNone);
     size_t mm0_off = kOffNone, mm2_off = kOffNone;
 
     for (int il = 0; il < hp.n_layer; il++) {
@@ -402,6 +745,9 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         if (wants_f32(R.down)) {
             down_off[(size_t)il] = append_vt(R.down, true);
         }
+        if (wants_f32(R.gate)) {
+            gate_off[(size_t)il] = append_vt(R.gate, true);
+        }
     }
     if (wants_f32(mm0)) {
         mm0_off = append_vt(mm0, true);
@@ -436,6 +782,8 @@ void vision_model::load(const std::string & path, model_profile::vision_kind req
         L.up_b = R.up_b;
         L.down = view(down_off[(size_t)il], R.down);
         L.down_b = R.down_b;
+        L.gate = view(gate_off[(size_t)il], R.gate);
+        L.gate_b = R.gate_b;
         L.ln1 = R.ln1;
         L.ln1_b = R.ln1_b;
         L.ln2 = R.ln2;
@@ -473,7 +821,7 @@ void vision_model::ensure_w32() const {
 
 vision_model::~vision_model() {
     free_dev_ptrs(dev_q,
-                  {dev_weights, d_w32, d_qkv_b32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0});
+                  {dev_weights, d_w32, d_qkv_b32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0, d_gate, d_grid});
     delete gemm;
     gemm = nullptr;
 }
@@ -581,6 +929,7 @@ void vision_model::upload(sycl::queue & q) {
             add(L.out);
             add(L.up);
             add(L.down);
+            add(L.gate);
         }
         add(mm0);
         add(mm2);
@@ -609,6 +958,9 @@ void vision_model::upload(sycl::queue & q) {
         for (const vision_layer & L : layers) {
             for (const vt * t : {&L.out, &L.up, &L.down}) {
                 linear.push_back(t->data);
+            }
+            if (L.gate.data) {
+                linear.push_back(L.gate.data);
             }
             if (kind != model_profile::vision_kind::qwen2vl) {
                 linear.push_back(L.qkv.data);
@@ -683,9 +1035,25 @@ vision_input vision_model::make_input(const vision_model & vm, const mm_image & 
     in.pw = img.width / vm.hp.patch_size;
     in.ph = img.height / vm.hp.patch_size;
     in.n_patches = in.pw * in.ph;
-    in.out_w = in.pw / vm.hp.merge;
-    in.out_h = in.ph / vm.hp.merge;
-    in.n_out = in.out_w * in.out_h;
+    if (vm.kind == model_profile::vision_kind::deepseek41v) {
+        // The 3x3 merge pads the patch grid UP to a multiple of 3, so the grid
+        // is ceil(pw/3) x ceil(ph/3), and the emitted block is
+        // n_llm_h*(n_llm_w+1)+2 rows with the start/newline/end sentinels.
+        // `n_pos` is the whole block: DeepSeek consumes plain 1-D positions.
+        const int r = vm.hp.merge > 0 ? vm.hp.merge : 3;
+        in.n_llm_w = (in.pw + r - 1) / r;
+        in.n_llm_h = (in.ph + r - 1) / r;
+        in.n_grid = in.n_llm_w * in.n_llm_h;
+        in.out_w = in.n_llm_w;
+        in.out_h = in.n_llm_h;
+        in.n_out = in.n_llm_h * (in.n_llm_w + 1) + 2;
+        in.n_pos = in.n_out;
+    } else {
+        in.out_w = in.pw / vm.hp.merge;
+        in.out_h = in.ph / vm.hp.merge;
+        in.n_out = in.out_w * in.out_h;
+        in.n_pos = std::max(in.out_w, in.out_h);
+    }
     return in;
 }
 
@@ -825,8 +1193,21 @@ bool vision_model::runnable(std::string * why) const {
         return fail("vision: incomplete tower geometry");
     }
     // The attention kernel is instantiated per head width.  qwen3vl uses 64/72;
-    // qwen2vl's 80-wide head has its own correct BQ=16 instantiation.
-    if (kind == model_profile::vision_kind::qwen2vl) {
+    // qwen2vl's 80-wide head has its own correct BQ=16 instantiation;
+    // deepseek41v is 16x64.
+    if (kind == model_profile::vision_kind::deepseek41v) {
+        if (hp.n_embd != 1024 || hp.n_head != 16 || hp.head_dim != 64 || hp.n_ff != 2816) {
+            return fail("vision: deepseek41v implements only 1024 embd / 16x64 heads / 2816 FFN (got "
+                        + std::to_string(hp.n_embd) + " / " + std::to_string(hp.n_head) + "x"
+                        + std::to_string(hp.head_dim) + " / " + std::to_string(hp.n_ff) + ")");
+        }
+        if (hp.patch_size != 14 || hp.merge != 3 || hp.proj_dim != 5120) {
+            return fail("vision: deepseek41v implements only patch 14 / merge 3 / projection 5120");
+        }
+        if (!img_start || !img_end || !img_newline) {
+            return fail("vision: deepseek41v is missing its sentinel embeddings");
+        }
+    } else if (kind == model_profile::vision_kind::qwen2vl) {
         if (hp.head_dim != 80) {
             return fail("vision: qwen2vl implements only the 80-wide head (got " + std::to_string(hp.head_dim) + ")");
         }
@@ -844,6 +1225,9 @@ bool vision_model::runnable(std::string * why) const {
         if (!L.qkv.data || L.qkv.N != 3 * E || L.qkv.K != E || !L.out.data || !L.up.data || !L.down.data) {
             return fail("vision: a block is missing a weight or its qkv is not [3E][E]");
         }
+        if (kind == model_profile::vision_kind::deepseek41v && (!L.gate.data || L.gate.K != E || L.gate.N != hp.n_ff)) {
+            return fail("vision: a deepseek41v block is missing its SwiGLU gate");
+        }
     }
     if (mm0.K != hp.merge * hp.merge * E || mm2.K != mm0.N || mm2.N != hp.proj_dim) {
         return fail("vision: projector shape mismatch");
@@ -851,7 +1235,231 @@ bool vision_model::runnable(std::string * why) const {
     return true;
 }
 
+// Raw patch vectors in *raster* order (t = py*pw + px), which is the order
+// the reference's reshape to [n_embd, nx, ny] and its 2D positions use.  The
+// generic build_raw_patches walks the merged (2x2/3x3) order instead.  The row
+// is `patch_K` wide (zero-padded past 3*P*P) for the device GEMM.
+void ds41_build_raw_patches(const vision_model & vm, const vision_input & in, std::vector<float> & x) {
+    const int P = vm.hp.patch_size;
+    const int np = in.n_patches;
+    x.assign((size_t)np * vm.patch_K, 0.f);
+    par(np, [&](int t) {
+        const int py = in.pw > 0 ? t / in.pw : 0;
+        const int px = in.pw > 0 ? t % in.pw : 0;
+        float * xt = x.data() + (size_t)t * vm.patch_K;
+        int i = 0;
+        for (int c = 0; c < 3; c++) {
+            const float * plane = in.chw + (size_t)c * in.width * in.height;
+            for (int kh = 0; kh < P; kh++) {
+                const float * row = plane + (size_t)(py * P + kh) * in.width + px * P;
+                for (int kw = 0; kw < P; kw++, i++) {
+                    xt[i] = row[kw];
+                }
+            }
+        }
+    });
+}
+
+// Host reference forward for deepseek41v.  The qwen reference in encode_host
+// below shares the layer skeleton, but the differences are structural:
+// RMSNorm instead of LayerNorm, SwiGLU instead of GELU, raster patch order,
+// the 3x3 unfold + 2-layer aligner, and the reading-order sentinel block.
+void encode_host_ds(const vision_model & vm, const vision_input & in, std::vector<float> & out) {
+    const vision_hparams & hp = vm.hp;
+    const int E = hp.n_embd;
+    const int ff = hp.n_ff;
+    const int HD = hp.head_dim;
+    const int NH = hp.n_head;
+    const int np = in.n_patches;
+    const int r = hp.merge;
+    const int nw = in.n_llm_w, nh = in.n_llm_h, ngrid = in.n_grid;
+    if (np <= 0 || ngrid <= 0) {
+        throw std::runtime_error("vision: empty patch grid");
+    }
+    if (!vm.runnable()) {
+        std::string why;
+        vm.runnable(&why);
+        throw std::runtime_error(why);
+    }
+
+    std::vector<float> raw;
+    ds41_build_raw_patches(vm, in, raw);
+    std::vector<float> x((size_t)np * E);
+    par(np, [&](int t) {
+        const float * src = raw.data() + (size_t)t * vm.patch_K;
+        float * dst = x.data() + (size_t)t * E;
+        for (int o = 0; o < E; o++) {
+            dst[o] = (vm.patch_b ? vm.patch_b[o] : 0.f)
+                     + isa().dot_f32(vm.patch_w.data() + (size_t)o * vm.patch_K, src, vm.patch_K);
+        }
+    });
+
+    std::vector<float> tmp((size_t)np * E);
+    std::vector<float> qkv((size_t)np * 3 * E);
+    std::vector<float> attn((size_t)np * E);
+    std::vector<float> gatebuf((size_t)np * ff);
+    std::vector<float> upbuf((size_t)np * ff);
+    std::vector<float> downbuf((size_t)np * E);
+
+    const float rope_scale = std::pow(hp.rope_base, -2.0f / (float)(HD / 2));
+    const float scale = 1.0f / std::sqrt((float)HD);
+
+    for (int il = 0; il < hp.n_layer; il++) {
+        const vision_layer & L = vm.layers[(size_t)il];
+        for (int t = 0; t < np; t++) {
+            ds41_rms_norm(x.data() + (size_t)t * E, L.ln1, tmp.data() + (size_t)t * E, E, hp.eps);
+        }
+        ds41_matmul_all(L.qkv, L.qkv_b, tmp.data(), qkv.data(), np);
+        // 2D vision RoPE: 32 half-split pairs; 0-15 row, 16-31 column
+        for (int t = 0; t < np; t++) {
+            const int py = in.pw > 0 ? t / in.pw : 0;
+            const int px = in.pw > 0 ? t % in.pw : 0;
+            float * qt = qkv.data() + (size_t)t * 3 * E;
+            for (int h = 0; h < NH; h++) {
+                float * q = qt + h * HD;
+                float * k = qt + E + h * HD;
+                for (int ic = 0; ic < HD / 2; ic++) {
+                    const int sec = ic / (HD / 4);
+                    const int p = ic % (HD / 4);
+                    const int pos = sec == 0 ? py : px;
+                    const float theta = pos * std::pow(rope_scale, (float)p);
+                    const float c = std::cos(theta), s = std::sin(theta);
+                    const float q0 = q[ic], q1 = q[ic + HD / 2];
+                    q[ic] = q0 * c - q1 * s;
+                    q[ic + HD / 2] = q0 * s + q1 * c;
+                    const float k0 = k[ic], k1 = k[ic + HD / 2];
+                    k[ic] = k0 * c - k1 * s;
+                    k[ic + HD / 2] = k0 * s + k1 * c;
+                }
+            }
+        }
+        // Bidirectional attention.  Parallelised over (head, query block): the
+        // per-query score row is a local buffer, and each task writes disjoint
+        // output rows.  A single-threaded loop here would dominate the host
+        // path on a full page (np is 5476 for a 1036x1036 image).
+        const int chunks = 8;
+        par(NH * chunks, [&](int task) {
+            const int h = task / chunks;
+            const int cb = task % chunks;
+            const int t_begin = np * cb / chunks;
+            const int t_end = np * (cb + 1) / chunks;
+            std::vector<float> sc((size_t)np);
+            for (int t0 = t_begin; t0 < t_end; t0++) {
+                const float * q = qkv.data() + (size_t)t0 * 3 * E + h * HD;
+                float mx = -INFINITY;
+                for (int t1 = 0; t1 < np; t1++) {
+                    const float * k = qkv.data() + (size_t)t1 * 3 * E + E + h * HD;
+                    float acc = 0;
+                    for (int d = 0; d < HD; d++) {
+                        acc += q[d] * k[d];
+                    }
+                    acc *= scale;
+                    sc[(size_t)t1] = acc;
+                    if (acc > mx) {
+                        mx = acc;
+                    }
+                }
+                double sum = 0;
+                for (int t1 = 0; t1 < np; t1++) {
+                    sc[(size_t)t1] = std::exp(sc[(size_t)t1] - mx);
+                    sum += sc[(size_t)t1];
+                }
+                const float inv = (float)(1.0 / sum);
+                float * o = attn.data() + (size_t)t0 * E + h * HD;
+                for (int d = 0; d < HD; d++) {
+                    o[d] = 0;
+                }
+                for (int t1 = 0; t1 < np; t1++) {
+                    const float p = sc[(size_t)t1] * inv;
+                    const float * v = qkv.data() + (size_t)t1 * 3 * E + 2 * E + h * HD;
+                    for (int d = 0; d < HD; d++) {
+                        o[d] += p * v[d];
+                    }
+                }
+            }
+        });
+        ds41_matmul_all(L.out, L.out_b, attn.data(), tmp.data(), np);
+        for (size_t i = 0; i < x.size(); i++) {
+            x[i] += tmp[i];
+        }
+        for (int t = 0; t < np; t++) {
+            ds41_rms_norm(x.data() + (size_t)t * E, L.ln2, tmp.data() + (size_t)t * E, E, hp.eps);
+        }
+        ds41_matmul_all(L.gate, L.gate_b, tmp.data(), gatebuf.data(), np);
+        ds41_matmul_all(L.up, L.up_b, tmp.data(), upbuf.data(), np);
+        for (size_t i = 0; i < upbuf.size(); i++) {
+            const float g = gatebuf[i];
+            upbuf[i] = (g / (1.0f + std::exp(-g))) * upbuf[i];
+        }
+        ds41_matmul_all(L.down, L.down_b, upbuf.data(), downbuf.data(), np);
+        for (size_t i = 0; i < x.size(); i++) {
+            x[i] += downbuf[i];
+        }
+    }
+    for (int t = 0; t < np; t++) {
+        ds41_rms_norm(x.data() + (size_t)t * E, vm.post_ln, tmp.data() + (size_t)t * E, E, hp.eps);
+    }
+    x.swap(tmp);
+
+    // 3x3 unfold on the patch grid zero-padded to multiples of 3.  The k order
+    // is the reference's im2col: k = channel*9 + kh*3 + kw.
+    const int K9 = r * r * E;
+    std::vector<float> fe((size_t)ngrid * K9, 0.f);
+    for (int cy = 0; cy < nh; cy++) {
+        for (int cx = 0; cx < nw; cx++) {
+            float * dst = fe.data() + (size_t)(cy * nw + cx) * K9;
+            for (int c = 0; c < E; c++) {
+                for (int kh = 0; kh < r; kh++) {
+                    const int py = cy * r + kh;
+                    if (py >= in.ph) {
+                        continue;
+                    }
+                    for (int kw = 0; kw < r; kw++) {
+                        const int px = cx * r + kw;
+                        if (px >= in.pw) {
+                            continue;
+                        }
+                        dst[c * (r * r) + kh * r + kw] = x[((size_t)py * in.pw + px) * E + c];
+                    }
+                }
+            }
+        }
+    }
+    std::vector<float> h1((size_t)ngrid * vm.mm0.N);
+    ds41_matmul_all(vm.mm0, vm.mm0_b, fe.data(), h1.data(), ngrid);
+    for (size_t i = 0; i < h1.size(); i++) {
+        const float v = h1[i];
+        h1[i] = 0.5f * v * (1.0f + std::erf(v * 0.7071067811865476f));
+    }
+    std::vector<float> grid((size_t)ngrid * hp.proj_dim);
+    ds41_matmul_all(vm.mm2, vm.mm2_b, h1.data(), grid.data(), ngrid);
+
+    // Reading-order block: [start] then each row's cells + [newline], [end].
+    const int P = hp.proj_dim;
+    const int n_out = in.n_out;
+    out.assign((size_t)n_out * P, 0.f);
+    std::memcpy(out.data(), vm.img_start, sizeof(float) * P);
+    int row = 1;
+    for (int rr = 0; rr < nh; rr++) {
+        for (int cc = 0; cc < nw; cc++) {
+            std::memcpy(out.data() + (size_t)row * P, grid.data() + (size_t)(rr * nw + cc) * P, sizeof(float) * P);
+            row++;
+        }
+        std::memcpy(out.data() + (size_t)row * P, vm.img_newline, sizeof(float) * P);
+        row++;
+    }
+    std::memcpy(out.data() + (size_t)row * P, vm.img_end, sizeof(float) * P);
+    row++;
+    if (row != n_out) {
+        throw std::runtime_error("vision: deepseek41v block length mismatch");
+    }
+}
+
 void vision_model::encode_host(const vision_input & in, std::vector<float> & out) const {
+    if (kind == model_profile::vision_kind::deepseek41v) {
+        encode_host_ds(*this, in, out);
+        return;
+    }
     // the qwen2vl q|k|v f32 matrix is deferred; the host reference forward reads it
     ensure_w32();
     const int E = hp.n_embd;
@@ -1059,7 +1667,168 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
 // (residual) -> LayerNorm -> FFN up -> bias -> GELU -> FFN down (residual), then
 // post LayerNorm and the 2x2 merger (concat is a stride reinterpretation).
 // ---------------------------------------------------------------------------
+// Device forward for deepseek41v.  Reuses the shared vit_* kernels for every
+// linear, RoPE and attention, and the three ds41_* kernels for RMSNorm, the 3x3
+// unfold and the sentinel assembly.
+void encode_device_ds(vision_model & vm, sycl::queue & q, const vision_input & in, float * d_out) {
+    pin_dev_queue(vm.dev_q, q, "vision");
+    const vision_hparams & hp = vm.hp;
+    const int E = hp.n_embd;
+    const int ff = hp.n_ff;
+    const int HD = hp.head_dim;
+    const int NH = hp.n_head;
+    const int np = in.n_patches;
+    const int nw = in.n_llm_w, nh = in.n_llm_h, ngrid = in.n_grid;
+    if (np <= 0 || ngrid <= 0 || in.n_out <= 0) {
+        throw std::runtime_error("vision: empty patch grid");
+    }
+    if (np > kMaxImgPatches) {
+        throw std::runtime_error("vision: image needs " + std::to_string(np) + " patch tokens (max "
+                                 + std::to_string(kMaxImgPatches) + ")");
+    }
+    if (!vm.runnable()) {
+        std::string why;
+        vm.runnable(&why);
+        throw std::runtime_error(why);
+    }
+    vm.upload(q);
+
+    if (!vm.d_patch_w) {
+        vm.d_patch_w = sycl::malloc_device((size_t)E * vm.patch_K * sizeof(float), q);
+        if (!vm.d_patch_w) {
+            throw std::runtime_error("vision: patch weight allocation failed");
+        }
+        q.memcpy(vm.d_patch_w, vm.patch_w.data(), (size_t)E * vm.patch_K * sizeof(float));
+    }
+    if (vm.scratch_patches < np || !vm.d_gate || !vm.d_grid) {
+        auto fre = [&](void * p) {
+            if (p) {
+                sycl::free(p, q);
+            }
+        };
+        fre(vm.d_patch_in);
+        fre(vm.d_x);
+        fre(vm.d_ln);
+        fre(vm.d_qkv);
+        fre(vm.d_attn);
+        fre(vm.d_ffn);
+        fre(vm.d_mm0);
+        fre(vm.d_gate);
+        fre(vm.d_grid);
+        vm.d_patch_in = (float *)sycl::malloc_device((size_t)np * vm.patch_K * 4, q);
+        vm.d_x = (float *)sycl::malloc_device((size_t)np * E * 4, q);
+        vm.d_ln = (float *)sycl::malloc_device((size_t)np * E * 4, q);
+        vm.d_qkv = (float *)sycl::malloc_device((size_t)np * 3 * E * 4, q);
+        vm.d_attn = (float *)sycl::malloc_device((size_t)np * E * 4, q);
+        vm.d_ffn = (float *)sycl::malloc_device((size_t)np * ff * 4, q);
+        vm.d_gate = (float *)sycl::malloc_device((size_t)np * ff * 4, q);
+        vm.d_mm0 = (float *)sycl::malloc_device((size_t)in.n_out * 9 * E * 4, q);
+        vm.d_grid = (float *)sycl::malloc_device((size_t)in.n_out * hp.proj_dim * 4, q);
+        if (!vm.d_patch_in || !vm.d_x || !vm.d_ln || !vm.d_qkv || !vm.d_attn || !vm.d_ffn || !vm.d_gate || !vm.d_mm0
+            || !vm.d_grid) {
+            throw std::runtime_error("vision: device scratch allocation failed");
+        }
+        vm.scratch_patches = np;
+    }
+
+    auto devf = [&](const float * p) { return (const float *)vm.dev_ptr(p); };
+    auto linear = [&](const vt & W, const float * x, int x_stride, int T, float * out, int out_stride,
+                      const float * residual, float alpha, int N) {
+        if (!vm.linear_dnnl(q, W.data, x, x_stride, T, W.K, out, out_stride, residual, alpha, N)) {
+            vit_gemm_launch(q, vm.dev_ptr(W.data), W.type, W.N, W.K, x, x_stride, out, out_stride, T, alpha, residual);
+        }
+    };
+
+    vision_stage_timer vt(si::env::flag("PF_VISION_TIME"));
+    const auto t_all0 = std::chrono::high_resolution_clock::now();
+
+    std::vector<float> pin;
+    ds41_build_raw_patches(vm, in, pin);
+    q.memcpy(vm.d_patch_in, pin.data(), pin.size() * sizeof(float));
+
+    // patch embedding (14x14 stride-14 conv) + bias
+    vit_gemm_launch(q, vm.d_patch_w, GGML_TYPE_F32, E, vm.patch_K, vm.d_patch_in, vm.patch_K, vm.d_x, E, np, 1.f,
+                    nullptr);
+    if (vm.patch_b) {
+        vit_add_bias_launch(q, vm.d_x, E, devf(vm.patch_b), np, E);
+    }
+    vt.lap(q, vt.patch);
+
+    const float scale = 1.0f / std::sqrt((float)HD);
+    for (int il = 0; il < hp.n_layer; il++) {
+        const vision_layer & L = vm.layers[(size_t)il];
+        ds41_rmsnorm_launch(q, vm.d_x, E, devf(L.ln1), vm.d_ln, E, np, E, hp.eps);
+        vt.lap_layer(q, vt.ln1);
+        linear(L.qkv, vm.d_ln, E, np, vm.d_qkv, 3 * E, nullptr, 1.f, 3 * E);
+        if (L.qkv_b) {
+            vit_add_bias_launch(q, vm.d_qkv, 3 * E, devf(L.qkv_b), np, 3 * E);
+        }
+        vt.lap_layer(q, vt.qkv);
+        vit_rope_launch(q, vm.d_qkv, 3 * E, np, NH, HD, in.pw, 1, hp.rope_base);
+        vt.lap_layer(q, vt.rope);
+        vit_attn_launch(q, vm.d_qkv, 3 * E, vm.d_attn, E, np, NH, HD, scale);
+        vt.lap_layer(q, vt.attn);
+        if (L.out_b) {
+            vit_add_bias_launch(q, vm.d_x, E, devf(L.out_b), np, E);
+        }
+        linear(L.out, vm.d_attn, E, np, vm.d_x, E, vm.d_x, 1.f, E);
+        vt.lap_layer(q, vt.out);
+
+        ds41_rmsnorm_launch(q, vm.d_x, E, devf(L.ln2), vm.d_ln, E, np, E, hp.eps);
+        vt.lap_layer(q, vt.ln2);
+        linear(L.gate, vm.d_ln, E, np, vm.d_gate, ff, nullptr, 1.f, ff);
+        if (L.gate_b) {
+            vit_add_bias_launch(q, vm.d_gate, ff, devf(L.gate_b), np, ff);
+        }
+        vt.lap_layer(q, vt.up);
+        linear(L.up, vm.d_ln, E, np, vm.d_ffn, ff, nullptr, 1.f, ff);
+        if (L.up_b) {
+            vit_add_bias_launch(q, vm.d_ffn, ff, devf(L.up_b), np, ff);
+        }
+        vit_silu_mul_launch(q, vm.d_gate, vm.d_ffn, ff, vm.d_ffn, np, ff);
+        vt.lap_layer(q, vt.act);
+        if (L.down_b) {
+            vit_add_bias_launch(q, vm.d_x, E, devf(L.down_b), np, E);
+        }
+        linear(L.down, vm.d_ffn, ff, np, vm.d_x, E, vm.d_x, 1.f, E);
+        vt.lap_layer(q, vt.down);
+    }
+
+    ds41_rmsnorm_launch(q, vm.d_x, E, devf(vm.post_ln), vm.d_ln, E, np, E, hp.eps);
+    vt.lap(q, vt.post_ln);
+
+    // 3x3 unfold -> mm.1 (+ erf GELU) -> mm.2 -> reading-order sentinel block
+    ds41_unfold_launch(q, vm.d_ln, in.pw, in.ph, nw, nh, E, vm.d_mm0);
+    linear(vm.mm0, vm.d_mm0, 9 * E, ngrid, vm.d_grid, vm.mm0.N, nullptr, 1.f, vm.mm0.N);
+    if (vm.mm0_b) {
+        vit_add_bias_launch(q, vm.d_grid, vm.mm0.N, devf(vm.mm0_b), ngrid, vm.mm0.N);
+    }
+    vit_gelu_errf_launch(q, vm.d_grid, ngrid * vm.mm0.N);
+    linear(vm.mm2, vm.d_grid, vm.mm0.N, ngrid, vm.d_mm0, hp.proj_dim, nullptr, 1.f, hp.proj_dim);
+    if (vm.mm2_b) {
+        vit_add_bias_launch(q, vm.d_mm0, hp.proj_dim, devf(vm.mm2_b), ngrid, hp.proj_dim);
+    }
+    vt.lap(q, vt.mm);
+    ds41_assemble_launch(q, vm.d_mm0, nw, nh, hp.proj_dim, devf(vm.img_start), devf(vm.img_end),
+                         devf(vm.img_newline), d_out);
+    q.wait();
+    if (vt.on) {
+        const double total =
+            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_all0).count();
+        fprintf(stderr,
+                "[vtime] ds41v np=%d n_out=%d L=%d: total=%.1f ms | patch=%.1f merger=%.1f post_ln=%.2f | "
+                "layers=%.1f (ln1=%.1f qkv=%.1f rope=%.1f attn=%.1f out=%.1f ln2=%.1f gate_up=%.1f act=%.1f "
+                "down=%.1f)\n",
+                np, in.n_out, hp.n_layer, total, vt.patch, vt.mm, vt.post_ln, vt.layers, vt.ln1, vt.qkv, vt.rope,
+                vt.attn, vt.out, vt.ln2, vt.up, vt.act, vt.down);
+    }
+}
+
 void vision_model::encode_device(sycl::queue & q, const vision_input & in, float * d_out) {
+    if (kind == model_profile::vision_kind::deepseek41v) {
+        encode_device_ds(*this, q, in, d_out);
+        return;
+    }
     pin_dev_queue(dev_q, q, "vision");
     const int E = hp.n_embd;
     const int ff = hp.n_ff;

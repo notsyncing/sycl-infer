@@ -188,6 +188,20 @@ inline float dequant_elem_iq(uint32_t type, const char * sb, int e) {
         const int is = (half * 4 + j) * 2 + (lane >= 16 ? 1 : 0);
         return fast_h2f(x->d) * (float)(scales[is] - 32) * (float)val;
     }
+    case 18: { // IQ3_XXS
+        const auto * x = (const block_iq3_xxs *)sb;
+        const uint8_t * qs = x->qs;
+        const uint8_t * ss = qs + 64;
+        uint32_t aux32;
+        __builtin_memcpy(&aux32, ss + 4 * b, 4);
+        const float db = fast_h2f(x->d) * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+        const int l = lane / 8, k = lane % 8;
+        const uint8_t q = qs[8 * b + 2 * l + (k < 4 ? 0 : 1)];
+        const uint8_t sg = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        const int gi = (k < 4) ? k : k - 4;
+        const float s = (sg & kmask_iq2xs[k]) ? -1.f : 1.f;
+        return db * (float)((const uint8_t *)(iq3xxs_grid + q))[gi] * s;
+    }
     case 20: { // IQ4_NL
         const auto * blk = (const block_iq4_nl *)(sb + b * (int)sizeof(block_iq4_nl));
         const uint8_t byte = blk->qs[lane & 15];
@@ -295,6 +309,24 @@ template <uint32_t TYPE> inline void dequant_sb_lane_impl(const char * sb, int l
             const int val = (int)((q >> (2 * j)) & 3) - ((hm & (1u << (half * 4 + j))) ? 0 : 4);
             const int is = (half * 4 + j) * 2 + (lane >= 16 ? 1 : 0);
             w[b] = d * (float)(scales[is] - 32) * (float)val;
+        }
+    } break;
+    case 18: { // IQ3_XXS
+        const auto * x = (const block_iq3_xxs *)sb;
+        const float d = fast_h2f(x->d);
+        const uint8_t * qs = x->qs;
+        const uint8_t * ss = qs + 64;
+        const int l = lane / 8, k = lane % 8;
+        const int gi = (k < 4) ? k : k - 4;
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            uint32_t aux32;
+            __builtin_memcpy(&aux32, ss + 4 * b, 4);
+            const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            const uint8_t q = qs[8 * b + 2 * l + (k < 4 ? 0 : 1)];
+            const uint8_t sg = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+            const float s = (sg & kmask_iq2xs[k]) ? -1.f : 1.f;
+            w[b] = db * (float)((const uint8_t *)(iq3xxs_grid + q))[gi] * s;
         }
     } break;
     case 20: { // IQ4_NL: 8 independent 32-element blocks
@@ -646,6 +678,7 @@ inline int superblock_bytes(uint32_t type) {
     case 14: return 210;
     case 20: return 8 * 18;
     case 21: return 110;
+    case 18: return 98; // IQ3_XXS: f16 d + 96 code/sign/scale bytes
     case 23: return 136;
     case 8: return 8 * 34;
     case 6: return 8 * 22;

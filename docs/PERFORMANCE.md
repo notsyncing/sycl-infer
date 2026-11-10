@@ -505,6 +505,79 @@ context the eight rows have stopped paying for each other: the attention over
 the 16k KV dominates and does not amortise over the batch the way the weight
 pass does.
 
+### 5.5 DeepSeek-V4.1-Flash (deepseek41)
+
+The reference file is `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS` (40 layers,
+64x512 MLA, group-shared compressed KV, 384 experts top-6, Engram).  It does
+**not** fit the 2x16 GB cards: 155 GiB of text weights plus a 110 GiB Engram
+table.  The measured path is therefore the host forward (CPU backend,
+i9-10940X, 28 threads), with the vision tower on the A770; the GPU engine path
+and its numbers are in [design/23-deepseek41.md](design/23-deepseek41.md) and
+are added here once its benchmark is recorded.
+
+Conditions: `--device cpu --ctx 512 --max-slots 1`, greedy (`--temp 0`), model
+fully in the host page cache, one process per cell.  The first forward of a
+process pays the one-time f32 dequantization of the ~5.7 GiB dense weights
+(~14 s); later requests reuse it.
+
+| cell | result |
+|---|---|
+| raw completion `The capital of France is` | ` Paris.` (ids 11111, 16, 1) |
+| first prompt (5 tokens), incremental | ~14.3 s, then **0.93 s/token** steady |
+| same, whole-sequence recompute (`--naive`) | 2.87 s/token (grows with T) |
+| confident prompt `The quick brown fox jumps over the lazy` | ` dog.` + EOS, identical to llama.cpp |
+| chat `2+2` / image chat (thinking off) | `4` / `HELLO 123` |
+| prefix cache, 42-token prompt (32 reused) | 114.5 s -> **41.8 s** (2.74x), logits identical |
+| prefix cache, 12-token exact repeat | 45.5 s -> **17.0 s** (2.68x) |
+| vision tower, 640x320 -> 202 tokens | 17.6 s device (bf16 `vit_gemm`); `PF_VISION_DNNL=1` ~1.7 s, cos 0.9996 vs clip |
+
+GPU kernel microbenchmarks (one A770, AOT/JIT device code, warm clocks):
+
+| kernel | shape | time | rate |
+|---|---|---:|---:|
+| IQ2_XXS GEMV | K=5120,N=2304,M=1 | 41.8 us | 72.8 GB/s |
+| IQ2_XS GEMV | K=5120,N=2304,M=1 | 37.3 us | 91.4 GB/s |
+| IQ2_S GEMV | K=2304,N=5120,M=1 | 38.3 us | 98.8 GB/s |
+| mHC mixer | K=20480,N=24,20 iters | 0.045 ms | - |
+| MLA attention | 64x512, 128 window + 512 selected | 0.60 ms/layer | - |
+| compressor | ratio 2, 8 groups | 0.051 ms | - |
+| indexer score | 512 rows, 32x128 | 0.014 ms | - |
+
+The host decode is 1.08 tok/s.  **GPU path (2x A770, measured 2026-11-07,
+JIT, ctx 512, `--device gpu --layer-map 0-19:gpu.0,20-39:gpu.1
+--moe-vram-mb 16000 --max-slots 1`, greedy, one process per cell):** dense
+5.74 GiB is resident (3.4 / 2.35 GiB), the bank is 14.6 GiB split across the
+two cards (card0 20 / card1 22 slots of its own expert half), the hit rate is
+**59.8 %**, and each layer's routed experts are split so both PCIe links upload
+concurrently.  **Decode 271-276 ms/token (3.6-3.7 tok/s); prefill 156-175 ms/token
+(5.7-6.4 tok/s at 18000 MB; 164-180 at 16000)** against 330-353 / 245-280
+before the performance pass, with the 32-token greedy completion
+**byte-identical** to the unsplit path.  A 320-token prompt prefills at 164.2
+ms/token (16000 MB, hit 88.0 %) and **156.4 (18000 MB, hit 90.7 %)**; the
+80-token cell reads 180.5 / 174.5.  Recommended 18000 MB for text-only (ctx
+32768 still fits) and 16000 when the vision tower must fit.
+Same-stream phase split (`PF_DS41_TIME=2`): attention 90, MoE 173 (about 140 of
+it H2D), head 2.2, other ~10 ms/token.  Startup: the 32+20-token run was 15.4 s
+JIT / 14.45 s AOT with the pinned staging ring (30.1 s with pageable copies),
+and the raw 5+2 cell 4.5 s AOT.  Contexts 512..262144 allocate at 16000 MB
+(1.4-1.7 GiB free per card; the unused generic paged-KV pool - 10.6 KB/token/
+card, 1.28 GB/card at 128k - is no longer allocated; text-only 19000 is the
+measured max).  Correctness on the same build: ` Paris.`, chat `2+2` -> `4`,
+image (640x320) -> `HELLO 123` with the vision tower.  Remaining headroom: the
+dense Q5_K decode GEMV runs at 110 GB/s (a native u4 store reaches 223-294
+GB/s but is lossy at 4.6 % weight error, an accuracy decision), a
+prefetch-staging pipeline would recover ~20-30 ms on decode, and prefill is
+bounded by ~40 serialized per-layer 9.2 MB H2Ds (84-91 % hit) plus the same
+110 GB/s dense stream; token batching of the MoE does not amortize because
+384 experts with top-6 leave ~1 pair per expert over a chunk.  The A770 does
+have XMX and the current oneDNN (3.13.2) uses it: `jit:xe_hp:gemm:any` measures
+41-44 T-MAC/s plain s8 / 22-30 grouped at M=512 here, so a *batched* prefill
+routed through it is the concrete next lever (est. 1.13-1.2x on the dense
+projections); the per-token M=1 walk cannot use it, and the MoE's IQ2 format
+blocks s8/u4 without tripling the bank footprint.
+Hot-set calibration (`PF_DS41_CAL=1`) remains opt-in (a net loss for short
+generations).
+
 ## 6. Speculative decoding
 
 Both speculative paths are **single-request** paths: they take the whole engine

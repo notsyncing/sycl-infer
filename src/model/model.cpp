@@ -53,6 +53,7 @@ static const loader kLoaders[] = {
     {"qwen35moe", &load_qwen35moe, &kQwen35MoeProfile},
     {"qwen4exp", &load_qwen4exp, &kQwen4ExpProfile},
     {"qwen2vl", &load_qwen2vl, &kQwen2VlProfile},
+    {"deepseek41", &load_deepseek41, &kDeepseek41Profile},
 };
 
 const loader * find(const std::string & name) {
@@ -74,7 +75,14 @@ const loader * registry(size_t & n) {
 namespace {
 
 const char * fwd_kind_name(model_profile::fwd_kind k) {
-    return k == model_profile::fwd_kind::hc_ple_qsa ? "hc_ple_qsa" : "generic_plan";
+    switch (k) {
+    case model_profile::fwd_kind::hc_ple_qsa:
+        return "hc_ple_qsa";
+    case model_profile::fwd_kind::deepseek41:
+        return "deepseek41";
+    default:
+        return "generic_plan";
+    }
 }
 
 const char * prefill_kind_name(model_profile::prefill_kind k) {
@@ -140,11 +148,26 @@ void validate_hparams(const hparams & hp, const std::string & arch) {
         throw std::runtime_error(p + "head_dim " + std::to_string(hp.head_dim) +
                                  " must be a positive multiple of 32 (the attention sub-group width)");
     }
-    if (hp.head_dim > 256) {
+    if (hp.head_dim > 256 && !hp.deepseek41) {
         // partials are `2 + head_dim` per (token, head, split); the allocation
         // follows head_dim, but the classic kernel's register array is sized
         // for 256 and the KV layouts assume at most one 32-lane block per byte.
+        // deepseek41's 512-wide MLA head has its own kernels (engine_ds41.cpp).
         throw std::runtime_error(p + "head_dim " + std::to_string(hp.head_dim) + " exceeds the 256 ceiling");
+    }
+    if (hp.deepseek41) {
+        // The MLA latent is a single K = V head, and RoPE covers only its last
+        // `n_rot` dims.  A file that contradicts this is not this architecture.
+        if (hp.n_head_kv != 1 || hp.ds.kv_dim != hp.head_dim || hp.n_rot <= 0
+            || hp.n_rot > hp.head_dim || hp.ds.rot_off != hp.head_dim - hp.n_rot) {
+            throw std::runtime_error(p + "unsupported MLA geometry: n_head_kv=" +
+                                     std::to_string(hp.n_head_kv) + " kv_dim=" +
+                                     std::to_string(hp.ds.kv_dim) + " head_dim=" +
+                                     std::to_string(hp.head_dim) + " n_rot=" + std::to_string(hp.n_rot));
+        }
+        if (hp.n_head <= 0 || hp.head_dim % 32 != 0) {
+            throw std::runtime_error(p + "MLA head geometry must be a multiple of 32");
+        }
     }
     if (hp.n_head <= 0 || hp.n_head_kv <= 0 || hp.n_head % hp.n_head_kv != 0) {
         // GQA is expanded as kvh = h * n_head_kv / n_head and the grouped/flash
@@ -202,8 +225,26 @@ void validate_model_profile(const hparams & hp, const model_profile & prof, bool
     // from the GGUF metadata by the loader.  They are two views of the same
     // facts, so refuse a file whose geometry contradicts the architecture's
     // declaration instead of letting one view silently win at a use site.
-    if (prof.fwd != model_profile::fwd_kind::hc_ple_qsa) {
+    if (prof.fwd != model_profile::fwd_kind::hc_ple_qsa
+        && prof.fwd != model_profile::fwd_kind::deepseek41) {
         // The generic plan has no geometric assumptions beyond validate_hparams.
+    } else if (prof.fwd == model_profile::fwd_kind::deepseek41) {
+        auto expect = [&](const char * what, long got, long want) {
+            if (got != want) {
+                throw std::runtime_error("model profile " + std::string(prof.key) + ": " + what + " is " +
+                                         std::to_string(got) + " in the GGUF but " + std::to_string(want) +
+                                         " in the profile");
+            }
+        };
+        expect("hyper-connection streams", hp.ds.hc_mult, prof.residual.streams);
+        expect("hyper-connection mix width", hp.ds.hc_mix_dim, prof.residual.low_rank);
+        expect("DSA top-k", hp.ds.idx_top_k, prof.extras.qsa_top_k);
+        expect("DSA indexer heads", hp.ds.idx_n_head, prof.extras.idx_heads);
+        expect("DSA indexer head_dim", hp.ds.idx_head_dim, prof.extras.idx_head_dim);
+        if (!prof.extras.ple || !prof.extras.qsa || !prof.residual.hyper) {
+            throw std::runtime_error("model profile " + std::string(prof.key) +
+                                     ": deepseek41 must declare hyper-connections, Engram and DSA");
+        }
     } else {
         auto expect = [&](const char * what, long got, long want) {
             if (got != want) {
