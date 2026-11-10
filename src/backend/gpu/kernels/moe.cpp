@@ -1155,8 +1155,11 @@ static inline void moe_grp_sc(const char * sb, int gg, int lane, float d, float 
         dmn = dmin * (float)mn;
     } else {
         // q6_K: a signed byte per SIXTEEN values, and a lane's four values all
-        // fall in one of them, so the scale is per-lane here.
-        const float e = d * (float)((const block_q6_K *) sb)->scales[2 * (gg & 3) + (lane >> 4)];
+        // fall in one of them, so the scale is per-lane here - and `lane` is the
+        // 8-lane sub-group lane, so the 16-value half is lane/4 = lane>>2.
+        // `2 * (gg & 3)` also truncated the superblock's second 128-value half
+        // (groups 4..7 use scales[8..15]); see the note in moe_dp4a_w.
+        const float e = d * (float)((const block_q6_K *) sb)->scales[2 * gg + (lane >> 2)];
         dsc = e;
         dmn = 32.0f * e;
     }
@@ -1181,10 +1184,22 @@ static inline uint32_t moe_dp4a_w(const char * sb, int gb, int lane) {
         const uint32_t h = *reinterpret_cast<const uint32_t *>(x->qh + (lane << 2));
         return ((gb & 1) ? ((v >> 4) & 0x0F0F0F0Fu) : (v & 0x0F0F0F0Fu)) | (((h >> gb) & 0x01010101u) << 4);
     } else { // Q6_K: 6 bits = a nibble plus a two-bit plane, scale per 16 values
+        // `gb` is the 32-value group within the SUPERBLOCK (0..7), and a
+        // superblock is two 128-value halves: groups 4..7 live at
+        // ql+64 / qh+32 / scales+8 (see the reference dequant in
+        // kernel_utils.h).  Dropping that half offset computes groups 4..7 from
+        // groups 0..3's bytes - and since `lane` is the 8-lane sub-group lane
+        // here, `l = lane << 2` walks the 32 values of ONE group, not the four
+        // a 32-lane split would cover.  Measured on Qwen3.6-35B-A3B (Q6_K down
+        // on 3 of 40 layers, exact weights, f16 KV, one-token prefix): the GPU
+        // vs CPU next-token logprobs were off by mean 0.85 / max 1.59 nats, and
+        // the same numbers with the fp32 expert path were 0.069 / 0.214 - i.e.
+        // this call was the whole expert error and it flipped near-ties
+        // (dropped `**`, `3D` -> `3`).  After the fix: 0.075 / 0.162.
         const auto * x = (const block_q6_K *) sb;
-        const int g0 = gb & 3, l = lane << 2;
-        const uint32_t ql = *reinterpret_cast<const uint32_t *>(x->ql + ((g0 & 1) ? 32 + l : l));
-        const uint32_t qh = *reinterpret_cast<const uint32_t *>(x->qh + l);
+        const int h = gb >> 2, g0 = gb & 3, l = lane << 2;
+        const uint32_t ql = *reinterpret_cast<const uint32_t *>(x->ql + h * 64 + ((g0 & 1) ? 32 + l : l));
+        const uint32_t qh = *reinterpret_cast<const uint32_t *>(x->qh + h * 32 + l);
         const uint32_t n = (g0 >> 1) ? ((ql >> 4) & 0x0F0F0F0Fu) : (ql & 0x0F0F0F0Fu);
         const uint32_t t = (qh >> (2 * g0)) & 0x03030303u;
         return n | ((t << 4) & 0x30303030u);

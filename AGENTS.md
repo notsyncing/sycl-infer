@@ -5377,6 +5377,24 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   layer for this reason; say the layer count and the distinct values out loud at
   startup so the mixed case cannot be silent.
 
+* **A Q6_K 32-value group is NOT 32 bytes, and the grouped expert GEMM is an
+  8-lane split - both have to be in the index arithmetic.**  The 8-lane grouped
+  dp4a kernel (`moe_grp_impl`) gives each 8-lane sub-group one 32-value scale
+  group, so lane `l` owns values `4l..4l+3`; `moe_dp4a_w`/`moe_grp_sc`'s Q6_K
+  branch was written for a 32-lane split (`lane << 2` over 128 bytes,
+  `lane >> 4` for the 16-value scale) and dropped the superblock's second
+  128-value half (`ql+64` / `qh+32` / `scales+8` for groups 4..7), which computed
+  groups 4..7 from groups 0..3's bytes and never selected the odd 16-value
+  scale.  On Qwen3.6-35B-A3B (Q6_K expert down on 3 of 40 layers) that was a
+  **mean 0.85 / max 1.59 nat** next-token logprob error against the CPU
+  reference with otherwise exact weights and f16 KV - enough to flip near-ties in
+  fluent Chinese (a dropped opening `**`, `3D` -> `3`), and it is invisible to
+  an argmax/token-stream oracle.  The fp32 expert path measured 0.069/0.214 on
+  the same probe, and after the fix the grouped path is 0.075/0.162.  Q4_K/Q5_K
+  are unaffected (a 32-value group really is 32 bytes there).  `w8.cpp`'s dense
+  Q6_K path is a different, correct implementation (`h*64`/`h*32`/`scales[h*8]`
+  with `u = r/32`).
+
 * **oneDNN eligibility is per *call* and all-or-nothing - one f32 tensor takes
   the whole call down with it.**  GDN's `ssm_beta`/`ssm_alpha` are f32; sharing
   a plan call with the convertible `wqkv`/`wgate` made the entire call fall back
