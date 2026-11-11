@@ -5174,6 +5174,22 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   (`step_info`, the block table, `d_logits`, `d_partials_dec`) because those are
   per-sequence, not per-state, and are small.
 
+* **A prefix-cache checkpoint is only resumable when the forward completed a
+  32-token block, and the capture must take the deepest one even if the batch
+  ends mid-block.**  `pc_capture_begin` used to require `(pos0+n)%32==0`, so
+  almost every real prompt captured nothing: a single 633-token mode-2 batch,
+  and the `1024+309` split a 1333-token prompt uses, both leave exactly zero
+  checkpoints, and the endpoint reports `cached_tokens=0` for every repeat.  It
+  now captures `cap_b=(pos0+n)/32` (or `(L-1)/32` on the prompt's last batch, so
+  the final token still has a real forward).  `pos0%32==0` remains a hard
+  prerequisite: the conv snapshot runs at a *row* end and rows are 32 tokens,
+  so an unaligned batch has no conv window at a block boundary.  `pc_admit`
+  prefers a cold-split prefix, but on a single-partition run falls back to the
+  deepest state (multi-partition keeps the aligned-only rule - the 27B/2-card
+  M-sensitivity is 25.8 logits).  Measured on the 35B A3B / Arc 140V: 118/223/
+  430/847/1422-token prompts go 0 -> 96/192/416/832/1024 cached tokens with
+  cold/warm `reasoning+content` identical; 633 tokens goes 0 -> 608.
+
 * **YaRN's two blends are written to be exact at their anchors, and that is not
   cosmetic.**  `yarn_build` combines three sequences (`interp`, `extrap`, and a
   ramp mask) and both blends are deliberately written in difference form

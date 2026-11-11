@@ -935,16 +935,31 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
         pc_stat_misses++;
         return 0;
     }
-    // Only resume at a boundary that is also a prefill split prefix from
-    // scratch: the batched GEMM's activation scales depend on M, so a boundary
-    // captured inside a mixed block+tail batch (e.g. 544 within a 33-token
-    // 512..544 batch) quantizes its prefix rows differently from a pure
-    // block batch holding the same tokens (depth-17 sums 1231.91 vs 1237.31).
-    // Resuming there replays the tail with a different M than the cold run
-    // used, which amplifies to a 23-logit flip on multi-device.  Recomputing
-    // the cold splits for this prompt length (identical to prefill_text with
-    // ample pool) and picking the deepest cached state among those prefixes
-    // keeps warm on the exact suffix batching cold used (512+33, not 544+1).
+    // Prefer a boundary that is also a prefill split prefix from scratch: the
+    // batched GEMM's activation scales depend on M, so a boundary captured
+    // inside a mixed block+tail batch (e.g. 544 within a 33-token 512..544
+    // batch) quantizes its prefix rows differently from a pure block batch
+    // holding the same tokens (depth-17 sums 1231.91 vs 1237.31).  Resuming
+    // there replays the tail with a different M than the cold run used, which
+    // amplifies to a 23-logit flip on multi-device.  Recomputing the cold
+    // splits for this prompt length and picking the deepest cached state among
+    // those prefixes keeps warm on the exact suffix batching cold used
+    // (512+33, not 544+1).
+    //
+    // If no such aligned state exists, fall back to the deepest boundary that
+    // has one (Pass 1's `deep`).  Without that fallback the cache was dead for
+    // nearly every prompt: prefill_text() splits into equal batches, so a
+    // batch almost never ends on a 32-token boundary, and a prompt that fits
+    // one batch has no intermediate split prefix at all.  The resumed suffix
+    // then uses a different M than the cold run would; that is the trade for a
+    // working prefix cache, and it only affects the replayed suffix - the
+    // restored KV and recurrent state are the same bytes.
+    //
+    // The fallback is single-partition only.  The M-sensitivity above was
+    // measured on a 2-GPU layer map, where a different suffix batching moved a
+    // 27B logit by 25.8; a multi-partition run keeps the aligned-only rule so
+    // that path stays bit-exact.  A one-GPU layer map (the 35B A3B deployment)
+    // has `multi_dev=true` but one backend and takes the fallback.
     {
         std::vector<int> prefixes;
         prefixes.push_back(0);
@@ -1020,7 +1035,15 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
                 break;
             }
         }
-        deep = aligned;
+        // Keep Pass 1's deepest resumable boundary when it is not one of the
+        // cold split prefixes (see the comment above).  A multi-partition
+        // layer map stays on the exact aligned-only rule.
+        const bool multi_partition = multi_dev && dev_queues_.size() > 1;
+        if (aligned > 0) {
+            deep = aligned;
+        } else if (multi_partition) {
+            deep = 0;
+        }
         if (deep <= 0) {
             pc_stat_misses++;
             return 0;
@@ -1136,6 +1159,7 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
 // links the slots to the cache nodes afterwards.
 void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_off, int pos0, int n,
                               bool single_boundary) {
+    (void)tok_off; // kept for callers that pass a chunk base; hashes are absolute
     step_info * inf = pf_info_ ? pf_info_ : d_info;
     // a previous forward's pending reservations (no commit) must not leak
     for (auto & p : pc_pending_) {
@@ -1150,6 +1174,14 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     if (!ps.tracking) {
         return;
     }
+    // pos0 must start a 32-token block.  Both snapshot paths (the fused GDN and
+    // conv_state_update_launch) write the conv window at a *row* end, and rows
+    // are kMaxT = kBlockSize tokens, so a block boundary is a row end only when
+    // pos0 is aligned.  Capturing at an unaligned batch's block boundary would
+    // store a GDN state without its matching conv window (the equal-split
+    // prefill_text() path can produce such a batch, e.g. 667+666 for 1333
+    // tokens), and restoring it would corrupt the resumed suffix.  The server
+    // and MTP prefill paths pass 1024/32-multiples, so they stay aligned.
     if (n <= 0 || pos0 < 0 || pos0 % kBlockSize != 0) {
         return;
     }
@@ -1159,15 +1191,34 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     // (qwen4exp's q4_prefill_common) or commits only after a whole prompt.
     // If the vector holds the full prompt - every caller passes one - the
     // intermediate hashes can be recomputed from the block tokens.
-    const int first = pos0 / kBlockSize;      // first block index of this forward
-    const int last = (pos0 + n) / kBlockSize; // boundaries first+1 .. last
+    const int first = pos0 / kBlockSize;
+    const int last = (pos0 + n) / kBlockSize; // final complete-block boundary
     if (last <= first || last >= kPcMapLen) {
         return;
     }
-    // Only a forward that ends on a block boundary can hand a resumable
-    // checkpoint: a partial end's last complete block is inside this forward's
-    // batch, and replaying from it would use a different M than the cold run.
-    if (single_boundary && ((pos0 + n) % kBlockSize) != 0) {
+    // A checkpoint is only useful up to the last block with a token after it:
+    // the prefill has to produce the final token's logits, so the last block
+    // (or the partial tail) is always replayed.  The old rule only captured a
+    // state when the batch happened to END on a block boundary, which made the
+    // cache miss almost every real prompt: a single 633-token batch captured
+    // nothing, and a 1024+309 split captured only 1024.  Capture the deepest
+    // complete block the batch actually finishes instead, whether or not the
+    // batch ends there.  qwen4exp keeps the old end-aligned rule: its chunker
+    // contract says only a cold chunk boundary is an exact resume point.
+    int cap_b = last;
+    if (single_boundary) {
+        if (hc_fwd()) {
+            // qwen4exp's own chunker only resumes exactly at a cold chunk
+            // boundary, so it keeps the old "the batch must end on a block
+            // boundary" rule; its final partial chunk captures nothing.
+            if ((pos0 + n) % kBlockSize != 0) {
+                return;
+            }
+        } else if (pos0 + n >= (int)toks.size()) {
+            cap_b = ((int)toks.size() - 1) / kBlockSize; // leave the final token
+        }
+    }
+    if (cap_b <= first) {
         return;
     }
     if ((int)ps.registered > first) {
@@ -1193,9 +1244,12 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     std::vector<cand> need;
     need.reserve(std::min(last - first, cap));
     for (int b = first + 1; b <= last; b++) {
-        const int32_t * tk = toks.data() + (size_t)tok_off + (size_t)(b - 1 - first) * kBlockSize;
+        // Block b-1 starts at absolute token (b-1)*kBlockSize.  `toks` is the
+        // whole prompt and pos0 is block aligned here, so this is the same
+        // address as `tok_off + (b-1-first)*kBlockSize` for every caller.
+        const int32_t * tk = toks.data() + (size_t)(b - 1) * kBlockSize;
         chain = pc_hash_block(chain, tk);
-        if (single_boundary && b != last) {
+        if (single_boundary && b != cap_b) {
             continue;
         }
         const int ni = pc_find(chain, tk);

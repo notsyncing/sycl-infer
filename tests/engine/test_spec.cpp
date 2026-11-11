@@ -461,10 +461,12 @@ int main(int argc, char ** argv) {
                     check(ok0 && ok1 && argmax(mcold) >= 0 && argmax(mcold) == argmax(mwarm),
                           "main-only 100-token mode-2 equals cold");
                     // A single 100-token mode-2 batch has no intermediate split
-                    // prefix (prefixes are 0,100), so admit correctly misses
-                    // rather than restoring a boundary captured under a
-                    // different M. No hit is expected here; the 545 pair below
-                    // is the one that must hit at 512.
+                    // prefix (prefixes are 0,100).  This test runs on a
+                    // multi-partition layer map, which keeps the exact
+                    // aligned-only rule, so admit misses rather than restoring a
+                    // boundary captured under a different M.  A one-partition
+                    // run falls back to the deepest complete block (96) and is
+                    // covered by the 35B A3B record in design 06.
                 }
                 // Cross a whole 512-token prefill batch, then reuse its cached
                 // prefix.  One token avoids conflating with long-stream drift.

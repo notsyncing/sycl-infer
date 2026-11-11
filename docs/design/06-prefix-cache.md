@@ -162,14 +162,26 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 8. `pcr->touch` / `pcd->touch` 记一次命中，设 `pc_slot_[slot].chain = hashes[deep-1]`、
    `registered = deep`，更新统计，返回 `deep * kBlockSize`。
 
-> 只认分批前缀：`deep` 还要收敛到“从零算起的分批前缀”。batched GEMM 的激活 scales
+> **优先取分批前缀，没有对齐的就回退到最深有状态边界。** batched GEMM 的激活 scales
 > 随 M 变，混着“新整块+零散尾巴”的一批（如 33-token 的 512..544）与其前 32 行同 token
 > 的纯 32 批算出不同的 qkv，经 GDN 递推放大到检查点可测分叉（0.8B 双卡 depth=17：
 > sum 1231.91 vs 1237.31），恢复+不同 M 尾巴再放大到 logit 换 argmax（27B 双卡 25.8）。
-> `pc_admit` 重算与 `prefill_text` 相同的 cold splits（只依赖 prompt 长度），在有状态的
-> 边界里取最深且落在前缀上的（如 545 取 512 而非 544），暖重做与 cold 完全相同的后缀批。
-> 100-token 单批没有中间前缀时按设计 miss（宁可重算，不做错恢复）；`test_spec
-> TEST_SPEC_LONG`（545-token，cold/warm/plain 三方 max|diff|=0）是常设覆盖。
+> 所以 `pc_admit` 先重算与 `prefill_text` 相同的 cold splits（只依赖 prompt 长度），在有状态
+> 的边界里取最深且落在前缀上的（如 545 取 512 而非 544），暖重做与 cold 完全相同的后缀批。
+>
+> **但这个对齐条件不能是硬门槛。** `prefill_text` 按等分分批，batch 很少正好结束在 32-token
+> 块上；单批 prompt 更没有任何中间分批前缀。硬门槛使前缀缓存对绝大多数请求完全失效
+> （实测 633-token 单批、1333-token 的 667/666 等分都一个 checkpoint 都不留，端点
+> `cached_tokens` 恒为 0）。因此没有对齐边界时回退到 Pass 1 的最深有状态边界；恢复的
+> KV/递归状态字节完全相同，只有重放后缀的 M 与 cold 不同。
+>
+> **回退只在单分区运行上启用**（无 `--layer-map`，或只有一个 GPU/CPU 分区：
+> `multi_dev && dev_queues_.size() > 1` 为 false）。上面的 25.8 logit 换 argmax 是在
+> 2 卡 layer map 上测的，所以多分区保持“只认对齐边界”的位精确规则；35B A3B 的单卡
+> 部署（`--layer-map 0-39:gpu.0`，`multi_dev=true` 但只有一个 backend）走回退。
+> 35B A3B 上实测 118/223/430/847/1422-token prompt 的 cold/warm `reasoning+content`
+> 完全相同（见 §7 的实测记录）；0.8B/27B 的 `test_spec TEST_SPEC_LONG`（545-token，
+> cold/warm/plain 三方 max|diff|=0）继续覆盖多分区的精确规则。
 
 `PF_PC_DEBUG`（与 `SCHED_DEBUG` 一样是“环境变量存在即开”，不看值）会逐块打印
 `[pcdbg] admit L=.. blk=.. h=.. vram=.. ram=.. disk=..`（`:653-656`）与
@@ -183,9 +195,23 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 * 目标 `step_info` 是 `pf_info_ ? pf_info_ : d_info`（`:787`）——多设备流水线里每个 chunk 有自己的
   `step_info`，快照表必须写进本次 chunk 用的那一份。
 * 释放上一 forward 未提交的预留，清 `pc_pending_`，`pc_active=0`。
-* 前置条件：缓存开、slot 有效、`tracking`、`n>0`、`pos0>=0`、`pos0%32==0`，且**连续性**
-  `registered*32 == pos0`（链式哈希只能从连续链推导）；`last >= kPcMapLen` 也整体放弃。
-* 计算 `first/last` 边界，清零 `pc_row_slot[b]`（`first+1 .. last`）。
+* 前置条件：缓存开、slot 有效、`tracking`、`n>0`、`pos0>=0`、`pos0%32==0`（见下），且
+  `registered <= first`（链式哈希只能从连续链推导；`toks` 是完整 prompt，所以中间的块
+  哈希仍可从 token 重建）；`last >= kPcMapLen` 也整体放弃。
+  **`pos0` 必须对齐是快照机制的要求，不是数学要求**：fused GDN 和
+  `conv_state_update_launch` 只在 *row* 结束写 conv 窗口，而 row 是 `kMaxT == kBlockSize`
+  个 token，所以只有 `pos0%32==0` 时 32-token 块边界才是 row 结束。等分 `prefill_text`
+  可能产生 667 起始的第二批；那种批次不捕获（否则会存一个没有 conv 窗口的 GDN 状态）。
+  服务端的 chunked prefill 和 MTP 都传 1024/32 的倍数，保持对齐。
+* 计算 `first = pos0/32` 和本 forward 完成的最后边界 `last = (pos0+n)/32`，清零
+  `pc_row_slot[b]`（`first+1 .. last`）。
+* **捕获边界是 `cap_b = last`，不再要求 batch 正好在块边界结束。** 若这批是 prompt 的最后
+  一批（`pos0+n >= toks.size()`），取 `cap_b = (L-1)/32`，把最后一个 token 留给真实 forward
+  （采样需要它的 logits）。旧实现要求 `(pos0+n)%32==0`，于是 633-token 单批一个检查点都不
+  留、1024+309 只留 1024；现在只要 batch 里完成了一个完整块就留最深的那个。conv 在
+  `cap_b*32` 结束的那个 row 上写窗口（`pc_row_slot[cap_b] >= 0` 时 `last_row_only` 也处理
+  非末行），所以两个状态是配套的。**qwen4exp 例外**：它只在自己的 cold chunk 边界恢复，
+  `hc_fwd()` 时保留旧的“批次必须结束在 32 块上”规则，最后的不完整 chunk 不捕获。
 * 从 `ps.chain` 向前走，收集**缺节点或缺状态**的边界到 `need`。
 * 取 `nsel = min(nneed, pc_max_states)` 个槽。选的是**最深**的 `nsel` 个（`k` 从 `nneed-nsel` 到
   `nneed`），因为后续请求从最深匹配边界恢复；分配时仍**浅→深**迭代，于是最深的槽最新
@@ -341,6 +367,13 @@ RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关�
 服务端把每序列的命中数 `sequence::reused` 作为 OpenAI `usage.prompt_tokens_details.cached_tokens`
 以及 `usage.prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` 返回（详见
 [09-server.md](09-server.md) §2.6/§8.2）。多模态路径绕过前缀缓存，故 `cached_tokens` 恒为 0。
+
+**实测（35B A3B，单卡 Arc 140V，Release JIT，`--ctx 2048 --kv-type i8`，
+`--pc-vram-mb 256` + 512 MB RAM + 512 MB disk，greedy）**：修复前，重复的
+118/223/430/847/1422-token prompt 的 `cached_tokens` 全为 0；修复后分别为
+96/192/416/832/1024（最后一个是 1024 分批前缀优先于 1408 的未对齐回退），
+cold/warm 的 `reasoning_content+content` 逐字节相同。共享 192-token 前缀、
+后缀不同的四个请求：第一个 0，之后三个都命中 192。
 
 ## 8. 不变量：`sync_all()` 必须在 CPU 后端上真的等待
 
