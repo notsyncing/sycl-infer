@@ -79,7 +79,7 @@ void cpu_conv_state_update(const float * qkv_raw, float * conv_state, const cpu_
         }
         const int n = nreal_arg > 0 ? nreal_arg : info->n_real;
         const int end_tok = info->pos[rr] + n;
-        const int cap = (info->pc_active && end_tok % kCpuBlk == 0) ? info->pc_row_slot[end_tok / kCpuBlk] : -1;
+        const int cap = (info->pc_active && end_tok % kCpuBlk == 0) ? info->pc_row_slot[(end_tok / kCpuBlk) % kCpuPcMapLen] : -1;
         const bool is_last = (rr == info->n_rows - 1);
         if (last_row_only && !is_last && cap < 0) {
             continue;

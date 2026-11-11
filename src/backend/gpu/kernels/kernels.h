@@ -22,9 +22,15 @@ constexpr int kMaxSplits = 64; // partial-buffer capacity (prefill K-split)
 // buffers are sized from the runtime dec_splits, not from this constant.
 // Measured optima: 27B (n_head 24, 512 EUs) 160, 0.8B (n_head 8) ~416-480.
 constexpr int kMaxDecSplits = 512;
-// prefix-cache snapshot map length: boundaries are indexed by complete blocks,
-// so this covers max_seq <= kPcMapLen*32 tokens (32768 with 1024)
+// Prefix-cache snapshot map length.  Block boundaries are indexed *modulo*
+// this ring, not by their absolute prompt position: a forward covers at most
+// kMaxB*kMaxT tokens, i.e. kMaxB*kMaxT/kBlockSize boundaries, so there is no
+// aliasing inside one forward however deep the prompt is.  The MTP verify also
+// indexes it per token (0 .. kMaxB*kMaxT-1), which is why it must stay at least
+// kMaxB*kMaxT.
 constexpr int kPcMapLen = 1024;
+static_assert(kMaxB * kMaxT <= kPcMapLen, "MTP per-token snapshots index 0..kMaxB*kMaxT-1");
+static_assert(kMaxB * kMaxT / kBlockSize < kPcMapLen, "a forward's boundary span must fit the ring");
 // max merged vision tokens one image may contribute to a prompt (bounds the
 // engine's image-embedding buffer and the vision scratch buffers)
 // MinerU's layout page is 1036x1036 = 37x37 merged tokens (1369), so the old
@@ -90,9 +96,12 @@ struct step_info {
     // ---- prefix-cache state snapshots (PF_PREFIX_CACHE) -------------------
     // A tracked prefill writes the conv/GDN state at every completed 32-token
     // block boundary into the checkpoint pool: `pc_active` is 1 only during
-    // the forward of that prefill, `pc_row_slot[b]` names the checkpoint slot
-    // for boundary b (= b complete blocks, i.e. after token b*32) or -1.
-    // Both are read inside the kernels, so they survive graph replay.
+    // the forward of that prefill, and `pc_row_slot[b % kPcMapLen]` names the
+    // checkpoint slot for absolute boundary b (= b complete blocks, i.e. after
+    // token b*32) or -1.  The map is a ring, so a prompt deeper than
+    // kPcMapLen*32 still captures: one forward spans at most
+    // kMaxB*kMaxT/kBlockSize boundaries.  Both fields are read inside the
+    // kernels, so they survive graph replay.
     int32_t pc_active;
     int32_t pc_stride;              // floats per checkpoint slot
     float * pc_base;                // checkpoint pool (device USM)

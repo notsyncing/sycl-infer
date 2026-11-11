@@ -121,7 +121,7 @@ static void gdn_kernel(queue & q, const float * conv_out, const float * alpha, c
                 // MTP spec verify (info->mtp_dt): snapshot after EVERY token so
                 // the recurrence can be rolled back to the accepted draft length.
                 if (pc_on && (info->mtp_dt || (pbase + t + 1) % kBlockSize == 0)) {
-                    const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kBlockSize];
+                    const int stt = info->pc_row_slot[(info->mtp_dt ? t : (pbase + t + 1) / kBlockSize) % kPcMapLen];
                     if (stt >= 0) {
                         float * dst = snap.base + (size_t)stt * snap.stride + snap.layer_off
                                       + ((size_t)head * head_dim + col0) * head_dim;
@@ -226,7 +226,7 @@ static void gdn_f4_kernel(queue & q, const float * conv_out, const float * alpha
                 // prefix cache: this token completes a 32-token block -> snapshot
                 // (see the scalar kernel: info->mtp_dt snapshots every token)
                 if (pc_on && (info->mtp_dt || (pbase + t + 1) % kBlockSize == 0)) {
-                    const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kBlockSize];
+                    const int stt = info->pc_row_slot[(info->mtp_dt ? t : (pbase + t + 1) / kBlockSize) % kPcMapLen];
                     if (stt >= 0) {
                         float * dst = snap.base + (size_t)stt * snap.stride + snap.layer_off
                                       + ((size_t)head * head_dim + col0) * head_dim;
@@ -381,7 +381,7 @@ static void gdn_head_kernel(queue & q, const float * qkv_raw, float * conv_state
                     }
                 }
                 if (pc_on && (info->mtp_dt || (pbase + t + 1) % kBlockSize == 0)) {
-                    const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kBlockSize];
+                    const int stt = info->pc_row_slot[(info->mtp_dt ? t : (pbase + t + 1) / kBlockSize) % kPcMapLen];
                     if (stt >= 0) {
                         float * dst = snap.base + (size_t)stt * snap.stride + snap.layer_off
                                       + ((size_t)head * head_dim + col0) * head_dim;
@@ -431,7 +431,7 @@ static void gdn_head_kernel(queue & q, const float * qkv_raw, float * conv_state
                 const int is_last = nreal_arg > 0 ? 1 : (rr == info->n_rows - 1);
                 float * cstate = conv_state + (size_t)info->slot[rr] * 3 * conv_dim;
                 const int end_tok = info->pos[rr] + n;
-                const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[end_tok / kBlockSize] : -1;
+                const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[(end_tok / kBlockSize) % kPcMapLen] : -1;
                 const bool wr = (!last_row_only || is_last) && !info->mtp_dry;
                 float * snapdst = cap >= 0 ? snap.base + (size_t)cap * snap.stride + snap.layer_off + snap.gdn_per
                                            : nullptr;
@@ -558,7 +558,7 @@ void gdn_conv_launch(queue & q, const float * qkv_raw, float * conv_state, const
             if (update_state && !cross_row && n_real == 1) {
                 // the only token of this row: shift the window in place
                 const int end_tok = info->pos[rr] + 1;
-                const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[end_tok / kBlockSize] : -1;
+                const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[(end_tok / kBlockSize) % kPcMapLen] : -1;
                 float * cstate = conv_state + (size_t)info->slot[rr] * 3 * conv_dim;
                 float * snapdst = cap >= 0 ? snap.base + (size_t)cap * snap.stride + snap.layer_off + snap.gdn_per
                                            : nullptr;

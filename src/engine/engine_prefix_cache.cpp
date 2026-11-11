@@ -1193,7 +1193,10 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
     // intermediate hashes can be recomputed from the block tokens.
     const int first = pos0 / kBlockSize;
     const int last = (pos0 + n) / kBlockSize; // final complete-block boundary
-    if (last <= first || last >= kPcMapLen) {
+    // `pc_row_slot` is a ring over block boundaries (the kernels index it
+    // modulo kPcMapLen), so `last` may be any depth.  Only the forward's own
+    // span has to fit the ring: it covers at most kMaxB*kMaxT tokens.
+    if (last <= first || last - first >= kPcMapLen) {
         return;
     }
     // A checkpoint is only useful up to the last block with a token after it:
@@ -1232,7 +1235,7 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
         chain = pc_hash_block(chain, toks.data() + (size_t)i * kBlockSize);
     }
     for (int b = first + 1; b <= last; b++) {
-        inf->pc_row_slot[b] = -1;
+        inf->pc_row_slot[b % kPcMapLen] = -1;
     }
 
     // find the boundaries whose node cannot be resumed yet
@@ -1275,7 +1278,7 @@ void engine::pc_capture_begin(int slot, const std::vector<int> & toks, int tok_o
             q4_pc_clear(st);
         }
         pc_state_stamp[st] = ++pc_clock;
-        inf->pc_row_slot[need[k].b] = st;
+        inf->pc_row_slot[need[k].b % kPcMapLen] = st;
         pc_pending_.push_back({need[k].h, st});
     }
     if (pc_pending_.empty()) {

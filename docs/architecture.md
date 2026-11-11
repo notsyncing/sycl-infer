@@ -448,7 +448,7 @@ static——两个 `--layer-map` 设备各有自己的队列，共用一份 scra
 | `kI8Q` | 32 | int8/int4 KV 每多少 head dim 一个 scale |
 | `kMaxSplits` | 64 | prefill attention K-split 容量 |
 | `kMaxDecSplits` | 512 | decode K-split 容量（**硬上限**，实际值按 EU 数推导，见下） |
-| `kPcMapLen` | 1024 | 前缀缓存检查点边界映射长度（覆盖 32768 token） |
+| `kPcMapLen` | 1024 | 前缀缓存检查点边界映射的环大小（按绝对块边界取模，无上下文深度上限；MTP 逐 token 需要 >= `kMaxB*kMaxT`） |
 | `kMaxImgTokens` | 1024 | 单图最大合并视觉 token 数 |
 | `kMaxImgPatches` | 4096 | 单图最大 ViT patch token 数（= 4 × 合并 token） |
 

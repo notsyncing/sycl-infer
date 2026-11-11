@@ -625,7 +625,7 @@ void engine::qsa_apply_update(int a, const layer_t & L, int n_tok, const int * p
         // completed 32-token block (the boundary's checkpoint slot is in the
         // forward's step_info).
         if (pcinf && pcinf->pc_active && (pos + 1) % kBlockSize == 0) {
-            const int st = pcinf->pc_row_slot[(pos + 1) / kBlockSize];
+            const int st = pcinf->pc_row_slot[((pos + 1) / kBlockSize) % kPcMapLen];
             if (st >= 0) {
                 q4_pc_qsa_store(st, a, sp->pool.data(), sp->n_pool, sp->ring.data());
             }

@@ -32,6 +32,12 @@ inline int cpu_kv_elem_bytes(cpu_kv_dtype t) {
 constexpr int kCpuI8Q = 32;
 
 // mirror of step_info; only the fields the CPU kernels read are carried over
+// Ring size of the prefix-cache boundary map.  Mirrors kPcMapLen in
+// kernels.h (the CPU tree must stay SYCL-free, so it cannot include that
+// header); the kernels index it modulo this value, and MTP's per-token
+// snapshots need at least kMaxB*kMaxT == 1024 entries.
+constexpr int kCpuPcMapLen = 1024;
+
 struct cpu_step_info {
     int32_t n_rows;
     int32_t n_real;
@@ -47,7 +53,7 @@ struct cpu_step_info {
     int32_t pc_active;
     int32_t pc_stride;
     float * pc_base;
-    int32_t pc_row_slot[1024];
+    int32_t pc_row_slot[kCpuPcMapLen];
     int32_t mrope_on;
     int32_t mrope_sections[4];
     int32_t mrope_interleaved;

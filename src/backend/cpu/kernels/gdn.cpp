@@ -72,7 +72,7 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
             }
             // prefix cache: this token completes a 32-token block -> snapshot
             if (pc_on && (info->mtp_dt || (pbase + t + 1) % kCpuBlk == 0)) {
-                const int stt = info->pc_row_slot[info->mtp_dt ? t : (pbase + t + 1) / kCpuBlk];
+                const int stt = info->pc_row_slot[(info->mtp_dt ? t : (pbase + t + 1) / kCpuBlk) % kCpuPcMapLen];
                 if (stt >= 0) {
                     const int64_t at = (int64_t)stt * snap.stride + snap.layer_off
                                        + (int64_t)head * head_dim * head_dim;

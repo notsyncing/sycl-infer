@@ -89,7 +89,7 @@ void conv_state_update_launch(queue & q, const float * qkv_raw, float * conv_sta
         const int n = row_nr(info, rr); // mode 2 may have a partial last row
         // prefix cache: this row ends a 32-token block -> checkpoint it
         const int end_tok = info->pos[rr] + n;
-        const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[end_tok / kBlockSize] : -1;
+        const int cap = (info->pc_active && end_tok % kBlockSize == 0) ? info->pc_row_slot[(end_tok / kBlockSize) % kPcMapLen] : -1;
         const bool is_last = (rr == info->n_rows - 1);
         if (last_row_only && !is_last && cap < 0) {
             return;

@@ -126,8 +126,10 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 `layer_off = gi * (gdn_per + conv_per)`，`gi` 是**全局** GDN 层号）。conv/GDN kernel 在 token 完成一个
 32 块边界时，通过 `step_info::pc_row_slot` 查目标槽并写入：GDN 在 token 索引 `(pbase + t + 1) % 32 == 0`
 处写（`gpu/kernels/gdn.cpp:122-135`），conv 在整行结束时若 `end_tok % 32 == 0` 写（`gpu/kernels/conv.cpp:92`）。
-`pc_row_slot` 是 host USM 的 `step_info` 字段，`kPcMapLen = 1024`（`kernels.h:27`），因此捕获只覆盖
-`max_seq <= 32768` 的边界索引。
+`pc_row_slot` 是 host USM 的 `step_info` 字段，`kPcMapLen = 1024`（`kernels.h:27`）。它是**按绝对
+块边界取模的环**：一个 forward 最多覆盖 `kMaxB*kMaxT/kBlockSize = 32` 个边界，所以任意深度的
+prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实现用绝对下标，`last >= kPcMapLen`
+就整体放弃）。MTP 的逐 token 快照仍用 `0..kMaxB*kMaxT-1` 的下标，`kPcMapLen` 因此必须 >= 1024。
 
 > **同一个机制的第二种用法**：MTP 的 dry verify 需要把递归状态回滚到被接受的 draft 长度，于是
 > `step_info::mtp_dt` 打开时改为**每个 token** 都快照，索引从 `pc_row_slot[t]` 取，目标是
@@ -197,7 +199,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
 * 释放上一 forward 未提交的预留，清 `pc_pending_`，`pc_active=0`。
 * 前置条件：缓存开、slot 有效、`tracking`、`n>0`、`pos0>=0`、`pos0%32==0`（见下），且
   `registered <= first`（链式哈希只能从连续链推导；`toks` 是完整 prompt，所以中间的块
-  哈希仍可从 token 重建）；`last >= kPcMapLen` 也整体放弃。
+  哈希仍可从 token 重建）；环只要求 `last - first < kPcMapLen`，不再限制绝对深度。
   **`pos0` 必须对齐是快照机制的要求，不是数学要求**：fused GDN 和
   `conv_state_update_launch` 只在 *row* 结束写 conv 窗口，而 row 是 `kMaxT == kBlockSize`
   个 token，所以只有 `pos0%32==0` 时 32-token 块边界才是 row 结束。等分 `prefill_text`
@@ -373,7 +375,9 @@ RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关�
 118/223/430/847/1422-token prompt 的 `cached_tokens` 全为 0；修复后分别为
 96/192/416/832/1024（最后一个是 1024 分批前缀优先于 1408 的未对齐回退），
 cold/warm 的 `reasoning_content+content` 逐字节相同。共享 192-token 前缀、
-后缀不同的四个请求：第一个 0，之后三个都命中 192。
+后缀不同的四个请求：第一个 0，之后三个都命中 192。环状边界映射另测了一个
+40,010-token prompt：第一次 `cached_tokens=0`（85.2 s），第二次命中
+**39,936**（0.9 s），输出相同；旧的绝对下标实现在约 31.7k 处就停止捕获。
 
 ## 8. 不变量：`sync_all()` 必须在 CPU 后端上真的等待
 

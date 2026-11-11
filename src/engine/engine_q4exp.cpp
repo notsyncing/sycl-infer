@@ -1257,7 +1257,7 @@ void engine::q4_pc_ple_store(const step_info & info, int slot, int base_pos, int
     // Boundaries completed by this chunk: positions base_pos+kBlockSize ..
     // base_pos+n_tok (inclusive), all multiples of kBlockSize.
     for (int p = base_pos + kBlockSize; p <= base_pos + n_tok; p += kBlockSize) {
-        const int st = info.pc_row_slot[p / kBlockSize];
+        const int st = info.pc_row_slot[(p / kBlockSize) % kPcMapLen];
         if (st < 0 || (size_t)st >= q4_pc_ple_.size()) {
             continue;
         }

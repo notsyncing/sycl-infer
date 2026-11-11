@@ -5186,9 +5186,13 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   so an unaligned batch has no conv window at a block boundary.  `pc_admit`
   prefers a cold-split prefix, but on a single-partition run falls back to the
   deepest state (multi-partition keeps the aligned-only rule - the 27B/2-card
-  M-sensitivity is 25.8 logits).  Measured on the 35B A3B / Arc 140V: 118/223/
-  430/847/1422-token prompts go 0 -> 96/192/416/832/1024 cached tokens with
-  cold/warm `reasoning+content` identical; 633 tokens goes 0 -> 608.
+  M-sensitivity is 25.8 logits).  `kPcMapLen` is a **ring** indexed by
+  `absolute_boundary % kPcMapLen`, not a depth cap: one forward spans at most
+  `kMaxB*kMaxT/kBlockSize` boundaries, so any prompt depth is safe (the old
+  absolute index stopped capturing above ~31.7k tokens).  Measured on the
+  35B A3B / Arc 140V: 118/223/430/847/1422-token prompts go 0 -> 96/192/416/
+  832/1024 cached tokens with cold/warm `reasoning+content` identical; 633
+  tokens goes 0 -> 608, and a 40,010-token prompt goes 0 -> 39,936.
 
 * **YaRN's two blends are written to be exact at their anchors, and that is not
   cosmetic.**  `yarn_build` combines three sequences (`interp`, `extrap`, and a
