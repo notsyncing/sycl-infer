@@ -152,9 +152,11 @@ not exact on this device/JIT; fp4 powers of two are built from float bits.
 The GPU engine path is `engine_ds41_gpu.cpp`: dense weights are uploaded per
 tensor and split 0-19/20-39 (5.74 GiB), the routed experts live in a ds41-owned
 LRU bank backed by the mmap, and `--device gpu` is selected with a layer map;
-`PF_DS41_GPU=0` keeps the host forward.  The ds41 GPU path deliberately skips
-the oneDNN int8 partition and the native u4/k5 stores (it reads raw GGUF
-types), which saves ~1.6 GiB/card.
+`PF_DS41_GPU=0` keeps the host forward.  The ds41 GPU path still skips the
+generic seg_plan oneDNN partition (`setup_md_dnnl` declines for it), but since
+2026-11-11 the *dense* linears use their own per-device `dnnl_gemm` stores -
+k5 for Q5_K - see **Dense oneDNN stores** below.  Q8_0, BF16 and the routed
+experts stay on the raw path.
 
 ### Performance pass (2026-11-07)
 
@@ -198,11 +200,83 @@ per expert.  Collapsing a miss's three plane copies into one padded slot is
 neutral (measured, reverted).  Text-only 18000 MB is the recommended budget
 (16000 keeps room for the vision tower).  The `nohead`
 ablation's 60 ms was a workload change (stale logits stop routing from moving
-and cut 6.7 GB of misses), not the head (4.1 ms at 110 GB/s).  The dense Q5_K
-decode GEMV at 110 GB/s is the largest remaining item: the native u4 store
-runs at 223-294 GB/s and is *smaller* (0.625 vs 0.6875 B/w) but lossy (4.6 %
-weight error), so it is an accuracy decision; a staging prefetch would recover
-~20-30 ms.  Bank hit saturates at ~60 % (R 20-24 vs 384 experts).
+and cut 6.7 GB of misses), not the head (4.1 ms at 110 GB/s).  The dense Q5_K decode GEMV ran at 110 GB/s and was the largest remaining item;
+it now uses the native k5 store (**Dense oneDNN stores** below), which took
+decode to 124 ms/token and prefill to 133.  Bank hit saturates at ~60 %
+(R 20-24 vs 384 experts).
+
+### Dense oneDNN stores (2026-11-11)
+
+The walk is per-token M=1, so the generic seg_plan stores never applied to it
+and every dense GEMV read the raw GGUF type through
+`gemv_dec_vec_kernel<13>` at 110 GB/s.  `setup_ds41_dense_store()`
+(`engine.cpp`, called from `setup_multi_device` before the upload) now creates
+a **decode-only** `dnnl_gemm(q, 2, 8192)` per GPU partition and registers:
+
+* **k5** (`add_weight_k5`, exact native Q5_K values, 0.75 B/w) for `wq_b`,
+  `wo_a` (one store per group - see the invariant), `wo_b`, the shared
+  `ffn_gate/up/down`, `engram_kv` and the untied LM head;
+* **int8** (`add_weight`) for Q8_0 (`wq_a`, `wkv`) behind `PF_DS41_DENSE_Q8=1`;
+  it measured neutral (124.3 vs 125.0 ms/token) and is off by default.
+
+`gemv1` (`engine_ds41_gpu.cpp`) takes `wkey(dev, t.data)` - the device pointer
+for an uploaded tensor, the host pointer (the store's key) for a converted one
+- and, when the store exists, runs `quantize()` + `gemm()` instead of
+`gemv_group_launch`.  A converted tensor skips its raw device upload via the
+existing oneDNN skip rule, now also gated on `ds41_dense_store_`.
+
+**Why the stores are decode-only.** `dnnl_gemm`'s prefill scratch is
+`cap_M=1024, cap_K=32768` (360 MB/card) and `add_weight_k5` allocates a `K*N`
+int8 expansion scratch for the M>1 path - 662 MB for the head alone.  With
+`cap_m=2` the row scratch is ~1 MB, and `impl::decode_only` makes `add_weight_k5`
+skip the expansion allocation (gemm()'s M>1 branches then decline).  The whole
+store set costs +1.2 GB across both cards (+9% over raw Q5_K), and the bank
+slots are unchanged.
+
+Measured (2x A770, JIT `build-ds41-jit`, ctx 512, `--moe-vram-mb 18000`,
+greedy, interleaved 3 reps, 80-token prompt + 64 **fixed** ids so both arms
+compute the same tokens):
+
+| cell | raw (`PF_DS41_DENSE_STORE=0`) | k5 store | delta |
+|---|---:|---:|---:|
+| decode, ctx 512 (ms/token) | 171.9 | **124.3** | -27.7% |
+| prefill, 320-token prompt (ms/token) | 180.3 | **133.2** | -26.1% |
+| decode, 3.6k depth (ms/token, 1 rep) | 208.0 | **186.2** | -10.5% |
+| k5 + Q8_0 int8, decode ctx 512 | - | 125.0 | Q8 neutral |
+| phase split, prefill 320 (`PF_DS41_TIME=2`) | attn 87.1 + MoE 87.8 | attn **49.9** + MoE 85.6 | dense -37 |
+| phase split, decode (steady) | attn 84.5 + MoE 103.3 | attn **50.1** + MoE 97.7 | - |
+
+Startup pays for the pack: engine ctor **5.0 -> 16.2 s** (5.9 GB of k5 packing,
+single-threaded; the raw upload drops from 5.9 GB to 1.2 GB), and the CLI
+reference cell's wall goes 9.0 -> 20.3 s.  `PF_DS41_DENSE_STORE=0` reproduces
+the pre-change stream exactly (same md5).
+
+**Exactness.** The k5 *weights* are exact, but `gemm()`'s M=1 branch requires
+the per-32-group int8 activation form, so the dot is `quantize(x)` x native
+Q5_K, not the raw path's fp32 activation.  Worst per-row relative error against
+the exact fp32 dot: wq_b 1.1e-3, wo_a 5.5e-4, wo_b 3.9e-4, ffn_gate 4.7e-4,
+ffn_down 8.8e-4, head 4.9e-4, engram 4.5e-4.  The reference cell's 32-token
+greedy text is identical (` Paris.` in 3x3 paired runs and 4 earlier), and
+`The Eiffel Tower is located in` / `def fibonacci(n):` are identical too, but a
+forced 64-id stream diverges at a documented near-tie: the first 9 ids match,
+then step 9 has token 455 vs EOS within **0.079** (raw) / **0.308** (store) and
+the store chooses EOS.  So the store is text-equivalent on natural prompts, not
+byte-identical on a forced stream; use `PF_DS41_DENSE_STORE=0` when exactness
+is the requirement.  `PF_DS41_DENSE_ONLY=<wq_b|wo_a|wo_b|ffn|engram|head>` is the
+bisection knob.
+
+**Phase 2 (batched dense prefill) is not reachable from this walk.** The
+per-token projections are ~24 ms of the 133 ms prefill (5.9 GB at 249 GB/s);
+the MoE is 86 (57%) and the MLA core ~25.  Batching the dense projections
+requires a layer-major chunked forward: the projection output is consumed
+immediately by per-token state (the window ring at `pos`, the compressed-row
+append with its block-start RoPE, the indexer pool over the pre-norm keys, the
+lagged mHC pre-mix, the Engram history), so a chunked prefill is a second full
+forward implementation.  The k5 store also has no M>1 path without the
+expansion scratch (above), and a full-size instance does not fit at 18000 MB
+(536 MB unallocated on card 0).  The measured ceiling from the dense alone,
+even if it were free, is 133 -> ~108-115 ms/token (1.16-1.23x); a realistic
+GEMV saving is ~20 ms -> ~113 ms/token.
 
 **XMX / DPAS (2026-11-08 study).**  The A770 is Xe-HPG (DG2) and does have the
 unit; oneDNN 3.13.2 selects `jit:xe_hp:gemm:any` and reaches 41-44 T-MAC/s plain
@@ -238,6 +312,24 @@ and oneDNN's 266-280 GB/s M=1 path needs an int8 store).
 * **The chat transition is `<|Assistant|>` + `<think>` / `</think>`**; a bare
   assistant marker leaves chat-mode image prompts with an unclosed think block
   and the model answers EOS.
+* **A stacked weight's group store must be keyed *and packed* at the group
+  offset.**  `wo_a` is one `[8*1024, 4096]` tensor whose GEMV call is made per
+  group with a byte offset into it, so `setup_ds41_dense_store` registers eight
+  k5 stores at `base + g*out_rank*row_bytes`.  Passing the group key but packing
+  from the tensor base gave every group group 0's weights: the model stayed
+  fluent-looking but degenerated within a few tokens, and only the per-group A/B
+  (`PF_DS41_DENSE_ONLY=wo_a`) localized it.  Each of the six other store classes
+  alone was coherent.
+* **Anything that skips a raw upload must be resolved through `wkey`, not
+  `wptr`.**  A converted tensor has no `weight_maps_` entry, so `wptr` throws
+  ("weight tensor not uploaded to this device's partition") while `wkey`
+  returns the host pointer - which is the store's key.  All dense `gemv1` call
+  sites use `wk()` for exactly that reason; the expert bank pointers stay raw.
+* **The generic multi-device oneDNN branch must exclude ds41.**  The
+  `else if (multi_dev && !md_int8 && !md_xmx && ...)` block in the engine
+  constructor re-creates `dnnl_dev_` for every non-seg_plan model; without the
+  `!ds41_dense_store_` guard it replaced the decode-only instances and then
+  `wptr()`-ed the shared-expert tensors whose raw upload the store had skipped.
 * **`mm_prompt::n_rows` is the embedding-row count**, not `n_img`: an image
   contributes many rows.
 

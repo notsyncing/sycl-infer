@@ -370,6 +370,15 @@ struct engine {
     // path when oneDNN is unavailable for the device (PF_GEMM_DNNL=0)
     bool md_xmx = false;
     bool setup_md_dnnl();
+    // DeepSeek-V4.1-Flash's GPU forward has no seg_plan: every dense GEMV is a
+    // ds41 gemv1 call.  This builds the per-device oneDNN stores it resolves
+    // through dnnl_for(dev) - k5 for Q5_K (exact native values, 0.75 B/w) and,
+    // behind PF_DS41_DENSE_Q8, the ordinary int8 conversion for Q8_0.  A
+    // converted tensor then skips its raw device upload (see
+    // upload_device_weights) and wkey() returns the host pointer, which is the
+    // store's key - exactly what the forward passes to gemv1.
+    bool setup_ds41_dense_store();
+    bool ds41_dense_store_ = false;
     std::vector<std::unordered_map<const void *, w8t>> w8_dev_;
     std::vector<int> layer_dev_;                           // layer -> backend index
     std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)

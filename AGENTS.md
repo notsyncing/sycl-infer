@@ -3106,11 +3106,54 @@ Same-stream phase split (`PF_DS41_TIME=2` adds per-phase waits): 275 ms =
 The head is **not** the 60 ms the `nohead` ablation suggested: removing it
 leaves stale logits, the same token repeats and routing stops changing, cutting
 miss bytes by 6.7 GB - the ablation changed the workload.  The head is 4.1 ms
-at 110 GB/s.  **The remaining headroom is the dense Q5_K decode GEMV**: the
-attention's ~3.6 GB/token of projections run at 110 GB/s
-(`gemv_dec_vec_kernel<13>`) against the native u4 store's 223-294 GB/s; u4 is
-also smaller (0.625 vs 0.6875 B/w) but lossy (4.6 % weight error), so it is an
-accuracy decision, and prefetching the staging would recover another ~20-30 ms.
+raw at 110 GB/s (1.7 ms from the k5 store).  The dense Q5_K projections were
+the largest remaining item and are now stored natively - see **Dense oneDNN
+stores** below: decode 172 -> 124 ms/token, prefill 180 -> 133.
+**Dense oneDNN stores (2026-11-11): decode 172 -> 124 ms/token, prefill 180 ->
+133 ms/token, 5.9 GiB of Q5_K read natively at 249 GB/s instead of 110.**
+Every dense GEMV in the ds41 walk is one `gemv1` call; it resolves its weight
+through `wkey()` and, when that key is a registered store in the device's
+`dnnl_gemm`, runs `quantize()` + `gemm()` instead of the raw `gemv_group`.
+`setup_ds41_dense_store()` registers Q5_K (k5: exact native values, 0.75 B/w)
+for wq_b, **wo_a's 8 groups** (the GEMV is called per group at a byte offset, so
+each group is its own store keyed at that offset and packed *from* that offset),
+wo_b, the shared ffn gate/up/down, engram_kv and the untied head.  Q8_0
+(wq_a/wkv) is an opt-in int8 A/B (`PF_DS41_DENSE_Q8=1`) that measured
+**neutral** (124.3 vs 125.0 ms/token) and stays off.
+`PF_DS41_DENSE_STORE=0` restores the raw path and reproduces the old stream
+exactly; `PF_DS41_DENSE_ONLY=<tag>` registers one class for bisection.
+
+The `dnnl_gemm` instances are **decode-only** (`dnnl_gemm(q, 2, 8192)`): cap_M=2
+keeps the row scratch at ~1 MB and `decode_only` skips the k5/cb4 prefill
+expansion scratch (K*N int8: 662 MB for the head alone), so the stores cost
++1.2 GB in total rather than +6 GB.  A converted tensor **skips its raw upload**
+(the existing skip rule gained `|| ds41_dense_store_`); that is only safe
+because `gemv1` receives `wkey(dev, t.data)`, which is the host pointer - the
+store's key - for a skipped tensor and the device pointer otherwise.  The
+generic seg_plan branch that re-creates `dnnl_dev_` for every multi-device run
+is excluded for ds41, or it overwrites these instances and `wptr()`s the
+skipped tensors.
+
+Measured (2x A770, JIT `build-ds41-jit`, ctx 512, 18000 MB, greedy, interleaved
+3 reps, 80-token prompt + 64 **fixed** ids so both arms compute the same
+tokens): **decode 171.9 -> 124.3 ms/token (-27.7 %)**; 320-token prefill
+**180.3 -> 133.2 ms/token (-26.1 %)**; 3.6k depth 208.0 -> 186.2 (-10.5 %,
+one rep each).  Phase split (320-token prefill, `PF_DS41_TIME=2`): attention
+87.1 -> 49.9, MoE 87.8 -> 85.6.  Startup pays for the pack: engine ctor
+5.0 -> 16.2 s (5.9 GB of k5 packing, single-threaded) and the stores are +9 %
+bytes over raw Q5_K (+1.2 GB total, bank slots unchanged at 22/25).
+
+**The weights are exact; the activation is not.**  `gemm()`'s k5 M=1 path
+requires the per-32-group int8 activation form, so the result is
+`quantize(x)` x native-Q5_K, not the raw path's fp32 activation.  Probe against
+the exact fp32 dot (worst row, relative): wq_b 1.1e-3, wo_a 5.5e-4, wo_b
+3.9e-4, ffn_gate 4.7e-4, ffn_down 8.8e-4, head 4.9e-4, engram 4.5e-4.  The
+reference cell's 32-token greedy text is identical (` Paris.`, 3x3 paired runs
+and 4 earlier), but a forced stream diverges at a near-tie: the first 9 ids are
+equal, then step 9 has {455, EOS} within **0.079** raw / **0.308** store, and
+the store picks EOS.  So "byte-identical" holds at the text level on natural
+prompts, not as a forced-id guarantee; `PF_DS41_DENSE_STORE=0` is the exact arm.
+
 **Prefill (same build):** 320-token prompt 164.2 ms/token at 16000 MB and
 **156.4 (6.39 tok/s) at 18000 MB** (hit 88.0 -> 90.7 %); 80-token cell 180.5 /
 174.5.  Phase split (80-token, 16000): attention 68 + MoE 107 + other ~9; the

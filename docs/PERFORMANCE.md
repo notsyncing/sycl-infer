@@ -563,18 +563,44 @@ and the raw 5+2 cell 4.5 s AOT.  Contexts 512..262144 allocate at 16000 MB
 (1.4-1.7 GiB free per card; the unused generic paged-KV pool - 10.6 KB/token/
 card, 1.28 GB/card at 128k - is no longer allocated; text-only 19000 is the
 measured max).  Correctness on the same build: ` Paris.`, chat `2+2` -> `4`,
-image (640x320) -> `HELLO 123` with the vision tower.  Remaining headroom: the
-dense Q5_K decode GEMV runs at 110 GB/s (a native u4 store reaches 223-294
-GB/s but is lossy at 4.6 % weight error, an accuracy decision), a
-prefetch-staging pipeline would recover ~20-30 ms on decode, and prefill is
-bounded by ~40 serialized per-layer 9.2 MB H2Ds (84-91 % hit) plus the same
-110 GB/s dense stream; token batching of the MoE does not amortize because
-384 experts with top-6 leave ~1 pair per expert over a chunk.  The A770 does
-have XMX and the current oneDNN (3.13.2) uses it: `jit:xe_hp:gemm:any` measures
-41-44 T-MAC/s plain s8 / 22-30 grouped at M=512 here, so a *batched* prefill
-routed through it is the concrete next lever (est. 1.13-1.2x on the dense
-projections); the per-token M=1 walk cannot use it, and the MoE's IQ2 format
-blocks s8/u4 without tripling the bank footprint.
+image (640x320) -> `HELLO 123` with the vision tower.  Token batching of the MoE does not amortize
+because 384 experts with top-6 leave ~1 pair per expert over a chunk.  The A770
+does have XMX and the current oneDNN (3.13.2) uses it: `jit:xe_hp:gemm:any`
+measures 41-44 T-MAC/s plain s8 / 22-30 grouped at M=512 here; the per-token
+M=1 walk cannot use it for prefill without a chunked forward (see
+design/23-deepseek41.md's Phase 2 note), and the MoE's IQ2 format blocks s8/u4
+without tripling the bank footprint.
+
+**Dense oneDNN stores (2026-11-11).**  The dense Q5_K linears ran at 110 GB/s
+through the raw fp32-dequant GEMV (`gemv_dec_vec_kernel<13>`).  They now use
+the native k5 store (0.75 B/w, exact values, 249 GB/s at M=1) through a
+**decode-only** per-device `dnnl_gemm`; Q8_0 -> int8 is an opt-in A/B that
+measured neutral.  Conditions: 2x A770, JIT `build-ds41-jit`, ctx 512,
+`--layer-map 0-19:gpu.0,20-39:gpu.1 --moe-vram-mb 18000 --max-slots 1`, greedy,
+one process per cell, interleaved 3 reps; decode is the difference of two
+generation lengths over an 80-token prompt + 64 **fixed** ids (so both arms
+compute the same tokens; the sampled streams diverge at an EOS near-tie after
+9 tokens and would route different experts).
+
+| cell | raw (`PF_DS41_DENSE_STORE=0`) | k5 store | delta |
+|---|---:|---:|---:|
+| decode, ctx 512 (ms/token) | 171.9 | **124.3** | -27.7% |
+| prefill, 320-token prompt (ms/token) | 180.3 | **133.2** | -26.1% |
+| decode, 3.6k depth (ms/token, 1 rep each) | 208.0 | **186.2** | -10.5% |
+| k5 + Q8_0 int8, decode ctx 512 | - | 125.0 | Q8 neutral |
+| engine ctor (startup) | 5.0 s | 16.2 s | k5 packing |
+| CLI reference cell, wall | 9.0 s | 20.3 s | incl. startup |
+| dense-store VRAM | - | +1.2 GB total | bank slots unchanged |
+
+Per-phase (`PF_DS41_TIME=2`; waits inflate the absolute): the 320-token prefill
+is attention 87.1 + MoE 87.8 raw vs attention **49.9** + MoE 85.6 with the
+store; the steady decode is attention 84.5 + MoE 103.3 vs attention **50.1** +
+MoE 97.7.  Exactness: the k5 weights are exact, but `gemm()`'s M=1 branch
+quantizes the activation per 32 values, so the dot is not the fp32 one - the
+reference cell's 32-token text is identical (` Paris.`) and two of three other
+natural prompts are identical, while a forced stream flips at a 0.08-logit
+near-tie (455 vs EOS) after 9 tokens.  `PF_DS41_DENSE_STORE=0` is the exact
+arm.
 Hot-set calibration (`PF_DS41_CAL=1`) remains opt-in (a net loss for short
 generations).
 

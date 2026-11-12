@@ -71,7 +71,14 @@ struct act_view {
 };
 
 struct dnnl_gemm {
-    explicit dnnl_gemm(sycl::queue & q);
+    // `cap_m` / `cap_k` <= 0 keep the prefill-capacity scratch (kMaxB*kMaxT
+    // rows, kActMaxK) that the seg_plan prefill and the MTP verify need.  A
+    // smaller pair is a decode-only instance: its row scratch covers just the
+    // rows it quantizes, and the k5/cb4 prefill expansion scratch is not
+    // allocated - gemm()'s M > 1 branches then return false instead of
+    // reading it.  DeepSeek-V4.1-Flash's model-owned walk is per-token M=1, so
+    // the full-size scratch would be 360 MB of dead VRAM per card.
+    explicit dnnl_gemm(sycl::queue & q, int cap_m = 0, int cap_k = 0);
     ~dnnl_gemm();
     dnnl_gemm(const dnnl_gemm &) = delete;
     dnnl_gemm & operator=(const dnnl_gemm &) = delete;

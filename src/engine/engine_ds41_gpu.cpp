@@ -60,6 +60,7 @@
 #include "ds41_hc.h"
 #include "ds41_iq2.h"
 #include "ds41_iq2_tables.h"
+#include "dnnl_gemm.h"
 #include "engine.h"
 #include "quant.h"
 #include "sampler.h"
@@ -495,6 +496,11 @@ struct ds41_gpu_state {
     devbuf & DV(int dev) { return dv[(size_t)dev]; }
     const devbuf & DV(int dev) const { return dv[(size_t)dev]; }
     const void * wp(int dev, const void * host) const { return e.wptr(dev, host); }
+    // A dense GEMV's key: the uploaded device pointer, or the host pointer when
+    // the tensor is registered as a oneDNN store (the upload then skips its raw
+    // copy).  Both are what gemv1 resolves the store by, and the raw fallback
+    // needs the device pointer - so this is wptr() with wkey()'s exception.
+    const void * wk(int dev, const void * host) const { return e.wkey(dev, host); }
     int dev_of_layer(int li) const { return e.layer_dev_[(size_t)li]; }
 
     template <class T>
@@ -1011,6 +1017,24 @@ void ds41_gpu_state::gemv_calls(int dev, uint32_t type, std::vector<gemv_seg> & 
 
 void ds41_gpu_state::gemv1(int dev, const void * w, uint32_t type, int K, int N, const float * x, float * out,
                            const float * residual, float alpha, int out_stride) {
+    // A oneDNN-managed dense store (setup_ds41_dense_store): the k5 M=1 GEMV
+    // reads the native 5-bit values at 249 GB/s instead of the raw
+    // fp32-dequant path's 110 (PF_DS41_DENSE_Q8 additionally routes Q8_0
+    // through the int8 GEMV; it is off by default).
+    // The activation is quantized per 32-value group exactly as every other
+    // oneDNN decode path does; `quantize` + `gemm` are one launch each on this
+    // device's in-order queue.  The plain path below stays for the expert bank,
+    // the BF16 compressor/indexer tensors and PF_DS41_DENSE_STORE=0.
+    if ((out_stride == 0 || out_stride == N) && K > 0 && (K % 32) == 0) {
+        if (dnnl_gemm * D = e.dnnl_for(dev)) {
+            if (D->has_weight_k5(w) || D->has_weight(w)) {
+                auto v = D->quantize(x, nullptr, K, 0, 1, K, /*do_split=*/true);
+                if (v.valid() && D->gemm(v, w, residual, alpha, 1, K, out, N)) {
+                    return;
+                }
+            }
+        }
+    }
     gemv_seg s{};
     s.w = w;
     s.type = type;
@@ -1113,7 +1137,7 @@ void ds41_gpu_state::engram_apply(int li, int dev) {
     }
     devbuf & t = DV(dev);
     t.q->memcpy(t.eng_ev, ev.data(), ev.size() * sizeof(float)).wait();
-    gemv1(dev, wp(dev, L.ds.engram_kv.data), L.ds.engram_kv.type, L.ds.engram_kv.K, L.ds.engram_kv.N,
+    gemv1(dev, wk(dev, L.ds.engram_kv.data), L.ds.engram_kv.type, L.ds.engram_kv.K, L.ds.engram_kv.N,
           t.eng_ev, t.eng_kv);
     engram_dot_launch(*t.q, t.h, t.eng_kv, (const float *)wp(dev, L.ds.engram_gate), hc, dim, t.eng_g);
     engram_add_launch(*t.q, t.h, t.eng_kv, t.eng_g, hc, dim);
@@ -1141,7 +1165,7 @@ void ds41_gpu_state::append_src(int li, int sidx, const float * latent, int bloc
     q.memcpy(S.ckv + (size_t)row * (size_t)D, t.rowo, (size_t)D * sizeof(float));
 
     // index key from the *pre-rope* latent
-    gemv1(dev, wp(dev, L.ds.idx_attn_k.data), L.ds.idx_attn_k.type, L.ds.idx_attn_k.K,
+    gemv1(dev, wk(dev, L.ds.idx_attn_k.data), L.ds.idx_attn_k.type, L.ds.idx_attn_k.K,
           L.ds.idx_attn_k.N, latent, t.ikproj);
     rms(dev, t.ikproj, L.ds.idx_k_norm, t.ikproj, idx_hd);
     ds41_rope_launch(q, t.ikproj, 1, idx_hd, idx_hd - 64, 64, block * S.ratio, 0, t.fcomp, false);
@@ -1162,17 +1186,17 @@ void ds41_gpu_state::push_kvsrc(int li, int dev, const float * x) {
     src & S = sources[(size_t)sidx];
     devbuf & t = DV(dev);
     if (S.ratio == 1) {
-        gemv1(dev, wp(dev, L.ds.comp_wkv.data), L.ds.comp_wkv.type, L.ds.comp_wkv.K, L.ds.comp_wkv.N, x,
+        gemv1(dev, wk(dev, L.ds.comp_wkv.data), L.ds.comp_wkv.type, L.ds.comp_wkv.K, L.ds.comp_wkv.N, x,
               t.latent);
         rms(dev, t.latent, L.ds.comp_norm, t.latent, D);
         append_src(li, sidx, t.latent, S.clen);
         return;
     }
     float * kdst = S.rkv + (size_t)S.ring_n * (size_t)D;
-    gemv1(dev, wp(dev, L.ds.comp_wkv.data), L.ds.comp_wkv.type, L.ds.comp_wkv.K, L.ds.comp_wkv.N, x, kdst);
+    gemv1(dev, wk(dev, L.ds.comp_wkv.data), L.ds.comp_wkv.type, L.ds.comp_wkv.K, L.ds.comp_wkv.N, x, kdst);
     if (L.ds.comp_wgate.data) {
         float * gdst = S.rsc + (size_t)S.ring_n * (size_t)D;
-        gemv1(dev, wp(dev, L.ds.comp_wgate.data), L.ds.comp_wgate.type, L.ds.comp_wgate.K,
+        gemv1(dev, wk(dev, L.ds.comp_wgate.data), L.ds.comp_wgate.type, L.ds.comp_wgate.K,
               L.ds.comp_wgate.N, x, gdst);
     }
     S.ring_n++;
@@ -1202,7 +1226,7 @@ void ds41_gpu_state::index_select(int li, int dev, const float * x, const float 
     devbuf & t = DV(dev);
     sycl::queue & q = *t.q;
 
-    gemv1(dev, wp(dev, L.ds.idx_attn_q_b.data), L.ds.idx_attn_q_b.type, L.ds.idx_attn_q_b.K,
+    gemv1(dev, wk(dev, L.ds.idx_attn_q_b.data), L.ds.idx_attn_q_b.type, L.ds.idx_attn_q_b.K,
           L.ds.idx_attn_q_b.N, qr, t.qi);
     ds41_rope_launch(q, t.qi, idx_nh, idx_hd, idx_hd - 64, 64, pos, 0, t.fcomp, false);
     if (!noq) {
@@ -1213,7 +1237,7 @@ void ds41_gpu_state::index_select(int li, int dev, const float * x, const float 
     {
         std::vector<float> wh((size_t)idx_nh);
         // idx_proj → host, scale, upload
-        gemv1(dev, wp(dev, L.ds.idx_proj.data), L.ds.idx_proj.type, L.ds.idx_proj.K, L.ds.idx_proj.N, x,
+        gemv1(dev, wk(dev, L.ds.idx_proj.data), L.ds.idx_proj.type, L.ds.idx_proj.K, L.ds.idx_proj.N, x,
               t.iw);
         q.memcpy(wdev, t.iw, (size_t)idx_nh * sizeof(float)).wait();
         for (int h = 0; h < idx_nh; h++) {
@@ -1304,15 +1328,15 @@ void ds41_gpu_state::attention(int li, int dev, const float * x, float * oo) {
     sycl::queue & q = *t.q;
 
     // qr = rms(wq_a x, q_a_norm)
-    gemv1(dev, wp(dev, L.ds.wq_a.data), L.ds.wq_a.type, L.ds.wq_a.K, L.ds.wq_a.N, x, t.qr);
+    gemv1(dev, wk(dev, L.ds.wq_a.data), L.ds.wq_a.type, L.ds.wq_a.K, L.ds.wq_a.N, x, t.qr);
     if (dbg) { q.memcpy(sstage, t.qr, (size_t)q_lora*sizeof(float)).wait(); double ss=0; for(int i=0;i<q_lora;i++) ss+=(double)sstage[i]*sstage[i]; fprintf(stderr, "[ds41g]   qr rms %.6f\n", std::sqrt(ss/(double)q_lora)); }
     rms(dev, t.qr, L.ds.q_a_norm, t.qr, q_lora);
-    gemv1(dev, wp(dev, L.ds.wq_b.data), L.ds.wq_b.type, L.ds.wq_b.K, L.ds.wq_b.N, t.qr, t.qb);
+    gemv1(dev, wk(dev, L.ds.wq_b.data), L.ds.wq_b.type, L.ds.wq_b.K, L.ds.wq_b.N, t.qr, t.qb);
     if (dbg) { q.memcpy(sstage, t.qb, 64*sizeof(float)).wait(); double ss=0; for(int i=0;i<64;i++) ss+=(double)sstage[i]*sstage[i]; fprintf(stderr, "[ds41g]   q[0:64] rms %.6f\n", std::sqrt(ss/64.0)); }
     ds41_rope_launch(q, t.qb, H, D, rot_off, n_rot, pos, 0, fc, false);
 
     // window K row
-    gemv1(dev, wp(dev, L.ds.wkv.data), L.ds.wkv.type, L.ds.wkv.K, L.ds.wkv.N, x, t.kvrow);
+    gemv1(dev, wk(dev, L.ds.wkv.data), L.ds.wkv.type, L.ds.wkv.K, L.ds.wkv.N, x, t.kvrow);
     rms(dev, t.kvrow, L.ds.kv_norm, t.kvrow, D);
     ds41_rope_launch(q, t.kvrow, 1, D, rot_off, n_rot, pos, 0, fc, false);
     if (!noq) {
@@ -1354,14 +1378,14 @@ void ds41_gpu_state::attention(int li, int dev, const float * x, float * oo) {
     // 8 groups through wo_a, then wo_b
     const int gsz = H / out_g * D;
     const size_t row_b = ggml_row_bytes(L.ds.wo_a.type, (uint64_t)L.ds.wo_a.K);
-    const char * wab = (const char *)wp(dev, L.ds.wo_a.data);
+    const char * wab = (const char *)wk(dev, L.ds.wo_a.data);
     for (int g = 0; g < out_g; g++) {
         gemv1(dev, wab + (size_t)g * (size_t)out_rank * row_b, L.ds.wo_a.type, gsz, out_rank,
               t.ob + (size_t)g * (size_t)gsz, t.og + (size_t)g * (size_t)out_rank);
     }
     if (dbg) { q.memcpy(sstage, t.og, (size_t)out_rank*sizeof(float)).wait(); double ss=0; for(int i=0;i<out_rank;i++) ss+=(double)sstage[i]*sstage[i]; fprintf(stderr, "[ds41g]   og rms %.6f\n", std::sqrt(ss/(double)out_rank));
         q.memcpy(sstage, t.ob, (size_t)std::min(64,H*D)*sizeof(float)).wait(); ss=0; double mx=0; for(int i=0;i<std::min(64,H*D);i++){ss+=(double)sstage[i]*sstage[i]; mx=std::max(mx,(double)std::fabs(sstage[i]));} fprintf(stderr, "[ds41g]   attn pre-wo rms %.6f max %.6f\n", std::sqrt(ss/64.0), mx); }
-    gemv1(dev, wp(dev, L.ds.wo_b.data), L.ds.wo_b.type, L.ds.wo_b.K, L.ds.wo_b.N, t.og, oo);
+    gemv1(dev, wk(dev, L.ds.wo_b.data), L.ds.wo_b.type, L.ds.wo_b.K, L.ds.wo_b.N, t.og, oo);
 }
 
 // ===========================================================================
@@ -1459,7 +1483,7 @@ void ds41_gpu_state::route_one(int li, const float * x, int dev, int32_t * ids, 
     const layer_t & L = m.layers[(size_t)li];
     devbuf & t = DV(dev);
     sycl::queue & q = *t.q;
-    gemv1(dev, wp(dev, L.moe.gate_inp), L.moe.gate_inp_type, dim, E, x, t.logits);
+    gemv1(dev, wk(dev, L.moe.gate_inp), L.moe.gate_inp_type, dim, E, x, t.logits);
     q.memcpy(sstage, t.logits, (size_t)E * sizeof(float)).wait();
 
     const float * bias = (moe_vl && router_bias_vl_p) ? router_bias_vl_p : router_bias_p;
@@ -1594,10 +1618,10 @@ void ds41_gpu_state::moe(int li, int dev, const float * x, float * y) {
 
     // shared expert (ungated add, same one-sided clamp family)
     const float slim = d.swiglu_clamp_shexp[li];
-    gemv1(dev, wp(dev, L.ffn_gate.data), L.ffn_gate.type, L.ffn_gate.K, L.ffn_gate.N, x, t.g);
-    gemv1(dev, wp(dev, L.ffn_up.data), L.ffn_up.type, L.ffn_up.K, L.ffn_up.N, x, t.u);
+    gemv1(dev, wk(dev, L.ffn_gate.data), L.ffn_gate.type, L.ffn_gate.K, L.ffn_gate.N, x, t.g);
+    gemv1(dev, wk(dev, L.ffn_up.data), L.ffn_up.type, L.ffn_up.K, L.ffn_up.N, x, t.u);
     swiglu_clamp_launch(q, t.g, t.u, t.sh, ffsh, slim);
-    gemv1(dev, wp(dev, L.ffn_down.data), L.ffn_down.type, L.ffn_down.K, L.ffn_down.N, t.sh, t.acc);
+    gemv1(dev, wk(dev, L.ffn_down.data), L.ffn_down.type, L.ffn_down.K, L.ffn_down.N, t.sh, t.acc);
     yadd_launch(q, y, t.acc, 1.f, dim);
 }
 
@@ -1621,7 +1645,7 @@ void ds41_gpu_state::head(int dev) {
     sycl::queue & q = *t.q;
     ds41_hc_pre_launch(q, t.h, t.pre_prev, t.mixx, hc, dim);
     rms(dev, t.mixx, m.output_norm, t.xn, dim);
-    gemv1(dev, wp(dev, m.output.data), m.output.type, m.output.K, m.output.N, t.xn, t.logits);
+    gemv1(dev, wk(dev, m.output.data), m.output.type, m.output.K, m.output.N, t.xn, t.logits);
 }
 
 // ===========================================================================
@@ -1837,7 +1861,24 @@ std::vector<int> ds41_gpu_generate(model & m, tokenizer & tk, const std::vector<
     if (first_logits) {
         *first_logits = st.logits_host;
     }
+    // PF_DUMP_DEC_LOGITS=<prefix>: the same per-step logit dump the generic
+    // decode loop writes (prefix.<step>.bin, step 0 = the prompt).  It is what
+    // separates "the store moved a near-tie" from "the store is wrong".
+    const char * dbg_lg = si::env::str("PF_DUMP_DEC_LOGITS");
+    auto dump_logits = [&](int step) {
+        if (!dbg_lg) {
+            return;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.%d.bin", dbg_lg, step);
+        FILE * f = fopen(path, "wb");
+        if (f) {
+            fwrite(st.logits_host.data(), sizeof(float), st.logits_host.size(), f);
+            fclose(f);
+        }
+    };
     const float * logits = st.logits_host.data();
+    dump_logits(0);
     for (int step = 0; step < gp.max_tokens; step++) {
         const int tok = sample_token(logits, (int)st.logits_host.size(), gp, ids, ss);
         if (!gp.ignore_eos && (tok == tk.eos_id || tok == 1)) {
@@ -1850,6 +1891,7 @@ std::vector<int> ds41_gpu_generate(model & m, tokenizer & tk, const std::vector<
         ids.push_back(tok);
         st.forward_token(tok, true, mm);
         logits = st.logits_host.data();
+        dump_logits(step + 1);
     }
     if (st.timing) {
         fprintf(stderr, "[ds41g] %llu forwards, %.2f ms/token total", (unsigned long long)st.tm.tok,

@@ -570,6 +570,10 @@ struct dnnl_gemm::impl {
     float * axs = nullptr;
     int32_t * axsum = nullptr;
     int cap_M = 0, cap_K = 0; // scratch capacity
+    // A decode-only instance (a small cap_M): no k5/cb4 prefill expansion
+    // scratch, and gemm()'s M > 1 native branches decline so the caller keeps
+    // its own fallback.  Set from the constructor's cap_m.
+    bool decode_only = false;
     int cur_M = 0, cur_K = 0; // currently quantized activations
     bool acts_valid = false;
     // Which quantize() last ran.  A view carries this back, so "is this the
@@ -1059,14 +1063,17 @@ struct dnnl_gemm::impl {
     }
 };
 
-dnnl_gemm::dnnl_gemm(sycl::queue & q) : p(new impl) {
+dnnl_gemm::dnnl_gemm(sycl::queue & q, int cap_m, int cap_k) : p(new impl) {
     p->q = q;
     p->eng = sycl_interop::make_engine(q.get_device(), q.get_context());
     p->st = sycl_interop::make_stream(p->eng, q);
     p->st_a = sycl_interop::make_stream(p->eng, q);
     p->attn_sep = attn_stream_env();
-    p->cap_M = kMaxB * kMaxT; // max rows of one chunk-batched prefill
-    p->cap_K = kActMaxK;
+    // max rows of one chunk-batched prefill, unless the caller names a
+    // decode-only instance (see dnnl_gemm.h)
+    p->cap_M = cap_m > 0 ? cap_m : kMaxB * kMaxT;
+    p->cap_K = cap_k > 0 ? cap_k : kActMaxK;
+    p->decode_only = cap_m > 0 && cap_m < kMaxT;
     p->ax = p->dev_alloc<int8_t>((size_t)p->cap_M * p->cap_K);
     p->axs = p->dev_alloc<float>(p->cap_M);
     p->axsum = p->dev_alloc<int32_t>(p->cap_M);
@@ -1491,17 +1498,21 @@ bool dnnl_gemm::add_weight_k5(const void * key, const void * host_data, uint32_t
         }
         p->q.memcpy(p->bit_lut, host, sizeof(host)).wait();
     }
-    // the prefill expansion needs the int8-sized scratch (shared with cb4)
-    const size_t need = (size_t)K * (size_t)N;
-    if (need > p->cb4_scratch_cap) {
-        p->dev_erase(p->cb4_scratch);
-        p->cb4_scratch = nullptr;
-        p->cb4_scratch_cap = 0;
-        p->cb4_scratch = p->dev_alloc<int8_t>(need);
-        if (!p->cb4_scratch) {
-            return false;
+    // the prefill expansion needs the int8-sized scratch (shared with cb4); a
+    // decode-only instance never takes the M > 1 path, so it would be a dead
+    // K*N allocation (662 MB for ds41's head alone)
+    if (!p->decode_only) {
+        const size_t need = (size_t)K * (size_t)N;
+        if (need > p->cb4_scratch_cap) {
+            p->dev_erase(p->cb4_scratch);
+            p->cb4_scratch = nullptr;
+            p->cb4_scratch_cap = 0;
+            p->cb4_scratch = p->dev_alloc<int8_t>(need);
+            if (!p->cb4_scratch) {
+                return false;
+            }
+            p->cb4_scratch_cap = need;
         }
-        p->cb4_scratch_cap = need;
     }
     e.ok = true;
     auto ins = p->k5weights.emplace(key, std::move(e));
@@ -1560,17 +1571,20 @@ bool dnnl_gemm::add_weight_cb4(const void * key, const void * host_data, uint32_
         p->q.memcpy(p->lut16, h16, sizeof(h16)).wait();
     }
     // the prefill expansion needs the int8-sized scratch; grow it to the widest
-    // converted tensor (the biggest is ffn_gate/up, ~95 MB, not the full model)
-    const size_t need = (size_t)K * (size_t)N;
-    if (need > p->cb4_scratch_cap) {
-        p->dev_erase(p->cb4_scratch);
-        p->cb4_scratch = nullptr;
-        p->cb4_scratch_cap = 0;
-        p->cb4_scratch = p->dev_alloc<int8_t>(need);
-        if (!p->cb4_scratch) {
-            return false;
+    // converted tensor (the biggest is ffn_gate/up, ~95 MB, not the full model).
+    // A decode-only instance has no M > 1 path, so it skips the allocation.
+    if (!p->decode_only) {
+        const size_t need = (size_t)K * (size_t)N;
+        if (need > p->cb4_scratch_cap) {
+            p->dev_erase(p->cb4_scratch);
+            p->cb4_scratch = nullptr;
+            p->cb4_scratch_cap = 0;
+            p->cb4_scratch = p->dev_alloc<int8_t>(need);
+            if (!p->cb4_scratch) {
+                return false;
+            }
+            p->cb4_scratch_cap = need;
         }
-        p->cb4_scratch_cap = need;
     }
     e.ok = true;
     auto ins = p->cb4weights.emplace(key, std::move(e));

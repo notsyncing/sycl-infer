@@ -712,12 +712,16 @@ engine::engine(const engine_config & cfg)
         if (!(envw && atoi(envw) != 0)) {
             dnnl->warmup();
         }
-    } else if (multi_dev && !md_int8 && !md_xmx && dnnl_gemm_enabled(q) &&
+    } else if (multi_dev && !md_int8 && !md_xmx && !ds41_dense_store_ && dnnl_gemm_enabled(q) &&
                dp4a_enabled(q)) {
         // one dnnl_gemm per GPU backend, holding only the layers that device
         // computes (the CPU partitions keep the fp32/i8 host path).  Every
         // prefill GEMM tensor of a GPU layer is converted - including the
         // small ssm_beta/ssm_alpha, which ride in the wqkv call.
+        // ds41 is excluded: its stores were built by setup_ds41_dense_store
+        // with its own decode-only scratch, and its layer_t has no wq/wk/wv -
+        // reusing this branch would replace the instances and wptr() the
+        // registered shared-expert tensors (whose raw upload was skipped).
         const char * envw = si::env::str("PF_DNNL_NOWARM");
         const bool nowarm = envw && atoi(envw) != 0;
         dnnl_dev_.resize(backends_.size());
@@ -2934,7 +2938,10 @@ void engine::upload_device_weights(int dev) {
             // the int8 (SIn) view replaces the raw device copy
             continue;
         }
-        if (mp_->rep.dnnl_int8 && dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
+        // deepseek41 registers only k5/int8 stores and has no seg_plan, so its
+        // gate is its own flag rather than rep.dnnl_int8.
+        const bool dnnl_replaces_raw = mp_->rep.dnnl_int8 || ds41_dense_store_;
+        if (dnnl_replaces_raw && dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
             && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data)
                 || dnnl_dev_[(size_t)dev]->has_weight_k5(t.data) || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
             // the oneDNN int8 (XMX) copy - or the u4 (4-bit) copy - replaces the
@@ -3319,14 +3326,154 @@ void engine::release_host_weight_pages() {
             (double)dropped / (1024.0 * 1024.0), m.keep_file_cache ? ", page cache kept" : "");
 }
 
-// ---------------------------------------------------------------------------
-// Multi-device layer placement (pipeline parallel).  `layer_map` is a
-// comma-separated list of `begin-end:device` ranges covering [0, n_layer);
-// `device` is `gpu[.N]` (N = SYCL GPU index, default 0) or `cpu`.  The ranges
-// execute in order, each device computing its contiguous layer range and handing
-// the hidden state to the next at the partition boundary; each device gets its
-// own weights and its own paged KV pool (same global block ids), so every
-// attention layer's KV is stored on the device that computes it.
+// DeepSeek-V4.1-Flash's dense linear stores (see engine.h).  Its GPU forward is
+// per-token M=1 and reads every dense weight through ds41_gpu_state::gemv1, so
+// the generic seg_plan stores never applied to it: Q5_K went through the raw
+// fp32-dequant GEMV at 110 GB/s.  The k5 store keeps the native 5-bit values
+// (no re-quantization, 0.75 B/w) and its M=1 GEMV measures 249 GB/s.  Q8_0 has
+// no native store; PF_DS41_DENSE_Q8 registers the ordinary per-32-group int8
+// conversion for it (measured worst per-row rel 2.2e-4, but neutral on time).
+//
+// The key is the host tensor pointer: a converted tensor skips its raw device
+// upload, so engine::wkey(dev, t.data) returns the host pointer - and that is
+// what the forward passes to gemv1.  PF_DS41_DENSE_STORE=0 restores the raw
+// GEMV (the exact A/B: nothing is registered and the raw upload happens).
+bool engine::setup_ds41_dense_store() {
+    if (!ds41_fwd() || !dnnl_gemm_enabled(q)) {
+        return false;
+    }
+    const char * es = si::env::str("PF_DS41_DENSE_STORE");
+    if (es && atoi(es) == 0) {
+        return false;
+    }
+    // Q8_0 has no native store; the ordinary per-32-group int8 conversion is
+    // *not* the 0.98% generic re-quantization here: Q8_0 already carries one
+    // f16 scale per 32 values, so the conversion keeps its own grid (measured
+    // worst per-row rel 2.2e-4 against the same fp32 dot, below the k5 store's
+    // 1.1e-3, because the activation quantization dominates).  It is an A/B and
+    // **off** by default: the interleaved 3-rep cell measured decode 124.3
+    // (k5 only) vs 125.0 (with the 80 int8 stores) ms/token, i.e. no time win
+    // here - the Q8_0 projections are 372 MB of a 6.3 GB dense stream - so the
+    // default keeps the raw Q8_0 GEMV and its exact weights.
+    const bool add_q8 = si::env::flag("PF_DS41_DENSE_Q8");
+    // Diagnostic bisection: PF_DS41_DENSE_ONLY=wq_b,wo_a,... registers only the
+    // named groups (the others keep their raw upload and GEMV), so a store that
+    // changes the stream can be isolated to one tensor class.
+    const char * only = si::env::str("PF_DS41_DENSE_ONLY");
+    auto want = [&](const char * tag) { return !only || std::strstr(only, tag) != nullptr; };
+    const ds41_hparams & d = m.hp.ds;
+    dnnl_dev_.clear();
+    dnnl_dev_.resize(backends_.size());
+    for (size_t dd = 0; dd < backends_.size(); dd++) {
+        if (dev_kind_[dd] != 0 || !dev_queues_[dd]) {
+            continue; // the ds41 GPU forward requires an all-GPU layer map
+        }
+        // decode-only: the forward quantizes one row per GEMV, so the
+        // prefill-capacity scratch (360 MB/card) and the k5 prefill expansion
+        // scratch (662 MB for the head alone) would be dead VRAM.
+        dnnl_dev_[dd] = std::make_unique<dnnl_gemm>(*dev_queues_[dd], 2, 8192);
+    }
+    size_t n_k5 = 0, n_i8 = 0;
+    uint64_t bytes = 0;
+    // the stores are device memory this engine owns, so they must be in the
+    // per-device accounting the control plane reports as free memory
+    std::vector<uint64_t> dev_bytes(backends_.size(), 0);
+    // `key` identifies the store and equals the pointer gemv1 receives;
+    // `host_data` is where the packed rows start (the tensor base, or a group's
+    // byte offset inside a stacked tensor such as wo_a).
+    auto reg_k5 = [&](int dev, const void * key, const void * host_data, uint32_t type, int K, int N) {
+        dnnl_gemm * D = dnnl_for(dev);
+        if (!D || !key || !host_data || type != 13 || K <= 0 || N <= 0 || (K % 32) != 0) {
+            return;
+        }
+        if (D->add_weight_k5(key, host_data, type, K, N)) {
+            const uint64_t b =
+                (uint64_t)((double)K * (double)N * 0.75) + 2ull * (uint64_t)(K / 32) * (uint64_t)N * 2;
+            n_k5++;
+            bytes += b;
+            if ((size_t)dev < dev_bytes.size()) {
+                dev_bytes[(size_t)dev] += b;
+            }
+        }
+    };
+    auto reg_i8 = [&](int dev, const wt & t) {
+        dnnl_gemm * D = dnnl_for(dev);
+        if (!D || !t.data || t.type != 8 || t.K <= 0 || t.N <= 0) {
+            return;
+        }
+        if (D->add_weight(t.data, t.data, t.type, t.K, t.N, /*eager=*/false, /*lazy=*/true)) {
+            const uint64_t b = (uint64_t)t.K * (uint64_t)t.N + 2ull * (uint64_t)(t.K / 32) * (uint64_t)t.N;
+            n_i8++;
+            bytes += b;
+            if ((size_t)dev < dev_bytes.size()) {
+                dev_bytes[(size_t)dev] += b;
+            }
+        }
+    };
+    for (int li = 0; li < m.hp.n_layer; li++) {
+        const int dev = layer_dev_[(size_t)li];
+        if (dev < 0 || (size_t)dev >= dev_kind_.size() || dev_kind_[(size_t)dev] != 0) {
+            continue;
+        }
+        const layer_t & L = m.layers[(size_t)li];
+        if (want("wq_b")) {
+            reg_k5(dev, L.ds.wq_b.data, L.ds.wq_b.data, L.ds.wq_b.type, L.ds.wq_b.K, L.ds.wq_b.N);
+        }
+        if (want("wo_b")) {
+            reg_k5(dev, L.ds.wo_b.data, L.ds.wo_b.data, L.ds.wo_b.type, L.ds.wo_b.K, L.ds.wo_b.N);
+        }
+        // wo_a is one tensor holding out_group_count stacked groups; the GEMV
+        // is called once per group with a byte offset into it, so each group is
+        // its own store keyed at that offset.
+        if (want("wo_a")) {
+            const int out_g = d.out_group_count > 0 ? d.out_group_count : 1;
+            const int out_rank = d.out_lora_rank > 0 ? d.out_lora_rank : 0;
+            const int gsz = m.hp.n_head / out_g * d.kv_dim;
+            const uint64_t row_b = (uint64_t)ggml_row_bytes(L.ds.wo_a.type, (uint64_t)gsz);
+            for (int g = 0; g < out_g; g++) {
+                const char * key = (const char *)L.ds.wo_a.data + (size_t)g * (size_t)out_rank * row_b;
+                reg_k5(dev, key, key, L.ds.wo_a.type, gsz, out_rank);
+            }
+        }
+        if (want("ffn")) {
+            reg_k5(dev, L.ffn_gate.data, L.ffn_gate.data, L.ffn_gate.type, L.ffn_gate.K, L.ffn_gate.N);
+            reg_k5(dev, L.ffn_up.data, L.ffn_up.data, L.ffn_up.type, L.ffn_up.K, L.ffn_up.N);
+            reg_k5(dev, L.ffn_down.data, L.ffn_down.data, L.ffn_down.type, L.ffn_down.K, L.ffn_down.N);
+        }
+        if (want("engram") && L.ds.engram_kv.data) {
+            reg_k5(dev, L.ds.engram_kv.data, L.ds.engram_kv.data, L.ds.engram_kv.type, L.ds.engram_kv.K, L.ds.engram_kv.N);
+        }
+        if (add_q8) {
+            reg_i8(dev, L.ds.wq_a);
+            reg_i8(dev, L.ds.wkv);
+        }
+    }
+    // The LM head runs on the primary device.  A tied head shares token_embd's
+    // bytes, which the embed kernel reads as raw GGUF rows on the host, so it
+    // cannot be replaced by a store.
+    if (want("head") && m.output.data && m.output.data != m.tok_embd.data) {
+        reg_k5(0, m.output.data, m.output.data, m.output.type, m.output.K, m.output.N);
+    }
+    if (n_k5 + n_i8 > 0) {
+        if (dev_used_bytes_.size() < dev_bytes.size()) {
+            dev_used_bytes_.resize(dev_bytes.size(), 0);
+        }
+        for (size_t d = 0; d < dev_bytes.size(); d++) {
+            dev_used_bytes_[d] += dev_bytes[d];
+        }
+    }
+    ds41_dense_store_ = (n_k5 + n_i8) > 0;
+    if (ds41_dense_store_) {
+        fprintf(stderr,
+                "[ds41] dense stores: %zu k5 + %zu int8 oneDNN tensors, %.0f MB%s "
+                "(PF_DS41_DENSE_STORE=0 restores the raw GEMV)\n",
+                n_k5, n_i8, (double)bytes / 1048576.0, add_q8 ? "" : " (Q8_0 kept raw)");
+    } else {
+        dnnl_dev_.clear();
+    }
+    return ds41_dense_store_;
+}
+
 // Build the per-device oneDNN int8 weights for the XMX prefill/decode path.
 // Keyed by the host weight pointer: upload_device_weights then skips the raw
 // device copy of a converted tensor, so the partition's linears live once as
@@ -3334,9 +3481,11 @@ void engine::release_host_weight_pages() {
 // to the SIn/dp4a path).
 bool engine::setup_md_dnnl() {
     if (ds41_fwd()) {
-        // The ds41 GPU forward reads the raw GGUF types through gemv_group and
-        // ds41_iq2; the oneDNN int8 partition and the native u4/k5/cb4 stores
-        // are pure VRAM on a card that already cannot hold the expert bank.
+        // The ds41 GPU forward has no seg_plan; its dense linears get their own
+        // per-device, decode-only stores in setup_ds41_dense_store(), and the
+        // routed experts stay on ds41_iq2 / the raw GEMV.  Converting the
+        // generic layer tensors here would also be wrong: ds41's layer_t has no
+        // wq/wk/wv to convert.
         return false;
     }
     if (!dnnl_gemm_enabled(q)) {
@@ -3764,6 +3913,14 @@ bool engine::setup_md_dnnl() {
     return any;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-device layer placement (pipeline parallel).  `layer_map` is a
+// comma-separated list of `begin-end:device` ranges covering [0, n_layer);
+// `device` is `gpu[.N]` (N = SYCL GPU index, default 0) or `cpu`.  The ranges
+// execute in order, each device computing its contiguous layer range and handing
+// the hidden state to the next at the partition boundary; each device gets its
+// own weights and its own paged KV pool (same global block ids), so every
+// attention layer's KV is stored on the device that computes it.
 void engine::setup_multi_device(const std::string & layer_map) {
     load_timer lt;
     struct ent {
@@ -3970,6 +4127,9 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // whether the file can take the SIn store at all (rep.sin_w8); oneDNN
         // eligibility is decided by setup_md_dnnl() itself.
         md_xmx = has_gpu && !dp4a_env_off && !f32_path_ && setup_md_dnnl();
+        // deepseek41 has no seg_plan, so setup_md_dnnl() declines; its dense
+        // GEMVs still take the same stores (see setup_ds41_dense_store).
+        ds41_dense_store_ = has_gpu && setup_ds41_dense_store();
         lt.lap("setup_md_dnnl (all)");
         md_int8 = has_gpu && !dp4a_env_off && mp_->rep.sin_w8 && !md_xmx;
         // md_xmx means "oneDNN int8 weights are available", not that the XMX
@@ -3977,7 +4137,10 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // jit:gemm:any (and ocl:ref:any with a blocked layout), so name the
         // path for what it is.
         fprintf(stderr, "[dev] multi-device weight path: %s\n",
-                md_xmx ? "oneDNN int8 matmul (jit:gemm:any)" : (md_int8 ? "SIn int8 (dp4a)" : "fp32"));
+                md_xmx       ? "oneDNN int8 matmul (jit:gemm:any)"
+                : ds41_dense_store_ ? "ds41 dense oneDNN k5/int8 stores"
+                : md_int8    ? "SIn int8 (dp4a)"
+                             : "fp32");
     }
     // Per-device oneDNN int8 weights (XMX) were built above before the upload;
     // converted tensors skip their raw device copy.  The SIn/w8 fallback built
