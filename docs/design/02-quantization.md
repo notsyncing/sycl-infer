@@ -35,9 +35,9 @@ fp32 回退：
 CPU 后端默认走**整数 int8** 路径，但**不构建 `w8t` 副本**（那是 GPU 的 SIn 格式）：`i8.cpp`
 按 32 值组从 block 里取无符号权重、用 `maddubs`/`madd` 与 `x8` 做整数点积，再按组做
 `sx*(d*sc*Σq·qx − dmin*m*Σqx)` 修正（Q6 为 `sx*d*sc*(Σq·qx − 32*Σqx)`，16 宽组映射到 x8 的
-32 宽组两个半区）。选哪条由 plan 的 `gemv_seg::i8` 决定（`engine_graph.cpp:147`：**只有 CPU 分区的
+32 宽组两个半区）。选哪条由 plan 的 `gemv_seg::i8` 决定（`graph.cpp:147`：**只有 CPU 分区的
 层**置位），于是同一个 CPU 后端同时暴露 `i8_gemv/gemm`（直读 GGUF）与 `dp4a_gemv/gemm`（吃 `w8t`）
-两套入口，分派见 `engine_graph.cpp:624-669`。Q8_0 与 `PF_CPU_ISA=scalar` 回退到融合 fp32
+两套入口，分派见 `graph.cpp:624-669`。Q8_0 与 `PF_CPU_ISA=scalar` 回退到融合 fp32
 （`qgemv_sb_*`）。见 [architecture.md §11](../architecture.md) 与
 [03-kernels.md](03-kernels.md)。
 
@@ -117,6 +117,16 @@ GGUF K-quant 布局是为“逐字节标量反量化”设计的。在 Iris Xe-L
 w        = scale * q - min
 sum_k w*x = sx * (scale * sum_k (q*qx) - min * sum_k qx),   x ≈ sx*qx
 ```
+
+这些副本的构建/释放与多设备的 per-device 副本由 `src/backend/weight_store.cpp` 负责：单设备副本写入 `m.output8` / `layer_t::*8`，多设备按 host tensor
+指针存入 store 的 per-device map。`model` 只保留 GGUF/hparams/张量绑定和 `w8t` 数据槽，不再持有
+设备存储或上传/指针 API。
+
+**`weight_store` 是引擎里唯一的原始设备权重存储。** 同一个类也持有 vision/audio mmproj 的设备
+权重和 DFlash 草稿的 f32 副本：整文件 1:1 的 `upload_contiguous`，或只上传内核真正读取的张量的
+`upload_spans`（紧凑 span 表，`ptr()` 二分查找）。`upload(model&,...)` 是文本路径的包装，
+vision/audio/dflash 直接调用通用 blob API；`model.h` 因此保持无 SYCL，`dflash.h` 是唯一直接
+include 该 backend store 的 draft-model 例外。
 
 ### 3.2 布局：group-major + 行块
 
@@ -248,7 +258,7 @@ CPU 的 `cpu_xq`（`cpu/kernels/xq.cpp:10-45`）是同一格式的 host 版：�
 **核心不变量：任何喂给原生存储 GEMV 的激活都必须用 `do_split=true` 量化。** 少这一次拆分不会报错，
 只会静默读到**上一次 call** 留下的 `axe`/`axo`——这就是 MTP 层 `eh_proj` 曾给出 acc 0.08（草稿全是
 垃圾）的原因，`eh_proj` 现在的显式写法是 `mtp_layer_w4_ || mtp_head_w4_`
-（`engine_mtp.cpp` 里记 `do_split` 规则的那段注释，注释在 `engine_mtp.cpp:275-282`）。同理，prefill 故意用 `do_split=false`
+（`spec/mtp.cpp` 里记 `do_split` 规则的那段注释，注释在 `spec/mtp.cpp:275-282`）。同理，prefill 故意用 `do_split=false`
 （oneDNN 只读连续形式 + 组和，省掉两次额外的存储），而消费这些平面的路径必须由 `split_valid`
 守卫，见 §6.5。
 
@@ -425,7 +435,7 @@ per-call 延迟，27B decode 的 320 个 call 实测 ~13 ms/token）。
 `gen` 在每次 `quantize()`（**包括失败的那次**）都自增，所以失败返回的 view（`gen == 0`）
 天然失效。逐行 GEMM（`df_gemm` 的 rowed 模式）每行自己量化、自己带 view。
 
-顺带暴露了一处既有不对称（`engine_mtp.cpp` 的 `PF_MTP_HEAD_SPLIT` 路径）：D1 用
+顺带暴露了一处既有不对称（`spec/mtp.cpp` 的 `PF_MTP_HEAD_SPLIT` 路径）：D1 用
 `do_split=true` 量化而 D 的 view 带的是 `do_split=w4_draft`，所以 `w4_draft` 为假时两半走不同
 kernel 分支——**这是原 `split_valid` 就有的行为，本次刻意不改**（该路径 opt-in 且实测是 wash，
 不属于管道重构的范围），但现在它有注释说明。
@@ -437,14 +447,14 @@ oneDNN primitive 无法被 SYCL command graph 捕获。除了靠 `use_dnnl` 不�
 * `dnnl_set_capturing(true)` 期间每个 `execute` 站点都先调 `dnnl_capture_guard()`
   （`dnnl_gemm.cpp` 的 `dnnl_capture_guard`，调用点如 `dnnl_gemm.cpp` 的 `dnnl_capture_guard()` 调用点），它直接抛异常，让调用方放弃录制并
   退回直接重放——否则会录下一条**悄悄少了工作**的 pass。
-* `record_forward` 的 `dnnl_call` 判定（`engine_graph.cpp:542-582`）：必须有绑到本 call 计算后端的
+* `record_forward` 的 `dnnl_call` 判定（`graph.cpp:542-582`）：必须有绑到本 call 计算后端的
   `dnnl_gemm *D`，且**不是**（`mode == 0 && !multi_dev`）——即单设备的 decode 保留 dp4a GEMV，
   其余（模式 1/2，以及多设备的 decode）走 oneDNN；call 必须有 xq 计划；call 的每个 w8 segment
   都必须在 `has_weight`/`has_weight_w4`/`has_weight_k5`/`has_weight_cb4` 里有 K 匹配的条目，
   多设备下**所有** segment 都要（它们没有 w8 视图）。任一条件不满足就退回
   `xq_launch` + `dp4a_gemm_launch`。
 * `build_graphs` 在 `use_dnnl` 时**不**录制模式 2 的 `pfb_vars_` 命令图，只保留 `ntok`
-  （`{2,4,8,16}×kMaxT`）供 `batched_prefill_fit` 选择尺寸（`engine_graph.cpp:1790-1808`）。
+  （`{2,4,8,16}×kMaxT`）供 `batched_prefill_fit` 选择尺寸（`graph.cpp:1790-1808`）。
   模式 2 因此总是直接（非图）重放，见 [04-engine.md](04-engine.md)。
 
 `PF_DNNL_NOWARM=1` 跳过 `warmup()`（`dnnl_gemm.cpp:396-398`、`408-409`），后者在引擎构造时把每个
@@ -638,7 +648,7 @@ zero-points（其布局未通过验证）。`act_quant_grp_launch` 顺带算出 
 * **喂给原生 store 的 GEMV，激活必须用 `do_split=true` 量化**——完整规则见 §4.4，守卫条件见 §6.5。
   少这一次拆分不会报错，只会读到上一次 call 的平面：MTP 层的 `eh_proj` 就这样给出 acc 0.08
   （draft 全是垃圾），修成 `do_split = mtp_layer_w4_ || mtp_head_w4_` 后恢复到 2.14
-  （`engine_mtp.cpp:377-382`）。
+  （`spec/mtp.cpp:377-382`）。
 * 测试分工：各类型（相对 fp32）的损失用 `test_quant_audit` 逐类型度量；u4 打包往返用
   `tests/model/test_w4`；u4 vs int8 的逐张量差异用 `test_w4_vs_i8`；u4 GEMM vs 真实反量化权重用
   `test_w4_gemm`；u4 logits vs fp32 CPU 参考用 `test_w4_vs_cpuref`。

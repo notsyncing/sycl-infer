@@ -108,7 +108,7 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 w8t w;
-                e.m.build_w8_one(q, *t, w);
+                e.ws_.build_w8_one(q, *t, w);
                 if (!w.vals) {
                     continue;
                 }

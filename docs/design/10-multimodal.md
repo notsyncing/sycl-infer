@@ -131,11 +131,12 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
   `out_w=pw/merge`、`out_h=ph/merge`、`n_out=out_w*out_h`；由
   `vision_model::make_input` 填写（`vision.cpp:260-272`）。
 * `vision_model`（`vision.h:76-127`）：权重 + 设备状态；`patch_w` 是两个 patch conv 相加后反量化的 f32
-  `[n_embd][3*P²]`；`pos_embd_host` 是反量化的 learned position；`dev_weights` 是紧凑 span 或
-整块 GGUF 的设备副本（§3.3）；
+  `[n_embd][3*P²]`；`pos_embd_host` 是反量化的 learned position；`weights` 是 backend 的
+  `weight_store`（紧凑 span 或整块 GGUF，§3.3）；
   `d_patch_w` 与 8 个 scratch 缓冲是模型自有的设备内存。所有权：`dev_q` pin 住首次传入的
-  engine queue（换 queue 直接抛，跨 queue 释放是 UB），析构按成员表全释放
-  （`free_dev_ptrs`，`enc_common.h`；audio 塔同构）。模型禁拷贝，只传引用。
+  engine queue（换 queue 直接抛，跨 queue 释放是 UB）；析构先 `weights.release(*dev_q)` 释放
+  权重 blob，再按成员表释放 scratch（`free_dev_ptrs`，`enc_common.h`；audio 塔同构）。
+  模型禁拷贝，只传引用。
 
 ### 3.2 mmproj 加载
 
@@ -163,12 +164,15 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 ### 3.3 上传与指针翻译
 
 `upload`（`vision.cpp` 的 `vision_model::upload`）默认只上传设备内核真正读的张量
-（`PF_VISION_COMPACT=1`，qwen2vl 的 oneDNN 线性层注册成功后只需 norms/biases，约 3.7 MB）；
-`blob_spans` 记录每个 span 的宿主指针范围与设备偏移，`dev_ptr` 二分查找后翻译
-（`(char*)dev_weights + span.off + (host - span.host)`）。`PF_VISION_COMPACT=0` 恢复整文件
-1:1 映射（`gguf.map_size`），用于 `PF_VISION_DNNL=0` 的完整回退或调试 A/B。`patch_w` 是加载时
-合成的数据，不在映射内，因此单独分配设备副本 `d_patch_w`（只拷一次）。析构有意不释放
-`dev_weights`（队列已随模型生命周期结束的注释仍然成立）。
+（`PF_VISION_COMPACT=1`，qwen2vl 的 oneDNN 线性层注册成功后只需 norms/biases，约 3.7 MB）。
+它把每个张量包成 `weight_span{host, bytes, off}` 交给
+`weights.upload_spans(std::move(spans), need, q, "mmproj ")`：store 持有排序后的 span 表、
+分配设备 blob 并逐 span 拷贝，`dev_ptr` 最终调用 `weights.ptr(host)` 做二分查找
+（紧凑 blob 中刻意省略的张量返回 null，与旧行为一致）。`PF_VISION_COMPACT=0` 恢复整文件
+1:1 映射（`weights.upload_contiguous(gguf.map_base, gguf.map_size, q, "mmproj ")`），用于
+`PF_VISION_DNNL=0` 的完整回退或调试 A/B。`patch_w` 是加载时合成的数据，不在映射内，因此
+单独分配设备副本 `d_patch_w`（只拷一次）。析构通过 store 释放 blob（`weights.release(*dev_q)`），
+模型本身不再声明 `dev_weights`/`blob_spans`。
 
 ### 3.4 host 参考前向（`encode_host`）
 
@@ -292,7 +296,7 @@ md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.99
 | 哪段用哪个位置 | **`sec == 0` 用 patch 行 `py`，其余段用 patch 列 `px`**（`vit.cpp:308`；host 侧同样，`vision.cpp:445`）。HD=64 时每头只有 32 对，段 2/3 不存在 | 三个 section 的位置全部来自 mrope 数组，按上面的 sector 规则选 |
 | 频率指数 | **每段重置**：`p = pair % (head_dim/4)`，`theta = pos * base^(-2p/(HD/2))`（`vit.cpp:309`；host 侧 `vision.cpp:443-446` 的注释写明 “sections {16,16,16,16}, exponent resets”） | **全局 pair 索引**：`theta = rpos * base^(-2*lane/n_rot)`，`lane` 就是全局 pair 序号（`qk_norm_rope.cpp:82`） |
 
-段宽来自 GGUF 的 `rope.dimension_sections`（读入 `hp.rope_sections`，`qwen35.cpp:39-43`），Qwen3.5 参考
+段宽来自 GGUF 的 `rope.dimension_sections`（读入 `hp.rope_sections`，`src/model/arch/qwen35/load.cpp:39-43`），Qwen3.5 参考
 架构是 `[11,11,10,0]`（即 `sector = lane % 32`）。四段全 0 表示普通 RoPE（`model.h:30-31`）；此时
 `sect_dims == 0` → `sector = lane`、`sec` 落到默认的 3，而 mrope 的第 4 段是 temporal 的副本
 （`multimodal.cpp:128`），所以带图的提示词依然退化为正确行为。
@@ -399,7 +403,7 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
   `engine.h`）。host 路径（`mm->embd` 非空且 `d_embd` 为空）会在 `generate_impl` 开头拷进去；
   device 路径本来就是它。**`mm_prompt::has_encoded_embd()` 是必需的检查**：prompt 有媒体行但
   phase 2 没跑（最常见的原因是缺 `--mmproj`/`--audio-mmproj`）时 `generate_mm` 直接抛错，
-  而不是把未初始化的行喂给前向。`arch_profile.mm_model_prefill` 为真（qwen4exp）时
+  而不是把未初始化的行喂给前向。`spec.mm_owned_prefill` 为真（qwen4exp 的 profile 声明）时
   `generate_impl` 不再拷 host 行——`q4_prefill_mm` 自己上传一次，避免拷两遍。
 * `step_info` 多模态字段（`kernels.h`）：`mrope_on`、`mrope_sections[4]`、
   `mrope[4*kMaxB*kMaxT]`（section-major）、`img_embd`、`img_row[kMaxB*kMaxT]`。它们全部在
@@ -409,7 +413,7 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
   * **通用路径**：按 `kMaxT` 逐块 `prefill_chunk`，每块用
     `mm_write_step(mm, pos, n, kMaxB*kMaxT, d_info->mrope, d_info->img_row)` 填位置/行映射，
     然后置 `mrope_on` 与 `img_embd`。这是所有架构的默认。
-  * **模型自有 forward**（`arch_profile.mm_model_prefill`，qwen4exp 的 loader 置位）：
+  * **模型自有 forward**（`spec.mm_owned_prefill`，qwen4exp 的 profile 置位）：
     `q4_prefill_mm(*mm, 0)` 把整个扩展后的 prompt 交给 `q4_prefill_common`；完整 `kMaxT`
     行走 mode 2，`< kMaxT` 尾行走 mode 1，每块同样用 `mm_write_step` 切 M-RoPE/`img_row`
     （mode-1 的 kernel flat 索引从 0 开始，切片也按这个布局写）。这样图像块可以跨 chunk row，
@@ -438,7 +442,7 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
   * *MTP*：`generate_impl` 的分派条件带 `mm == nullptr`，多模态提示词永远走普通
     decode。
   * *连续批处理*：走的是单序列入口 `generate_mm`，不进调度器。
-  * *模型的通用 prefill chunker*：`mm_model_prefill` 为真时走 `q4_prefill_mm`，不经过
+  * *模型的通用 prefill chunker*：`spec.mm_owned_prefill` 为真时走 `q4_prefill_mm`，不经过
     `prefill_chunk`（见上）；前缀缓存/MTP 的绕过来自同一条“单序列、整段 prompt”约束。
 
 ---

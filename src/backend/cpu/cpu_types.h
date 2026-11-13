@@ -162,7 +162,7 @@ void cpu_set_thread_count(int n);
 
 // ---- routed-MoE mirror (see src/backend/cpu/kernels/moe.cpp) -------------------
 // Raw host pointers only: this header is SYCL-free, so it cannot carry `moe_t`.
-// engine_graph's MoE branch fills one of these per layer and dispatches to the
+// graph.cpp's MoE branch fills one of these per layer and dispatches to the
 // CPU kernels when the layer's partition is a cpu device.
 struct cpu_moe_wt {
     const char * data = nullptr;

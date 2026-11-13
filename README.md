@@ -30,11 +30,14 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
   Weight types Q4_K / Q5_K / Q6_K / Q3_K / IQ4_XS / IQ4_NL / IQ3_S / Q8_0 / F32
   are dequantized on the fly inside the kernels.
 * **Pluggable architectures** — the model type is read from
-  `general.architecture` and dispatched to a per-architecture loader (one source
-  file plus one registry entry).  Implemented: `qwen35` / `qwen35moe` (hybrid
-  Gated DeltaNet + full attention, dense or routed MoE), `qwen4exp`
-  (hyper-connections + PLE + QSA) and `qwen2vl` (the dense Qwen2-VL/MinerU
-  trunk).  Adding one is a loader plus a model profile.
+  `general.architecture` and dispatched to a per-architecture loader under
+  `src/model/arch/<arch>/` (a loader and a complete model profile, plus one
+  `kLoaders[]` entry).  A model that owns its forward also gets
+  `src/engine/arch/<arch>/` and one `kArchOps[]` row.  Implemented: `qwen35` /
+  `qwen35moe` (hybrid Gated DeltaNet + full attention, dense or routed MoE),
+  `qwen4exp` (hyper-connections + PLE + QSA), `deepseek41` (MLA + DSA + mHC +
+  Engram) and `qwen2vl` (the dense Qwen2-VL/MinerU trunk).  See
+  [Design 24](docs/design/24-arch-modules.md).
 * **Paged KV cache + continuous batching** — 32-token physical blocks with
   per-sequence block tables; chunked prefill and batched decode (up to 16
   concurrent sequences by default, 32 with `--max-slots`).  Batched decode
@@ -147,19 +150,21 @@ to a per-architecture loader; the engine itself is not tied to any model family.
 | Qwen3.8-27B (UD-Q4_K_M) | `qwen35` | supported | dense, 64 layers; 15.4 GiB of weights, so it needs the two-card split |
 | Qwen3.6-35B-A3B (UD-Q4_K_M) | `qwen35moe` | supported | routed MoE, 256 experts / 8 active, 40 layers; 21.1 GiB of weights, so it needs the two-card split too |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL, 4 shards) | `qwen4exp` | **supported** | hyper-connections + n-gram PLE + 512-expert MoE + QSA.  The routed bank and PLE table are host-resident (with a pinned 69.8 GiB source mirror); the dense trunk plus a 17 500 MB per-expert LRU bank (47 layers, Q8_0-down layers included) run on the GPUs.  Recommended: `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500 --ctx 2048 --kv-type f16`.  See [Design 18](docs/design/18-qwen4exp.md) |
+| DeepSeek-V4.1-Flash (IQ2_XS, 6+ENGRAM shards) | `deepseek41` | supported | 40-layer all-MoE decoder: MLA with a 512-wide latent K==V, group-shared compressed KV, two-level DSA index, 4-stream mHC and Engram.  Needs `--device gpu --layer-map ... --moe-vram-mb 16000 --ctx 512 --max-slots 1` for the GPU path.  See [Design 23](docs/design/23-deepseek41.md) |
 | MinerU2.5-Pro-2605-1.2B | `qwen2vl` | supported | dense Qwen2-VL decoder (24 layers, head_dim 64, Q5_0/Q8_0) behind the MinerU two-step document extraction (`sycl-infer-mineru`, the standalone `tools/mineru/` client); needs its mmproj.  See [Design 21](docs/design/21-mineru-qwen2vl.md) |
 
 | | |
 |---|---|
 | file format | GGUF (memory-mapped; single file **or split shards**, merged into one virtual mapping) |
 | weight quantization | Q4_K, Q5_K, Q6_K, Q3_K, Q5_1, IQ4_XS, IQ4_NL, IQ3_S, Q8_0, F16, BF16, F32; Q4_K uses the native 4-bit (u4) path by default |
-| architecture registry | selected via `general.architecture`; `qwen35`, `qwen35moe`, `qwen4exp` and `qwen2vl` implemented, others plug in via `src/model/model_arch.h` + a `kLoaders[]` entry and a `src/model/profiles/<arch>.cpp` policy |
+| architecture registry | selected via `general.architecture`; `qwen35`, `qwen35moe`, `qwen4exp`, `deepseek41` and `qwen2vl` implemented, others plug in via the public `src/model/arch/registry.h` seam + a `kLoaders[]` row in the internal `src/model/arch/registry.cpp` hub and `src/model/arch/<arch>/{load.h,load.cpp,profile.cpp}`; a model-owned forward adds `src/engine/arch/<arch>/` + a `kArchOps[]` row (see [Design 24](docs/design/24-arch-modules.md)) |
 | expert placement | routed-MoE models can keep part of the experts on the GPU and compute the rest on the host per step (llama.cpp's ncmoe), with a disk → host-RAM → VRAM three-tier expert cache (`--moe-resident` / `--moe-vram-mb` / `--moe-ram-mb`) |
 | KV cache dtype | `i8` (default), `i4`, `bf16`, `f16`, `f32`; `--kv-type K:V` sizes K and V independently (`i4:i8`) |
 | tokenizer | GPT-2 byte-level BPE from the GGUF vocabulary + special tokens / chat template |
 
-Adding an architecture is a single new file under `src/model/` — see
-[`AGENTS.md`](AGENTS.md#add-a-model-architecture).
+Adding an architecture starts with `src/model/arch/<arch>/{load,profile}.cpp` — see
+[`AGENTS.md`](AGENTS.md#add-a-model-architecture) and
+[Design 24](docs/design/24-arch-modules.md).
 
 ### Best measured performance, at context depth 0
 

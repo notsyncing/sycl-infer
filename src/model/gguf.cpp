@@ -275,7 +275,15 @@ parsed_header parse_header(const uint8_t * base, size_t size) {
     const size_t pos = (size_t)(r.p - base);
     h.data_offset = (pos + alignment - 1) / alignment * alignment;
     if (h.data_offset > size) {
-        throw std::runtime_error("gguf: bad data offset");
+        // A metadata-only shard (n_tensors == 0) has no data section: its
+        // header can end exactly at EOF, so the padding to the alignment lands
+        // past the file.  There is nothing at that offset to read, so clamp it
+        // into range instead of rejecting a valid shard.  A shard that claims
+        // tensors must still have their data inside the file.
+        if (n_tensors > 0) {
+            throw std::runtime_error("gguf: bad data offset");
+        }
+        h.data_offset = size;
     }
     return h;
 }

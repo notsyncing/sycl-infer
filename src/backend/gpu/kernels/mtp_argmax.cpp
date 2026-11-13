@@ -28,7 +28,7 @@ static inline float mb_h2f(uint16_t h) {
 }
 
 // ---------------------------------------------------------------------------
-// Candidate set for the MTP draft's LM head (see engine_mtp.cpp).
+// Candidate set for the MTP draft's LM head (see spec/mtp.cpp).
 //
 // The draft needs one token per step and its head GEMV reads all 248320 rows
 // (794 MB of u4, 2.4 ms of the ~3.3 ms a draft step costs) only to throw

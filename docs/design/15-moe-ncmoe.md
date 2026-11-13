@@ -20,9 +20,9 @@
 
 ## 1. 架构注册与绑定
 
-`src/model/qwen35moe.cpp` 定义 `arch::load_qwen35moe(model &)`，在
-`src/model/model.cpp` 的 `kLoaders[]` 注册。除 `qwen35` 已有的 GDN / 全注意力层绑定外，
-它额外绑定：
+`src/model/arch/qwen35moe/load.cpp` 定义 `arch::load_qwen35moe(model &)`（由同目录
+`load.h` 声明），在内部 hub `src/model/arch/registry.cpp` 的 `kLoaders[]` 注册。除
+`qwen35` 已有的 GDN / 全注意力层绑定外，它额外绑定：
 
 | 张量 | 含义 |
 |---|---|
@@ -60,7 +60,7 @@ Q6_K 层读到 Q5_K 层的权重，症状是"模型能加载、48 层里 46 层�
 
 ## 3. MoE 的 plan：四个 call
 
-`record_forward` 的 MoE 分支（`engine_graph.cpp`）把一层 MoE 编成：
+`record_forward` 的 MoE 分支（`graph.cpp`）把一层 MoE 编成：
 
 ```
 call 0  moe_routed     router + CSR + gate/up + down + reduce（无 gemv 段）
@@ -118,7 +118,7 @@ stride 32（`src/backend/gpu/kernels/moe.cpp`）。
 
 > **"decode" 必须是模式，不能是 token 数。** 选路曾经是 `dec_step = (n_tok <= 1)`，而**批量 decode
 > 的 `n_tok = rows = N > 1`**——于是每一个批量 decode 步都被当成 prefill，跑的是 prefill 的 M=8
-> tile。现在是 `mode == 0`（`engine_graph.cpp`）。这条曾被记成"decode 的形状不对 grouped dp4a，
+> tile。现在是 `mode == 0`（`graph.cpp`）。这条曾被记成"decode 的形状不对 grouped dp4a，
 > 所以 decode 走 fp32"，那是**形状诊断对、结论错**：tile 是编译期模板参数，"M=8 在 decode 上
 > 7/8 空"从来不是放弃这条路的理由，而是给 decode 一份自己的 tile 的理由。
 >
@@ -170,7 +170,7 @@ prefill 的 oracle 不变（pp512 11171 / pp16384 1204 / pp65536 4779），MoE �
 ### 4.2 主机半读的是 MoE 自己的输入缓冲
 
 主机 half 原先硬编码 `d_xnorm`。MTP 的 draft 层跑在 `d_mtp_xnorm` 上
-（见 `engine_mtp.cpp` 里 `mtp_moe` 的注释），读 `d_xnorm` 等于拿**另一层**的
+（见 `spec/mtp.cpp` 里 `mtp_moe` 的注释），读 `d_xnorm` 等于拿**另一层**的
 激活去算专家。现在输入缓冲作为参数传入。
 
 ### 4.3 主机 pass 不能进 command graph
@@ -347,7 +347,7 @@ Qwen3.8-Flash-Next（`qwen4exp`，104 GiB，512 专家/top-10）走的是**另�
   `moe_cfg_.host_only = true`，
   `moe_cache` 因此算出 `total = 0`、启动打印 `bank 0/512 resident per layer`；它的设备路径在
   `record_forward` 的 `seg_plan` 分支，而 q4exp 在 `q4_forward` 里自己走层。**两条路径不会相遇。**
-* q4 的 GPU bank 是 `engine_q4exp.cpp` 自己分配的**每专家 LRU**：`--moe-vram-mb 16000` 给出
+* q4 的 GPU bank 是 `src/engine/arch/qwen4exp/forward.cpp` 自己分配的**每专家 LRU**：`--moe-vram-mb 16000` 给出
   每层 124 个槽、43 层（15.3 GiB），其余 5 层（down 为 Q8_0 的 2/4/30/46/47）全部留在主机。
   slot map 是纯主机侧决定，kernel 仍然 `slot < 0` 就返回。
 * 预填充超过 bank 容量时走**两遍**：512 token 的一层最多选中 328 个不同专家，而 R=124，所以

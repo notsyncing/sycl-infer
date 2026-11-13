@@ -1,6 +1,6 @@
 // Device-vs-host validation for the DeepSeek-V4.1-Flash misc device ops in
 // src/backend/gpu/kernels/ds41_ops.cpp.  The host side reproduces the exact
-// oracle code from src/engine/engine_ds41.cpp:
+// oracle code from src/engine/arch/deepseek41/forward_host.cpp:
 //
 //   fp8_round_row (window KV / attention output round),
 //   Fwd::moe's swiglu and sqrt-softplus router,
@@ -149,7 +149,7 @@ static float e4m3_host(float v) {
     return neg ? -out : out;
 }
 
-// fp8_round_row (engine_ds41.cpp): one power-of-two E4M3 scale per `block`.
+// fp8_round_row (arch/deepseek41/forward_host.cpp): one power-of-two E4M3 scale per `block`.
 static void fp8_round_ref(float * v, int n, int block) {
     for (int b = 0; b < n; b += block) {
         const int m = std::min(block, n - b);

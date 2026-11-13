@@ -13,11 +13,18 @@
 核心设计原则：
 
 1. **架构无关（pluggable architecture）**。模型类型由 GGUF 的 `general.architecture` 决定，通过
-   `src/model/model_arch.h` + `model.cpp` 中的注册表分发。新增模型架构 = 新增一个 `.cpp` + 一行注册,
-   无需改动引擎或 kernel。见 [design/01-model-loading.md](design/01-model-loading.md)。
-2. **量化权重零转换加载**。GGUF 文件以只读 `mmap` 映射，整个映射一次性拷贝到设备，所有设备指针
-   都通过“相对 `map_base` 的偏移”从主机指针推导（`model::dev_ptr`）。见
+   公开的 `src/model/arch/registry.h`（`arch::loader` / `find` / `registry`，不含架构名）与内部 hub
+   `src/model/arch/registry.cpp` 的 `kLoaders[]` 分发。新增一个 **generic-plan** 架构 =
+   `src/model/arch/<arch>/{load.h,load.cpp,profile.cpp}` + `registry.cpp` 一行注册，无需改动引擎或
+   kernel；自带 forward 的架构另加 `src/engine/arch/<arch>/` 与 `kArchOps[]` 一行。通用引擎/模型文件**不得**命名某个架构，
+   由 `ci/check_arch_boundaries.py` 强制。见
+   [design/24-arch-modules.md](design/24-arch-modules.md) 与
    [design/01-model-loading.md](design/01-model-loading.md)。
+2. **量化权重零转换加载**。GGUF 文件以只读 `mmap` 映射，文本模型的整个映射由 `weight_store`
+   一次性拷贝到设备，所有设备指针都通过“相对 `map_base` 的偏移”从主机指针推导
+   （`weight_store::ptr`）。同一个 store 也持有 vision/audio mmproj 的设备权重（整文件
+   `upload_contiguous` 或紧凑 `upload_spans`）和 DFlash 草稿的 f32 副本；它是引擎中唯一的
+   原始设备权重存储。见 [design/01-model-loading.md](design/01-model-loading.md)。
 3. **kernel 库与编排分离**。每个 kernel 一个编译单元，公开的启动 API 集中在
    `src/backend/gpu/kernels/kernels.h`；共享的设备辅助函数在 `src/backend/gpu/kernels/kernel_utils.h`（`si::kd`）。kernel 体
    不放在头文件里。
@@ -37,10 +44,10 @@
    自己的 matcher），`src/device/device_registry.cpp` 只按 SYCL 报告的设备名挑一份并缓存。
    没被认领的卡拿到 `key=unknown` 的 profile 并打印 WARNING，而不是静默继承上一张卡的调优。
    见 §11.3。
-9. **模型文件的架构策略属于 model profile，不属于散落的 `m.q4exp` 三元表达式**。forward 类型、
+9. **模型文件的架构策略属于 model profile，不属于散落的模型标志三元表达式**。forward 类型、
    HC/PLE/QSA 几何、decode 行数、prefill 粒度、prefix cache 能否表示该 state、权重表示能力、
    MTP/DFlash/MM 能力（含 `why`）和 routed expert 的 owner 都在
-   `src/model/profiles/<arch>.cpp`，由 loader registry 的精确 `general.architecture` key 选中。
+   `src/model/arch/<arch>/profile.cpp`，由 loader registry 的精确 `general.architecture` key 选中。
    按卡实测的 tuning 仍在 device profile；某个文件的 per-layer stride、budget、KV 类型和
    layer map 不进任何 profile。见 §11.4。
 
@@ -89,7 +96,7 @@ flowchart LR
   `scheduler` 做自动 batching；见 [design/19-c-api.md](design/19-c-api.md)。
 * **Python**（`python/` + `src/capi/`）：ctypes 绑定，建立在 C ABI 上；见
   [design/20-python-binding.md](design/20-python-binding.md)。
-* **MTP 投机解码**（`--mtp N`，`src/engine/engine_mtp.cpp`）：贪心（`temperature <= 0` 或
+* **MTP 投机解码**（`--mtp N`，`src/engine/spec/mtp.cpp`）：贪心（`temperature <= 0` 或
   `top_k == 1`）且非多模态的请求在 `engine::generate_impl` 内部改走 draft/verify 循环
   （`engine::generate_impl` 的 MTP/DFlash 分派条件）。服务端**默认**仍把贪心请求交给调度器，只有 `PF_MTP_SERVER=1`
   时 `server.cpp` 的 `mtp_direct` 才绕过调度器直送单序列 MTP 循环（`src/server/server.cpp:901`）——
@@ -123,6 +130,9 @@ src/backend/    backend.h       compute_backend 抽象（共享接口 + 工厂�
                 dnnl_gemm.{h,cpp}  权重路径调度器：oneDNN int8 matmul（PF_GEMM_DNNL）+
                                    M<=13 的原生精度批 GEMM（nat_gemm_launch）+
                                    attn_xmx 用的 attn_qk/attn_pv
+                weight_store.{h,cpp}  引擎唯一的设备权重存储：文本整块 GGUF blob/单设备
+                                   SIn 副本/多设备 w8 map，以及 vision/audio mmproj
+                                   （连续或紧凑 span）与 DFlash f32 副本的上传/指针/free
 
 src/backend/cpu/kernels/    每个主机 kernel 一个 .cpp（编译时 `-fno-sycl`，可带 AVX2 /
                 AVX-VNNI / AVX-512 target attribute；结构类内核为标量）：
@@ -148,16 +158,23 @@ src/backend/gpu/kernels/    kernels.h      公开启动 API + step_info + gemv_s
                 vit（视觉编码器）, at（音频塔辅助：at_conv1d / at_rope1d）
 
 src/model/      gguf.{h,cpp}       GGUF 解析 + mmap
-                model.{h,cpp}      通用加载/上传 + 绑定辅助
-                model_arch.h       架构注册表接口
+                model.{h,cpp}      通用加载 + 绑定辅助（不含 SYCL/设备 API）
+                model_types.h      通用 wt/moe_wt POD + `arch_hparams` /
+                                   `arch_layer` / `arch_model_extras` 虚基类
+                arch_util.h        共享 loader 辅助（bind_tensor/bind_f32 + bind_moe/require_meta）
+                arch/registry.h    公开注册表接口（`arch::loader` / find / registry），不含架构名
+                arch/registry.cpp  内部 hub：`kLoaders[]` + find/registry；唯一允许写架构名的模型侧文件
                 model_profile.h    声明式模型策略（fwd/policy/rep/spec/moe）
-                profiles/<arch>.cpp 每个架构一份完整 profile（key/值/provenance）
-                qwen35.cpp         Qwen3.5 混合架构加载器
-                qwen35moe.cpp      Qwen3.6-35B-A3B（routed MoE）
-                qwen2vl.cpp        Qwen2-VL / MinerU dense decoder
-                qwen4exp.cpp       Qwen3.8-Flash-Next（HC + PLE + QSA）
+                arch/<arch>/{load.h,load.cpp,profile.cpp}  每个架构一份 loader 接口 + 加载器 + complete profile
+                                    （load.h 声明 `load_<arch>()` 与 `<arch>_profile()`）
+                arch/qwen35/       Qwen3.5 混合架构
+                arch/qwen35moe/    Qwen3.6-35B-A3B（routed MoE）
+                arch/qwen2vl/      Qwen2-VL / MinerU dense decoder
+                arch/qwen4exp/     Qwen3.8-Flash-Next（HC + PLE + QSA）；
+                                   另有 hparams.h / tensors.h / accessors.h
+                arch/deepseek41/   DeepSeek-V4.1-Flash（MLA + DSA + mHC + Engram）；
+                                   另有 hparams.h / tensors.h / accessors.h
                 dflash.cpp         DFlash2 draft GGUF 加载器
-                model_w8.cpp       SIn int8 权重副本的构建/释放
                 tokenizer.{h,cpp}  BPE 分词器
 
 src/mm/         image.{h,cpp}        解码 + Qwen 智能缩放/归一化/patchify
@@ -168,13 +185,27 @@ src/mm/         image.{h,cpp}        解码 + Qwen 智能缩放/归一化/patchi
                 multimodal.{h,cpp}   提示词扩展 + M-RoPE 位置（图像/视频/音频/混合）
 
 src/engine/     engine.{h,cpp}             编排、缓冲区、单序列 API、MTP 门控
-                engine_graph.cpp           seg_plan、record_forward、build_graphs、
+                engine_types.h            seg_plan 与每次 forward 的 call plan
+                graph.cpp           record_forward、build_graphs、
                                            多设备 decode / MTP verify 的分段 command graph
-                engine_mtp.cpp             MTP plan / draft / verify / commit / rollback +
-                                           投机循环
-                engine_dflash.cpp          DFlash2 block drafter / 验证 / 提交
-                engine_q4exp.cpp           qwen4exp 自己的 forward（HC/PLE/QSA + LRU bank）
-                engine_qsa.cpp             QSA host selector / mirror / sparse attention
+                spec/mtp.cpp             MTP plan / draft / verify / commit / rollback +
+                                           投机循环；状态在 spec/mtp_state.h
+                spec/dflash.cpp          DFlash2 block drafter / 验证 / 提交；
+                                           状态在 spec/dflash_state.h
+                spec/verify_scratch.h    verify 周期共享的 argmax staging
+                arch/qwen4exp/forward.cpp           qwen4exp 自己的 forward（HC/PLE/QSA + LRU bank）
+                arch/qwen4exp/qsa.cpp             QSA host selector / sparse attention
+                arch/qwen4exp/runtime.cpp         qwen4exp 的 arch_ops hooks（setup / prefault / 前向与前缀缓存派发）
+                arch/arch_ops.h                   公开 seam：struct arch_ops + arch_ops_for（不含架构名）
+                arch/registry_internal.h          内部 seam：arch_ops_registry 钩子声明（仅 registry.cpp 与各 runtime.cpp 包含）
+                arch/registry.cpp                 ops 表与 arch_ops_for
+                arch/qwen4exp/state.h             qwen4exp 的组合状态（缓冲区、bank、PLE/engram、前缀缓存附加状态）
+                arch/qwen4exp/qsa_state.h         QSA 运行时状态（indexer cache、延迟更新、设备 scratch），由 state.h 组合
+                arch/deepseek41/forward_host.cpp  DeepSeek-V4.1-Flash host forward（mHC/MLA/DSA/Engram/MoE）
+                arch/deepseek41/forward_gpu.cpp   DeepSeek-V4.1-Flash GPU forward（2×A770）
+                arch/deepseek41/runtime.cpp       ds41 的 arch_ops hooks（setup / dense stores / destroy / generate）
+                arch/deepseek41/state.h           ds41 的组合状态（GPU 句柄 + dense-store 标志）
+                arch/deepseek41/prefix_cache.h    DeepSeek-V4.1-Flash 前缀状态缓存
                 moe_cache.{h,cpp}          三层 expert cache
                 engine_kvpool.cpp          动态 KV 块池
                 engine_prefix_cache.cpp    前缀缓存（VRAM 层 + 三层调度）
@@ -233,12 +264,18 @@ classDiagram
         +gguf_file gguf
         +hparams hp
         +const model_profile* prof
-        +arch_profile profile
+        +shared_ptr<arch_hparams> arch
         +layer_t[] layers
+        +unique_ptr<arch_model_extras> extras
         +mtp_layer_t mtp
         +bool has_mtp
-        +void* dev_weights
-        +load() upload() build_w8() page_out_host()
+        +w8t output8
+        +load() page_out_host()
+    }
+    class weight_store {
+        +upload_contiguous() upload_spans() clear() uploaded() release()
+        +upload(model&) build_w8() release(model&) ptr(host) device_bytes()
+        +begin_devices() build_w8_device() w8_for() has_w8() free_devices()
     }
     class model_profile {
         +const char* key
@@ -278,11 +315,21 @@ classDiagram
 ```
 
 ### `si::model`
-静态权重：GGUF 的内存映射、解析出的超参数 `hparams`、每层 `layer_t`（张量视图）、整个 GGUF 的
-设备副本 `dev_weights`，以及可选的 SIn int8 权重副本。`model::prof` 是 `model::load` 从
+静态权重：GGUF 的内存映射、解析出的超参数 `hparams`、每层 `layer_t`（张量视图），以及可选的
+`w8t` 数据槽（plan 与 `m.output8` 直接引用它们）。设备侧存储（整块 GGUF blob、SIn int8 副本的
+分配、多设备 per-device w8 map、上传/指针/free）归 `src/backend/weight_store.{h,cpp}`，因此
+`model.h` 不包含 SYCL，也不暴露设备 API。同一个 store 也是 vision/audio mmproj 的连续/紧凑
+设备 blob 与 DFlash f32 副本的存储：这三个模型各自持有实例，`dflash.h` 是唯一直接 include
+该 backend store 的 draft-model 例外。`model::prof` 是 `model::load` 从
 `kLoaders[]` 行拿到的架构策略（`model_profile`，key 必须逐字节等于 `general.architecture`）；
-`model::profile`（`arch_profile`）是 loader 声明的、通用驱动要读的能力位，目前是
-`mm_model_prefill`（媒体 prompt 必须走模型自己的 chunker）。GGUF 若随模型附带一个 NextN 块
+`hparams::arch` 是 loader 挂上的架构自有几何（`qwen4exp_hparams` / `ds41_hparams`，
+通过 `q4_hp`/`ds41_hp` 读取；无额外几何的架构为 null）。**架构自有的逐层/模型级张量**同样不在
+`model.h` 里：`layer_t::extras` 与 `model::extras` 是 pimpl 槽（`std::unique_ptr<arch_layer>` /
+`arch_model_extras`，通用架构为 null），架构自己的定义与枚举落在
+`arch/<arch>/tensors.h`，通过 `arch/<arch>/accessors.h` 的 `q4_layer`/`q4_model` /
+`ds41_layer_of`/`ds41_model` 访问。通用上传/保留循环只调用 `extras->visit_weights` /
+`visit_device_weights` / `visit_host_keep`，从不命名某个架构的张量。媒体 prompt 是否必须走模型
+自己的 chunker 是 profile 的 `spec.mm_owned_prefill`。GGUF 若随模型附带一个 NextN 块
 （`qwen35.nextn_predict_layers`），它被绑成独立的 `mtp_layer_t mtp` 并置 `has_mtp = true`；
 没有它时 `--mtp` 会被引擎门控掉（§12）。见 [design/01-model-loading.md](design/01-model-loading.md)
 与 §11.4。
@@ -295,8 +342,9 @@ classDiagram
 系统的核心。持有 `sycl::queue`（**in_order**）、所有激活缓冲区、paged KV 池、递归状态、录制好的
 command graph、前缀缓存三层，以及可选的 MTP 草稿层与它自己的 KV 切片。`mp_`（`= m.prof`）是
 它读取策略的入口：prefix cache、auto layer map、`md_splits`、`md_int8`、MTP 能力、engram 默认和
-scheduler 的 decode 行数/prefill 粒度都从这里来；前向派发也走 `engine::hc_fwd()`（`mp_->fwd ==
-hc_ple_qsa`），`m.q4exp` 只剩加载期一致性标志。对外提供两类 API：
+scheduler 的 decode 行数/prefill 粒度都从这里来；前向与前缀缓存的派发走 `arch_ops`
+（`engine::aops_`，见 arch/arch_ops.h：`prefill_text`/`prefill_mm`/`decode_batch`/`run_head`
+与 `pc_*` 钩子），`spec.mm_owned_prefill` 是媒体 prefill 的声明。对外提供两类 API：
 
 * **批处理 API**（调度器使用）：`prefill_chunk`、`prefill_batch`、`decode_batch`、`fetch_logits`，
   调用者必须持有 `engine::mtx`。
@@ -369,7 +417,7 @@ LM head 的 call 固定挂在主设备（`cur_dev = 0`），见 §9 不变量 9�
 |---|---|---|
 | `attn_xmx_launch`（oneDNN int8 matmul 的 prefill attention，`attn_xmx.cpp`） | `attn_launch` 内部（`src/backend/gpu/kernels/attn.cpp:322`） | `n_real > 1 && head_dim == 256`；`PF_ATTN_XMX` 未关时默认开（取自 profile 的 `attn.xmx`），key 数 < `PF_ATTN_XMX_MIN`（A770 默认 2048）或不在 i8-KV / oneDNN 范围内时返回 false，回落经典 kernel |
 | `nat_gemm_launch`（M ≤ 13 的批量原生精度 GEMM，`w4_gemv.cpp`） | `dnnl_gemm::gemm` / `gemm_w4`（`src/backend/dnnl_gemm.cpp:1267`、`1324`、`1376`、`1440`） | `2 <= M <= 13 && K % 32 == 0`，且调用点是 decode / MTP verify（激活的 even/odd 分组视图有效，即 `p->split_valid`）；`PF_NAT=0` 全局关掉 |
-| `i8_grp_gemv_rows_multi_launch`（把一个 call group 的窄 int8 段融成一次 launch） | `record_forward` 的 `gemv_at`（`src/engine/engine_graph.cpp:708`） | `tbm <= 13` 且组内多于一整段；`PF_NOFUSE=1` 关掉 |
+| `i8_grp_gemv_rows_multi_launch`（把一个 call group 的窄 int8 段融成一次 launch） | `record_forward` 的 `gemv_at`（`src/engine/graph.cpp:708`） | `tbm <= 13` 且组内多于一整段；`PF_NOFUSE=1` 关掉 |
 | `dp4a_gemm` 的 split-K partial 和 | `kd::gemm_ws`（`src/backend/gpu/kernels/dp4a_common.cpp:10`） | 需要 K-split 时按需增长的设备 workspace；chunk 批 prefill 下每行一个槽位 |
 | `mtp_argmax_launch`（设备端 per-row argmax） | `compute_backend::mtp_argmax`（`src/backend/gpu/gpu_backend.cpp:39`） | 仅 MTP verify 用；CPU 后端在 `cpu_backend.cpp` 里用主机循环实现同一入口 |
 
@@ -414,13 +462,13 @@ prefill；prefill 走 oneDNN 的 `PF_GEMM_DNNL` 路径。见 §9 不变量 3 与
 
 | 区域 | 说明 |
 |---|---|
-| `dev_weights` | 整个 GGUF 映射的副本（由 `model::upload` 分配） |
-| SIn 权重副本 | `PF_DP4A` 打开时约 700 MB（`model::build_w8`） |
+| 设备权重 blob | 文本为整个 GGUF 映射的副本（`weight_store::upload`）；vision/audio 为整文件或紧凑 span；DFlash 为 f32 副本 |
+| SIn 权重副本 | `PF_DP4A` 打开时约 700 MB（`weight_store::build_w8`） |
 | 激活缓冲 | 行数 `R = kMaxB*kMaxT = 1024`（`src/engine/engine.cpp` 的 `alloc_act_set`），各阶段按需分配 |
 | KV 池 | 虚拟 USM 预留 + 物理 extent 按需提交（`engine_kvpool.cpp`） |
 | 递归状态 | `d_gdn_state`、`d_conv_state`，每序列一个 slot；slot 轴是 `state_slots_`（`--max-slots`，**默认 16**）而不是 `kMaxB`——27B 上每卡 1.125 GiB，单流长上下文只需一个 slot（`src/engine/engine.h`） |
 | 前缀缓存检查点 | `d_pc_states[pc_max_states][pc_state_floats]`（`src/engine/engine.cpp:2205`） |
-| MTP 缓冲 | `d_mtp_*`：草稿层的激活、per-token 递归状态快照（`d_mtp_hist_`）、候选集；MTP 开时才有（`src/engine/engine.h:459` 起） |
+| MTP 缓冲 | `d_mtp_*`：草稿层的激活、per-token 递归状态快照（`d_mtp_hist_`）、候选集；MTP 开时才有（`src/engine/spec/mtp_state.h` 的 `mspec_state`） |
 | command graph | 单设备：decode 桶 `1/2/4/8/16` + prefill 变体；多设备：每个连续设备段一份 decode 图 + MTP verify 图 |
 
 KV 池的地址范围只预留一次，物理内存按 extent 提交/解映射，这样录制进图的每层基址指针在池增长时
@@ -475,7 +523,7 @@ attn+combine ms）nsp = 64/128/**160**/168/176 → 3.05/2.18/1.70/1.74/2.68，17
    `call_tb`/`call_xq`/`call_group_*`，从 0 起步会让后面的分区读第一层的 call 元数据（`dnnl_call`
    转 false，组落回 fp32 `gemv_group`，层静默不写东西）。
 3. **oneDNN 不能录制进 SYCL 图**。`PF_GEMM_DNNL` 路径直接重放模式 2（`prefill_batch`）。多设备的
-   MTP verify 图声明自己必须是全 SYCL，并用 `dnnl_capture_guard`（`engine_graph.cpp` 的 `dnnl_capture_guard`
+   MTP verify 图声明自己必须是全 SYCL，并用 `dnnl_capture_guard`（`graph.cpp` 的 `dnnl_capture_guard`
    布防，`dnnl_gemm.cpp` 的 `dnnl_capture_guard` 检查点 在每个 `prim.execute` 处检查并抛异常）——一个无法服务的
    形状不会静默录出一份缺活的图。
 4. **不要多个 TU 包含 `sycl/ext/oneapi/dot_product.hpp`**（其函数在该工具链下不是 `inline`），统一用
@@ -527,7 +575,11 @@ attn+combine ms）nsp = 64/128/**160**/168/176 → 3.05/2.18/1.70/1.74/2.68，17
 
 ## 10. 扩展点
 
-* **新增模型架构**：[design/01-model-loading.md](design/01-model-loading.md)。
+* **新增模型架构**：[design/24-arch-modules.md](design/24-arch-modules.md)（分层契约、两个注册表、
+  `arch_hparams`/`arch_layer` 与边界门禁）与 [design/01-model-loading.md](design/01-model-loading.md)。
+  generic-plan 架构只需 `src/model/arch/<arch>/{load,profile}.cpp`；自带 forward 的架构还需
+  `src/model/arch/<arch>/{hparams,tensors,accessors}.h` + `src/engine/arch/<arch>/` +
+  `kArchOps[]` 一行。
 * **新增 GPU 卡（device profile）**：新增 `src/device/profiles/<card>.cpp`——一份完整实现，
   含 key、取值和**自己的** matcher——再在 `src/device/device_registry.cpp:22` 的 `kDevices[]` 加一行。
   顺序即匹配顺序（先匹配先赢），宽泛的 matcher 放在具体 matcher 之后。取值必须写指定初始化器
@@ -597,7 +649,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 设备 `d` 计算自己的层区间，算完后把隐藏状态交给下一个设备。具体地：
 
 * `backends_` 每个设备一个后端；`layer_dev_[il]` 决定每层用哪个后端，`record_forward` 在**分区边界**
-  调 `handoff_x(prev_dev, dev, nrows * nreal)`（`src/engine/engine_graph.cpp:903`），再
+  调 `handoff_x(prev_dev, dev, nrows * nreal)`（`src/engine/graph.cpp:903`），再
   `bind_acts(dev)` 切成员。这就是 pipeline 的 stage 交接点，两个要点：
   (1) `handoff_x`（`src/engine/engine.cpp:796`）先在**源设备的队列**上 `wait()`——command graph 只排序
   已录制的依赖，不排序这些手工提交的拷贝——再经一块 host USM 暂存缓冲拷到目标设备的
@@ -622,7 +674,7 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
   - **oneDNN int8（`md_xmx`，同时服务 prefill 与 decode）**：每 GPU 后端各持有一份绑定该设备队列的
     `dnnl_gemm`（`dnnl_dev_`），只转换该设备分区的层权重。CPU 分区层走直读 GGUF 块的 i8 路径
     （`PF_GEMM_DNNL=0` 或 `PF_DP4A=0` 关掉这种多设备 oneDNN）。
-  - **SIn/w8 dp4a（`md_int8`，oneDNN 不可用时）**：为分区里的层各建一份 SIn w8 副本（`w8_dev_`），
+  - **SIn/w8 dp4a（`md_int8`，oneDNN 不可用时）**：为分区里的层各建一份 SIn w8 副本（`weight_store` 的 per-device map），
     单序列 decode 走 `plan_dec8_`：GPU 层 `dp4a_gemv`、CPU 层 `i8_gemv`、LM head（主设备）也 int8；
     `PF_DP4A_DEC=0` 关掉，仍走 fp32 GEMV。批式 decode n>1 目前仍是 fp32，与单设备一致。
 * **prefill 的 mode-2 批处理**：`plan_pfb_` + 行偏移段副本 `d_segs_pfb`，一个长 prompt 的所有
@@ -701,12 +753,12 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 
 ### 11.4 模型 profile（架构策略）
 
-`src/model/model_profile.h` 声明结构，`src/model/profiles/<arch>.cpp` 给每个架构一个完整 const：
+`src/model/model_profile.h` 声明结构，`src/model/arch/<arch>/profile.cpp` 给每个架构一个完整 const：
 
 | 字段组 | 内容 |
 |---|---|
 | 身份 | `key`（精确的 `general.architecture`）、`name`、`provenance` |
-| `fwd` | `generic_plan`（共享 `seg_plan`/`record_forward`）或 `hc_ple_qsa`（qwen4exp 自己的 walk） |
+| `fwd` | `generic_plan`（共享 `seg_plan`/`record_forward`）、`hc_ple_qsa`（qwen4exp 自己的 walk）或 `deepseek41`（MLA/DSA/mHC 自有 forward） |
 | `residual`/`extras` | HC streams/low rank；PLE、QSA 的 top_k/pool/indexer 几何 |
 | `policy` | decode 行数上限、prefill 粒度、prefix cache 能否表示 state、auto layer map、多设备 K-split、engram 默认 |
 | `rep`/`spec`/`moe` | 权重表示能力、机制能力（MTP/DFlash/MM + `why`）、routed expert owner |
@@ -716,12 +768,15 @@ Q4_K/Q5_K/Q6_K；Q8_0 与未知格式回退到 `common.cpp` 的融合 fp32 `qgem
 `PF_MODEL_PROFILE` pin（模型文件自己声明架构）。`PF_MODEL_INFO=1` 打印解析结果与 provenance；
 `test_model_profile` 是无需模型/GPU 的注册表与取值测试。
 
-引擎的 policy 分支读 `engine::mp_`（`= m.prof`），不再用 `m.q4exp`：prefix cache、auto layer map、
+引擎的 policy 分支读 `engine::mp_`（`= m.prof`），不再用模型标志：prefix cache、auto layer map、
 `md_splits`、`md_int8`、MTP 能力、engram 默认和 scheduler 的 decode 行数/prefill 粒度都从
-profile 来；前向派发也读 profile（`engine::hc_fwd()`，加载时断言 `m.q4exp` 一致），M2 才把
-walk 交给 runtime 对象。**model profile 与 device profile 的边界**：前者说“这是什么模型、允许用什么”，
-后者说“这张卡怎么跑它”；per-layer stride、budget、KV 类型、layer map、`TB` 桶和 prefill chunk
-属于文件/运行，不属于任何一个 profile。
+profile 来；前向与前缀缓存的派发读 `arch_ops` 行（`engine::aops_`，按 `mp_->fwd` 选择；qwen4exp 的
+walk 仍在 `src/engine/arch/qwen4exp/forward.cpp`，钩子只做派发）。架构自有的几何与张量走
+`hparams::arch`（`arch_hparams`）和 `layer_t::extras` / `model::extras`（`arch_layer` /
+`arch_model_extras`）这两个 pimpl 槽，通用上传/保留循环只调用其虚函数。**model profile 与
+device profile 的边界**：前者说“这是什么模型、允许用什么”，后者说“这张卡怎么跑它”；per-layer
+stride、budget、KV 类型、layer map、`TB` 桶和 prefill chunk 属于文件/运行，不属于任何一个
+profile。完整契约见 [design/24-arch-modules.md](design/24-arch-modules.md)。
 
 ---
 
@@ -732,7 +787,7 @@ walk 交给 runtime 对象。**model profile 与 device profile 的边界**：�
 0.8B 不带，所以那里的 `--mtp` 是空操作。
 
 > 第二个草稿器 **DFlash2**（`--spec-type dflash2`）与 MTP 的 verify/rollback/accept 那一半
-> 完全共用（`engine_mtp.cpp` 的 `mtp_verify`），只有 draft 那一半不同：它一次**非因果**前向
+> 完全共用（`spec/mtp.cpp` 的 `mtp_verify`），只有 draft 那一半不同：它一次**非因果**前向
 > 产出整块候选，由 selector lattice 在主机侧走出一条连贯路径。见
 > [设计 14](design/14-dflash2.md)。
 
@@ -756,7 +811,7 @@ walk 交给 runtime 对象。**model profile 与 device profile 的边界**：�
 * **draft 与 verify 的 kernel**：`mtp.cpp`（`mtp_capture_launch` 把主干 post-`output_norm` 的隐藏
   拷进草稿缓冲、`mtp_concat_launch` 拼 `[enorm(emb) ; hnorm(h_{i-1})]`）与 `mtp_argmax.cpp`
   （`mtp_argmax_launch` 设备端 per-row argmax = accept 判据；外加 `PF_MTP_CAND` 的
-  候选受限草稿头三个入口，默认关）。orchestration 全在 `src/engine/engine_mtp.cpp`。
+  候选受限草稿头三个入口，默认关）。orchestration 全在 `src/engine/spec/mtp.cpp`。
 * **accept argmax 走 `compute_backend::mtp_argmax` 这一个入口**（GPU 上是
   `mtp_argmax_launch`，全 `cpu` 跑时是 `cpu_backend.cpp` 的主机循环）。它必须是每行一个
   work-group + SLM 树归约，并把平局**打破到最小下标**，才与主机的 `if (v[i] > best)` 逐位一致。

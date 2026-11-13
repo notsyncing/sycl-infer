@@ -26,8 +26,8 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 > 层解析到所属设备的池（`dev_kpool_[d] + layer_attn_local_[il] * kv_layer_stride`）与该设备的队列
 > （`engine_prefix_cache.cpp` 的 `pc_serialize_block`、`:154`），块内偏移与单设备布局一致。
 >
-> **MTP 路径**也支持：`generate_mtp` 对 prompt 调 `pc_admit`（`engine_mtp.cpp:736`，命中数还会打印
-> `[mtp] prefix cache: reused N prompt tokens`）、prefill 后调 `pc_commit`（`engine_mtp.cpp:847-849`），
+> **MTP 路径**也支持：`generate_mtp` 对 prompt 调 `pc_admit`（`spec/mtp.cpp:736`，命中数还会打印
+> `[mtp] prefix cache: reused N prompt tokens`）、prefill 后调 `pc_commit`（`spec/mtp.cpp:847-849`），
 > 与调度器是同一套契约。
 
 ---
@@ -122,7 +122,7 @@ pc_snap = base + slot*stride + layer_off + [0, gdn_per)             // GDN
           base + slot*stride + layer_off + gdn_per + [0, conv_per)  // conv
 ```
 
-`pc_snap`（`kernels.h:125-131`）由 `record_forward` 逐层填好（`engine_graph.cpp:931-938`：
+`pc_snap`（`kernels.h:125-131`）由 `record_forward` 逐层填好（`graph.cpp:931-938`：
 `layer_off = gi * (gdn_per + conv_per)`，`gi` 是**全局** GDN 层号）。conv/GDN kernel 在 token 完成一个
 32 块边界时，通过 `step_info::pc_row_slot` 查目标槽并写入：GDN 在 token 索引 `(pbase + t + 1) % 32 == 0`
 处写（`gpu/kernels/gdn.cpp:122-135`），conv 在整行结束时若 `end_tok % 32 == 0` 写（`gpu/kernels/conv.cpp:92`）。
@@ -134,7 +134,7 @@ prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实
 > **同一个机制的第二种用法**：MTP 的 dry verify 需要把递归状态回滚到被接受的 draft 长度，于是
 > `step_info::mtp_dt` 打开时改为**每个 token** 都快照，索引从 `pc_row_slot[t]` 取，目标是
 > `d_mtp_hist_[dev]` 而不是 `d_pc_states`（`kernels.h:98-101`、`gdn.cpp:122-123`、
-> `engine_graph.cpp:948-958`）。布局与前缀缓存的检查点相同，conv 平面必须逐层存在，否则会落进下一层
+> `graph.cpp:948-958`）。布局与前缀缓存的检查点相同，conv 平面必须逐层存在，否则会落进下一层
 > 的 GDN 切片。
 
 ---
@@ -213,7 +213,8 @@ prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实
   留、1024+309 只留 1024；现在只要 batch 里完成了一个完整块就留最深的那个。conv 在
   `cap_b*32` 结束的那个 row 上写窗口（`pc_row_slot[cap_b] >= 0` 时 `last_row_only` 也处理
   非末行），所以两个状态是配套的。**qwen4exp 例外**：它只在自己的 cold chunk 边界恢复，
-  `hc_fwd()` 时保留旧的“批次必须结束在 32 块上”规则，最后的不完整 chunk 不捕获。
+  `pc_block_aligned_capture` 钩子返回 true（generic 行为返回空），此时保留旧的“批次必须结束在
+  32 块上”规则，最后的不完整 chunk 不捕获。
 * 从 `ps.chain` 向前走，收集**缺节点或缺状态**的边界到 `need`。
 * 取 `nsel = min(nneed, pc_max_states)` 个槽。选的是**最深**的 `nsel` 个（`k` 从 `nneed-nsel` 到
   `nneed`），因为后续请求从最深匹配边界恢复；分配时仍**浅→深**迭代，于是最深的槽最新

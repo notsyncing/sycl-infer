@@ -1,5 +1,5 @@
 // DeepSeek-V4.1-Flash mHC kernels.  See ds41_hc.h for the contract; the math
-// mirrors engine_ds41.cpp's hc_mixes/hc_pre/hc_post step for step.
+// mirrors arch/deepseek41/forward_host.cpp's hc_mixes/hc_pre/hc_post step for step.
 #include "ds41_hc.h"
 
 namespace si {

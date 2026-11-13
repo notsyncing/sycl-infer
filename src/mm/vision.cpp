@@ -820,8 +820,11 @@ void vision_model::ensure_w32() const {
 }
 
 vision_model::~vision_model() {
+    if (dev_q && weights.uploaded()) {
+        weights.release(*dev_q);
+    }
     free_dev_ptrs(dev_q,
-                  {dev_weights, d_w32, d_qkv_b32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0, d_gate, d_grid});
+                  {d_w32, d_qkv_b32, d_patch_w, d_patch_in, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_mm0, d_gate, d_grid});
     delete gemm;
     gemm = nullptr;
 }
@@ -861,7 +864,7 @@ bool vision_model::linear_dnnl(sycl::queue & q, const void * key, const float * 
 void vision_model::upload(sycl::queue & q) {
     vision_load_timer lt;
     pin_dev_queue(dev_q, q, "vision");
-    if (dev_weights) {
+    if (weights.uploaded()) {
         return;
     }
     const int E = hp.n_embd;
@@ -944,7 +947,6 @@ void vision_model::upload(sycl::queue & q) {
     // Weight blob.  Compact when every linear is on the int8 path; otherwise
     // the whole file is mapped 1:1 so a vit_gemm fallback can still read any
     // tensor at its GGUF offset.
-    blob_spans.clear();
     if (all && compact_ok) {
         // the host-side tensor each linear was converted from
         std::vector<const void *> linear;
@@ -977,31 +979,17 @@ void vision_model::upload(sycl::queue & q) {
             return false;
         };
         size_t need = 0;
+        std::vector<weight_span> spans;
         for (const gguf_tensor_info & t : gguf.tensors) {
             if (!t.data || t.nbytes() == 0 || is_linear(t.data)) {
                 continue;
             }
-            blob_spans.push_back(blob_span{(const char *)t.data, (size_t)t.nbytes(), need});
+            spans.push_back(weight_span{t.data, (size_t)t.nbytes(), need});
             need += (size_t)t.nbytes();
         }
-        std::sort(blob_spans.begin(), blob_spans.end(),
-                  [](const blob_span & a, const blob_span & b) { return a.host < b.host; });
-        dev_weights_size = need;
-        dev_weights = sycl::malloc_device(dev_weights_size ? dev_weights_size : 1, q);
-        if (!dev_weights) {
-            throw std::runtime_error("mmproj device allocation failed");
-        }
-        for (const blob_span & sp : blob_spans) {
-            q.memcpy((char *)dev_weights + sp.off, sp.host, sp.bytes);
-        }
-        q.wait();
+        weights.upload_spans(std::move(spans), need, q, "mmproj ");
     } else {
-        dev_weights_size = gguf.map_size;
-        dev_weights = sycl::malloc_device(dev_weights_size, q);
-        if (!dev_weights) {
-            throw std::runtime_error("mmproj device allocation failed");
-        }
-        q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
+        weights.upload_contiguous(gguf.map_base, gguf.map_size, q, "mmproj ");
         // a fallback reads the qwen2vl q/k/v through w32, so that copy must
         // exist and be resident
         if (!host_qkv.empty()) {
@@ -1854,7 +1842,7 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         throw std::runtime_error(why);
     }
 
-    if (!dev_weights) {
+    if (!weights.uploaded()) {
         upload(q);
     }
     if (!d_patch_w) {

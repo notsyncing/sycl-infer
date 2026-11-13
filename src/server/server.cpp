@@ -289,7 +289,7 @@ bool mtp_direct(const engine & e, const gen_params & gp, int n, bool logprobs) {
     // DeepSeek-V4.1-Flash has no batched/scheduler forward: its model-owned walk
     // owns the per-sequence window + compressed caches.  Route it through the
     // same direct generate() path MTP uses (one sequence, no logprobs).
-    if (e.ds41_fwd()) {
+    if (e.owns_request_path()) {
         // All ds41 requests take the direct path: the scheduler's batched
         // paged-KV forward does not exist for this model, so falling through
         // would corrupt/crash.  The callers loop `n` choices; logprobs are

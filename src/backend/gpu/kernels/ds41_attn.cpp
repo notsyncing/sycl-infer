@@ -1,5 +1,5 @@
 // DeepSeek-V4.1-Flash MLA attention, compressor, indexer, RoPE and fp4
-// rounding.  The math mirrors engine_ds41.cpp (sparse_attn, compressor,
+// rounding.  The math mirrors arch/deepseek41/forward_host.cpp (sparse_attn, compressor,
 // indexer, rope_one, fp4_round_row); see ds41_attn.h for the contracts.
 #include "ds41_attn.h"
 

@@ -27,6 +27,11 @@ curl -L -o MinerU2.5-Pro-2605-1.2B.mmproj-f16.gguf  $B/MinerU2.5-Pro-2605-1.2B.m
 
 ## 2. 文本主干（`qwen2vl`）
 
+代码位置：`src/model/arch/qwen2vl/{load,profile}.cpp`（loader 与完整
+`model_profile`；`fwd = generic_plan`，因此没有 `src/engine/arch/qwen2vl/`——
+共享 `seg_plan`/`record_forward` 直接运行它）。分层契约见
+[24-arch-modules.md](24-arch-modules.md)。
+
 几何（来自 GGUF 元数据）：24 层、`n_embd` 896、`n_ff` 4864、14 个 query 头 /
 2 个 KV 头（`head_dim` 64）、RoPE sections `[8,12,12,0]`、base 1e6、每层都是
 full attention、tied `output`。
@@ -135,8 +140,8 @@ F16/F32/BF16 源都支持（`add_weight` 的 switch 与 `dequantize_row`）。
 
 **上传是紧凑的**：所有线性层都注册到 oneDNN 之后，设备内核真正读的只有
 norms/biases（1.32 GB 文件里的 3.7 MB），所以 `PF_VISION_COMPACT=1`（默认）
-只上传这些 span，`dev_ptr` 走 `blob_spans` 的二分查找；`PF_VISION_COMPACT=0`
-恢复整文件 1:1 映射（回退/A/B）。
+只上传这些 span（`weight_store::upload_spans`），`dev_ptr` 委托 `weights.ptr()` 做二分查找；
+`PF_VISION_COMPACT=0` 恢复整文件 1:1 映射（`upload_contiguous`，回退/A/B）。
 
 **验证**：对同一张 1036×1036 页面，和 llama.cpp `llama-mtmd-cli` 的
 `MTMD_DEBUG_EMBEDDINGS` 输出逐元素比较：1369 个 merged token × 896 维，

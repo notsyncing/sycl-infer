@@ -55,7 +55,7 @@
 |---|---|
 | `kd::gemm_ws()` | 进程级单例，未按 queue 索引（`src/backend/gpu/kernels/dp4a_common.cpp:10`），被 `dp4a_gemv.cpp` / `dp4a_gemm.cpp` 的 decode 路径使用。同卡两个 engine → 静默数据竞争 |
 | 同进程第二个 engine | AGENTS.md 已记录："an MTP-enabled engine followed by a DFlash one fails at construction"；`test_spec` 因此被设计成"一配置一进程" |
-| `engine_dflash.cpp` 的 `static sycl::event` | 进程级 |
+| `spec/dflash.cpp` 的 `static sycl::event` | 进程级 |
 | oneDNN primitive 缓存 | 每个 `dnnl_gemm` 实例一份 → 每 engine 一份（**跨进程也一样，省不了**） |
 
 ### 2.4 显存预算已有现成旋钮

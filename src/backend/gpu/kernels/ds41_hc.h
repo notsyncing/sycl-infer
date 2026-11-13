@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // DeepSeek-V4.1-Flash hyper-connection (mHC) kernels.
 //
-// One token's full mixer, matching `engine_ds41.cpp`'s `hc_mixes` / `hc_pre` /
+// One token's full mixer, matching `arch/deepseek41/forward_host.cpp`'s `hc_mixes` / `hc_pre` /
 // `hc_post` exactly (same order, same eps placement):
 //
 //   flat   = h.view(hc*d)                       row-major (stream, element)

@@ -526,7 +526,7 @@ void at_rope1d_launch(sycl::queue & q, float * qkv, int qkv_stride, int n_tok, i
 // is a separate 5-layer model with head_dim 128, no attention gate, non-causal
 // attention inside its own draft block and a *ring* K/V cache (the cell for
 // absolute position p is p % ring), so none of the main-model attention kernels
-// apply.  See engine_dflash.cpp for the forward that drives them.
+// apply.  See spec/dflash.cpp for the forward that drives them.
 
 // Strided row capture for the draft's target-feature buffer (see dflash.cpp).
 void df_capture_launch(sycl::queue & q, const float * src, float * dst, int n_rows, int n, int dst_row_stride);

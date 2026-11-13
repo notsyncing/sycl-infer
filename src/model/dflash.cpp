@@ -1,7 +1,7 @@
 // DFlash / DFlash2 draft-model loader.  See dflash.h for what the architecture is.
 #include "dflash.h"
 
-#include "model_arch.h"
+#include "arch_util.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -170,17 +170,38 @@ void dflash_model::load(const std::string & path, int target_n_embd, int target_
     }
 }
 
+dflash_model::~dflash_model() {
+    release();
+}
+
+void dflash_model::release() {
+    if (dev_q && weights.uploaded()) {
+        weights.release(*dev_q);
+    }
+    dev_q = nullptr;
+}
+
 void dflash_model::upload_f32(sycl::queue & q) {
+    if (weights.uploaded()) {
+        return;
+    }
+    dev_q = &q;
+    std::vector<weight_span> spans;
+    size_t off = 0;
     auto up = [&](const void * p, size_t bytes) {
-        if (!p || dev.count(p)) {
+        if (!p) {
             return;
         }
-        void * g = sycl::malloc_device(bytes, q);
-        if (!g) {
-            throw std::runtime_error("dflash: device allocation failed");
+        // The old map skipped a pointer that was already uploaded; keep that
+        // (several layers can share a norm tensor) and assign sequential
+        // device offsets.
+        for (const weight_span & s : spans) {
+            if (s.host == p) {
+                return;
+            }
         }
-        q.memcpy(g, p, bytes).wait();
-        dev[p] = g;
+        spans.push_back(weight_span{p, bytes, off});
+        off += bytes;
     };
     const size_t en = (size_t)hp.n_embd * 4;
     up(enc_norm, en);
@@ -199,6 +220,7 @@ void dflash_model::upload_f32(sycl::queue & q) {
             up(L.attn_sinks, (size_t)hp.n_head * 4);
         }
     }
+    weights.upload_spans(std::move(spans), off, q, "dflash: ");
 }
 
 size_t dflash_model::bytes() const {

@@ -1,6 +1,6 @@
 // Hermetic test for the ds41 prefix-cache bookkeeping (no GGUF, no GPU).
 //
-// The engine's real payload is a DecState+logits (engine_ds41.cpp); here an int
+// The engine's real payload is a DecState+logits (arch/deepseek41/forward_host.cpp); here an int
 // stands in for it, which is enough to pin the three properties the cache must
 // have: the chained hash identifies a whole prefix, `longest` returns the
 // greatest stored consumed count for a shared prefix, and eviction is LRU by
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "ds41_prefix_cache.h"
+#include "engine/arch/deepseek41/prefix_cache.h"
 
 using namespace si;
 

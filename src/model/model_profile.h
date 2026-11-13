@@ -9,8 +9,8 @@
 // tuning: it walks its own forward pass (hyper-connections, PLE, QSA, a
 // per-expert LRU bank), it cannot use the prefix cache or MTP yet, it wants one
 // decode row and a whole-prompt server prefill, and its file cannot be converted
-// to the SIn/oneDNN weight stores.  Those decisions used to be `m.q4exp`
-// ternaries scattered through engine.cpp and scheduler.cpp.  A model profile
+// to the SIn/oneDNN weight stores.  Those decisions used to be per-model flags
+// scattered through engine.cpp and scheduler.cpp.  A model profile
 // puts them in one auditable place, the same way a device profile does for the
 // GPU.
 //
@@ -44,7 +44,7 @@ namespace si {
 struct model_profile {
     // How the forward pass is executed.  `generic_plan` is the shared
     // seg_plan/record_forward path; `hc_ple_qsa` is the qwen4exp walk
-    // (engine_q4exp.cpp), which cannot be expressed as the generic plan.
+    // (arch/qwen4exp/forward.cpp), which cannot be expressed as the generic plan.
     enum class fwd_kind { generic_plan, hc_ple_qsa, deepseek41 };
 
     // Which vision tower an mmproj for this architecture is.  The loader
@@ -149,19 +149,37 @@ struct model_profile {
         bool mtp = true;
         bool dflash = true;
         bool multimodal = true;
+        // A multimodal prompt must go through the model's own forward chunker.
+        // The generic mm driver feeds one kMaxT row per prefill_chunk, which is
+        // exactly the path a model-owned forward (qwen4exp: hyper-connections,
+        // PLE, QSA and the per-expert bank) bypasses; its whole-prompt
+        // batching is where those live.  This is the declarative capability the
+        // loader used to publish separately from the profile.
+        bool mm_owned_prefill = false;
         const char * why = "";
     } spec;
 
     moe_owner moe = moe_owner::engine_cache;
 };
 
-// One profile per `general.architecture` value.  The registry rows in
-// src/model/model.cpp point at these; a new architecture needs both a loader and
-// a profile, and model::load refuses a row whose key does not match the loader.
-extern const model_profile kQwen35Profile;    // qwen35
-extern const model_profile kQwen35MoeProfile; // qwen35moe
-extern const model_profile kQwen4ExpProfile;  // qwen4exp
-extern const model_profile kQwen2VlProfile;   // qwen2vl
-extern const model_profile kDeepseek41Profile; // deepseek41
+// The name of a forward kind, for the PF_MODEL_INFO banner.  It lives here (not
+// in the generic model.cpp) so the generic registry does not have to name an
+// architecture to report it; the enum itself is the architecture vocabulary.
+inline const char * fwd_kind_name(model_profile::fwd_kind k) {
+    switch (k) {
+    case model_profile::fwd_kind::hc_ple_qsa:
+        return "hc_ple_qsa";
+    case model_profile::fwd_kind::deepseek41:
+        return "deepseek41";
+    default:
+        return "generic_plan";
+    }
+}
+
+// One profile per `general.architecture` value, owned by that architecture's
+// `src/model/arch/<arch>/profile.cpp` and published through its `load.h` as
+// `<arch>_profile()`.  The internal table in `src/model/arch/registry.cpp` points
+// at those; a new architecture needs both a loader and a profile, and
+// model::load refuses a row whose key does not match the loader.
 
 } // namespace si

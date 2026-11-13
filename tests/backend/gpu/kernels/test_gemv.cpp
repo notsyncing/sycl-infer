@@ -38,7 +38,7 @@ static void check_gemv(engine & e, const std::string & name, int TB) {
     e.q.memcpy(dx, hx.data(), hx.size() * 4).wait();
 
     gemv_seg s{};
-    s.w = e.m.dev_ptr(ti->data);
+    s.w = e.ws_.ptr(ti->data);
     s.type = ti->type;
     s.K = K;
     s.n_rows = N;

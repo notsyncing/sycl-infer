@@ -23,9 +23,11 @@
 #pragma once
 
 #include "model.h" // wt, hparams-free tensor view, bind_tensor/bind_f32
+#include "weight_store.h"
+
+#include <sycl/sycl.hpp> // the drafter owns its device copy (upload_f32)
 
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace si {
@@ -84,19 +86,28 @@ struct dflash_model {
     wt sel_next;            // [rank, n_vocab]
     std::vector<dflash_layer_t> layers;
 
-    // device USM pointers for the *unquantized* tensors (norms, conv bases).
-    // Every quantized tensor lives on the device through its native/int8 store
-    // (registered in the device's dnnl_gemm table, keyed by the host pointer),
-    // so nothing else needs a raw device copy.
-    std::unordered_map<const void *, void *> dev;
-    void * dev_reserved = nullptr;
+    // Device copies of the *unquantized* tensors (norms, conv bases, sinks),
+    // held as a compact span blob by the backend store.  Every quantized tensor
+    // lives on the device through its native/int8 store (registered in the
+    // device's dnnl_gemm table, keyed by the host pointer), so nothing else
+    // needs a raw device copy.  `dev_q` is the queue the blob was allocated on.
+    weight_store weights;
+    sycl::queue * dev_q = nullptr;
+
+    dflash_model() = default;
+    ~dflash_model();
+    dflash_model(const dflash_model &) = delete;
+    dflash_model & operator=(const dflash_model &) = delete;
 
     void load(const std::string & path, int target_n_embd, int target_n_vocab);
     // upload the f32 tensors to `q`'s device
     void upload_f32(sycl::queue & q);
+    // free the device copies (idempotent; the destructor calls it, and the
+    // engine calls it while its queues are alive)
+    void release();
     const void * dev_ptr(const void * host) const {
-        auto it = dev.find(host);
-        return it == dev.end() ? host : it->second;
+        const void * p = weights.ptr(host);
+        return p ? p : host; // identity on a tensor that was never uploaded
     }
     const float * dev_f32(const float * p) const {
         return (const float *)dev_ptr(p);

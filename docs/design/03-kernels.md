@@ -97,12 +97,12 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
 | `slm.*` | `budget_bytes` | `w4_gemv.cpp` 的 `fits(RB)` 判据 | staging tile 的 `fits(RB)` 判据；48 KB 是在 64 KB 硬件上限下的**主动预留** |
 | `moe.*` | `cfg_gate` / `cfg_down` / `cfg_dec` | `moe.cpp` 的 `moe_cfg_for(q, down, dec)` | 分组 expert GEMM 的 tile case（寄存器预算 sweep 的编号）；`cfg_dec = 0` 是 auto（单 token 一行、批式两行） |
 | | `flat` / `flat_dec` | `moe_grp_gate_up_launch` 的 `profile_flag` | 行 tile 放进 grid（prefill / decode） |
-| | `dp4a` / `dp4a_dec` | `engine_graph.cpp` 的 `moe_call`（按本层队列解析） | 分组 dp4a expert GEMM（prefill / decode） |
-| | `upload_ring` / `pf_wmin` | `engine_q4exp.cpp` 的 `q4_upload_init` / 两遍 prefill | qwen4exp 的 pinned expert-upload ring 槽数、两遍 prefill 的最小 workspace |
+| | `dp4a` / `dp4a_dec` | `graph.cpp` 的 `moe_call`（按本层队列解析） | 分组 dp4a expert GEMM（prefill / decode） |
+| | `upload_ring` / `pf_wmin` | `src/engine/arch/qwen4exp/forward.cpp` 的 `q4_upload_init` / 两遍 prefill | qwen4exp 的 pinned expert-upload ring 槽数、两遍 prefill 的最小 workspace |
 | `attn.*` | `vec` / `dec_group` | `gpu/kernels/attn.cpp` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
 | | `xmx` / `xmx_min_keys` | `attn_xmx.cpp` | oneDNN prefill attention 开关与键数门槛 |
 | | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp` | gather 一级 max 归约的工作组数与上限 |
-| | `split_keys` | `engine_graph.cpp`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
+| | `split_keys` | `graph.cpp`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
 | `wt.*` | `w4` / `k5` / `cb4` | `engine.cpp` | 原生 u4 / 5-bit / codebook 存储的默认 |
 | `hw.*` | `compute_units` | `engine.cpp` | SYCL 查不到 EU 数时的兜底 |
 | | `max_work_group_size` | `device_registry.cpp` 的 `max_wg` 兜底 | `wg_clamped()` 的兜底 |
@@ -127,7 +127,7 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
    `device_registry.cpp` 的 `for_queue`），修好后 verify 221 → 85 ms、cycle 255 → 107 ms。
 
 **`moe_grp_tile_rows(q, down, dec)` 是 tile 的公共解析器。** `moe_grp_go` 的 dispatch 和
-`engine_graph` 的 `PF_MOE_HIST` 调度模型都调它，因此诊断打印的 M 与实际 kernel 用的 M 不会
+`graph.cpp` 的 `PF_MOE_HIST` 调度模型都调它，因此诊断打印的 M 与实际 kernel 用的 M 不会
 分叉。它只用于诊断/代价模型，不改变 dispatch 本身。
 
 **每张卡必须自己写全，包括 provenance。** `arc_a770.cpp` 的 `.provenance` 串与逐字段注释给出
@@ -372,7 +372,7 @@ launch。** GDN 的 `ssm_alpha` / `ssm_beta` 是两个同 K、同量化激活的
 * **必须记录的坑**：`i8_grp_seg` 描述符要**按值**拷进 lambda 闭包（`w4_gemv.cpp:312-320`）。调用方把它
   们放在主机栈上，设备侧解引用读到的是零——一个看起来完全正常、**静默为空**的 GEMV，实测还"快"了
   1.9 ms。按值拷贝才会进 kernel 参数 blob。
-* 默认开（`engine_graph.cpp:708` 的 `PF_NOFUSE` 关掉、`PF_FUSEDBG=1` 打 trace）。它用的是 M=1 GEMV 的
+* 默认开（`graph.cpp:708` 的 `PF_NOFUSE` 关掉、`PF_FUSEDBG=1` 打 trace）。它用的是 M=1 GEMV 的
   累加顺序而非 `nat_gemm` 的，所以会重排 emit 流的接受率：一个 prompt 上 1.64 → 1.53，另两个不变
   （`-1.1 … +0.9 ms/token`）。
 
@@ -708,7 +708,7 @@ layer-0 `mixed` 逐位相同；96-token decode 的三档 ISA 端到端相同（`
 **LRU / 两遍 prefill（engine 侧，不新增 kernel）**
 
 qwen4exp 的每专家 LRU、pinned expert source（`PF_Q4_PIN_SRC`，63.0 GiB / 47 层 69.8 GiB）、
-32-slot staging ring 回退和两遍 prefill 调度都在 `engine_q4exp.cpp`，不在 kernel 里：slot map
+32-slot staging ring 回退和两遍 prefill 调度都在 `src/engine/arch/qwen4exp/forward.cpp`，不在 kernel 里：slot map
 是纯主机侧决定，kernel 仍然只判断 `slot < 0` 就返回。推荐 bank 是 121 slots × 47 层
 （16.5 GiB，含四个 Q8_0-down 层；layer 2 的 decode-only bank
 `PF_Q4_BANK_Q5K=1` 实测 107.2 ms，比 host 的 93.3 慢，保持关闭）。两遍的每一批都以

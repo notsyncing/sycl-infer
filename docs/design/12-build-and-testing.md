@@ -191,6 +191,8 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_pc_ram` | 无 | CPU | RAM 层 LRU 记录存储 |
 | `test_yarn` | 无 | CPU | YaRN 每对维度频率表（`src/common/yarn.h`）：factor=1 逐位等于原表、ramp 两个锚点按位、单调性、mscale 与 clamp、退化输入 |
 | `test_model_profile` | 无 | CPU | loader registry 每一行都带 profile，且 `prof->key` 逐字节等于 `general.architecture`；qwen4exp 的 policy/几何/权重表示/能力值被钉住；qwen35/qwen35moe 除身份与 MoE 说明外逐字段一致 |
+| `test_arch_ops` | 无 | CPU | `kArchOps[]` 的行形状（不调用任何钩子）：`generic_plan` 无行；qwen4exp 的钩子齐全且 `hist_report == nullptr`（teardown 自己打印，通用路径不得重复）、无 `dense_store`；ds41 的 `owns_kv_pool`/`owns_request_path`/`host_keep_routed_experts`/`!md_dnnl`/`generate`/`setup`/`setup_weights`/`destroy`/`dense_store` |
+| `arch_boundaries` | 无 | CPU | `ci/check_arch_boundaries.py`：七个通用文件（comments/strings 剥离后）不得出现架构名、`q4_*`/`ds41_*`、`q4x_`/`ds41x_`、model-owned `fwd_kind`、`arch_profile` 或 `arch/...` include；见 [24-arch-modules.md](24-arch-modules.md) §8 |
 | `test_mm_step` | 无 | CPU | `mm_write_step` 的逐 token M-RoPE/`img_row` 切片（含 chunk 边界落在图像块中间）、越界切片/过小 section stride 必须抛错、`has_encoded_embd` 的缺编码器判据 |
 | `test_dev_profile` | 无 | CPU | 设备 profile 的判定与回退（A770 / Iris / 混合 / 未知），`moe.*`、`shape.*` 的取值，以及 `unknown` 行必须是 A770 的完整拷贝且硬件事实清零 |
 | `test_multimodal` | 0.8B + mmproj | CPU+GPU | 图像预处理几何、host/device 视觉编码器、位置与 prompt 布局、逐 kernel 对照；音频解码/mel、AuT 塔 |
@@ -236,7 +238,9 @@ sampler、请求/响应解析、前缀缓存存储层、控制面、URL/SSRF 策
 CLI 的 `--help`/未知参数契约，以及 `test_multimodal --video-only` 的
 合成视频/视觉宽度测试（ffmpeg 可缺席，AVI 测试仍运行）；它们必须已构建。
 `test_kv_type` / `test_quant_synth` / `test_chat_builtin` 是 2026-11 新增的
-三条完全无模型用例。模型测试必须显式配置
+三条完全无模型用例。默认 hermetic 集合为 **38** 条，其中 `test_arch_ops`（`kArchOps[]`
+行形状）与 `arch_boundaries`（`ci/check_arch_boundaries.py` 的架构边界门禁）是 2026-11
+加入的两条（见 [24-arch-modules.md](24-arch-modules.md) §8）。模型测试必须显式配置
 `-DSI_REGISTER_GPU_TESTS=ON -DSI_TEST_08B_MODEL=/path/to/0.8b.gguf`；
 另外给 `SI_TEST_27B_MODEL`（可再给 `SI_TEST_DFLASH_MODEL`）才注册双卡 27B
 测试，自动设置 `TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1`。用
@@ -381,13 +385,13 @@ TEST_LAYER_MAP=0-11:gpu.0,12-23:cpu   ./build/test_decode_vs_prefill  # OK
 4. `attn` 的 `attn.vec`/`dec_group` 与 `attn_xmx`/`gemm_dnnl` 的开关；
 5. `moe.cpp` 的 tile case 与 grid 门（`PF_MOE_CFG`/`_DOWN`/`_DEC`、`PF_MOE_FLAT`/
    `_DEC`）——`moe_cfg_for(q, down, dec)` 读本队列的 `profile.moe.*`；
-6. `engine_graph.cpp` 的 dp4a 门（`PF_MOE_DP4A`/`_DEC`）与 `PF_MOE_HIST` 的 tile
+6. `graph.cpp` 的 dp4a 门（`PF_MOE_DP4A`/`_DEC`）与 `PF_MOE_HIST` 的 tile
    （`moe_grp_tile_rows(q, ...)`，不再是 "cfg 43 => 8，否则 16" 的猜测）；
 7. `gemv.cpp` 的 F32 / Q8_0 窄形状 split 行门槛与 WPR（`shape.f32_rows`/`q8_rows`、
    `split.max`）；
 8. `w4_gemv.cpp` 的原生权重 GEMV 每工作组行数（`shape.w4_rows_per_wg`，u4 /
    i8-grouped / cb4 共用）；
-9. `engine_q4exp.cpp` 的 `moe.upload_ring` / `moe.pf_wmin`。
+9. `src/engine/arch/qwen4exp/forward.cpp` 的 `moe.upload_ring` / `moe.pf_wmin`。
 
 为此加了 `si::dev::profile_int` / `profile_flag`：env 部分在所有卡上相同、读一次缓存，
 profile 默认值按调用从该卡的 queue 读——**不要**再写回 `static const = []{ active()... }()`，
@@ -502,9 +506,11 @@ src/backend/    → docs/design/02-quantization.md
 src/backend/gpu/kernels/    → docs/design/03-kernels.md §1-13
 src/backend/cpu/kernels/    → docs/design/03-kernels.md §14, docs/architecture.md §11
 src/backend/cpu/    → docs/design/03-kernels.md §14, docs/architecture.md §11（设备选择与多设备执行）
-src/model/      → docs/design/01-model-loading.md（含 model_profile / profiles/）, 08-tokenizer.md, 11-qwen35-model.md
+src/model/      → docs/design/01-model-loading.md（含 model_profile / arch/）, 08-tokenizer.md, 11-qwen35-model.md, 24-arch-modules.md
+src/model/arch/<arch>/  → docs/design/24-arch-modules.md §1（每架构 load/profile，model-owned 还有 hparams/tensors/accessors）
 src/mm/         → docs/design/10-multimodal.md, 13-audio-video.md
-src/engine/     → docs/design/04-engine.md, 05-kv-cache.md, 06-prefix-cache.md, 07-sampler.md
+src/engine/     → docs/design/04-engine.md, 05-kv-cache.md, 06-prefix-cache.md, 07-sampler.md, 24-arch-modules.md
+src/engine/arch/<arch>/  → docs/design/24-arch-modules.md §1/§6（forward、runtime 钩子、组合状态）
 src/server/     → docs/design/09-server.md
 dev/            → 本文档 §1.5（本地未跟踪，不属于本仓库）
 tests/backend/gpu/  → docs/design/03-kernels.md, 06-prefix-cache.md

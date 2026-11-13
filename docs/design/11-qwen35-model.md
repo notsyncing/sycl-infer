@@ -1,6 +1,6 @@
 # 设计 11：Qwen3.5 混合模型
 
-覆盖 `src/model/qwen35.cpp` 以及它在引擎/内核中的执行路径。通用加载机制见
+覆盖 `src/model/arch/qwen35/load.cpp` 以及它在引擎/内核中的执行路径。通用加载机制见
 [01-model-loading.md](01-model-loading.md)，kernel 细节见 [03-kernels.md](03-kernels.md)。
 
 ---
@@ -35,8 +35,8 @@ paged KV slice。见 §3.2。
 
 ## 2. 超参数
 
-来自 Qwen3.5 的 GGUF 元数据（`qwen35.cpp:19-46`）。加载器用一个 `key()` 闭包把所有元数据键加上
-`"qwen35."` 前缀（`qwen35.cpp:17`），所以下表里的短名都实际带前缀：
+来自 Qwen3.5 的 GGUF 元数据（`src/model/arch/qwen35/load.cpp:19-46`）。加载器用一个 `key()` 闭包把所有元数据键加上
+`"qwen35."` 前缀（`src/model/arch/qwen35/load.cpp:17`），所以下表里的短名都实际带前缀：
 
 | `hparams` 字段 | GGUF key |
 |---|---|
@@ -55,7 +55,7 @@ paged KV slice。见 §3.2。
 `attn_scale = 1/sqrt(head_dim)`；`rope_sections` 全零表示普通 RoPE，非零时启用文本模型的交错 M-RoPE。
 
 ⚠️ **`block_count` 包含 NextN 层**。`load_qwen35` 算的是
-`hp.n_layer = block_count - n_layer_nextn`（`qwen35.cpp:20-23`），所以：
+`hp.n_layer = block_count - n_layer_nextn`（`src/model/arch/qwen35/load.cpp:20-23`），所以：
 
 * 0.8B 的 GGUF **没有** `qwen35.nextn_predict_layers`，`hp.n_mtp == 0`、`hp.n_layer == 24`，
   `--mtp` 在它上面是 no-op（`engine.cpp` 的「无 NextN 头」门控 打一行 `[mtp] model has no NextN (blk.%d.nextn.*)
@@ -85,11 +85,11 @@ paged KV slice。见 §3.2。
 
 ---
 
-## 3. 加载器张量绑定（`qwen35.cpp`）
+## 3. 加载器张量绑定（`src/model/arch/qwen35/load.cpp`）
 
 ### 3.1 主干
 
-全局（`qwen35.cpp:48-57`）：
+全局（`src/model/arch/qwen35/load.cpp:48-57`）：
 
 | 张量 | 目标 |
 |---|---|
@@ -127,7 +127,7 @@ paged KV slice。见 §3.2。
 `ssm_a` / `ssm_dt` / `ssm_norm` 是 f32；`ssm_conv1d.weight` 在 GGUF 里是**转置**的 `[conv_k, qkv_dim]`
 （0.8B：`[4, 6144]`），只能按裸 f32 数组读，见 [01-model-loading.md §2.5](01-model-loading.md)。
 
-### 3.2 MTP / NextN 草稿层（`qwen35.cpp:96-118`）
+### 3.2 MTP / NextN 草稿层（`src/model/arch/qwen35/load.cpp:96-118`）
 
 `hp.n_mtp > 0` 时才绑定，前缀是 `blk.<hp.n_layer>.`——**注意它不在主干的层循环里**
 （`m.layers` 只有 `hp.n_layer` 个元素，`gdn_layer_index` 也不含它），而是独立的 `m.mtp`
@@ -160,7 +160,7 @@ eh_proj( concat( enorm(emb(t_p)), hnorm(h_{p-1}) ) ) -> 一个 full-attention Qw
 * 它的 f32 norm 上传到 `--mtp-device` 指定的那个分区，线性层（`eh_proj` 与 block 里的 7 个矩阵）的
   oneDNN/u4 转换也发生在该分区的权重表里；而草稿用的 shared LM head
   （`M.shared_head` 或 `m.output`）**永远在主设备 0 上**，因为它和主干 head 共用一张表
-  （`engine.cpp` 的 `split_md_phases`、`engine_mtp.cpp` 的 MTP plan 原始拷贝）。
+  （`engine.cpp` 的 `split_md_phases`、`spec/mtp.cpp` 的 MTP plan 原始拷贝）。
 
 ---
 
@@ -196,10 +196,10 @@ gemv: ssm_out -> d_x (+ residual d_x)
   `S = g*S + k⊗del`、`out = (S·q)*scale`。
 * `gated_norm`：`out = a * rsqrt(mean(a²)+eps) * ssm_norm * silu(z)`。
 * 模式 2（chunk 批量 prefill）下 `PF_GDN_FUSE>=1`（默认 2）整批融合：**一次** `conv_l2` + **一次**
-  `conv_state_update` + **一个** `gdn` dispatch（`engine_graph.cpp:978-1007`）。非融合路径是每行 3 次
-  dispatch（`conv_l2` + `conv_state_update` + `gdn`，`engine_graph.cpp` 的 `record_forward` GDN dispatch 段），而 `gated_norm`
-  两种路径都只调一次、覆盖整批（`engine_graph.cpp` 的 `record_forward` 批级调用处）。
-* 融合路径的 `gdn` 用 `kMaxT` 作为行数、`tpb` 作为 token 数（`engine_graph.cpp:994-996`）；非融合路径
+  `conv_state_update` + **一个** `gdn` dispatch（`graph.cpp:978-1007`）。非融合路径是每行 3 次
+  dispatch（`conv_l2` + `conv_state_update` + `gdn`，`graph.cpp` 的 `record_forward` GDN dispatch 段），而 `gated_norm`
+  两种路径都只调一次、覆盖整批（`graph.cpp` 的 `record_forward` 批级调用处）。
+* 融合路径的 `gdn` 用 `kMaxT` 作为行数、`tpb` 作为 token 数（`graph.cpp:994-996`）；非融合路径
   逐行走 `row0 = r0`。`nreal_arg` 是这里唯一的例外开关：融合路径用一行走完整批
   （`nreal_arg > 0 ? nreal_arg : row_nr(...)`，`gdn.cpp:53-59`）——没有它，kernel 只处理第 0 行的
   `kMaxT` 个 token，后续 chunk 行读到陈旧递归状态，这就是 mode-2 prefill 的那个 bug。
@@ -263,7 +263,7 @@ gemv: ffn_down (SiLU 门控)
   （0.8B 上是 Q8_0，形状 `[n_embd, dt_rank]`）。
 * `PF_DP4A` 时 `build_w8` 为 **`output`（LM head）**、FFN 三线性、GDN 的 `wqkv/wgate/ssm_out`、
   attention 的 `wq/wk/wv/wo` 构建 SIn int8 副本；`ssm_beta`/`ssm_alpha`/norm 不复制
-  （`model::build_w8`，`model_w8.cpp:91` 起）。`output` 的 SIn 副本只有 8-bit 类型可精确表示，5/6-bit（Q5_K/Q6_K）与
+  （`weight_store::build_w8`，`src/backend/weight_store.cpp`）。`output` 的 SIn 副本只有 8-bit 类型可精确表示，5/6-bit（Q5_K/Q6_K）与
   codebook 型（IQ*）的精度损失见 [02-quantization.md](02-quantization.md)。
 * **`m.output` 与 `m.tok_embd` 未必是同一张量**：GGUF 没有 `output.weight` 时加载器把 `m.output`
   指向 `tok_embd`（0.8B），27B 则自带独立的 Q6_K `output.weight`。任何算 logits 的地方都必须用

@@ -29,6 +29,7 @@ committed doc is a dead link for everyone who clones the tree.
 | [Testing](#testing) | hermetic layer, GPU layer, the five mandatory tests |
 | [Repository layout](#repository-layout) | where each module lives |
 | [How to extend](#how-to-extend) | a model, a kernel, a stage test, multimodal |
+| [Architecture modules](docs/design/24-arch-modules.md) | the model/engine layer split, the two registries and the boundary gate |
 | [The ONNX model service](#the-onnx-model-service-the-document-pipeline) | the document pipeline |
 | [Device profiles](#device-profiles-where-a-gpu-specific-number-belongs) | per-card tuning |
 | [Model profiles](#model-profiles-where-an-architectures-policy-belongs) | per-architecture policy |
@@ -47,8 +48,9 @@ the *conclusions* and the invariants, not a second copy of every table.
 A general-purpose from-scratch C++17 + SYCL LLM inference engine for quantized
 GGUF models on Intel GPUs.  The reference model used for development and testing
 is **Qwen3.5-0.8B (Q4_K_M)** on Iris Xe-LP, but the engine is architecture-
-agnostic: model types are selected through the registry in
-`src/model/model_arch.h` / `model.cpp`.  It contains: a GGUF loader, a quantized
+agnostic: model types are selected through the public registry seam
+(`src/model/arch/registry.h`) and the internal table in
+`src/model/arch/registry.cpp`.  It contains: a GGUF loader, a quantized
 SYCL kernel library, a paged-KV continuous-batching engine with a reusable prefix
 cache, and an OpenAI-compatible HTTP server plus a CLI.
 
@@ -122,6 +124,12 @@ measurements and gotchas.
   the worker's `/v1/pipelines/{id}/run`, the router's dedicated proxy, and the
   boundary with `/v1/models` / `/v1/chat/completions`.  MinerU is deliberately
   *not* a pipeline; it is a client/reference tool under `tools/mineru/`.
+* [`docs/design/24-arch-modules.md`](docs/design/24-arch-modules.md) — the
+  model/engine architecture contract: the `src/model/arch/<arch>` /
+  `src/engine/arch/<arch>` layout, `kLoaders[]` and `kArchOps[]`,
+  `arch_hparams`/`arch_layer`/`arch_model_extras`, the profile-vs-`arch_ops`
+  split, the steps for adding a generic-plan or a model-owned forward, and the
+  `arch_boundaries` gate + `test_arch_ops`.
 * [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **the measured throughput
   table**: prefill and decode by context depth and batch size, per model and
   per speculative path, each with the hardware, the build, the harness and the
@@ -444,6 +452,11 @@ src/device/     device_profile.h (the `profile` struct + the registry API),
                 arc_a770, iris_xe) — see "Device profiles" below
 src/backend/    backend.h (compute_backend abstraction), dnnl_gemm.{h,cpp}
                 (optional oneDNN int8 matmul, PF_GEMM_DNNL),
+                weight_store.{h,cpp} (the engine's single device weight store:
+                the text whole-mmap blob, the single-device SIn copies and the
+                per-device w8 maps, plus the generic contiguous/span blob API
+                used by the vision and audio mmprojs and the DFlash f32 copies;
+                model.h includes no SYCL),
                 gpu/gpu_backend.cpp (forwards to the SYCL kernels),
                 cpu/cpu_backend.cpp (converts the PODs, calls the host kernels),
                 cpu/cpu_types.h (SYCL-free mirror structs + launch decls)
@@ -476,13 +489,22 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                   NOT the XMX unit, see the "XMX is a name, not a unit" note
                   below; PF_ATTN_XMX below), qsa (the Stage 2 device gather +
                   scratch step_info for QSA; src/backend/gpu/kernels/qsa.cpp)
-src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load/upload + bind helpers),
-                qwen2vl.cpp (Qwen2-VL dense decoder / MinerU trunk), profiles/qwen2vl.cpp,
-                model_arch.h (architecture registry), model_profile.h (the
-                declarative per-architecture policy), profiles/<arch>.cpp (one
-                architecture's complete profile: key, values, provenance),
-                qwen35.cpp, model_w8.cpp, tokenizer.{h,cpp} — see "Model
-                profiles" below
+src/model/      gguf.{h,cpp}, model.{h,cpp} (generic load + bind helpers; no SYCL/device API),
+                model_types.h (the generic wt/moe_wt PODs plus the `arch_layer` /
+                `arch_model_extras` pimpl bases whose `visit_weights` /
+                `visit_device_weights` / `visit_host_keep` hooks the generic
+                upload/keep loops call), arch_util.h (shared
+                loader helpers: bind_tensor/bind_f32 + bind_moe/require_meta),
+                arch/registry.h (public `arch::loader` + find/registry; names no
+                architecture) and arch/registry.cpp (the internal hub: the
+                explicit kLoaders[] table, the one model file naming archs),
+                model_profile.h (the declarative per-architecture policy),
+                arch/<arch>/{load.h,load.cpp,profile.cpp} (one directory per
+                architecture: qwen35, qwen35moe, qwen2vl, qwen4exp, deepseek41;
+                load.h declares `load_<arch>()` and `<arch>_profile()`; qwen4exp and
+                deepseek41 also carry tensors.h (their pimpl layer/model extras),
+                accessors.h and their own hparams.h),
+                tokenizer.{h,cpp}, dflash.{h,cpp} — see "Model profiles" below
 src/mm/         vision.{h,cpp} (the ONE mmproj loader + host/device vision encoder;
                 qwen3vl and qwen2vl towers selected by model_profile::vision),
                 image.{h,cpp} (decode + qwen smart-resize/normalize/patchify),
@@ -490,15 +512,33 @@ src/mm/         vision.{h,cpp} (the ONE mmproj loader + host/device vision encod
                 audio.{h,cpp} (audio decode: WAV native / ffmpeg fallback +
                 log-mel), audio_model.{h,cpp} (AuT audio tower: host + device),
                 multimodal.{h,cpp} (prompt expansion + M-RoPE positions)
-src/engine/     engine.{h,cpp} (orchestration), engine_mtp.cpp (MTP plan/forward/
-                verify/rollback + the speculative loop), engine_dflash.cpp (the
-                DFlash2 drafter), engine_graph.cpp (seg_plan,
-                record_forward, build_graphs), engine_kvpool.cpp (dynamic KV
+src/engine/     engine.{h,cpp} (orchestration), engine_types.h (seg_plan and
+                the per-forward call plan), graph.cpp (record_forward,
+                build_graphs), engine_kvpool.cpp (dynamic KV
                 pool), engine_prefix_cache.cpp (VRAM tier + tier demotion),
                 moe_cache.{h,cpp} (the three-tier expert cache),
                 pc_ram.{h,cpp} (host-RAM tier: LRU record store),
                 pc_disk.{h,cpp} (disk tier: record format, index, LRU),
-                sampler.{h,cpp}
+                sampler.{h,cpp};
+                spec/mtp.cpp (MTP plan/forward/verify/rollback + the
+                speculative loop) + spec/mtp_state.h, spec/dflash.cpp (the
+                DFlash2 drafter) + spec/dflash_state.h, spec/verify_scratch.h
+                (the verify cycle's shared argmax staging);
+                arch/qwen4exp/{forward,qsa}.cpp (the model-owned qwen4exp
+                forward and its QSA selector/attention) + state.h + qsa_state.h
+                (the QSA runtime state composed into state.h);
+                arch/arch_ops.h (the public seam: struct arch_ops +
+                arch_ops_for only) and arch/registry_internal.h (the
+                arch_ops_registry hook declarations, internal) +
+                arch/registry.cpp (the table and arch_ops_for);
+                arch/qwen4exp/runtime.cpp and
+                arch/deepseek41/runtime.cpp (the per-arch ops hooks);
+                arch/deepseek41/{forward_host,forward_gpu}.cpp + forward.h
+                (the model-owned DeepSeek-V4.1-Flash host/GPU forward entry
+                points) + dense_store.cpp (its dense oneDNN k5/int8 stores) +
+                prefix_cache.h + state.h
+                (the model-owned DeepSeek-V4.1-Flash host/GPU forwards, their
+                prefix cache and their composed state)
 src/server/     chat.{h,cpp} (render_chat + built-in ChatML fallback),
                 chat_template.{h,cpp} (minja Jinja wrapper for the GGUF
                 tokenizer.chat_template), response_parser.{h,cpp} (streaming
@@ -554,6 +594,9 @@ tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter),
                 test_sse_cancel.cpp (SSE disconnect cancellation: real httplib +
                 real socket reset, no model)
 tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
+                test_arch_ops.cpp (the kArchOps[] rows: generic_plan is null,
+                qwen4exp's hooks incl. hist_report == nullptr, ds41's
+                capabilities and dense_store; never calls a hook),
                 test_decode_vs_prefill.cpp (single-token decode vs re-prefill),
                 test_sched.cpp (the scheduler's token-stream path, and the
                 batched-decode row coverage),
@@ -569,6 +612,10 @@ tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
                 prompts, audio kernels, positions), test_mm_step.cpp (the
                 per-token M-RoPE / image-row slice the generic and model-owned
                 prefill chunkers share)
+ci/             check_arch_boundaries.py: the hermetic gate that fails when a
+                generic engine/model file names an architecture, a per-model
+                state member or a model-owned fwd_kind (see
+                docs/design/24-arch-modules.md)
 src/pipeline/   request-level multi-step orchestration (see
                 docs/design/22-pipelines.md).  `pipeline.h` / `registry.{h,cpp}`
                 define the interface, id registry and availability filter.  The
@@ -644,14 +691,31 @@ every vision tower, which is wrong for a Qwen3-VL file.  If a future
 architecture differs in a way no field represents, add the field to the model
 profile or `hparams` in the same change - do not leave the difference implicit.
 
-1. Create `src/model/<arch>.cpp` defining `si::arch::load_<arch>(model & m)` that
-   fills `m.hp` and binds the layer tensors (copy the structure of
-   `qwen35.cpp`; use `arch::bind_tensor` / `arch::bind_f32`).
-2. Declare it in `src/model/model_arch.h` and register it in the `kLoaders[]`
-   table in `src/model/model.cpp` (`general.architecture` value → loader).
-3. Add the file to `CMakeLists.txt`.  `model::load` dispatches automatically; an
-   unknown architecture still throws `unsupported architecture: <name>`.
-4. `validate_hparams` runs after every loader, so a geometry the kernels do not
+1. **Model side.** Create `src/model/arch/<arch>/load.cpp` defining
+   `si::arch::load_<arch>(model & m)` that fills `m.hp` and binds the layer
+   tensors (copy the structure of `src/model/arch/qwen35/load.cpp`; use
+   `arch::bind_tensor` / `arch::bind_f32` from `arch_util.h`), and
+   `src/model/arch/<arch>/profile.cpp` with the complete `model_profile`
+   (`key` byte-identical to `general.architecture`; `fwd = generic_plan` unless
+   the model owns its forward) plus its `<arch>_profile()` accessor; declare
+   both in the same directory's `load.h`.
+2. Register the row in the `kLoaders[]` table in the internal hub
+   `src/model/arch/registry.cpp` (`general.architecture` value -> loader +
+   `<arch>_profile()`), including the new `arch/<arch>/load.h`.  The public
+   `src/model/arch/registry.h` and `model_profile.h` need no change.
+3. **Engine side, only for a model-owned forward.** A generic-plan architecture
+   stops here: `arch_ops_for(generic_plan)` is null and the shared
+   `seg_plan`/`record_forward` machinery runs it.  A model-owned forward also
+   needs `src/model/arch/<arch>/{hparams,tensors,accessors}.h` (an
+   `arch_hparams` with `wide_head_ok`/`validate`/`validate_profile`, an
+   `arch_layer : arch_layer` and an `arch_model_extras`, plus the checked
+   accessors), `src/engine/arch/<arch>/{forward*.cpp,runtime.cpp,state.h}` and a
+   `kArchOps[]` row in `src/engine/arch/registry.cpp`.  Declare the forward entry
+   points in a local `forward.h`, never in `engine.h`.  See
+   [`docs/design/24-arch-modules.md`](docs/design/24-arch-modules.md).
+4. Add every `.cpp` to `CMakeLists.txt`.  `model::load` dispatches automatically;
+   an unknown architecture still throws `unsupported architecture: <name>`.
+5. `validate_hparams` runs after every loader, so a geometry the kernels do not
    implement is refused at load time, before any device allocation.  This is a
    memory-safety guard, not a precision one: `attn.cpp`'s generic attention uses
    `pstride = 2 + head_dim` for each split's partials and sizes its register
@@ -662,9 +726,15 @@ profile or `hparams` in the same change - do not leave the difference implicit.
    which is the path Qwen2-VL's 64-wide heads take.  Also checked: the GQA ratio,
    the basic extents, `full_attn_interval`, and the GDN geometry.  If your
    architecture needs a geometry outside these, extend the check *and* the kernel
-   together.
+   together; a wide-head architecture opts in through `arch_hparams::wide_head_ok`.
+6. Pin the profile in `tests/model/test_model_profile.cpp`, pin a model-owned
+   row in `tests/engine/test_arch_ops.cpp`, and keep
+   `python3 ci/check_arch_boundaries.py` clean (the gate fails if a generic file
+   names the architecture, the `q4x_`/`ds41x_` state or a model-owned
+   `fwd_kind`).
 
-See [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
+See [`docs/design/24-arch-modules.md`](docs/design/24-arch-modules.md),
+[`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
 [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) for the full
 loading design.
 
@@ -937,7 +1007,7 @@ Startup weight report, `--layer-map 0-31:gpu.0,32-63:gpu.1`:
 ```
 
 The 1248 MiB of imbalance **is** the int8 LM head (248320x5120 at 1.0625 B/w),
-pinned to backend 0 (`engine_graph.cpp` resets `cur_dev = 0` before the head
+pinned to backend 0 (`graph.cpp` resets `cur_dev = 0` before the head
 because `gemv_at` reads `dnnl_for(cur_dev)`).
 
 Per-card VRAM budget, card 0 (card 1 has the same KV and 1248 MiB more room):
@@ -1210,7 +1280,7 @@ Two measurement traps that cost real time and are worth stating once:
 
 The `dev/` harnesses are **gitignored**, so they rot silently and nothing fails until
 you run one.  `dev/bench_mtp.cpp` (the one-process-per-cell MTP sweep) had stopped
-compiling after the MTP state moved into `mspec_state` — and note the trap: the bare
+compiling after the MTP state moved into `mspec_state` (`spec/mtp_state.h`) — and note the trap: the bare
 `engine::mtp_k` that remains is the *config* field the constructor takes, so
 `e.mtp_k = k` silently became a no-op that would have measured a plain decode and
 reported it as speculative.  They are one-file tools compiled by hand, each of which
@@ -1321,7 +1391,7 @@ slots (`--max-slots`, default 16).  `kMaxB` is the compile-time *ceiling* (32),
 so after the ceiling was raised from 16 every GDN layer after the first read or
 wrote past the allocation; the USM copy's source/destination was outside the
 buffer, and the Level Zero driver faulted at enqueue.  The five sites in
-`engine_mtp.cpp` now use `state_slots_` (the same invariant every other
+`spec/mtp.cpp` now use `state_slots_` (the same invariant every other
 `[layer][slot]` stride follows).
 
 Measured after the fix (2x A770, 2026-11-05):
@@ -1660,7 +1730,7 @@ lattice instead of re-drawing per token.  Model `Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 5 layers, `n_embd` 5120, 32/8 heads, `head_dim` 128, block 8, `swa` 2048, mask id
 248070, selector rank 256 / top 16, target layers `[6,20,34,48,62]`.  Files:
 `src/model/dflash.{h,cpp}`, `src/backend/gpu/kernels/dflash.cpp`,
-`src/engine/engine_dflash.cpp`, plus the capture hook in `engine_graph.cpp`.
+`src/engine/spec/dflash.cpp`, plus the capture hook in `graph.cpp`.
 
 #### Acceptance is the whole story, and it is prompt-dependent
 
@@ -1965,14 +2035,15 @@ bound.  The recommended run is all-GPU with a per-expert LRU bank:
   --ctx 2048 --kv-type f16 gen --prompt "..."
 ```
 
-`q4_forward` (`src/engine/engine_q4exp.cpp`) walks the layers itself; HC/PLE do
+`q4_forward` (`src/engine/arch/qwen4exp/forward.cpp`) walks the layers itself; HC/PLE do
 not fit the generic `seg_plan` (one GEMV list per layer plus fixed epilogues).
 It reuses the existing GDN/attention/GEMV launchers and the paged KV pool.  The
 host half is `src/backend/cpu/kernels/q4exp.cpp`; the new device kernels are in
 `src/backend/gpu/kernels/q4exp.cpp` (HC norm/mix/combine, the F32 inject dot,
 the arbitrary-K up GEMV).  The plan builders and recorded decode graphs are
-deliberately skipped; the forward still reads `m.q4exp` (M2 will delegate the
-walk to a runtime object), while the *policy* branches read the model profile.
+deliberately skipped; the forward reads its architecture geometry through
+`q4_hp(m.hp)` (a `qwen4exp_hparams` attached to `hparams::arch`), while the
+*policy* branches read the model profile.
 The prefix cache has its own hooks inside the walk (below), and MTP is gated with
 a printed reason; DFlash has no q4 draft/verify path in this build;
 multimodal is routed through the model's own chunker (see below).  The server's q4 `prefill_batch` has no recorded variant,
@@ -1992,9 +2063,9 @@ slot state; the generated content matched.  `PF_PFB_MAX_M` no longer affects q4
 (it remains a non-q4 A/B knob).
 
 **The engine policy is the model profile (M0+M1).**  `src/model/model_profile.h`
-and `src/model/profiles/qwen4exp.cpp` declare what this architecture is and
+and `src/model/arch/qwen4exp/profile.cpp` declare what this architecture is and
 what it may use; `engine` stores `mp_ = m.prof` and the policy branches read it
-instead of scattering `m.q4exp` tests.  The resolved qwen4exp values are:
+instead of scattered model-flag tests.  The resolved qwen4exp values are:
 `fwd = hc_ple_qsa`; `policy.max_decode_rows = 1`;
 `policy.prefill = whole_prompt`; `policy.prefix_cache = true`;
 `policy.auto_layer_map = true`; `policy.md_splits = true`;
@@ -2022,7 +2093,7 @@ qwen4exp values.
 
 **Multimodal goes through the model's own forward.**  The text GGUF carries no
 vision/audio tensors - the towers are separate mmproj GGUFs, as for every
-architecture.  The qwen4exp loader sets `arch_profile.mm_model_prefill`, and
+architecture.  The qwen4exp profile declares `spec.mm_owned_prefill`, and
 `engine::generate_impl` then hands the whole expanded prompt to
 `q4_prefill_mm` instead of the generic one-`kMaxT`-row loop, which would
 re-upload experts at every 32-token boundary and bypass the HC/PLE/QSA state.
@@ -2043,9 +2114,9 @@ request.  `test_mm_step` (hermetic) pins the slice
 mapping, a chunk boundary inside an image block, and the out-of-range /
 too-small-stride errors.  The model profile's `spec.multimodal` is both
 reported and enforced (`engine::generate_impl` throws for a media prompt on a
-model that declares false); the *routing* capability is the loader's
-`mm_model_prefill`, so a model can only take the model-owned path when its
-loader says it has one.  **The qwen4exp profile now declares
+model that declares false); the *routing* capability is the profile's
+`spec.mm_owned_prefill`, so a model can only take the model-owned path when its
+profile declares it.  **The qwen4exp profile now declares
 `vision = qwen3vl` and `spec.multimodal = true`**, and the tower is the same
 27-layer / 1152-wide / head_dim-72 qwen3vl mmproj the 27B uses (its
 `clip.projector_type = qwen3vl_merger`, `projection_dim = 2560`).  Verified on
@@ -2107,7 +2178,7 @@ zero tile, not "unmeasured") but the sweep was done on the 512-EU card.
 `PF_*` remains the A/B.  A field whose `0` is a measured value (`cfg_dec` auto,
 `PF_Q4_F32_SPLIT=0`) reads the raw env with a `-1` sentinel, because
 `profile_int` folds an env 0 into "unset"; `PF_Q4_PF_WMIN` behaves the same way
-so an explicit 0 still means the smallest workspace.  `engine_graph`'s schedule
+so an explicit 0 still means the smallest workspace.  `graph.cpp`'s schedule
 model now asks `moe_grp_tile_rows()` for the tile the dispatch will actually
 use, instead of guessing "cfg 43 means 8, otherwise 16" (the guess mis-priced
 every makespan it printed).  `PF_DEVICE_INFO=1` prints the `moe`/`shape` groups;
@@ -2389,7 +2460,7 @@ Correctness on this build:
 `test_decode_vs_prefill` oracle is **8/8 OK**, and `PF_Q4_FFCMP` gives cosine
 **0.99998** for the routed GPU FFN against the host path.
 
-**QSA is implemented** (`src/engine/engine_qsa.cpp`, with the ISA-dispatched
+**QSA is implemented** (`src/engine/arch/qwen4exp/qsa.cpp`, with the ISA-dispatched
 host kernels in `src/backend/cpu/kernels/qsa.cpp`).  The selector and the
 attention over the selected keys run on the host; there is **no host K/V
 mirror**: `qsa_gather_positions` gathers the selected rows from the paged pool
@@ -2429,7 +2500,7 @@ experts, so it stays off.  Its pool costs `(max_seq/kp+1)*idx_head_dim*4 B` per
 48k - plus a 2 KB ring and a ~65 KB/device score+pool scratch (32k); the
 one-time pinned handoff staging is ~1.9 MB/device at 14.6k.
 
-**The selector's pool width comes from `hp.idx_kpool`, not a literal 4.**
+**The selector's pool width comes from `q4_hp(hp).idx_kpool`, not a literal 4.**
 `qsa_pool_div()` returns `idx_kpool > 1 ? idx_kpool : 4`, and every pool
 expression uses it: the pool array and ring sizes, `pos / kp`, `pos % kp`, the
 pooled key's RoPE position `pos - (kp - 1)`, `n_pool_max = idx_top_k / kp`, the
@@ -2438,10 +2509,10 @@ was invisible on the shipped model (its `compress_ratios` is 4) but a model that
 pools 8 would have selected the wrong key set while still running.  `kp = 4` is
 bit-identical to the old code: `1/4` is exact and the four-term sum keeps its
 order.  The guard is an `assert(kp >= 2)` plus the comment; a grep for
-`/ 4`, `% 4`, `* 4 +` in `engine_qsa.cpp` must find no pool arithmetic.
+`/ 4`, `% 4`, `* 4 +` in `src/engine/arch/qwen4exp/qsa.cpp` must find no pool arithmetic.
 
 **The recommended `--ctx 2048` decode does not run QSA at all**:
-`qsa_on_` requires `max_seq > idx_top_k` and both are 2 048, so the 88.2 ms/token
+`q4x_.qsa.on` requires `max_seq > idx_top_k` and both are 2 048, so the 88.2 ms/token
 cell has zero QSA cost and the QSA numbers below are measured at `--ctx 4096`
 with the same weights/bank and the same 96-token TCP prompt.
 
@@ -2798,8 +2869,8 @@ box, qwen3.8-flash-next, `--layer-map 0-19:gpu.0,20-47:gpu.1 --moe-vram-mb 17500
 * **The LM head is the one dense tensor with a native u4 store, and reading it
   is opt-in (`PF_Q4_HEAD_W4`, default 0).**  `setup_md_dnnl` already registers
   the `PF_HEAD_U4` store for `m.output` (default on), keyed by the **host**
-  pointer; qwen4exp is the path that also keeps the raw head upload (`!m.q4exp`
-  skips the page-out and the upload's converted-tensor skip), so the q4 head
+  pointer; qwen4exp is the path that also keeps the raw head upload (its model-owned
+  forward skips the page-out and the upload's converted-tensor skip), so the q4 head
   path keys the store on `m.output.data`, not `wkey()`.  With the flag on the
   mode-0 head quantizes the activation in the split form (`do_split=true`, as
   `run_head` does) and calls `gemm_w4` at M=1 (`K=2560`, `N=248320`); with it
@@ -3003,7 +3074,7 @@ Full measurement log in [`docs/design/18-qwen4exp.md`](docs/design/18-qwen4exp.m
   post-decode sparse prefill on the same slot needs no rebuild (both the host
   gather and the device prefill path read the paged pool); `head_dim != 256`,
   i8 and CPU use the host gather; the first device token allocates ~17 MB
-  per device (~9.8 ms).  A pre-existing `qsa_cache_`/`zero_slot` slot-reuse bug
+  per device (~9.8 ms).  A pre-existing `q4x_.qsa.cache`/`zero_slot` slot-reuse bug
   was fixed with `engine::qsa_reset_slot` (flush, clear pending, destroy the
   per-slot pool/ring) from `zero_slot` and `reset_state`; three sequential
   server requests on slot 0 gave B1 == B2, A differs, 12 layers cleared and
@@ -3025,9 +3096,9 @@ Sinkhorn 20 / eps 1e-6; 384 experts top-6 + 1 ungated shared expert, FFN 2304,
 `expert_weights_scale 1.5`; Engram on layers 1 and 14 (n-gram 4, 8 heads per
 n-gram, 256-wide rows from a 110 GiB IQ4_NL table); RMSNorm eps **1e-20**.
 
-Files: `src/model/deepseek41.cpp` (loader), `src/model/profiles/deepseek41.cpp`
-(profile), `src/engine/engine_ds41.cpp` (host forward + incremental `DecState` +
-prefix cache), `src/engine/engine_ds41_gpu.cpp` (2×A770 path),
+Files: `src/model/arch/deepseek41/load.cpp` (loader), `src/model/arch/deepseek41/profile.cpp`
+(profile), `src/engine/arch/deepseek41/forward_host.cpp` (host forward + incremental `DecState` +
+prefix cache), `src/engine/arch/deepseek41/forward_gpu.cpp` (2×A770 path),
 `src/backend/gpu/kernels/ds41_{iq2,attn,hc,ops}.*`, `src/mm/vision.cpp`
 (`deepseek41v`), `src/server/chat.cpp` (`render_chat_deepseek`).
 Docs: `docs/design/23-deepseek41.md`, `docs/PERFORMANCE.md` §5.5.
@@ -3127,7 +3198,7 @@ The `dnnl_gemm` instances are **decode-only** (`dnnl_gemm(q, 2, 8192)`): cap_M=2
 keeps the row scratch at ~1 MB and `decode_only` skips the k5/cb4 prefill
 expansion scratch (K*N int8: 662 MB for the head alone), so the stores cost
 +1.2 GB in total rather than +6 GB.  A converted tensor **skips its raw upload**
-(the existing skip rule gained `|| ds41_dense_store_`); that is only safe
+(the existing skip rule gained `|| ds41x_.dense_store`); that is only safe
 because `gemv1` receives `wkey(dev, t.data)`, which is the host pointer - the
 store's key - for a skipped tensor and the device pointer otherwise.  The
 generic seg_plan branch that re-creates `dnnl_dev_` for every multi-device run
@@ -3191,7 +3262,7 @@ for short generations).
 `opendatalab/MinerU2.5-Pro-2605-1.2B` is a **Qwen2-VL dense decoder** (24 layers,
 n_embd 896, n_ff 4864, 14 query / 2 KV heads, head_dim 64, RoPE sections
 [8,12,12,0], every layer full attention, tied output).  Files:
-`src/model/qwen2vl.cpp`, `src/model/profiles/qwen2vl.cpp`,
+`src/model/arch/qwen2vl/load.cpp`, `src/model/arch/qwen2vl/profile.cpp`,
 `src/mm/vision.{h,cpp}` (the one vision module, here in its qwen2vl mode), and
 `tools/mineru/` (`mineru.{h,cpp}` for the two-step orchestration, `layout.{h,cpp}`
 for the pure prompts/JSON grammar, and `main.cpp` for the standalone
@@ -3977,7 +4048,7 @@ name.
   work-group width, `attn_xmx`'s gather count (it also sizes scratch allocated
   per queue), `gdn`'s `gdn_cols`/`gdn_warps_per_wg`, `attn`'s `vec`/`dec_group`
   plus the `attn_xmx`/`gemm_dnnl` switches, the routed-expert tile cases and
-  flat gates (`moe.cpp`'s `moe_cfg_for`, `engine_graph.cpp`'s per-queue dp4a
+  flat gates (`moe.cpp`'s `moe_cfg_for`, `graph.cpp`'s per-queue dp4a
   gates), the GEMV row thresholds and split widths in `gemv.cpp`, the native
   weight GEMV's rows per work-group in `w4_gemv.cpp`, and qwen4exp's
   `upload_ring`/`pf_wmin`.  Two details are load-bearing: `profile_int` folds an
@@ -3998,7 +4069,7 @@ name.
 ## Model profiles: where an architecture's policy belongs
 
 **Rule: a property of the model file or its architecture lives in that
-architecture's model profile, not in an `m.q4exp` ternary at its use site.**
+architecture's model profile, not in a model-flag ternary at its use site.**
 The use site asks for it by name.
 
 Every new model must have a profile.  Architecture facts that are *geometry or
@@ -4010,13 +4081,32 @@ the architecture is loaded; never hardcode it, infer it from a GGUF key, or
 branch on the model name at the use site.**
 
     src/model/model_profile.h       the `model_profile` struct: the declaration
-    src/model/profiles/<arch>.cpp   one architecture's COMPLETE profile: its key,
+    src/model/arch/<arch>/profile.cpp  one architecture's COMPLETE profile: its key,
                                     values and provenance
-    src/model/model.cpp             the kLoaders[] rows that point at the
-                                    profiles, the exact-key check, the
-                                    PF_MODEL_INFO report
-    src/model/model.h               `model::prof` (set by load) and the loader's
-                                    `arch_profile` capability flags
+    src/model/arch/<arch>/{hparams,tensors,accessors}.h  a model-owned
+                                    architecture's geometry, pimpl extras and
+                                    checked accessors
+    src/model/model_types.h         the generic wt/moe_wt PODs and the
+                                    `arch_hparams` / `arch_layer` /
+                                    `arch_model_extras` virtuals
+    src/model/model.cpp             the generic load path + the exact-key check
+                                    and the PF_MODEL_INFO report
+    src/model/arch/registry.cpp     the kLoaders[] rows that point at the
+                                    loaders and profiles (internal hub)
+    src/model/model.h               `model::prof` (set by load), `hparams::arch`
+                                    (the per-architecture geometry base) and the
+                                    `layer_t::extras` / `model::extras` pimpl
+                                    slots (per-arch `arch_layer` /
+                                    `arch_model_extras` in arch/<arch>/tensors.h,
+                                    enumerated through `visit_weights`)
+    src/engine/arch/arch_ops.h      the public runtime seam: struct arch_ops +
+                                    arch_ops_for (names no architecture)
+    src/engine/arch/registry_internal.h  the internal per-arch hook
+                                    declarations (arch_ops_registry), included
+                                    only by registry.cpp + the runtime TUs
+    src/engine/arch/registry.cpp    the kArchOps[] table and arch_ops_for
+    src/engine/arch/<arch>/         a model-owned forward's runtime.cpp, forward
+                                    TUs, state and prefix-cache extras
 
 * **What belongs there**: how the forward is executed (`generic_plan` for the
   shared `seg_plan`/`record_forward`, `hc_ple_qsa` for qwen4exp's own walk), the
@@ -4041,10 +4131,18 @@ branch on the model name at the use site.**
   profile, (b) refuses a profile whose `key` is not *exactly* the GGUF's
   `general.architecture`, and only then (c) calls the loader.  `arch::registry()`
   exposes the same table, so the report and the test cannot read a second list.
-  While `hparams::q4exp` / `model::q4exp` still exist, `model::load` also
-  asserts they agree with `fwd_kind::hc_ple_qsa`.  The engine now dispatches
-  every forward/policy branch through `engine::hc_fwd()` (`mp_->fwd ==
-  hc_ple_qsa`), so `m.q4exp` is only the loader/consistency flag.  For a
+  The loader attaches an architecture's extra geometry as `hparams::arch` (a
+  `qwen4exp_hparams` / `ds41_hparams`, see `arch/<arch>/hparams.h` and its
+  `q4_hp`/`ds41_hp` accessor); the generic `hparams` itself carries no
+  architecture-specific field.  The engine dispatches every
+  forward/policy branch through the `arch_ops` row (`engine::aops_`,
+  `arch/arch_ops.h`), not through the profile: `prefill_text` / `prefill_mm` /
+  `decode_batch` / `run_head` are forward hooks, `pc_extra_floats` /
+  `pc_serialize` / `pc_deserialize` / `pc_restore` / `pc_clear` /
+  `pc_resume_prefixes` / `pc_block_aligned_capture` are prefix-cache hooks, and
+  `device_argmax` is the capability bit the generic request path reads (a null
+  hook means the generic plan owns it); whether an mm prompt must go through
+  the model's own chunker is the profile's `spec.mm_owned_prefill`.  For a
   model-owned forward, `model::load` also validates the profile's declared
   geometry (HC streams/low rank, QSA top-k/pool/heads) against the GGUF's
   `hparams` and refuses a file that contradicts it; a split GGUF must declare
@@ -4053,7 +4151,11 @@ branch on the model name at the use site.**
   as a card file: quote the GGUF metadata a geometry came from and the measured
   document for a policy value.  `PF_MODEL_INFO=1` prints the resolved profile,
   the policy, the weight representation, the capabilities (with `why`) and that
-  provenance at load, so a run says which policy it actually selected.
+  provenance at load, so a run says which policy it actually selected.  The
+  `qwen35` / `qwen35moe` provenance strings intentionally cite the pre-move
+  loader paths (`src/model/qwen35.cpp`, `src/model/qwen35moe.cpp`): they are part
+  of the byte-identical `PF_MODEL_INFO` output the refactor preserves.  Do not
+  "fix" those two strings.
 * **An env var or CLI flag overrides a profile *default*, not a capability.**
   Keep the ordering "explicit value, else profile": `--engram-ram-mb` (unset =
   the profile's MiB default, `0` = off), `--layer-map` (overrides
@@ -4073,11 +4175,11 @@ branch on the model name at the use site.**
 * **The model/device boundary in one line**: a model profile says what the model
   is and may use; a device profile says how this card runs it.  The *forward
   entry point* is model policy; the work-group, tile and split constants inside
-  every kernel are device tuning.  The one capability the generic driver reads
-  from `arch_profile` directly is `mm_model_prefill` (set by the qwen4exp
-  loader): it says an mm prompt must go through the model's own chunker instead
-  of the generic one-row-at-a-time loop, so it is a property of the forward, not
-  a model-name test.
+  every kernel are device tuning.  The one forward capability declared on the
+  profile is `spec.mm_owned_prefill` (true for qwen4exp): it says an mm prompt
+  must go through the model's own chunker instead of the generic
+  one-row-at-a-time loop, so it is a property of the forward, not a model-name
+  test.
 * **Test.**  `test_model_profile` is hermetic (no GGUF, no GPU): it asserts every
   registry row has a profile, the key is exact, the qwen4exp policy/geometry/
   weight/capability values are pinned, and `qwen35`/`qwen35moe` agree field by
@@ -4260,7 +4362,7 @@ shared-expert / GPU-handoff split), `PF_QSA_TIME=1` (the host QSA split:
 expert pair counts, top-B coverage and whole-layer coverage, printed at exit;
 `PF_Q4_BANK_TYPES`/`_MAX`/`_SKIP`/`_BANKCHK` are the bank diagnostics), `PF_Q4_DUMP=1` (per-stage rms/max/first),
 `PF_Q4_BIN=<path>` (dump one stage's full f32 tensor; the layer/tag is chosen in
-`engine_q4exp.cpp`), `PF_Q4_PREFAULT=0` (skip the startup touch of the 71.7 GiB
+`src/engine/arch/qwen4exp/forward.cpp`), `PF_Q4_PREFAULT=0` (skip the startup touch of the 71.7 GiB
 host-resident expert/PLE/indexer pages that feed the bank), `PF_Q4_NOPLE=1`
 (skip the PLE module - diagnostic only, it changes the model),
 `PF_MTP_STEPS=1` (per-depth MTP acceptance: reach[j] = the fraction of cycles
@@ -5068,6 +5170,47 @@ the point where the experts' depth-independent share stops shrinking.
 The rules that are not obvious from the code, and what breaks when they are
 broken.  Each one is a thing that *was* broken, or that fails silently.
 
+* **A generic engine/model file must not name an architecture, a per-model
+  state member or a model-owned `fwd_kind`.**  `engine.cpp`, `graph.cpp`,
+  `engine_prefix_cache.cpp`, `engine_kvpool.cpp`, `server.cpp`, `model.cpp` and
+  `model.h` reach architecture-specific behaviour only through a
+  `model_profile` field, an `arch_ops` hook, an `arch_hparams` / `arch_layer` /
+  `arch_model_extras` virtual, or the architecture's own code.  New behaviour
+  goes into one of those in the same change; `ci/check_arch_boundaries.py`
+  (the hermetic `arch_boundaries` test) fails on `qwen4exp`/`deepseek41`,
+  `q4_*`/`ds41_*`, the `q4x_`/`ds41x_` state members, a
+  `model_profile::fwd_kind::(hc_ple_qsa|deepseek41)` branch or an
+  `arch/...` include.  The reason is not style: a generic file that names an
+  architecture cannot be read or tested without it, and the `PF_MODEL_INFO`
+  report then has two sources of truth.  `test_arch_ops` pins the rows.
+
+* **`model.h` describes the file, not the device representation.**  It must not
+  include `<sycl/sycl.hpp>`, name `sycl::`, or expose `dev_weights`,
+  `upload()`, `build_w8`/`free_w8` or `dev_ptr`/`dev_f32`: the whole-mmap blob,
+  the single-device SIn allocations and the per-device w8 maps belong to
+  `src/backend/weight_store.{h,cpp}` (owned by `engine` as `ws_`).  `model`
+  keeps the GGUF/hparams/tensor bindings and the `w8t` data slots
+  (`m.output8` / `layer_t::*8`) that the plan and the head reference.  The
+  `arch_boundaries` gate fails on any of those names in `model.h` and on a
+  reintroduced `src/model/model_w8.cpp`.  Leaking the allocation back into
+  `model` would make every model-only TU include SYCL and put the device
+  representation into the loader test surface.
+
+* **The same store is the only raw device weight storage for the media towers
+  and the drafter.**  `vision_model` (`src/mm/vision.h`), `audio_model`
+  (`src/mm/audio_model.h`) and `dflash_model` (`src/model/dflash.h`) each hold
+  a `weight_store`: the two mmprojs use `upload_contiguous` (whole file) or
+  `upload_spans` (the compact `PF_VISION_COMPACT` blob), the drafter uses
+  `upload_spans` for its f32 norms/conv bases.  Their headers must not declare
+  `dev_weights`, `dev_weights_size` or `dev_reserved` - the derived
+  `d_w32`/`d_qkv_b32` side caches and scratch are theirs to keep, but a raw
+  weight blob is the store's.  `arch_boundaries` fails on those names.
+  `model.h` stays SYCL-free; `dflash.h` is the deliberate draft-model
+  exception that includes the backend store directly.  A model frees the blob
+  with `weights.release(*dev_q)`; the engine calls the drafter's `release()`
+  while its device queues are alive (`release()` clears `dev_q`, so the
+  destructor is a no-op afterwards).
+
 * **A profiling-enabled SYCL queue is not free on oneAPI 2026.2.**  A launch
   on an in-order queue with `enable_profiling` costs **0.133 ms instead of
   0.0055 ms (24x)**; the mode-2 prefill submits ~10^5 kernels individually, so
@@ -5410,9 +5553,9 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
   instance of this shape was found, in `test_w4_gemm`.
 
 * **The two drafters share exactly one piece of device state, and it is
-  allocated as a pair.**  `engine::verify_scratch` owns the verify cycle's
+  allocated as a pair.**  `verify_scratch` (`spec/verify_scratch.h`) owns the verify cycle's
   argmax staging (`d_argmax` + `d_argval`); every other drafter buffer is
-  MTP-only or lives in the nested `dflash_state`.  The pair matters because
+  MTP-only or lives in `dflash_state` (`spec/dflash_state.h`).  The pair matters because
   MTP's candidate readout (`PF_MTP_CAND`) needs the *value* side and decides
   that from its own `mtp_cand_cap_` - so a value side that could be absent
   while the id side existed would let it write through a null pointer.  Each
@@ -6034,7 +6177,11 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
 
 ```bash
 cmake --build build -j$(nproc)          # must be warning-free (except the linker notes)
-ctest --test-dir build -L hermetic --output-on-failure   # profiles, kv_type, quant, chat, sampler, CLI
+ctest --test-dir build -L hermetic --output-on-failure   # 38/38: profiles, kv_type, quant,
+                                        # chat, sampler, CLI, test_arch_ops, arch_boundaries
+./build/test_arch_ops                   # the arch_ops dispatch table (hermetic)
+python3 ci/check_arch_boundaries.py     # generic engine/model files name no architecture
+                                        # (or: ctest --test-dir build -R arch_boundaries)
 ./build/test_gpu_stages                 # all stages OK
 ./build/test_gpu_vs_ref                 # argmax SAME
 ./build/test_forward                    # default prompt predicted_argmax=248068

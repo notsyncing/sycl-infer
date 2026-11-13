@@ -2,7 +2,7 @@
 // DeepSeek-V4.1-Flash device ops that are not covered by ds41_iq2.h,
 // ds41_attn.h or ds41_hc.h.  All pointers are device USM and the caller's
 // queue orders the work.  The CPU oracles are the matching functions in
-// src/engine/engine_ds41.cpp (cited per op in reports/ds41_gpu_design.md §5.2).
+// src/engine/arch/deepseek41/forward_host.cpp (cited per op in docs/design/23-deepseek41.md).
 // ---------------------------------------------------------------------------
 #pragma once
 

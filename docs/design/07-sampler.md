@@ -108,7 +108,7 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
   （`scheduler.cpp` 追加惩罚窗口 token 处），之后每个生成 token 追加（`:275`、`:381`）—— 惩罚窗口能看到完整上下文，
   最多回看 `repeat_last_n`（默认 64）个 token。
 * **单序列引擎路径**：`engine::generate_impl`（`engine.cpp:2455`）与 `generate_mtp`
-  （`engine_mtp.cpp` 的 `mtp_forward` 调用点、`:1435`）传的是 `out`，只含**已生成**的 token，不含 prompt。CLI 又不设置
+  （`spec/mtp.cpp` 的 `mtp_forward` 调用点、`:1435`）传的是 `out`，只含**已生成**的 token，不含 prompt。CLI 又不设置
   penalty，所以这条路上 `do_pen` 实际恒为 false。
 
 ---
@@ -140,7 +140,7 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
   `.first`，而 `std::partial_sort` 不稳定，所以同分项之间的顺序不保证。`tv` 是 `thread_local` 复用，
   但每个要报告的 token 仍要付两遍词表扫描加一次 partial sort。
 * 开关：调度器只在 `gp.wants_logprobs()` 时传 `&lp`，否则传 `nullptr`（`scheduler.cpp:271-274`、
-  `374-377`）；单序列引擎路径**从不**传 `out`（`engine.cpp` 的 `generate_mtp` 调用点、`engine_mtp.cpp:872`、`934`（两个 `mtp_forward` 调用点都不传 `out`）），所以 CLI
+  `374-377`）；单序列引擎路径**从不**传 `out`（`engine.cpp` 的 `generate_mtp` 调用点、`spec/mtp.cpp:872`、`934`（两个 `mtp_forward` 调用点都不传 `out`）），所以 CLI
   没有 logprobs。
 * 上限：`top_logprobs` 被服务器夹到 `[0, 20]`（`server.cpp:151`、`:155`）。chat 的 `logprobs` 是 bool
   配 `top_logprobs`；completions 的 `logprobs` 是整数，同时决定 `logprobs` 与 `top_logprobs`
@@ -162,7 +162,7 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 |---|---|
 | `scheduler::submit`（`scheduler.cpp:55`） | `steady_clock::now().time_since_epoch().count()` |
 | `engine::generate_impl`（`engine.cpp:2371`） | `std::random_device{}()` |
-| `engine::generate_mtp`（`engine_mtp.cpp:723`） | `std::random_device{}()` |
+| `engine::generate_mtp`（`spec/mtp.cpp:723`） | `std::random_device{}()` |
 
 * 显式 `seed != 0` 时三处都用请求的 seed，且第 `c` 个 choice 拿 `seed + c`（`gp_for_choice`，
   `server.cpp:738-744`）。因为每序列一条独立的流，同 seed + 同请求的**随机数序列**与批处理无关；
@@ -171,7 +171,7 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 * **贪心短路不消耗随机数**（`sampler.cpp:90-101`），所以 `temperature <= 0` 或 `top_k == 1` 的输出与
   seed 无关。
 * **MTP 路径没有随机采样**：它只在贪时下进入（`engine::generate_impl` 的 `gp.speculative_greedy()` 条件），verify 里的 bonus token 或走
-  `sample_token`、或直接用设备 argmax（`engine_mtp.cpp:1354-1357`、`:1435`），对贪心二者等价。
+  `sample_token`、或直接用设备 argmax（`spec/mtp.cpp:1354-1357`、`:1435`），对贪心二者等价。
 
 ### 5.1 采样器是宿主侧的，而它每行每步要搬 1 MB
 

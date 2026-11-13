@@ -233,6 +233,7 @@ engine::engine(const engine_config & cfg)
     if (!mp_) {
         throw std::runtime_error("model loaded without a model profile");
     }
+    aops_ = arch_ops_for(mp_->fwd);
     // A model whose startup copies tens of GiB into a pinned expert source
     // reads the file more than once; the explicit POSIX_FADV_DONTNEED in
     // page_out_host would evict every byte from the page cache right after it
@@ -244,15 +245,12 @@ engine::engine(const engine_config & cfg)
         const char * e = si::env::str("PF_F32");
         f32_path_ = e && atoi(e) != 0 ? true : (e && atoi(e) == 0 ? false : mp_->rep.f32_gemm);
     }
-    // The PLE engram budget is a model-profile default (qwen4exp 4096 MB); an
-    // explicit --engram-ram-mb / engine_config value still wins.  Resolved after
-    // the load, because the profile is selected by the GGUF's architecture.
-    engram_ram_mb_ =
-        cfg.engram_ram_mb == engine_config::kEngramRamAuto ? mp_->policy.engram_ram_mb_default : cfg.engram_ram_mb;
-    // Tail-skip precedence: an explicit --q4-tail-skip / engine_config value
-    // wins, else PF_Q4_TAIL_SKIP, else 0 (the exact expert set).  Resolved once
-    // here so the forward has no second default at its use site.
-    q4_tail_skip_ = cfg.q4_tail_skip >= 0 ? cfg.q4_tail_skip : si::env::i32("PF_Q4_TAIL_SKIP", 0);
+    // Architecture-owned construction config (qwen4exp resolves its PLE engram
+    // budget and tail-skip here, once the profile is known).  The exact
+    // precedence lives in arch/<arch>/runtime.cpp.
+    if (aops_ && aops_->configure) {
+        aops_->configure(*this, cfg);
+    }
     tk.load(m.gguf);
     lt.lap("tokenizer load");
     // The model profile owns the expert placement.  qwen4exp's per-expert LRU
@@ -480,15 +478,15 @@ engine::engine(const engine_config & cfg)
     }
     // upload weights after setup_multi_device so multi-device can skip the
     // full-blob device copy and instead upload only each partition's tensors
-    m.upload(q, /*host=*/cpu_mode || multi_dev);
+    ws_.upload(m, q, /*host=*/cpu_mode || multi_dev);
     lt.lap("model upload (H2D/raw)");
     if (f32_path_) {
         build_f32_weights();
     }
-    if (m.dev_weights) {
+    if (ws_.device_bytes()) {
         // The single-device path keeps the whole GGUF blob on the device.
         dev_used_bytes_.assign(1, 0);
-        dev_used_bytes_[0] += m.dev_weights_size;
+        dev_used_bytes_[0] += ws_.device_bytes();
     }
     {
         // fp32 scale side arrays: measured as a net loss on this GPU (the packed
@@ -508,7 +506,7 @@ engine::engine(const engine_config & cfg)
         const char * envd = si::env::str("PF_DP4A_DEC");
         pf8_dec = pf8 && !(envd && atoi(envd) == 0);
         if (pf8 && !cpu_mode) {
-            m.build_w8(q); // SI8 copies cost ~700 MB; only the GPU needs them
+            ws_.build_w8(m, q); // SI8 copies cost ~700 MB; only the GPU needs them
         }
     }
     // prefix cache: ON by default (a hash lookup per request plus bounded
@@ -712,7 +710,7 @@ engine::engine(const engine_config & cfg)
         if (!(envw && atoi(envw) != 0)) {
             dnnl->warmup();
         }
-    } else if (multi_dev && !md_int8 && !md_xmx && !ds41_dense_store_ && dnnl_gemm_enabled(q) &&
+    } else if (multi_dev && !md_int8 && !md_xmx && !arch_dense_store() && dnnl_gemm_enabled(q) &&
                dp4a_enabled(q)) {
         // one dnnl_gemm per GPU backend, holding only the layers that device
         // computes (the CPU partitions keep the fp32/i8 host path).  Every
@@ -739,11 +737,8 @@ engine::engine(const engine_config & cfg)
                 // w8.vals, so oneDNN and dp4a agree on the key.  Tensors without
                 // a w8 view (ssm_beta/ssm_alpha) key on the fp32 device pointer.
                 const void * key = nullptr;
-                if (w8_dev_.size()) {
-                    auto it = w8_dev_[(size_t)d].find(t.data);
-                    if (it != w8_dev_[(size_t)d].end()) {
-                        key = it->second.vals;
-                    }
+                if (const w8t * w = ws_.w8_for((int)d, t.data)) {
+                    key = w->vals;
                 }
                 if (!key) {
                     key = wptr((int)d, t.data); // == the segments' sj.w
@@ -813,47 +808,22 @@ engine::engine(const engine_config & cfg)
         }
     }
     n_blocks = pool_cap;
-    if (ds41_fwd() && !cpu_mode) {
+    if (owns_kv_pool() && !cpu_mode) {
         // ds41 keeps its own window/compressed caches; the paged pool is unused
         // (and its default 640 MB is a real loss on a 15.5 GiB card).
         n_blocks = 1;
     }
     alloc_buffers();
     lt.lap("alloc_buffers (KV/act)");
-    if (hc_fwd()) {
-        q4_alloc();
-        lt.lap("q4_alloc (banks+pin)");
-    } else if (!ds41_fwd()) {
-        // deepseek41 has no seg_plan and no paged KV: its forward owns its
-        // window/compressed caches and is driven from generate_impl, so there
-        // is nothing to build (and the generic plan would dereference null
-        // wq/wk/wv/wo slots).
+    if (aops_ && aops_->setup) {
+        // qwen4exp: bank/pin allocation; ds41: the GPU forward's caches, bank
+        // and scratch (the generic plan is not built for either - neither fits
+        // the seg_plan layout).
+        aops_->setup(*this);
+        lt.lap("arch_ops setup");
+    } else {
         build_graphs();
         lt.lap("build_graphs (plans+capture)");
-    }
-    if (ds41_fwd() && !cpu_mode) {
-        // The GPU forward is the default for a ds41 run on a GPU; PF_DS41_GPU=0
-        // keeps the validated host forward for an A/B.  The weights were
-        // uploaded by setup_multi_device -> upload_device_weights above; this
-        // allocates the ds41-owned caches, the expert bank and the scratch.
-        const char * eg = si::env::str("PF_DS41_GPU");
-        const bool gpu_default = !(eg && atoi(eg) == 0);
-        if (gpu_default && !multi_dev) {
-            fprintf(stderr, "[ds41] --device gpu without a layer map: keeping the host forward "
-                            "(pass --layer-map 0-%d:gpu.0)\n", m.hp.n_layer - 1);
-        } else if (gpu_default) {
-            bool any_cpu = false;
-            for (int d : dev_kind_) {
-                any_cpu = any_cpu || d != 0;
-            }
-            if (any_cpu) {
-                fprintf(stderr, "[ds41] the GPU forward needs an all-GPU --layer-map; "
-                                "keeping the host forward\n");
-            } else {
-                ds41g_ = ds41_gpu_create(*this);
-                lt.lap("ds41_gpu_create (caches+bank)");
-            }
-        }
     }
 
     // PF_MEM_REPORT: the engine's own device-allocation accounting against the
@@ -891,126 +861,21 @@ engine::engine(const engine_config & cfg)
         lt.lap("release host pages");
     }
     lt.total("engine ctor total");
-    if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
-        q4_hist_report();
+    if (aops_ && aops_->hist_report) {
+        aops_->hist_report(*this);
     }
-    if (hc_fwd()) {
-        q4_prefault();
+    if (aops_ && aops_->prefault) {
+        aops_->prefault(*this);
     }
 }
 
 engine::~engine() {
-    if (ds41g_) {
-        ds41_gpu_destroy(ds41g_);
-        ds41g_ = nullptr;
+    if (aops_ && aops_->destroy) {
+        aops_->destroy(*this);
     }
-    if (!q4_hist_pre_.empty() || !q4_hist_dec_.empty()) {
-        q4_hist_report();
+    if (aops_ && aops_->hist_report) {
+        aops_->hist_report(*this);
     }
-    if (engram_hits_ + engram_misses_ > 0) {
-        fprintf(stderr, "[q4] engram cache: %zu hits / %zu misses (%.1f%% hit rate)\n", engram_hits_, engram_misses_,
-                100.0 * (double)engram_hits_ / (double)(engram_hits_ + engram_misses_));
-    }
-    for (void * p : q4_owned_) {
-        std::free(p);
-    }
-    q4_owned_.clear();
-    for (void * p : q4_host_usm_) {
-        sycl::free(p, q);
-    }
-    q4_host_usm_.clear();
-    for (auto & pr : q4_pin_src_) {
-        sycl::free(pr.first, dev_queue(pr.second));
-    }
-    q4_pin_src_.clear();
-    for (auto & st : qsa_stage_) {
-        sycl::queue & qd = dev_queue(st.dev < 0 ? 0 : st.dev);
-        auto fq = [&](float * p) {
-            if (p) {
-                sycl::free(p, qd);
-            }
-        };
-        fq(st.mixed);
-        fq(st.iq);
-        fq(st.ik);
-        for (uint8_t * p : {st.sbk, st.sbv, st.sbsk, st.sbsv}) {
-            if (p) {
-                sycl::free(p, qd);
-            }
-        }
-    }
-    qsa_stage_.clear();
-    for (auto & hs : qsa_host_stage_) {
-        sycl::queue & qd = dev_queue(hs.dev < 0 ? 0 : hs.dev);
-        if (hs.out_pending) {
-            hs.out_ev.wait();
-            hs.out_pending = false;
-        }
-        if (hs.q) {
-            sycl::free(hs.q, qd);
-        }
-        if (hs.out) {
-            sycl::free(hs.out, qd);
-        }
-    }
-    qsa_host_stage_.clear();
-    for (auto & b : qsa_idx_dev_buf_) {
-        if (b.q) {
-            sycl::free(b.q, dev_queue(b.dev < 0 ? 0 : b.dev));
-        }
-        if (b.k) {
-            sycl::free(b.k, dev_queue(b.dev < 0 ? 0 : b.dev));
-        }
-    }
-    qsa_idx_dev_buf_.clear();
-    qsa_idx_slot_release_all();
-    for (auto & h : qsa_handoff_) {
-        if (h.stage) {
-            sycl::free(h.stage, dev_queue(h.dev < 0 ? 0 : h.dev));
-        }
-    }
-    qsa_handoff_.clear();
-    for (auto & d : qsa_dev_) {
-        sycl::queue & qd = dev_queue(d.dev < 0 ? 0 : d.dev);
-        if (d.ck) {
-            sycl::free(d.ck, qd);
-        }
-        if (d.cv) {
-            sycl::free(d.cv, qd);
-        }
-        if (d.dsel) {
-            sycl::free(d.dsel, qd);
-        }
-        if (d.dcounts) {
-            sycl::free(d.dcounts, qd);
-        }
-        if (d.tab) {
-            sycl::free(d.tab, qd);
-        }
-        if (d.htab) {
-            sycl::free(d.htab, qd);
-        }
-        if (d.scores) {
-            sycl::free(d.scores, qd);
-        }
-        if (d.dpools) {
-            sycl::free(d.dpools, qd);
-        }
-    }
-    qsa_dev_.clear();
-    for (auto & x : qsa_aux_) {
-        sycl::queue & qd = dev_queue(x.dev < 0 ? 0 : x.dev);
-        if (x.hsel) {
-            sycl::free(x.hsel, qd);
-        }
-        if (x.hcnt) {
-            sycl::free(x.hcnt, qd);
-        }
-        if (x.sinfo) {
-            sycl::free(x.sinfo, qd);
-        }
-    }
-    qsa_aux_.clear();
     if (moe_cache_.active()) {
         // The three tiers in one line, so a run says what it used rather than
         // only what it was configured with: the VRAM bank's size is a *measured*
@@ -1105,6 +970,13 @@ engine::~engine() {
     // MTP / DFlash speculative-decoding buffers (both are pure device/USM
     // allocations; the drafts share the verify machinery)
     {
+        // The drafter's f32 copies are a backend weight_store blob; release it
+        // here, while the device queues are alive.  `release()` clears dev_q so
+        // the dflash_model destructor (member teardown after this body) is a
+        // no-op rather than a second free.
+        if (dfl.dfm_) {
+            dfl.dfm_->release();
+        }
         sycl::queue & qm = dev_queue(mtp.mtp_dev);
         sycl::queue & qf0 = dev_queue(0);
         sycl::queue & qd0 = dev_queue(dfl.df_dev_);
@@ -1265,18 +1137,10 @@ engine::~engine() {
         pcr->print_stats("exit");
     }
     kv_release_pool();
-    m.free_w8(q);
-    // multi-device per-device SIn copies: free on each device's own queue
-    for (size_t d = 0; d < w8_dev_.size(); d++) {
-        for (auto & kv : w8_dev_[d]) {
-            if (kv.second.vals && d < dev_queues_.size() && dev_queues_[d]) {
-                sycl::free(kv.second.vals, *dev_queues_[d]);
-            }
-            if (kv.second.meta && d < dev_queues_.size() && dev_queues_[d]) {
-                sycl::free(kv.second.meta, *dev_queues_[d]);
-            }
-        }
-    }
+    // single-device SIn copies + the whole-blob device weights, then the
+    // multi-device per-device SIn copies on each device's own queue
+    ws_.release(m, q);
+    ws_.free_devices(dev_queues_);
     // A fused gate/up bank is registered under both tensors' keys and owns one
     // allocation, so free each pointer once.
     std::unordered_set<const void *> freed;
@@ -1290,9 +1154,6 @@ engine::~engine() {
         }
     }
     weight_maps_.clear();
-    if (m.dev_weights) {
-        sycl::free(m.dev_weights, q);
-    }
     if (h_logits) {
         if (h_logits_pinned_) {
             sycl::free(h_logits, q);
@@ -2665,7 +2526,7 @@ void engine::sync_all() {
 
 const void * engine::wptr(int dev, const void * host) const {
     if (!multi_dev) {
-        return m.dev_ptr(host);
+        return ws_.ptr(host);
     }
     // Decide by backend kind, not by an empty weight map: a GPU partition's map
     // is never empty (every layer has f32 norms that are uploaded raw), and
@@ -2761,11 +2622,8 @@ void engine::upload_device_weights(int dev) {
         addp(m.tok_embd.data);
         addp(m.output.data);
         addp(m.output_norm);
-        if (hc_fwd()) {
-            addp(m.hc_head.norm);
-            addp(m.hc_head.down.data);
-            addp(m.hc_head.up.data);
-            // m.ple_table intentionally NOT uploaded: 26.8 GiB, gathered on the host
+        if (m.extras) {
+            m.extras->visit_device_weights(addp);
         }
         if (mtp.mtp_on) {
             const mtp_layer_t & M = m.mtp;
@@ -2799,45 +2657,6 @@ void engine::upload_device_weights(int dev) {
         addp(L.ffn_gate.data);
         addp(L.ffn_up.data);
         addp(L.ffn_down.data);
-        if (m.ds41) {
-            // DeepSeek-V4.1-Flash's MLA / mHC / compressor / indexer / Engram
-            // tensors.  Everything is uploaded raw: the fp32 GEMV reads the
-            // GGUF type directly (Q5_K/Q8_0/Q4_K/Q6_K/BF16/F32/IQ4_NL), so
-            // there is no SIn/oneDNN conversion.  The routed experts are NOT
-            // here - the ds41 bank streams them - and neither is ple_table
-            // (100 GiB, gathered on the host).
-            const ds41_layer & D = L.ds;
-            addp(D.wq_a.data);
-            addp(D.wq_b.data);
-            addp(D.wkv.data);
-            addp(D.wo_a.data);
-            addp(D.wo_b.data);
-            addp(D.q_a_norm);
-            addp(D.kv_norm);
-            addp(D.attn_sinks);
-            addp(D.hc_attn_fn.data);
-            addp(D.hc_attn_base);
-            addp(D.hc_attn_scale);
-            addp(D.hc_ffn_fn.data);
-            addp(D.hc_ffn_base);
-            addp(D.hc_ffn_scale);
-            addp(L.moe.gate_inp);
-            if (m.hp.ds.kv_src_of[il] == il) {
-                addp(D.comp_wkv.data);
-                addp(D.comp_wgate.data);
-                addp(D.comp_norm);
-                addp(D.idx_attn_k.data);
-                addp(D.idx_k_norm);
-            }
-            if (m.hp.ds.topk_src_of[il] == il) {
-                addp(D.idx_attn_q_b.data);
-                addp(D.idx_proj.data);
-            }
-            if (m.hp.ds.is_ple[il]) {
-                addp(D.engram_kv.data);
-                addp(D.engram_gate);
-            }
-        }
         if (L.recurrent) {
             addp(L.wqkv.data);
             addp(L.wgate.data);
@@ -2859,33 +2678,14 @@ void engine::upload_device_weights(int dev) {
             addp(L.k_bias);
             addp(L.v_bias);
         }
-        if (hc_fwd()) {
-            // the router and the shared-expert gate stay on the device even when
-            // every routed expert is computed on the host
+        if (L.extras) {
+            // This layer's architecture-specific weights (raw, like the dense
+            // tensors: no SIn/oneDNN conversion for a model-owned forward).
+            L.extras->visit_weights(m.hp, il, addp);
+            // the router and the shared-expert gate stay on the device even
+            // when every routed expert is computed on the host
             addp(L.moe.gate_inp);
             addp(L.moe.gate_inp_shexp);
-            addp(L.hc_attn.norm);
-            addp(L.hc_attn.down.data);
-            addp(L.hc_attn.up.data);
-            addp(L.hc_attn.inject.data);
-            addp(L.hc_ffn.norm);
-            addp(L.hc_ffn.down.data);
-            addp(L.hc_ffn.up.data);
-            addp(L.hc_ffn.inject.data);
-            if (L.ple.ok()) {
-                addp(L.ple.key.data);
-                addp(L.ple.value.data);
-                addp(L.ple.norm_key);
-                addp(L.ple.norm_query);
-                addp(L.ple.norm_conv);
-                addp(L.ple.conv);
-            }
-            if (L.idx.ok()) {
-                addp(L.idx.q_proj.data);
-                addp(L.idx.k_proj.data);
-                addp(L.idx.q_norm);
-                addp(L.idx.k_norm);
-            }
         }
         if (L.moe.ok() && !moe_host_only_) {
             // the routed experts.  They are the bulk of a MoE model's file, so
@@ -2934,13 +2734,13 @@ void engine::upload_device_weights(int dev) {
             // exactly what the bank replaces, so it must not happen.
             continue;
         }
-        if (dev < (int)w8_dev_.size() && w8_dev_[(size_t)dev].count(t.data)) {
+        if (ws_.has_w8(dev, t.data)) {
             // the int8 (SIn) view replaces the raw device copy
             continue;
         }
         // deepseek41 registers only k5/int8 stores and has no seg_plan, so its
         // gate is its own flag rather than rep.dnnl_int8.
-        const bool dnnl_replaces_raw = mp_->rep.dnnl_int8 || ds41_dense_store_;
+        const bool dnnl_replaces_raw = mp_->rep.dnnl_int8 || arch_dense_store();
         if (dnnl_replaces_raw && dev < (int)dnnl_dev_.size() && dnnl_dev_[(size_t)dev]
             && (dnnl_dev_[(size_t)dev]->has_weight(t.data) || dnnl_dev_[(size_t)dev]->has_weight_w4(t.data)
                 || dnnl_dev_[(size_t)dev]->has_weight_k5(t.data) || dnnl_dev_[(size_t)dev]->has_weight_cb4(t.data))) {
@@ -3200,10 +3000,12 @@ void engine::release_host_weight_pages() {
             keep.insert(m.tok_embd.data);
             keep.insert(m.output.data);
             keep.insert(m.output_norm);
-            if (hc_fwd()) {
-                keep.insert(m.hc_head.norm);
-                keep.insert(m.hc_head.down.data);
-                keep.insert(m.hc_head.up.data);
+            if (m.extras) {
+                m.extras->visit_host_keep(true, [&](const void * p) {
+                    if (p) {
+                        keep.insert(p);
+                    }
+                });
             }
         }
         for (int il = 0; il < m.hp.n_layer; il++) {
@@ -3219,29 +3021,8 @@ void engine::release_host_weight_pages() {
             };
             kp(L.attn_norm);
             kp(L.post_attn_norm);
-            if (hc_fwd()) {
-                kp(L.hc_attn.norm);
-                kp(L.hc_attn.down.data);
-                kp(L.hc_attn.up.data);
-                kp(L.hc_attn.inject.data);
-                kp(L.hc_ffn.norm);
-                kp(L.hc_ffn.down.data);
-                kp(L.hc_ffn.up.data);
-                kp(L.hc_ffn.inject.data);
-                if (L.ple.ok()) {
-                    kp(L.ple.key.data);
-                    kp(L.ple.value.data);
-                    kp(L.ple.norm_key);
-                    kp(L.ple.norm_query);
-                    kp(L.ple.norm_conv);
-                    kp(L.ple.conv);
-                }
-                if (L.idx.ok()) {
-                    kp(L.idx.q_proj.data);
-                    kp(L.idx.k_proj.data);
-                    kp(L.idx.q_norm);
-                    kp(L.idx.k_norm);
-                }
+            if (L.extras) {
+                L.extras->visit_weights(m.hp, il, kp);
             }
             kp(L.ffn_gate.data);
             kp(L.ffn_up.data);
@@ -3266,9 +3047,14 @@ void engine::release_host_weight_pages() {
             }
         }
     }
-    if (hc_fwd() && m.ple_table.data) {
-        // gathered by the host on the PLE layer's step: keep it out of page-out
-        keep.insert(m.ple_table.data);
+    if (m.extras) {
+        // qwen4exp's PLE / deepseek41's Engram table is gathered by the host on
+        // every step: keep it out of page-out.
+        m.extras->visit_host_keep(false, [&](const void * p) {
+            if (p) {
+                keep.insert(p);
+            }
+        });
     }
     if (!moe_resident) {
         // The ncmoe host half evaluates the non-resident experts straight out of
@@ -3294,14 +3080,11 @@ void engine::release_host_weight_pages() {
             keep.insert(M.gate_inp);
         }
     }
-    if (m.ds41) {
+    if (aops_ && aops_->host_keep_routed_experts) {
         // The ds41 GPU path streams the routed experts from the mmap and
         // gathers the 24 Engram rows per token on the host, so those pages are
         // live even though they are never uploaded.  Everything else (the
         // dense MLA/mHC/compressor/indexer tensors) is on the cards.
-        if (m.ple_table.data) {
-            keep.insert(m.ple_table.data);
-        }
         for (int il = 0; il < m.hp.n_layer; il++) {
             const moe_t & M = m.layers[(size_t)il].moe;
             keep.insert(M.gate_exps.data);
@@ -3326,161 +3109,13 @@ void engine::release_host_weight_pages() {
             (double)dropped / (1024.0 * 1024.0), m.keep_file_cache ? ", page cache kept" : "");
 }
 
-// DeepSeek-V4.1-Flash's dense linear stores (see engine.h).  Its GPU forward is
-// per-token M=1 and reads every dense weight through ds41_gpu_state::gemv1, so
-// the generic seg_plan stores never applied to it: Q5_K went through the raw
-// fp32-dequant GEMV at 110 GB/s.  The k5 store keeps the native 5-bit values
-// (no re-quantization, 0.75 B/w) and its M=1 GEMV measures 249 GB/s.  Q8_0 has
-// no native store; PF_DS41_DENSE_Q8 registers the ordinary per-32-group int8
-// conversion for it (measured worst per-row rel 2.2e-4, but neutral on time).
-//
-// The key is the host tensor pointer: a converted tensor skips its raw device
-// upload, so engine::wkey(dev, t.data) returns the host pointer - and that is
-// what the forward passes to gemv1.  PF_DS41_DENSE_STORE=0 restores the raw
-// GEMV (the exact A/B: nothing is registered and the raw upload happens).
-bool engine::setup_ds41_dense_store() {
-    if (!ds41_fwd() || !dnnl_gemm_enabled(q)) {
-        return false;
-    }
-    const char * es = si::env::str("PF_DS41_DENSE_STORE");
-    if (es && atoi(es) == 0) {
-        return false;
-    }
-    // Q8_0 has no native store; the ordinary per-32-group int8 conversion is
-    // *not* the 0.98% generic re-quantization here: Q8_0 already carries one
-    // f16 scale per 32 values, so the conversion keeps its own grid (measured
-    // worst per-row rel 2.2e-4 against the same fp32 dot, below the k5 store's
-    // 1.1e-3, because the activation quantization dominates).  It is an A/B and
-    // **off** by default: the interleaved 3-rep cell measured decode 124.3
-    // (k5 only) vs 125.0 (with the 80 int8 stores) ms/token, i.e. no time win
-    // here - the Q8_0 projections are 372 MB of a 6.3 GB dense stream - so the
-    // default keeps the raw Q8_0 GEMV and its exact weights.
-    const bool add_q8 = si::env::flag("PF_DS41_DENSE_Q8");
-    // Diagnostic bisection: PF_DS41_DENSE_ONLY=wq_b,wo_a,... registers only the
-    // named groups (the others keep their raw upload and GEMV), so a store that
-    // changes the stream can be isolated to one tensor class.
-    const char * only = si::env::str("PF_DS41_DENSE_ONLY");
-    auto want = [&](const char * tag) { return !only || std::strstr(only, tag) != nullptr; };
-    const ds41_hparams & d = m.hp.ds;
-    dnnl_dev_.clear();
-    dnnl_dev_.resize(backends_.size());
-    for (size_t dd = 0; dd < backends_.size(); dd++) {
-        if (dev_kind_[dd] != 0 || !dev_queues_[dd]) {
-            continue; // the ds41 GPU forward requires an all-GPU layer map
-        }
-        // decode-only: the forward quantizes one row per GEMV, so the
-        // prefill-capacity scratch (360 MB/card) and the k5 prefill expansion
-        // scratch (662 MB for the head alone) would be dead VRAM.
-        dnnl_dev_[dd] = std::make_unique<dnnl_gemm>(*dev_queues_[dd], 2, 8192);
-    }
-    size_t n_k5 = 0, n_i8 = 0;
-    uint64_t bytes = 0;
-    // the stores are device memory this engine owns, so they must be in the
-    // per-device accounting the control plane reports as free memory
-    std::vector<uint64_t> dev_bytes(backends_.size(), 0);
-    // `key` identifies the store and equals the pointer gemv1 receives;
-    // `host_data` is where the packed rows start (the tensor base, or a group's
-    // byte offset inside a stacked tensor such as wo_a).
-    auto reg_k5 = [&](int dev, const void * key, const void * host_data, uint32_t type, int K, int N) {
-        dnnl_gemm * D = dnnl_for(dev);
-        if (!D || !key || !host_data || type != 13 || K <= 0 || N <= 0 || (K % 32) != 0) {
-            return;
-        }
-        if (D->add_weight_k5(key, host_data, type, K, N)) {
-            const uint64_t b =
-                (uint64_t)((double)K * (double)N * 0.75) + 2ull * (uint64_t)(K / 32) * (uint64_t)N * 2;
-            n_k5++;
-            bytes += b;
-            if ((size_t)dev < dev_bytes.size()) {
-                dev_bytes[(size_t)dev] += b;
-            }
-        }
-    };
-    auto reg_i8 = [&](int dev, const wt & t) {
-        dnnl_gemm * D = dnnl_for(dev);
-        if (!D || !t.data || t.type != 8 || t.K <= 0 || t.N <= 0) {
-            return;
-        }
-        if (D->add_weight(t.data, t.data, t.type, t.K, t.N, /*eager=*/false, /*lazy=*/true)) {
-            const uint64_t b = (uint64_t)t.K * (uint64_t)t.N + 2ull * (uint64_t)(t.K / 32) * (uint64_t)t.N;
-            n_i8++;
-            bytes += b;
-            if ((size_t)dev < dev_bytes.size()) {
-                dev_bytes[(size_t)dev] += b;
-            }
-        }
-    };
-    for (int li = 0; li < m.hp.n_layer; li++) {
-        const int dev = layer_dev_[(size_t)li];
-        if (dev < 0 || (size_t)dev >= dev_kind_.size() || dev_kind_[(size_t)dev] != 0) {
-            continue;
-        }
-        const layer_t & L = m.layers[(size_t)li];
-        if (want("wq_b")) {
-            reg_k5(dev, L.ds.wq_b.data, L.ds.wq_b.data, L.ds.wq_b.type, L.ds.wq_b.K, L.ds.wq_b.N);
-        }
-        if (want("wo_b")) {
-            reg_k5(dev, L.ds.wo_b.data, L.ds.wo_b.data, L.ds.wo_b.type, L.ds.wo_b.K, L.ds.wo_b.N);
-        }
-        // wo_a is one tensor holding out_group_count stacked groups; the GEMV
-        // is called once per group with a byte offset into it, so each group is
-        // its own store keyed at that offset.
-        if (want("wo_a")) {
-            const int out_g = d.out_group_count > 0 ? d.out_group_count : 1;
-            const int out_rank = d.out_lora_rank > 0 ? d.out_lora_rank : 0;
-            const int gsz = m.hp.n_head / out_g * d.kv_dim;
-            const uint64_t row_b = (uint64_t)ggml_row_bytes(L.ds.wo_a.type, (uint64_t)gsz);
-            for (int g = 0; g < out_g; g++) {
-                const char * key = (const char *)L.ds.wo_a.data + (size_t)g * (size_t)out_rank * row_b;
-                reg_k5(dev, key, key, L.ds.wo_a.type, gsz, out_rank);
-            }
-        }
-        if (want("ffn")) {
-            reg_k5(dev, L.ffn_gate.data, L.ffn_gate.data, L.ffn_gate.type, L.ffn_gate.K, L.ffn_gate.N);
-            reg_k5(dev, L.ffn_up.data, L.ffn_up.data, L.ffn_up.type, L.ffn_up.K, L.ffn_up.N);
-            reg_k5(dev, L.ffn_down.data, L.ffn_down.data, L.ffn_down.type, L.ffn_down.K, L.ffn_down.N);
-        }
-        if (want("engram") && L.ds.engram_kv.data) {
-            reg_k5(dev, L.ds.engram_kv.data, L.ds.engram_kv.data, L.ds.engram_kv.type, L.ds.engram_kv.K, L.ds.engram_kv.N);
-        }
-        if (add_q8) {
-            reg_i8(dev, L.ds.wq_a);
-            reg_i8(dev, L.ds.wkv);
-        }
-    }
-    // The LM head runs on the primary device.  A tied head shares token_embd's
-    // bytes, which the embed kernel reads as raw GGUF rows on the host, so it
-    // cannot be replaced by a store.
-    if (want("head") && m.output.data && m.output.data != m.tok_embd.data) {
-        reg_k5(0, m.output.data, m.output.data, m.output.type, m.output.K, m.output.N);
-    }
-    if (n_k5 + n_i8 > 0) {
-        if (dev_used_bytes_.size() < dev_bytes.size()) {
-            dev_used_bytes_.resize(dev_bytes.size(), 0);
-        }
-        for (size_t d = 0; d < dev_bytes.size(); d++) {
-            dev_used_bytes_[d] += dev_bytes[d];
-        }
-    }
-    ds41_dense_store_ = (n_k5 + n_i8) > 0;
-    if (ds41_dense_store_) {
-        fprintf(stderr,
-                "[ds41] dense stores: %zu k5 + %zu int8 oneDNN tensors, %.0f MB%s "
-                "(PF_DS41_DENSE_STORE=0 restores the raw GEMV)\n",
-                n_k5, n_i8, (double)bytes / 1048576.0, add_q8 ? "" : " (Q8_0 kept raw)");
-    } else {
-        dnnl_dev_.clear();
-    }
-    return ds41_dense_store_;
-}
-
 // Build the per-device oneDNN int8 weights for the XMX prefill/decode path.
 // Keyed by the host weight pointer: upload_device_weights then skips the raw
 // device copy of a converted tensor, so the partition's linears live once as
 // int8.  Returns false if no device can run the int8 matmul (caller falls back
 // to the SIn/dp4a path).
 bool engine::setup_md_dnnl() {
-    if (ds41_fwd()) {
+    if (aops_ && !aops_->md_dnnl) {
         // The ds41 GPU forward has no seg_plan; its dense linears get their own
         // per-device, decode-only stores in setup_ds41_dense_store(), and the
         // routed experts stay on ds41_iq2 / the raw GEMV.  Converting the
@@ -4129,7 +3764,9 @@ void engine::setup_multi_device(const std::string & layer_map) {
         md_xmx = has_gpu && !dp4a_env_off && !f32_path_ && setup_md_dnnl();
         // deepseek41 has no seg_plan, so setup_md_dnnl() declines; its dense
         // GEMVs still take the same stores (see setup_ds41_dense_store).
-        ds41_dense_store_ = has_gpu && setup_ds41_dense_store();
+        if (aops_ && aops_->setup_weights) {
+            aops_->setup_weights(*this, has_gpu);
+        }
         lt.lap("setup_md_dnnl (all)");
         md_int8 = has_gpu && !dp4a_env_off && mp_->rep.sin_w8 && !md_xmx;
         // md_xmx means "oneDNN int8 weights are available", not that the XMX
@@ -4138,7 +3775,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // path for what it is.
         fprintf(stderr, "[dev] multi-device weight path: %s\n",
                 md_xmx       ? "oneDNN int8 matmul (jit:gemm:any)"
-                : ds41_dense_store_ ? "ds41 dense oneDNN k5/int8 stores"
+                : arch_dense_store() ? "ds41 dense oneDNN k5/int8 stores"
                 : md_int8    ? "SIn int8 (dp4a)"
                              : "fp32");
     }
@@ -4146,23 +3783,14 @@ void engine::setup_multi_device(const std::string & layer_map) {
     // converted tensors skip their raw device copy.  The SIn/w8 fallback built
     // its copies just above.  Comment retained for the fallback path:
     if (md_int8) {
-        w8_dev_.assign((size_t)ndev, {});
+        ws_.begin_devices(ndev);
         for (int il = 0; il < m.hp.n_layer; il++) {
             const int d = layer_dev_[(size_t)il];
             if (d < 0 || dev_kind_[(size_t)d] != 0 || !dev_queues_[(size_t)d]) {
                 continue;
             }
             const layer_t & L = m.layers[il];
-            auto add = [&](const wt & t) {
-                if (!t.data) {
-                    return;
-                }
-                w8t w;
-                m.build_w8_one(*dev_queues_[(size_t)d], t, w);
-                if (w.vals) {
-                    w8_dev_[(size_t)d][t.data] = w;
-                }
-            };
+            auto add = [&](const wt & t) { ws_.build_w8_device(d, *dev_queues_[(size_t)d], t); };
             add(L.ffn_gate);
             add(L.ffn_up);
             add(L.ffn_down);
@@ -4178,7 +3806,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
             }
         }
         // the LM head's int8 copy lives on the primary device (decode head)
-        m.build_w8_one(*dev_queues_[0], m.output, m.output8);
+        ws_.build_w8_one(*dev_queues_[0], m.output, m.output8);
     }
     lt.lap("md_int8 fallback");
     for (size_t i = 0; i < gpu_indices.size(); i++) {
@@ -4204,7 +3832,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
                     L0.wqkv.data, (int)in_map, (int)dnnl_dev_[d]->has_weight(L0.wqkv.data),
                     (int)dnnl_dev_[d]->has_weight_w4(L0.wqkv.data), (int)dnnl_dev_[d]->has_weight_k5(L0.wqkv.data),
                     (int)dnnl_dev_[d]->has_weight_cb4(L0.wqkv.data),
-                    (int)(d < w8_dev_.size() && w8_dev_[d].count(L0.wqkv.data)));
+                    (int)(ws_.has_w8((int)d, L0.wqkv.data)));
         }
         {
             const moe_t & M = m.layers[0].moe;
@@ -4533,7 +4161,7 @@ void engine::alloc_buffers() {
     // decode is a direct replay, so a bucket is cheap and every row count gets
     // one.  The single-device path records a command graph per bucket, which
     // costs a whole forward recording at startup, so only the coarse counts
-    // get a graph there (engine_graph.cpp) and the rest replay directly.
+    // get a graph there (graph.cpp) and the rest replay directly.
     for (int tb = 1; tb <= kMaxB; tb++) {
         dec_bucket b;
         b.tb = tb;
@@ -4565,7 +4193,9 @@ void engine::zero_slot(int slot) {
     if (slot < 0 || slot >= state_slots_) {
         return;
     }
-    q4_zero_state(slot);
+    if (aops_ && aops_->slot_zero) {
+        aops_->slot_zero(*this, slot);
+    }
     // The QSA host mirror is per (attention layer, slot) and is not part of the
     // device recurrent state below; clear it before the next sequence uses the
     // slot (no-op for non-q4exp and when QSA is off).
@@ -4613,16 +4243,8 @@ void engine::reset_state() {
         q.memset(d_conv_state, 0, (size_t)state_slots_ * n_gdn * conv_per * 4);
         q.wait();
     }
-    if (hc_fwd()) {
-        const int hist_rows = (m.hp.ple_conv - 1) * m.hp.ple_ngram;
-        const int hc_dim = m.hp.hc_mult * m.hp.n_embd;
-        if (q4_ple_hist_) {
-            std::memset(q4_ple_hist_, 0, (size_t)state_slots_ * hist_rows * hc_dim * sizeof(float));
-            std::memset(q4_ple_nhist_, 0, (size_t)state_slots_ * sizeof(int32_t));
-            for (int i = 0; i < state_slots_ * 8; i++) {
-                q4_ple_prev_[i] = m.hp.ple_eos;
-            }
-        }
+    if (aops_ && aops_->reset_extra) {
+        aops_->reset_extra(*this);
     }
     // the QSA host mirror/pool is per slot too: a full engine reset clears all
     // of it (no-op when QSA is off)
@@ -4657,8 +4279,8 @@ void engine::reset_single() {
 // ---------------------------------------------------------------------------
 void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int slot, bool with_head) {
     kv_scope kv_scope_(kv_k_, kv_v_);
-    if (hc_fwd()) {
-        q4_prefill_text(toks, slot, n, start);
+    if (aops_ && aops_->prefill_text) {
+        aops_->prefill_text(*this, toks, slot, n, start);
         return;
     }
     // a pending pipelined mode-2 chunk must complete (and its device-1 phase be
@@ -4730,8 +4352,8 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
 // is ~2x the chunked throughput for the same tokens
 void engine::prefill_text(const std::vector<int> & toks, int slot, int n, int start) {
     kv_scope kv_scope_(kv_k_, kv_v_);
-    if (hc_fwd()) {
-        q4_prefill_text(toks, slot, n, start);
+    if (aops_ && aops_->prefill_text) {
+        aops_->prefill_text(*this, toks, slot, n, start);
         return;
     }
     int pos = start;
@@ -4916,27 +4538,8 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
 
 void engine::decode_batch(const int32_t * tokens, const int32_t * poss, const int32_t * slots, int n_rows) {
     kv_scope kv_scope_(kv_k_, kv_v_);
-    if (hc_fwd()) {
-        prefill_flush();
-        pf_info_ = nullptr;
-        d_info->pc_active = 0;
-        d_info->n_rows = n_rows;
-        d_info->tpb = 1;
-        d_info->n_real = 1;
-        // generate_mm writes the single decode row's M-RoPE position just before
-        // this call (an image's RoPE position is not the token index).  Keep it
-        // for that loop; every text-only caller resets step_info or prefills
-        // through q4_prefill_text, which clears mrope_on.
-        d_info->mrope_on = mm_decode_rope_ ? 1 : 0;
-        d_info->img_embd = nullptr;
-        for (int r = 0; r < kMaxB; r++) {
-            d_info->pos[r] = (r < n_rows) ? poss[r] : 0;
-            d_info->slot[r] = (r < n_rows) ? slots[r] : (r % kMaxB);
-            d_info->active[r] = (r < n_rows) ? 1 : 0;
-            d_info->tokens[r] = (r < n_rows) ? tokens[r] : 0;
-            d_info->n_real_row[r] = 1;
-        }
-        q4_forward(0, n_rows, true);
+    if (aops_ && aops_->decode_batch) {
+        aops_->decode_batch(*this, tokens, poss, slots, n_rows);
         return;
     }
     // One-shot freeze of the expert bank.  By now every layer's router output of
@@ -5029,9 +4632,9 @@ void engine::fetch_logits(int row, float * out) {
 // request is a plain greedy one (see generate_impl); a logprobs request still
 // needs the full vector.
 int engine::fetch_argmax(int row) {
-    // The common path: q4_forward enqueued the argmax right after the LM head
-    // and its final sync already waited for the 4-byte copy into h_logits, so
-    // this is a host read with no submission round trip.
+    // The common path: the model-owned decode forward enqueued the argmax right
+    // after the LM head and its final sync already waited for the 4-byte copy
+    // into h_logits, so this is a host read with no submission round trip.
     if (dec_argmax_dev_ && row == 0 && d_dec_argmax_ != nullptr) {
         int32_t id = 0;
         std::memcpy(&id, h_logits, sizeof(int32_t));
@@ -5050,32 +4653,8 @@ int engine::fetch_argmax(int row) {
 }
 
 std::vector<float> engine::run_head() {
-    if (hc_fwd()) {
-        q.memcpy(h_logits, d_logits, (size_t)m.hp.n_vocab * 4).wait();
-        if (const char * dp = si::env::str("PF_DUMP_Q4LOG")) {
-            if (FILE * fp = fopen(dp, "wb")) {
-                fwrite(h_logits, sizeof(float), (size_t)m.hp.n_vocab, fp);
-                fclose(fp);
-            }
-            int top[5] = {0};
-            for (int i = 0; i < m.hp.n_vocab; i++) {
-                for (int j = 0; j < 5; j++) {
-                    if (h_logits[i] > h_logits[top[j]] || (j == 0 && i == 0)) {
-                        for (int k = 4; k > j; k--) {
-                            top[k] = top[k - 1];
-                        }
-                        top[j] = i;
-                        break;
-                    }
-                }
-            }
-            fprintf(stderr, "[q4] top5:");
-            for (int j = 0; j < 5; j++) {
-                fprintf(stderr, " %d(%.4f)", top[j], h_logits[top[j]]);
-            }
-            fprintf(stderr, "\n");
-        }
-        return std::vector<float>(h_logits, h_logits + m.hp.n_vocab);
+    if (aops_ && aops_->run_head) {
+        return aops_->run_head(*this);
     }
     // the pipelined multi-device prefill may still owe the last chunk's device-1
     // phase (and the head, which writes d_last_hidden)
@@ -5184,39 +4763,11 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     last_cached_tokens_.store(0, std::memory_order_relaxed);
     // DeepSeek-V4.1-Flash: a model-owned forward with no paged KV and no
     // seg_plan.  It carries its own per-sequence window/compressed caches and
-    // Engram history, so the whole request is handed to engine_ds41.cpp.
-    if (ds41_fwd()) {
+    // Engram history, so the whole request is handed to its arch_ops row
+    // (arch/deepseek41/runtime.cpp -> forward_host.cpp / forward_gpu.cpp).
+    if (aops_ && aops_->generate) {
         size_t cached = 0;
-        std::vector<int> out;
-        auto run_fwd = [&](const mm_prompt * mmp) {
-            if (ds41g_) {
-                return ds41_gpu_generate(m, tk, prompt, mmp, gp, cb, first_logits, &cached, *ds41g_);
-            }
-            return ds41_generate(m, tk, prompt, mmp, gp, cb, first_logits, &cached);
-        };
-        if (!mm) {
-            out = run_fwd(nullptr);
-        } else {
-            if (!mm->has_encoded_embd()) {
-                throw std::runtime_error("multimodal: the prompt has media rows but no encoder output "
-                                         "(image/video need --mmproj)");
-            }
-            // The ds41 forward reads the image embeddings from host memory.  The
-            // device-built prompt keeps them in `d_embd`; copy once here.
-            mm_prompt local;
-            const mm_prompt * mmp = mm;
-            if (mm->embd.empty() && mm->d_embd && mm->n_img > 0) {
-                local = *mm;
-                // `n_img` counts media blocks, not embedding rows: an image
-                // contributes many rows.  `n_rows` is the buffer's first dimension.
-                const size_t rows = (size_t)(mm->n_rows > 0 ? mm->n_rows : (int)mm->img_row.size());
-                local.embd.resize(rows * (size_t)m.hp.n_embd);
-                q.memcpy(local.embd.data(), mm->d_embd, local.embd.size() * sizeof(float)).wait();
-                local.d_embd = nullptr;
-                mmp = &local;
-            }
-            out = run_fwd(mmp);
-        }
+        auto out = aops_->generate(*this, prompt, mm, gp, cb, first_logits, &cached);
         last_cached_tokens_.store(cached, std::memory_order_relaxed);
         return out;
     }
@@ -5263,9 +4814,9 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
             throw std::runtime_error("multimodal: too many image tokens");
         }
         // The device path already produced the embeddings in the caller's
-        // buffer.  A model-owned prefill uploads a host-built prompt itself
-        // (q4_prefill_mm), so do not copy it twice.
-        if (!mm->d_embd && !mm->embd.empty() && !m.profile.mm_model_prefill) {
+        // buffer.  A model-owned prefill uploads a host-built prompt itself,
+        // so do not copy it twice.
+        if (!mm->d_embd && !mm->embd.empty() && !(mp_ && mp_->spec.mm_owned_prefill)) {
             q.memcpy(d_img_embd, mm->embd.data(), mm->embd.size() * sizeof(float)).wait();
         }
     }
@@ -5282,14 +4833,14 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     set_table(0, blocks);
 
     if (mm) {
-        if (m.profile.mm_model_prefill) {
+        if (mp_ && mp_->spec.mm_owned_prefill) {
             // The model owns its forward (qwen4exp): feed the whole expanded
             // prompt to its chunker, which carries the M-RoPE/image-row slices
             // per chunk and keeps the expert bank, PLE history and QSA on the
             // same path as a text prefill.  The generic loop below would call
             // prefill_chunk one kMaxT row at a time and re-upload experts at
             // every 32-token boundary.
-            q4_prefill_mm(*mm, 0);
+            aops_->prefill_mm(*this, *mm, 0);
             pos = nprompt;
         } else {
             // Chunk-batched (mode 2) prefill, the same path prefill_text uses.
@@ -5364,12 +4915,13 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // the q4 forward synchronises before it returns, so a GPU partition is
     // required (CPU falls back).
     static const bool argmax_dev = si::env::i32("PF_Q4_ARGMAX_DEV", 1) != 0;
-    const bool use_dev_argmax = argmax_dev && hc_fwd() && !cpu_mode
+    const bool use_dev_argmax = argmax_dev && aops_ && aops_->device_argmax && !cpu_mode
                                 && !(multi_dev && dev_kind_[(size_t)0] == static_cast<int>(device_kind::cpu))
                                 && dbg_lg == nullptr && gp.speculative_greedy() && !gp.wants_logprobs();
-    // q4_forward reads this to enqueue the argmax into the same submission as
-    // the rest of the mode-0 forward (see fetch_argmax).  The guard clears it on
-    // every exit, including an exception from the emit callback.
+    // The model-owned decode forward reads this to enqueue the argmax into the
+    // same submission as the rest of the mode-0 forward (see fetch_argmax).
+    // The guard clears it on every exit, including an exception from the emit
+    // callback.
     dec_argmax_dev_ = use_dev_argmax;
     struct dec_argmax_guard {
         bool & f;
@@ -5380,7 +4932,7 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     // PF_Q4_ARGMAX_TIME: split the per-step logits acquisition (sample/fetch on
     // the host vs the device argmax, plus the host logits download) so the A/B
     // is measured inside the engine rather than inferred from wall clock.
-    static const bool arg_time = hc_fwd() && si::env::flag("PF_Q4_ARGMAX_TIME");
+    static const bool arg_time = aops_ && aops_->device_argmax && si::env::flag("PF_Q4_ARGMAX_TIME");
     double arg_ms = 0.0, fetch_ms = 0.0;
     int arg_n = 0;
     const auto t_loop = arg_time ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

@@ -1,7 +1,7 @@
 // DFlash / DFlash2 draft-model kernels.
 //
 // Four shapes the main model does not have, all of them small and all of them on
-// the draft's own buffers (see engine_dflash.cpp for the forward that drives
+// the draft's own buffers (see spec/dflash.cpp for the forward that drives
 // them):
 //
 //   df_conv_launch          the DFlash2 grouped dynamic depthwise convolution
@@ -798,7 +798,7 @@ void df_topk_launch(queue & q, const float * logits, int n, int32_t * ids, float
 //     edge(p->c) = < A[p] * gate(h_i), B[c] > + unary_i[c]
 // with A/B the per-token rank-space codebooks (row = one Q4_K block, 256 floats),
 // gate = selector_hidden.weight @ h_i and unary the candidate's own logit.  The
-// host then walks one path through the lattice (see engine_dflash.cpp).
+// host then walks one path through the lattice (see spec/dflash.cpp).
 //
 // One work-group per position: the 16 conditional rows (A rows premultiplied by
 // gate) and the 16 successor rows are staged in SLM, then the 256 threads each

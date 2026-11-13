@@ -37,11 +37,19 @@ window-only.
 
 | file | role |
 |---|---|
-| `src/model/deepseek41.cpp` | loader; binds MLA, compressor, indexer, mHC, MoE, Engram; fills `hparams::ds` |
-| `src/model/profiles/deepseek41.cpp` | model profile: `fwd = deepseek41`, `vision = deepseek41v`, policy |
-| `src/model/model.h` | `ds41_hparams` (sources resolved to `kv_src_of`/`topk_src_of`), `ds41_layer`, `engram_token_map` |
-| `src/engine/engine_ds41.cpp` | validated host forward (mHC, MLA, compressed KV, DSA, Engram, MoE), incremental `DecState`, prefix cache |
-| `src/engine/ds41_prefix_cache.h` | chained-hash longest-prefix state cache |
+| `src/model/arch/deepseek41/load.cpp` | loader; binds MLA, compressor, indexer, mHC, MoE, Engram; fills `hparams::arch` (a `ds41_hparams`) |
+| `src/model/arch/deepseek41/profile.cpp` | model profile: `fwd = deepseek41`, `vision = deepseek41v`, policy |
+| `src/model/arch/deepseek41/hparams.h` | `ds41_hparams : arch_hparams` (sources resolved to `kv_src_of`/`topk_src_of`), attached as `hparams::arch` and read through `ds41_hp(hp)` |
+| `src/model/arch/deepseek41/tensors.h` | `ds41_layer` (per-layer MLA / compressor / indexer / Engram / mHC tensor views) and `ds41_model_extras` (Engram token map + table), held in `layer_t::extras` / `model::extras` |
+| `src/model/arch/deepseek41/accessors.h` | `ds41_layer_of(L)` / `ds41_model(m)` pimpl accessors |
+| `src/model/model.h` | `hparams::arch` (base `arch_hparams`) and the generic `layer_t::extras` / `model::extras` slots |
+| `src/engine/arch/deepseek41/forward_host.cpp` | validated host forward (mHC, MLA, compressed KV, DSA, Engram, MoE), incremental `DecState`, prefix cache |
+| `src/engine/arch/deepseek41/forward_gpu.cpp` | the 2×A770 GPU forward (same semantics, device kernels) |
+| `src/engine/arch/deepseek41/forward.h` | the forward entry points (`ds41_generate`, `ds41_gpu_*`); includes them only from the architecture's own TUs |
+| `src/engine/arch/deepseek41/runtime.cpp` | the `arch_ops` hooks (setup, setup_weights, dense_store, destroy, generate) |
+| `src/engine/arch/deepseek41/state.h` | the composed runtime state (GPU handle + dense-store flag) |
+| `src/engine/arch/deepseek41/dense_store.cpp` | the per-device oneDNN k5/int8 dense stores (`setup_ds41_dense_store`) |
+| `src/engine/arch/deepseek41/prefix_cache.h` | chained-hash longest-prefix state cache |
 | `src/backend/gpu/kernels/ds41_iq2.{h,cpp}` | raw IQ2_XXS/XS/S expert GEMV (no expansion pass) |
 | `src/backend/gpu/kernels/ds41_attn.{h,cpp}` | MLA attention, compressor, RoPE, fp4, indexer score |
 | `src/backend/gpu/kernels/ds41_hc.{h,cpp}` | mHC mixes/pre/post |
@@ -52,8 +60,11 @@ window-only.
 ## Forward
 
 The forward is **model-owned**: it does not use `seg_plan` or the paged KV pool.
-`engine::ds41_fwd()` is the predicate; `generate_impl` hands the request to
-`ds41_generate` (CPU) / the GPU path.
+Its `arch_ops` row (`src/engine/arch/registry.cpp`, hooks in
+`src/engine/arch/deepseek41/runtime.cpp`) declares `owns_kv_pool` and
+`owns_request_path`; the engine's lifecycle sites ask `engine::owns_kv_pool()` /
+`owns_request_path()`, and `generate_impl` hands the request to
+`arch_ops::generate` (`ds41_generate` on the CPU or the GPU path).
 
 Per layer, in order:
 
@@ -88,7 +99,7 @@ mscale cancelled to 1.0.  RMSNorm is always `1e-20`.
 
 ## Host implementation and measurements
 
-`engine_ds41.cpp` is a scalar/AVX f32 implementation: it dequantizes the dense
+`src/engine/arch/deepseek41/forward_host.cpp` is a scalar/AVX f32 implementation: it dequantizes the dense
 weights once into RAM (routed experts are streamed from the mmap), keeps a
 `DecState` per sequence (40 window rings of 128×512, four compressed caches of
 640-wide rows, compressor rings, Engram history), and decodes one token at a
@@ -109,7 +120,7 @@ was masking the issue.
 
 ### Prefix cache
 
-`ds41_prefix_cache.h` keys a chained FNV-1a hash per token and stores
+`src/engine/arch/deepseek41/prefix_cache.h` keys a chained FNV-1a hash per token and stores
 `DecState` snapshots at the prompt end and every 16 tokens, with a 512 MiB
 LRU-by-bytes budget.  A shared prefix resumes and only the suffix is
 forwarded.  `ds41_generate` reports the reused count; the server maps it to
@@ -149,7 +160,7 @@ The IQ2 GEMV is codebook/issue-bound, not DRAM-bound; the coalesced
 value-per-lane mapping is 3–6× slower and is not shipped.  `sycl::exp2(int)` is
 not exact on this device/JIT; fp4 powers of two are built from float bits.
 
-The GPU engine path is `engine_ds41_gpu.cpp`: dense weights are uploaded per
+The GPU engine path is `src/engine/arch/deepseek41/forward_gpu.cpp`: dense weights are uploaded per
 tensor and split 0-19/20-39 (5.74 GiB), the routed experts live in a ds41-owned
 LRU bank backed by the mmap, and `--device gpu` is selected with a layer map;
 `PF_DS41_GPU=0` keeps the host forward.  The ds41 GPU path still skips the
@@ -219,11 +230,11 @@ a **decode-only** `dnnl_gemm(q, 2, 8192)` per GPU partition and registers:
 * **int8** (`add_weight`) for Q8_0 (`wq_a`, `wkv`) behind `PF_DS41_DENSE_Q8=1`;
   it measured neutral (124.3 vs 125.0 ms/token) and is off by default.
 
-`gemv1` (`engine_ds41_gpu.cpp`) takes `wkey(dev, t.data)` - the device pointer
+`gemv1` (`src/engine/arch/deepseek41/forward_gpu.cpp`) takes `wkey(dev, t.data)` - the device pointer
 for an uploaded tensor, the host pointer (the store's key) for a converted one
 - and, when the store exists, runs `quantize()` + `gemm()` instead of
 `gemv_group_launch`.  A converted tensor skips its raw device upload via the
-existing oneDNN skip rule, now also gated on `ds41_dense_store_`.
+existing oneDNN skip rule, now also gated on `ds41x_.dense_store`.
 
 **Why the stores are decode-only.** `dnnl_gemm`'s prefill scratch is
 `cap_M=1024, cap_K=32768` (360 MB/card) and `add_weight_k5` allocates a `K*N`
@@ -328,7 +339,7 @@ and oneDNN's 266-280 GB/s M=1 path needs an int8 store).
 * **The generic multi-device oneDNN branch must exclude ds41.**  The
   `else if (multi_dev && !md_int8 && !md_xmx && ...)` block in the engine
   constructor re-creates `dnnl_dev_` for every non-seg_plan model; without the
-  `!ds41_dense_store_` guard it replaced the decode-only instances and then
+  `!ds41x_.dense_store` guard it replaced the decode-only instances and then
   `wptr()`-ed the shared-expert tensors whose raw upload the store had skipped.
 * **`mm_prompt::n_rows` is the embedding-row count**, not `n_img`: an image
   contributes many rows.

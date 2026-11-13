@@ -284,9 +284,9 @@ int engine::attn_dev(int a) const {
 }
 
 void engine::kv_setup(int n_attn, int initial_blocks) {
-    if (ds41_fwd()) {
+    if (owns_kv_pool()) {
         // deepseek41 owns its sliding-window and group-shared compressed caches
-        // (engine_ds41.cpp / engine_ds41_gpu.cpp) and never touches the paged
+        // (arch/deepseek41/forward_host.cpp / arch/deepseek41/forward_gpu.cpp) and never touches the paged
         // pool.  engine.cpp already sets n_blocks = 1, but the multi-device
         // branch below re-derives n_blocks from pool_cap and commits the whole
         // context: 4096 blocks x 16 KB x 20 attention layers = 1.28 GB per card

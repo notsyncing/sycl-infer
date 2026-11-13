@@ -43,6 +43,7 @@
 #include "gguf.h"
 #include "image.h"
 #include "model_profile.h"
+#include "weight_store.h"
 
 namespace si {
 
@@ -163,9 +164,9 @@ struct vision_model {
     // sampled learned position embedding [np][n_embd] in merged token order
     void build_pos_emb(const vision_input & in, std::vector<float> & out) const;
 
-    // device copy of the weights (one blob)
-    void * dev_weights = nullptr;
-    size_t dev_weights_size = 0;
+    // device copy of the weights: the whole file 1:1, or a compact span set
+    // (src/backend/weight_store.h) when every linear is on the oneDNN path.
+    weight_store weights;
     // PF_VISION_DNNL (default on for qwen2vl): every vision linear runs through
     // the text model's oneDNN int8 matmul instead of vit_gemm.  `gemm` is a
     // private instance created on upload; each call falls back to vit_gemm for a
@@ -204,23 +205,12 @@ struct vision_model {
     };
     std::vector<qkv_src> host_qkv;
     void ensure_w32() const;
-    // Compact weight blob: with every linear on the oneDNN int8 path, the only
-    // mmproj tensors a device kernel reads are the norms/biases (3.7 MB of the
-    // 1.32 GB file).  `blob_spans` maps the uploaded (host pointer, bytes) to
-    // its device offset; empty means the whole file is mapped 1:1 (the
-    // PF_VISION_DNNL=0 / partial-registration fallback).
-    struct blob_span {
-        const char * host = nullptr;
-        size_t bytes = 0;
-        size_t off = 0;
-    };
-    std::vector<blob_span> blob_spans;
     // Queue every device allocation below was made on (set on first upload):
     // sycl::free needs it, and freeing on another queue is UB.  All callers
     // pass the engine queue, so one queue per model holds in practice.
     sycl::queue * dev_q = nullptr;
     void upload(sycl::queue & q);
-    // releases dev_weights + patch weights + scratch on dev_q (no-op when
+    // releases the weight blob + patch weights + scratch on dev_q (no-op when
     // nothing was ever uploaded).  Models are never copied (a copy would
     // double-free), only referenced - and the deleted copy ctor suppresses
     // the implicit default ctor, so it is defaulted explicitly.
@@ -237,26 +227,9 @@ struct vision_model {
             && h < (const char *)qkv_b32.data() + qkv_b32.size() * sizeof(float)) {
             return (const char *)d_qkv_b32 + (h - (const char *)qkv_b32.data());
         }
-        if (!blob_spans.empty()) {
-            // binary search the uploaded spans (sorted by host pointer)
-            size_t lo = 0, hi = blob_spans.size();
-            while (lo < hi) {
-                const size_t mid = (lo + hi) / 2;
-                if (blob_spans[mid].host <= h) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if (lo > 0) {
-                const blob_span & s = blob_spans[lo - 1];
-                if (h >= s.host && h < s.host + s.bytes) {
-                    return (const char *)dev_weights + s.off + (h - s.host);
-                }
-            }
-            return nullptr; // a tensor the compact blob deliberately omitted
-        }
-        return (const char *)dev_weights + (h - (const char *)gguf.map_base);
+        // no blob -> identity; contiguous -> offset from map_base; compact ->
+        // span search (null for a tensor the blob deliberately omitted)
+        return weights.ptr(host_ptr);
     }
 
     // Reference forward on the host: writes n_out * proj_dim embeddings.

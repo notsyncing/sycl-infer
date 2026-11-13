@@ -1,7 +1,7 @@
 # 设计 14：DFlash2 block drafter
 
 > 配套阅读：[设计 04 §12（MTP 引擎侧）](04-engine.md)、[设计 03 §15（MTP kernel）](03-kernels.md)。
-> DFlash2 与 MTP 的 **verify / rollback / accept** 那一半完全共用（`engine_mtp.cpp` 的
+> DFlash2 与 MTP 的 **verify / rollback / accept** 那一半完全共用（`spec/mtp.cpp` 的
 > `mtp_verify`），差别只在 **draft** 那一半：MTP 逐 token 前向，DFlash2 一次前向产出整块候选。
 
 ## 1. 概览
@@ -16,7 +16,7 @@ DFlash2 是一个**块扩散（block-diffusion）草稿器**，不是第二个�
 参考实现：llama.cpp `src/models/dflash.cpp` +
 `common/speculative.cpp::common_speculative_impl_draft_draft_dflash`。
 
-一个 cycle 的数据流（`engine_dflash.cpp` 的 `df_block` `df_block`）：
+一个 cycle 的数据流（`spec/dflash.cpp` 的 `df_block` `df_block`）：
 
 ```
 目标 hidden（target_layers 处捕获）
@@ -45,8 +45,8 @@ DFlash2 是一个**块扩散（block-diffusion）草稿器**，不是第二个�
 |---|---|
 | `src/model/dflash.{h,cpp}` | 草稿 GGUF 的 metadata、张量绑定、conv/selector 几何推导 |
 | `src/backend/gpu/kernels/dflash.cpp` | `df_capture_launch` / `df_conv_launch` / `df_gemm_head` / `df_topk_launch` / `df_sel_launch` / `df_rowrms` 等设备 kernel |
-| `src/engine/engine_dflash.cpp` | `df_block`（一次块前向）、`df_draft`、`generate_dflash`（投机循环） |
-| `src/engine/engine_graph.cpp` | 目标 hidden 的捕获 hook（`df_capture`） |
+| `src/engine/spec/dflash.cpp` | `df_block`（一次块前向）、`df_draft`、`generate_dflash`（投机循环） |
+| `src/engine/graph.cpp` | 目标 hidden 的捕获 hook（`df_capture`） |
 
 ## 2. 模型与几何
 
@@ -74,6 +74,20 @@ n_feat    = n_tgt_layer * 目标 n_embd    = 5*5120   = 25600
 ```
 
 一个 cycle 的行数 `M = n_max + 1`：第 0 行是**已提交的 anchor**，第 1..M-1 行填 `mask_id`。
+
+### 2.1 设备权重：f32 副本进 `weight_store`
+
+量化张量走各自的 native/int8 store（按 host 指针注册到该设备的 `dnnl_gemm` 表）。只有未量化的
+f32 张量——`enc.output_norm`、`output_norm`、每层 `attn_norm`/`ffn_norm`/`q_norm`/`k_norm`、
+`attn_conv_base`/`ffn_conv_base` 和可选的 `attn_sinks`——需要一份裸设备副本。
+`dflash_model::upload_f32` 把它们收进 backend `weight_store` 的紧凑 span blob
+（`weights.upload_spans`，每个 (host, bytes) 一个 span；重复指针只上传一次，设备偏移顺序分配），
+`dev_ptr`/`dev_f32` 委托 `weights.ptr()`，未上传的指针返回自身（恒等，保留旧 map miss 的语义）。
+
+与文本/视觉/音频不同，`dflash.h` **直接**持有 `weight_store`：它是 draft model 的例外，不进
+`model.h`（后者保持无 SYCL/设备 API）。blob 的释放必须发生在队列仍存活时：`engine::~engine`
+在 DFlash 清理段调用 `dfm_->release()`（`release()` 释放 blob 并清空 `dev_q`，因此随后的成员
+析构再调用是 no-op）；独立构造的 `dflash_model` 由析构函数释放。
 
 ## 3. 卷积系数：两个镜像的轴序
 
@@ -131,7 +145,7 @@ score(p → c) = unary_i[c] + <A[p] * gate(h_i), B[c]>
 `df_sel_launch` 输出 `[M][K + K*K]` 的 lattice（`K=16`）。
 
 主机从位置 1 开始走，每步在 `pred` 那一行里对 16 个候选取 argmax 作为下一个 `pred`
-（`engine_dflash.cpp` 的 `pred` 循环），**一次**产出整条路径——这是 DFlash2 与"每 token 独立
+（`spec/dflash.cpp` 的 `pred` 循环），**一次**产出整条路径——这是 DFlash2 与"每 token 独立
 重抽"的关键差别。
 
 > **候选顺序是模型定义的一部分。** ggml 的 `top_k` 排序后会交换前两个元素

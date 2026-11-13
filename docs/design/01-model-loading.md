@@ -1,6 +1,6 @@
 # 设计 01：模型加载与 CLI
 
-覆盖 `src/model/gguf.{h,cpp}`、`model.{h,cpp}`、`model_arch.h`、`qwen35.cpp`、`model_w8.cpp`、
+覆盖 `src/model/gguf.{h,cpp}`、`model.{h,cpp}`、`arch/registry.h` + `arch/registry.cpp`（内部 hub）、`arch_util.h`、`src/model/arch/qwen35/load.cpp`、`src/backend/weight_store.{h,cpp}`、
 `src/main.cpp`。相关：SIn 格式细节见 [02-quantization.md](02-quantization.md)，分词见
 [08-tokenizer.md](08-tokenizer.md)。
 
@@ -83,7 +83,7 @@ Q2_K..Q8_K 与 IQ3_XXS/IQ3_S/IQ4_XS = 256；**IQ4_NL = 32**（不是 256，它�
 K-quant 线性层的 `K`（= `dims[0]`）必须是块大小的整数倍。反过来，像
 `blk.0.ssm_conv1d.weight = [4, 6144]` 这种“转置读”的 conv 核一旦被 `bind_tensor` 绑成 `wt`，
 得到的会是 `K=4, N=6144`（完全反的形状）——它必须用 `bind_f32` 按裸 f32 数组读，加载器正是这么做的
-（`qwen35.cpp:81`）。
+（`src/model/arch/qwen35/load.cpp:81`）。
 
 计算路径实际消费的子集：F32（norm/标量）、Q4_K/Q5_K/Q6_K（线性层主力）、Q8_0/Q8_1
 （`ssm_beta`/`ssm_alpha` 这类窄 int8 行）、**Q5_0**（Qwen2-VL 的 `n_embd = 896` 不是 256 的倍数，
@@ -111,7 +111,7 @@ map_base
 
 因此：
 
-* 任意张量的地址减去 `map_base` 仍是一个**全局稳定偏移**，`model::dev_ptr` 的偏移恒等、逐张量上传和
+* 任意张量的地址减去 `map_base` 仍是一个**全局稳定偏移**，`weight_store::ptr` 的偏移恒等、逐张量上传和
   `model::page_out_host` 全部照常工作；
 * 分片之间的 gap 是页对齐 padding，不对应任何文件字节；读取 gap 会命中 `PROT_NONE` 而 fault；
 * `gguf_file::is_split()`（`shards.size() > 1`）是判断入口；析构时对整段区间一次 `munmap` 即可解除
@@ -119,7 +119,7 @@ map_base
 * `gguf_file::drop_cache` 不能把 reservation 偏移直接交给 `posix_fadvise`：它把范围裁剪到每个分片
   自己的 `[base, base+size)` 内，再换算成该分片的文件偏移（范围可以跨过 padding）。
 
-**单块上传拒绝 split 文件。** `model::upload(q)` 会 `memcpy` 整个 `map_size`，而 split 映射的 gap 是
+**单块上传拒绝 split 文件。** `weight_store::upload(m, q)` 会 `memcpy` 整个 `map_size`，而 split 映射的 gap 是
 `PROT_NONE`，拷贝会 fault；因此它直接抛
 `single-blob upload is not supported for a split GGUF: use --layer-map`。大分片模型走
 `engine::setup_multi_device` 的逐张量（每设备）上传；`qwen4exp` 即使只有一张 GPU 也走这条路径
@@ -130,7 +130,7 @@ map_base
 ## 3. 架构注册表与模型 profile
 
 ```cpp
-// model_arch.h
+// src/model/arch/registry.h —— 公开头，不出现任何架构名
 struct loader {
     const char *name;              // general.architecture 的精确值
     void (*load)(model & m);       // 填 hparams + 绑定该架构的张量
@@ -138,22 +138,32 @@ struct loader {
 };
 const loader * find(const std::string & name);   // 未知返回 nullptr
 const loader * registry(size_t & n);             // 整张表，给 PF_MODEL_INFO / 测试用
-void load_qwen35(model & m);
-void load_qwen35moe(model & m);
-void load_qwen4exp(model & m);
-void load_qwen2vl(model & m);
-wt bind_tensor(const gguf_file & f, const std::string & name, uint32_t expect_type = 0xFFFFFFFF);
-const float * bind_f32(const gguf_file & f, const std::string & name);
 ```
 
-`model.cpp` 中的静态表（每一行同时给出 loader 和它的 profile）：
+`bind_tensor` / `bind_f32`（定义仍在 `model.cpp`）与 header-only 的 `bind_moe` /
+`require_meta` 一起声明在 `src/model/arch_util.h`。每个架构自己的接口在
+`src/model/arch/<arch>/load.h`：
+
+```cpp
+namespace si {
+struct model;
+struct model_profile;
+const model_profile & <arch>_profile();
+namespace arch { void load_<arch>(model & m); }
+}
+```
+
+**内部注册表 hub** `src/model/arch/registry.cpp` 是模型侧唯一允许写架构名的文件：
+它显式维护 `kLoaders[]` 并 include 每个 `arch/<arch>/load.h`（核心是静态库，自注册
+的对象若无人引用会在链接期被丢弃，所以表必须显式）：
 
 ```cpp
 static const loader kLoaders[] = {
-    {"qwen35",     &load_qwen35,     &kQwen35Profile},
-    {"qwen35moe",  &load_qwen35moe,  &kQwen35MoeProfile},
-    {"qwen4exp",   &load_qwen4exp,   &kQwen4ExpProfile},
-    {"qwen2vl",    &load_qwen2vl,    &kQwen2VlProfile},
+    {"qwen35",     &load_qwen35,     &qwen35_profile()},
+    {"qwen35moe",  &load_qwen35moe,  &qwen35moe_profile()},
+    {"qwen4exp",   &load_qwen4exp,   &qwen4exp_profile()},
+    {"qwen2vl",    &load_qwen2vl,    &qwen2vl_profile()},
+    {"deepseek41", &load_deepseek41, &deepseek41_profile()},
 };
 ```
 
@@ -161,27 +171,32 @@ static const loader kLoaders[] = {
 
 ### 3.1 模型 profile（`src/model/model_profile.h`）
 
-每个架构一个完整的 const，放在 `src/model/profiles/<arch>.cpp`（`generic.cpp`
-同时定义 `kQwen35Profile` / `kQwen35MoeProfile`，`qwen4exp.cpp` 定义
-`kQwen4ExpProfile`，`qwen2vl.cpp` 定义 `kQwen2VlProfile`），字段分五组：
+每个架构一个完整的 const，放在 `src/model/arch/<arch>/profile.cpp`，对象是文件内
+（anonymous namespace）的，只通过 `load.h` 里的 `<arch>_profile()` 暴露，字段分五组：
 
 | 组 | 内容 |
 |---|---|
 | 身份 | `key`（精确的 `general.architecture`）、`name`、`provenance` |
-| `fwd` | `generic_plan`（共享 `seg_plan`/`record_forward`）或 `hc_ple_qsa`（qwen4exp 自己的 `q4_forward`） |
+| `fwd` | `generic_plan`（共享 `seg_plan`/`record_forward`）、`hc_ple_qsa`（qwen4exp 自己的 `q4_forward`）或 `deepseek41`（MLA/DSA/mHC 自有 forward） |
 | `residual` / `extras` | hyper-connection 的 streams/low rank；PLE、QSA 的 top_k/pool/indexer 几何 |
 | `policy` | decode 行数上限、prefill 方式（chunk32/whole_prompt）、prefix cache 能否表示该 state、auto layer map、多设备 K-split、engram 默认值 |
-| `rep` / `spec` / `moe` | 权重表示能力（SIn/oneDNN/raw GGUF/逐张量上传）、机制能力（MTP/DFlash/MM + 一个 `why`）、routed expert owner（engine cache / runtime bank / host only） |
+| `rep` / `spec` / `moe` | 权重表示能力（SIn/oneDNN/raw GGUF/逐张量上传）、机制能力（MTP/DFlash/MM + 一个 `why`，以及 `spec.mm_owned_prefill` 声明媒体 prefill 走模型自己的 chunker）、routed expert owner（engine cache / runtime bank / host only） |
 
 **边界**：按卡实测的 tuning 属于 device profile（[03-kernels.md §1.3](03-kernels.md)），
 不属于这里。某个**文件或运行**的属性也不属于这里：per-layer expert plane 大小、
 bank/VRAM budget、KV 类型、layer map、`TB` 桶和 prefill chunk 大小。profile 里放
 这些会让同一个架构的另一个文件拿到错误的 stride。
 
-`model.h` 另有一个 `arch_profile`（目前只有 `mm_model_prefill`），由 loader 设置：
-它不是策略表，而是“这个 forward 要求通用驱动怎么调用它”的能力位（qwen4exp 的媒体
-prompt 必须走模型自己的 chunker）。`model::prof` 是策略，`model::profile` 是前向能力，
-两者都由 `model::load` 在 loader 之后可见。
+架构自有的几何（qwen4exp 的 HC/PLE/QSA、deepseek41 的 MLA/mHC/Engram）不在
+通用 `hparams` 里：loader 分配一个 `qwen4exp_hparams` / `ds41_hparams`（都派生自
+`arch_hparams`）挂到 `hparams::arch`，架构代码通过 `q4_hp(hp)` / `ds41_hp(hp)`
+读取。`arch_hparams`（`src/model/model_types.h`）带三个虚函数：`wide_head_ok()`
+（宽于 256 的 head 必须显式 opt in，ds41 的 512 宽 MLA）、`validate(hp, prefix)`
+（架构自己的几何检查，在通用 `validate_hparams` 之后带前缀抛错）和
+`validate_profile(hp, prof)`（把 GGUF 几何与声明式 profile 交叉校验）。媒体
+prompt 是否必须走模型自己的 chunker 是 profile 的 `spec.mm_owned_prefill`
+（qwen4exp 为真），不再是 loader 另行设置的能力位。分层契约见
+[24-arch-modules.md](24-arch-modules.md)。
 
 **精确 key，不做模糊匹配。** `model::load` 在调用 loader 前要求注册行、profile
 指针存在，且 `prof->key` 与 GGUF 的 `general.architecture` 逐字节相同；不满足就抛
@@ -203,9 +218,9 @@ prompt 必须走模型自己的 chunker）。`model::prof` 是策略，`model::p
 4. 校验 profile 存在且 key 精确匹配，设 `model::prof`；
 5. 调用加载器填充 `hp`、绑定张量、构建 `layers`；
 6. `validate_hparams(hp, name)`；
-7. 在 `hparams::q4exp` / `model::q4exp` 仍存在期间，断言它们与
-   `prof->fwd == hc_ple_qsa` 一致（前向派发仍用这个 bool；M2 才把 walk 交给 runtime
-   对象），然后按 `PF_MODEL_INFO` 打印 profile。
+7. `validate_model_profile(hp, *prof, gguf.is_split())` 交叉校验 loader 填的架构几何
+   与 profile 声明（`fwd == hc_ple_qsa` 时读 `q4_hp(hp)`，`fwd == deepseek41` 时读
+   `ds41_hp(hp)`），然后按 `PF_MODEL_INFO` 打印 profile。
 
 `model_context_length(path)`（`model.cpp` 的 `model_context_length`）是加载器之外唯一独立读 GGUF 的入口：它自己 `load()`
 一遍，只取 `<arch>.context_length`，**不构造 `model`**，因此可以在引擎之前用来给 `--ctx full` 定大小
@@ -230,23 +245,45 @@ sub-group，非 32 的倍数会静默漏掉尾部维度。
 recurrent 层时 `d_state/n_group/dt_rank/conv_k > 0`。消息带架构名。
 
 **新增架构自动继承这一关**：只要 loader 通过 `kLoaders[]` 注册，填出一个 kernel 不支持的几何时
-报错发生在分配任何设备内存之前。测试 `tests/model/test_hparams.cpp` 不需要 GGUF 或 GPU，
+报错发生在分配任何设备内存之前。拥有自有几何的架构还可以在 `arch_hparams::validate` /
+`validate_profile` 里追加检查（ds41 的 MLA 几何、qwen4exp 的 HC/PLE/QSA 几何），它们由
+`validate_hparams` 在通用检查之后调用。测试 `tests/model/test_hparams.cpp` 不需要 GGUF 或 GPU，
 直接驱动该函数。
 
 ### 新增模型架构
 
-1. 新建 `src/model/<arch>.cpp`，定义 `si::arch::load_<arch>(model & m)`（照抄 `qwen35.cpp` 结构），
-   用 `arch::bind_tensor` / `arch::bind_f32` 绑定张量。
-2. 在 `src/model/profiles/<arch>.cpp` 定义该架构的 `model_profile`（§3.1），在
-   `model_profile.h` 里 `extern`；**`key` 必须逐字节等于注册名**。`qwen35`/`qwen35moe`
-   是两个 const，因为它们各自的 key 不同（精确匹配不允许共用一个 "generic" key）；
-   两个 rows 的 policy 由 `test_model_profile` 逐字段比较。
-3. 在 `model_arch.h` 声明 loader，在 `model.cpp` 的 `kLoaders[]` 注册（loader + profile）。
+完整契约见 [24-arch-modules.md](24-arch-modules.md)。分两种情况：
+
+**generic-plan 架构**（共享 `seg_plan` / `record_forward`）：
+
+1. 新建 `src/model/arch/<arch>/load.cpp`，定义 `si::arch::load_<arch>(model & m)`（照抄
+   `src/model/arch/qwen35/load.cpp` 结构），用 `arch_util.h` 的 `arch::bind_tensor` /
+   `arch::bind_f32` 绑定张量；同目录的 `load.h` 声明这个 loader 和 `<arch>_profile()`。
+2. 在 `src/model/arch/<arch>/profile.cpp` 定义该架构的 `model_profile`（§3.1，对象放
+   anonymous namespace），并实现 `const model_profile & <arch>_profile()`；`fwd =
+   generic_plan`，**`key` 必须逐字节等于注册名**。
+   `qwen35`/`qwen35moe` 是两个 const，因为它们各自的 key 不同（精确匹配不允许共用一个
+   "generic" key）；两个 rows 的 policy 由 `test_model_profile` 逐字段比较。
+3. 在 **`src/model/arch/registry.cpp`**（内部 hub）include 新的 `arch/<arch>/load.h` 并给
+   `kLoaders[]` 加一行。公开的 `arch/registry.h` / `model_profile.h` 不改。
 4. 在 `CMakeLists.txt` 加入 loader 和 profile 两个 `.cpp`。`model::load` 自动分发；
-   未知架构仍抛异常，缺 profile 或 key 不匹配同样在加载期抛异常。
-5. 若该架构的几何超出 §3.2 的约束，先扩展 `validate_hparams` 并放宽对应 kernel——**不要**让一个
-   不受支持的 head_dim 走到 kernel 里越界写内存。
-6. 新的 profile/值由 `tests/model/test_model_profile.cpp` 钉住；它不需要 GGUF 或 GPU。
+   未知架构仍抛异常，缺 profile 或 key 不匹配同样在加载期抛异常。**不需要**
+   `src/engine/arch/<arch>/`：`arch_ops_for(generic_plan)` 返回 null，通用引擎接管。
+
+**model-owned forward 架构**（如 qwen4exp / deepseek41）还要：
+
+5. `src/model/arch/<arch>/{hparams,tensors,accessors}.h`：`arch_hparams` 派生（含
+   `wide_head_ok`/`validate`/`validate_profile`）、`arch_layer` / `arch_model_extras`
+   派生（实现 `visit_weights` / `visit_device_weights` / `visit_host_keep`）以及带
+   `kind` 断言的 accessor（`<arch>_hp` / `<arch>_layer_of` / `<arch>_model`）。
+6. `src/engine/arch/<arch>/{forward*.cpp,runtime.cpp,state.h}`：forward 入口（声明在本地
+   `forward.h`，不要放进 `engine.h`）、`arch_ops_registry` 钩子和组合状态；在
+   `src/engine/arch/registry.cpp` 的 `kArchOps[]` 加一行。空钩子表示通用引擎负责该项。
+7. 若该架构的几何超出 §3.2 的约束，先扩展 `validate_hparams` / `arch_hparams::validate`
+   并放宽对应 kernel——**不要**让一个不受支持的 head_dim 走到 kernel 里越界写内存。
+8. 新的 profile/值由 `tests/model/test_model_profile.cpp` 钉住；model-owned 行由
+   `tests/engine/test_arch_ops.cpp` 钉住；`python3 ci/check_arch_boundaries.py` 必须干净
+   （通用文件里出现架构名、`q4x_`/`ds41x_` 或 model-owned `fwd_kind` 即失败）。
 
 ---
 
@@ -264,34 +301,50 @@ struct wt { const void *data; uint32_t type; int32_t K; int32_t N; }; // model.h
 `mmap` 的 `const float*`。两者都**不做边界/形状推断**：一个 `wt` 只带 `data/type/K/N`，宽度假设错写成
 别处（`3*d_inner` 之类）不会有任何报错，见 [11-qwen35-model.md §2](11-qwen35-model.md)。
 
-### 4.2 一次性上传与 `dev_ptr`
+### 4.2 一次性上传与 `weight_store::ptr`
 
-`model::upload(q)`（`model.cpp` 的 `model::upload`）：
-
-```cpp
-dev_weights_size = gguf.map_size;                  // 整个文件，含元数据和 padding
-dev_weights = sycl::malloc_device(dev_weights_size, q);
-q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
-```
-
-设备指针用**偏移恒等**推导（`model.h:134-139`）：
+设备存储归 `src/backend/weight_store.cpp` 的 `weight_store`；`model` 只保存 GGUF、hparams、张量绑定
+和 `w8t` 数据槽。`weight_store::upload(m, q, host)` 是文本路径的包装：`host=true` 调 `clear()`，
+split GGUF 直接拒绝，否则调通用 API `upload_contiguous`：
 
 ```cpp
-const void * dev_ptr(const void * host_ptr) const {
-    if (!dev_weights) return host_ptr;             // CPU 后端 / 多设备
-    return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
+void weight_store::upload_contiguous(const void * host_base, size_t bytes, sycl::queue & q, const char * what) {
+    p_->contiguous = true;
+    p_->base = (const char *)host_base;
+    p_->bytes = bytes;                             // 整个文件，含元数据和 padding
+    p_->blob = sycl::malloc_device(bytes, q);
+    if (!p_->blob) throw std::runtime_error(std::string(what) + "device allocation failed");
+    q.memcpy(p_->blob, host_base, bytes).wait();
 }
 ```
 
-之所以要上传整个映射而不是仅张量数据：所有 `wt.data` / `bind_f32` 返回的都是 `map_base` 内部的
-指针，一次线性拷贝才能保持每个偏移有效。kernel 在录制图时捕获 `dev_ptr` 值，因此只要
-`dev_weights` 存活，录制的图就一直有效。**split GGUF 不能走这条路径**：分片之间的 gap 是
-`PROT_NONE`，`model::upload` 直接拒绝（见 §2.6），改走 `setup_multi_device` 的逐张量上传。
+设备指针用**偏移恒等**推导（`weight_store::ptr`；紧凑 span 形式则二分查找，见下）：
 
-`model::upload(q, host)`（`model.h:113-115`）的 `host=true` 分支 **不做拷贝**：`dev_weights = nullptr`，
-`dev_ptr` 退化为恒等（直接返回 mmap 指针），这就是 CPU 后端的模式——权重留在 mmap 里，主机内核
+```cpp
+const void * weight_store::ptr(const void * host_ptr) const {
+    if (!p_->blob) return host_ptr;                // CPU 后端 / 多设备
+    if (p_->contiguous) {
+        return (const char *)p_->blob + ((const char *)host_ptr - p_->base);
+    }
+    // span 形式：按 host 排序后二分，命中返回 blob + off + (host - span.host)，否则 nullptr
+}
+```
+
+同一个 store 也是 vision/audio mmproj 与 DFlash f32 副本的设备存储：mmproj 用
+`upload_spans`（紧凑 span 表）或 `upload_contiguous`（整文件），DFlash 用 `upload_spans`；
+它们各自持有自己的 `weight_store` 实例，释放时调用 `release(q)`（见
+[10-multimodal.md](10-multimodal.md)、[13-audio-video.md](13-audio-video.md)、
+[14-dflash2.md](14-dflash2.md)）。
+
+之所以要上传整个映射而不是仅张量数据：所有 `wt.data` / `bind_f32` 返回的都是 `map_base` 内部的
+指针，一次线性拷贝才能保持每个偏移有效。kernel 在录制图时捕获 `ptr` 值，因此只要 store 的
+blob 存活，录制的图就一直有效。**split GGUF 不能走这条路径**：分片之间的 gap 是
+`PROT_NONE`，`weight_store::upload` 直接拒绝（见 §2.6），改走 `setup_multi_device` 的逐张量上传。
+
+`upload(m, q, host)` 的 `host=true` 分支 **不做拷贝**：`clear()` 后没有 blob，
+`ptr` 退化为恒等（直接返回 mmap 指针），这就是 CPU 后端的模式——权重留在 mmap 里，主机内核
 直接读（见 [architecture.md §11](../architecture.md)）。`engine` 构造时对 CPU 后端和多设备都传
-`host=true`（`engine.cpp` 里 `build_w8` 的 `host=true` 处），所以多设备**不复用单一 `dev_weights`**：`engine::setup_multi_device`
+`host=true`（`engine` 的 `ws_.upload(m, q, /*host=*/...)`），所以多设备**不复用单一整块 blob**：`engine::setup_multi_device`
 只把每个 GPU 后端 **自己分区** 的张量（外加始终落在主设备上的 `tok_embd` / `output` / `output_norm`）
 拷到该设备，`engine::wptr(dev, host)`（`engine.cpp:842-859`）按层解析出该设备的指针（CPU 后端仍返回
 mmap 指针）。
@@ -350,8 +403,8 @@ tied 之所以要反过来：它与 `token_embd` 共用同一份存储，而 emb
 `wptr(0, m.output.data)` 取到它的 device 指针作为 key 做转换。
 
 漏掉任何一个前提（key 用错、或 head 的 GEMV 段没有 `xq` 条目）都不会报错，只会让 head **静默掉回
-fp32 dequant GEMV**：记录在 `engine_graph.cpp` 的 `build_plan` 里那段实测注释 注释里的实测是 **27B / 2x A770 上 12.3 →
-3.7 ms/token**。因此 plan 构建 head 段时必须用 `wkey` 而不是 `wptr`（`engine_graph.cpp:265-271`），
+fp32 dequant GEMV**：记录在 `graph.cpp` 的 `build_plan` 里那段实测注释 注释里的实测是 **27B / 2x A770 上 12.3 →
+3.7 ms/token**。因此 plan 构建 head 段时必须用 `wkey` 而不是 `wptr`（`graph.cpp:265-271`），
 并且 `gemv_at` 的 oneDNN 分支要覆盖单 token 调用。engine 侧的其它相关不变量（`bind_acts(0)` 必须在
 构建 head 段之前、`cur_dev` 复位）见 [04-engine.md](04-engine.md)。
 
@@ -377,9 +430,10 @@ fp32 dequant GEMV**：记录在 `engine_graph.cpp` 的 `build_plan` 里那段实
 | `d_state` / `n_group` / `dt_rank` / `d_inner` / `conv_k` | `ssm.*` |
 | `full_attn_interval` | `full_attention_interval`（默认 4） |
 | `rope_sections[4]` | `rope.dimension_sections`（全零 = 普通 RoPE） |
+| `arch` | 架构自有几何的 pimpl 槽（`std::shared_ptr<arch_hparams>`）；generic 架构为空，qwen4exp/ds41 挂 `qwen4exp_hparams`/`ds41_hparams`，经 `q4_hp`/`ds41_hp` 读取 |
 
 **注意 `block_count` 包含 MTP 层**：`load_qwen35` 算的是 `hp.n_layer = block_count - n_mtp`
-（`qwen35.cpp:20-23`），所以 `hp.n_layer` 只数主干 block，NextN 头落在 `blk.<hp.n_layer>.*`。
+（`src/model/arch/qwen35/load.cpp:20-23`），所以 `hp.n_layer` 只数主干 block，NextN 头落在 `blk.<hp.n_layer>.*`。
 0.8B 的 GGUF 没有 `nextn_predict_layers`，`hp.n_layer == block_count == 24`。
 
 `is_recr(il) = (il+1) % full_attn_interval != 0`（`model.h:33-35`）。含义是“不是每个 interval 的最后一层”
@@ -391,12 +445,18 @@ fp32 dequant GEMV**：记录在 `engine_graph.cpp` 的 `build_plan` 里那段实
 * attention 层：`wq, wk, wv, wo` + `q_norm, k_norm`。
 * GDN 层：`wqkv, wgate, ssm_beta, ssm_alpha, ssm_out` + `ssm_a, ssm_dt, ssm_norm, ssm_conv1d`。
 * SI8 副本：`ffn_gate8/up8/down8`，attention 的 `wq8/wk8/wv8/wo8`，GDN 的 `wqkv8/wgate8/ssm_out8`。
+* 架构自有张量：`std::unique_ptr<arch_layer> extras`（通用架构为 null）。qwen4exp 的
+  `qwen4exp_layer`（HC/PLE/QSA）与 deepseek41 的 `ds41_layer`（MLA/mHC/compressor/indexer/Engram）
+  定义在 `arch/<arch>/tensors.h`，通过 `arch/<arch>/accessors.h` 的 `q4_layer`/`ds41_layer_of`
+  访问；通用上传/保留循环只调用 `extras->visit_weights(hp, il, cb)`，从不直接读这些字段。模型级
+  的同类槽是 `model::extras`（`arch_model_extras`，qwen4exp 的 HC head + PLE 表、deepseek41 的
+  Engram token map + 表），通用循环调用 `visit_device_weights` / `visit_host_keep`。
 
 `model` 还持有 `gdn_layer_index`（层 id → 该层在 GDN 层中的顺序索引，attention 层为 -1）、`tok_embd`、
 `output`、`output_norm`、`tok_embd_row_bytes`、`output8`（LM head 的 SIn 副本）。
 
 ⚠️ **`m.output` 与 `m.tok_embd` 不是同一个字段**：`load_qwen35` 只在 GGUF 里**没有**
-`output.weight` 时才让 `m.output = m.tok_embd`（`qwen35.cpp:48-55`）。任何算 logits 的地方必须用
+`output.weight` 时才让 `m.output = m.tok_embd`（`src/model/arch/qwen35/load.cpp:48-55`）。任何算 logits 的地方必须用
 `m.output`——两者的差别见 §4.4，以及 [11-qwen35-model.md §7](11-qwen35-model.md)。
 
 ### 5.3 `mtp_layer_t`（`model.h` 的 `mtp_layer_t`）
@@ -406,13 +466,13 @@ fp32 dequant GEMV**：记录在 `engine_graph.cpp` 的 `build_plan` 里那段实
 > 见 [设计 14](14-dflash2.md)。
 
 MTP/NextN 草稿头，**只有 `hp.n_mtp > 0` 时才绑定**（`m.has_mtp = true`），否则所有字段为空、
-`model::build_w8` / `setup_md_dnnl` 的 `if (mtp_on)` 分支根本不会走到它：
+`weight_store::build_w8` / `setup_md_dnnl` 的 `if (mtp_on)` 分支根本不会走到它：
 
 * 一个完整 full-attention block：`attn_norm`、`post_attn_norm`、`wq/wk/wv/wo`、`q_norm`、`k_norm`、
   `ffn_gate/up/down`——注意它是 **attention** block，不是 GDN；
 * NextN 额外张量：`eh_proj`（`[2*n_embd][K=2*n_embd] -> n_embd`，把 `concat(enorm(emb(t_p)), hnorm(h_{p-1}))`
   投回 `n_embd`）、`enorm`、`hnorm`、可选的 `shared_head_norm`；
-* `shared_head`：`blk.<n>.nextn.shared_head_head.weight` **存在才绑定**（`qwen35.cpp:114-116`），
+* `shared_head`：`blk.<n>.nextn.shared_head_head.weight` **存在才绑定**（`src/model/arch/qwen35/load.cpp:114-116`），
   空则草稿头回落到 `m.output`。注意 `shared_head_norm` 相反——它是无条件 `bind_f32`，缺失会抛
   `missing tensor`，所以“可选”只对 `shared_head_head` 成立；
 * 每设备的 SIn 副本：`wq8/wk8/wv8/wo8/ffn_gate8/ffn_up8/ffn_down8/eh_proj8`。
@@ -422,11 +482,11 @@ MTP 层的 KV 归属：它是一个 full-attention 层，因此**自己占一份
 KV 存储类型与前缀缓存，并计入 `--kv-cap-mb` 与三层前缀缓存预算。MTP 的 plan/forward/verify/rollback
 语义见 [04-engine.md](04-engine.md)。
 
-### 5.4 `load_qwen35`（`qwen35.cpp`）
+### 5.4 `load_qwen35`（`src/model/arch/qwen35/load.cpp`）
 
 见 [11-qwen35-model.md](11-qwen35-model.md)。
 
-### 5.5 `load_qwen2vl`（`qwen2vl.cpp`，MinerU2.5）
+### 5.5 `load_qwen2vl`（`src/model/arch/qwen2vl/load.cpp`，MinerU2.5）
 
 `general.architecture = qwen2vl`，是普通 dense decoder：24 层、`n_embd` 896、
 `n_ff` 4864、14 query / 2 KV heads、`head_dim` 64、RoPE sections
@@ -463,22 +523,22 @@ superblock，`K=896` 会被截断。per-tensor 路径的 oneDNN int8 转换通�
 
 ## 6. SIn int8 权重副本
 
-`PF_DP4A`（默认开）时 `engine` 构造中调用 `m.build_w8(q)`（`engine.cpp:194-196`），构建约 700 MB 的
+`PF_DP4A`（默认开）时 `engine` 构造中调用 `ws_.build_w8(m, q)`，构建约 700 MB 的
 int8 副本。格式与数学见 [02-quantization.md](02-quantization.md)。这里只说明加载期行为：
 
-* `build_w8_tensor`（`model_w8.cpp:19-61`）跳过既不是 Q4_K/Q5_K/Q6_K、也不在 `w8_requant_type`
+* `build_w8_tensor`（`src/backend/weight_store.cpp`）跳过既不是 Q4_K/Q5_K/Q6_K、也不在 `w8_requant_type`
   列表里的张量；后者是 Q3_K / IQ4_NL / IQ3_S / IQ4_XS——它们没有原生 SIn 打包，被 dequant 到 fp32 再
   重量化到 per-32 的 4-bit 非对称组（`w8.h:89-93`）。之后按 `w8_vals_bytes` / `w8_meta_bytes` 分配
   设备缓冲；以 **4096 行为一 slab** 在主机暂存区重排后 `memcpy` 到设备，每个 slab 后 `q.wait()`
   （暂存区复用，否则异步拷贝会与下一 slab 覆写竞争）。LM head 的副本最大（27B 约 1 GB 的 GGUF 行），
   slab 化用于限制主机暂存内存。
-* 覆盖集合（`model::build_w8`，`model_w8.cpp:91` 起）：**LM head `m.output` → `m.output8`**（注意不是 `tok_embd`；
+* 覆盖集合（`weight_store::build_w8`）：**LM head `m.output` → `m.output8`**（注意不是 `tok_embd`；
   tied head 上二者同源）、每层的 3 个 FFN 线性、以及 GDN 层的 `wqkv/wgate/ssm_out` 或 attention 层的
   `wq/wk/wv/wo`。`ssm_beta`、`ssm_alpha` 和所有 f32 norm **不**复制。
 * CPU 后端不构建这些副本：`pf8` 只在非 CPU 且非多设备时为真（`engine.cpp` 里解 `pf8` 的那段），CPU 的整数
   kernel 直接读 GGUF 块。
 * `PF_SI4` 会影响 `w8_vals_bytes` / `w8_meta_bytes`（全 4-bit），因此副本尺寸随环境变化。
-* `PF_META` 是引擎级可选项（不是 `model_w8.cpp`）：`use_meta32` 要求非 CPU 且非多设备
+* `PF_META` 是引擎级可选项（不是 `weight_store.cpp`）：`use_meta32` 要求非 CPU 且非多设备
   （`engine.cpp` 的 `build_meta32` 调用处），`build_meta32` 为 Q4_K/Q5_K 构建 fp32 `(scale,min)` 旁路数组
   （`engine.cpp` 的 `build_meta32`），实测为净损失（多一条内存流），默认关闭。
 

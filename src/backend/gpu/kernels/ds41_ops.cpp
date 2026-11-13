@@ -2,7 +2,7 @@
 // routed-expert clamp, the sqrt-softplus router, the DSA selector, the
 // candidate-block stage, the compressed-row gather, the window ring write and
 // the Engram apply.  The host oracles are the matching functions in
-// src/engine/engine_ds41.cpp: fp8_round_row, Fwd::moe, compute_candidates_one,
+// src/engine/arch/deepseek41/forward_host.cpp: fp8_round_row, Fwd::moe, compute_candidates_one,
 // index_select_one's top-k, attention_one's gather/window write and
 // apply_engram_rows.  See ds41_ops.h for the contracts.
 #include "ds41_ops.h"

@@ -20,6 +20,7 @@
 #include "kernels.h"
 #include "moe_cache.h"
 #include "model.h"
+#include "weight_store.h"
 #include "model_profile.h"
 #include "multimodal.h"
 #include "pc_disk.h"
@@ -29,134 +30,17 @@
 #include "dflash.h"
 #include "common/env.h"
 
+#include "engine_types.h"
+#include "arch/arch_ops.h"
+#include "spec/mtp_state.h"
+#include "spec/dflash_state.h"
+#include "arch/qwen4exp/state.h"
+#include "arch/deepseek41/state.h"
+
 namespace si {
 
 namespace sx = sycl::ext::oneapi::experimental;
 
-// plan of GEMV calls for one full forward pass (must match record order)
-struct seg_plan {
-    std::vector<gemv_seg> segs;
-    struct group_t {
-        uint32_t type;
-        int off;
-        int n;
-        int rows;
-    };
-    std::vector<group_t> groups;
-    // first call index of each layer, plus a final entry for the LM head call.
-    // The call metadata is plan-global and indexed by call order, so a partial
-    // (per-device) replay must start its call cursor at the phase's first layer
-    // instead of at 0.
-    std::vector<int> layer_c0;
-    // DP4A path: activation quantization needed before one call.  An empty `x`
-    // means the call's activations are already fp32.
-    struct xq_t {
-        const float * x = nullptr;
-        const float * up = nullptr;
-        int x_stride = 0;
-        int up_stride = 0;
-        int K = 0;
-    };
-    // Everything record_forward needs about one call, in the order it must
-    // replay them.
-    //
-    // These were eight parallel std::vectors indexed by call - call_offsets,
-    // call_counts, call_total_rows, call_tb, call_nsb, call_xq,
-    // call_group_begin, call_group_count - which made "call 3 exists but has no
-    // xq entry" a representable state.  That state is what validate() spent
-    // four size comparisons checking for, and the comment on begin_call ("pushes
-    // all six per-call vectors together") was an admission that nothing else
-    // held them together.  One array of records makes it unrepresentable, and a
-    // bounds check on `calls` now covers every field at once instead of only the
-    // one array a given site happened to read.
-    struct call_t {
-        int seg_off = 0;     // first index into `segs`
-        int seg_count = 0;   // segments in this call
-        int total_rows = 0;  // sum of this call's segment n_rows
-        int tb = 0;          // token-block width (the batched GEMM's row origin)
-        int nsb = 0;         // segments before the batch base
-        int group_begin = 0; // first index into `groups`
-        int group_count = 0; // groups in this call
-        // What the call *is*.  A dense call replays its segments; a MoE call
-        // has none and dispatches the MoE kernels instead, so the router's
-        // output - which no host code has seen at record time - still lives in
-        // the same recorded command graph.
-        enum kind_t { dense = 0, moe_routed = 1, moe_epilogue = 2 };
-        kind_t kind = dense;
-        xq_t xq;
-    };
-    std::vector<call_t> calls;
-    // false for the non-final prefill variant: record_forward must not replay a
-    // "head" call then (there is none, and the last FFN call must not repeat)
-    bool has_head = true;
-    void set_xq(const float * x, const float * up, int xs, int us, int K) {
-        calls.back().xq = {x, up, xs, us, K};
-    }
-    void begin_call(int tb, int nsb) {
-        call_t c;
-        c.seg_off = (int)segs.size();
-        c.tb = tb;
-        c.nsb = nsb;
-        calls.push_back(c);
-    }
-    // open a MoE call: it advances the call cursor exactly like begin_call (so
-    // the replay stays a straight walk over `calls`) but carries no segments.
-    call_t & begin_moe_call(call_t::kind_t kind, int tb, int nsb) {
-        begin_call(tb, nsb);
-        calls.back().kind = kind;
-        return calls.back();
-    }
-    void add(const gemv_seg & s) {
-        segs.push_back(s);
-        calls.back().seg_count++;
-        calls.back().total_rows += s.n_rows;
-    }
-    // ffn_down's activation is silu(gate)*up.  The quantizer path applies that
-    // from calls.back().xq.up; every other consumer of these segments (the fp32
-    // GEMV and the oneDNN fallback) reads the raw gate from seg.x and must apply
-    // it itself, which it does when act_up is set.  Patch the segments added by
-    // the current call, preserving any per-slice x offset.
-    void set_act_up(const float * up_base, const float * x_base) {
-        for (size_t i = (size_t)calls.back().seg_off; i < segs.size(); i++) {
-            segs[i].act_up = up_base + (segs[i].x - x_base);
-        }
-    }
-    void finalize() {
-        for (call_t & c : calls) {
-            const int off = c.seg_off;
-            const int n = c.seg_count;
-            std::stable_sort(segs.begin() + off, segs.begin() + off + n,
-                             [](const gemv_seg & a, const gemv_seg & b) {
-                                 return (a.dev < b.dev) || (a.dev == b.dev && a.type < b.type);
-                             });
-            c.group_begin = (int)groups.size();
-            int i = 0;
-            while (i < n) {
-                const uint32_t t = segs[off + i].type;
-                int j = i, rows = 0;
-                while (j < n && segs[off + j].type == t) {
-                    rows += segs[off + j].n_rows;
-                    j++;
-                }
-                groups.push_back({t, off + i, j - i, rows});
-                i = j;
-            }
-            c.group_count = (int)groups.size() - c.group_begin;
-        }
-        // grouping continues on `type` only after a (dev,type) sort, so a group
-        // spanning two devices would silently merge two backends' segments -
-        // fail fast here instead of miswiring a future cross-device call.
-        // n_layer < 0 skips the layer-count checks (plan_mtp_ has no layer_c0).
-        validate(-1, "finalize");
-    }
-    // Structural self-check, defined in engine_graph.cpp: 4 calls per layer, the
-    // head call (if any) pinned to device 0, per-call segment and group ranges
-    // inside their arrays, and device-homogeneous groups.  Throws naming the
-    // first violation.  Pure integer compares; no behavior change when passing.
-    // (It used to also check that the per-call vectors were the same length;
-    // that is now the type's invariant rather than a runtime property.)
-    void validate(int n_layer, const char * what) const;
-};
 
 // engine's construction inputs, by name.
 //
@@ -269,50 +153,44 @@ struct engine_config {
     int draft_dev = 0;
 };
 
-// DeepSeek-V4.1-Flash's model-owned forward (engine_ds41.cpp).  It owns its
-// per-sequence window / compressed caches and its Engram history, so it does
-// not use the paged KV pool or the seg_plan machinery.  Greedy/sampled token
-// generation, one sequence at a time (the profile caps decode rows at 1).
-std::vector<int> ds41_generate(model & m, tokenizer & tk, const std::vector<int> & prompt, const mm_prompt * mm,
-                               const gen_params & gp, const std::function<bool(int)> & cb,
-                               std::vector<float> * first_logits = nullptr, size_t * cached_tokens = nullptr);
-
-// ---- DeepSeek-V4.1-Flash GPU forward (engine_ds41_gpu.cpp) ----------------
-// The host forward above is the oracle.  When the run is on GPUs this state
-// owns the device weight views (through engine::weight_maps_), the per-layer
-// window / group-shared compressed caches, the routed-expert bank and the
-// per-token scratch, and drives every dense GEMV, the mHC, the MLA attention,
-// the compressor/indexer and the routed/shared experts on the card.  The
-// Engram n-gram hash and its 24-row table gather stay on the host (the table
-// is ~100 GiB and never uploaded).
-struct engine;
-struct ds41_gpu_state;
-ds41_gpu_state * ds41_gpu_create(engine & e);
-void ds41_gpu_destroy(ds41_gpu_state * st);
-std::vector<int> ds41_gpu_generate(model & m, tokenizer & tk, const std::vector<int> & prompt, const mm_prompt * mm,
-                                   const gen_params & gp, const std::function<bool(int)> & cb,
-                                   std::vector<float> * first_logits, size_t * cached_tokens,
-                                   ds41_gpu_state & st);
+// DeepSeek-V4.1-Flash's model-owned forward entry points live in
+// arch/deepseek41/forward.h; only the architecture's own code includes them.
+// engine.h keeps the composed per-model state below.
 
 struct engine {
     model m;
+    // The text model's device-side weights: the single-device whole-mmap blob,
+    // the single-device SIn copies' allocations, and the per-device w8 maps.
+    // `model` keeps only the GGUF/bindings/w8t data slots.
+    weight_store ws_;
     // The model's declarative profile (== m.prof), set once the engine has
-    // loaded the model.  Policy branches read this instead of m.q4exp; it is
-    // never null after construction.
+    // loaded the model.  Policy branches read this instead of a model flag; it
+    // is never null after construction.
     const model_profile * mp_ = nullptr;
+    // The architecture dispatch row for mp_->fwd (arch/arch_ops.h): the single
+    // seam for lifecycle, capability and request-path decisions.  Null for the
+    // shared generic plan, and for an unknown kind.
+    const arch_ops * aops_ = nullptr;
+    friend struct arch_ops_registry;
 
     // Does this model own its forward pass (the qwen4exp HC/PLE/QSA walk)?
-    // The single predicate every dispatch site uses; the loader's `q4exp` flag
-    // stays only as the consistency assertion in model::load.
+    // The single predicate every dispatch site uses; the profile's `fwd` is the
+    // only source, there is no per-model flag left.
     bool hc_fwd() const { return mp_ && mp_->fwd == model_profile::fwd_kind::hc_ple_qsa; }
     // DeepSeek-V4.1-Flash owns a completely different forward (MLA + compressed
     // cross-layer KV + DSA + mHC + Engram).  It has no paged KV pool and no
-    // seg_plan; generate_impl hands the whole request to engine_ds41.cpp.
-    bool ds41_fwd() const { return mp_ && mp_->fwd == model_profile::fwd_kind::deepseek41; }
-    // The GPU implementation of that forward (engine_ds41_gpu.cpp); null on a
-    // CPU run, for a non-ds41 model, or when PF_DS41_GPU=0.
-    ds41_gpu_state * ds41g_ = nullptr;
-    bool ds41_gpu() const { return ds41g_ != nullptr; }
+    // seg_plan; its arch_ops row declares both facts and generate_impl hands the
+    // whole request to arch/deepseek41/runtime.cpp.
+    bool owns_kv_pool() const { return aops_ && aops_->owns_kv_pool; }
+    bool owns_request_path() const { return aops_ && aops_->owns_request_path; }
+    // True when the architecture registered its own dense oneDNN stores (ds41);
+    // null for every other row, so this is the only place generic code asks.
+    bool arch_dense_store() const { return aops_ && aops_->dense_store && aops_->dense_store(*this); }
+    // The GPU implementation of that forward and its dense-store flag
+    // (arch/deepseek41/state.h); `gpu` is null on a CPU run, for a non-ds41
+    // model, or when PF_DS41_GPU=0.
+    deepseek41_state ds41x_;
+    bool ds41_gpu() const { return ds41x_.gpu != nullptr; }
     tokenizer tk;
     int device_req = -1; // resolved device request (0 = gpu, 1 = cpu)
     // A pipeline-parallel run over several GPUs shares one SYCL context: USM
@@ -358,12 +236,12 @@ struct engine {
     bool f32_path_ = false;
     float * d_f32act = nullptr;
     void build_f32_weights();
-    // multi-device decode: per-backend map of the SIn (w8) copies of the GPU
-    // partitions' layer weights (host tensor pointer -> w8t on that device,
-    // allocated on the device's queue).  The single-sequence decode plan then
-    // runs the GPU segments on dp4a_gemv (like single-device) and the CPU ones
-    // on i8_gemv; empty vector when int8 decode is disabled (PF_DP4A /
-    // PF_DP4A_DEC=0).
+    // multi-device decode: the per-device SIn (w8) copies of the GPU
+    // partitions' layer weights live in ws_ (host tensor pointer -> w8t on
+    // that device, allocated on the device's queue).  The single-sequence
+    // decode plan then runs the GPU segments on dp4a_gemv (like single-device)
+    // and the CPU ones on i8_gemv; empty when int8 decode is disabled
+    // (PF_DP4A / PF_DP4A_DEC=0).
     bool md_int8 = false;
     // multi-device XMX path: oneDNN int8 weights built per device (used when
     // the device supports the int8 matmul primitive); falls back to the w8/dp4a
@@ -377,9 +255,8 @@ struct engine {
     // converted tensor then skips its raw device upload (see
     // upload_device_weights) and wkey() returns the host pointer, which is the
     // store's key - exactly what the forward passes to gemv1.
+    // The flag itself lives in ds41x_.dense_store (arch/deepseek41/state.h).
     bool setup_ds41_dense_store();
-    bool ds41_dense_store_ = false;
-    std::vector<std::unordered_map<const void *, w8t>> w8_dev_;
     std::vector<int> layer_dev_;                           // layer -> backend index
     std::vector<int> layer_attn_local_;                    // layer -> local attention index (-1)
     std::vector<int> dev_kind_;                            // backend -> 0 gpu / 1 cpu
@@ -408,8 +285,8 @@ struct engine {
     }
     // Device pointer of a weight tensor as uploaded on backend `dev` (the host
     // mmap for a CPU partition).  Public because a test that drives one layer's
-    // kernels standalone needs it, and model::dev_f32 is not a substitute:
-    // multi-device has no whole-blob upload, so dev_ptr hands back the *host*
+    // kernels standalone needs it, and weight_store::ptr is not a substitute:
+    // multi-device has no whole-blob upload, so ptr hands back the *host*
     // pointer and the kernel dereferences host memory on the device.
     const void * wptr(int dev, const void * host) const;
     void kv_layer_ptrs(int a, const char *& kp, const char *& vp, const char *& ksc, const char *& vsc) const;
@@ -545,7 +422,7 @@ struct engine {
     };
     std::vector<moe_act> moe_as_;
     // residency + the disk/RAM/VRAM expert cache tiers
-    // the host half of the expert split needs this; engine_graph reaches it
+    // the host half of the expert split needs this; graph.cpp reaches it
     // through the engine, so the cache keeps its own API instead of being
     // a friend
     moe_cache moe_cache_;
@@ -666,168 +543,20 @@ struct engine {
     void bind_moe_acts(int dev);
 
     // ---- qwen4exp (hyper-connections + PLE) -----------------------------
-    // Per-device scratch for the trunk.  The residual is [token][hc][n_embd];
-    // `xn`, `gate`, `mixed`, `block` are the per-layer temporaries.  The PLE
-    // module and the routed MoE run on the host (their tables and expert bank
-    // are host-resident), so their buffers are engine-wide, not per device.
-    struct q4_bufs {
-        float * res = nullptr;
-        float * xn = nullptr;
-        float * gate = nullptr;
-        float * mixed = nullptr;
-        float * block = nullptr;
-        float * lo = nullptr;
-        float * inj = nullptr;
-        gemv_seg * segs = nullptr;      // device (or host, for a cpu partition)
-        gemv_seg * host_segs = nullptr; // staging ring for the async copy
-        int segs_cap = 0;
-        int seg_used = 0;  // next ring slot
-        int seg_alloc = 0; // allocations since the ring last wrapped (drained reset)
-        float * router_logits = nullptr;
-        int32_t * router_ids = nullptr;
-        float * router_wts = nullptr;
-    };
-    std::vector<q4_bufs> q4b_;
-    float * q4_host_res_ = nullptr; // host staging for a partition handoff
-    float * q4_host_mix_ = nullptr;
-    float * q4_host_out_ = nullptr;
-    float * q4_moe_logits_ = nullptr;
-    float * q4_moe_wts_ = nullptr;
-    float * q4_moe_acc_ = nullptr;
-    // PF_Q4_CPU_MISS: the host-computed miss pair rows, pinned so the H2D into
-    // the device A.acc is an enqueue rather than a pageable blocking copy.
-    float * q4_miss_acc_ = nullptr;
-    float * q4_moe_sh_ = nullptr;
-    float * q4_moe_shout_ = nullptr;
-    int32_t * q4_moe_ids_ = nullptr;
-    // routing histogram (PF_Q4_HIST): (layer, expert) pair counts, prefill and
-    // decode kept apart.  Diagnostic only - it is never read by a kernel.
-    // Per-expert hot bank: R slots per GPU layer, calibrated from the first
-    // prefill's routing (PF_Q4_HOT, the default when --moe-vram-mb > 0).
-    // PF_Q4_BANK_LAYER=1 keeps the older whole-layer bank for A/B.
-    bool q4_hot_ = false;
-    bool q4_hot_ready_ = false;
-    bool q4_cal_done_ = false; // the first prefill's hot set has been frozen
-    int q4_hot_r_ = 0;
-    std::vector<uint32_t> q4_cal_;
-    size_t q4_cal_pairs_ = 0;
-    std::vector<int32_t> q4_sm_host_;
-    // Pinned staging ring for the LRU expert uploads.  A q.memcpy whose source
-    // is pageable blocks the host until the in-order queue drains (measured
-    // 1.7 ms for 1 MB behind a kernel against 0.016 ms from pinned USM), and
-    // the LRU's source is the GGUF mmap: PF_Q4_HOT_TIME priced the uploads at
-    // 1.43 ms/expert, 112 ms of a decode token.  Staging keeps the ordering
-    // (the device copy is still enqueued before the kernels that read the
-    // bank) and takes the host out of the wait.
-    std::vector<char *> q4_up_stage_;    // per device: pinned ring base
-    std::vector<sycl::event> q4_up_ev_;  // [dev * q4_up_slots_ + slot]
-    std::vector<unsigned char> q4_up_live_;
-    std::vector<int> q4_up_next_;        // per device: next ring slot
-    size_t q4_up_stride_ = 0;            // bytes per ring slot (max plane)
-    int q4_up_slots_ = 0;
-    // PF_Q4_UPSTAT: the upload split.  `copy` is the host memcpy into the ring,
-    // `enq` the device-copy enqueues, `wait` the ring-slot event waits, and
-    // `bytes` what went through the ring, so a `copy` that does not scale with
-    // threads can be told from one that is already at the DMA floor.
-    double q4_up_wait_ms_ = 0.0;
-    double q4_up_copy_ms_ = 0.0;
-    double q4_up_enq_ms_ = 0.0;
-    double q4_up_dma_ms_ = 0.0;          // PF_Q4_UPDMA: the H2D floor, measured
-    size_t q4_up_bytes_ = 0;
-    size_t q4_up_calls_ = 0;
-    // PF_Q4_UPSTAT: the device copies' own event intervals, so the printed rate
-    // is the DMA rate and not the host memcpy's.  Before this the line divided
-    // bytes by the pageable->pinned host memcpy time, which is zero on the
-    // shipped pinned path and printed either 0.00 or absurd values (17389 GB/s)
-    // depending on whether a ring slot happened to be reused in that step.
-    std::vector<sycl::event> q4_up_prof_;
+    // The model's own state - per-device trunk scratch, the PLE/engram row
+    // cache, the routed-expert bank and its LRU, and the prefix-cache extras -
+    // lives in arch/qwen4exp/state.h.  The methods that drive it stay here.
+    qwen4exp_state q4x_;
+
     void q4_upload(int dev, void * dst, const void * src, size_t n, bool pinned = false);
     // Prefill-only: enqueue on the per-device copy queue so the H2D rides
     // alongside the previous batch's expert GEMMs.  The caller waits
-    // q4_up_last_ev_[dev] before enqueuing the kernels that read the bank.
+    // q4x_.q4_up_last_ev_[dev] before enqueuing the kernels that read the bank.
     void q4_upload_async(int dev, void * dst, const void * src, size_t n, bool pinned = false);
     void q4_upload_impl(int dev, sycl::queue & q, void * dst, const void * src, size_t n, bool async, bool pinned);
     void q4_upload_init(int nd, size_t max_plane);
-    std::vector<std::unique_ptr<sycl::queue>> q4_up_q_; // per device, in-order copy queue
-    std::vector<sycl::event> q4_up_last_ev_;            // last async copy this batch
-    std::vector<unsigned char> q4_up_last_live_;
-    std::vector<int> R_cur_;           // per device: slots per layer
-    std::vector<size_t> q4_r_off_;     // [n_layer+1] offsets into the LRU arrays
-    // [layer][R_l] with R_l from that layer's device; q4_r_off_ gives the
-    // per-layer offset, so index these through it and never as il * R.
-    std::vector<uint32_t> q4_lru_age_; // the per-slot LRU clock
-    std::vector<float> q4_lru_heat_;   // decayed routing heat (PF_Q4_HEAT)
-    uint32_t q4_lru_tick_ = 0;
-    bool q4_hotchk_done_ = false;
-    // Decode forwards seen by the q4 path (PF_Q4_CPU_MISS's warm-up gate).
-    uint32_t q4_dec_step_ = 0;
-    float * q4_spill_acc_ = nullptr;
     void q4_hot_calibrate();
-    std::vector<uint64_t> q4_hist_pre_, q4_hist_dec_;
-    size_t q4_hist_pre_pairs_ = 0, q4_hist_dec_pairs_ = 0;
     void q4_hist_report() const;
-    float * q4_ple_hist_ = nullptr;
-    int32_t * q4_ple_nhist_ = nullptr;
-    float * q4_ple_emb_ = nullptr;
-    float * q4_ple_key_ = nullptr;
-    float * q4_ple_val_ = nullptr;
-    float * q4_ple_gate_ = nullptr;
-    float * q4_ple_a_ = nullptr;
-    float * q4_ple_b_ = nullptr;
-    int32_t * q4_ple_prev_ = nullptr; // [slot][ple_ngram-1] last tokens before the batch
-    std::vector<void *> q4_owned_; // host buffers freed in ~engine
-    // full-layer VRAM expert banks (all 512 experts of a layer); `--moe-vram-mb`
-    // is the per-device byte budget.  A layer with a bank runs its whole MoE on
-    // the GPU instead of the host.
-    struct q4_bank_t {
-        void * g = nullptr;
-        void * u = nullptr;
-        void * d = nullptr;
-        size_t sg = 0, su = 0, sd = 0;
-        int r = 0; // slots this layer's device could afford
-        int32_t * sm = nullptr;  // slot map (decode / first prefill batch)
-        int32_t * sm2 = nullptr; // alternate map for the two-pass prefetch
-        void * hg = nullptr;     // pinned host copy of this layer's expert planes
-        void * hu = nullptr;
-        void * hd = nullptr;
-        bool q5sb = false;       // hd holds the 128-value Q5_1 down panel repack
-    };
-    std::vector<q4_bank_t> q4_bank_layer_;
-    std::vector<void *> q4_host_usm_; // pinned expert mirrors, freed with sycl::free
-    std::vector<std::pair<void *, int>> q4_pin_src_; // pinned expert source + device, freed with sycl::free
-    bool q4_mirror_ = false;
-    // Resolved once in the constructor: CLI/engine_config > PF_Q4_TAIL_SKIP >
-    // 0 (exact expert set).  0 means no tail-skip.
-    int q4_tail_skip_ = 0;
-    size_t engram_ram_mb_ = 0;
-    size_t engram_cap_ = 0; // power of two
-    std::vector<int32_t> engram_tag_;
-    std::vector<float> engram_row_;
-    size_t engram_hits_ = 0, engram_misses_ = 0;
-    // ---- qwen4exp prefix-cache extras -----------------------------------
-    // The generic checkpoint pool (`d_pc_states`) holds only the GDN/conv
-    // state, which a kernel can snapshot at a block boundary.  qwen4exp also
-    // needs two pieces of *host* state:
-    //   * the PLE rolling history (the last (conv_k-1)*ngram normalised rows)
-    //     plus the previous-token ring; and
-    //   * the QSA indexer pool/ring (the raw indexer keys, which are not in the
-    //     paged KV and cannot be recomputed without the prefix hidden states).
-    // Both are indexed by the same checkpoint slot as `d_pc_states`; the QSA
-    // host mirror is *not* stored - it is the same K/V the paged pool holds and
-    // is rebuilt from the restored blocks when the host path needs it.
-    struct q4_pc_ple_state {
-        std::vector<float> hist;   // hist_rows*hc_dim, right-aligned
-        std::vector<int32_t> prev; // ngram-1 previous token ids
-        int32_t nhist = 0;
-        bool valid = false;
-    };
-    std::vector<q4_pc_ple_state> q4_pc_ple_;
-    struct q4_pc_qsa_state {
-        std::vector<std::vector<float>> pool; // [attn layer][n_pool*idx_head_dim]
-        std::vector<std::vector<float>> ring; // [attn layer][kp*idx_head_dim]
-        bool valid = false;
-    };
-    std::vector<q4_pc_qsa_state> q4_pc_qsa_;
     void q4_pc_alloc();
     void q4_pc_clear(int st);
     size_t q4_pc_extra_floats(int depth_blocks) const;
@@ -839,197 +568,22 @@ struct engine {
     void q4_pc_qsa_store(int st, int a, const float * pool, int n_pool, const float * ring);
     // Install a checkpoint's PLE/QSA extras into `slot` (pc_restore_state).
     void q4_pc_restore(int slot, int st, int depth_blocks);
-    // QSA: host-side indexer cache/mirror and the sparse attention.  The main
-    // KV stays on the device; full-attention layers keep a host copy of their
-    // own K/V so the selected keys can be attended on the CPU without a gather
-    // kernel.  Allocated lazily per (attention layer, slot).
-    struct qsa_slot_state {
-        // Only the selector's indexer pool/ring is per-sequence host state.  The
-        // main K/V is read straight from the paged pool (and dequantized) by the
-        // host sparse attention, so there is no host K/V mirror: it used to cost
-        // max_seq*n_head_kv*head_dim*2 bytes per attention layer per slot (48 MB
-        // at 4k, 3.2 GB at 256k) and made a prefix-cache resume impossible for a
-        // quantized KV type (the mirror holds pre-quantization values).
-        std::vector<float> pool; // [(max_seq/kp+1)][idx_head_dim]
-        std::vector<float> ring; // [kp][idx_head_dim]
-        int n_pool = 0;
-    };
-    std::vector<std::vector<std::unique_ptr<qsa_slot_state>>> qsa_cache_;
-    bool qsa_on_ = false;
-    int qsa_max_seq_ = 0;
-    // Deferred QSA update (decode while the selector is dense-equivalent).
-    // The D2H copies are enqueued per layer and waited once at the end of the
-    // forward, so the host MoE and the device no longer serialise 12 times per
-    // token; the indexer projection and the mirror/pool update then run while
-    // the LM head is on the device.  Only the per-token update is deferred -
-    // the selector and the sparse attention must stay inline before `wo`.
-    struct qsa_pending {
-        const layer_t * L = nullptr;
-        int a = -1;
-        int n_tok = 0;
-        int dev = -1;
-        bool active = false;
-        bool has_ev = false;
-        sycl::event ev;
-        std::vector<int> pos, slot;
-        // The forward's step_info, for the prefix cache's per-block checkpoints
-        // (the deferred update runs after the head, inside the same forward).
-        const step_info * inf = nullptr;
-        float * mixed = nullptr; // per-layer pinned staging
-    };
-    std::vector<qsa_pending> qsa_pending_;
-    // PF_QSA_EARLY (default on): enqueue the per-layer `mixed` D2H right after
-    // hc_mix, i.e. before the QKV GEMVs, and consume its event in
-    // qsa_attention instead of draining the in-order queue there.  `mixed` is
-    // produced by hc_mix and the QKV/rope chain never touches it, so this is a
-    // scheduling change only: the copy source/destination and the host update
-    // read the same bytes.  `PF_QSA_EARLY=0` restores the old placement (copy
-    // inside qsa_attention) and the blocking `sel` H2D wait for the A/B.
-    bool qsa_early_ = true;
-    struct qsa_early_copy {
-        bool valid = false;
-        int dev = -1;
-        int kind = 0; // 0 = `mixed` D2H, 1 = device-indexer iq/ik D2H
-        sycl::event ev;
-    };
-    std::vector<qsa_early_copy> qsa_early_ev_;
+    // QSA: host-side indexer cache/mirror and the sparse attention.  The state
+    // (and its per-layer/per-slot scratch) lives in q4x_.qsa; see
+    // arch/qwen4exp/qsa_state.h.  These methods drive it.
     void qsa_early_mixed(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
                          const float * mixed);
-    // PF_QSA_IDX_DEV (default on after validation): project the indexer on the
-    // device from the live `mixed` activation and D2H only the 2.5 KB the host
-    // selector/pool update reads.  Falls back to qsa_early_mixed() for every
-    // shape it does not serve (non-BF16 indexer, CPU, dense-equivalent token).
-    bool qsa_idx_dev_ = true;
-    struct qsa_idx_dev_buf {
-        int dev = -1;
-        float * q = nullptr; // [cap][idx_n_head*idx_head_dim]
-        float * k = nullptr; // [cap][idx_head_dim]
-        int cap = 0;
-    };
-    std::vector<qsa_idx_dev_buf> qsa_idx_dev_buf_;
     void qsa_idx_dev_ensure(int dev, int n_tok);
     void qsa_early_indexer(int a, const layer_t & L, int dev, int mode, int n_tok, const step_info * inf,
                            const float * mixed);
-    // PF_QSA_SEL_DEV (step 3, opt-in): the raw-key ring and pool live on the
-    // card per (attention layer, slot), the selector runs there, and Stage 3's
-    // gather consumes the device selection directly.  Measured a wash at
-    // 14.6k and 3.2 ms/token slower at 3.6k (the device chain competes with the
-    // MoE), so it defaults off; `=0` keeps the host ring/pool/selector (the
-    // step-2 path).
-    bool qsa_sel_dev_ = false;
-    struct qsa_idx_slot_dev {
-        int dev = -1;
-        float * pool = nullptr; // [(max_seq/kp)+1][idx_head_dim]
-        float * ring = nullptr; // [kp][idx_head_dim]
-        bool ready = false;     // host pool/ring handed off
-    };
-    std::vector<std::vector<std::unique_ptr<qsa_idx_slot_dev>>> qsa_idx_slot_;
     void qsa_idx_slot_ensure(int a, int slot, int dev);
     void qsa_idx_slot_release(int a, int slot);
     void qsa_idx_slot_release_all();
-    // Per-device pinned handoff staging for the host -> device pool/ring copy
-    // that happens once per (layer, slot) at the first sparse decode token.
-    struct qsa_handoff {
-        int dev = -1;
-        float * stage = nullptr;
-        size_t cap = 0;
-        sycl::event ev;
-        bool ev_valid = false;
-    };
-    std::vector<qsa_handoff> qsa_handoff_;
     void qsa_handoff_ensure(int dev, size_t n);
     void qsa_idx_device_chain(int a, const layer_t & L, int dev, int slot, int pos);
     void qsa_devattn_run_dev(int a, int dev, int slot, int pos, int nsel, const float * qbuf, float * attn_out);
-    // Per-attention-layer pinned staging for the D2H inputs (mixed/q/k/v) and
-    // the sparse attention's H2D output.  Allocated lazily and grown to the
-    // largest chunk seen; a pageable std::vector makes the copy synchronous
-    // and the q4 box's in-order queue drain was the cost.
-    struct qsa_stage {
-        float * mixed = nullptr;
-        float * iq = nullptr; // PF_QSA_IDX_DEV: normed+RoPEd q, [cap_i][inh*id]
-        float * ik = nullptr; // PF_QSA_IDX_DEV: raw indexer key, [cap_i][id]
-        size_t cap = 0;     // tokens: mixed
-        size_t cap_i = 0;   // tokens: iq/ik
-        int dev = -1;
-        // Host sparse attention's scratch.  The selected rows are gathered from
-        // the paged pool (dequantized) into a compact f32 buffer; a prefill chunk
-        // gathers the union of its rows' selections once per layer.
-        std::vector<float> gk, gv; // compact rows: [npos][n_head_kv*head_dim]
-        // Pinned per-block staging for the gather's D2H copies (K/V data and,
-        // for i8/i4, their scale planes).  Grown on demand; freed with the
-        // rest of the per-layer staging in ~engine.
-        uint8_t * sbk = nullptr, * sbv = nullptr, * sbsk = nullptr, * sbsv = nullptr;
-        size_t cap_sbk = 0, cap_sbv = 0, cap_sbsk = 0, cap_sbsv = 0;
-        std::vector<int32_t> gpos;  // union of selected positions (ascending)
-        std::vector<uint8_t> gused; // per-position membership bitmap
-        std::vector<int32_t> gmap;  // position -> compact row (-1 = absent)
-        std::vector<int32_t> gblk;  // unique blocks in gpos
-        std::vector<int32_t> grange; // [start,end) in gpos per gblk entry
-        std::vector<int32_t> gstage; // staging block index per gblk entry
-        std::vector<int32_t> grun_start, grun_len; // coalesced block runs
-        std::vector<int32_t> gsel;  // one row's mapped selection
-        std::vector<int32_t> gsel_all, goff, gcnt; // every row's selection
-    };
-    std::vector<qsa_stage> qsa_stage_;
-    // The host sparse path's Q and output staging is shared across the
-    // attention layers of one device: only one layer runs inline at a time, and
-    // per-layer copies cost ~30 MB x 12 of pinned USM (which the Level Zero
-    // driver charges against the card) at a 1024-token chunk.
-    struct qsa_host_stage {
-        float * q = nullptr;
-        float * out = nullptr;
-        size_t cap_q = 0, cap_out = 0;
-        int dev = -1;
-        // The H2D of the host attention output is asynchronous; the buffer is
-        // shared by the device's attention layers, so the next layer's memset
-        // must not overwrite it before the copy has read it.
-        sycl::event out_ev;
-        bool out_pending = false;
-    };
-    std::vector<qsa_host_stage> qsa_host_stage_;
     void qsa_stage_ensure(int a, int n_tok, bool need_q, bool need_out, int dev);
     void qsa_idx_stage_ensure(int a, int n_tok, int dev);
-    bool qsa_devattn_ = true; // PF_QSA_DEVATTN (default on, Stage 2; =0 keeps host)
-    bool qsa_pf_dev_ = true;  // PF_QSA_PF_DEV: device sparse *prefill* (see docs 18 §4)
-    int qsa_pf_wave_ = 8;     // PF_QSA_PF_WAVE: prefill rows per compact pool
-    // PF_QSA_DEVATTN scratch.  Per device: the compact f16 K/V pool (the same
-    // [block][kv head][kBlockSize token][head_dim] layout as the paged pool)
-    // and its sequential table + selected-index buffer.  Per attention layer:
-    // a device step_info (filled by qsa_sinfo_launch) and the pinned host
-    // `sel` staging, which is per layer so a later layer's selector cannot
-    // overwrite it before its H2D copy has completed.
-    struct qsa_dev_buf {
-        int dev = -1;
-        sycl::half * ck = nullptr;
-        sycl::half * cv = nullptr;
-        int32_t * dsel = nullptr;  // [kMaxB*kMaxT][cap_keys]
-        int32_t * dcounts = nullptr; // [kMaxB*kMaxT] selected-key count per row
-        int32_t * tab = nullptr; // identity compact block table (device)
-        int32_t * htab = nullptr; // pinned staging for the one-time table copy
-        float * scores = nullptr; // PF_QSA_SEL_DEV: per-pool selector scores [max_seq/kp+1]
-        int32_t * dpools = nullptr; // PF_QSA_SEL_DEV: selected pool ids
-        int cap_keys = 0;
-        int cap_blocks = 0;
-        int cap_wave = 0; // prefill rows per compact pool
-        int cap_pool = 0; // scores/dpools capacity
-    };
-    std::vector<qsa_dev_buf> qsa_dev_;
-    struct qsa_dev_aux {
-        int dev = -1;
-        int32_t * hsel = nullptr; // pinned staging, [kMaxB*kMaxT][cap_keys]
-        int32_t * hcnt = nullptr; // pinned staging, [kMaxB*kMaxT]
-        step_info * sinfo = nullptr; // device, one wave of rows
-        // PF_QSA_EARLY decode path: the `sel` H2D is issued without waiting, so
-        // its pinned source must not be overwritten while the copy is in
-        // flight.  Two cap_keys-wide buffers are round-robined; before writing
-        // one, the copy that last read it (two calls ago) is waited for.  The
-        // prefill staging above is separate, so the two paths cannot collide.
-        int32_t * dsel_stage[2] = {nullptr, nullptr};
-        sycl::event dsel_ev[2];
-        bool dsel_ev_valid[2] = {false, false};
-        int dsel_par = 0;
-    };
-    std::vector<qsa_dev_aux> qsa_aux_;
     void qsa_devattn_ensure(int dev);
     void qsa_devattn_aux(int a, int dev);
     void qsa_devattn_run(int a, int dev, int slot, int pos, const std::vector<int> & sel, const float * qbuf,
@@ -1051,18 +605,6 @@ struct engine {
     // reset): drop its host mirror/pool/ring and any deferred update that names
     // it.  `slot < 0` resets every slot.  No-op when QSA is off.
     void qsa_reset_slot(int slot);
-    // PF_QSA_TIME: the host QSA split, accumulated over one forward.  `copy`
-    // is the D2H waits, `gemv` the indexer projections (q is skipped when no
-    // selector runs), `upd` the per-token norm/RoPE/pool/mirror update, `sel`
-    // the selector and `attn` the sparse attention.  `rows`/`nsel` size the
-    // selector and the attention.
-    double qsa_copy_ms_ = 0.0;
-    double qsa_gemv_ms_ = 0.0;
-    double qsa_upd_ms_ = 0.0;
-    double qsa_sel_ms_ = 0.0;
-    double qsa_attn_ms_ = 0.0;
-    long qsa_rows_ = 0;
-    long qsa_nsel_ = 0;
     bool qsa_attention(int a, const layer_t & L, int dev, int n_tok, const step_info * inf, const float * mixed,
                        float * qbuf, const float * kbuf, const float * vbuf, float * attn_out);
     void q4_alloc_banks();
@@ -1215,7 +757,7 @@ struct engine {
     // Decode buckets, one per row count (1..kMaxB): the decode runs EXACTLY
     // n_rows rows.  `g`/`e` are the recorded command graph, which only the
     // single-device path uses and only for the coarse row counts (see
-    // engine_graph.cpp's dec_graph_rows); a bucket without one is replayed
+    // graph.cpp's dec_graph_rows); a bucket without one is replayed
     // directly from its plan.
     struct dec_bucket {
         int tb;
@@ -1228,10 +770,11 @@ struct engine {
 
     float * h_logits = nullptr; // [kMaxB][vocab], pinned USM when available
     bool h_logits_pinned_ = false;
-    // Greedy qwen4exp decode's device argmax (see fetch_argmax).  q4_forward
-    // enqueues it at the end of the mode-0 head so the launch rides the same
-    // submission as the rest of the forward; the 4-byte result lands in the
-    // pinned h_logits and the forward's own sync waits for it.
+    // Greedy qwen4exp decode's device argmax (see fetch_argmax).  The
+    // model-owned decode forward enqueues it at the end of the mode-0 head so
+    // the launch rides the same submission as the rest of the forward; the
+    // 4-byte result lands in the pinned h_logits and the forward's own sync
+    // waits for it.
     bool dec_argmax_dev_ = false;
     int32_t * d_dec_argmax_ = nullptr;
 
@@ -1353,135 +896,8 @@ struct engine {
     // owns its own paged KV slice (attention layer index attn_layers()-1), so it
     // shares the block table, the prefix cache and the KV storage type.
     // ------------------------------------------------------------------
-    // The verify cycle's argmax staging.  This is the *only* device scratch the
-    // two drafters share: each allocates it lazily on first use (so a run that
-    // never verifies pays nothing) and both write the verify rows' argmax into
-    // it before copying back to h_argmax.
-    //
-    // Both buffers are created together, deliberately.  MTP's candidate readout
-    // (PF_MTP_CAND) additionally needs the value side, and it decides that from
-    // its own mtp_cand_cap_ - so if the value side could exist without the id
-    // side, a drafter that ran first and allocated only the ids would leave MTP
-    // writing through a null pointer.  That is not hypothetical: the two drafter
-    // sites each had their own `if (!d_argmax)` block, and only MTP's allocated
-    // both.  test_spec never caught it because it runs one drafter per process.
-    struct verify_scratch {
-        int32_t * d_argmax = nullptr; // [kMaxB] the verify rows' argmax ids
-        float * d_argval = nullptr;   // [kMaxB] ... and their values
-        void ensure(sycl::queue & q) {
-            if (!d_argmax) {
-                d_argmax = sycl::malloc_device<int32_t>(kMaxB, q);
-                d_argval = sycl::malloc_device<float>(kMaxB, q);
-            }
-            // the invariant this type exists to keep, asserted rather than assumed
-            assert(d_argmax != nullptr && d_argval != nullptr);
-        }
-    };
-
-    struct mspec_state {
-      bool mtp_on = false;
-      int mtp_dev = 0; // backend index the MTP layer runs on (its KV follows)
-      int mtp_k = 0;      // draft predictions per verify cycle
-      int mtp_nsnap = 0;  // per-token recurrent-state snapshots kept (k+1)
-      int mtp_attn_local_ = -1; // MTP layer index inside the primary device's pool
-      std::vector<float *> d_mtp_hist_;    // [dev] per-token GDN state snapshots
-      std::vector<float *> d_mtp_convsave_; // [dev] conv rows (1,2) before the verify
-      float * d_mtp_cat = nullptr;       // [R][2*n_embd] concat(enorm(emb), hnorm(h))
-      float * d_mtp_x = nullptr;         // [R][n_embd]
-      float * d_mtp_xnorm = nullptr;     // [R][n_embd]
-      float * d_mtp_qbuf = nullptr;      // [R][n_head*2*head_dim]
-      float * d_mtp_kbuf = nullptr;      // [R][n_head_kv*head_dim]
-      float * d_mtp_vbuf = nullptr;      // [R][n_head_kv*head_dim]
-      float * d_mtp_attn_out = nullptr;  // [R][n_head*head_dim]
-      float * d_mtp_ffn = nullptr;       // [R][2*n_ff]
-      float * d_mtp_hnorm = nullptr;
-      float * d_mtp_raw = nullptr; // MTP hidden before shared_head_norm (AR seed)     // [R][n_embd] shared-head-normalized hidden
-      float * d_mtp_main_h = nullptr;    // [kMaxB*kMaxT][n_embd] main hidden capture
-      std::vector<float> h_save_;        // PF_MTP_STATECHK: pre-verify recurrent state
-      // MTP rollback by recurrence replay: the verify saves each GDN layer's
-      // per-token (conv_out, alpha, beta) plus the pre-verify GDN state, and the
-      // commit restores the state and replays those tokens.
-      std::vector<float *> d_mtp_rin_;
-      std::vector<float *> d_mtp_qsave_; // per-layer raw GDN conv taps of the verify rows    // [dev] ng * mtp_nsnap * (conv_dim + 2*dt_rank)
-      std::vector<float *> d_mtp_ssave_;  // [dev] ng * gdn_per
-      step_info * d_mtp_rinfo = nullptr;  // step_info for the replay launches
-      float * d_mtp_hnorm0 = nullptr;    // primary-device copy feeding the shared LM head
-      float * d_mtp_hprev = nullptr;     // [kMaxB][n_embd] main hidden before the row
-      step_info * d_mtp_info = nullptr;  // host USM step_info for the MTP layer
-      seg_plan plan_vf_;                 // verify forward: mode 2 with a batched head
-      gemv_seg * d_segs_vf = nullptr;
-      seg_plan plan_mtp_;                // the MTP layer's own calls
-      gemv_seg * d_segs_mtp = nullptr;
-      // which plan call holds the shared LM head.  It is 4 for a dense
-      // draft layer and 6 once the NextN block's own MoE takes four calls,
-      // so the verify and the readout ask the plan instead of hardcoding it.
-      int head_call = 4;
-      // PF_MTP_LAYER_EXACT: same segments with `w` pointing at the raw GGUF bytes
-      gemv_seg * d_segs_mtp_exact = nullptr;
-      // PF_MTP_HEAD_W4: a draft-only u4 copy of the LM head, registered under a
-      // private key (the target keeps its exact int8 head, so only the drafts -
-      // and hence acceptance, never the emitted stream - can move).
-      float * d_mtp_partials = nullptr; // the MTP's own attention partials (see mtp_splits)
-      int32_t h_argmax[kMaxB] = {0};    // host mirror of the verify's per-row argmax
-      bool mtp_head_w4_ = false;
-      // PF_MTP_LAYER_W2: the MTP layer also has a 2-bit copy (0.375 B/weight).
-      bool mtp_layer_w2_ = false;
-      // 2-bit copy of the draft LM head (0.375 B/weight against the u4 copy's
-      // 0.625): the draft reads the whole head once per drafted token, so this is
-      // the single largest byte item in the speculative cycle.  The draft only
-      // needs its argmax, and its weights are already re-quantized, so the extra
-      // step is a trade in acceptance for bytes: 0.375 B/weight is exact enough
-      // for an argmax (39.8 % relative L2) but costs ~2 % acceptance, which
-      // cancels the saving.  Off with PF_MTP_HEAD_W2=0.
-      bool mtp_head_w2_ = false;
-      char mtp_head_w2_key_[1] = {0};
-      bool mtp_layer_w4_ = false; // the MTP layer's own linears are GEMV-only u4 too
-      char mtp_head_w4_key_[1] = {0};
-      // The MTP draft is a single-token decode over the MTP layer's KV, so it gets
-      // the decode's key-parallel split count - *not* n_splits, which the
-      // --layer-map path pins to 1 (its split path is opt-in) and which left a
-      // 1-row attention with n_head workgroups each looping the whole KV: 2451 vs
-      // 183 ms/cycle at 128k.  PF_MTP_SPLITS overrides (1 = the old behaviour).
-      int mtp_splits = kMaxDecSplits;
-      // The speculative draft's LM head: the MTP/NextN layer's shared head when
-      // the GGUF ships one, else the model's output projection.
-      // ---- MTP draft head (see mtp_argmax.cpp) -------------------------------
-      // d_mtp_tok[i] is the token draft step i chose (the head's argmax, computed
-      // on the device), read back by the next step's concat, so the chain needs no
-      // host round-trip.  With PF_MTP_CAND the head is evaluated on a candidate set
-      // (mtp_cand_launch / mtp_gather_launch) instead of all 248320 rows - measured
-      // a net loss, so it is off by default (25/17/7 % hit rate at margin 8).
-      int32_t * d_mtp_cand_ = nullptr;  // [mtp_cand_cap] candidate token ids (device 0)
-      float * d_mtp_cvals_ = nullptr;   // [mtp_cand_cap] their head values
-      int32_t * d_mtp_tok_ = nullptr;   // [kMaxT] per-step draft token ids (device 0, next to the head)
-      // Head readout split across both cards (PF_MTP_HEAD_SPLIT=1, **default off**).
-      // out[n] = w[n].h is independent per output row, so the draft's 795 MB u4
-      // stream (3.0 ms of device time, 75 % of a draft step) can be halved by
-      // giving the second device the upper row range while it is otherwise idle:
-      // each side runs the identical GEMV over its own rows into the *same*
-      // device-0 logits row, so the argmax stays one scan on the owning card.
-      // Draft 17.2 -> 13.1 ms/cycle, and end to end a wash: halving N changes the
-      // u4 GEMV's decomposition, so the draft's argmax flips on a near-tie now and
-      // then (p0 -6 %, p2 -8 % acceptance).
-      bool mtp_head_split_ = false;
-      int mtp_head_half_ = 0;      // rows [0, half) on device 0, [half, n_vocab) on device 1
-      char mtp_head_w4lo_key_[1] = {0};
-      char mtp_head_w4b_key_[1] = {0};
-      float * d_mtp_hnorm1 = nullptr;   // device-1 copy of the draft hidden
-      float * h_head_stage = nullptr;   // host staging for the 20 KB activation copy
-      float * d_mtp_cval1_ = nullptr;   // scalar: the chosen candidate's logit (PF_MTP_CANDV)
-      float * d_mtp_amv_ = nullptr;     // scalar: the seed distribution's argmax value
-      verify_scratch verify;             // the verify cycle's argmax staging
-      int32_t * d_am2_ = nullptr;        // PF_MTP_CANDDBG diagnostic staging
-      int mtp_cand_src_ = 1;            // 1 = seed from the draft's own step-0 readout
-      int mtp_cand_cap_ = 0;            // 0 = off (the full head readout)
-      float mtp_cand_margin_ = 8.0f;
-      bool mtp_cand_ok_ = false;        // the head's int8 view exists on device 0
-      const int8_t * mtp_head_w8_ = nullptr;
-      const uint16_t * mtp_head_wsc_ = nullptr;
-      int mtp_head_rows_ = 0;
-
-    } mtp;
+    // The state itself is in spec/mtp_state.h.
+    mspec_state mtp;
 
     void mtp_rollback(int j);
     const wt & draft_head() const { return m.mtp.shared_head.data ? m.mtp.shared_head : m.output; }
@@ -1502,55 +918,13 @@ struct engine {
     std::vector<int> generate_mtp(const std::vector<int> & prompt, const gen_params & gp,
                                   const std::function<bool(int)> & cb, std::vector<float> * first_logits);
 
-    // ---- DFlash / DFlash2 draft model (src/engine/engine_dflash.cpp) --------
+    // ---- DFlash / DFlash2 draft model (src/engine/spec/dflash.cpp) --------
     // A block-diffusion drafter in its own GGUF: it reads the target's hidden
     // states at `dflash.target_layers`, keeps its own K/V ring for every committed
     // token, and emits a whole block of candidates in one forward pass.  Enabled
     // by --spec-type dflash2 (a non-empty --spec-draft-model).
-    struct dflash_state {
-      bool dflash_on_ = false;
-      std::string dflash_path_;
-      std::unique_ptr<dflash_model> dfm_;
-      int df_dev_ = 0;      // device the draft runs on (must be 0: the shared head)
-      int df_kmax_ = 0;     // requested draft tokens per cycle (block_size-1 max)
-      int df_k_ = 0;        // the clamped draft length actually used
-      int df_block_ = 0;    // dflash.block_size
-      int df_swa_ = 0;      // the draft's sliding window
-      int df_ring_ = 0;     // K/V ring tokens per layer
-      int df_kv_bytes_ = 2; // 2 = f16 ring, 4 = f32
-      int df_splits_ = 8;   // draft attention key splits
-      int df_cap_rows_ = 0;
-      float * d_df_h = nullptr; // [block][n_embd] residual stream
-      float * d_df_b = nullptr; // scratch [block][n_embd]
-      float * d_df_c = nullptr; // scratch [block][n_embd]
-      float * d_df_qkv = nullptr; // [block][(n_head + 2*n_head_kv)*head_dim]
-      float * d_df_gu = nullptr; // [block][2*n_ff]
-      float * d_df_dyn = nullptr; // [block][2*conv_k*n_groups]
-      float * d_df_gate = nullptr; // [block][selector rank]
-      float * d_df_partials = nullptr;
-      float * d_df_feat = nullptr; // HOST USM [kMaxB*kMaxT][n_tgt_layer*n_embd]
-      float * d_df_feat_dev = nullptr; // device staging for one injection chunk
-      void * d_df_kring = nullptr; // [n_layer][ring][n_head_kv][head_dim]
-      void * d_df_vring = nullptr;
-      int32_t * d_df_pos = nullptr; // device: absolute position per row
-      std::vector<int32_t> h_df_pos; // host mirror of d_df_pos
-      int32_t * d_df_ids = nullptr; // [block][top_k]
-      float * d_df_vals = nullptr;
-      int32_t * d_df_pids = nullptr; // [block][topk slices][top_k] partials
-      float * d_df_pvals = nullptr;
-      int df_pcap_ = 0;
-      int df_slices_ = 1;
-      float * d_df_lattice = nullptr; // [block][top_k + top_k*top_k]
-      std::vector<float> h_df_lattice;
-      step_info * d_df_info = nullptr;
-      const void * df_head_key_ = nullptr; // the store key for the shared LM head
-      bool df_head_w4_ = false;
-      char df_head_key_store_[1] = {0};
-      const uint8_t * df_sel_pv_ = nullptr; // selector codebooks (u4 planes)
-      const uint16_t * df_sel_ps_ = nullptr, * df_sel_po_ = nullptr;
-      const uint8_t * df_sel_nv_ = nullptr;
-      const uint16_t * df_sel_ns_ = nullptr, * df_sel_no_ = nullptr;
-    } dfl;
+    // The state itself is in spec/dflash_state.h.
+    dflash_state dfl;
 
     // --spec-draft-model was asked for (setup_dflash runs after the weight
     // conversion, so setup_md_dnnl cannot ask dfl).  A draft's verify is a
@@ -1967,6 +1341,12 @@ private:
     void pc_deserialize_block(const uint8_t * blob, int block);
     void pc_serialize_state(int st, std::vector<float> & out);
     void pc_deserialize_state(const float * in, int st, int depth_blocks);
+    // The checkpoint blob's architecture-owned tail, in floats (0 when the
+    // forward has no extras): the arch_ops hook, so the generic tiers size a
+    // record without knowing which forward wrote it.
+    size_t pc_state_extra_floats(int depth_blocks) {
+        return aops_ && aops_->pc_extra_floats ? aops_->pc_extra_floats(*this, depth_blocks) : 0;
+    }
     // demote a node to the next enabled tier (RAM, else disk); returns true
     // when the record is stored in a lower tier
     bool pc_demote_node(int ni);

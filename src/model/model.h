@@ -1,94 +1,16 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <sycl/sycl.hpp> // IWYU pragma: keep
-
 #include "gguf.h"
 #include "model_profile.h"
+#include "model_types.h"
 #include "w8.h"
 
 namespace si {
-
-struct wt { // weight tensor view
-    const void * data = nullptr;
-    uint32_t type = 0;
-    int32_t K = 0; // input dim (dims[0])
-    int32_t N = 0; // output rows (product of dims[1:])
-};
-
-// One Mixture-of-Experts weight: the GGUF stores the routed experts as a 3-D
-// tensor [K][N][E], so a single expert is exactly a 2-D weight of the same
-// (K, N) as any other linear - `plane(e)` is `data + e*plane_bytes`, which is
-// why every existing GEMV path takes an expert unchanged.  Keeping the expert
-// count and the plane stride here (rather than a std::vector of `wt`) is what
-// lets one expert be handed to the GPU as an ordinary base pointer while the
-// expert *index* stays a runtime value the kernels read from device memory.
-struct moe_wt {
-    const void * data = nullptr;
-    uint32_t type = 0;
-    int32_t K = 0;
-    int32_t N = 0;
-    int32_t E = 0;
-    size_t plane_bytes = 0;
-
-    bool ok() const {
-        return data != nullptr && E > 0;
-    }
-    const void * plane(int e) const {
-        return (const char *)data + (size_t)e * plane_bytes;
-    }
-    size_t total_bytes() const {
-        return plane_bytes * (size_t)E;
-    }
-};
-
-// ---- DeepSeek-V4.1-Flash (`deepseek41`) --------------------------------
-// MLA attention (512-wide latent, K == V), compressed sparse attention with a
-// two-level DSA indexer, group-shared KV caches, 4-stream hyper-connections and
-// Engram.  The per-layer source/ratio arrays are resolved at load time
-// (`kv_src_of`/`topk_src_of`) so no use site re-derives the "greatest source
-// <= il" rule, and the hash constants are stored per Engram layer.
-struct ds41_hparams {
-    int q_lora_rank = 0;     // 1280
-    int out_group_count = 0; // 8
-    int out_lora_rank = 0;   // 1024
-    int sliding_window = 0;  // 128 (includes self)
-    int kv_dim = 0;          // 512 == key_length == value_length
-    int rot_off = 0;         // kv_dim - n_rot (448): RoPE on the LAST n_rot dims
-    float rope_base = 0.f;   // ratio-0 layers
-    float compress_rope_base = 0.f; // ratio>0 layers (160000)
-    float yarn_factor = 0.f;
-    int yarn_orig = 0;
-    float yarn_beta_fast = 0.f, yarn_beta_slow = 0.f;
-
-    int idx_n_head = 0, idx_head_dim = 0, idx_top_k = 0;
-    int cand_src = -1, cand_topk_blocks = 0, cand_block = 0;
-    int n_idx_src = 0, idx_src[64] = {0};
-    int topk_src_of[64] = {0}; // greatest index source <= il (-1 before the first)
-
-    int n_kv_src = 0, kv_src[64] = {0};
-    int kv_src_of[64] = {0}; // greatest KV source <= il (-1 before the first)
-    int compress_ratio[64] = {0};
-
-    int hc_mult = 0, hc_mix_dim = 0, hc_sinkhorn = 0;
-    float hc_eps = 0.f;
-
-    int n_expert_shared = 0;
-    float expert_scale = 1.f;
-    bool expert_norm = false;
-    float swiglu_clamp[64] = {0.f};
-    float swiglu_clamp_shexp[64] = {0.f};
-
-    bool is_ple[64] = {false};
-    int engram_index_of[64] = {0}; // number of Engram layers strictly before il
-    int ple_ngram = 0, ple_heads_per_ngram = 0, ple_head_dim = 0, ple_n_heads = 0;
-    uint64_t ple_mult[8] = {0};
-    uint32_t ple_off[64] = {0}, ple_vocab[64] = {0};
-    int engram_pad = 0;
-    int image_token_id = -1;
-};
 
 struct hparams {
     int n_layer = 0, n_embd = 0, n_ff = 0;
@@ -124,38 +46,17 @@ struct hparams {
     int n_ff_shexp = 0;
     float expert_weights_scale = 1.0f;
 
-    // ---- Qwen3.8-Flash-Next / qwen4exp -------------------------------------
-    // Hyper-connections replace every layer norm: the residual stream is `hc`
-    // parallel copies of the hidden state and each block mixes them through a
-    // low-rank gate.  PLE is an n-gram-hash embedding table on one layer; QSA
-    // is a sparse selector on the full-attention layers.  See qwen4exp.cpp.
-    bool q4exp = false;
-    int hc_mult = 0;
-    int hc_low_rank = 0;
-    int idx_n_head = 0;
-    int idx_head_dim = 0;
-    int idx_top_k = 0;
-    int idx_kpool = 0; // QSA compress ratio (0 = dense)
-    int ple_layer = -1;
-    int ple_n_heads = 0;
-    int ple_head_dim = 0;
-    int ple_ngram = 0;
-    int ple_heads_per_ngram = 0;
-    int ple_conv = 0;
-    int ple_eos = 0;
-    int ple_image = 0;
-    int64_t ple_mult[8] = {0};
-    uint32_t ple_off[64] = {0};
-    uint32_t ple_vocab[64] = {0};
-    bool gdn_sigmoid_gate = false; // qwen4exp's gated norm uses sigmoid, not silu
+    // ---- Architecture-specific geometry ------------------------------------
+    // null for an architecture whose generic fields above describe it
+    // completely; otherwise a qwen4exp_hparams / ds41_hparams (see
+    // arch/<arch>/hparams.h and the matching `*_hp(hp)` accessor).  The engine
+    // never reads this directly - only the architecture's own loader/forward.
+    std::shared_ptr<arch_hparams> arch;
+
     // Qwen3.5 fuses the attention output gate into attn_q (q and gate in one
     // projection).  Qwen2/Qwen2-VL do not: their q projection is exactly
     // n_head*head_dim wide and the attention output has no sigmoid gate.
     bool attn_gate = true;
-
-    // ---- DeepSeek-V4.1-Flash (`deepseek41`) ------------------------------
-    bool deepseek41 = false;
-    ds41_hparams ds;
 
     bool is_moe() const {
         return n_expert > 0;
@@ -187,12 +88,6 @@ struct moe_t {
     uint32_t gate_inp_type = 0;
     const void * gate_inp_shexp = nullptr;
     uint32_t gate_inp_shexp_type = 0;
-    // qwen4exp: the down projection converted once to a symmetric int8 store
-    // with one scale per 32-value group (the Q5_1/Q8_0 mixed bank cannot be
-    // consumed by the K-quant int8 GEMM otherwise).  Host-only.
-    uint8_t * down_i8 = nullptr;
-    float * down_sc = nullptr;
-    int down_i8_K = 0, down_i8_N = 0, down_i8_E = 0;
 
     bool ok() const {
         return gate_exps.ok();
@@ -200,73 +95,6 @@ struct moe_t {
     size_t bytes() const {
         return gate_exps.total_bytes() + up_exps.total_bytes() + down_exps.total_bytes();
     }
-};
-
-// A hyper-connection module: grouped RMSNorm gamma [hc][n_embd], the low-rank
-// gate down/up, and the per-stream scatter projection [hc].
-struct hc_wt {
-    const float * norm = nullptr;
-    wt down, up, inject;
-    bool ok() const {
-        return norm && down.data && up.data && inject.data;
-    }
-};
-
-// PLE (per-layer n-gram embedding) tensors on the one layer that has them.
-struct ple_wt {
-    wt key, value;
-    const float * norm_key = nullptr;
-    const float * norm_query = nullptr;
-    const float * norm_conv = nullptr;
-    const float * conv = nullptr; // depthwise taps [ple_conv][hc*n_embd]
-    bool ok() const {
-        return key.data && value.data && norm_key && norm_query && norm_conv && conv;
-    }
-};
-
-// QSA (query-side sparse attention) indexer projections on a full-attention
-// layer.  The stored keys are 128-wide, four indexer heads.
-struct indexer_wt {
-    wt q_proj, k_proj;
-    const float * q_norm = nullptr;
-    const float * k_norm = nullptr;
-    bool ok() const {
-        return q_proj.data && k_proj.data && q_norm && k_norm;
-    }
-};
-
-// DeepSeek-V4.1-Flash layer tensors.  The attention is MLA: `wq_a`/`wq_b` is a
-// low-rank q, `wkv` is the single 512-wide latent used as both K and V, and the
-// output is `wo_a` (8 groups of 1024) then `wo_b`.  `wo_a` is stored 3-D
-// [K=4096][N=1024][E=8], so one group is a plain 2-D weight.
-struct ds41_layer {
-    wt wq_a, wq_b, wkv, wo_b;
-    // attn_output_a is stored 2-D [K=4096][N=8192]; the eight output groups are
-    // consecutive 1024-row blocks of N (the reference reshapes it to
-    // [4096, 1024, 8] for the per-group GEMV).
-    wt wo_a;
-    const float * q_a_norm = nullptr;
-    const float * kv_norm = nullptr;
-    const float * attn_sinks = nullptr; // [n_head]
-    // compressed-KV owner only (kv_src_of[il] == il)
-    wt comp_wkv, comp_wgate; // comp_wgate absent at ratio 1
-    const float * comp_norm = nullptr;
-    wt idx_attn_k; // [512,128], owner only
-    const float * idx_k_norm = nullptr;
-    // index source only (topk_src_of[il] == il)
-    wt idx_attn_q_b, idx_proj;
-    // Engram layer only (1, 14)
-    wt engram_kv; // [6144, 5*n_embd]
-    const float * engram_gate = nullptr;
-    // hyper-connections
-    wt hc_attn_fn, hc_ffn_fn; // [hc*n_embd, (2+hc)*hc]
-    const float * hc_attn_base = nullptr;
-    const float * hc_attn_scale = nullptr;
-    const float * hc_ffn_base = nullptr;
-    const float * hc_ffn_scale = nullptr;
-    // router biases (the `_vl` variant is used for image-span tokens)
-    const float * exp_probs_b = nullptr;
-    const float * exp_probs_b_vl = nullptr;
 };
 
 struct layer_t {
@@ -299,13 +127,12 @@ struct layer_t {
         }
         return n;
     }
-    // qwen4exp: hyper-connection mixers before the token mixer and before the
-    // FFN, plus the optional PLE module and the full-attention indexer.
-    hc_wt hc_attn, hc_ffn;
-    ple_wt ple;
-    indexer_wt idx;
-    // deepseek41 (MLA + compressor + indexer + Engram + mHC)
-    ds41_layer ds;
+    // Architecture-specific pimpl slot: null for a generic architecture, a
+    // per-arch `arch_layer` (qwen4exp's HC/PLE/QSA, deepseek41's MLA/mHC/...)
+    // otherwise.  The generic upload/keep loops enumerate it through
+    // `visit_weights`; the architecture's own code reaches it through its
+    // accessor (q4_layer / ds41_layer_of).
+    std::unique_ptr<arch_layer> extras;
     const float * attn_norm = nullptr;
     const float * post_attn_norm = nullptr;
     wt ffn_gate, ffn_up, ffn_down;
@@ -356,18 +183,6 @@ struct mtp_layer_t {
     w8t wq8, wk8, wv8, wo8, ffn_gate8, ffn_up8, ffn_down8, eh_proj8;
 };
 
-// Capabilities of an architecture's own forward that the generic driver has to
-// know about.  Set by the loader, read by the engine - a capability rather than
-// a model-name test, so a second model with the same geometry inherits it.
-struct arch_profile {
-    // A multimodal prompt must go through the model's own forward chunker.  The
-    // generic mm driver feeds one kMaxT row per prefill_chunk, which is exactly
-    // the path a model-owned forward (qwen4exp: hyper-connections, PLE, QSA and
-    // the per-expert bank) bypasses; its whole-prompt batching is where those
-    // live.
-    bool mm_model_prefill = false;
-};
-
 // Reject a model whose geometry the kernels do not implement, before anything
 // is uploaded or allocated.  Several kernels hardcode a head_dim (the generic
 // attention partial stride is literally 256) and would otherwise overrun their
@@ -389,8 +204,6 @@ struct model {
     // registry row that matched general.architecture.  Never null after a
     // successful load; the row's key is asserted against the GGUF's exact key.
     const model_profile * prof = nullptr;
-    // what this architecture's own forward can do (see arch_profile)
-    arch_profile profile;
     // tokenizer.chat_template (Jinja); empty when the GGUF does not carry one
     std::string chat_template;
     std::vector<layer_t> layers;
@@ -399,16 +212,12 @@ struct model {
     // LM-head weight: `output.weight` when the GGUF is untied, else tok_embd
     wt output;
     const float * output_norm = nullptr;
-    // qwen4exp: the final hyper-connection mixer is the output norm, and this
-    // is the n-gram hash table (host-only: 26.8 GiB in the reference Q4 file).
-    hc_wt hc_head;
-    wt ple_table;
-    bool q4exp = false;
-    // deepseek41: the Engram table (110 GiB in the reference file) and the
-    // vocab -> n-gram-id map the hash uses (a GGUF metadata array, not a
-    // tensor).  Both are host-only; the forward reads rows on demand.
-    bool ds41 = false;
-    std::vector<int32_t> engram_token_map;
+    // Architecture-specific model-level pimpl slot: null for a generic
+    // architecture, an `arch_model_extras` otherwise (qwen4exp's HC head and
+    // PLE table, deepseek41's Engram token map and table).  The generic
+    // upload/keep loops enumerate it through `visit_device_weights` /
+    // `visit_host_keep`.
+    std::unique_ptr<arch_model_extras> extras;
     // Keep the GGUF shards' page cache when page_out_host() releases the PTEs.
     // MADV_DONTNEED alone drops only this process's private mappings, so the
     // file pages stay cached; the explicit evictor is the POSIX_FADV_DONTNEED
@@ -422,20 +231,7 @@ struct model {
     mtp_layer_t mtp;
     bool has_mtp = false;
 
-    // device copy of all weights (one blob)
-    void * dev_weights = nullptr;
-    size_t dev_weights_size = 0;
-
     void load(const std::string & path);
-    // upload the whole mmap to device USM; `host` keeps the weights in the
-    // mmap and only makes dev_ptr() an identity (CPU backend)
-    void upload(sycl::queue & q, bool host = false);
-    // build / free the SI8 int8 copies of the quantized weight tensors (DP4A path)
-    void build_w8(sycl::queue & q, bool host = false);
-    // multi-device: build the SIn copy of a single tensor on `q`'s device
-    // (a non-K-quant tensor yields an empty w8t)
-    void build_w8_one(sycl::queue & q, const wt & t, w8t & out);
-    void free_w8(sycl::queue & q);
     // Drop this process's resident pages backing [p, p+len) of the GGUF mmap.
     // The MAP_PRIVATE mapping stays valid, so a later host read simply re-faults
     // from the file; used once a tensor has been copied to a device so the
@@ -447,15 +243,6 @@ struct model {
     }
     void page_out_tensor(const wt & t) {
         page_out_host(t.data, tensor_bytes(t));
-    }
-    const void * dev_ptr(const void * host_ptr) const {
-        if (!dev_weights) {
-            return host_ptr; // CPU backend: weights stay in the mmap
-        }
-        return (const char *)dev_weights + ((const char *)host_ptr - (const char *)gguf.map_base);
-    }
-    const float * dev_f32(const float * p) const {
-        return (const float *)dev_ptr(p);
     }
 };
 

@@ -155,17 +155,15 @@ void audio_model::load(const std::string & path) {
 }
 
 audio_model::~audio_model() {
-    free_dev_ptrs(dev_q, {dev_weights, d_cw, d_mel, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_post});
+    if (dev_q && weights.uploaded()) {
+        weights.release(*dev_q);
+    }
+    free_dev_ptrs(dev_q, {d_cw, d_mel, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_post});
 }
 
 void audio_model::upload(sycl::queue & q) {
     pin_dev_queue(dev_q, q, "audio tower");
-    dev_weights_size = gguf.map_size;
-    dev_weights = sycl::malloc_device(dev_weights_size, q);
-    if (!dev_weights) {
-        throw std::runtime_error("audio device allocation failed");
-    }
-    q.memcpy(dev_weights, gguf.map_base, dev_weights_size).wait();
+    weights.upload_contiguous(gguf.map_base, gguf.map_size, q, "audio ");
 }
 
 audio_input audio_model::make_input(const audio_model & am, const float * mel, int n_frames) {
@@ -334,7 +332,7 @@ void audio_model::encode_device(sycl::queue & q, const audio_input & in, float *
         throw std::runtime_error("audio: unsupported head_dim");
     }
 
-    if (!dev_weights) {
+    if (!weights.uploaded()) {
         upload(q);
     }
     if (scratch_frames < n_frames) {

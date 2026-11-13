@@ -16,7 +16,13 @@
 #include <string>
 
 #include "model.h"
-#include "model_arch.h"
+#include "arch/deepseek41/load.h"
+#include "arch/qwen2vl/load.h"
+#include "arch/qwen35/load.h"
+#include "arch/qwen35moe/load.h"
+#include "arch/qwen4exp/hparams.h"
+#include "arch/qwen4exp/load.h"
+#include "arch/registry.h"
 #include "model_profile.h"
 
 using namespace si;
@@ -50,7 +56,7 @@ static bool same_rep(const model_profile & a, const model_profile & b) {
 
 static bool same_spec(const model_profile & a, const model_profile & b) {
     return a.spec.mtp == b.spec.mtp && a.spec.dflash == b.spec.dflash && a.spec.multimodal == b.spec.multimodal
-           && std::strcmp(a.spec.why, b.spec.why) == 0;
+           && a.spec.mm_owned_prefill == b.spec.mm_owned_prefill && std::strcmp(a.spec.why, b.spec.why) == 0;
 }
 
 static bool same_extras(const model_profile & a, const model_profile & b) {
@@ -99,7 +105,7 @@ int main() {
     }
 
     printf("qwen4exp profile values\n");
-    const model_profile & q4 = kQwen4ExpProfile;
+    const model_profile & q4 = qwen4exp_profile();
     CHECK(q4.fwd == model_profile::fwd_kind::hc_ple_qsa, "forward kind is hc_ple_qsa");
     CHECK(q4.policy.max_decode_rows == 1, "max_decode_rows is 1 (2 rows measured 0.85x)");
     CHECK(q4.policy.prefix_cache, "prefix cache is on (PLE/QSA state is checkpointed)");
@@ -121,11 +127,12 @@ int main() {
     CHECK(q4.vision == model_profile::vision_kind::qwen3vl,
           "qwen4exp uses the qwen3vl mmproj tower");
     CHECK(!q4.spec.mtp && !q4.spec.dflash && q4.spec.multimodal, "MTP/DFlash off, multimodal on");
+    CHECK(q4.spec.mm_owned_prefill, "qwen4exp owns the multimodal prefill chunker");
     CHECK(std::strlen(q4.spec.why) > 0u, "the unsupported capabilities carry a reason");
 
     printf("generic profiles\n");
-    const model_profile & g35 = kQwen35Profile;
-    const model_profile & gmoe = kQwen35MoeProfile;
+    const model_profile & g35 = qwen35_profile();
+    const model_profile & gmoe = qwen35moe_profile();
     CHECK(std::strcmp(g35.key, "qwen35") == 0, "qwen35 profile key");
     CHECK(std::strcmp(gmoe.key, "qwen35moe") == 0, "qwen35moe profile key");
     CHECK(g35.fwd == model_profile::fwd_kind::generic_plan && gmoe.fwd == model_profile::fwd_kind::generic_plan,
@@ -151,24 +158,28 @@ int main() {
     CHECK(g35.rep.sin_w8 && g35.rep.dnnl_int8 && !g35.rep.raw_gemv_decode && !g35.rep.split_per_tensor_upload,
           "generic weights use the SIn/oneDNN stores and the single-blob upload");
     CHECK(g35.spec.mtp && g35.spec.dflash && g35.spec.multimodal, "generic MTP/DFlash/MM are wired");
+    CHECK(!g35.spec.mm_owned_prefill && !gmoe.spec.mm_owned_prefill,
+          "generic profiles use the generic multimodal chunk loop");
     CHECK(g35.vision == model_profile::vision_kind::qwen3vl
               && gmoe.vision == model_profile::vision_kind::qwen3vl,
           "generic mmproj files use the qwen3vl tower");
 
     printf("qwen2vl profile values\n");
-    const model_profile & q2 = kQwen2VlProfile;
+    const model_profile & q2 = qwen2vl_profile();
     CHECK(q2.fwd == model_profile::fwd_kind::generic_plan, "qwen2vl uses the shared forward");
     CHECK(q2.vision == model_profile::vision_kind::qwen2vl, "qwen2vl mmproj uses the qwen2vl tower");
     CHECK(q2.spec.multimodal && !q2.spec.mtp && !q2.spec.dflash, "qwen2vl declares MM only");
+    CHECK(!q2.spec.mm_owned_prefill, "qwen2vl uses the generic multimodal chunk loop");
     CHECK(!q2.policy.prefix_cache && q2.policy.auto_layer_map && q2.policy.auto_layer_map_one_gpu,
           "qwen2vl takes the per-tensor upload and disables the prefix cache");
 
     printf("deepseek41 profile values\n");
-    const model_profile & ds = kDeepseek41Profile;
+    const model_profile & ds = deepseek41_profile();
     CHECK(ds.fwd == model_profile::fwd_kind::deepseek41, "deepseek41 uses its own forward");
     CHECK(ds.vision == model_profile::vision_kind::deepseek41v,
           "deepseek41 mmproj uses the deepseek41v tower");
     CHECK(ds.spec.multimodal && !ds.spec.mtp && !ds.spec.dflash, "deepseek41 declares MM only");
+    CHECK(!ds.spec.mm_owned_prefill, "deepseek41 does not own a generic mm prefill chunker");
     CHECK(ds.policy.max_decode_rows == 1, "deepseek41 caps a decode at one row");
     CHECK(ds.policy.prefix_cache, "deepseek41 checkpoints its window + compressed state");
     CHECK(ds.policy.prefill == model_profile::prefill_kind::whole_prompt, "deepseek41 prefill is whole_prompt");
@@ -189,43 +200,49 @@ int main() {
     // profile report cannot print one object while the engine uses another.
     {
         const arch::loader * a = arch::find("deepseek41");
-        CHECK(a != nullptr && a->prof == &kDeepseek41Profile, "deepseek41 row points at kDeepseek41Profile");
+        CHECK(a != nullptr && a->prof == &deepseek41_profile(), "deepseek41 row points at deepseek41_profile()");
     }
     {
         const arch::loader * a = arch::find("qwen4exp");
-        CHECK(a != nullptr && a->prof == &kQwen4ExpProfile, "qwen4exp row points at kQwen4ExpProfile");
+        CHECK(a != nullptr && a->prof == &qwen4exp_profile(), "qwen4exp row points at qwen4exp_profile()");
     }
     {
         const arch::loader * a = arch::find("qwen35");
-        CHECK(a != nullptr && a->prof == &kQwen35Profile, "qwen35 row points at kQwen35Profile");
+        CHECK(a != nullptr && a->prof == &qwen35_profile(), "qwen35 row points at qwen35_profile()");
     }
     {
         const arch::loader * a = arch::find("qwen35moe");
-        CHECK(a != nullptr && a->prof == &kQwen35MoeProfile, "qwen35moe row points at kQwen35MoeProfile");
+        CHECK(a != nullptr && a->prof == &qwen35moe_profile(), "qwen35moe row points at qwen35moe_profile()");
+    }
+    {
+        const arch::loader * a = arch::find("qwen2vl");
+        CHECK(a != nullptr && a->prof == &qwen2vl_profile(), "qwen2vl row points at qwen2vl_profile()");
     }
 
     printf("profile geometry validation\n");
     {
         hparams hp{};
-        hp.hc_mult = 4;
-        hp.hc_low_rank = 320;
-        hp.idx_top_k = 2048;
-        hp.idx_kpool = 4;
-        hp.idx_n_head = 4;
-        hp.idx_head_dim = 128;
+        auto qh = std::make_shared<qwen4exp_hparams>();
+        hp.arch = qh;
+        qh->hc_mult = 4;
+        qh->hc_low_rank = 320;
+        qh->idx_top_k = 2048;
+        qh->idx_kpool = 4;
+        qh->idx_n_head = 4;
+        qh->idx_head_dim = 128;
         bool ok = true;
         try {
-            validate_model_profile(hp, kQwen4ExpProfile, /*split_file=*/true);
+            validate_model_profile(hp, qwen4exp_profile(), /*split_file=*/true);
         } catch (const std::exception & e) {
             ok = false;
             fprintf(stderr, "FAIL matching qwen4exp geometry rejected: %s\n", e.what());
         }
         CHECK(ok, "matching qwen4exp geometry is accepted");
 
-        hp.hc_mult = 3;
+        qh->hc_mult = 3;
         bool threw = false;
         try {
-            validate_model_profile(hp, kQwen4ExpProfile, false);
+            validate_model_profile(hp, qwen4exp_profile(), false);
         } catch (const std::exception &) {
             threw = true;
         }
@@ -234,7 +251,7 @@ int main() {
         hparams generic{};
         bool generic_ok = true;
         try {
-            validate_model_profile(generic, kQwen35Profile, false);
+            validate_model_profile(generic, qwen35_profile(), false);
         } catch (...) {
             generic_ok = false;
         }
@@ -242,7 +259,7 @@ int main() {
 
         bool split_threw = false;
         try {
-            validate_model_profile(generic, kQwen35Profile, /*split_file=*/true);
+            validate_model_profile(generic, qwen35_profile(), /*split_file=*/true);
         } catch (const std::exception &) {
             split_threw = true;
         }

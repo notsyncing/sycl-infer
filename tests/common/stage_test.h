@@ -101,7 +101,7 @@ struct stage_env {
 
     // Device pointer of a weight, as uploaded on the device this harness is
     // bound to.  model::dev_f32/dev_ptr cannot be used by a stage test: in
-    // multi-device mode there is no whole-blob upload (dev_weights is null), so
+    // multi-device mode there is no whole-blob upload (the store has no blob), so
     // dev_ptr returns the *host* mmap pointer and the kernel dereferences host
     // memory on the device.  That reads as 0 rather than faulting, so every
     // weighted stage came back as max|diff| == max|exp| - i.e. "the engine

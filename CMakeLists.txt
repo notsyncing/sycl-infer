@@ -148,6 +148,7 @@ add_library(sycl_infer_core STATIC
     src/common/cpu_isa.cpp
     # backend: the shared interface plus the GPU and CPU implementations
     src/backend/dnnl_gemm.cpp
+    src/backend/weight_store.cpp
     src/backend/gpu/gpu_backend.cpp
     src/backend/cpu/cpu_backend.cpp
     # cpu kernels: one translation unit per host kernel (compiled without -fsycl)
@@ -202,16 +203,17 @@ add_library(sycl_infer_core STATIC
     # model: GGUF loading, weights, tokenizer
     src/model/gguf.cpp
     src/model/model.cpp
-    src/model/model_w8.cpp
-    src/model/qwen35.cpp
-    src/model/qwen35moe.cpp
-    src/model/qwen4exp.cpp
-    src/model/qwen2vl.cpp
-    src/model/deepseek41.cpp
-    src/model/profiles/generic.cpp
-    src/model/profiles/qwen4exp.cpp
-    src/model/profiles/qwen2vl.cpp
-    src/model/profiles/deepseek41.cpp
+    src/model/arch/registry.cpp
+    src/model/arch/qwen35/load.cpp
+    src/model/arch/qwen35/profile.cpp
+    src/model/arch/qwen35moe/load.cpp
+    src/model/arch/qwen35moe/profile.cpp
+    src/model/arch/qwen4exp/load.cpp
+    src/model/arch/qwen4exp/profile.cpp
+    src/model/arch/qwen2vl/load.cpp
+    src/model/arch/qwen2vl/profile.cpp
+    src/model/arch/deepseek41/load.cpp
+    src/model/arch/deepseek41/profile.cpp
     src/model/dflash.cpp
     src/model/tokenizer.cpp
     # mm: multimodal image/video/audio preprocessing + vision/audio encoders
@@ -223,13 +225,17 @@ add_library(sycl_infer_core STATIC
     src/mm/multimodal.cpp
     # engine: forward execution, graph capture, KV pool, prefix cache
     src/engine/engine.cpp
-    src/engine/engine_graph.cpp
-    src/engine/engine_mtp.cpp
-    src/engine/engine_dflash.cpp
-    src/engine/engine_q4exp.cpp
-    src/engine/engine_qsa.cpp
-    src/engine/engine_ds41.cpp
-    src/engine/engine_ds41_gpu.cpp
+    src/engine/graph.cpp
+    src/engine/spec/mtp.cpp
+    src/engine/spec/dflash.cpp
+    src/engine/arch/qwen4exp/forward.cpp
+    src/engine/arch/qwen4exp/qsa.cpp
+    src/engine/arch/qwen4exp/runtime.cpp
+    src/engine/arch/deepseek41/forward_host.cpp
+    src/engine/arch/deepseek41/forward_gpu.cpp
+    src/engine/arch/deepseek41/dense_store.cpp
+    src/engine/arch/deepseek41/runtime.cpp
+    src/engine/arch/registry.cpp
     src/engine/engine_kvpool.cpp
     src/engine/moe_cache.cpp
     src/engine/engine_prefix_cache.cpp
@@ -680,6 +686,7 @@ si_add_test(test_moe_grp_q6  tests/backend/gpu/kernels/test_moe_grp_q6.cpp)
 si_add_test(test_moe_ref tests/model/test_moe_ref.cpp)
 si_add_test(test_dflash_kernels tests/backend/gpu/kernels/test_dflash_kernels.cpp)
 si_add_test(test_spec        tests/engine/test_spec.cpp)
+si_add_test(test_arch_ops    tests/engine/test_arch_ops.cpp)
 
 # Pipeline mechanism and the MinerU grammar: hermetic and engine-free.
 si_add_host_test(test_pipeline_registry
@@ -698,6 +705,12 @@ si_add_host_test(test_mineru_layout
 # ds41's model-owned prefix cache: the prefix hashing and LRU bookkeeping are
 # header-only, so this needs no GGUF and no GPU.
 si_add_host_test(test_ds41_pc tests/engine/test_ds41_pc.cpp)
+
+# Split-GGUF loading, including a metadata-only shard (n_tensors == 0, header ends
+# at EOF).  gguf.cpp is SYCL-free, so this stays a host test: no GPU, no model.
+si_add_host_test(test_gguf_split
+    src/model/gguf.cpp
+    tests/model/test_gguf_split.cpp)
 
 si_add_test(test_ds41_ops    tests/backend/gpu/kernels/test_ds41_ops.cpp)
 si_add_test(test_gpu_stages
@@ -722,7 +735,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()
@@ -732,6 +745,13 @@ if(BUILD_TESTING)
         add_test(NAME ${name} COMMAND ${name})
         set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
     endforeach()
+    # The architecture-boundary gate: the generic engine/model files must not
+    # name or dispatch on an architecture.  Hermetic (a source scan, no GPU).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME arch_boundaries COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ci/check_arch_boundaries.py)
+        set_tests_properties(arch_boundaries PROPERTIES LABELS "hermetic")
+    endif()
     if(NOT SI_ROUTER_ONLY)
         # The CLI's own contract: --help exits 0 and documents the flags a
         # script would use; an unknown flag is an error, not silently ignored.

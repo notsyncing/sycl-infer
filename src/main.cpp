@@ -724,7 +724,7 @@ int main(int argc, char ** argv) {
                                         d.get_info<sycl::info::device::global_mem_size>() / 1048576.0,
                                         d.get_info<sycl::info::device::max_mem_alloc_size>() / 1048576.0);
                             }
-                            fprintf(stderr, "[mm] vision weights %.0f MiB on %s\n", vm_owned.dev_weights_size / 1048576.0,
+                            fprintf(stderr, "[mm] vision weights %.0f MiB on %s\n", vm_owned.weights.device_bytes() / 1048576.0,
                                     e.q.get_device().get_info<sycl::info::device::name>().c_str());
                         }
                         img_cfg.patch_size = vm.hp.patch_size;

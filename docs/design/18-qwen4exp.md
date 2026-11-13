@@ -16,7 +16,7 @@ the model is host-RAM bound, not VRAM bound.
 | hyper-connections | `hc = 4` streams, low-rank gate 320 |
 | routed experts | 512, top-10, FFN width 640, plus a shared expert |
 | PLE | one layer, 16 n-gram-hash rows of a 160-wide table (IQ4_NL) |
-| QSA | 128-wide indexer key, `compress_ratios = 4` pools (the code reads `hp.idx_kpool`, not a literal 4), top 2 048 keys |
+| QSA | 128-wide indexer key, `compress_ratios = 4` pools (the code reads `q4_hp(hp).idx_kpool`, not a literal 4), top 2 048 keys |
 | GGUF | 4 shards, UD-Q4_K_XL, `general.architecture = qwen4exp` |
 
 Hyper-connections replace every layer norm.  The residual is `hc` parallel
@@ -91,7 +91,7 @@ costs hundreds of ms/token at this model's expert traffic.
 ### 3.1 Model profile (M0+M1)
 
 The architecture's policy is declarative: `src/model/model_profile.h` plus
-`src/model/profiles/qwen4exp.cpp` (the registry rows in `model.cpp` point at the
+`src/model/arch/qwen4exp/profile.cpp` (the registry rows in `model.cpp` point at the
 const, and `model::load` requires the profile's key to be the GGUF's exact
 `general.architecture`).  For qwen4exp:
 
@@ -102,7 +102,7 @@ const, and `model::load` requires the profile's key to be the GGUF's exact
 | `extras` | PLE on; QSA on, top_k 2048, pool 4, indexer 4 heads x 128 |
 | `policy` | `max_decode_rows = 1`, prefill `whole_prompt`, prefix cache **yes**, auto layer map **yes**, md_splits **yes**, engram default 4096 MiB |
 | `rep` | `sin_w8 = false`, `dnnl_int8 = false`, `raw_gemv_decode = true`, `split_per_tensor_upload = true` |
-| `spec` | `mtp`/`dflash` declared false with one `why` (no NextN block in the trunk, and the walk does not produce the per-token GDN/conv snapshots the verify needs); multimodal **on**, `vision = qwen3vl`, routed through the model-owned chunker (the loader's `mm_model_prefill`) |
+| `spec` | `mtp`/`dflash` declared false with one `why` (no NextN block in the trunk, and the walk does not produce the per-token GDN/conv snapshots the verify needs); multimodal **on**, `vision = qwen3vl`, routed through the model-owned chunker (the profile's `spec.mm_owned_prefill`) |
 | `moe` | `runtime_bank` (not the generic three-tier cache) |
 
 The engine stores `mp_ = m.prof` and every policy branch reads it:
@@ -117,9 +117,13 @@ reason and disables MTP before the `has_mtp` check, and the scheduler reads
 qwen35/qwen35moe profiles are `generic_plan`, engine-cache, chunk32 prefill,
 prefix cache on, so their behaviour is unchanged.  `PF_MODEL_INFO=1` prints the
 profile, policy, weights, capabilities and provenance; `test_model_profile`
-pins the values.  The forward dispatch reads `engine::hc_fwd()`
-(`mp_->fwd == hc_ple_qsa`, with `m.q4exp` asserted equal at load), which is the
-M0+M1 line: the policy is declarative, the walk is not yet a runtime object.
+pins the values.  The forward and prefix-cache dispatch reads the `arch_ops`
+row (`engine::aops_`, `arch/arch_ops.h`: `prefill_text` / `prefill_mm` /
+`decode_batch` / `run_head` and the `pc_*` hooks, selected by `mp_->fwd`; the
+walk itself stays in `engine/arch/qwen4exp/forward.cpp` and its state in
+`engine/arch/qwen4exp/{state,qsa_state}.h`): the policy is declarative, and the
+forward is a runtime object reached only through the row.  The layer contract is
+[24-arch-modules.md](24-arch-modules.md).
 
 The profile is not a tuning store: per-card constants remain in the device
 profile, and per-file/run values (expert plane strides, bank budget, KV type,
@@ -130,8 +134,8 @@ use" versus "how does this card run it".
 ### 3.2 Multimodal and the shared chunker
 
 The text GGUF has no vision/audio tensors (the towers are separate mmproj
-GGUFs, as for every architecture).  `load_qwen4exp` sets
-`arch_profile.mm_model_prefill`, and `generate_impl` then calls `q4_prefill_mm`
+GGUFs, as for every architecture).  the qwen4exp profile declares
+`spec.mm_owned_prefill`, and `generate_impl` then calls `q4_prefill_mm`
 for the whole expanded prompt instead of one `kMaxT` row per `prefill_chunk`
 (the generic loop would re-upload experts every 32 tokens and bypass the
 HC/PLE/QSA state).  `q4_prefill_common` is the shared chunker: full `kMaxT` rows
@@ -225,7 +229,7 @@ reports the match in `usage.prompt_tokens_details.cached_tokens` /
 
 ## 4. QSA
 
-The selector runs on the host (`engine_qsa.cpp`).  The attention over the
+The selector runs on the host (`src/engine/arch/qwen4exp/qsa.cpp`).  The attention over the
 selected keys runs on the host for CPU, non-f16 KV, a non-256 head and the
 `PF_QSA_DEVATTN=0` / `PF_QSA_PF_DEV=0` A/Bs, and on the device for the f16 GPU
 sparse paths (one token via Stage 2, a whole prefill chunk via Stage 3 below).
@@ -246,7 +250,7 @@ cos 0.9999, indexer score corr 0.9994.  The top-512 sets differ by one
 boundary pool (fp accumulation order), so bit-exactness is not claimed.
 `PF_Q4_QSADBG` and the `PF_QSA_*` dump knobs are diagnostics.
 
-**The pool width is `hp.idx_kpool`, not a literal 4.**  `qsa_pool_div()` returns
+**The pool width is `q4_hp(hp).idx_kpool`, not a literal 4.**  `qsa_pool_div()` returns
 `idx_kpool > 1 ? idx_kpool : 4` and every pool expression uses it: the pool
 array and per-slot ring, `pos / kp`, `pos % kp`, the pooled key's RoPE position
 `pos - (kp - 1)`, `n_pool_max = idx_top_k / kp`, the selected range `p*kp + j`,
@@ -255,9 +259,9 @@ and the incomplete tail.  The old `/4` arithmetic was invisible on this file
 wrong key set while still running.  `kp = 4` is bit-identical to the old code:
 `1/4` is exact and the four-term sum keeps its order.  The guard is
 `assert(kp >= 2)` plus a grep guard - no `/ 4`, `% 4` or `* 4 +` pool
-arithmetic may remain in `engine_qsa.cpp`.
+arithmetic may remain in `src/engine/arch/qwen4exp/qsa.cpp`.
 
-**The recommended `--ctx 2048` decode does not run QSA**: `qsa_on_` requires
+**The recommended `--ctx 2048` decode does not run QSA**: `q4x_.qsa.on` requires
 `max_seq > idx_top_k` and both are 2 048, so the 88.2 ms/token cell has no QSA
 cost.  Measured at `--ctx 4096` (same weights, bank and TCP prompt), the host
 call was **26.8 ms/token** and **23.7 ms of it was the four blocking D2H waits
@@ -265,7 +269,7 @@ per layer** (`memcpy().wait()` drains the in-order queue while the host MoE
 would otherwise overlap the device), not the dots: indexer BF16 projection
 3.0, mirror/pool update 0.08.  The payload is 744 KiB/token; the wait is mostly
 the layer's own producers.  The fixes, in order, are in
-`engine_qsa.cpp`/`qsa.cpp`:
+`src/engine/arch/qwen4exp/qsa.cpp` / `src/backend/gpu/kernels/qsa.cpp`:
 
 * enqueue the four copies and wait once: QSA **21.5 ms**, decode 106.4 ->
   **100.8** (both `[q4]` sums; the deferred rows below also give the true
@@ -327,7 +331,7 @@ that changes the accumulation order and needs a sparse-stream oracle.
 (`PF_CPU_ISA` also scalarises the MoE/HC/PLE and is not an A/B of this path).
 
 **Stage 1 (2026-10-27, mirror later removed).**  The low-risk items were
-implemented in `engine_qsa.cpp`/`qsa.cpp`: per-layer pinned USM staging for the
+implemented in `src/engine/arch/qwen4exp/qsa.cpp` / `src/backend/gpu/kernels/qsa.cpp`: per-layer pinned USM staging for the
 four D2H buffers and `attn_out` (a pageable `std::vector` D2H is synchronous, so
 even the deferred copies blocked the host), an f16 host K/V mirror
 (`PF_QSA_F16MIR`, since removed) and `PF_QSA_COPYQ` (since removed) putting the
@@ -356,7 +360,7 @@ rows - is skipped while no selector runs) and `upd=0.05` for
 scalar/AVX2/AVX-512.  The 93.3 ms `--ctx 2048` cell is unchanged (QSA off); at
 `--ctx 4096` the dense-equivalent update is deferred under the LM head, so the
 96-token cell also stays at 93.4 ms.  A
-pre-existing lifecycle bug was found and fixed: `qsa_cache_` was not cleared by
+pre-existing lifecycle bug was found and fixed: `q4x_.qsa.cache` was not cleared by
 `engine::zero_slot`, so a server reusing a slot above `idx_top_k` could read the
 previous sequence's state.  `engine::qsa_reset_slot` now flushes, clears the
 pending entries and destroys the per-slot pool/ring from `zero_slot` and

@@ -134,8 +134,10 @@ log-mel [n_frames][n_mel]
   learned position embedding 无关——后者是逐行**加上去的向量**（`audio_model.cpp:283-291` /
   `476-482`），不移动任何位置。
 * `n_out = (n_frames+1)/2`（`audio_model::make_input`，`audio_model.cpp:259-265`），即 ceil(n_frames/2)。
-* `encode_host` 是宿主参考；`encode_device` 与视觉一致——权重单 blob 上传、`dev_ptr` 翻译、
-  scratch 增长至最大 `n_frames`、**in-order queue**。conv 权重/位置嵌入被打成一个 `d_cw` blob
+* `encode_host` 是宿主参考；`encode_device` 与视觉一致——权重经
+  `weights.upload_contiguous(gguf.map_base, gguf.map_size, q, "audio ")` 单 blob 上传、
+  `dev_ptr` 委托 store（`weights.ptr(host)`）、scratch 增长至最大 `n_frames`、**in-order queue**。
+  audio 塔与视觉塔共用 backend 的 `weight_store`；析构先 `weights.release(*dev_q)` 再释放 scratch。conv 权重/位置嵌入被打成一个 `d_cw` blob
   （`c1_w | c1_b | c2_w | c2_b | pos`，`audio_model::encode_device`），并且**每次调用都重拷**
   （`audio_model::encode_device` 里每次调用重拷 `c1_w`/`c2_w`）——与视觉路径“只拷一次”的做法不同。
 * device 前向复用 `vit_gemm`/`vit_layernorm`/`vit_gelu`/`vit_add_bias`/`vit_add`/`vit_attn`/`vit_copy`
@@ -204,7 +206,7 @@ max_video_frames)`（`mm_build_prompt_mixed_device`，声明在 `multimodal.h`�
 prompt-token 索引，不是 RoPE 位置），所以一个视频/图像块跨 prefill chunk 时不会移动位置或
 嵌入行。通用 `generate_impl` 按 `kMaxT` 逐块调用 `prefill_chunk` 并使用这个切片。
 
-`arch_profile.mm_model_prefill` 为真时（qwen4exp 的 loader 置位），引擎改走
+`spec.mm_owned_prefill` 为真时（qwen4exp 的 profile 声明），引擎改走
 `q4_prefill_mm(*mm, 0)`：整个扩展后的 prompt 进入 `q4_prefill_common`，full `kMaxT` 行
 走 mode 2、尾行走 mode 1，每块仍用 `mm_write_step` 切片。对文本 prompt（`mm == nullptr`）
 这个函数就是原来的 `q4_prefill_text` 路径，**文本输出逐位不变**；媒体 prompt 则让专家
