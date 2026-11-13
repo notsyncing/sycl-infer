@@ -242,6 +242,7 @@ add_library(sycl_infer_core STATIC
     src/engine/pc_disk.cpp
     src/engine/pc_ram.cpp
     src/engine/sampler.cpp
+    src/engine/guided.cpp
     # server: chat template, continuous batching scheduler, HTTP API
     src/server/chat.cpp
     src/server/chat_template.cpp
@@ -640,6 +641,7 @@ si_add_test(test_sse_cancel     tests/server/test_sse_cancel.cpp)
 si_add_test(test_control         tests/server/test_control.cpp)
 si_add_test(test_url_fetch     tests/server/test_url_fetch.cpp)
 si_add_test(test_sampler tests/engine/test_sampler.cpp)
+si_add_test(test_guided  tests/engine/test_guided.cpp)
 si_add_test(test_sched   tests/engine/test_sched.cpp)
 si_add_test(test_q4_batch tests/engine/test_q4_batch.cpp)
 si_add_test(test_q4_verify tests/engine/test_q4_verify.cpp)
@@ -735,7 +737,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_guided test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()

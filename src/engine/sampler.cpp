@@ -1,7 +1,11 @@
 #include "sampler.h"
 
+#include "guided.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <random>
 #include <unordered_map>
 #include <utility>
@@ -53,12 +57,16 @@ void fill_logprobs(const float * lg, int n_vocab, float inv_t, int chosen, int t
 
 int sample_token(const float * logits, int n_vocab, const gen_params & gp, const std::vector<int> & recent,
                  sampler_state & ss, sample_logprobs * out) {
-    // repetition / presence / frequency penalties and logit_bias
+    // repetition / presence / frequency penalties, logit_bias and the guided
+    // mask all operate on one mutable copy of the row.  The guided mask is
+    // applied after the penalties so it is the final word: a token the schema
+    // forbids must stay forbidden even if a penalty or bias would promote it.
     std::vector<float> scr;
     const float * lg = logits;
     const bool do_pen = gp.repeat_penalty != 1.0f || gp.presence_penalty != 0.f || gp.frequency_penalty != 0.f;
     const bool do_bias = !gp.logit_bias.empty();
-    if ((do_pen && !recent.empty()) || do_bias) {
+    const bool do_guided = gp.guided != nullptr;
+    if ((do_pen && !recent.empty()) || do_bias || do_guided) {
         scr.assign(logits, logits + n_vocab);
         if (do_pen && !recent.empty()) {
             const int n = (int)recent.size();
@@ -88,6 +96,31 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
         }
         lg = scr.data();
     }
+    if (do_guided) {
+        if (!ss.guided) {
+            ss.guided = make_guided_state(*gp.guided);
+        }
+        if (!guided_apply(*gp.guided, *ss.guided, scr.data(), n_vocab)) {
+            // The run state admits nothing (a dead end, e.g. a pattern that the
+            // already-emitted prefix cannot satisfy).  guided_apply disables
+            // itself; report once and continue unconstrained rather than
+            // returning a token the schema rejects anyway.
+            static std::atomic<bool> warned{false};
+            bool expected = false;
+            if (warned.compare_exchange_strong(expected, true)) {
+                fprintf(stderr, "[guided] constraint exhausted; continuing without it\n");
+            }
+        }
+    }
+    // Commit the chosen token into the guided state before returning; every
+    // return path below goes through this so a token can never be sampled
+    // without advancing the schema cursor.
+    auto finish = [&](int tok) {
+        if (gp.guided && ss.guided) {
+            guided_commit(*gp.guided, *ss.guided, tok);
+        }
+        return tok;
+    };
 
     const float inv_t = gp.temperature > 0.f ? 1.0f / gp.temperature : 1.0f;
 
@@ -101,7 +134,7 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
         if (out != nullptr) {
             fill_logprobs(lg, n_vocab, inv_t, best, gp.top_logprobs, out);
         }
-        return best;
+        return finish(best);
     }
 
     float mx = -INFINITY;
@@ -130,7 +163,7 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
                 best = i;
             }
         }
-        return best;
+        return finish(best);
     }
 
     // softmax over candidates
@@ -181,7 +214,7 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
     if (out != nullptr) {
         fill_logprobs(lg, n_vocab, inv_t, chosen, gp.top_logprobs, out);
     }
-    return chosen;
+    return finish(chosen);
 }
 
 } // namespace si

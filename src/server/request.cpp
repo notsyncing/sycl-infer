@@ -3,6 +3,7 @@
 // Included directly rather than through request.h: this file uses these symbols,
 // and Diagnostics.UnusedIncludes: Strict wants the providing header named.
 #include "chat.h"
+#include "guided.h"
 #include "json_util.h"
 #include "media_fetch.h"
 #include "sampler.h"
@@ -11,7 +12,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -113,6 +116,65 @@ bool parse_include_usage(const json & body) {
         return body["stream_options"].value("include_usage", false);
     }
     return false;
+}
+
+bool parse_guided(const json & body, const tokenizer & tk, gen_params & gp, std::string & err) {
+    auto compile = [&](const json & schema) {
+        std::string text;
+        if (schema.is_object()) {
+            // OpenAI nests the schema under json_schema.schema; llama.cpp's
+            // top-level json_schema has the same {name,schema,strict} wrapper.
+            // A raw schema that happens to have a "schema" property of its own
+            // is told apart by the wrapper keys / a missing "type".
+            const bool wrapped = schema.contains("schema") && schema["schema"].is_object() &&
+                                 (schema.contains("name") || schema.contains("strict") || schema.size() == 1);
+            text = dump_json(wrapped ? schema["schema"] : schema);
+        } else if (schema.is_string()) {
+            text = schema.get<std::string>();
+        } else {
+            throw std::runtime_error("json_schema must be an object");
+        }
+        gp.guided = make_guided_from_tokenizer(tk, text);
+    };
+    try {
+        if (body.contains("response_format") && body["response_format"].is_object()) {
+            const json & rf = body["response_format"];
+            const std::string type = rf.value("type", "");
+            if (type.empty() || type == "text") {
+                return true;
+            }
+            if (type == "json_object") {
+                gp.guided = make_guided_json_object(tk);
+                return true;
+            }
+            if (type == "json_schema") {
+                if (!rf.contains("json_schema")) {
+                    err = "response_format.type=json_schema requires response_format.json_schema";
+                    return false;
+                }
+                compile(rf["json_schema"]);
+                return true;
+            }
+            err = "unsupported response_format.type: " + type;
+            return false;
+        }
+        if (body.contains("json_schema")) {
+            compile(body["json_schema"]);
+            return true;
+        }
+        if (body.contains("guided_json")) {
+            compile(body["guided_json"]);
+            return true;
+        }
+        if (body.contains("grammar") && body["grammar"].is_string() && !body["grammar"].get<std::string>().empty()) {
+            err = "GBNF grammar is not supported; use response_format json_schema";
+            return false;
+        }
+    } catch (const std::exception & ex) {
+        err = ex.what();
+        return false;
+    }
+    return true;
 }
 
 std::vector<std::string> parse_stop(const json & body) {

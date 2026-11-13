@@ -129,7 +129,8 @@ MinerU 这类纯客户端流程不属于这里。只想做普通 qwen2vl 图片�
 * 请求若满足 `mtp_direct(e, gp, n, gp.logprobs)` 则不进调度器，改走 §3.6 的 MTP 路径
   （`server.cpp` 的 `handle_chat`）。
 
-参数映射（`parse_params`）：
+参数映射（`parse_params`；`response_format` / `json_schema` / `guided_json`
+由 `parse_guided` 处理）：
 
 | JSON key | 字段 | 默认 |
 |---|---|---|
@@ -142,6 +143,12 @@ MinerU 这类纯客户端流程不属于这里。只想做普通 qwen2vl 图片�
 | `seed` | `seed` | 0 |
 | `logit_bias` | `logit_bias`（map，clamp ±100） | 空 |
 | `logprobs`（chat: bool / completion: int） + `top_logprobs` | `logprobs` / `top_logprobs`（≤20） | 关闭 |
+| `response_format`（`json_object` / `json_schema` / `text`） | `gp.guided`（编译后的 JSON Schema 约束） | `text`/缺省不约束；`json_object` 等价于 `{"type":"object"}`；`json_schema` 读取其 `json_schema.schema`（缺失 400） |
+| 顶层 `json_schema` / `guided_json` | 同上 | llama.cpp/vLLM 兼容字段；`grammar`（GBNF）不支持，返回 400 |
+
+引导参数生效时聊天模板强制关闭 thinking（推理文本会出现在 JSON 之前），且
+`gp.speculative_greedy()` 返回 false，因此 MTP/DFlash 与设备端 argmax 自动让位给
+带掩码的宿主采样；约束语义与快速路径见 [07-sampler.md](07-sampler.md) §7。
 
 `/v1/completions` 的 `prompt` 支持字符串、字符串数组、token id 数组、token id 数组的数组
 （`parse_completion_prompts`，`request.cpp`；缺失/空/类型不识别都退化成一条空 prompt）；
@@ -699,7 +706,7 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 | `ignore_eos` | ✅ | llama.cpp 扩展 |
 | `logprobs` / `top_logprobs` | ✅ | 生成 token 的 logprob（惩罚/偏置、温度缩放后的完整词表 log-softmax）；chat 返回 `logprobs.content[]`；多模态与 MTP 路径恒为 `null`（拿不到 per-token 细节；`logprobs` 也会让 `mtp_direct` 退出） |
 | `logit_bias` | ✅ | token id -> 加性偏置，clamp 到 [-100,100]，在惩罚之后、softmax 之前应用 |
-| `response_format`（`json_object` / `json_schema`） | ❌ | 无语法约束，忽略 |
+| `response_format`（`json_object` / `json_schema` / `text`） | ✅ | JSON Schema 引导解码（`src/engine/guided.{h,cpp}`，设计见 [07-sampler.md](07-sampler.md) §7）；无效 schema 返回 400；顶层 `json_schema`/`guided_json` 也接受；`grammar` 不支持并返回 400 |
 | `tools` | ✅ | 传给 Jinja 模板（Qwen 原生支持） |
 | `tool_choice` | ⚠️ | `none` 清空工具；字符串/指定函数对象按名过滤；`required` 只透传不强制 |
 | `parallel_tool_calls` | ❌ | 忽略；始终允许模型并行调用 |

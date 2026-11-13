@@ -12,6 +12,7 @@
 #include "cpu_types.h"
 #include "common/exit_codes.h"
 #include "engine.h"
+#include "guided.h"
 #include "image.h"
 #include "model.h"
 #include "multimodal.h"
@@ -165,6 +166,9 @@ static void usage(const char * prog) {
             "  --temp T                     sampling temperature (default 0.7)\n"
             "  --top-p P                    nucleus sampling (default 0.95)\n"
             "  --top-k K                    top-k sampling (default 40)\n"
+            "  --json-schema FILE           constrain the reply to this JSON Schema\n"
+            "                               (guided decoding; forces thinking off)\n"
+            "  --json-object                constrain the reply to any JSON object\n"
             "\n"
             "prefix cache (three LRU tiers; lookups promote, evictions demote\n"
             "VRAM -> RAM -> disk -> dropped):\n"
@@ -178,6 +182,9 @@ static void usage(const char * prog) {
             "                               0 = unbounded)\n"
             "\n"
             "profiles and diagnostics (env only; see AGENTS.md for the full list):\n"
+            "  PF_GUIDED_DEBUG=1            JSON-schema guided decoding diagnostics: the\n"
+            "                               compiled EOS ids, dead ends, and per-apply\n"
+            "                               time / simulated-token count\n"
             "  PF_MODEL_INFO=1              print the resolved model profile (key, policy,\n"
             "                               weight representation, capabilities, provenance)\n"
             "  PF_DEVICE_INFO=1             print the resolved device profile and provenance\n"
@@ -238,6 +245,8 @@ int main(int argc, char ** argv) {
         max_slots = atoi(e);
     }
     int max_tokens = 256;
+    std::string json_schema_path; // --json-schema: guided decoding
+    bool json_object_mode = false; // --json-object
     float temp = 0.7f;
     float top_p = 0.95f;
     int top_k = 40;
@@ -309,6 +318,10 @@ int main(int argc, char ** argv) {
             control_token = next();
         } else if (a == "--control-token-file") {
             control_token_file = next();
+        } else if (a == "--json-schema") {
+            json_schema_path = next();
+        } else if (a == "--json-object") {
+            json_object_mode = true;
         } else if (a == "--max-tokens") {
             max_tokens = atoi(next().c_str());
         } else if (a == "--temp") {
@@ -667,6 +680,22 @@ int main(int argc, char ** argv) {
             gp.temperature = temp;
             gp.top_p = top_p;
             gp.top_k = top_k;
+            if (json_object_mode) {
+                gp.guided = make_guided_json_object(e.tk);
+            } else if (!json_schema_path.empty()) {
+                std::ifstream sf(json_schema_path, std::ios::binary);
+                if (!sf) {
+                    fprintf(stderr, "error: cannot read the JSON schema '%s'\n", json_schema_path.c_str());
+                    return 1;
+                }
+                const std::string schema_text((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
+                gp.guided = make_guided_from_tokenizer(e.tk, schema_text);
+            }
+            if (gp.guided) {
+                // The constrained document must start at the first generated
+                // token, so no reasoning block precedes it.
+                thinking = false;
+            }
             utf8_stream_buffer ub;
             const bool dump_gen = si::env::flag("PF_DUMP_GEN");
             auto emit = [&](int tok) {

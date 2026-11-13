@@ -352,6 +352,8 @@ from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
 ./build/test_sse_cancel     # SSE client-disconnect cancels generation (real socket,
                               # real httplib, no model needed)
 ./build/test_sampler       # logit_bias + logprob reporting (CPU only)
+./build/test_guided        # JSON-schema guided decoding: keys/enums/ranges/refs and
+                           # the sample_token mask+commit path (CPU only)
 ./build/test_model_profile # loader registry x model profiles: exact keys, pinned
                            # qwen4exp policy, qwen35/qwen35moe agree (CPU only)
 ./build/test_mm_step       # per-token M-RoPE / img_row slicing, a chunk boundary
@@ -519,7 +521,9 @@ src/engine/     engine.{h,cpp} (orchestration), engine_types.h (seg_plan and
                 moe_cache.{h,cpp} (the three-tier expert cache),
                 pc_ram.{h,cpp} (host-RAM tier: LRU record store),
                 pc_disk.{h,cpp} (disk tier: record format, index, LRU),
-                sampler.{h,cpp};
+                sampler.{h,cpp}, guided.{h,cpp} (JSON-schema guided decoding:
+                schema -> byte-level pushdown automaton, the token-byte table,
+                the `-inf` mask in sample_token and the per-sequence cursor);
                 spec/mtp.cpp (MTP plan/forward/verify/rollback + the
                 speculative loop) + spec/mtp_state.h, spec/dflash.cpp (the
                 DFlash2 drafter) + spec/dflash_state.h, spec/verify_scratch.h
@@ -594,6 +598,7 @@ tests/server/   test_response_parser.cpp (reasoning_content/tool_call splitter),
                 test_sse_cancel.cpp (SSE disconnect cancellation: real httplib +
                 real socket reset, no model)
 tests/engine/   test_sampler.cpp (logit_bias + logprob reporting),
+                test_guided.cpp (JSON-schema guided decoding, synthetic vocab),
                 test_arch_ops.cpp (the kArchOps[] rows: generic_plan is null,
                 qwen4exp's hooks incl. hist_report == nullptr, ds41's
                 capabilities and dense_store; never calls a hook),
@@ -4342,6 +4347,8 @@ addresses - an internal media server, and SSRF exposure again),
 `PF_AV_FFMPEG` (audio/video decode CLI path, default `ffmpeg`).
 
 **Diagnostics**
+`PF_GUIDED_DEBUG=1` (JSON-schema guided decoding: the compiled vocabulary's
+EOS ids, a dead-end report, and per-apply time plus simulated-token count),
 `PF_MODEL_INFO=1` (print the resolved model profile, its policy/weight/
 capability fields and its provenance at load; the model-side counterpart of
 `PF_DEVICE_INFO`), `PF_MEM_REPORT=1` (the engine's own device accounting:
@@ -6177,9 +6184,11 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
 
 ```bash
 cmake --build build -j$(nproc)          # must be warning-free (except the linker notes)
-ctest --test-dir build -L hermetic --output-on-failure   # 38/38: profiles, kv_type, quant,
-                                        # chat, sampler, CLI, test_arch_ops, arch_boundaries
+ctest --test-dir build -L hermetic --output-on-failure   # 39/39: profiles, kv_type, quant,
+                                        # chat, sampler, guided, CLI, test_arch_ops,
+                                        # arch_boundaries
 ./build/test_arch_ops                   # the arch_ops dispatch table (hermetic)
+./build/test_guided                     # JSON-schema guided decoding (hermetic)
 python3 ci/check_arch_boundaries.py     # generic engine/model files name no architecture
                                         # (or: ctest --test-dir build -R arch_boundaries)
 ./build/test_gpu_stages                 # all stages OK

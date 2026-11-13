@@ -45,6 +45,13 @@ int parse_best_of(const json & body, int n);
 // chat `stream_options.include_usage`
 bool parse_include_usage(const json & body);
 
+// Guided decoding from `response_format` (OpenAI's json_object / json_schema)
+// or the llama.cpp/vLLM-compatible top-level `json_schema` / `guided_json`
+// fields.  On success `gp.guided` is set (or left null for `type: text`).  On
+// failure returns false and fills `err` with a client-facing message; the
+// handler must answer 400 rather than silently generating unconstrained text.
+bool parse_guided(const json & body, const tokenizer & tk, gen_params & gp, std::string & err);
+
 // `stop` as a string or an array of strings, capped at kMaxStops.
 std::vector<std::string> parse_stop(const json & body);
 

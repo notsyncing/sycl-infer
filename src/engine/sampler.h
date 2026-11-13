@@ -1,11 +1,15 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace si {
+
+struct guided_constraint;
+class guided_state;
 
 struct gen_params {
     int max_tokens = 256;
@@ -30,6 +34,11 @@ struct gen_params {
     // when the client did not ask for logprobs.
     bool need_score = false;
 
+    // JSON-schema guided decoding (response_format json_schema / json_object).
+    // Immutable and shared by an n-choice request; the per-sequence progress
+    // lives in sampler_state.  Null means unconstrained.
+    std::shared_ptr<const guided_constraint> guided;
+
     bool wants_logprobs() const {
         return logprobs || need_score;
     }
@@ -37,7 +46,7 @@ struct gen_params {
     // penalties change the sampled greedy token, so those requests must use
     // the ordinary decoder until acceptance applies the same processing.
     bool speculative_greedy() const {
-        return (temperature <= 0.f || top_k == 1) && repeat_penalty == 1.f && presence_penalty == 0.f
+        return !guided && (temperature <= 0.f || top_k == 1) && repeat_penalty == 1.f && presence_penalty == 0.f
                && frequency_penalty == 0.f && logit_bias.empty();
     }
 };
@@ -51,6 +60,10 @@ struct sample_logprobs {
 
 struct sampler_state {
     std::mt19937_64 rng;
+    // Guided-decoding progress (null unless gen_params::guided is set).  It is
+    // per-sequence by construction: a request with n choices gets one
+    // sampler_state per choice and shares only the immutable constraint.
+    std::shared_ptr<guided_state> guided;
     void seed(uint64_t s) {
         rng.seed(s);
     }

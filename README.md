@@ -97,7 +97,8 @@ under, is in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
   replayed, keeping per-token launch overhead minimal (GPU only).
 * **OpenAI-compatible API** — streaming and non-streaming chat/completions with
   temperature / top-k / top-p / min-p / penalties, `logit_bias`,
-  `logprobs`/`top_logprobs`, `reasoning_content` (thinking models),
+  `logprobs`/`top_logprobs`, JSON-schema guided decoding (`response_format`
+  `json_schema`/`json_object`), `reasoning_content` (thinking models),
   function/tool calling (`tools`, `tool_calls`, `tool` results), `n` choices,
   `echo`/`suffix`/`best_of` and `/v1/models`; `usage` reports prefix-cache
   `cached_tokens` and `reasoning_tokens` details.
@@ -319,10 +320,10 @@ HTTP endpoints:
   (`chat_template_kwargs.enable_thinking` / `enable_thinking` / `thinking` /
   `reasoning_effort`),
   `tools`/`tool_choice` + `tool_calls`/`tool` results, `logit_bias`, `logprobs`/
-  `top_logprobs`, image parts)
+  `top_logprobs`, `response_format` (`json_schema` / `json_object`), image parts)
 * `POST /v1/completions` — raw text completion (string/string[]/token-id prompt,
   `n`, `echo`, `suffix`, `best_of`, `logit_bias`, `logprobs`,
-  `stream_options.include_usage`)
+  `response_format` (`json_schema` / `json_object`), `stream_options.include_usage`)
 * `GET /v1/models` + `GET /v1/models/{id}`, `GET /health`
 
 ### Embedding the engine: C API and Python

@@ -115,7 +115,8 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 
 ## 3. 边界与外部职责
 
-* **无 grammar / FSM**，无 mirostat / DRY。
+* **无 GBNF grammar**（`grammar` 字段会被拒绝并提示改用 `response_format`），无 mirostat / DRY；
+  JSON Schema 引导解码见 §7（`src/engine/guided.{h,cpp}`）。
 * **已支持 `logit_bias` 与 token logprobs**：请求侧解析见 [09-server.md](09-server.md) §2.4 与 §8，
   语义见本篇 §2/§4；`best_of` 用 chosen logprob 求和打分（§4）。
 * **无 stop-string 支持**：stop 字符串是服务器侧的后处理过滤（见 [09-server.md](09-server.md) §5
@@ -199,6 +200,13 @@ server 的采样器没有用它。
 
 ## 6. 测试
 
+`tests/engine/test_guided.cpp`（CPU only，不需要模型/GGUF）用一个合成词表覆盖
+JSON Schema 引导解码：必填字段与 `additionalProperties:false` 的 key 过滤、
+`enum` 的最短精确拼写、整数区间的前缀剪枝、数组 `minItems/maxItems`、
+字符串 `maxLength` 与 `\uXXXX` 的码点计数、`$defs/$ref`、`anyOf`、通用
+`json_object`，以及 `sample_token` 的掩码 + 提交路径（schema 之外的词表项必须被
+`-inf` 屏蔽，EOS 在根值完成前不可采样）。
+
 `tests/engine/test_sampler.cpp`（CPU only，不需要模型），失败返回非 0：
 
 | 断言 | 内容 |
@@ -207,3 +215,73 @@ server 的采样器没有用它。
 | `chosen logprob uniform` / `top size honored` / `top logprob uniform` | 4 个全 0 logit：chosen logprob = `-log 4`，`top.size() == top_logprobs`，首项数值相同 |
 | `top logprobs normalized` | 5 个不等 logit + `top_logprobs=5` → `Σ exp(top[i]) == 1` |
 | `need_score computes chosen logprob` / `skips top alternatives` | `temperature=0` + `need_score`：填 `logprob`，`top` 保持空 |
+
+
+---
+
+## 7. 引导解码（JSON Schema，`src/engine/guided.{h,cpp}`）
+
+采样前把 schema 不允许的词表项写成 `-inf`，采样后把选中的 token 的字节喂回约束状态。
+它不改写 grammar、不重排候选，所以 temperature / top_k / top_p / min_p / penalty /
+logit_bias / logprobs 的语义和不引导时完全一样。
+
+**三个阶段：**
+
+1. **编译（每请求一次，`make_guided_from_tokenizer`）。** 词表字节表（每个 token 的
+   `token_piece`）按 `tokenizer*` 缓存在进程内，只建一次；schema JSON 每次请求编译成
+   不可变的 `guided_constraint`。`n` 个 choice 共享这一份约束，进度则在各自的
+   `sampler_state` 里（`guided_state`），所以并发/多 choice 不会串味。
+2. **掩码（`guided_apply`）。** 约束状态是一组“解析栈”（`anyOf`/多 type 会暂时分叉）：
+   每层栈帧是正在解析的 JSON 值（object/array/string/number/精确字面量），schema 决定
+   下一字节允许哪些类型、key、枚举拼写、长度与数值范围。先对 256 个首字节做可行性检查，
+   再只模拟首字节可行的 token；不允许的 token 写 `-inf`。
+3. **提交（`guided_commit`）。** 选中 token 的字节逐字节推进状态；EOS token 不喂字节。
+   根值完成前 EOS 被屏蔽，所以模型不能停在半截对象上；根值完成后**只允许 EOS**
+   （不再放行尾随空白），否则模型会把剩余 token 预算全花在对象后的空格上。
+   JSON 对象按“键唯一”处理：重复的声明键或附加键在收尾引号处被拒绝
+   （JSON Schema 本身不强制，但合法的 JSON 对象语义上键是唯一的）。
+
+**支持的关键字**：`type`（含 type 数组/`"integer"`）、`properties`、`required`、
+`additionalProperties`（bool 或 schema）、`minProperties`/`maxProperties`、`items`、
+`minItems`/`maxItems`、`minLength`/`maxLength`、`pattern`、`enum`、`const`、
+`minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`/`multipleOf`、
+`anyOf`/`oneOf`、`allOf`（编译期合并）、本地 `$ref`（`#/$defs/...` 与
+`#/definitions/...`）和布尔 schema。`format`、`patternProperties`、`prefixItems`、
+`if/then/else`、`not`、`dependentRequired` 与远程 `$ref` 按宽松处理（忽略），
+和 llama.cpp 的 JSON-schema 转换对不支持关键字的选择一致。
+
+**两个已量的边界，不要当成 bug：**
+
+* **枚举字面量采用最短完成。** 例如 `enum: ["a","ab"]`，模型发出 `"a"` 的收尾引号时
+  就提交为 `"a"`（约束是字节级的，不能回溯）。多字符 token 直接产出 `"ab"` 时正常匹配。
+* **死路会降级而不是卡死。** `pattern` 只能在字符串收尾时判断，已经写完的非法字符串
+  无法补救；`guided_apply` 发现没有任何合法 token 时打印一行 `[guided] constraint
+  exhausted` 并把该序列的约束关闭，继续生成。这不是正常路径，但比空转/返回非法 token
+  更可用。
+
+**API 入口：**
+
+* HTTP：`response_format: {"type":"json_object"}` 和
+  `{"type":"json_schema","json_schema":{"schema":{...}}}`；也接受 llama.cpp/vLLM 风格的
+  顶层 `json_schema` / `guided_json`（`src/server/request.cpp` 的 `parse_guided`）。
+  无效 schema 返回 400；`response_format` 生效时聊天模板强制关闭 thinking，因为推理文本
+  会出现在 JSON 之前。
+* CLI：`gen --json-schema FILE` / `--json-object`。
+* 子进程/引擎：`gen_params::guided`，约束实现见 `guided.h`。
+
+**性能（实测，不是估计）。** 第一版对每个首字节可行的 token 完整模拟，在真实 248k
+词表上把 0.8B/CPU 的 32-token decode 从 0.9 s 推到 7.5 s（约 200 ms/token）。当前
+实现把五类常见形态改成 O(1)/按桶检查，只有真正需要结构判断的 token 才走自动机：
+
+* 纯空白 token（约 105k 个 leading-space token 的一部分）：状态不变，直接合法；
+* 单字节 token（`{`、`}`、`,`、`:`、数字等）：`first[]` 已给出答案；
+* `"` 开头的 token：内容为普通字符串时按长度检查，键则按属性名前缀/重复键检查；
+* 数字开头的 token：按 JSON 数字状态机 + 区间可达性检查（含 `95` 不能进 `maximum:1`
+  的前缀剪枝），不再构造解析栈；
+* 空白后的 `true`/`false`/`null`：按字面量前缀检查。
+
+前导空白后的下一非空白字节还要在 `first[]` 里合法，否则直接排除（不模拟）。
+实测同一台机器（0.8B，CPU 28 线程，32-token 请求）：`{"type":"string"}` 的引导
+开销与不引导相同（0.9 s 级）；`json_object` 在 EOS 前真正生成满 32 token 时约
+1.9 s，其中 `guided_apply` 约 2-3 ms/step（打开 `PF_GUIDED_DEBUG=1` 时日志会把它
+打印出来）。`PF_GUIDED_DEBUG` 是唯一的环境变量诊断开关。

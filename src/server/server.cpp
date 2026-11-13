@@ -806,13 +806,25 @@ int serve(engine & e, const server_config & cfg) {
         }
         std::vector<media_part> media;
         auto msgs = parse_messages(body, media);
-        const std::optional<bool> thinking_req = parse_thinking(body);
+        std::optional<bool> thinking_req = parse_thinking(body);
         // The template's own default applies when the request did not choose;
         // the effective value is read back from the rendered prompt below.
         bool thinking = thinking_req.value_or(false);
         const std::string tools_json = parse_tools_json(body);
         const bool parse_tools = !tools_json.empty();
         gen_params gp = parse_params(body, e.max_seq);
+        {
+            std::string gerr;
+            if (!parse_guided(body, e.tk, gp, gerr)) {
+                bad_request(res, gerr, "invalid_request_error");
+                return;
+            }
+        }
+        if (gp.guided) {
+            // A JSON document cannot be preceded by a reasoning block, so a
+            // guided request always renders without one.
+            thinking_req = false;
+        }
         auto stops = parse_stop(body);
         const int n = parse_n(body);
         const bool stream = body.value("stream", false);
@@ -1051,6 +1063,13 @@ int serve(engine & e, const server_config & cfg) {
                     chars, cp.tokens.size());
         }
         gen_params gp = parse_params(body, e.max_seq);
+        {
+            std::string gerr;
+            if (!parse_guided(body, e.tk, gp, gerr)) {
+                bad_request(res, gerr, "invalid_request_error");
+                return;
+            }
+        }
         auto stops = parse_stop(body);
         const int n = parse_n(body);
         const bool stream = body.value("stream", false);

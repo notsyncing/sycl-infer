@@ -163,7 +163,7 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 > 下表是代表性清单；`CMakeLists.txt` 的 `si_add_test` 与 `ctest --test-dir build -N`
 > 是权威来源。2026-11 新增的 hermetic 用例包括 `test_kv_type`、
 > `test_quant_synth`、`test_chat_builtin`、`test_hparams`、`test_f16conv`、
-> `test_yarn`，以及 CLI 的 `test_cli_help` / `test_cli_unknown`。
+> `test_yarn`、`test_guided`，以及 CLI 的 `test_cli_help` / `test_cli_unknown`。
 > Pipeline 机制已经落地：`test_pipeline_registry`、`test_pipeline_route`
 > （hermetic，无 GPU/无模型）；MinerU 作为 `tools/mineru/` 的参考工具，另有
 > `test_mineru_layout`（prompt/版面语法/bbox/角度/IoU，hermetic）。设计见
@@ -177,6 +177,7 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_compare` | 0.8B | CPU | CPU 参考各阶段 vs llama.cpp tensor dump |
 | `test_cpuref` | 0.8B | CPU | CPU 参考 forward head on token ids（默认 `{9419}`） |
 | `test_sampler` | 无 | CPU | `logit_bias` 强制/封禁 token、logprob log-softmax 与归一化、best_of 打分路径 |
+| `test_guided` | 无 | CPU | JSON Schema 引导解码：必填/`additionalProperties` 键过滤、`enum` 精确拼写、整数区间与有界数字前缀、数组边界、字符串长度/转义、`$defs/$ref`（含递归）、`anyOf`、通用 `json_object`，以及 `sample_token` 的掩码+提交路径 |
 | `test_cpu_gemv` | 0.8B | CPU | CPU 融合 fp32 + 整数 int8 GEMV/RMSNorm vs `quant.h` 主机反量化参考，多类型多 TB；`PF_CPU_ISA=scalar\|avx2\|avx512` 钉住变体 |
 | `test_kv_type` | 无 | 无设备 | `--kv-type` 名称/别名、`K:V` 允许与拒绝的组合、row/bits/scales 几何、i4 二补码 nibble、`kv_scope` 嵌套恢复 |
 | `test_quant_synth` | 无 | 无设备 | 手写 Q8_0/Q5_0/Q5_1/F16/BF16 block 的 `dequantize_row`、Q5_1 交错半区、f16 subnormal、`w8_*` 尺寸与拒绝规则 |
@@ -237,8 +238,8 @@ YaRN、f16 转换、量化块的合成反量化、KV 类型解析、内置 ChatM
 sampler、请求/响应解析、前缀缓存存储层、控制面、URL/SSRF 策略、
 CLI 的 `--help`/未知参数契约，以及 `test_multimodal --video-only` 的
 合成视频/视觉宽度测试（ffmpeg 可缺席，AVI 测试仍运行）；它们必须已构建。
-`test_kv_type` / `test_quant_synth` / `test_chat_builtin` 是 2026-11 新增的
-三条完全无模型用例。默认 hermetic 集合为 **38** 条，其中 `test_arch_ops`（`kArchOps[]`
+`test_kv_type` / `test_quant_synth` / `test_chat_builtin` / `test_guided` 是
+2026-11 新增的完全无模型用例。默认 hermetic 集合为 **39** 条，其中 `test_arch_ops`（`kArchOps[]`
 行形状）与 `arch_boundaries`（`ci/check_arch_boundaries.py` 的架构边界门禁）是 2026-11
 加入的两条（见 [24-arch-modules.md](24-arch-modules.md) §8）。模型测试必须显式配置
 `-DSI_REGISTER_GPU_TESTS=ON -DSI_TEST_08B_MODEL=/path/to/0.8b.gguf`；
