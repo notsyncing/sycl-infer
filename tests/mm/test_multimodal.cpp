@@ -751,7 +751,9 @@ static void test_prompt_video(const std::string & text_path, const std::string &
     cfg.patch_size = vm.hp.patch_size;
     cfg.merge = vm.hp.merge;
     const int patch_area = cfg.patch_size * cfg.patch_size * cfg.merge * cfg.merge;
-    cfg.min_pixels = 8 * patch_area;
+    // Match multimodal.cpp's vision_cfg(): the video builder re-preprocesses
+    // raw frames with the model's floor, so the expected grid must use it too.
+    cfg.min_pixels = vm.hp.min_pixels;
     cfg.max_pixels = kMaxImgTokens * patch_area;
     for (int c = 0; c < 3; c++) {
         cfg.mean[c] = vm.hp.mean[c];
@@ -779,7 +781,8 @@ static void test_prompt_video(const std::string & text_path, const std::string &
     mm_video vid;
     vid.frames = frames;
 
-    // grid derived from the preprocessed frame (96x96 → 3x3 merged, like images)
+    // Grid derived from the same preprocessing the video builder applies (the
+    // raw 96x96 frame is upscaled to vm.hp.min_pixels for a Qwen3-VL tower).
     mm_image img0 = mm_image_preprocess(frames[0].rgb.data(), W, H, cfg);
     vision_input vi0 = vision_model::make_input(vm, img0);
     const int G = vi0.out_w * vi0.out_h;
@@ -962,7 +965,10 @@ static void test_audio_kernels() {
         at_rope1d_launch(q, d, 3 * embd, n_tok, n_head, HD, base);
         std::vector<float> got(qkv.size());
         q.memcpy(got.data(), d, got.size() * 4).wait();
-        kern_cmp("at_rope1d", got, exp, 1e-5);
+        // sycl::cos/sin's range reduction at t ~ 1e3 differs from std::cos/sin
+        // by a few 1e-5 (vit_rope's t is small and keeps 1e-5).  The audio
+        // tower's weights are f16 (~1e-3), so 1e-4 is the meaningful bound.
+        kern_cmp("at_rope1d", got, exp, 1e-4);
         sycl::free(d, q);
     }
     { // at_conv1d matches conv1d_all (the audio_model host helper) exactly
