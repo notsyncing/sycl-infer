@@ -190,6 +190,15 @@ struct profile {
         // optimum on the A770 and deliberately not the occupancy-maximising
         // value; it is a latency/merge trade that differs per card.
         int dflash_slices;
+        // PF_KV_ROT: rotate Q/K by a normalized Hadamard before the i4 K cache
+        // quantizes them.  Orthonormal, so the attention dot product is
+        // unchanged; the i4 error is smaller because a head vector's outliers
+        // are spread over its 32-value scale groups (27B, 12k K dump: relative
+        // L2 15% lower, per-32 group max/median 4.6 -> 2.4).  The FWHT is a few
+        // adds/subtracts per element, so the measured prefill cost is ~2% and
+        // the decode cost is below the noise; 1 on the A770, inherited on Iris
+        // Xe and the Arc 140V until each has its own measurement.
+        int kv_rot;
     } attn;
 
     // Feature defaults.  The native 4/5-bit stores cut bytes per weight, so

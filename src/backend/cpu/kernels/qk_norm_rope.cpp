@@ -4,6 +4,8 @@
 // The M-RoPE branch uses the same pair->section mapping as the device kernel.
 #include "common.h"
 
+#include <cstdlib>
+
 namespace si {
 
 void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_norm, const float * k_norm, void * kpool,
@@ -15,6 +17,17 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
     const int qstride = n_head * qgate * head_dim;
     const int kvstride = n_head_kv * head_dim;
     const int total = n_rows * n_real;
+    // The GPU profile turns the i4 rotation on by default; the CPU path keeps
+    // it opt-in.  The CPU backend has no device profile and its i4
+    // prefill/decode paths have their own accumulator order; enabling the
+    // rotation here changes those near-ties before it has been measured on a
+    // CPU-only or hybrid run, so the default stays off and PF_KV_ROT=1 is the
+    // explicit opt-in.
+    static const bool rot_env = [] {
+        const char * e = std::getenv("PF_KV_ROT");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool rot = rot_env && kkv == cpu_kv_dtype::i4 && hadamard_dim(head_dim) > 0;
     par(total, [&](int idx) {
         const int r = idx / n_real;
         const int t = idx % n_real;
@@ -55,6 +68,9 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
             } else {
                 rope_apply(qh, n_rot, rope_base, (float)pos, rope_freqs, rope_mscale);
             }
+            if (rot) {
+                hadamard_inplace_cpu(qh, head_dim);
+            }
         }
         for (int h = 0; h < n_head_kv; h++) {
             float * khp = kbuf + (size_t)row * kvstride + (size_t)h * head_dim;
@@ -86,6 +102,9 @@ void cpu_qk_norm_rope(float * qbuf, float * kbuf, float * vbuf, const float * q_
                 }
             } else {
                 rope_apply(khp, n_rot, rope_base, (float)pos, rope_freqs, rope_mscale);
+            }
+            if (rot) {
+                hadamard_inplace_cpu(khp, head_dim);
             }
             const int kb = table[pos / kCpuBlk];
             const int ko = pos % kCpuBlk;

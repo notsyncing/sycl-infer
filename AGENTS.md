@@ -307,6 +307,29 @@ the fp32 CPU reference, versus 0.035 for i8 and 0.183 for i4, at 24 KB/token
 near-i8 accuracy.  `i8:i4` is the mirror image and is *worse* than i4/i4
 (mean|diff| 1.49), confirming V is the sensitive side.
 
+**`i4:i8` is a capacity setting, not a correctness guarantee.**  A 12k-token KG
+extraction prompt returned facts under `i8` and `{"facts":[]}` under `i4:i8`;
+the same body with a two-character section-label change showed the same split.
+The 4-bit **K** cache is the lever: cold (prefix cache off), `i4:i8` was empty
+6/6 and `i8` non-empty 4/4.  The i4 K Hadamard rotation (`PF_KV_ROT`, below)
+reduces the K reconstruction error and fixed the *other* section label (0/3 ->
+3/3 facts) but **not** the original bad prompt (still 0/3), so it does not
+replace `i8` for this workload.  Keep `i8` (or a `--ctx` sized to the prompt)
+for greedy KG extraction; use `i4:i8` only when the 256k capacity is the point,
+and expect a lossy decision boundary.
+
+**TurboQuant/PolarQuant/QJL at 3-4 bits does not close this gap.**  Offline on
+the same 27B K dump (attention-score relative error, random isotropic q; 16
+full-attention layers, 2048 samples each): `i8` 0.00044, `i4` 0.00798,
+`i4`+Hadamard 0.00681, 4-bit TurboQuant MSE 0.00646, 4-bit MSE+QJL 0.00596,
+3-bit TQ3 0.01231 (worse than `i4`), 3-bit+QJL 0.00975.  The QJL stage adds
+only 5-10%; the best 4-bit+QJL is still 13.5x `i8`.  The 3.5 bpw llama.cpp
+`tq3_0` fork (Algorithm 1, no QJL) also fails to load this 27B - its base
+predates the file (`missing blk.64.ssm_conv1d.weight`) - and upstream master has
+no TurboQuant KV type at all (only the Hadamard rotation above).  TurboQuant at
+3-4 bits is a *capacity* tool, not a fix for this near-tie; do not implement it
+for KG extraction.
+
 `--max-slots N` bounds the concurrent sequences, which is what sizes the
 **recurrent** state; see *Long context: what actually fits* below for why that
 is the cheapest context headroom there is (1.125 GiB per card at the default 16).
@@ -3995,9 +4018,10 @@ name.
   gates (`shape.w4_rows_per_wg`, `shape.q8_rows`, `shape.f32_rows`), the
   vision-tower attention tile (`attn.vit_tile`, 70 on a 1024-thread card and 0
   on a 512-thread one), the xmx gather width (`attn.xmx_gather_q`) and the
-  DFlash top-k slice count (`attn.dflash_slices`), and the *default* for any
-  on/off feature whose value was chosen by measurement (`wt.w4`, `wt.k5`,
-  `wt.cb4`, `wt.dp4a`, `attn.xmx`, `attn.dec_group`, ...).  A launcher reads
+  DFlash top-k slice count (`attn.dflash_slices`), the i4 K Hadamard rotation
+  (`attn.kv_rot`; measured on the A770, inherited elsewhere), and the *default*
+  for any on/off feature whose value was chosen by measurement (`wt.w4`,
+  `wt.k5`, `wt.cb4`, `wt.dp4a`, `attn.xmx`, `attn.dec_group`, ...).  A launcher reads
   the per-queue profile (`si::dev::for_queue(q)`), never `active()`, so a
   heterogeneous layer map tunes each card separately.
 * **What deliberately does not belong**: a number that is a property of the
@@ -4030,6 +4054,12 @@ name.
   `attn.xmx_min_keys` 512, `gdn_cols` 8, `moe.row_gemv`/`tiled` 1 and
   `hw.sub_group8` 0.  The A770 and Iris Xe rows keep `gu_tile`/`dn_tile` 0
   (the old cost model / 128) and `w4_qfuse` 0, marked unmeasured there.
+  `attn.kv_rot` = **1** on the A770 (the i4 K Hadamard rotation; measured
+  2026-11-15), inherited on the Iris Xe and the Arc 140V.  The CPU backend has
+  no device profile and keeps the rotation off unless `PF_KV_ROT=1`; the CPU
+  i4 path was not validated with it (the strict 0.8B i4 decode-vs-prefill
+  fails with the CPU rotation on, while the GPU i4 path and the default
+  GPU+CPU hybrid pass).
 * **What stays a literal**: hardware facts SYCL already reports and that cannot
   change with tuning — they are queried, with the profile as the fallback.  And
   anything a *model* dictates rather than a card (`kBlockSize`, `kI8Q`,
@@ -4326,6 +4356,12 @@ headroom there is; the ceiling is `kMaxB`=32),
 `PF_KV_TYPE` (`i4`|`int4`|`i8`|`bf16`|`f16`|`f32`, default `i8`; `--kv-type`
 overrides it; `K:V` sizes K and V independently, e.g. `i4:i8`), `PF_KV_F32`,
 `PF_KV_BF16`,
+`PF_KV_ROT` (i4 K Hadamard rotation; default on for i4 on the GPU via the
+device profile `attn.kv_rot`, opt-in on the CPU; `0` is the A/B.  It is
+orthonormal, so Q/K must both be rotated and the attention dot product is
+unchanged; the prefix cache stores rotated K and `pc_disk`'s `kVersion` is 2,
+so v1 records are skipped once.  It is an accuracy improvement for the i4
+*capacity* path, not a replacement for `i8`; see the `--kv-type` note above),
 `PF_SI4` (re-quantize weights to 4-bit SIn), `PF_META` (fp32 side scales).
 
 **Compute path**

@@ -3,13 +3,37 @@
 // the backend abstraction existed).  All allocations and command-graph handling
 // stay in the engine; this layer is intentionally stateless beyond the queue.
 #include "backend.h"
+#include "device/device_profile.h"
 #include "env.h"
+#include "kv_type.h"
 
+#include <cstdlib>
 #include <memory>
 
 namespace si {
 
 namespace {
+
+// PF_KV_ROT: rotate Q and K by a normalized Hadamard matrix before the i4 K
+// cache quantizes them.  The transform is orthonormal, so the attention dot
+// product is unchanged; only the i4 quantization error changes.  The default is
+// on for an i4 K cache whose head width is a supported rotation block (64/128/
+// 256, or a block-diagonal rotation of a 64-multiple); i8/f16/f32 K are left
+// untouched because the measured gain there is small and the i8 trajectory is
+// the reference the tests pin.  PF_KV_ROT=0 is the A/B.
+static bool kv_rot_enabled(sycl::queue & q, int head_dim) {
+    static const bool env_on = [] {
+        const char * e = si::env::str("PF_KV_ROT");
+        return !e || atoi(e) != 0;
+    }();
+    if (!env_on || kv_k_dtype() != kv_dtype_t::i4) {
+        return false;
+    }
+    if (head_dim < 64 || head_dim > 256 || (head_dim % 64) != 0) {
+        return false;
+    }
+    return si::dev::for_queue(q).attn.kv_rot != 0;
+}
 
 struct gpu_backend : compute_backend {
     sycl::queue & q;
@@ -72,7 +96,8 @@ struct gpu_backend : compute_backend {
                       const float * v_bias, int qgate) override {
         qk_norm_rope_launch(q, qbuf, kbuf, vbuf, q_norm, k_norm, kpool, vpool, tables, info, n_head, n_head_kv,
                             head_dim, n_rot, rope_base, rope_freqs, rope_mscale, eps, max_blocks, n_rows, n_real,
-                            kscales, vscales, qk_sum_slot(), qk_sum_ptr(), q_bias, k_bias, v_bias, qgate);
+                            kscales, vscales, qk_sum_slot(), qk_sum_ptr(), q_bias, k_bias, v_bias, qgate,
+                            kv_rot_enabled(q, head_dim));
     }
     // PF_KVSTORE_SUM: hand the per-call slot and the device checksum buffer to the
     // kernel, which folds the post-norm/post-RoPE K and V into it.  Diagnostic only;

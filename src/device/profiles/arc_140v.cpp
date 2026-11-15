@@ -105,6 +105,7 @@ static const profile arc_140v = {
         .vit_tile = 70,       // INHERITED; 1024-thread tiles launch on this part
         .xmx_gather_q = 8,    // INHERITED (unmeasured here)
         .dflash_slices = 8,   // INHERITED (unmeasured here)
+        .kv_rot = 1,          // INHERITED (unmeasured here)
     },
 
     // INHERITED: the native stores save bytes, which matters MORE on a

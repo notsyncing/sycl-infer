@@ -99,6 +99,7 @@ static const profile arc_a770 = {
         .vit_tile = 70,       // ILP 48/32/1024 SG16 RQ2/RQP2, 2.10 vs 3.26 s
         .xmx_gather_q = 8,    // 0.902 -> 0.771 ms/call; 4.5x the one-row shape
         .dflash_slices = 8,   // measured: 1/8/32/64/128/256 -> 2.09/1.39/1.52/1.69/1.70/1.67 ms
+        .kv_rot = 1,           // i4 K Hadamard rotation; measured, see AGENTS.md
     },
 
     // the native 4/5-bit stores save real decode bandwidth here (0.625/0.75 vs

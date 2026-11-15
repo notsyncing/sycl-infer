@@ -262,10 +262,31 @@ i4 的 16）拿到接近 i8 的精度，并能装下 262144 上下文；`i8:i4` 
 
 ---
 
+### 7.1 i4 K 的 Hadamard 旋转（`PF_KV_ROT`）
+
+i4 的误差不只是 4 bit：每 32 维一个 scale，如果某个 head 的少数维有离群值，整组 32 维都会被这个最大值决定，4-bit step 变大。做法是在 K 写入缓存前、以及在同一个 kernel 里对 Q，做归一化 Walsh-Hadamard 旋转（`1/sqrt(n) * H`）。H 正交，`(H q) · (H k) = q · k`，所以数学上 attention 不变，只有"被量化"的坐标分布变了。K 以旋转后的值存储和反量化；Q 在 attention 前用同一个 H；V 不旋转（K-only 不改变输出；V 是 i8 时收益小，i4 V 才需要 llama.cpp 的 64-block + 输出反旋转）。
+
+旋转大小取 head_dim 可整除的最大 2 的幂块（27B head_dim=128 → 128；192 → 3×64），块对角旋转同样保点积。GPU 的 FWHT 在 `qk_norm_rope` 的 32-lane 子组里做：5 个跨 lane stage 加 log2(head_dim/32) 个 lane 内 slot stage；CPU 是同一 Sylvester 矩阵的标量 butterfly。
+
+默认与开关：GPU 用 device profile 的 `attn.kv_rot`（A770=1，Iris Xe / Arc 140V INHERITED）；`PF_KV_ROT=0` 是 A/B。CPU 没有 device profile，默认关，`PF_KV_ROT=1` 才开；CPU i4 的 prefill/decode 累加序与 GPU 不同，显式开启在 0.8B 的严格 decode-vs-prefill 上失败，未作为默认。异构 `--layer-map` 的默认（GPU 开、CPU 关）每层 Q/K 自洽，0.8B 的 decode-vs-prefill 通过（graded）。
+
+前缀缓存：K 存的是旋转后的值；`pc_disk` 的 `kVersion` 已从 1 升到 2，旧记录被跳过（一次冷启动）。固定 Hadamard 不需要每记录额外 metadata；随机化 Hadamard 才需要存 sign/seed（当前未采用）。
+
+实测（27B，2x A770，`--kv-type i4:i8`，12k tokens）：
+
+* 12k 的 post-norm+RoPE K dump：i4 相对 L2 0.1132 → 0.0965（-14.7%，逐层 8-24%），每 32 组 max/median 4.6 → 2.4（逐层 3.6-5.7 / 2.2-2.7）；随机 sign/permutation 的 Hadamard 没有再明显改善（最好 0.0949），所以固定 H 就够。
+* 前端：同一个 12k prompt 的 good 变体，`PF_KV_ROT=0` 3/3 空，`PF_KV_ROT=1` 3/3 非空（2/2/4 facts，含"宏观经济"）；bad 变体两者都 3/3 空，i8 4/4 非空。
+* 一致性：27B i4:i8 `test_decode_vs_prefill`（split）8/8 OK；0.8B i4:i8 GPU 8/8、CPU 默认 8/8、GPU+CPU 默认 8/8（graded）；27B i8 8/8（1 NEAR-TIE）。
+* 成本：12k prompt + 5-token 请求 24.4-24.9 s（rot0）对 24.8-25.4 s（rot1），约 +0.4 s（1.7% 的 prefill）；decode 的 FWHT 在噪声以下。
+
+结论：这是 i4 的精度改善（默认 GPU i4），不是 i8 的替代；KG 抽取的 bad prompt 仍应使用 i8（或缩小 `--ctx`）。
+
+---
+
 ## 8. 池的定尺
 
 尺寸参数分三个层次：`--ctx` 定每序列能有多长、`--blocks` 定启动即提交多少、`--kv-cap-mb` 给增长封顶，
-`PF_KV_GROW` 决定每次增长多少（`main.cpp:326-340`、`engine.cpp:466-505`）：
+`PF_KV_GROW` 决定每次增长多少（`main.cpp:326-340`、`engine.cpp:771-810`）：
 
 | 参数 | 含义 | 默认 |
 |---|---|---|
@@ -320,7 +341,7 @@ down int8 bank 10 656 + dense/u4 head/norms 1 656 + KV 170 + 激活/状态/scrat
 
 ## 9. 相关环境变量
 
-`PF_CTX`、`PF_KV_CAP_MB`、`PF_KV_GROW`、`PF_KV_TYPE`、`PF_KV_F32`、`PF_KV_BF16`。总表以
+`PF_CTX`、`PF_KV_CAP_MB`、`PF_KV_GROW`、`PF_KV_TYPE`、`PF_KV_F32`、`PF_KV_BF16`、`PF_KV_ROT`。总表以
 `AGENTS.md#environment-variables` 为准。前缀缓存的三层预算另见
 [06-prefix-cache.md](06-prefix-cache.md) §9。
 

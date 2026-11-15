@@ -16,7 +16,10 @@ namespace si {
 // Written with explicit little-endian integers so the file does not depend on
 // the host endianness.  Anything a reader does not recognise is skipped.
 static constexpr char kMagic[4] = {'P', 'C', 'D', '1'};
-static constexpr uint32_t kVersion = 1;
+// 2: an i4 K cache stores Q/K Hadamard-rotated (PF_KV_ROT).  A record written
+// by v1 holds unrotated K, so it must be skipped rather than resumed into a
+// rotated cache; the reader already treats an unknown version as opaque.
+static constexpr uint32_t kVersion = 2;
 static constexpr uint32_t kEndianMarker = 0x01020304u;
 static constexpr uint32_t kFlagHasState = 1u;
 

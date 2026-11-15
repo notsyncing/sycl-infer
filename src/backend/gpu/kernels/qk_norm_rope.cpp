@@ -91,12 +91,80 @@ struct kv_sum_holder {
 };
 static kv_sum_holder g_kv_sum;
 
+// ---------------------------------------------------------------------------
+// Rotate a Q or K head vector by a normalized Walsh-Hadamard matrix before it
+// is quantized (PF_KV_ROT).  The transform is orthonormal, so `(H q) . (H k)`
+// is `q . k`: the model's attention is unchanged in exact arithmetic and only
+// the i4 quantization error changes.  The rotation spreads the head vector's
+// outliers over its 32-value scale groups, which is what makes the i4 K cache
+// behave closer to i8 (the offline K reconstruction error of the 27B at 12k
+// tokens dropped 8-24%, mean 15% relative L2, with the per-32 group max/median
+// 4.6 -> 2.4).
+//
+// The Hadamard matrix is the Sylvester one in the kernel's natural
+// `d = lane + 32*i` order: five cross-lane stages (lanes 0..31) then
+// log2(ns) stages over the lane-local slots.  `head_dim` may exceed the
+// rotation block; llama.cpp's equivalent picks the largest power-of-two block
+// that divides the head dim, and a block-diagonal rotation preserves the dot
+// product just the same, so a 192-wide head rotates three 64-wide blocks.
+static inline int hadamard_dim(int head_dim) {
+    if (head_dim < 64 || head_dim > 256 || (head_dim % 64) != 0) {
+        return 0;
+    }
+    int rd = 64;
+    while (head_dim % (2 * rd) == 0) {
+        rd *= 2;
+    }
+    return rd;
+}
+
+static inline void hadamard_rot(sub_group sg, int lane, int head_dim, float * v) {
+    const int rd = hadamard_dim(head_dim);
+    if (!rd) {
+        return;
+    }
+    const int ns = rd / 32;
+    for (int off = 0; off < head_dim; off += rd) {
+        float x[8];
+#pragma unroll
+        for (int i = 0; i < ns; i++) {
+            x[i] = v[off + lane + 32 * i];
+        }
+        // H_n bits 0..4 are the lane index, bits 5.. are the slot index.
+#pragma unroll
+        for (int b = 0; b < 5; b++) {
+            const int mask = 1 << b;
+#pragma unroll
+            for (int i = 0; i < ns; i++) {
+                const float p = sycl::permute_group_by_xor(sg, x[i], mask);
+                x[i] = (lane & mask) ? (p - x[i]) : (x[i] + p);
+            }
+        }
+        for (int step = 1; step < ns; step <<= 1) {
+            float t[8];
+#pragma unroll
+            for (int i = 0; i < ns; i++) {
+                t[i] = x[i];
+            }
+#pragma unroll
+            for (int i = 0; i < ns; i++) {
+                x[i] = (i & step) ? (t[i ^ step] - t[i]) : (t[i] + t[i ^ step]);
+            }
+        }
+        const float norm = sycl::rsqrt((float)rd);
+#pragma unroll
+        for (int i = 0; i < ns; i++) {
+            v[off + lane + 32 * i] = x[i] * norm;
+        }
+    }
+}
+
 void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, const float * q_norm,
                          const float * k_norm, void * kpool, void * vpool, const int32_t * tables,
                          const step_info * info, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base,
                          const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
                          int n_real, const void * kscales, const void * vscales, int sum_slot, int64_t * sum_kv,
-                         const float * q_bias, const float * k_bias, const float * v_bias, int qgate) {
+                         const float * q_bias, const float * k_bias, const float * v_bias, int qgate, bool rot) {
     const int qstride = n_head * qgate * head_dim;
     const int n_sg = n_head + 2 * n_head_kv; // Q + K + V groups
     auto launch = [&](auto * kdst_base, auto * vdst_base, const sycl::half * ksc_base, const sycl::half * vsc_base) {
@@ -233,6 +301,9 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         qh[lane] = x0 * c - x1 * s;
                         qh[lane + n_rot / 2] = x0 * s + x1 * c;
                     }
+                    if (rot) {
+                        hadamard_rot(sgg, lane, head_dim, qh);
+                    }
                 } else if (sg < n_head + n_head_kv) {
                     const int kh = sg - n_head;
                     float * khp = kbuf + (size_t)row * (n_head_kv * head_dim) + (size_t)kh * head_dim;
@@ -263,6 +334,9 @@ void qk_norm_rope_launch(queue & q, float * qbuf, float * kbuf, float * vbuf, co
                         const float x0 = khp[lane], x1 = khp[lane + n_rot / 2];
                         khp[lane] = x0 * c - x1 * s;
                         khp[lane + n_rot / 2] = x0 * s + x1 * c;
+                    }
+                    if (rot) {
+                        hadamard_rot(sgg, lane, head_dim, khp);
                     }
                     const int kb = table[pos / kBlockSize];
                     if constexpr (I8) {

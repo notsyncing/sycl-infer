@@ -310,7 +310,8 @@ void qk_norm_rope_launch(sycl::queue & q, float * qbuf, float * kbuf, float * vb
                          const float * rope_freqs, float rope_mscale, float eps, int max_blocks, int n_rows,
                          int n_real, const void * kscales = nullptr, const void * vscales = nullptr,
                          int sum_slot = -1, int64_t * sum_kv = nullptr, const float * q_bias = nullptr,
-                         const float * k_bias = nullptr, const float * v_bias = nullptr, int qgate = 2);
+                         const float * k_bias = nullptr, const float * v_bias = nullptr, int qgate = 2,
+                         bool rot = false);
 // QSA Stage 2 (PF_QSA_DEVATTN): compact the selected paged-KV rows and write
 // the scratch step_info that presents them as a one-row sequence.
 void qsa_sinfo_launch(sycl::queue & q, step_info * info, int nsel);

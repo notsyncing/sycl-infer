@@ -336,7 +336,7 @@ void report(const profile & p, const char * how, bool warn_unknown) {
                 "      moe: cfg gate=%d down=%d dec=%d flat=%d/%d dp4a=%d/%d "
                 "ring=%d pf_wmin=%d\n"
                 "      attn: gather_red=%d (max %d) vec=%d xmx=%d xmx_min_keys=%d "
-                "split_keys=%d dec_group=%d vit_tile=%d gather_q=%d dflash_slices=%d\n"
+                "split_keys=%d dec_group=%d vit_tile=%d gather_q=%d dflash_slices=%d kv_rot=%d\n"
                 "      weights: w4=%d k5=%d cb4=%d dp4a=%d gemm_dnnl=%d dpas=%d\n",
                 p.key, how, p.provenance, p.hw.compute_units, p.hw.max_work_group_size,
                 p.hw.local_mem_size, p.hw.has_dpas, p.occ.warps_per_eu_x2 / 2.0, p.occ.warps_per_eu_x2,
@@ -349,7 +349,7 @@ void report(const profile & p, const char * how, bool warn_unknown) {
                 p.attn.xmx_gather_red,
                 p.attn.xmx_gather_red_max, p.attn.vec, p.attn.xmx, p.attn.xmx_min_keys,
                 p.attn.split_keys, p.attn.dec_group, p.attn.vit_tile, p.attn.xmx_gather_q,
-                p.attn.dflash_slices, p.wt.w4, p.wt.k5, p.wt.cb4, p.wt.dp4a, p.wt.gemm_dnnl,
+                p.attn.dflash_slices, p.attn.kv_rot, p.wt.w4, p.wt.k5, p.wt.cb4, p.wt.dp4a, p.wt.gemm_dnnl,
                 p.wt.dpas_in_gemm);
     }
     if (warn_unknown && std::strcmp(p.key, "unknown") == 0) {

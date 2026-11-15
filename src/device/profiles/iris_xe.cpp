@@ -117,6 +117,7 @@ static const profile iris_xe = {
         .vit_tile = 0,
         .xmx_gather_q = 8,   // INHERITED (unmeasured here)
         .dflash_slices = 8,  // INHERITED (unmeasured here)
+        .kv_rot = 1,         // INHERITED (unmeasured here)
     },
 
     .wt = {

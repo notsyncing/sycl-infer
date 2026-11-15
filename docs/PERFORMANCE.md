@@ -639,6 +639,50 @@ arm.
 Hot-set calibration (`PF_DS41_CAL=1`) remains opt-in (a net loss for short
 generations).
 
+### 5.6 i4 K Hadamard rotation (`PF_KV_ROT`, 2026-11-15)
+
+The i4 K cache has one f16 scale per 32 head dims; a head vector with a few
+outliers makes one scale dominate its group.  The rotation applies a normalized
+Walsh-Hadamard to Q and K before the K store (orthonormal, so the attention dot
+product is unchanged; V is not rotated).  The default is on for i4 on the GPU
+(`attn.kv_rot = 1`), opt-in on the CPU (`PF_KV_ROT=1`), and `PF_KV_ROT=0` is
+the A/B.
+
+Conditions: 27B Q4_K_M, 2x A770, this tree at 2026-11-15, Release JIT,
+`--layer-map 0-31:gpu.0,32-63:gpu.1 --ctx 20480 --kv-type i4:i8 --max-slots 2`,
+`PF_PREFIX_CACHE=0`, the 12,288-token prompt whose reply is 5 tokens
+(`{"facts":[]}`), one process per arm, three requests per arm.
+
+| arm | request wall (12k prompt + 5 tokens) |
+|---|---:|
+| `PF_KV_ROT=0` | 24.4 / 24.6 / 24.9 s |
+| `PF_KV_ROT=1` | 24.8 / 24.9 / 25.4 s |
+
+The rotation is ~0.4 s of a 24 s request (~1.7%, mostly prefill); the decode
+FWHT is below the request noise.  Accuracy: on the same K dump the i4
+relative-L2 reconstruction went 0.1132 -> 0.0965 (-14.7%; per layer 8-24%) and
+the prompt's "good" section label went 0/3 empty -> 3/3 facts.  The "bad"
+section label still returned `{"facts":[]}` 3/3 under i4 with the rotation;
+`i8` returns facts 4/4, so the rotation is an i4 improvement, not a substitute
+for i8.  The 27B `i4:i8` `test_decode_vs_prefill` is 8/8 split OK; the 0.8B
+`i4:i8` is 8/8 on the GPU, the CPU default (rotation off) and the default
+GPU+CPU hybrid.  See [design/05-kv-cache.md](design/05-kv-cache.md) §7.1 and
+AGENTS.md.
+
+**TurboQuant/PolarQuant/QJL was evaluated offline on the same K dump**, because
+the available llama.cpp implementations cannot run this model: upstream master
+has no TurboQuant KV type (only the Hadamard rotation), and the `tq3_0` fork
+(Algorithm 1, 3.5 bpw, no QJL) fails to load the 27B (`missing
+blk.64.ssm_conv1d.weight`; its base predates the file).  Attention-score
+relative error with a random isotropic q, 16 full-attention layers x 2048
+vectors: `i8` 0.00044, `i4` 0.00798, `i4`+Hadamard 0.00681, 4-bit TurboQuant
+MSE 0.00646, 4-bit MSE+QJL 0.00596, 3-bit TQ3 0.01231 (worse than `i4`),
+3-bit+QJL 0.00975.  The QJL adds only 5-10% and the best 4-bit+QJL is still
+13.5x `i8`; the TQ3 is worse than the existing `i4`.  So the full 3-4 bit
+TurboQuant does not fix this near-tie - it is a capacity tool.  Keep `i8` for
+KG extraction; the implemented Hadamard rotation is the low-cost `i4`
+improvement.
+
 ## 6. Speculative decoding
 
 Both speculative paths are **single-request** paths: they take the whole engine

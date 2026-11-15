@@ -95,6 +95,7 @@ static void profile_values(const char * who, const dev::profile & p, int row_gem
     expect_int((std::string(who) + " attn.vit_tile").c_str(), p.attn.vit_tile, vit_tile);
     expect_int((std::string(who) + " attn.xmx_gather_q").c_str(), p.attn.xmx_gather_q, 8);
     expect_int((std::string(who) + " attn.dflash_slices").c_str(), p.attn.dflash_slices, 8);
+    expect_int((std::string(who) + " attn.kv_rot").c_str(), p.attn.kv_rot, 1);
     // Invariants a card file cannot express: only 8/16/32 are instantiated for
     // the native-weight GEMV, and a ring/workspace of 0 would disable a path
     // rather than tune it.

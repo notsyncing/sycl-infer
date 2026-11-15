@@ -165,4 +165,46 @@ inline void rope_apply(float * v, int n_rot, float base, float rpos, const float
     }
 }
 
+
+// Normalized Walsh-Hadamard rotation of one Q or K head vector (PF_KV_ROT).
+// The host mirror of the GPU helper: the same Sylvester matrix in the natural
+// index order, the same block-diagonal choice for a head width that is not a
+// power of two.  Orthonormal, so the attention dot product is unchanged.
+inline int hadamard_dim(int head_dim) {
+    if (head_dim < 64 || head_dim > 256 || (head_dim % 64) != 0) {
+        return 0;
+    }
+    int rd = 64;
+    while (head_dim % (2 * rd) == 0) {
+        rd *= 2;
+    }
+    return rd;
+}
+
+inline void hadamard_inplace_cpu(float * v, int head_dim) {
+    const int rd = hadamard_dim(head_dim);
+    if (!rd) {
+        return;
+    }
+    for (int off = 0; off < head_dim; off += rd) {
+        float t[256];
+        for (int i = 0; i < rd; i++) {
+            t[i] = v[off + i];
+        }
+        for (int step = 1; step < rd; step <<= 1) {
+            for (int i = 0; i < rd; i += 2 * step) {
+                for (int j = 0; j < step; j++) {
+                    const float a = t[i + j], b = t[i + j + step];
+                    t[i + j] = a + b;
+                    t[i + j + step] = a - b;
+                }
+            }
+        }
+        const float norm = 1.0f / std::sqrt((float)rd);
+        for (int i = 0; i < rd; i++) {
+            v[off + i] = t[i] * norm;
+        }
+    }
+}
+
 } // namespace si
