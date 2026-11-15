@@ -193,11 +193,12 @@ generic seg_plan oneDNN partition (`setup_md_dnnl` declines for it), but since
 k5 for Q5_K - see **Dense oneDNN stores** below.  Q8_0, BF16 and the routed
 experts stay on the raw path.
 
-### Performance pass (2026-11-07)
+### Expert split, copy crew, KV skip (design)
 
-Measured on 2x A770, ctx 512, `--moe-vram-mb 16000`, greedy, one process per
-cell: **decode 353 -> 276 ms/token (3.62 tok/s)**, **prefill 165-180 ms/token**,
-the 32-token greedy text **byte-identical** to the unsplit path.
+The 2026-11-07 measurement basis is in [§History](#history-superseded-measurements);
+the design it introduced is current.  Measured on 2x A770, ctx 512,
+`--moe-vram-mb 16000`, greedy, one process per cell: the 32-token greedy text
+is **byte-identical** to the unsplit path.
 
 * **Expert split across cards** (`PF_DS41_SPLIT`, default on for 2 GPUs).
   `banks[li*ndev + c]`: ids below `0.34 * E` live on card 0, the rest on card 1
@@ -223,10 +224,6 @@ the 32-token greedy text **byte-identical** to the unsplit path.
   `n_blocks` from `pool_cap` and committed 10.6 KB/token/card (1.28 GB/card at
   ctx 128k) - that was what made the split bank fault at depth.  `kv=1` now.
 
-Same-stream phase split (`PF_DS41_TIME=2`, per-phase waits): 275 ms =
-attention 90 + MoE 173 (~140 H2D) + head 2.2 + ~10 other.  Prefill at 16000:
-183.7 = attention 68 + MoE 107 (~65 H2D) + other 9; a 320-token prompt is
-164.2 ms/token (hit 88.0 %) and **156.4 (6.39 tok/s, hit 90.7 %) at 18000 MB**.
 The prefill MoE uploads are ~42 misses/token, about one per layer, so each
 9.2 MB H2D is exposed by the layer dependency; batching tokens does not help
 because 384 experts with top-6 and strong adjacent-token locality give a
@@ -565,3 +562,23 @@ GPU stage tests/probes: `dev/ds41_iq2_probe`, `dev/ds41_attn_probe`,
 `dev/ds41_ops_probe`, `dev/ds41_vision`.
 Model-backed: `dev/ds41_gen` (golden ids), `dev/test_ds41_pc` (prefix reuse),
 `dev/bench_ds41` (prefill/decode).
+
+## History: superseded measurements
+
+These cells are **not current state**; they are kept for reading a change
+against.  The current numbers are in `docs/PERFORMANCE.md` §5.5 and in
+"Dense oneDNN stores" above.
+
+* **2026-11-07, pre-dense-store**: decode **353 -> 276 ms/token (3.62 tok/s)**,
+  prefill **165-180 ms/token** at 16000 MB.  Same-stream phase split
+  (`PF_DS41_TIME=2`, per-phase waits): 275 ms = attention 90 + MoE 173
+  (~140 H2D) + head 2.2 + ~10 other; prefill at 16000: 183.7 = attention 68 +
+  MoE 107 (~65 H2D) + other 9.  A 320-token prompt: 164.2 ms/token (hit
+  88.0 %) and 156.4 (6.39 tok/s, hit 90.7 %) at 18000 MB.  The dense Q5_K
+  decode GEMV ran at 110 GB/s and was the largest remaining item; the k5
+  stores took decode to 124 ms/token and prefill to 133.
+* **2026-11-14 re-measure note**: the old `attn 49.9 + MoE 85.6` pair does not
+  reproduce as a pair; `attn` is better (33-36) and the MoE worse (130-140)
+  because the bank hit rate is prompt-dependent.  The conclusions that survive
+  are current: the MoE is 75-83 % of the prefill and the dense projections are
+  ~29 ms/token.

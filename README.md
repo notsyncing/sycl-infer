@@ -426,10 +426,11 @@ fit on two 16 GB cards.
   must tile `[0, n_layer)` with no gaps (otherwise startup fails with
   `--layer-map must cover every layer without gaps` / `... must end at the model's
   layer count`).
-* `gpu` is the first enumerated GPU, `gpu.N` the N-th one in
-  `sycl::device::get_devices(sycl::info::device_type::gpu)` order (the order
-  `sycl-ls` prints).  `cpu` (or `host`) puts that range on the AVX host backend,
-  so GPU + CPU splits work too.
+* `gpu` is the first usable GPU, `gpu.N` the N-th one in
+  `si::dev::gpu_devices()` order: the Level Zero devices when any is enumerated,
+  otherwise `sycl::device::get_devices(sycl::info::device_type::gpu)` (the order
+  `sycl-ls` prints, minus the OpenCL duplicates of a Level Zero card).  `cpu` (or
+  `host`) puts that range on the AVX host backend, so GPU + CPU splits work too.
 * Backend 0 - the first GPU in the map, or the CPU when the map has no GPU - runs
   the global tensors and the LM head.  `--device` is not needed: the map fully
   determines placement.  Distinct GPUs in the map share one SYCL context, so the
@@ -712,11 +713,14 @@ token, so a decode step touches a fraction of its 21 GiB.
 | 32 | 76.45 tok/s | **168.33 tok/s** |
 
 * **Every extra row amortises the same weight pass, so the aggregate grows —
-  but not always.**  The 27B's aggregate *drops 28 %* from 8 rows to 16: above
-  13 rows the dense layers leave the native u4 GEMV (`nat_gemm_launch`, which
-  refuses M > 13) for oneDNN's int8 matmul, and the step cost jumps from
-  128 ms to 354 ms.  The 35B crosses the same boundary far more gently,
-  because only its dense layers are affected.
+  but not always.**  On the 2026-10-20 build the 27B's aggregate *drops 28 %*
+  from 8 rows to 16: above 13 rows the dense layers left the native u4 GEMV
+  (`nat_gemm_launch`) for oneDNN's int8 matmul, and the step cost jumped from
+  128 ms to 354 ms.  The 35B crossed the same boundary far more gently, because
+  only its dense layers are affected.  `nat_gemm_launch` now accepts M = 2..32
+  (M = 14/16/20/24/28/32 via `nat_gemm_big`, u4 and grouped int8 only; k5/cb4
+  still stop at 13), so this cell has **not** been re-measured on the current
+  code — see [PERFORMANCE §10](docs/PERFORMANCE.md#10-history-superseded-cells-and-builds).
 * **The prefill saturates at 16 rows and the decode does not**: on the 35B,
   +2.5 % of prefill for twice the concurrency against +36 % of decode.
 

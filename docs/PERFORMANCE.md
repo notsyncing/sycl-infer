@@ -483,12 +483,15 @@ cell, 2026-10-20.
 | 32 | 898.3 tok/s | 76.45 tok/s | 418.56 | 13.1 ms |
 
 * **The aggregate is not monotone: it drops 28 % from 8 rows to 16.**  The step
-  cost jumps from 128 ms to 354 ms for twice the rows.  The cause is the
-  native GEMM's **M ≤ 13 boundary** (`nat_gemm_launch`): above 13 rows the
-  dense layers leave the native u4 path for oneDNN's int8 matmul, which is a
-  different cost shape and cannot be recorded into a SYCL command graph.
-  This is the same boundary the 35B's measurement found on the *prefill* side,
-  and on a dense model it is worth far more than on the MoE.
+  cost jumps from 128 ms to 354 ms for twice the rows.  On the measured build
+  (2026-10-20) the cause was the native GEMM's **M ≤ 13 boundary**
+  (`nat_gemm_launch`): above 13 rows the dense layers left the native u4 path
+  for oneDNN's int8 matmul, a different cost shape that cannot be recorded into
+  a SYCL command graph.  This is the same boundary the 35B's measurement found
+  on the *prefill* side, and on a dense model it is worth far more than on the
+  MoE.  **The boundary moved on 2026-11-03**: `nat_gemm_big` instantiates
+  M = 14/16/20/24/28/32 for the u4 and grouped-int8 stores, so this table has
+  not been re-measured on the current code (see [§10](#10-history-superseded-cells-and-builds)).
 * The per-row cost falls all the way down to 13.1 ms at 32 rows — the weight
   pass is amortised over 32 rows and the attention over the KV is shared.
 
@@ -571,34 +574,26 @@ an 80-token prompt: **136.1 ms/token (7.35 tok/s)** at 18000 MB.  The dense
 projections sum to **28.8 ms/token** (sum of per-call microbench times over 40
 layers: `wq_a` 0.117, `wq_b` 0.125, `wkv` 0.024, `wo_a` 8x0.027, `wo_b` 0.123,
 shared ffn 0.113 ms per layer), against an `attn` phase of 33.8-35.4 ms that
-also contains the MLA core.  The pre-store paragraph below (2026-11-07) quotes
-271-276 decode and 156-175 prefill; those predate the k5 stores and a warm
-page cache and are superseded by the cells above.  The batched-dense
-alternative, its per-shape oneDNN microbench and the 1.15-1.18x ceiling are in
+also contains the MLA core.  The batched-dense alternative, its per-shape
+oneDNN microbench and the 1.15-1.18x ceiling are in
 `design/23-deepseek41.md` ("Batched prefill + oneDNN dense"); no batched
-prefill is implemented.
+prefill is implemented.  The pre-dense-store cells (2026-11-07) are in
+[§10](#10-history-superseded-cells-and-builds).
 
-**GPU path (2026-11-07, pre-dense-store).**  ctx 512, `--device gpu
+**GPU path (2026-11-11, dense k5 stores).**  ctx 512, `--device gpu
 --layer-map 0-19:gpu.0,20-39:gpu.1 --moe-vram-mb 16000 --max-slots 1`, greedy,
 one process per cell: dense
 5.74 GiB is resident (3.4 / 2.35 GiB), the bank is 14.6 GiB split across the
 two cards (card0 20 / card1 22 slots of its own expert half), the hit rate is
 **59.8 %**, and each layer's routed experts are split so both PCIe links upload
-concurrently.  **Decode 271-276 ms/token (3.6-3.7 tok/s); prefill 156-175 ms/token
-(5.7-6.4 tok/s at 18000 MB; 164-180 at 16000)** against 330-353 / 245-280
-before the performance pass, with the 32-token greedy completion
-**byte-identical** to the unsplit path.  A 320-token prompt prefills at 164.2
-ms/token (16000 MB, hit 88.0 %) and **156.4 (18000 MB, hit 90.7 %)**; the
-80-token cell reads 180.5 / 174.5.  Recommended 18000 MB for text-only (ctx
-32768 still fits) and 16000 when the vision tower must fit.
-Same-stream phase split (`PF_DS41_TIME=2`): attention 90, MoE 173 (about 140 of
-it H2D), head 2.2, other ~10 ms/token.  Startup: the 32+20-token run was 15.4 s
-JIT / 14.45 s AOT with the pinned staging ring (30.1 s with pageable copies),
-and the raw 5+2 cell 4.5 s AOT.  Contexts 512..262144 allocate at 16000 MB
-(1.4-1.7 GiB free per card; the unused generic paged-KV pool - 10.6 KB/token/
-card, 1.28 GB/card at 128k - is no longer allocated; text-only 19000 is the
-measured max).  Correctness on the same build: ` Paris.`, chat `2+2` -> `4`,
-image (640x320) -> `HELLO 123` with the vision tower.  Token batching of the MoE does not amortize
+concurrently, with the 32-token greedy completion **byte-identical** to the
+unsplit path.  Recommended 18000 MB for text-only (ctx 32768 still fits) and
+16000 when the vision tower must fit.  Contexts 512..262144 allocate at
+16000 MB (1.4-1.7 GiB free per card; the unused generic paged-KV pool -
+10.6 KB/token/card, 1.28 GB/card at 128k - is no longer allocated; text-only
+19000 is the measured max).  Correctness on the same build: ` Paris.`, chat
+`2+2` -> `4`, image (640x320) -> `HELLO 123` with the vision tower.
+Token batching of the MoE does not amortize
 because 384 experts with top-6 leave ~1 pair per expert over a chunk.  The A770
 does have XMX and the current oneDNN (3.13.2) uses it: `jit:xe_hp:gemm:any`
 measures 41-44 T-MAC/s plain s8 / 22-30 grouped at M=512 here; the per-token
@@ -1080,10 +1075,12 @@ mode-2 batch is capped at `kMaxB * kMaxT` tokens, so beyond 16 rows it stops
 growing (+2.5 % for twice the concurrency on the 35B) while the decode's
 aggregate grows 36 % over the same doubling.
 
-**The dense model's aggregate is not monotone in the batch size.**  The 27B
-loses 28 % of its aggregate throughput going from 8 rows to 16, because above
-13 rows the dense layers leave the native u4 GEMV (`nat_gemm_launch` refuses
-M > 13) for oneDNN's int8 matmul.  The same boundary on the 35B A3B costs far
+**The dense model's aggregate is not monotone in the batch size.**  On the
+2026-10-20 build the 27B lost 28 % of its aggregate throughput going from 8 rows
+to 16, because above 13 rows the dense layers left the native u4 GEMV
+(`nat_gemm_launch` then refused M > 13) for oneDNN's int8 matmul.  `nat_gemm_big`
+(2026-11-03) added M = 14/16/20/24/28/32 for u4 and grouped int8, so the current
+code has not re-measured this cell.  The same boundary on the 35B A3B costs far
 less, because only its dense layers are affected — and it is the *prefill* side
 of the boundary that hurt there, not the decode.
 
@@ -1146,3 +1143,35 @@ The build these numbers come from is an AOT Release build
 [`../AGENTS.md`](../AGENTS.md#aot-builds-sycl_infer_aot) for the AOT notes and
 the JIT-cache trap on this driver.
 
+## 10. History: superseded cells and builds
+
+This section keeps measurements that are **no longer current state** but are
+still useful to read a change against.  The main tables above describe the
+current code.
+
+### DeepSeek-V4.1-Flash GPU path, 2026-11-07 (pre-dense-store)
+
+Measured before the dense Q5_K oneDNN stores and with a cold page cache, one
+process per cell, ctx 512, `--device gpu --layer-map
+0-19:gpu.0,20-39:gpu.1 --moe-vram-mb 16000 --max-slots 1`, greedy:
+
+* decode **271-276 ms/token (3.6-3.7 tok/s)** against 330-353 before the
+  performance pass;
+* prefill **156-175 ms/token** (164-180 at 16000 MB), against 245-280 before;
+* a 320-token prompt: 164.2 ms/token at 16000 MB (hit 88.0 %) and 156.4 at
+  18000 MB (hit 90.7 %);
+* same-stream phase split (`PF_DS41_TIME=2`): attention 90, MoE 173 (about 140
+  of it H2D), head 2.2, other ~10 ms/token;
+* startup: 15.4 s JIT / 14.45 s AOT with the pinned staging ring (30.1 s with
+  pageable copies).
+
+These are superseded by the 2026-11-11/14 cells in §5.5 (decode 124-136
+ms/token, prefill 133-172 ms/token).
+
+### Dense batched decode on the 27B, measured 2026-10-20
+
+§5.2's table and its 8→16-row cliff were measured on the build before
+`nat_gemm_big` (2026-11-03).  The current `nat_gemm_launch` accepts M = 2..32,
+with M = 14/16/20/24/28/32 instantiated for u4 and grouped int8; k5/cb4 still
+stop at 13.  The table is kept as the historical baseline and has not been
+re-measured on the current code.

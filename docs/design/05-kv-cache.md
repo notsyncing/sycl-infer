@@ -24,27 +24,27 @@
 * `kv_block_bytes()`（`engine_kvpool.cpp:29-31`）：一个 attention 层中一个块 **K 的字节数**
   `n_head_kv * kBlockSize * kv_dtype_row_bytes(kv_k_dtype(), head_dim)`；V 用 `kv_v_block_bytes()`
   （`engine_kvpool.cpp:33-35`）。只有 `--kv-type K:V` 混型时两者不同，否则相等。
-* `kv_layer_stride` / `kv_v_layer_stride`（`engine.h:195-196`）：每 attention 层 K / V 的字节数 =
+* `kv_layer_stride` / `kv_v_layer_stride`（`engine.h:344-345`）：每 attention 层 K / V 的字节数 =
   `n_blocks * kv_block_bytes()` / `n_blocks * kv_v_block_bytes()`。写入点不止一处：`alloc_buffers`
   先按构造期算好的 `n_blocks`（= `pool_cap`）写一次 K stride（`engine.cpp` 的 `kv_layer_stride = n_blocks * kv_block_bytes()`），紧接着调用
-  `kv_setup`（`engine.cpp:1718`），而 `kv_setup` 的每个分支都会**重写两侧**：多设备分支
-  `engine_kvpool.cpp:193-194`、CPU 分支 `:246-247`、虚拟/固定回退 `:324-329`。这里的 `n_blocks` 是
+  `kv_setup`（`engine.cpp:3884`），而 `kv_setup` 的每个分支都会**重写两侧**：多设备分支
+  `engine_kvpool.cpp:307-308`、CPU 分支 `:246-247`、虚拟/固定回退 `:324-329`。这里的 `n_blocks` 是
   **预留**大小，这正是池增长时图基址仍然有效的原因。
-* `attn_layers()`（`engine_kvpool.cpp:102-115`）：统计非递归（full attention）层；GDN 层不占 KV。
+* `attn_layers()`（`engine_kvpool.cpp:128-141`）：统计非递归（full attention）层；GDN 层不占 KV。
   `mtp_on` 时**再加一**——MTP draft 层是一个 full-attention qwen35 块，它拥有自己那份 paged KV，
   索引为 `attn_layers() - 1`（存最后）。把它算进 `attn_layers()` 让池定尺、前缀缓存 blob 及其
   序列化循环都自动覆盖它，无需额外插桩。
 * MTP 的 KV 落在 `--mtp-device` 那张卡的池上，是该分区自己注意力层之后的下一个本地索引
-  （`mtp_attn_local_`，`engine_kvpool.cpp:202-208`；解析在 `:128-138`）。注意 MTP 的硬门禁要求
+  （`mtp_attn_local_`，`engine_kvpool.cpp:158-166`；解析在 `:318-322`）。注意 MTP 的硬门禁要求
   `multi_dev && md_xmx`（`engine.cpp:141-149`），**所以单设备（虚拟 USM）路径永远不会带 MTP**——
   这也是 `kv_setup` 的非多设备分支不需要给 MTP 多留一层的原因。
 
 ### 2.2 scale 平面
 
-`kv_scale_stride` / `kv_v_scale_stride`（`engine.h:229-230`）仅在任一侧带 scale 时存在
+`kv_scale_stride` / `kv_v_scale_stride`（`engine.h:641-642`）仅在任一侧带 scale 时存在
 （`has_scales = kv_dtype_has_scales(k) || kv_dtype_has_scales(v)`，`engine_kvpool.cpp` 里解 `has_scales` 处）：
 `n_blocks * n_head_kv * kBlockSize * (head_dim/kI8Q) * sizeof(half)`（`kI8Q = 32`，
-`kernels.h:12`；写入点 `engine_kvpool.cpp:214-216`、`:249-251`、`:335-336`）。
+`kernels.h:12`；写入点 `engine_kvpool.cpp:328-330`、`:249-251`、`:335-336`）。
 
 **两侧永远相等**（三处都是 `kv_v_scale_stride = kv_scale_stride;`）：scale 平面的几何只依赖
 `head_dim` 与 `kI8Q`，而 i4 与 i8 共用同一个 per-32 fp16 平面——只有数据平面的行字节数不同。
@@ -75,18 +75,18 @@ prefill），对 `kI8Q` 这 12 处 layout 引用不划算。注意**不是**因�
 
 ### 2.3 总量报告
 
-`kv_bytes_total()` / `kv_bytes_cap()`（`engine.h:648-653`）报告已提交/预留的 K+V 总字节，用的是
+`kv_bytes_total()` / `kv_bytes_cap()`（`engine.h:1066-1091`）报告已提交/预留的 K+V 总字节，用的是
 `(kv_block_bytes() + kv_v_block_bytes()) * attn_layers() * {pool_blocks,pool_cap}`——所以混型时
 K 与 V 各按自己的行宽计入。
 
 ---
 
-## 3. 池的建立（`kv_setup`，`engine_kvpool.cpp:182-363`）
+## 3. 池的建立（`kv_setup`，`engine_kvpool.cpp:286-496`）
 
-由 `alloc_buffers` 以 `n_blocks = pool_cap`、`pool_initial` 为启动块数调用（`engine.cpp:1718`）。
+由 `alloc_buffers` 以 `n_blocks = pool_cap`、`pool_initial` 为启动块数调用（`engine.cpp:3884`）。
 `kv_setup` 开头有**三条**互斥分支，前两条都会**跳过虚拟 USM**。
 
-### 3.1 CPU（`cpu_mode`，`engine_kvpool.cpp:239-267`）
+### 3.1 CPU（`cpu_mode`，`engine_kvpool.cpp:358-398`）
 
 `kv_virtual = false`，`initial_blocks` 被**强制改成 `pool_cap`**，把整个预留一次性用
 `sycl::malloc_host` 提交（K/V 与 scale 平面都是主机 USM），随后 `kv_grow` 只做空闲链表记账。没有
@@ -98,10 +98,10 @@ K 与 V 各按自己的行宽计入。
 （`dev_kpool_[d]`/`dev_vpool_[d]` + scale 平面，`engine.h` 的 `dev_kpool_`/`dev_vpool_`），由 `layer_attn_local_[il]` 索引；
 block id 全局一致，所以 block table 只需一份。分配走 `dev_alloc_on(d, ...)`（`engine.cpp` 的 `dev_alloc_on`）：
 GPU 分区给该设备队列上的 device USM，CPU 分区给主队列上的 host USM。没有注意力层的分区被跳过。
-`kv_release_pool`（`engine_kvpool.cpp:474-497`）按分区释放，GPU 池在各自队列上 `sycl::free`、
+`kv_release_pool`（`engine_kvpool.cpp:607-630`）按分区释放，GPU 池在各自队列上 `sycl::free`、
 CPU 池在主队列上。
 
-`kv_layer_ptrs(a, ...)`（`engine_kvpool.cpp:126-162`）与 `attn_dev(a)`（`:164-180`）把**全局**注意力
+`kv_layer_ptrs(a, ...)`（`engine_kvpool.cpp:152-188`）与 `attn_dev(a)`（`:164-180`）把**全局**注意力
 层号解析到“设备 + 该设备的本地层号”，前缀缓存的序列化/反序列化就靠它们（`engine_prefix_cache.cpp` 的 `pc_serialize_block`、
 `:154`）。
 
@@ -109,7 +109,7 @@ CPU 池在主队列上。
 
 ### 3.3 虚拟路径的步骤
 
-1. **2 MB 颗粒度推导**：`mb2 = 2<<20`。原因（注释 `engine_kvpool.cpp:269-274`）：Level Zero 要求
+1. **2 MB 颗粒度推导**：`mb2 = 2<<20`。原因（注释 `engine_kvpool.cpp:400-405`）：Level Zero 要求
    ≥ 2 MB 的映射必须 2 MB 对齐，所以层 stride 与 extent 起点都保持在 2 MB 边界。块大小决定每 2 MB
    能放多少块，于是分别算 `align_k = ceil(mb2 / block_bytes)`、`align_v = ceil(mb2 / v_block_bytes)`，
    `align = lcm(align_k, align_v)`，`kv_align_blocks = align`。**取最小公倍数而不是 K 的那一个**，
@@ -127,11 +127,11 @@ CPU 池在主队列上。
 
    `i4:i8` 因此取 `lcm(256,128) = 256`（0.8B）/`lcm(128,64) = 128`（27B）——混型按**较大**的颗粒走。
 2. `pool_cap` 向上取整到 `align` 的倍数（不足一个颗粒时提到一个颗粒）；`initial_blocks` 先 clamp 到
-   `pool_cap`、再向上对齐、之后再 clamp 一次（`engine_kvpool.cpp:279-293`），保证“已提交 ≤ 预留”且
+   `pool_cap`、再向上对齐、之后再 clamp 一次（`engine_kvpool.cpp:410-424`），保证“已提交 ≤ 预留”且
    extent 起点不落在半个颗粒上。
 3. **预留**：分别对 K（`kv_vbase`）与 V（`kv_vbase_v`）调用 `sx::reserve_virtual_mem`。大小先按
    **1 MB** 向上取整（`k_reserve` / `v_reserve`，`:296-297`），再按设备内存粒度 `gran` 对齐
-   （`:299-303`）；`kv_reserve_bytes` 与 `kv_reserve_bytes_v`（`engine.h:252-253`）分别记录两侧的
+   （`:299-303`）；`kv_reserve_bytes` 与 `kv_reserve_bytes_v`（`engine.h:684-685`）分别记录两侧的
    实际预留大小——V 的块宽可以不等于 K，所以两边是独立的一次预留。
 4. **对齐探测**：`kv_map2 = ok && kv_vbase % mb2 == 0 && kv_vbase_v % mb2 == 0 &&
    (pool_cap*block_bytes) % mb2 == 0 && (pool_cap*v_block_bytes) % mb2 == 0`（`:305-306`）——**K 与 V
@@ -154,7 +154,7 @@ CPU 池在主队列上。
 
 ## 4. 物理 extent（`kv_grow` / `kv_shrink` / `kv_release_pool`）
 
-### 4.1 增长（`engine_kvpool.cpp:366-429`）
+### 4.1 增长（`engine_kvpool.cpp:499-562`）
 
 * `want < 1` 或 `pool_blocks >= pool_cap` 直接返回 false。
 * `kv_map2` 时 `want` 向上取整到 `kv_align_blocks`；否则上限 16 块（< 2 MB 规则；固定回退同样走这条
@@ -163,15 +163,15 @@ CPU 池在主队列上。
 * K 与 V 各自的 `map_bytes` 按设备 granularity 向上取整（取不到就退回不取整，`:383-388`）。
 * **每层物理映射**：对每个 attention 层 `il`（层数取 `attn_layers()`），`off = il*layer_bytes +
   first*block_bytes`，为 `(layer, K)` 与 `(layer, V)` 各构造一个 `sx::physical_mem` 并 `map()` 到
-  `kv_vbase+off` / `kv_vbase_v+off`（`read_write`）。注释（`engine.h:806-807`）：一个 `physical_mem`
-  对象只能映射一次，所以每层每侧一个，存进 `kv_extent::phys_k/phys_v`（`engine.h:801-809`）。
+  `kv_vbase+off` / `kv_vbase_v+off`（`read_write`）。注释（`engine.h:1273-1274`）：一个 `physical_mem`
+  对象只能映射一次，所以每层每侧一个，存进 `kv_extent::phys_k/phys_v`（`engine.h:1268-1276`）。
 * 映射异常时该 extent 保持未映射、打印 `[kv] grow failed (...)` 并返回 false——那些块只是不可用，
   池停在原处。
 * extent 的块推进 `free_blocks_`，设 `block_extent_[b]`；追加 extent、`extent_used_.push_back(0)`、
   `pool_blocks += count`、`pool_grows++`。
 * 虚拟且非初始化时 `pool_print("grow")`。
 
-### 4.2 收缩（`engine_kvpool.cpp:431-472`）
+### 4.2 收缩（`engine_kvpool.cpp:564-605`）
 
 * 无虚拟 USM 时空操作。
 * 循环条件：顶部 extent 存在、`extent_used_.back() == 0`、且 `kv_extents_.back().first >= pool_initial`。
@@ -180,14 +180,14 @@ CPU 池在主队列上。
   `phys_k/phys_v`，把该 extent 的 `block_extent_` 置 -1，`pool_blocks -= ex.count`，弹出，
   `pool_shrinks++`，`pool_print("shrink")`。
 
-### 4.3 拆除（`engine_kvpool.cpp:474-536`）
+### 4.3 拆除（`engine_kvpool.cpp:607-669`）
 
 * 多设备：见 §3.2。
 * 虚拟：逐 extent 逐层 unmap，`sx::free_virtual_mem` 释放两个基址（用各自记录的
   `kv_reserve_bytes` / `kv_reserve_bytes_v`），`kv_vbase = kv_vbase_v = 0`。
 * 固定：`sycl::free` 池与 scale 平面。
 
-由 `~engine` 在 `pool_print("exit")` / `pc_print_stats("exit")` 之后调用（`engine.cpp:625-633`）。
+由 `~engine` 在 `pool_print("exit")` / `pc_print_stats("exit")` 之后调用（`engine.cpp:1132-1140`）。
 
 ---
 
@@ -195,23 +195,23 @@ CPU 池在主队列上。
 
 * **空闲表**是 `std::priority_queue<int, vector<int>, greater<int>>` 最小堆（`engine.h` 的 `free_blocks_`），因此分配
   总是取最小块 id。这保证高地址 extent 容易完全空闲，从而可被收缩。
-* `alloc_block()`（`engine_kvpool.cpp:549-576`）：
+* `alloc_block()`（`engine_kvpool.cpp:682-717`）：
   1. 弹出最小空闲块（防御性跳过 `block_used_` 已置位的块，保证不重复发放）；
   2. 置 `block_used_[b]=1`、`extent_used_[block_extent_[b]]++`、更新 `pool_peak`；
   3. 若空闲表为空：前缀缓存开启时先 `pc_evict_lru()`（可能把节点降级到 RAM/磁盘再腾块），再在 cap 内
      `kv_grow(pool_chunk)`，两者都失败才返回 -1。
-  * `pool_chunk` 默认 64 块（`engine.h:246`），`PF_KV_GROW` 可覆盖并被夹到 ≥ 1
-    （`engine.cpp:497-505`）。
-* `free_block(b)`（`engine_kvpool.cpp:578-594`）：越界与重复释放守卫；清 `block_used_`、减
+  * `pool_chunk` 默认 64 块（`engine.h:678`），`PF_KV_GROW` 可覆盖并被夹到 ≥ 1
+    （`engine.cpp:802-810`）。
+* `free_block(b)`（`engine_kvpool.cpp:719-735`）：越界与重复释放守卫；清 `block_used_`、减
   `extent_used_`、推回最小堆；虚拟模式下若该块属于**顶部** extent，调 `kv_shrink()`。
-* `set_table(slot, blocks)`（`engine_kvpool.cpp:596-612`）：把最多 `max_blocks` 个块 id 写入
+* `set_table(slot, blocks)`（`engine_kvpool.cpp:737-776`）：把最多 `max_blocks` 个块 id 写入
   `h_tables` 第 `slot` 行，再整行拷到 `d_tables`（`[kMaxB][max_blocks]`）。
-  `max_blocks = ceil(max_seq/kBlockSize)`（`engine.cpp:467`）。**多设备路径下 `d_tables` 是主机 USM、
+  `max_blocks = ceil(max_seq/kBlockSize)`（`engine.cpp:772`）。**多设备路径下 `d_tables` 是主机 USM、
   由每个队列的 kernel 读，所以那一行用主机 `memcpy` 直接写，而不是在主队列上排一次拷贝**——后者
   第二张卡并没有排在它之后。
 * 记账：`pool_free_blocks() = free_blocks_.size()`，`pool_used_blocks() = pool_blocks - free`
-  （`engine.h:634-639`，均为 inline）。每块元数据 `block_used_`、`block_extent_`、`extent_used_`。
-* `pool_print(tag)`（`engine_kvpool.cpp:538-547`）输出已提交/上限块数与 MB、in-use、peak、
+  （`engine.h:1053-1058`，均为 inline）。每块元数据 `block_used_`、`block_extent_`、`extent_used_`（`engine.h:1278-1280`）。
+* `pool_print(tag)`（`engine_kvpool.cpp:671-680`）输出已提交/上限块数与 MB、in-use、peak、
   grow/shrink 次数，非虚拟时追加 `(fixed)`。MB 用
   `(kv_block_bytes() + kv_v_block_bytes()) * attn_layers()`，所以混型按真实几何报。
 
@@ -244,10 +244,10 @@ CPU 池在主队列上。
 
 int8/int4 的量化与反量化在 kernel 内完成（`qk_norm_rope` 写、`attn` 读），中间算术保持 fp32。
 KV 类型通过 `--kv-type`（CLI）或 `PF_KV_TYPE`（env，`PF_KV_F32=1` / `PF_KV_BF16=0` 是 f32 的别名）
-选择，解析顺序与拼写表见 `kv_type.cpp:19-37` 与 `:86-102`；`--kv-type` 通过
+选择，解析顺序与拼写表见 `kv_type.cpp:20-38` 与 `:86-102`；`--kv-type` 通过
 `kv_dtype_set_kv`（`kv_type.h:48`）在 engine 构造前覆盖进程默认值。
 `--kv-type K:V` 可分别指定 K 与 V，**只有携带 scale 的 i4/i8 允许混型**
-（`kv_dtype_mix_ok`，`kv_type.cpp:43-52`）——它们的行字节数不同但共用同一个 per-32 平面。
+（`kv_dtype_mix_ok`，`kv_type.cpp:44-53`）——它们的行字节数不同但共用同一个 per-32 平面。
 
 **误差由 V 主导，不是 K**：27B 对 fp32 CPU 参考的 mean|diff| 是 i8 0.035、`i4:i8` 0.061、i4 0.183、
 `i8:i4` 1.49。所以 `i4:i8`（4-bit 键、8-bit 值）用 i8 的 75% 字节（27B 上 24 KB/token 对 i8 的 32、
@@ -298,14 +298,14 @@ i4 的误差不只是 4 bit：每 32 维一个 scale，如果某个 head 的少�
 * `--blocks` 的默认：未显式给 `--ctx`/`--ctx full` 时是 512 块（16k token，懒提交）；显式给 `--ctx`
   时是 `max(512, ceil(ctx/32))`；`--ctx full` 回到 512（可能非常大的 context 不适合 eager）。
   显式 `--kv-cap-mb` 会把启动块数抬到至少 `ceil(ctx/32)`，否则池装不下整个 context，prefill 会失败。
-* `--kv-cap-mb` 的三种取值（`engine.cpp:482-488`）：`> 0` 换算成
+* `--kv-cap-mb` 的三种取值（`engine.cpp:787-1095`）：`> 0` 换算成
   `N MB / ((kv_block_bytes + kv_v_block_bytes) * n_attn)` 个块（`n_attn` 含 MTP 层，所以 MTP 的那份
   切片计入 `--kv-cap-mb`）；`< 0`（CLI 默认 `INT_MIN` 归一化成 -1）= `max_blocks`，即刚好够 `--ctx`
   用；`0` = 不增长。
 * `pool_cap = max(n_blocks_, cap_blocks)`——**`--kv-cap-mb` 小于 `--blocks` 时不会缩小预留**，
   它只是给增长封顶；真正的驻留上限永远是启动块数加上按需增长的部分。
 * 前缀缓存开启时预留至少 `pc_max_states` 块：每个**有状态**的缓存节点还占一个 KV 块
-  （`engine.cpp:489-494`）。这仍然是地址空间而非已提交内存。
+  （`engine.cpp:794-799`）。这仍然是地址空间而非已提交内存。
 
 ### 8.1 共享显存设备上的上下文上限（Arc 140V）
 

@@ -99,13 +99,22 @@ fp32 scale，M=1 解码直接读，见 §5.2）、`w_raw`（原始 GGUF 字节�
 | | `flat` / `flat_dec` | `moe_grp_gate_up_launch` 的 `profile_flag` | 行 tile 放进 grid（prefill / decode） |
 | | `dp4a` / `dp4a_dec` | `graph.cpp` 的 `moe_call`（按本层队列解析） | 分组 dp4a expert GEMM（prefill / decode） |
 | | `upload_ring` / `pf_wmin` | `src/engine/arch/qwen4exp/forward.cpp` 的 `q4_upload_init` / 两遍 prefill | qwen4exp 的 pinned expert-upload ring 槽数、两遍 prefill 的最小 workspace |
+| | `row_gemv` / `tiled` | `moe.cpp` | Xe2 的 warp-per-row 单 token expert GEMV / tiled fp32-SLM prefill expert GEMM |
+| | `gu_tile` / `dn_tile` | banked prefill expert GEMM | 每卡实测的 gate/up 与 down M（0 = 代价模型） |
+| | `w4_qfuse` | 窄 dense GEMV | 把 M=1 的激活量化融进 u4 GEMV（Arc 140V 默认开） |
 | `attn.*` | `vec` / `dec_group` | `gpu/kernels/attn.cpp` | 向量化经典 kernel / 分组 decode kernel 的默认（后者两卡都是 off，但理由相反，见 §7.4） |
 | | `xmx` / `xmx_min_keys` | `attn_xmx.cpp` | oneDNN prefill attention 开关与键数门槛 |
 | | `xmx_gather_red` / `xmx_gather_red_max` | `attn_xmx.cpp` | gather 一级 max 归约的工作组数与上限 |
+| | `xmx_gather_q` | `attn_xmx.cpp` | gather 二级的每 key 行 lane 数（`PF_XMX_GQ` 的默认） |
+| | `vit_tile` | `vit.cpp` 的 `vit_attn_launch` | 视觉塔 attention tile（70 = ILP 48/32/1024 SG16；0 = 512 线程回退） |
+| | `dflash_slices` | `dflash.cpp` 的 `df_topk_launch` | DFlash2 top-k 每行 slice 数（默认 8） |
 | | `split_keys` | `graph.cpp`（`PF_ATTN_SPLIT_KEYS` 的默认值来源） | prefill attention 每个 split 的键数 |
 | `wt.*` | `w4` / `k5` / `cb4` | `engine.cpp` | 原生 u4 / 5-bit / codebook 存储的默认 |
+| | `dp4a` / `gemm_dnnl` / `nat_gemm` | `engine.cpp` / `dnnl_gemm.cpp` | int8 GEMM、oneDNN prefill GEMM、批量原生 GEMM 的每卡默认 |
+| | `dpas_in_gemm` | `dnnl_gemm.cpp` | 手写 ESIMD DPAS GEMM 的开关（实测 37x 慢，默认关） |
 | `hw.*` | `compute_units` | `engine.cpp` | SYCL 查不到 EU 数时的兜底 |
 | | `max_work_group_size` | `device_registry.cpp` 的 `max_wg` 兜底 | `wg_clamped()` 的兜底 |
+| | `has_dpas` / `sub_group8` | `has_dpas_for_queue` / `nat_gemm_launch` | XMX/DPAS 能力与 8 宽子组是否存在（Xe2 只有 16/32） |
 
 四条规矩：
 
@@ -198,7 +207,7 @@ out_i = x_i * (1/sqrt(mean(x²)+eps)) * w_i
 
 ---
 
-## 3. `embed_launch`（`embed.cpp:14-41`）
+## 3. `embed_launch`（`embed.cpp:14-49`）
 
 把每个 active token 的 embedding 行反量化到 fp32 输出，并做多模态替换。
 
@@ -265,7 +274,7 @@ Q8_0 段与 F32 段合成一次 launch。** 以前 `gemv_many` 只按 segment 0 
 
 ### 5.2 DP4A GEMV（`dp4a_gemv.cpp`）
 
-`dp4a_gemv_impl<QT,SPLIT>`（`dp4a_gemv.cpp:18-76`）：
+`dp4a_gemv_impl<QT,SPLIT>`（`dp4a_gemv.cpp:19-77`）：
 
 * `WG=128` = 4 子组 × 32 行；`n_wg = ceil(N/128)`，grid = `n_wg*n_split`。
 * `row = (blk/n_split)*128 + local_id`：**一 lane 一输出行**，一个子组覆盖 32 连续行。因为 32 行同属一个
@@ -275,7 +284,7 @@ Q8_0 段与 F32 段合成一次 launch。** 以前 `gemv_many` 只按 segment 0 
   `uint4 xw` 在子组内广播；内层 4 个 dp4a word。
 * 累加 `acc += sx*(sw*dot - mw*c)`，`c = sum(qx)`。
 * `SPLIT` 时写 partials，否则 epilogue 应用 `alpha*acc (+residual)`。
-* `dp4a_gemv_launch`（`dp4a_gemv.cpp:93-131`）：`PF_GEMV_SPLIT` 默认开；`N <= 2*split.gemv_rows` 时
+* `dp4a_gemv_launch`（`dp4a_gemv.cpp:94-132`）：`PF_GEMV_SPLIT` 默认开；`N <= 2*split.gemv_rows` 时
   `S = ceil(split.gemv_rows/N)`、上限 `split.max`（两卡 2048 / 8，即 `N<=4096` 时切 2..8 份）。
   decode 对小输出尺寸（4–8 个 workgroup）同样是延迟受限，因此像 prefill 一样切 K。
 
@@ -283,8 +292,8 @@ Q8_0 段与 F32 段合成一次 launch。** 以前 `gemv_many` 只按 segment 0 
 
 | kernel | 几何 | 说明 |
 |---|---|---|
-| `i8_row_gemv_launch`（`dp4a_gemv.cpp:139-171`） | 一个输出行一个 256 线程组，lane 跨步归约 K | 行主序 `[N][K]` int8 + 每行一个 fp32 scale（`sx_dev` 在 kernel 内从 USM 读）。oneDNN primitive 在 M=1 被 per-call 开销主导，所以解码直接读它的权重缓冲 |
-| `i8_row_gemv_multi_impl<R>`（`dp4a_gemv.cpp:178-246`） | `WG=256`、`LPR=32/R` lane 一行、每组 `(WG/32)*R` 行 | 每 lane 一条更深的 K 循环（10 → 40 次迭代，R=4）才是隐藏 DRAM 延迟的关键；权重 XOR 到无符号后 `128*sum(x)` 每行校正一次。`PF_DEC_R` ∈ {1,2,4,8}（默认 1） |
+| `i8_row_gemv_launch`（`dp4a_gemv.cpp:140-172`） | 一个输出行一个 256 线程组，lane 跨步归约 K | 行主序 `[N][K]` int8 + 每行一个 fp32 scale（`sx_dev` 在 kernel 内从 USM 读）。oneDNN primitive 在 M=1 被 per-call 开销主导，所以解码直接读它的权重缓冲 |
+| `i8_row_gemv_multi_impl<R>`（`dp4a_gemv.cpp:179-247`） | `WG=256`、`LPR=32/R` lane 一行、每组 `(WG/32)*R` 行 | 每 lane 一条更深的 K 循环（10 → 40 次迭代，R=4）才是隐藏 DRAM 延迟的关键；权重 XOR 到无符号后 `128*sum(x)` 每行校正一次。`PF_DEC_R` ∈ {1,2,4,8}（默认 1） |
 
 ### 5.3 DP4A GEMM（`dp4a_gemm.cpp`）
 
@@ -310,7 +319,7 @@ alpha/residual，写 `out[t*out_stride + row]`。注意 partials 用张量自己
 `TB_T` 是编译期 tile，`tstride` 是激活 token 步长；dispatcher 只在 `TB == TB_T`（或 MT 时
 `TB == tstride`）时选择对应变体，使 token 循环无 guard。
 
-**调度与调优**（`dp4a_gemm_launch`，`dp4a_gemm.cpp:832-1307`），从上到下第一个命中的生效：
+**调度与调优**（`dp4a_gemm_launch`，`dp4a_gemm.cpp:834-1309`），从上到下第一个命中的生效：
 
 1. **M-tiled 路径**：`TB > 32 && TB % 32 == 0 && TB <= kMaxB*kMaxT` 时启用（chunk-batched prefill）。
    `PF_GEMM_ARCH=2` 走 gemmstone 变体；否则 `PF_MT_R`（默认 2，`PF_MT_R2=0` 才回到 1）选
@@ -326,7 +335,7 @@ alpha/residual，写 `out[t*out_stride + row]`。注意 partials 用张量自己
 注释中的实测：row 映射在同一数据上约 12 GB/s，tiled 约 4 GB/s；row kernel 需要约 16k 输出行才能填满
 机器，因此小张量切 K；更小的 WG 提升常驻 warp 数。
 
-**编译期开关（不是环境变量）**：`PF_MT_DEBUG` 是 `#ifdef` 宏（`dp4a_gemm.cpp:190`）。定义后给 MT 路径
+**编译期开关（不是环境变量）**：`PF_MT_DEBUG` 是 `#ifdef` 宏（`dp4a_gemm.cpp:191`）。定义后给 MT 路径
 加一段"在当前 group 的 32-token 主体运行时预取下一个 group 的打包权重字节"的实验块（载入有约 2400
 个周期可以到达），并打印一行一次性的 `[mtk] K=… N=… TB=… tstride=… n_tt=… grid=…`。这个预取没有独立开关
 （注释里曾提到的 `PF_ROW_PF` 在代码里没有任何读取处，已删除；要给它定价就删掉那个循环）。
@@ -345,7 +354,7 @@ multi-device 的单 token 解码走这两个 kernel（`dnnl_gemm::gemm_w4` / `ge
 - 一个子组（32 lane）= 一个输出行 `n`；lane `l` 处理组 `g=l, l+32, …`。u4 的一个组恰好 16 连续
   字节（一次 `uint4` 载入），int8 是 32 字节（两次 `uint4`）；激活侧 int8 用
   `dp4a_s8u8(x, w^0x80808080, acc)`（XOR 把有符号权重变无符号，再用 `128·Σx` 校正，`Σx` 即
-  `XS`，由 `w4_xs_launch` 一次算出、同一 call 的所有张量共享）。
+  `XS`，由同一次 `act_quant_grp_launch` 在 lane 0 上算出、同一 call 的所有张量共享）。
 - **scale staging 是这里的关键**：oneDNN 要求 scale 平面按 `[g][n]`（组在外），对逐行 GEMV 就是
   跨 `N` 的步长访问——每个 scale 一条 cache line。因此每个 workgroup 先把 `RB` 行的 scale
   stage 进 SLM，索引取 **g 外 / 行内**（`g=i/RB, r=i%RB`），让相邻 lane 读相邻 `n`（一次
@@ -355,21 +364,21 @@ multi-device 的单 token 解码走这两个 kernel（`dnnl_gemm::gemm_w4` / `ge
   判据是 `2*RB*ng*2 B` 是否装得进 `slm.budget_bytes`（`w4_gemv.cpp:153`）。整机 tg128
   的结果见 `AGENTS.md`。
 
-**`i8_grp_gemv_rows_multi_launch`（`w4_gemv.cpp:308-429`）——把一个 call group 的窄 int8 段合成一次
+**`i8_grp_gemv_rows_multi_launch`（`w4_gemv.cpp:312-433`）——把一个 call group 的窄 int8 段合成一次
 launch。** GDN 的 `ssm_alpha` / `ssm_beta` 是两个同 K、同量化激活的 48 行 int8 段；每段一次 launch 的
 代价是暴露的延迟而不是带宽（M=5 下 K=5120×32 行 40.1 µs、×96 行 40.9 µs，而 launch 地板本身是 5.8 µs），
 27B 一次权重 pass 里 48 层 × 2 次 launch 就是 ~4 ms。融合后 68.3 → 66.5 ms（M=5）、
 53.9 → 53.4 ms（M=1）。内核形状：
 
-* `i8_grp_gemv_rows_multi_impl<M,NS>`（`w4_gemv.cpp:309-389`）：**一个输出行一个工作组、32 线程**
+* `i8_grp_gemv_rows_multi_impl<M,NS>`（`w4_gemv.cpp:313-393`）：**一个输出行一个工作组、32 线程**
   （一个子组），`NS ≤ 4`；行 → `(segment, row)` 的映射是对捕获到的 NS 个描述符做一次扫描，
   所以没有跨工作组归约，子组树是唯一的归约。每行 stage 自己的 `ng` 个 f16 scale（该段的
   `[K/32][n_rows]` 平面）进同一个 SLM 槽，然后跑与 M=1 GEMV 相同的 group 循环——**每行与
   `i8_grp_gemv_launch` 逐位一致**（同样的 lane→group 映射与归约）。算术相同，只是 `M` 个累加器。
 * 12 个参数 / 一个 local accessor（对比 `nat_gemm` 的 25 个 / 6 个）；`M = 2..13` 与
   `n_segs = 1..4` 都是模板化分派（`i8_grp_gemv_rows_launch` 就是 `n_segs=1` 的包装，
-  `w4_gemv.cpp:431-436`）。端到端：verify **94.0 → 91.7 ms**（各三次重复，-2.4 ms，确定性）。
-* **必须记录的坑**：`i8_grp_seg` 描述符要**按值**拷进 lambda 闭包（`w4_gemv.cpp:312-320`）。调用方把它
+  `w4_gemv.cpp:435-440`）。端到端：verify **94.0 → 91.7 ms**（各三次重复，-2.4 ms，确定性）。
+* **必须记录的坑**：`i8_grp_seg` 描述符要**按值**拷进 lambda 闭包（`w4_gemv.cpp:316-324`）。调用方把它
   们放在主机栈上，设备侧解引用读到的是零——一个看起来完全正常、**静默为空**的 GEMV，实测还"快"了
   1.9 ms。按值拷贝才会进 kernel 参数 blob。
 * 默认开（`graph.cpp:708` 的 `PF_NOFUSE` 关掉、`PF_FUSEDBG=1` 打 trace）。它用的是 M=1 GEMV 的
@@ -418,7 +427,7 @@ launch 数。
   4 字节 0/1，`l0 |= lt[…] << 4` 后与 §5.4 一样 8 次 `dp4a_s8u8`。4 条独立累加链
   （单链慢 ~3 %）。整个额外开销是每 32 值 8 次 SLM LUT 载入 + 16 条 ALU，换来 0.75 B/weight
   而不是 int8 转换的 1.125——它**完全藏在带宽里**：实测就贴着卡读上限 ~405 GB/s，而 int8 GEMV 只达到
-  其中 92 %（`w4_gemv.cpp:530-531`）。作为速率参照，`AGENTS.md` 记录该形状（M=7、K=5120、N=17408）
+  其中 92 %（`w4_gemv.cpp:990-991`）。作为速率参照，`AGENTS.md` 记录该形状（M=7、K=5120、N=17408）
   下 M=1 GEMV 的 u4/k5/cb4/int8 = 294/249/261/364 GB/s，对比同一次测量里 §5.8 的
   `nat_gemm` 223/188/173/323 GB/s。
 * `k5_expand_launch`（prefill）：元素序 int8 = `lo4 | (bit << 4)`。偶/奇两半各自用
@@ -431,7 +440,7 @@ launch 数。
   用真实模型的 Q5_K 张量，与 `dequantize_block_q5_K` 的 native q5 对拍，
   实测 max rel 5.7e-08（float32 舍入）。
 
-### 5.7 2-bit draft 存储（`w2_gemv_launch`，`w4_gemv.cpp:167-301`）
+### 5.7 2-bit draft 存储（`w2_gemv_launch`，`w4_gemv.cpp:276-305`）
 
 给 MTP draft 的 LM head 用：0.375 B/weight（u4 的 0.625）。形状、循环顺序与 epilogue 都照抄 u4 GEMV，
 三个差别：权重平面每权重 2 bit、**按元素序**存放，所以一个字节正好展开成一个 dp4a word，不需要
@@ -439,23 +448,24 @@ even/odd 激活拆分，`xq` 就是 int8 路径已有的连续 per-32 激活；l
 dp4a 操作数，所以既没有 `0x80` 偏置也没有 `128*sum(a)` 校正；一组只有 8 字节，所以一 lane 一次
 8 字节载入读 16 个权重（u4 是 16 字节读 8 个）。
 
-实测（`w4_gemv.cpp:279-283`，head 形状 K=5120 N=65536）：每 4 个权重约 9 条 ALU 展开，在由此得到的
+实测（`w4_gemv.cpp:283-287`，head 形状 K=5120 N=65536）：每 4 个权重约 9 条 ALU 展开，在由此得到的
 字节率上远低于发射预算，所以 kernel 仍和 u4 一样带宽受限。**两个组合的一组：**扩大成
 `PAIR=1`（一次 `uint4` 取两组）实测**更差**——0.517 ms / 243 GB/s 对 0.467 ms / 270 GB/s，
 两者字节数相同，窄形式只是活着的字更少、发出更多更小的载入，所以默认窄形式，`PF_W2_PAIR=1` 是 A/B。
 实测结论是 draft 便宜 6 % 而接受率掉 2 %（`AGENTS.md`）。
 
-### 5.8 `nat_gemm_launch`：M = 2..13 的批量原生精度 GEMM（`w4_gemv.cpp:1306-1892`）
+### 5.8 `nat_gemm_launch`：M = 2..32 的批量原生精度 GEMM（`w4_gemv.cpp:2409-2492`）
 
 MTP 推测 verify 的形状是 `M = k+1` 行、`K`/`N` 与解码同阶。§5.4 的 M=1 GEMV 每列都要重读一整遍激活行
 （激活流量 ~`N*K*M` 字节，是权重流的 `N/RB` 倍），所以按行展开的 `w4_gemm_batched` 以 `1/M` 衰减
 （M=5 时 43 GB/s）。`nat_gemm_launch` 保持同样的 `lane = 组 / 子组 = 输出列` 映射，但**把整个调用的
 K-tile 激活一次 stage 进 SLM**，于是权重流对全部 M 行只读一遍、激活重读留在 SLM 里；scale/offset/
-residual 的 epilogue 在同一个 kernel 内完成，`M <= 13` 时取代 `gemm_w4`/`gemm`。
-它返回 `false` 表示调用方要回落：`M < 2 || M > 13 || K % 32 != 0`（`w4_gemv.cpp:1858-1860`），
-`PF_NAT=0` 则整条路径关闭、回落 oneDNN 分组-scale matmul + epilogue。
+residual 的 epilogue 在同一个 kernel 内完成，`M <= 13` 时取代 `gemm_w4`/`gemm`；`M` 为 14/16/20/24/28/32 时另有一条 `nat_gemm_big`（只实例化 u4 与 grouped-int8 两种存储，C=1、APAD=32）。
+它返回 `false` 表示调用方要回落：`M < 2 || M > 32 || K % 32 != 0`，且 `M > 13` 只对 u4/int8 成立
+（`w4_gemv.cpp:2418-2426`）；k5/cb4 在 `M > 13` 返回 `false`，调用方回落 oneDNN 的 expand + int8
+primitive；`PF_NAT=0` 则整条路径关闭、回落 oneDNN 分组-scale matmul + epilogue。
 
-> **为什么边界是 13 而不是 32。** `M` 是模板参数，所以每个行数都是一份独立的实例化，而
+> **为什么通用边界是 13，而不是把每个格式都扩到 32。** `M` 是模板参数，所以每个行数都是一份独立的实例化，而
 > `nat_gemm_impl` 的累加器是 `acc[M*C]` 个寄存器、激活 tile 是 `M*KT*APAD` 字节的 SLM——**M 大了
 > 两个资源一起涨**。实测（`dev/bench_natgemm`，27B 形状 K=5120 N=17408，A770，每行数一次运行，
 > GB/s）：
@@ -469,12 +479,18 @@ residual 的 epilogue 在同一个 kernel 内完成，`M <= 13` 时取代 `gemm_
 > | 32 | **7.0** | 10.3 | 12.6 | 26.4 |
 >
 > 原生路径的率**随 M 单调下降**，而 oneDNN 的 int8 matmul 在 LM head 的形状（M=16，508 MB）
-> 上稳在 ~110 GB/s——**两者正好在现有的 M=13 边界交叉**。所以那条边界不是遗留，而是对的：把它扩到
-> 32 被实现过、逐位精确（每个 M、每个格式都 `ok=1 maxdiff=0.0000`），但**每字节慢 2-6 倍**，
-> N=32 的 decode 步从 191.96 变成 210.34 ms/step。**逐位精确但更慢的开关仍然是不该存在的开关。**
+> 上稳在 ~110 GB/s——**两者正好在 M=13 附近交叉**。这条交叉线是**通用** dense 路径的边界：把每个
+> 格式都扩到 32 被实现过、逐位精确（每个 M、每个格式都 `ok=1 maxdiff=0.0000`），但**每字节慢
+> 2-6 倍**，N=32 的 decode 步从 191.96 变成 210.34 ms/step，所以那个通用扩展被撤回。
+>
+> **现在的例外是窄的、有明确形状的**：`nat_gemm_big` 只实例化 u4 与 grouped int8，只覆盖
+> 14/16/20/24/28/32，用 `C=1`（32 个累加器）和 `APAD=32`，服务的是 **banked 路由专家的 32-row
+> prefill tile**（`graph.cpp:2874-2884` 的 `gemm_w4` M=32）。k5/cb4 没有 big 实例化，
+> `nat_gemm_launch` 在 `M > 13` 返回 `false`，调用方回落 oneDNN 的 expand + int8 primitive；
+> 它不是一个“所有格式都能扩到 32”的开关。**逐位精确但更慢的通用开关仍然是不该存在的开关。**
 
 **SLM 预算与模板参数**（`nat_gemm_impl<FMT,M,C,KT,SG,ORDER,TX,OPQ,TREE,ABL,VECST,VECA,NOX,DIRECT>`，
-`w4_gemv.cpp:1370-1797`）：
+`w4_gemv.cpp:1840-2275`）：
 
 * `NSG = TX/SG`，`RB = NSG*C`（一个工作组覆盖 `RB` 个输出列）。发射
   `nd_range<1>(ceil(N/RB)*TX, TX)`，每子组 `C` 列、lane = `g += SG`。
@@ -482,7 +498,7 @@ residual 的 epilogue 在同一个 kernel 内完成，`M <= 13` 时取代 `gemm_
   `sc_s[KT*RB]` 与 `of_s[KT*RB]` f16（cb4/int8 不用 off）、以及 256 项 `lut16`（cb4）或 16 项
   `bit_lut`（k5）。`FMT`：0 = u4（Q4_K）、1 = k5（Q5_K）、2 = cb4（IQ4_XS/NL）、3 = 分组 int8；
   u4/k5 读 even/odd 拆分（`axe/axo`），cb4/int8 读连续分组激活（`axg`）。
-* **赢的形状**（`nat_gemm_pick`，`w4_gemv.cpp:1805-1820`，调在 27B verify 形状
+* **赢的形状**（`nat_gemm_pick`，`w4_gemv.cpp:2321-2336`，调在 27B verify 形状
   M=7 K=5120 N=17408 / A770 上）：`C=2, KT=32, SG=8, ORDER=1, TX=128, TREE=1, VECST=1, VECA=1,
   NOX=0`，即 `NSG=16`、`RB=32`；每个输出 `(m,n)` 都按组升序累加、子组归约也相同，所以**与 M=1 的
   GEMV 逐位一致**。
@@ -502,28 +518,31 @@ residual 的 epilogue 在同一个 kernel 内完成，`M <= 13` 时取代 `gemm_
 其它承重项：
 
 * **SIMD8 子组**（`SG=8`）。SIMD16/SIMD32 的一个 float 占 2/4 个 GRF，而 `M*C` 个累加器必须全部常驻；
-  SIMD32 会把整套累加器溢出 18-23 KB/thread 到 scratch 并慢 4-5×（`w4_gemv.cpp:1329-1331`）。
+  SIMD32 会把整套累加器溢出 18-23 KB/thread 到 scratch 并慢 4-5×（`w4_gemv.cpp:1799-1801`）。
 * **16 字节拷贝** stage 激活（`VECA`）与 scale/offset tile（`VECST`），不是逐字节循环。
 * **SLM 激活 stride `APAD`**：48 字节让 `M >= 8` 越过寄存器悬崖，因此取 **32**，只有 u4 在
-  `M >= 12` 时例外取 48（`w4_gemv.cpp:1379-1386`）。实测（48 → 32）：M=8 u4 0.360 → 0.240、
+  `M >= 12` 时例外取 48（`w4_gemv.cpp:1856`）。实测（48 → 32）：M=8 u4 0.360 → 0.240、
   M=12 k5 0.685 → 0.497、cb4 0.639 → 0.426、int8 0.583 → 0.398；M=7 上 32 赢 u4 ~1 %、
   k5/cb4 ~4-7 %，而 u4 M=12 反向——那里 48 更好（0.572 → 0.549 ms），只有 u4 在 `M >= 12` 退化。
-* 每格式的组循环展开不同（`w4_gemv.cpp:1659-1669`）：u4 用 `#pragma unroll 2` 让第二组的权重载入
+* 每格式的组循环展开不同（`w4_gemv.cpp:2137-2147`）：u4 用 `#pragma unroll 2` 让第二组的权重载入
   与第一组的 dp4a 链重叠（u4 的解码只有掩码，有富余寄存器）；k5/cb4/int8 保持 unroll 1，
   因为它们活着的解码字更多，展开反而更快（M=7：k5 0.248 → 0.237、cb4 0.276 → 0.259 ms）。
 * `TREE=1` 是每列一条 dp4a 累加链（`TREE=0` 则拆成 4 条链再 `((q0+q1)+(q2+q3))` 合并）；选中的是前者。
 * 输掉的形状：`C=4/8`、更大的 `TX`（更大的工作组更慢，多出的寄存器占用也没帮助——stage 过的激活本来
   就住在 L2）、以及 `ORDER=0`。
 
-**硬限制：它服务不了 prefill。** `nat_gemm_impl` 把整个调用的 32 组激活 tile stage 进 SLM
-（`M*KT*APAD` 字节，`KT=32`，即 `M × 1024` 字节），`APAD=32` 时约 `M <= 56`、`APAD=48` 时约
-`M <= 37`，对照 DG2 每工作组 64 KB SLM（profile 预算 48 KB）。而 **prefill 的 GEMM M 就是总 token
-数**（`record_forward` 里的 `rows`，`tbm = (mode == 2 && !single) ? rows : tb`），主配置下 prefill 永远
-是模式 2，所以**没有任何 prefill 调用落进 `M <= 13` 的窗口**。这是硬限制，不是缺一个实例化：即使给
-prefill 加上偶/奇激活拆分，也只对 < 13 token 的短 prompt 有用。prefill 的大 M 需要的是被阻塞的大 M
-GEMM，`nat_gemm` 与 dp4a 都不是答案（见 `AGENTS.md` 的 prefill 成本分析）。
+**M = 14..32 的 `nat_gemm_big` 服务的是 banked 路由专家的 32-row prefill tile，不是 dense prefill。**
+`nat_gemm_impl` 把整个调用的 32 组激活 tile stage 进 SLM（`M*KT*APAD` 字节，`KT=32`，即
+`M × 1024` 字节），`APAD=32` 时约 `M <= 56`、`APAD=48` 时约 `M <= 37`，对照 DG2 每工作组 64 KB SLM
+（profile 预算 48 KB）。一个大 token batch 里每个专家平均只有约 25 个 `(token, expert)` pair，
+`M = 32` 正是要服务的形状，所以 `nat_gemm_big` 用 `C=1`（`P = 32` 个累加器）、`APAD=32`，只实例化
+**u4 与 grouped-int8** 两种存储（路由 bank 的 gate/up 与 down 就是这两种），行数只覆盖
+14/16/20/24/28/32。**dense prefill 仍不走它**：`record_forward` 的 prefill 是模式 2、`v.split == false`，
+nat 的入口都要求 even/odd 拆分；dense prefill 的大 M 需要的是被阻塞的大 M oneDNN GEMM。k5/cb4 没有
+`nat_gemm_big` 实例化，`nat_gemm_launch` 对它们在 `M > 13` 返回 `false`，调用方回落到 oneDNN 的
+expand + int8 路径。
 
-**旧版 `w4_gemm_launch`**（`w4_gemv.cpp:797-1304`，`dnnl_gemm.cpp:1502-1511` 门控）只服务 `2 <= M <= 8`
+**旧版 `w4_gemm_launch`**（`w4_gemv.cpp:1264-1774`，`dnnl_gemm.cpp:2518-2527` 门控）只服务 `2 <= M <= 8`
 的小批量，且默认**不启用**（`PF_W4_GEMM_MAXM` 默认 1，所以默认仍走 oneDNN matmul；把它设成 2..8 才会把
 u4 张量路由过来）。它是同一问题的行展开答案：`w4_gemm_batched<M,U,RB>`（运行时行索引会把累加器打到
 local memory，20 GB/s；编译期 M 但经数组索引仍溢出，M=2 时 38.8 GB/s）、`w4_gemm_tn<M,TN>`（每子组
@@ -740,7 +759,7 @@ qwen4exp 的每专家 LRU、pinned expert source（`PF_Q4_PIN_SRC`，63.0 GiB / 
 
 ---
 
-## 6. `qk_norm_rope_launch`（`qk_norm_rope.cpp:14-224`）
+## 6. `qk_norm_rope_launch`（`qk_norm_rope.cpp:94-409`）
 
 对 Q/K 做 per-head RMSNorm + RoPE，并把 K/V 写入 paged KV 池。
 
@@ -878,7 +897,7 @@ kernel 更快（它有 4× 的 warp，K/V 冗余由 L2 承担）。同一个值�
 
 经典 prefill kernel 受限在每 score 的标量算术：每个 key 一次 32-lane 点积 + 一次子组归约 + 一次 exp，
 而且每个 K/V 行按 query head 重读一遍。这条路径把两个 attention GEMM 写成**普通的 oneDNN int8 matmul**，
-KV 先 gather 进连续 scratch（`attn_xmx.cpp:21-46`）：
+KV 先 gather 进连续 scratch（`attn_xmx.cpp:22-47`）：
 
 ```
 QK^T : [M, 256] s8  x  [256, blk] s8 -> [M, blk] s32
@@ -903,7 +922,7 @@ PV   : [M, blk] u8   x  [blk, 256] s8 -> [M, 256] s32
    精确且可结合，所以 block scale 与整个输出**逐位不变**。实测 **18.1 → 9.1 ms**，64k 深度下
    512-token chunk 的边际 **975 → 833 ms（-15 %）**。
 
-一级归约本身还有两个实现细节（`attn_xmx.cpp:289-323`）：每 32 维一组，
+一级归约本身还有两个实现细节（`attn_xmx.cpp:425-459`）：每 32 维一组，
 `max|k*scale| = |scale| * max|k|` 是**精确**的，所以 256 次乘+取绝对值+取 max 可以塌成 8 次；
 四个组各放一条独立累加链（标量形式是每 lane 一条 256 长的 fmax 依赖链，正是这一阶段剩下 9 ms 的
 来源），数据载入走 16 字节向量。
@@ -925,20 +944,20 @@ PV   : [M, blk] u8   x  [blk, 256] s8 -> [M, 256] s32
 **其余实现要点：**
 
 * **per-row 索引数组 `orow`/`oh`/`olim` 由 device kernel 从 `info` 构造**，不是 host `q.memcpy`
-  （`attn_xmx.cpp:601-632`）。每个 kv head 三次 host→device 拷贝会把主机钉在 GPU 上（in-order 队列
+  （`attn_xmx.cpp:875-906`）。每个 kv head 三次 host→device 拷贝会把主机钉在 GPU 上（in-order 队列
   上的 host 指针拷贝把主机与设备串行化），还会与复用的 host vector 竞争，约 2×。
-* **softmax 是每个 query 行一个 256 线程工作组**（`xmx_softmax`，`attn_xmx.cpp:381-460`）：先一遍
+* **softmax 是每个 query 行一个 256 线程工作组**（`xmx_softmax`，`attn_xmx.cpp:621-718`）：先一遍
   向量化的 block max，再一遍 `exp` + P 重量化（直接对 block max 归一化，`pmax = exp(blo-mb)`、
   `e2 = exp(score-blo)`、`p8 = round(255*e2)`、`ps = pmax/255`），于是不需要第二遍 exp 或 pmax 扫描；
   因果 mask 用每行的 `olim` 裁剪。被遮住的 key 直接写 `P = 0`。
-* **scratch 按 queue 区分**：`xmx_get` 以 **queue 指针**为 key（`attn_xmx.cpp:142-149`）。函数内
+* **scratch 按 queue 区分**：`xmx_get` 以 **queue 指针**为 key（`attn_xmx.cpp:161-168`）。函数内
   static 会被两个 `--layer-map` 设备共享，device 1 的 matmul 去读写 device 0 的 USM（跨设备页抖动，
   约 12×）。只有 query-tile 容量 `Mcap` 决定重分配——键块恒为 `kBlk` 宽、`max_nkv` 增长**不许**
   重分配（per-chunk 重分配 `[M,kBlk]` scratch 要花掉几秒）。
-* **matmul 走专用的 oneDNN stream `st_a`**（`dnnl_gemm.cpp:1621-1673`），它包着与 softmax/累加 kernel
-  同一个 in-order 队列，所以后续 SYCL kernel 自动排在 matmul 之后，不用显式 wait；只等 `st_a` 不会
-  把主 stream 上排队的稠密 GEMM 一起等掉（queue 级 wait 会把整个 prefill 串行化）。`PF_ATTN_WAIT=1`
-  恢复每次 matmul 都等。
+* **matmul 跑在主 oneDNN stream `p->st` 上**（`dnnl_gemm.cpp:549-567`），与 softmax/累加和所有稠密
+  GEMM 同一个排序域，所以后续 SYCL kernel 自然排在 matmul 之后，不需要显式 wait。`PF_ATTN_STREAM=1`
+  才把 QK/PV 放回独立的 `st_a` —— 那是旧路径，stream 是独立的排序域，会与下一轮 gather 竞争
+  （§17）；`PF_ATTN_WAIT=1` 恢复每次 matmul 都等，仅用于诊断。
 * **作用域**：i8 KV、head_dim 256、oneDNN 可用、`n_real > 1`；激活行必须共用同一张 page table
   （模式 1 / 2 都是整个 chunk 一个 slot，decode 的每行 slot 到不了这里），否则返回 `false` 让调用方
   回落经典 kernel。`xmx_min_keys` 以下回落（默认 2048，见 profile）。两种输出形态都支持：融合
@@ -958,23 +977,36 @@ PV   : [M, blk] u8   x  [blk, 256] s8 -> [M, 256] s32
 
 ---
 
-## 8. `conv_l2_launch` / `conv_state_update_launch`（`conv.cpp`）
+## 8. GDN 卷积：`gdn_conv_launch` / `conv_l2_launch` / `conv_state_update_launch`（`gdn.cpp`、`conv.cpp`）
 
 GDN 的 depthwise 因果卷积 + q/k 部分的 L2 归一化。
 
-### 8.1 `conv_l2_launch`（`cpu/kernels/conv.cpp` 的 `cpu_conv_l2`）
+### 8.1 默认：`gdn_conv_launch`（warp-per-group，`PF_GDN_CONV_FAST` 默认开）
 
-* 组维度 `group_dim = head_k_dim`（调用方传 `hp.d_state`），`n_groups = conv_dim/group_dim`，实现上
-  tap 循环 `#pragma unroll` 固定为 4（即硬编码 GDN 的 4-tap 卷积）。网格
-  `nd_range<1>(n_rows*n_real*n_groups*128, 128)`：每组一个 conv 输出通道块、128 线程，
-  `ch = grp*head_k_dim + lane`，L2 归约用 128 宽的 SLM 树。
-* `conv_state + slot*3*conv_dim` 是 `kernel_size-1 = 3` 行滑窗。
-* `cross_row=true`：tap 索引是批次绝对 token `gp = rr*tpb + p`，可读前一行的 qkv，使一次调用覆盖整个
-  chunk-batched prefill；`cross_row=false`：负索引读保存的 state。
+* GPU 层、`conv_k == 4`、`d_state == 128` 时走它（`graph.cpp` 的 `run_conv`）；否则回落
+  `conv_l2_launch`。网格 `nd_range<1>(n_rows*n_real*n_groups*32, 32)`：一个 **warp** 负责一个
+  `(row, token, group)` 的 128 个通道，lane `l` 拥有 `l`、`l+32`、`l+64`、`l+96` 四个通道。
+* L2 归约因此是子组蝴蝶（无 SLM、无 barrier），与 128 线程 SLM 树的求和顺序**逐位相同**
+  （128-token greedy 哈希不变）。
+* `update_state=true` 时，单 token 行把 3 行滑窗的搬移折叠进同一 lane：该 lane 是它四个通道的唯一
+  读者和写者，原地移位不需要跨 work-item 顺序，于是单独的 `conv_state_update_launch` 在 decode
+  消失。chunk 行仍保留单独 launch（前几个 token 读旧窗口，最后一个才写新窗口）。
+* tap 循环 `#pragma unroll` 固定为 4（GDN 的 4-tap 卷积）；`conv_state + slot*3*conv_dim` 是
+  `kernel_size-1 = 3` 行滑窗；`cross_row=true` 时 tap 索引是批次绝对 token `gp = rr*tpb + p`，
+  可读前一行的 qkv，一次调用覆盖整个 chunk-batched prefill。
 * `silu_f` 后，前 `n_norm_groups = 2*n_k_heads` 组（q 和 k 段）做 L2 归一化
-  （SLM 归约 + `1/max(sqrt(red[0]),eps)`）。
+  （`1/max(sqrt(sum),eps)`）。
+* `PF_GDN_CONV_FAST=0` 回到下面的通用 `conv_l2_launch`。
 
-### 8.2 `conv_state_update_launch`（`conv.cpp:76-126`）
+### 8.2 回退：`conv_l2_launch`（`conv.cpp`，CPU 侧是 `cpu/kernels/conv.cpp` 的 `cpu_conv_l2`）
+
+* 组维度 `group_dim = head_k_dim`（调用方传 `hp.d_state`），`n_groups = conv_dim/group_dim`，
+  tap 循环固定为 4。网格 `nd_range<1>(n_rows*n_real*n_groups*128, 128)`：每组一个 conv 输出
+  通道块、128 线程，`ch = grp*head_k_dim + lane`，L2 归约用 128 宽的 SLM 树。
+* 单 token 行需要单独调用 `conv_state_update_launch` 搬 conv 窗口。
+* 其余语义（`cross_row`、滑窗、silu+L2）与 §8.1 相同。
+
+### 8.3 `conv_state_update_launch`（`conv.cpp`）
 
 网格 `nd_range<1>(n_rows*(conv_dim/256)*256, 256)`。把最后 3 个 qkv 行写回每 slot 状态，并在需要时写
 检查点：`end_tok = pos[rr]+n`，`pc_active && end_tok % kBlockSize == 0` 时 `cap = pc_row_slot[end_tok/kBlockSize]`，
@@ -986,9 +1018,15 @@ GDN 的 depthwise 因果卷积 + q/k 部分的 L2 归一化。
 * `last_row_only`（一次调用覆盖所有 chunk 行时）只有最后一行写常驻 state，但被标记了块边界的行始终
   写检查点池；`info->mtp_dry` 时一律不写 state（MTP 的 dry verify，见 §9）。
 
+### 8.4 可选的全融合头 kernel（`PF_GDN_HEAD`，默认关）
+
+`gdn_head_launch`（`gdn.cpp` 的 `gdn_head_kernel`）把 conv、L2、gated norm 与递归放进一个
+work-group-per-head 的 kernel：prefill 的 scan 快约 10%，但 decode 只有 32 个 work-group（64 EU
+的卡上并发不足），因此默认关、`PF_GDN_HEAD=1` 才启用；`PF_GDN_HEAD_COLS=4` 选 4 列/头，默认 8。
+
 ---
 
-## 9. `gdn_launch`（`gdn.cpp:248-392`）
+## 9. `gdn_launch`（`gdn.cpp:629-835`）
 
 Gated DeltaNet 递归。两个数学等价的实现：`gdn_kernel<C,WPW>`（标量，`gdn.cpp:19-147`）与
 `gdn_f4_kernel<C,WPW>`（float4，`gdn.cpp:152-246`）。
@@ -1042,6 +1080,9 @@ out  = (S · q) * scale
     否则 `c = 1`（decode 每行只有 1 个 token，列批处理省下的共享 q/k 载入换不回减半的 warp 数）。
     MTP verify 的 `n_real = k+1 = 5` 落在门槛之下，实测每个 `PF_GDN_COLS>1` 变体在那里慢 1-1.7 ms，
     所以门槛是对的。
+  * `PF_GDN_CONV_FAST`（默认 1）：warp-per-group 的 `gdn_conv_launch`（§8.1）；
+    0 回到 `conv_l2_launch`。`PF_GDN_HEAD`（默认 0）/ `PF_GDN_HEAD_COLS`（4|8）：
+    work-group-per-head 的全融合 kernel（§8.4），prefill 快约 10%、decode 更慢。
   * `PF_GDN_VEC`：**未设不是“默认开”**，而是“按规则”——float4 变体只在
     `n_real < shape.gdn_vec_max_rows`（两卡都是 2）时用，因为 float4 的状态切片占 4× 寄存器。
     27B / 2x A770 上每个 pass 的 ms：`n_real` 1/2/4/8/12/16/32 时 float4 是
@@ -1054,7 +1095,7 @@ out  = (S · q) * scale
 
 ---
 
-## 10. `gated_norm_launch`（`gated_norm.cpp:14-44`）
+## 10. `gated_norm_launch`（`gated_norm.cpp:14-46`）
 
 每个 `(r,t,head)` 一个 warp，对 attention 输出做 gated RMSNorm：
 
@@ -1209,7 +1250,7 @@ out[slot] = [ rmsnorm(enorm, emb(tok_slot)) ; rmsnorm(hnorm, h_{slot-1}) ]
 `mtp_capture_launch`（`mtp.cpp:15-26`）把主模型 `output_norm` 之后的 hidden 行整块拷进专用缓冲，
 这样 draft head 不会读共享的激活 scratch（后面会被别的 kernel 覆写）。
 
-### 15.2 verify 的 accept argmax：`mtp_argmax_launch`（`mtp_argmax.cpp:170-216`）
+### 15.2 verify 的 accept argmax：`mtp_argmax_launch`（`mtp_argmax.cpp:216-230`）
 
 对 `[M][n]` 的 logits 矩阵逐行 argmax，只把下标（可选地连值）写回——verify 每 cycle 要它做接受判定，
 而把 `M*n_vocab` 个 float（M=5、n_vocab=248320 时约 7 MB）拷回主机再单核串行比较，实测 **33.7
@@ -1226,7 +1267,7 @@ ms/cycle**，占整个 MTP cycle 的 24 %。
   993 KB logits 的 D2H + host 扫描，平票规则与 `sample_token` 相同，所以 token 流不变；
   logprobs/penalties/`PF_DUMP_DEC_LOGITS` 与 CPU 仍走 host 路径。`PF_Q4_ARGMAX_DEV=0` 是 A/B。
 
-### 15.3 候选受限的 draft head（默认关，`mtp_argmax.cpp:44-168`）
+### 15.3 候选受限的 draft head（默认关，`mtp_argmax.cpp:45-169`）
 
 draft 每步只需要 head 的 argmax，而它的 head GEMV 要读**全部** 248320 行（794 MB 的 u4）。这条路径
 改为在**候选集**上求值：候选集来自目标模型刚产生的分布（`mtp_cand_launch` 取 argmax 及其 `margin`
@@ -1283,3 +1324,24 @@ base 张量是 **channel 最内**（`(c,t) = c + width*t`），dynamic 张量是
 [设计 14 §3](14-dflash2.md)。
 
 ---
+
+---
+
+## 17. 历史记录
+
+本节保存已被替换或删除的 kernel 路径；正文只描述当前代码。
+
+* **`st_a` 独立 oneDNN stream**：attention 的 QK/PV matmul 曾在与主 stream 不同的 `st_a` 上
+  执行，注释曾声称“同一个 in-order queue 所以有序”——这是错的（stream 是独立排序域），
+  下一轮的 gather 会覆盖 PV 还在读的行。现在都在 `p->st`；`PF_ATTN_STREAM=1` 只保留作 A/B。
+* **`w4_gemm_launch`**（`2 <= M <= 8` 的行展开 u4 GEMM）已被 `nat_gemm_launch` 取代，默认
+  `PF_W4_GEMM_MAXM=1`（仍走 oneDNN），保留作 A/B。
+* **`conv_l2_launch` 不再是 decode 默认**：warp-per-group 的 `gdn_conv_launch`
+  （`PF_GDN_CONV_FAST` 默认开）取代它，并把单 token 行的 conv 窗口搬移折进同一个 lane；
+  `conv_l2_launch` 是回退路径。
+* **`PF_GDN_PD` / `PF_ROW_PF`**：只剩注释、没有 `getenv`，已删除；`gdn_launch` 的分派只看
+  `f4`、列数与每工作组 warp 数。
+* **`nat_gemm` 的 M <= 13**：见 §5.8，14..32 现在有 u4/int8 的 `nat_gemm_big`；k5/cb4 在
+  `M > 13` 明确返回 `false` 并回落 oneDNN。
+* **DFlash2 top-k 的 6 个 work-group**：M=6 时一行一个 work-group 只有 6 个组，后来改为每行
+  `S` 个 slice（默认 8）再合并；`PF_DFLASH_SLICES` 覆盖。

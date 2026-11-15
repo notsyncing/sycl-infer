@@ -218,6 +218,18 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_dflash_kernels` | 无 | GPU | DFlash top-k 与卷积的合成输入对照 |
 | `test_spec` | 27B + draft GGUF | 双 GPU | MTP/DFlash2 对**显式绕过投机**的 plain greedy oracle；`TEST_SPEC_LONG=1` 另测跨 512-token prefill 和缓存复用 |
 
+其余 hermetic 目标（同样由 `CMakeLists.txt` 注册，2026-11-15 同步补齐）：
+`test_request_parse`、`test_response_json`、`test_sse_cancel`（真实 socket + httplib）、
+`test_control`（worker 控制面）、`test_url_fetch_*`（SSRF 分类，三个进程）、
+`test_router_{config,proxy,supervisor,control}`（无需 SYCL/模型）、
+`test_chat_deepseek`（ds41 的 assistant 转换）、`test_gguf_split`（分片映射/元数据）、
+`test_pipeline_route`、`test_mineru_layout`、`test_ds41_pc`。另外
+`test_moe_ref` 是**模型-backed** 的独立二进制（`si_add_test` 只构建，未注册到 ctest），
+`test_enc_own` 注册在 `gpu;kernel` 组（需要 GPU）。`test_capi` 是 C ABI 的模型-backed
+二进制（CPU，0.8B）。ONNX 的
+`test_onnx_api`/`test_onnx_batch`/`test_onnx_pv` 需要 `-DSI_ONNX=ON`；
+`test_ds41_ops` 是 ds41 GPU 算子的覆盖（GPU，无模型）。
+
 `TEST_LAYER_MAP` 是多设备 split 的通用开关（`test_w4_vs_cpuref`、`test_w4_topk`、`test_27b_prefill` 读它），
 `TEST_DEVICE` 只有 `test_27b_prefill` 读。`test_decode_vs_prefill` 另外读三个：
 `TEST_MAX_SLOTS`（走 `--max-slots`，覆盖 per-slot 递归状态 stride）、`TEST_YARN_FACTOR`（开 YaRN 并
@@ -543,6 +555,7 @@ tests/server/, tests/engine/ → docs/design/09-server.md, 07-sampler.md
 | GEMV/native store 的实测带宽、per-format B/weight | `AGENTS.md` 的 Weight representation |
 | 逐 kernel 的布局与 launch geometry | [03-kernels.md](03-kernels.md) |
 | 逐调优常数的出处（哪个数在哪张卡上测的） | `AGENTS.md` 的 Device profiles |
+| **被替换的数字/设计（历史）** | `PERFORMANCE.md` §10，以及每篇设计文档末尾的“历史记录 / History”节 |
 
 一条测量只有在"数字 + 硬件 + 环境变量 + 怎么复现的命令"四件齐全时才可以被引用；只写数字不写条件
 的数字在下次复现时会变成噪音。**吞吐率的四件套写在

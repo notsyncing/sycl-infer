@@ -508,7 +508,7 @@ src/backend/gpu/kernels/    kernels.h (public launch API + step_info/gemv_seg), 
                 dp4a_gemm (+ dp4a_common for the shared split-K workspace),
                  w4_gemv (every native weight store's GEMV: u4/k5/codebook/2-bit
                  g-major SLM-staged decode GEMV, the LUT-expanding codebook GEMV
-                 and its prefill expansion, the batched nat_gemm_launch (M <= 13),
+                 and its prefill expansion, the batched nat_gemm_launch (M = 2..32; 14..32 only u4/int8),
                  the opt-in batched u4 GEMM `w4_gemm_launch`, and the fused narrow
                  int8 call group `i8_grp_gemv_rows_multi_launch`),
                  moe (the routed experts: the router, the CSR, the grouped dp4a
@@ -1530,10 +1530,12 @@ are worth not reintroducing:
 #### The verify's kernel, and the ceiling that bounds it
 
 `nat_gemm_launch` (`w4_gemv.cpp`) is a batched native-width GEMM (u4/k5/cb4/grouped
-int8) for M = 2..13 that stages the K-tile's activations in SLM once per workgroup,
+int8) for M = 2..32 that stages the K-tile's activations in SLM once per workgroup,
 so the weight stream is read once for all M rows; it runs the whole
-scale/offset/residual epilogue in the same kernel and takes over `gemm_w4`/`gemm`
-for M <= 13.  That took the verify from 196 to 147 ms and let `--mtp N` keep the
+scale/offset/residual epilogue in the same kernel and takes over `gemm_w4`/`gemm`.
+M = 14/16/20/24/28/32 go through `nat_gemm_big` (C=1, APAD=32) and only u4 and
+grouped int8 have that instantiation; k5/cb4 decline above M = 13 (the launcher
+returns false) and the caller falls back to oneDNN.  That took the verify from 196 to 147 ms and let `--mtp N` keep the
 native q5/cb4 stores (it no longer forces `PF_CB4=0`/`PF_K5=0`).
 
 **The largest single win was a loop-order change, and the reason is invisible in the
@@ -1661,8 +1663,9 @@ instantiation.**  `nat_gemm_impl` stages the call's whole 32-group activation ti
 in SLM (`M x 1024` bytes), which with `APAD=32` caps it at M ~ 56 rows and with the
 `APAD=48` u4 prefers at M >= 12, M ~ 37 — against DG2's 64 KB of SLM per workgroup.
 Prefill's GEMM M is the *total token count* (`tbm = (mode == 2 && !single) ? rows :
-tb`), so a 512-token prompt is **one** mode-2 forward at M=512 and no prefill call
-lands inside the M <= 13 window.  On the main configuration prefill is always mode 2
+tb`), so a 512-token prompt is **one** mode-2 forward at M=512 and no *dense*
+prefill call lands inside the M <= 13 window.  (The banked routed experts' 32-row
+prefill tiles do use `nat_gemm_big`; the generic grouped expert path is a different GEMM.)  On the main configuration prefill is always mode 2
 and mode 1's M=kMaxT=32 chunks are never used.
 
 **What prefill actually costs** (27B / 2x A770).  The **in-process mode-2
@@ -2796,6 +2799,8 @@ the checks that catch them.
 | `PF_Q4_SHOVER=0` | on | run the shared GEMVs after `moe_reduce` instead of under the routed-expert H2D wait |
 | `PF_Q4_SHPREF=0` | on | plain strided `moe_gate_add` loops instead of the 8-pair register prefetch |
 | `PF_Q4_PLEFAULT=1` / `PF_Q4_PLE_PREFAULT=1` / `PF_Q4_PLEAPPLY_TIME=1` | off | PLE page-fault split, prefault the 26.8 GiB PLE table, and the four loop timers inside `cpu_q4_ple_apply` |
+| `PF_Q4_FFCMP_H` / `PF_Q4_FFCMP_MAP` / `PF_Q4_FFCMP_NATIVE` | off | routed-FFN oracle variants (host/mapped/native down) |
+| `PF_Q4_NOGRP_UP` / `PF_Q4_NO_SHGPU` / `PF_Q4_GEMVDET` / `PF_Q4_ROUTIME` / `PF_Q4_UPDMA` / `PF_Q4_GRPDBG` / `PF_Q4_ARGMAX_TIME` / `PF_QSA_ATTN_LAYER` | off | per-path ablations/probes (grouped up, shared-on-GPU, deterministic GEMV, router timing, upload DMA, group debug, argmax timing, one QSA layer) |
 | `PF_Q4_ABL_NOGEMV=1` / `PF_Q4_ABL_NOMIX=1` | off | ablation for attributing `pre`: drop the dense GEMV launches / the GDN+attention cores. **Wrong output by design**, timing only |
 | `PF_MOE_RT_FAST=0` | **1** | batch the fused router selection's dependent SLM loads into registers (top-k scan, cross-warp max fold, weight-sum tail). Bit-identical (`PF_MOE_RT_CHK`): fused kernel 0.0422 -> 0.0377 ms/layer, router device 0.0627 -> 0.0582, -0.22 ms/token |
 | `PF_MOE_RT_ABL=1\|2\|3\|5\|6\|8\|9` | 0 | router phase ablation (skip exp / p[] writeback / top-k / sum / 1/sum multiply / tree / retire). **Wrong output by design**, timing only. The top-k selection is 28 us of the fused kernel's 41 |
@@ -2811,6 +2816,9 @@ the checks that catch them.
 | `PF_Q4_GEMV8=0` | on | generic Q8_0 GEMV |
 | `PF_Q4_GEMV8_SPLIT_ROWS` / `PF_Q4_GEMV8_WPR` | profile `shape.q8_rows` (512) / `split.max` (8) | K-split row gate / warps per row for the Q8_0 decode GEMV; `-1` = profile. A 4096/8 sweep measured **84.8-85.1 vs 88.6-88.7 ms (3.8 ms, 4.2%)** but changes the sum order and flips a near-tie (KL 4.9e-5 at step 12); the default stays 512/8 and the flag is the opt-in |
 | `PF_Q4_GEMVSEG=0` | on | blocking per-call segment copy |
+| `PF_Q4_GEMV8_SCALAR` / `_RPW` / `_MAX_ROWS` | off / profile / `1<<30` | Q8_0 GEMV variant probes: a scalar inner form, rows per warp, and the max row gate (diagnostics, not tuning) |
+| `PF_Q4_CAL_SAVE` / `PF_Q4_SM_SAVE` | off | write the hot-set calibration / static slot map to a file (the load side is `PF_Q4_CAL_LOAD` / `PF_Q4_SM_LOAD`) |
+| `PF_Q4_HOT_ONLY` / `PF_Q4_HOT_LAYERS` / `PF_Q4_HOTCHK` | off | hot-set calibration on a layer subset / a given layer count / a coverage check |
 | `PF_Q4_F32_SPLIT=0` | profile `split.max` (8) | generic GDN beta/alpha GEMV; `-1` = profile, `0` = off |
 | `PF_MOE_CFG` / `PF_MOE_CFG_DOWN` / `PF_MOE_CFG_DEC` | profile `moe.cfg_*` (43/43/0) | grouped expert GEMM tile case; `_DEC` 0 = auto (one row per expert, two when batched) |
 | `PF_MOE_FLAT` / `PF_MOE_FLAT_DEC` | profile `moe.flat`/`flat_dec` (1/0) | put the row tile in the grid (prefill / decode) |
@@ -4425,6 +4433,10 @@ a trap.  A real rewrite would have to beat the occupancy argument in *MTP* first
 
 **GDN**
 `PF_GDN_COLS` (state columns/warp, default 2), `PF_GDN_WG` (warps/WG, default 8),
+`PF_GDN_CONV_FAST` (default on: the warp-per-group `gdn_conv_launch`, which folds the
+single-token conv-window shift into the same lane; 0 restores `conv_l2_launch`),
+`PF_GDN_HEAD` / `PF_GDN_HEAD_COLS` (default off / 8: one work-group per head; ~10%
+faster on the prefill scan, slower on decode),
 `PF_GDN_VEC` (unset = **float4 only for `n_real < 2`**, 0 = always the scalar
 kernel, 1 = always float4; the float4 state slice costs 4x the registers, so it
 wins by 0.25 ms at one token per row and loses by 1.46x from two, 1.81x at 32 -
@@ -4478,6 +4490,8 @@ capability fields and its provenance at load; the model-side counterpart of
 `dev_used_bytes_` per device and the deducted free memory, which is
 deterministic - the driver's `free_memory` on a shared-memory iGPU swings by
 +-2.5 GB between runs and is not a capacity oracle), `PF_NOGRAPH` (replay kernels directly), `PF_PROF` (with `PF_NOGRAPH`),
+`PF_QUEUE_PROF=1/0` (force the profiling queue property on/off; off by default
+since oneAPI 2026.2 made it 24x per launch),
 `PF_TIME`, `PF_DBG_MID` (stop after embedding/norm/attn/ffn), `PF_DBG_GEMV`,
 `PF_DBG_MT`, `PF_DBG_PFB`, `PF_GDN_DBG`, `PF_SRV_TIME`,
 `PF_HOSTPROF=1` (the `PF_PROF` block breakdown *without* the per-stamp device
@@ -4931,9 +4945,9 @@ the 5x.
   Two details worth not re-deriving: the stores must be registered *after* the
   raw upload, because the upload skips any tensor a oneDNN table already holds
   and the MoE decode path still reads these tensors' GGUF blocks (registering
-  first strands it on an unuploaded pointer); and `nat_gemm` rejects M > 13
+  first strands it on an unuploaded pointer); and `nat_gemm`'s k5/cb4 paths stop at M = 13
   while a 512-token prefill routes ~16 pairs per expert, so the pairs must be
-  tiled either way.
+  tiled either way.  (u4/int8 do have the 14..32 `nat_gemm_big`.)
 
 #### The routed experts: the decode, and the two shape bugs that were in it
 
@@ -4996,17 +5010,20 @@ was two bugs at once:
    table**, and the only reason this one looked plausible is that it was smooth.
 
 **The dense model's batch curve has a CLIFF at the native GEMM's M ≤ 13
-boundary, and it is worth 2.5x.**  The 27B's aggregate throughput *falls* from
+boundary, and it is worth 2.5x (measured 2026-10-20, before `nat_gemm_big`).**  The 27B's aggregate throughput *falls* from
 8 rows to 16: 62.53 tok/s (127.9 ms/step) at N=8 against **45.22 tok/s (353.8
-ms/step)** at N=16.  The cause is `nat_gemm_launch`, which refuses M > 13: above
-13 rows the dense layers leave the native u4 path for oneDNN's int8 matmul.
-`PF_NAT=0` (which forces the oneDNN path at every M) prices it exactly:
-**315.2 ms/step at N=8** against 127.9 with the native path, and **353.9 vs
-353.8 ms/step at N=16** - i.e. at 16 rows the native path is already not being
-used.  The MoE model crosses the same boundary far more gently, because only
-its dense layers are affected.  **This is the same M > 13 boundary the native
-GEMM's extension was measured against, and on a dense model it is not a
-rounding detail but a 28 % loss of aggregate throughput.**
+ms/step)** at N=16.  The cause on that build was `nat_gemm_launch` refusing M > 13: above
+13 rows the dense layers left the native u4 path for oneDNN's int8 matmul.
+`nat_gemm_big` (2026-11-03) later added M = 14/16/20/24/28/32 for u4 and grouped
+int8, so this curve has not been re-measured on the current code.
+`PF_NAT=0` (which forces the oneDNN path at every M) prices the **same pre-big
+build**: **315.2 ms/step at N=8** against 127.9 with the native path, and
+**353.9 vs 353.8 ms/step at N=16** - confirming that at 16 rows that build had
+already fallen through to oneDNN.  The current build has a native u4/int8 M=16
+path (`nat_gemm_big`), so neither the 28 % loss nor the PF_NAT=0 comparison
+describes current behavior until the curve is re-measured.  The MoE model
+crosses the same boundary far more gently, because only its dense layers are
+affected.
 
 **The concurrency curve is in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
 §4.2** (35B A3B, depth 512, 128 decode steps, one process per cell, prefill and
@@ -5041,16 +5058,19 @@ interleaved measurements and a two-instrument attribution because every
 instrument agreed on *where* the time was and none of them asked whether the
 tile was the right shape.
 
-**The native GEMM's M > 13 boundary is where it should be, not a leftover.**
-`nat_gemm_launch` rejects `M > 13` and `M` is a template parameter, so extending
-it to 32 looked like a small change.  It is not: the native path's rate falls
+**The native GEMM's M > 13 boundary for the general formats is where it should
+be, not a leftover.**  On the 2026-10-20 build `nat_gemm_launch` rejected
+`M > 13` and `M` is a template parameter, so extending it to 32 looked like a
+small change.  It is not: the native path's rate falls
 monotonically with M (u4 91.8 GB/s at M=7, 60.0 at M=8, 51.6 at M=13, **36.0 at
 M=16**, 7.0 at M=32) while oneDNN's int8 matmul holds ~110 GB/s at the LM head's
 shape - **the two cross exactly at the existing boundary**.  The extension was
 implemented, verified exact at every M and every format (`ok=1 maxdiff=0.0000`),
 and measured **2-6x slower per byte**; N=32 went 191.96 -> 210.34 ms/step.
 **A switch that is exact and slower is still a switch that should not exist**,
-so it was reverted and only the measurement kept.
+so it was reverted and only the measurement kept.  A *narrow* version (u4/int8
+only, for the banked routed experts' 32-row prefill tiles) was added later as
+`nat_gemm_big`; it does not make the general extension pay.
 
 **The host is not the bottleneck, and the harness is inside the timed region.**
 `PF_HOSTPROF` at N=16 measures the host at **111.48 ms against the device's
@@ -5059,8 +5079,10 @@ mostly `bench_conc`'s own per-row logits fetch and host argmax
 (**~0.45 ms per row**: 1 MB D2H plus 248320 comparisons), so the engine's own
 marginal row is 3.41 ms and not 3.86.  That closes the "record a command graph
 for the batched multi-device decode" idea - worth at most the 12.9 ms, and
-unavailable above thirteen rows anyway, because oneDNN's int8 matmul cannot be
-recorded into a SYCL command graph and that is the dense layers' path at M > 13.
+unavailable above thirteen rows for the tensors that leave the native path
+anyway: oneDNN's int8 matmul cannot be recorded into a SYCL command graph.  u4
+and grouped-int8 do have `nat_gemm_big` at 14..32; k5/cb4 decline and fall back
+to oneDNN.
 
 **The sampler is host-side, and that is a real product cost**, not just a
 harness artefact: the scheduler fetches `d_logits` row by row and argmaxes it on

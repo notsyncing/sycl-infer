@@ -22,9 +22,9 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 > recr 状态检查点只有一个池 `d_pc_states`，全 GPU 的映射下它是**主设备 device USM**
 > （`alloc_bytes`，`engine.cpp` 的 `alloc_bytes`），混合 CPU/GPU 映射下 `host_act` 让它落在主机 USM；
 > `pc_restore_state` 逐分区用该设备自己的队列拷进 `as_[dev].gdn_state/conv_state` 再 `sync_all()`
-> （`engine_prefix_cache.cpp:485-501`）。块的序列化/恢复通过 `engine::kv_layer_ptrs` 把每个全局注意力
+> （`engine_prefix_cache.cpp:604-655`）。块的序列化/恢复通过 `engine::kv_layer_ptrs` 把每个全局注意力
 > 层解析到所属设备的池（`dev_kpool_[d] + layer_attn_local_[il] * kv_layer_stride`）与该设备的队列
-> （`engine_prefix_cache.cpp` 的 `pc_serialize_block`、`:154`），块内偏移与单设备布局一致。
+> （`engine_prefix_cache.cpp` 的 `pc_serialize_block`、`:136`），块内偏移与单设备布局一致。
 >
 > **MTP 路径**也支持：`generate_mtp` 对 prompt 调 `pc_admit`（`spec/mtp.cpp:736`，命中数还会打印
 > `[mtp] prefix cache: reused N prompt tokens`）、prefill 后调 `pc_commit`（`spec/mtp.cpp:847-849`），
@@ -35,7 +35,7 @@ prefill，会重复大量计算。前缀缓存按 32-token 块缓存已 prefill 
 ## 2. 缓存节点
 
 ```cpp
-struct pc_node {                    // engine.h:842-850
+struct pc_node {                    // engine.h:1301-1309
     uint64_t hash;                  // 链式哈希
     int32_t  block;                 // KV 池块 id
     int32_t  refcount;              // 持有该块的活跃序列数
@@ -52,7 +52,7 @@ struct pc_node {                    // engine.h:842-850
 
 ### 2.1 链式哈希
 
-`pc_hash_block(chain, toks)`（`engine_prefix_cache.cpp:23-33`）：FNV-1a（offset basis
+`pc_hash_block(chain, toks)`（`engine_prefix_cache.cpp:25-35`）：FNV-1a（offset basis
 `0xcbf29ce484222325`，prime `0x100000001b3`）按字节遍历该块 32 个 token id（每个 token 4 字节），
 以父链 `chain` 为种子（零链用 offset basis）。根块的哈希覆盖了它之前的所有 token，因此节点只在它
 被创建的精确上下文中有效——同一段文本出现在两个不同前缀的同一位置会得到两个不同的 hash，这是特性
@@ -60,11 +60,11 @@ struct pc_node {                    // engine.h:842-850
 
 ### 2.2 精确校验
 
-64 位哈希不足以保证唯一，因此 `pc_find`（`engine_prefix_cache.cpp:441-450`）命中后必须 `memcmp` 存的
+64 位哈希不足以保证唯一，因此 `pc_find`（`engine_prefix_cache.cpp:569-578`）命中后必须 `memcmp` 存的
 `toks`，不符返回 -1。RAM（`pc_ram.cpp:19-28`）与磁盘（`pc_disk.cpp:175-184`）的 `find` 做同样的
 token 校验，所以三层之间传递的 key 永远是 (hash, 32 个 token)。
 
-`pc_add_node(chain, toks, block, depth)`（`engine_prefix_cache.cpp:452-474`）：哈希已存在、块越界、
+`pc_add_node(chain, toks, block, depth)`（`engine_prefix_cache.cpp:580-602`）：哈希已存在、块越界、
 或块已被别的节点占用则拒绝；否则 `refcount=1`（创建序列持有）、`lru=++pc_clock`，拷贝 token，追加节点
 并更新两个映射。`depth` 由调用者给，是链里的块序号（`pc_commit` 传 `i+1`，`:882`）。
 
@@ -76,7 +76,7 @@ token 校验，所以三层之间传递的 key 永远是 (hash, 32 个 token)。
 
 ### 2.4 驱逐
 
-`pc_evict_lru()`（`engine_prefix_cache.cpp:595-617`）线性扫一遍 `pc_nodes_`，取 `refcount <= 0` 且
+`pc_evict_lru()`（`engine_prefix_cache.cpp:777-799`）线性扫一遍 `pc_nodes_`，取 `refcount <= 0` 且
 `block >= 0` 中 `lru` 最小的一个；有下层时先 `pc_demote_node` 再 `pc_evict_node`，并计
 `pc_stat_evict_nodes`。它同时是 `alloc_block()` 的降压阀（块用尽时先回收缓存节点，见
 [05-kv-cache.md](05-kv-cache.md) §5）。
@@ -93,14 +93,14 @@ token 校验，所以三层之间传递的 key 永远是 (hash, 32 个 token)。
 
 ### 3.1 检查点池
 
-`d_pc_states` 是 `[pc_max_states][pc_state_floats]` 设备内存（分配点 `engine.cpp:1898-1907`，
+`d_pc_states` 是 `[pc_max_states][pc_state_floats]` 设备内存（分配点 `engine.cpp:4121-4130`，
 `pc_max_states == 0` 时不分配）。`pc_state_floats = n_gdn * (gdn_per_slot() + conv_per_slot())`
-（`engine.cpp:267`），其中 `gdn_per_slot = dt_rank*d_state*d_state`（`engine_prefix_cache.cpp:12-15`）、
+（`engine.cpp:590`），其中 `gdn_per_slot = dt_rank*d_state*d_state`（`engine_prefix_cache.cpp:14-17`）、
 `conv_per_slot = (conv_k-1)*qkv_dim()`（`:17-20`）（**不是 `3*d_inner`**；27B 上 `qkv_dim()=10240`，
 见 [11-qwen35-model.md](11-qwen35-model.md) §2）。
 
 槽记账：`pc_state_owner[st]`（节点 idx 或 -1）、`pc_state_free`（空闲栈，初始化为倒序填充，
-`engine.cpp:1903-1906`）、`pc_state_stamp[st]`（LRU）。
+`engine.cpp:4126-4129`）、`pc_state_stamp[st]`（LRU）。
 
 * `pc_state_take()`（`:504-548`）：`pc_max_states <= 0` 或无池直接 -1；优先取空闲栈顶；否则驱逐
   `pc_state_stamp` 最小的**已提交**检查点（owner 越界或 -1 的槽被跳过）。存在下层且该 owner 节点
@@ -141,10 +141,10 @@ prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实
 
 ## 4. 生命周期
 
-### 4.1 Admit（`pc_admit`，`engine_prefix_cache.cpp:619-779`）
+### 4.1 Admit（`pc_admit`，`engine_prefix_cache.cpp:801-1067`）
 
 调度器在每个序列准入时调用（`scheduler.cpp` 的 `pc_admit` 调用点），返回命中的 token 数（0 表示需要 `zero_slot`，
-`scheduler.cpp:92-94`）。
+`scheduler.cpp:142-144`）。
 
 1. 重置 `pc_slot_[slot]`；缓存关闭返回 0。
 2. 置 `tracking = true`，让后续 prefill 捕获检查点。
@@ -190,7 +190,7 @@ prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实
 `[pcdbg] commit slot=.. blk=.. done=.. h=.. found=..`（`:877-880`），是排查“为什么没命中/为什么没
 被捕获”的唯一入口。
 
-### 4.2 捕获（`pc_capture_begin` + kernel 快照，`engine_prefix_cache.cpp:786-859`）
+### 4.2 捕获（`pc_capture_begin` + kernel 快照，`engine_prefix_cache.cpp:1074-1147`）
 
 在 `prefill_chunk` 与 `prefill_batch`（均在 `engine.cpp`）之前调用：
 
@@ -224,7 +224,7 @@ prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实
 
 ### 4.3 提交（`pc_commit`，`engine_prefix_cache.cpp` 的 `engine::pc_commit`）
 
-调度器在每个 prefill chunk 之后调用（`scheduler.cpp:257-259`），MTP 在 prompt prefill 之后调用：
+调度器在每个 prefill chunk 之后调用（`scheduler.cpp:471-473`），MTP 在 prompt prefill 之后调用：
 
 * 缓存关闭或 slot 非法：释放全部 pending 槽并清空，直接返回。
 * 把 `[registered, done/32)` 的块注册为节点（`pc_add_node(h, tk, blocks[i], i + 1)`），并推进
@@ -234,9 +234,9 @@ prompt 都不会在环内别名，捕获不再有 32768-token 的上限（旧实
   `pc_stat_states`；否则释放该槽。
 * 清空 `pc_pending_`。
 
-### 4.4 退休（`pc_retire`，`engine_prefix_cache.cpp:904-919`）
+### 4.4 退休（`pc_retire`，`engine_prefix_cache.cpp:1249-1264`）
 
-准入失败（`scheduler.cpp:105`）或序列退休（`scheduler.cpp` 的 `pc_retire` 调用点）时调用。重置 slot tracking；对每个
+准入失败（`scheduler.cpp:152`、`:171`）或序列退休（`scheduler.cpp` 的 `pc_retire` 调用点）时调用。重置 slot tracking；对每个
 块：若被节点拥有且确属该节点则 `refcount--`，归零时 stamp `lru` 使其可驱逐；否则直接 `free_block`。
 
 ---
@@ -287,7 +287,7 @@ state（`blob == nullptr` 时 seek 跳过 blob）。
 `enforce_budget`（`:310-326`）把 `bytes_ + opaque_bytes_` 一起与预算比较——未知版本的文件虽然永不
 被逐出，却仍然占预算。
 
-**模型指纹**：`pc_disk_init`（`engine_prefix_cache.cpp:40-93`）对模型身份与所有影响序列化布局的形状做
+**模型指纹**：`pc_disk_init`（`engine_prefix_cache.cpp:42-95`）对模型身份与所有影响序列化布局的形状做
 哈希：字面量 `"sycl-infer-pc"`、磁盘格式 generation `1`、`kv_k_dtype`/`kv_v_dtype`、`kBlockSize`、
 全部 hparams（`n_layer/n_embd/n_ff/n_head/n_head_kv/head_dim/n_rot/n_vocab/d_state/n_group/dt_rank/
 d_inner/conv_k/full_attn_interval`，`:60-63`）、`rope_sections`、`gguf.map_size`、
@@ -324,9 +324,9 @@ d_inner/conv_k/full_attn_interval`，`:60-63`）、`rope_sections`、`gguf.map_s
 至少一个 `dev_kpool_[d]` 非空）时无操作。否则 (1) `pcr->drain` 后逐条 `pc_ram_to_disk`；
 (2) 把 resident `pc_nodes_` 按 **LRU 最旧优先**写磁盘，使 flush 期间的磁盘预算淘汰丢掉的是最久未用的
 前缀，而不是刚写入的；最后打印 `[pcd] flushed on exit: N nodes, disk now M records (X MB)`。
-`~engine` 在池与检查点仍存活时调用它（`engine.cpp:521-523`，位于 `pool_print("exit")` 与
+`~engine` 在池与检查点仍存活时调用它（`engine.cpp:900-902`，位于 `pool_print("exit")` 与
 `kv_release_pool()` 之前）。`SIGINT`/`SIGTERM` 只置一个原子标志，由 `serve()` 的 watchdog 线程转成
-`srv.stop()` 让进程正常展开（`server.cpp:47-53`、`:1916-1917`），于是调度器先关、engine 析构再 flush。
+`srv.stop()` 让进程正常展开（`server.cpp:96-99`、`:1916-1917`），于是调度器先关、engine 析构再 flush。
 
 ---
 
@@ -354,18 +354,18 @@ d_inner/conv_k/full_attn_interval`，`:60-63`）、`rope_sections`、`gguf.map_s
   “0 = 无界”，`:355-357`）。削完打印 `[pc] tiers clamped to --kv-cap-mb ...`。
 * 未给显式 cap 时，三层配置本身构成总预算。
 * 前缀缓存开启时，KV 预留至少 `pc_max_states` 块（每个有状态节点也占一个 KV 块，
-  `engine.cpp:489-494`）；这仍然是虚拟地址空间，不是已提交内存。
+  `engine.cpp:794-799`）；这仍然是虚拟地址空间，不是已提交内存。
 
 ---
 
 ## 7. 统计
 
-`pc_print_stats`（`engine_prefix_cache.cpp:921-952`）输出节点数、有状态节点数、总引用、命中率
+`pc_print_stats`（`engine_prefix_cache.cpp:1266-1297`）输出节点数、有状态节点数、总引用、命中率
 （`hits/(hits+misses)`）、复用 token、捕获状态数、驱逐节点/状态数、检查点尺寸×数量 = 总量，以及
-RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关计数器字段见 `engine.h:667-668`
-（命中/未命中/复用 token/捕获/驱逐）与 `engine.h` 的 `pc_flush_to_disk`/`pc_store_ram`（磁盘与 RAM 的 spill/load/store）。
+RAM 的 stores/loads/spills/records 与磁盘的 spills/loads/records。相关计数器字段见 `engine.h:1124-1125`
+（命中/未命中/复用 token/捕获/驱逐）与 `engine.h` 的 `pc_flush_to_disk` 与 `engine_prefix_cache.cpp` 的 RAM 层 `pcr->put`/`take`（spill/load/store）。
 每层还各有自己的 `print_stats`（`pc_ram.cpp:107-113`、`pc_disk.cpp:328-335`），由 `~engine` 在
-`pool_print("exit")` 之后逐层调用（`engine.cpp:625-632`）。
+`pool_print("exit")` 之后逐层调用（`engine.cpp:1132-1139`）。
 
 服务端把每序列的命中数 `sequence::reused` 作为 OpenAI `usage.prompt_tokens_details.cached_tokens`
 以及 `usage.prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` 返回（详见
@@ -423,3 +423,16 @@ virtual 在某个后端上不起作用，就断言它，不要留空。
   而块表 `d_tables` 与 `pc_block_node_` 由 `set_table` / `pc_retire` 分别维护。
 * [11-qwen35-model.md](11-qwen35-model.md) §2/§5：GDN 与 conv 的几何，即检查点切片的来源。
 * [04-engine.md](04-engine.md)：prefix cache 与多设备 phase 的关系。
+
+---
+
+## 11. 历史记录
+
+* **边界映射曾是绝对下标**：`pc_row_slot[boundary]` 在 `last >= kPcMapLen` 时整体放弃捕获，
+  于是 ~31.7k token 以上永远没有检查点；现在是按 `absolute_boundary % kPcMapLen` 的环，
+  任意深度都捕获（一个 forward 最多跨 `kMaxB*kMaxT/kBlockSize = 32` 个边界）。
+* **捕获曾要求批次正好结束在 32-token 边界**：一个 633-token 的 mode-2 批次和 `1024+309`
+  的拆分都留不下任何检查点。现在取批次里**最深的已完成块**（prompt 的最后一个批次取
+  `(L-1)/32`，给最后一个 token 留一次真实 forward），`pos0 % 32 == 0` 仍是硬前提。
+* **单分区回退**：没有对齐边界时曾只服务冷启动；现在单分区（无 `--layer-map` 或只有一个
+  分区）回退到 Pass 1 的最深有状态边界，多分区仍保持 aligned-only（27B/2 卡的 M 敏感性）。

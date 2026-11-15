@@ -1527,3 +1527,22 @@ tree: it speaks the protocol above and returns numpy arrays, so every
 code that calls it.  The pipeline's post-processing (the box filtering,
 the CTC decoding, the table HTML assembly) stays where it is, so only the place
 the inference happens changes.
+
+## History: the optimization passes, in one table
+
+The pass-by-pass sections above are the **historical** record of how the
+current design was reached (they explain the rules that stayed); the current
+numbers are the `0.996-0.989 s/page` cells at the end of that section.
+
+| pass (2026-10-29) | 957-page pipeline | peak RSS | main change |
+|---|---:|---:|---|
+| baseline | 2 335 s / 2.44 s/page | 7 306 MiB | - |
+| first | 1 262 s / 1.32 s/page | 4 270 MiB | output modes, row-wise softmax, 1x1 matmul, conv index order, loop re-feed |
+| second | 1 067 s / 1.115 s/page | - | device-resident `Loop` carried values, no-wait copies, device ScatterElements, O(1) release |
+| third | 962 s / 1.005 s/page | - | pinned body inputs (metadata aliases), retry only the wireless model |
+| fourth | 953 s / 0.996 s/page | 4 272 MiB | cached diagnostics, host int control flow, host-only ops skip uploads |
+
+Every pass kept every document's Markdown md5 unchanged.  Rejected variants
+are recorded in the body (skip-the-retry unconditionally, batch the retry,
+growth of the upload staging buffer, the recogniser's matmuls off oneDNN,
+table batch 1).

@@ -345,13 +345,12 @@ tools/mineru/
 | 测试 | 层 | 覆盖 |
 |---|---|---|
 | `test_pipeline_registry` | hermetic | id 查找、重复 id、`available()` 过滤、空列表 |
-| `test_pipeline_route` | hermetic/CPU | `/v1/pipelines` 列表、`/run` 非流式、SSE 拼接、404/400、`/v1/models` 不含 pipeline |
+| `test_pipeline_route` | hermetic/CPU | `/v1/pipelines` 列表、`/run` 非流式、SSE 拼接、404/400、`/v1/models` 与 `/v1/chat/completions` 不把 pipeline 当模型 |
 | `test_mineru_layout` | hermetic | `tools/mineru` 的 prompt、版面语法、bbox/角度/IoU/去重 |
-| `test_pipeline_chat_unchanged` | CPU | 可选：pipeline id 在 `/v1/chat/completions` 上按普通模型处理（未知模型 404），不触发 pipeline |
 
 ---
 
-## 11. 迁移计划
+## 11. 历史：MinerU 的迁移（部分完成）
 
 1. **移动 MinerU**（已完成）：`src/mineru.{h,cpp}` → `tools/mineru/`；拆出
    `layout.{h,cpp}`；CMake 新增 `sycl-infer-mineru`，从 `sycl-infer` 的源列表中删除

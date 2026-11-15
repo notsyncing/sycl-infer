@@ -351,3 +351,17 @@ non-uniform work-group，以及 `df_topk_launch` 的 `K` 上界（SLM 预算其�
   （10 GMAC 在实测 7.6 T-MAC/s 下是 1.3-2.8 ms）。
 * **长上下文**：204-token prompt 上均值 1.81 vs 参考 2.07，差约 12%。这一段是引擎解决不了的
   之外的问题——天花板是 `n = 1 + acc`。
+
+---
+
+## 12. 历史记录
+
+* **验收率表**：早先记录的是 `n_max=1..6` acc 0.98/1.44/2.18/2.54/2.90/2.90 与 31.5 ms/token
+  （`n_max=5`）；2026-10-09 重测为 0.92/1.80/2.84/3.46/4.25/5.05 与 21.8 ms/token。cycle 成本
+  没变（verify 92.4 vs 90.9 ms，都符合“一次普通 decode 的权重流 + 每行约 4-5 ms”），差异在
+  acceptance；原因未二分，但文本未变。
+* **“RMSNorm 占 82%”的计时表**：三个 bug 叠加（段累加在层循环外只跑一次、marker 下标顺序
+  与程序顺序不一致、`seg_e[0]` 在循环外），真实值是 5 次 RMSNorm 共 0.36 ms。教训是
+  **A/B 相减在 in-order queue 上不是归因**，时间线必须用 `sum ≈ devspan` 自检。
+* **`PF_DFLASH_OPTIME` 的按行号插桩**：多次插入落在 injection 路径，且报告的“gate+up 读
+  167 MB 用 0.2 ms”在 in-order queue 上不可能；它只能当顺序线索，不能当设备时间。

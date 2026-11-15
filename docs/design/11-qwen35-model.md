@@ -10,7 +10,7 @@
 Qwen3.5 是一种**混合架构**：大多数层是 **Gated DeltaNet（GDN）** 线性递归层，每隔
 `full_attention_interval` 层插入一个 **full attention（GQA）** 层。
 
-`hparams::is_recr(il)`（`model.h:33-35`）：
+`hparams::is_recr(il)`（`model.h:65-67`）：
 
 ```cpp
 bool is_recr(int il) const { return (il + 1) % full_attn_interval != 0; }
@@ -61,7 +61,7 @@ paged KV slice。见 §3.2。
   `--mtp` 在它上面是 no-op（`engine.cpp` 的「无 NextN 头」门控 打一行 `[mtp] model has no NextN (blk.%d.nextn.*)
   layer - MTP disabled`）；
 * 27B 的 GGUF 有 `qwen35.nextn_predict_layers == 1`，于是 `hp.n_layer = 65 - 1 = 64`，草稿头落在
-  `blk.64.*`（与 `engine.cpp:1186` 注释里提到的 `blk.64.nextn.eh_proj` 一致），**主干里不存在第 65 层**。
+  `blk.64.*`（与 `engine.cpp:3209` 注释里提到的 `blk.64.nextn.eh_proj` 一致），**主干里不存在第 65 层**。
 
 `rope.freq_base` 在这两个参考 GGUF 里都是 `10000000.0`（1e7），不是代码里的默认值 10000——写死
 10000 会在参考模型上直接跑出错误的 RoPE。
@@ -154,7 +154,7 @@ eh_proj( concat( enorm(emb(t_p)), hnorm(h_{p-1}) ) ) -> 一个 full-attention Qw
 执行侧的 plan/forward/verify/rollback 见 [04-engine.md](04-engine.md)，这里只强调两条与加载/资源分配
 直接相关的事实：
 
-* 它是一个 **full-attention** 层，因此**自带一份 paged KV slice**（`engine_kvpool.cpp:102-115` 的
+* 它是一个 **full-attention** 层，因此**自带一份 paged KV slice**（`engine_kvpool.cpp:128-141` 的
   `attn_layers()` 在 `mtp_on` 时 `+1`，索引为 `attn_layers()-1`），共享 block table、KV 存储类型与
   前缀缓存，**并计入 `--kv-cap-mb` 与三层 prefix cache 预算**；
 * 它的 f32 norm 上传到 `--mtp-device` 指定的那个分区，线性层（`eh_proj` 与 block 里的 7 个矩阵）的
@@ -239,7 +239,7 @@ gemv: ffn_down (SiLU 门控)
   编译期上限，`state_slots_` 才是实际分配量；两者混用就是往 USM 池外写（`design/04-engine.md` 的
   `state_slots_` 一节）。
 * 多设备布局：**每个分区只分配自己那几层**的状态（`engine.cpp` 里按分区分配递归状态那段，用 per-device 的
-  `n_gdn_dev_` 计数），并通过 `bind_acts(dev)` 在设备间切换（`engine.cpp:792-793`）。所以“层 n 的状态”
+  `n_gdn_dev_` 计数），并通过 `bind_acts(dev)` 在设备间切换（`engine.cpp:2393-2405`）。所以“层 n 的状态”
   在多设备下不是全局第 n 个 slot，而是“第 n 层所在分区的第 n_gdn_dev_[dev] 个”。
 * 前缀缓存检查点按层切分为 `[GDN gdn_per][conv conv_per]`，见
   [06-prefix-cache.md](06-prefix-cache.md)。
@@ -319,7 +319,7 @@ gemv: ffn_down (SiLU 门控)
 | `dt_rank` | 16 | 48 | **`n_group != dt_rank`**，见 §4.1 |
 | `d_inner` | 2048 | 6144 | — |
 | `qkv_dim()` | 6144 | 10240 | `qkv_dim() != 3*d_inner` |
-| LM head | 与 `tok_embd` 共享（无 `output.weight`） | 独立 `output.weight`（Q6_K，裸拷贝约 1.0 GB，`engine.cpp:1258-1262`） | 见 §7 与 [01 §4.4](01-model-loading.md) |
+| LM head | 与 `tok_embd` 共享（无 `output.weight`） | 独立 `output.weight`（Q6_K，裸拷贝约 1.0 GB，`engine.cpp:3281-3285`） | 见 §7 与 [01 §4.4](01-model-loading.md) |
 
 27B 还有一处必然踩到的分支：`--layer-map` 是必需的（模型放不下一张卡），所以多设备 LM head 那条路
 每次都在场——而 tied（0.8B）与 untied（27B）恰好各走一条 key 规则，见上表最后一行与 §7。

@@ -813,6 +813,9 @@ python -m sycl_infer.doctor
 
 ## 6. 测试计划
 
+> 这一节是计划中的 pytest 套件；这些测试文件**当前不在仓库里**，v0.1 的验证是 CLI 冒烟、
+> `syi_*` 的 C ABI 测试与 `python -m sycl_infer.doctor`。
+
 ### 6.1 无模型测试
 
 * `test_python_import`：导入、版本、ABI、`__all__`。
@@ -856,7 +859,11 @@ python -m sycl_infer.doctor
 
 ---
 
-## 7. 实现里程碑
+## 7. 实现里程碑（历史记录）
+
+> 这一节是最初的 **pybind11** 计划；v0.1 实际走 ctypes（见文首），因此 P0-P3
+> 里的“pybind11 模块”只作后续性能路径保留。已经落地的部分是 ctypes 包、
+> 流式/批量/线程 API、setuptools wheel、便携运行时与 `doctor`。
 
 ### P0：Python 绑定骨架
 

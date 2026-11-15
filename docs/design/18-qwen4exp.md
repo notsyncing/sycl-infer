@@ -724,35 +724,22 @@ The 14.6k prompt is synthetic (a repeated phrase); its routing is degenerate
 and it is not comparable to a document.  One row per forward; MTP is gated off.
 §7.2 has the per-stage budget of one decode step.
 
-The table below is the **2026-10-27 archive** (former `0-23/24-47` map, the
-former tail-skip-7 default, an older indexer and no QSA device prefill); it is
-kept as history, not as the current default.
+The 2026-10-27 archive table (former `0-23/24-47` map, tail-skip-7, the older
+indexer and no QSA device prefill) is in [§10](#10-历史记录已废弃的设计与数字).
 
-| configuration | 512-token prefill | decode |
-|---|---:|---:|
-| host experts, bank off | 48.7 s (10.5 tok/s) | ~500 ms/token (~2 tok/s) |
-| whole-layer bank, 18000 MB | 45.5 s (11.25 tok/s) | ~470 ms/token (~2 tok/s) |
-| full host mirror, GPU reads over PCIe (Strata-style) | 14.1 s (544 tokens) | 178 ms/token |
-| per-expert LRU, all-GPU, 16000 MB, pinned source | ~12.0 s (45 tok/s) | ~101 ms/token (9.9 tok/s) |
-| per-expert LRU, all-GPU, 17500 MB, pinned source | ~11.4 s cold / 9.6 s warm (47-56 tok/s) | ~93.3 ms/token (10.7 tok/s) |
-| per-expert LRU, all-GPU, 18000 MB, pinned source | – | ~93.3 ms/token (10.7 tok/s) |
+Correctness on the current config: `12 x 9` -> **108**, the TCP/UDP prompt is
+coherent, the 27B `test_decode_vs_prefill` oracle is 8/8 OK, and `PF_Q4_FFCMP`
+gives cosine 0.99998 against the host routed FFN (layer 4's Q8_0 down 0.999999,
+layer 2's Q5_K/Q8_0 0.99995).  The profile/device/chunker changes add three
+hermetic checks: `test_model_profile` (registry x exact profile keys and the
+qwen4exp values), `test_mm_step` (the shared M-RoPE/image-row slice) and the
+extended `test_dev_profile` (`moe.*`/`shape.*` on the A770, the Iris
+inheritance and the unknown fallback).
 
-In the archive, the pinned expert source is 69.8 GiB of host RAM copied once at
-startup.  A cold first prefill is **11.4 s** (the bank calibrates on it); the
-second/steady prefill is **~9.6 s (56 tok/s)**.  Decode reaches **~93.3
-ms/token (10.7 tok/s)** after ~16 tokens of LRU warm-up; a 64-token generation
-is ~15.6 s wall including the warm prefill.  18 000 loads but is not faster
-than 17 500.  Correctness:
-`12 x 9` -> 108, the TCP/UDP prompt is coherent, the 27B
-`test_decode_vs_prefill` oracle is 8/8 OK, and `PF_Q4_FFCMP` gives cosine
-0.99998 against the host routed FFN (layer 4's Q8_0 down 0.999999, layer 2's
-Q5_K/Q8_0 0.99995).  The profile/device/chunker changes add three hermetic
-checks: `test_model_profile` (registry x exact profile keys and the qwen4exp
-values), `test_mm_step` (the shared M-RoPE/image-row slice) and the extended
-`test_dev_profile` (`moe.*`/`shape.*` on the A770, the Iris inheritance and the
-unknown fallback).
+### 7.1 Historical log (2026-10-27, old map / tail-7): batching, tail-skip, MTP and the prefill ceiling
 
-### 7.1 Measurement log: batching, tail-skip, MTP and the prefill ceiling
+> 本节是**历史日志**：旧 `--layer-map 0-23:gpu.0,24-47:gpu.1`、tail-skip 7（当前默认 0）、
+> 2026-10-27。当前配置的数字见 §7 上表与 §7.2/§7.3 的 “current” 列；归档见 §10。
 
 Unless a cell says otherwise: AOT Release, 2x Arc A770, `--layer-map
 0-23:gpu.0,24-47:gpu.1`, `--moe-vram-mb 17500`, `--cpu-threads 28`,
@@ -949,7 +936,7 @@ best-of-three.
 | bank slots/layer | 121 (24/24 map) | 152 / 104 per device (20/28 map) |
 
 Per-token stage budget measured with ablations (`PF_Q4_ABL_NOGEMV` /
-`PF_Q4_ABL_NOMIX`) and barrier-pair segment timing (`PF_Q4_QSA_TIME`-style,
+`PF_Q4_ABL_NOMIX`) and barrier-pair segment timing (`PF_QSA_TIME`-style,
 `PF_Q4_KTIME`, `PF_Q4_SEGTIME`):
 
 | line | bytes/token | measured | floor | verdict |
@@ -1086,7 +1073,7 @@ and keep-vs-evict produce byte-identical logits.  Steady-state decode is
 unchanged (mean `[q4] fwd n=1` 97-112 ms/token, within run noise) and 4k prefill
 per-chunk times are unchanged.
 
-### 7.3 Depth cells re-baselined, and the one-card experiment (2026-11-01)
+### 7.3 Historical depth cells, and the one-card experiment (2026-11-01)
 
 Both cards, `--layer-map 0-19:gpu.0,20-47:gpu.1`, f16 KV, 28 threads, tail 7
 (no longer the default),
@@ -1187,6 +1174,13 @@ slower at 512, and cannot hold a 48k context.
 | `PF_Q4_KTIME=1` / `PF_Q4_SEGTIME=1` / `PF_Q4_SHTIME=1` | off | device-side kernel/segment timing from barrier pairs |
 | `PF_Q4_PLEFAULT=1` / `PF_Q4_PLEAPPLY_TIME=1` / `PF_Q4_PLEGPU_TIME=1` | off | PLE stage splits |
 | `PF_MOE_RT_ABL` / `PF_Q4_ABL_NOGEMV` / `PF_Q4_ABL_NOMIX` | 0 | phase ablations for attribution; **wrong output by design** |
+
+内部诊断（默认关，只用于定位；不在上面的主线表里）：`PF_Q4_CAL_SAVE` /
+`PF_Q4_SM_SAVE`（保存校准/静态 slot map）、`PF_Q4_HOT_ONLY` / `PF_Q4_HOT_LAYERS` /
+`PF_Q4_HOTCHK`（hot-set 标定）、`PF_Q4_FFCMP_H` / `_MAP` / `_NATIVE`（routed-FFN oracle
+的变体）、`PF_Q4_GEMV8_SCALAR` / `_RPW` / `_MAX_ROWS`（Q8_0 GEMV 变体）、
+`PF_Q4_NOGRP_UP` / `PF_Q4_NO_SHGPU` / `PF_Q4_GEMVDET` / `PF_Q4_ROUTIME` / `PF_Q4_UPDMA` /
+`PF_Q4_GRPDBG` / `PF_Q4_ARGMAX_TIME`、`PF_QSA_ATTN_LAYER`（只 dump 一层 QSA）。
 
 The full knob list (including the `PF_QSA_*` dumps) is in
 [`../../AGENTS.md`](../../AGENTS.md#environment-variables).
@@ -1323,3 +1317,41 @@ The full knob list (including the `PF_QSA_*` dumps) is in
 * **Increasing the engram cache.**  `hit ~= cap/rows` exactly, the gather is
   0.075 ms, and the table is 28.8 GB; `PF_Q4_PLE_PREFAULT` costs 26.8 GiB to
   save <= 0.08 ms.
+
+## 10. 历史记录：已废弃的设计与数字
+
+本节保存**不再是当前状态**、但读一次变更时仍有参考价值的记录。正文只描述当前代码。
+
+### 2026-10-27 专家放置与吞吐（旧 map / 旧默认）
+
+旧配置：`--layer-map 0-23:gpu.0,24-47:gpu.1`、tail-skip 7、旧 indexer、无 QSA device prefill。
+保留它是为了看各配置的相对关系，不是当前默认。
+
+| configuration | 512-token prefill | decode |
+|---|---:|---:|
+| host experts, bank off | 48.7 s (10.5 tok/s) | ~500 ms/token (~2 tok/s) |
+| whole-layer bank, 18000 MB | 45.5 s (11.25 tok/s) | ~470 ms/token (~2 tok/s) |
+| full host mirror, GPU reads over PCIe (Strata-style) | 14.1 s (544 tokens) | 178 ms/token |
+| per-expert LRU, all-GPU, 16000 MB, pinned source | ~12.0 s (45 tok/s) | ~101 ms/token (9.9 tok/s) |
+| per-expert LRU, all-GPU, 17500 MB, pinned source | ~11.4 s cold / 9.6 s warm (47-56 tok/s) | ~93.3 ms/token (10.7 tok/s) |
+| per-expert LRU, all-GPU, 18000 MB, pinned source | – | ~93.3 ms/token (10.7 tok/s) |
+
+In the archive, the pinned expert source is 69.8 GiB of host RAM copied once at
+startup.  A cold first prefill is **11.4 s** (the bank calibrates on it); the
+second/steady prefill is **~9.6 s (56 tok/s)**.  Decode reaches **~93.3
+ms/token (10.7 tok/s)** after ~16 tokens of LRU warm-up; a 64-token generation
+is ~15.6 s wall including the warm prefill.  18 000 loads but is not faster
+than 17 500.
+2026-11-01 之后的当前状态见 §7（warm 3 660-token prefill 65.4 s、decode depth 512
+88.2 ms/step、startup 28.0 s warm / 109.4 s cold）；tail-skip 的默认已改为 0（精确专家集）。
+
+### 其他已废弃的路径
+
+* **主机 K/V mirror**：QSA 主机路径曾维护一份 f16 K/V 镜像（48 MB/slot @4k、3.2 GB/slot @256k）
+  和一条 K/V D2H 拷贝队列；现在主机稀疏路径直接从 paged pool gather + 反量化，`PF_QSA_F16MIR`
+  与 `PF_QSA_COPYQ` 已删除。f16 rounding 的旧 caveat 也随之删除。
+* **`PF_Q4_CPU_MISS`**：decode 的 CPU miss 路径测量为 1.49x 慢（见 §6.1），保留为 A/B，默认关。
+* **旧 Q5_1 down 默认 `PF_Q4_Q5NPB=8`**：冷流扫描后 NPB=1 才是默认（90.71 -> 89.41 ms/token）。
+* **`nat_gemm` 的 M <= 13 限制**：2026-11-03 起 u4/int8 有 M=14/16/20/24/28/32 的
+  `nat_gemm_big`；k5/cb4 仍停在 13。旧的“任何 prefill 都落不进 M<=13 窗口”的结论只对 dense
+  prefill（模式 2、`v.split == false`）成立。

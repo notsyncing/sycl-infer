@@ -23,7 +23,7 @@
 
 | 不做 | 原因 |
 |---|---|
-| 跨模型批处理 | 权重不同，同一次前向无法同时算两个模型。连续批处理的收益全部来自"同一份权重下的多行并行"（`src/server/scheduler.h:132` 的 `engine & e` 就是 per-engine 的），跨模型无处安放 |
+| 跨模型批处理 | 权重不同，同一次前向无法同时算两个模型。连续批处理的收益全部来自"同一份权重下的多行并行"（`src/server/scheduler.h:210` 的 `engine & e` 就是 per-engine 的），跨模型无处安放 |
 | GPU 显存硬分区 | Level Zero 没有显存分区/隔离能力（见 §9.3）。路由器能做的是**准入 + 预测 + 快速失败**，不是隔离 |
 | 在路由器里重做 OpenAI 响应整形 | `reasoning_content` / `tool_calls` 的流式拆分、logprobs、`usage` 已经在 worker 侧实现并被 `test_response_parser` 覆盖（`src/server/response_parser.cpp`）。复制一份会引入"两套实现漂移"，且路由器成为所有流量的单点 |
 | 一个进程内多个 engine | 已知会踩雷：`kd::gemm_ws()` 是**进程级单例且没有按 queue 索引**（`src/backend/gpu/kernels/dp4a_common.cpp:10`），两个 engine 同卡会共用同一块 K-split workspace；AGENTS.md 也记录了"同进程第二个 engine 继承第一个的状态"。见 §2.3 |
@@ -34,8 +34,8 @@
 
 ### 2.1 现有结构本来就是单模型
 
-* `serve(engine & e, const server_config & cfg)`（`src/server/server.cpp:565`）——一个进程一个 engine。
-* `/v1/models` 只返回一条（`src/server/server.cpp:672`），`model` 字段只回显不路由
+* `serve(engine & e, const server_config & cfg)`（`src/server/server.cpp:591`）——一个进程一个 engine。
+* `/v1/models` 只返回一条（`src/server/server.cpp:703-707`），`model` 字段只回显不路由
   （[09-server.md](09-server.md) §8 的字段矩阵："仅回显/用于选择（单模型）"）。
 * `engine` 独占：GGUF 映射、device 权重、KV 池、递归状态、三层前缀缓存、oneDNN primitive 缓存。
   这些全是"每模型一份"，没有共享成分（除非两个模型共享 base 权重 + LoRA，本项目不支持）。
@@ -67,7 +67,7 @@
 | 权重（固定） | `--layer-map` 分卡 | 9 072 MiB/卡（含 1 248 MiB 的 int8 LM head） |
 | 激活 + 递归状态 | `--max-slots` | 1 484 MiB/卡（其中 1 125 是 `gdn_state`，16 slot；单流用 1） |
 | oneDNN + attn_xmx scratch | 固定 | 318 MiB |
-| KV 池 | `--kv-cap-mb` / `--blocks` | 剩余 4 667 MiB；虚拟 USM 只预留地址、按需提交物理页（`src/engine/engine_kvpool.cpp:342`、`:411`） |
+| KV 池 | `--kv-cap-mb` / `--blocks` | 剩余 4 667 MiB；虚拟 USM 只预留地址、按需提交物理页（`src/engine/engine_kvpool.cpp:352`、`:411`） |
 | 前缀缓存 VRAM 层 | `--pc-vram-mb` | 见 [06-prefix-cache.md](06-prefix-cache.md) |
 | MoE 专家库 | `--moe-vram-mb` | 见 [15-moe-ncmoe.md](15-moe-ncmoe.md) |
 
@@ -256,7 +256,7 @@ sycl-infer-onnx --model <id>=<path> --device <kind> --host <http.host> --port <h
 
 `id` 里不能出现 `=`（它是 `id=path` 的分隔符）；`device.count` 必须是 1。
 
-`main.cpp` 的参数解析是**顺序无关**的（`src/main.cpp:231` 起的循环把任何非 `-` 开头的参数当作命令），
+`main.cpp` 的参数解析是**顺序无关**的（`src/main.cpp:282` 起的循环把任何非 `-` 开头的参数当作命令），
 所以 `serve` 放最后即可。注意 `serve` 是唯一的非选项参数。
 
 ### 4.5 校验规则（配置错误必须在启动时失败，不是在第一次请求时）
@@ -333,7 +333,7 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
 
 * worker 的 RPC 端口**默认只听 127.0.0.1**（`--control-port` 不给就没有这个面）。
 * 远程 worker 需要显式 `--control-host 0.0.0.0`，且 worker 会打一行警告
-  （对齐 `src/server/server.cpp:1056` 的既有做法）；配了令牌时那行警告就不打了。
+  （对齐 `src/server/server.cpp:641-645` 的既有做法）；配了令牌时那行警告就不打了。
 * **令牌是 v1 的全部**：没有 mTLS，没有 per-peer 身份。令牌泄露 = 任何人都能停掉这个 worker
   并读它的设备账目，所以它应当像密码一样被对待（文件形式 + 0600）。
 
@@ -363,7 +363,7 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
   `Transfer-Encoding`、`TE`、`Upgrade`），其余（含 `Authorization`）转发。请求体上限为 512 MiB
   （ONNX 一次可以带多张大图；OpenAI 的 base64 图片远小于它）。
 * **`model` 字段**：路由器是路由的权威。它按 `model` 找到 worker，然后**把请求体里的 `model` 改写成
-  worker 自报的 id**（`general.name`，见 `src/server/server.cpp:615`），避免 worker 侧的
+  worker 自报的 id**（`general.name`，见 `src/server/server.cpp:697-700`），避免 worker 侧的
   `/v1/models/{id}` 语义与路由器的别名不一致。**路由键与公布的 id 都以配置文件为准**：
   `/v1/models`（含 `/v1/models/{id}`）公布的 `id` 是 `models[].id`，worker 自报的 id 只用于
   上游改写。作为兼容，路由也接受 worker 自报的 id（旧客户端可能记下过它），两者撞车时配置的 id 优先。
@@ -371,7 +371,7 @@ v1 没有实现任何事件：worker 的日志走 stderr（路由器收进文件
 * **错误映射**：
   | 情况 | 状态码 | 响应体 |
   |---|---|---|
-  | 未知 `model` | 404 | `{"error":{"message":"model 'x' not found","type":"invalid_request_error"}}`（与 worker 自身的形状一致，`src/server/server.cpp:679`） |
+  | 未知 `model` | 404 | `{"error":{"message":"model 'x' not found","type":"invalid_request_error"}}`（与 worker 自身的形状一致，`src/server/server.cpp:754`） |
   | 缺 `model` 且只有一个模型 | — | 用那一个 |
   | 缺 `model` 且有多个模型 | 400 | `invalid_request_error` |
   | worker 不在 `up` | 503 | `{"error":{"message":"model 'x' is unavailable (state: down)","type":"server_error"}}` |
@@ -497,7 +497,7 @@ worker 能报什么，取决于它手上有什么：
 ### 7.4 "ready" 的定义
 
 **worker 的 HTTP 端口开始监听 = 模型已加载完成**：`main.cpp` 先构造 `engine`（加载 GGUF、上传权重、
-定尺 KV 池、记录命令图），再调 `serve()` 监听端口（`src/server/server.cpp:1071`）。所以"端口通"就等于
+定尺 KV 池、记录命令图），再调 `serve()` 监听端口（`src/server/server.cpp:1204`）。所以"端口通"就等于
 "模型在显存里、可以服务"。
 
 路由器的就绪判定**以 HTTP 为准**（`/health`），控制面随后用来补身份与显存。理由：控制面是在
@@ -567,7 +567,7 @@ worker 的日志：stdout/stderr 重定向到 `<log_dir>/<id>.log`，`/router/st
 3. 等所有 worker 退出后退出。
 
 worker 侧的 `shutdown` 走的是它自己的 SIGTERM 路径（§7.1），因此**前缀缓存会被 flush 到磁盘**
-（`src/engine/engine_prefix_cache.cpp:283` 的 graceful-shutdown flush）。这条不能省：省了就是一次
+（`src/engine/engine_prefix_cache.cpp:299` 的 graceful-shutdown flush）。这条不能省：省了就是一次
 静默的前缀缓存丢失。
 
 **每个子进程只能有一个"主人"。** supervisor 的线程负责 waitpid 自己的子进程，路由器的 stop 路径
@@ -589,7 +589,7 @@ shutdown 后**故意多活 2 秒**（模拟 flush），测试断言它走完了�
 |---|---|---|---|
 | ① 静态预算 | 配置里的 `memory.vram_budget_mb`，按设备组求和 ≤ `router.device_vram_mb` | 路由器（配置校验，§4.5） | 路由器拒绝启动，配置错误 |
 | ② 经验准入 | worker 加载后通过控制面回报**加载后**的 `free_vram_bytes`；路由器据此决定同组的下一个模型能否启动 | 路由器（supervisor 的账本） | 标 `failed`，附原因（"the device group 'gpu.0' has 600 MB free, and this model needs 900 MB"） |
-| ③ 池内退让 | worker 自己的 `--kv-cap-mb` / `--max-slots` / `--pc-vram-mb` 决定实际峰值；KV 池按需增长、到 cap 停止 | worker | KV 池停在上限，**不是崩溃**（`src/engine/engine_kvpool.cpp:411`） |
+| ③ 池内退让 | worker 自己的 `--kv-cap-mb` / `--max-slots` / `--pc-vram-mb` 决定实际峰值；KV 池按需增长、到 cap 停止 | worker | KV 池停在上限，**不是崩溃**（`src/engine/engine_kvpool.cpp:421`） |
 
 **第 ② 层是这套设计里最值钱的部分**：它把显存准入从"预测"变成"实测"。27B 加载完才占满 9 072 MiB，
 静态表算不准；让 worker 自己报，比路由器猜准得多。
@@ -627,7 +627,7 @@ shutdown 后**故意多活 2 秒**（模拟 flush），测试断言它走完了�
 
 * `vram_budget_mb` 是**软预算**——路由器用它做准入与告警，不是内核级的限额。
 * 真正的上限由 worker 的池参数决定，超出表现为**启动期 fail-fast**
-  （`dev_alloc_on` 抛 `device alloc failed`，`src/engine/engine.cpp:992`），而不是运行期神秘 OOM。
+  （`dev_alloc_on` 抛 `device alloc failed`，`src/engine/engine.cpp:1266`），而不是运行期神秘 OOM。
 * 如果多个 worker 的预算之和超过卡的容量，**后启动的那个会分配失败**——所以 ① 层必须做，
   路由器要在启动前就把这种配置挡掉，而不是让它在部署时炸。
 

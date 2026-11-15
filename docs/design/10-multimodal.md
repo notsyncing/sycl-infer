@@ -24,9 +24,9 @@ flowchart LR
 
 两条前向路径（`vision_model::encode_host` / `encode_device`）互为参考：host 版是标量参考实现，device 版
 逐阶段镜像它。它们**共享几何与 token 顺序契约**，但不共享输入构造函数——host 路径用
-`build_patch_input`（patch 投影在主机上算完，`vision.cpp:339-397`），device 路径用
+`build_patch_input`（patch 投影在主机上算完，`vision.cpp:1135-1194`），device 路径用
 `build_raw_patches` + `build_pos_emb` 把两件事都留给设备上的 GEMM
-（`vision.cpp:274-337`）。一致性要求：实测约 2e-4，测试阈值 5e-3·max(1, max|host|)
+（`vision.cpp:1071-1133`）。一致性要求：实测约 2e-4，测试阈值 5e-3·max(1, max|host|)
 （`test_multimodal.cpp` 的视频抽帧检查）。
 
 ---
@@ -45,15 +45,15 @@ struct image_preproc_cfg {                                            // image.h
 ```
 
 `chw` 是 plane-major（CHW）fp32，三个连续平面 R/G/B，已归一化。运行时配置由 mmproj 超参覆盖：三个调用点
-（CLI `main.cpp` 的 `ensure_vm()`、服务端 `serve()` 的 mm 加载、视频路径的 `vision_cfg`，`multimodal.cpp:210` 的 `vision_cfg`）
+（CLI `main.cpp` 的 `ensure_vm()`、服务端 `serve()` 的 mm 加载、视频路径的 `vision_cfg`，`multimodal.cpp:238` 的 `vision_cfg`）
 都从 `vm.hp` 派生同一份 cfg，公式见 §2.6。
 
 ### 2.2 解码
 
 stb 在本 TU 编译（`STB_IMAGE_IMPLEMENTATION` + `STBI_ONLY_JPEG/PNG/BMP/GIF` + `STBI_NO_STDIO`，
 `image.cpp:7-12`）。`mm_image_decode_mem` 调 `stbi_load_from_memory(..., 3)` 强制 RGB8
-（`image.cpp:181`）；`mm_image_decode_file` 自己 `fopen`/`fread` 整个文件再委托之，不把路径交给 stb
-（`image.cpp:193-221`）——`STBI_NO_STDIO` 决定了这一点。
+（`image.cpp:187`）；`mm_image_decode_file` 自己 `fopen`/`fread` 整个文件再委托之，不把路径交给 stb
+（`image.cpp:199-227`）——`STBI_NO_STDIO` 决定了这一点。
 
 ### 2.3 Qwen 智能缩放（`mm_image_target_size`，`image.cpp:123-147`）
 
@@ -71,7 +71,7 @@ else if min_pixels > 0 && h_bar*w_bar < min_pixels:
 
 * 三个 `*_by` lambda 都以 `align` 为粒度（`image.cpp:130-132`）。
 * 两边永远对齐到 `patch_size*merge` 的倍数，保证合并网格精确（`make_input` 用的是整数除法
-  `pw/merge`，`vision.cpp:268-269`）。
+  `pw/merge`，`vision.cpp:1063-1064`）。
 * max 分支优先（`else if`），因此 `max_pixels` 压过 `min_pixels`。
 * min 分支放大小图（`ceil`，且**不带** `max(align,…)` 下界），max 分支缩小大图（`floor`，带下界）。
 
@@ -89,7 +89,7 @@ else if min_pixels > 0 && h_bar*w_bar < min_pixels:
 
 ### 2.5 归一化（patchify 在视觉塔侧）
 
-`mm_image_preprocess`（`image.cpp:149-176`）：算目标尺寸，仅当尺寸变化才重采样（`image.cpp:159-163`），
+`mm_image_preprocess`（`image.cpp:155-182`）：算目标尺寸，仅当尺寸变化才重采样（`image.cpp:165-169`），
 然后 plane-major 写出
 
 ```
@@ -101,12 +101,12 @@ patchify 不在这里——它属于视觉塔的输入构建（`build_raw_patche
 
 ### 2.6 预算常量
 
-`kMaxImgTokens = 1024`（单图最大合并 token）、`kMaxImgPatches = 4*kMaxImgTokens = 4096`（patch token），
-定义在 `src/backend/gpu/kernels/kernels.h:28-33`。前者约束三处：`d_img_embd` 的行数
-（`engine.cpp:1705` 分配 `kMaxImgTokens * n_embd`）、`image_preproc_cfg::max_pixels`
-（`= kMaxImgTokens * patch_area`，其中 `patch_area = P²·merge²`，见 `main.cpp:519-521`、服务端 `serve()` 的 `max_pixels`、
-`multimodal.cpp` 的 `vision_cfg`），以及 prompt 装配时的总行数检查（`multimodal.cpp:164-165` 等）。
-后者约束每图的 patch 网格与设备 scratch（`vision.cpp:559-562` 抛错）。因为 `max_pixels` 已经把合并
+`kMaxImgTokens = 4096`（单图最大合并 token）、`kMaxImgPatches = 4*kMaxImgTokens = 16384`（patch token；MinerU 的 1036x1036 版面页是 1369 个合并 token，旧的 1024 上限放不下），
+定义在 `src/backend/gpu/kernels/kernels.h:34-41`。前者约束三处：`d_img_embd` 的行数
+（`engine.cpp:3871` 分配 `kMaxImgTokens * n_embd`）、`image_preproc_cfg::max_pixels`
+（`= kMaxImgTokens * patch_area`，其中 `patch_area = P²·merge²`，见 `main.cpp:761-763`、服务端 `serve()` 的 `max_pixels`（`server.cpp:663`）、
+`multimodal.cpp` 的 `vision_cfg`），以及 prompt 装配时的总行数检查（`multimodal.cpp:192-193` 等）。
+后者约束每图的 patch 网格与设备 scratch（`vision.cpp:1856-1859` 抛错）。因为 `max_pixels` 已经把合并
 token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是同一个约束的两种表述。
 
 ---
@@ -115,8 +115,8 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 
 ### 3.1 类型
 
-* `vt`（`vision.h:26-31`）：行主序权重视图 `{data, type, K, N}`（`K = dims[0]`，`N = n_rows()`）。
-* `vision_hparams`（`vision.h:33-48`）：`image_size, patch_size, n_embd, n_ff, n_layer, n_head, head_dim,
+* `vt`（`vision.h:53-58`）：行主序权重视图 `{data, type, K, N}`（`K = dims[0]`，`N = n_rows()`）。
+* `vision_hparams`（`vision.h:60-83`）：`image_size, patch_size, n_embd, n_ff, n_layer, n_head, head_dim,
   proj_dim, merge, n_pos_side, eps, rope_base, mean/std[3]`。`head_dim` 是**派生**的
   `n_embd / n_head`（`vision.cpp` 加载处派生，不是元数据字段）。
 * **「能加载」不等于「能跑」，所以这个区别是可查询的**：`vision_model::runnable()`
@@ -126,11 +126,11 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
   前向时 abort。**新增几何约束时要同时加到 `runnable()` 和前向的检查里**，否则这个区别
   是不可见的；调用方应当用 `runnable()` 把「能加载但不能跑」报出来，而不是让它变成一次
   运行时中止。
-* `vision_layer`（`vision.h:50-61`）：`qkv/out/up/down` + 可选 f32 bias，`ln1/ln1_b, ln2/ln2_b`。
-* `vision_input`（`vision.h:64-74`）：`chw`、`width/height`、`pw=w/P`、`ph=h/P`、`n_patches=pw*ph`、
+* `vision_layer`（`vision.h:85-100`）：`qkv/out/up/down` + 可选 f32 bias，`ln1/ln1_b, ln2/ln2_b`。
+* `vision_input`（`vision.h:103-122`）：`chw`、`width/height`、`pw=w/P`、`ph=h/P`、`n_patches=pw*ph`、
   `out_w=pw/merge`、`out_h=ph/merge`、`n_out=out_w*out_h`；由
-  `vision_model::make_input` 填写（`vision.cpp:260-272`）。
-* `vision_model`（`vision.h:76-127`）：权重 + 设备状态；`patch_w` 是两个 patch conv 相加后反量化的 f32
+  `vision_model::make_input` 填写（`vision.cpp:1041-1069`）。
+* `vision_model`（`vision.h:124-265`）：权重 + 设备状态；`patch_w` 是两个 patch conv 相加后反量化的 f32
   `[n_embd][3*P²]`；`pos_embd_host` 是反量化的 learned position；`weights` 是 backend 的
   `weight_store`（紧凑 span 或整块 GGUF，§3.3）；
   `d_patch_w` 与 8 个 scratch 缓冲是模型自有的设备内存。所有权：`dev_q` pin 住首次传入的
@@ -140,7 +140,7 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 
 ### 3.2 mmproj 加载
 
-元数据来自 `clip.vision.*`（`vision.cpp:144-164`）：`image_size`、`patch_size`、`embedding_length`、
+元数据来自 `clip.vision.*`（`vision.cpp:459-484`）：`image_size`、`patch_size`、`embedding_length`、
 `feed_forward_length`、`block_count`、`attention.head_count`、`projection_dim`、
 `spatial_merge_size`（默认 2）、`attention.layer_norm_epsilon`（默认 1e-6）、`rope_theta`（默认 10000）、
 `image_mean/std`。**`feed_forward_length` 不能直接信**：MinerU 的 mmproj 写的是 896（文本宽度），
@@ -148,10 +148,10 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 张量：
 
 * `v.patch_embd.weight` + `v.patch_embd.weight.1`：两个 4-D 卷积 `[kw,kh,in,out]`，校验
-  `N=n_embd`、`K=3P²`，**逐元素相加**后反量化为 `patch_w`（`vision.cpp:187-201`，注释解释了
+  `N=n_embd`、`K=3P²`，**逐元素相加**后反量化为 `patch_w`（`vision.cpp:508-529`，注释解释了
   “参考实现对同一输入做两个 conv 求和”）；`v.patch_embd.bias` 可选。
 * `v.position_embd.weight`：要求行数是正方形（`n_side=round(sqrt(N))`，否则抛
-  `position embedding not square`），逐元素反量化为 f32 `[N][K]`（`vision.cpp:205-217`）。注意**没有
+  `position embedding not square`），逐元素反量化为 f32 `[N][K]`（`vision.cpp:535-547`）。注意**没有
   转置**：GGUF 张量本身按 `[pos][embd]` 行主序存放（`vt_get` 取 `data[s*K+d]`）。
 * `v.post_ln.weight/bias`。
 * 每层 `v.blk.{i}.`：`attn_qkv.{weight,bias}`、`attn_out.{weight,bias}`、
@@ -179,16 +179,16 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 
 * **输入构建**：`build_patch_input` 按合并 token 顺序，每 token 抽 `[c][kh][kw]` 顺序的 patch，用
   `patch_w`（+bias）投影，再加位置嵌入（`pw==ph==n_side` 时精确取样，否则 `pos_sample` 的 align_corners
-  双线性，`vision.cpp:109-125`）。位置嵌入用**同一个 reorder 的原始 patch 坐标** `(py,px)` 取样
-  （`vision.cpp:376-390` 的注释）。
-* **合并顺序**：`my, mx, dy, dx` 四层循环（`vision.cpp:351-355`），因此每个 2×2 合并组内 token 连续，
+  双线性，`vision.cpp:101-117`）。位置嵌入用**同一个 reorder 的原始 patch 坐标** `(py,px)` 取样
+  （`vision.cpp:1173-1187` 的注释）。
+* **合并顺序**：`my, mx, dy, dx` 四层循环（`vision.cpp:1148-1152`），因此每个 2×2 合并组内 token 连续，
   合并输出行是 4 个组 token 的拼接。这是整个合并阶段依赖的顺序契约，`vit_rope` 的坐标反推
-  （`vit.cpp:299-305`）也依赖它。
+  （`vit.cpp:356-362`）也依赖它。
 * **Transformer 层**：LayerNorm（double 求均值/方差，`vision.cpp:45-62`）→ fused QKV → 2D RoPE（见
   §3.7）→ 双向 attention（无因果掩码，`1/sqrt(HD)`）→ out 投影 + residual → ln2 →
-  `up → gelu_tanh → down` + residual。token → patch 坐标的反推在 `vision.cpp:428-434`。
+  `up → gelu_tanh → down` + residual。token → patch 坐标的反推在 `vision.cpp:1526-1532`。
 * **merger**：`C = merge² = 4`，`hidden = C*n_embd`；`n_out` 行直接重解释为 `n_out` 个长度 `hidden`
-  的向量（2×2 拼接是 stride 重解释，`vision.cpp:523-529`），然后 `mm.0 → gelu → mm.2`，输出
+  的向量（2×2 拼接是 stride 重解释，`vision.cpp:1652-1658`），然后 `mm.0 → gelu → mm.2`，输出
   `n_out * proj_dim`。文本引擎按 `n_embd` 为每行分配，所以 CLI/服务器加载 mmproj 时，
   以及 `mm_build_prompt*` 编码前，均校验 `proj_dim == text n_embd`；不匹配直接报错，
   不能把 `proj_dim` 个 float 写进 `n_embd` 行跨度。
@@ -213,10 +213,10 @@ bias → GELU → `mm.2` → bias）→ `q.wait()`。
 两个值得记的实现细节：
 
 * **残差通过 GEMM 的 `residual` 参数完成**：`vit_gemm_launch` 的最后一个参数非空时输出为
-  `alpha*acc + residual[t][n]`（`vit.cpp:178-190`），所以 `out`/`down` 两个投影直接写回 `d_x`。
+  `alpha*acc + residual[t][n]`（`vit.cpp:194-206`），所以 `out`/`down` 两个投影直接写回 `d_x`。
 * **两条路径的 RoPE 基数同源**：都用 `hp.rope_base`（即 mmproj 的 `clip.vision.rope_theta`，默认
-  10000）——host 是 `pow(rope_base, -2/(HD/2))`（`vision.cpp:411-415`），device 把它交给
-  `vit_rope_launch`（`vision_model::encode_device` 里的 `vit_rope_launch`，`vit.cpp:294` 再取 `log2(rope_base)`）。host 路径原先硬编码
+  10000）——host 是 `pow(rope_base, -2/(HD/2))`（`vision.cpp:1487-1491`），device 把它交给
+  `vit_rope_launch`（`vision_model::encode_device` 里的 `vit_rope_launch`，`vit.cpp:350` 再取 `log2(rope_base)`）。host 路径原先硬编码
   10000，于是换一个 `rope_theta` 的 mmproj 会让参考与 GPU 分叉，已修。
 
 **队列必须 in-order**：各阶段数据依赖但启动器不发事件（没有 `ext_oneapi_submit_barrier`），因此要求
@@ -293,9 +293,9 @@ rel-L2 7.8%），所以这不是 27B 的个例。等 `down` 也能走 int8（需
 
 | kernel | 启动几何 | 说明 |
 |---|---|---|
-| `vit_gemm_launch` | 128 线程 WG，覆盖 64 行 × 32 token 的 tile（`vit.cpp:69-84`）；每 lane 拥有 `TP=4` token × `RP=4` 行，K 按 64 一块进 SLM | `out[t][n] = alpha*Σ W[n][k]x[t][k] (+residual)`；BF16/F32 两个模板实例 |
-| `vit_layernorm_launch` | 256 线程 WG，每 WG 8 行（每行一个 32-lane 子组，`vit.cpp:216-218`） | 通道内规约用 `sg_sum` |
-| `vit_gelu_launch` | 一线程一个元素（`vit.cpp:245-254`） | tanh 近似，`sqrt(2/pi)` 硬编码 |
+| `vit_gemm_launch` | 128 线程 WG，覆盖 64 行 × 32 token 的 tile（`vit.cpp:85-100`）；每 lane 拥有 `TP=4` token × `RP=4` 行，K 按 64 一块进 SLM | `out[t][n] = alpha*Σ W[n][k]x[t][k] (+residual)`；BF16/F32 两个模板实例 |
+| `vit_layernorm_launch` | 256 线程 WG，每 WG 8 行（每行一个 32-lane 子组，`vit.cpp:234-236`） | 通道内规约用 `sg_sum` |
+| `vit_gelu_launch` | 一线程一个元素（`vit.cpp:263-272`） | tanh 近似，`sqrt(2/pi)` 硬编码 |
 | `vit_add_bias_launch` / `vit_add_launch` / `vit_copy_launch` | `range<2>(rows, cols)` | 三种逐元素偏置/加法/拷贝 |
 | `vit_rope_launch` | `range<1>(n_tok*n_head*head_dim/2)` | 2D 视觉 RoPE，见 §3.7 |
 | `vit_attn_launch` | 每 `(head, BQ-query block)` 一个 WG；**qwen2vl 的 80 宽头默认是 ILP `BQ=48, BK=32, WG=1024, SG=16, RQ=2, RQP=2`**（47.6 KiB SLM，一个 WG 占满一个 Xe core；`PF_VIT_ATTN=70`），64/72 宽头仍是 16-32 query、64 key、128 线程 | 双向注意力，**在线 softmax**（running max/sum），score 矩阵不出工作组；部分 tile 的填充行在每个阶段都有 `r < n_q` / `k < n_k` 守卫。ILP 版本每线程算 2 个查询行的 score dot、2 个 PV 行共享一个 V `float4`，保持原来的求和顺序 |
@@ -310,21 +310,21 @@ rel-L2 7.8%），所以这不是 27B 的个例。等 `down` 也能走 int8（需
 
 | | 视觉塔自己的 RoPE（`vit_rope`） | 文本模型的 M-RoPE（`qk_norm_rope`） |
 |---|---|---|
-| 位置来源 | 由合并 token 序号反推 patch 网格坐标 `(py,px)`（`vit.cpp:299-305`） | `step_info::mrope[sec*(kMaxB*kMaxT) + r*kMaxT + t]`，值由 `mm_expand_prompt` 装配（§4.3） |
-| 分段方式 | `head_dim` 切 4 段、每段 `head_dim/4` 对：`sec = pair/(head_dim/4)`（`vit.cpp:306-307`） | 交错 sector 模式：`sector = lane % (s0+s1+s2+s3)`，再按 `sector%3` 取 row（且 `sector < 3*s1`）/ col（`sector < 3*s2`）/ temporal（`sector < 3*s0`）；三个条件都不满足就落到默认的 `sec = 3`（`qk_norm_rope.cpp:56-64`） |
-| 哪段用哪个位置 | **`sec == 0` 用 patch 行 `py`，其余段用 patch 列 `px`**（`vit.cpp:308`；host 侧同样，`vision.cpp:445`）。HD=64 时每头只有 32 对，段 2/3 不存在 | 三个 section 的位置全部来自 mrope 数组，按上面的 sector 规则选 |
-| 频率指数 | **每段重置**：`p = pair % (head_dim/4)`，`theta = pos * base^(-2p/(HD/2))`（`vit.cpp:309`；host 侧 `vision.cpp:443-446` 的注释写明 “sections {16,16,16,16}, exponent resets”） | **全局 pair 索引**：`theta = rpos * base^(-2*lane/n_rot)`，`lane` 就是全局 pair 序号（`qk_norm_rope.cpp:82`） |
+| 位置来源 | 由合并 token 序号反推 patch 网格坐标 `(py,px)`（`vit.cpp:356-362`） | `step_info::mrope[sec*(kMaxB*kMaxT) + r*kMaxT + t]`，值由 `mm_expand_prompt` 装配（§4.3） |
+| 分段方式 | `head_dim` 切 4 段、每段 `head_dim/4` 对：`sec = pair/(head_dim/4)`（`vit.cpp:363-364`） | 交错 sector 模式：`sector = lane % (s0+s1+s2+s3)`，再按 `sector%3` 取 row（且 `sector < 3*s1`）/ col（`sector < 3*s2`）/ temporal（`sector < 3*s0`）；三个条件都不满足就落到默认的 `sec = 3`（`qk_norm_rope.cpp:56-64`） |
+| 哪段用哪个位置 | **`sec == 0` 用 patch 行 `py`，其余段用 patch 列 `px`**（`vit.cpp:365`；host 侧同样，`vision.cpp:1549`）。HD=64 时每头只有 32 对，段 2/3 不存在 | 三个 section 的位置全部来自 mrope 数组，按上面的 sector 规则选 |
+| 频率指数 | **每段重置**：`p = pair % (head_dim/4)`，`theta = pos * base^(-2p/(HD/2))`（`vit.cpp:364-366`；host 侧 `vision.cpp:443-446` 的注释写明 “sections {16,16,16,16}, exponent resets”） | **全局 pair 索引**：`theta = rpos * base^(-2*lane/n_rot)`，`lane` 就是全局 pair 序号（`qk_norm_rope.cpp:82`） |
 
 段宽来自 GGUF 的 `rope.dimension_sections`（读入 `hp.rope_sections`，`src/model/arch/qwen35/load.cpp:39-43`），Qwen3.5 参考
-架构是 `[11,11,10,0]`（即 `sector = lane % 32`）。四段全 0 表示普通 RoPE（`model.h:30-31`）；此时
+架构是 `[11,11,10,0]`（即 `sector = lane % 32`）。四段全 0 表示普通 RoPE（`model.h:28-29`）；此时
 `sect_dims == 0` → `sector = lane`、`sec` 落到默认的 3，而 mrope 的第 4 段是 temporal 的副本
-（`multimodal.cpp:128`），所以带图的提示词依然退化为正确行为。
+（`multimodal.cpp:134`），所以带图的提示词依然退化为正确行为。
 
 ---
 
 ## 4. 提示词组装（`multimodal.cpp`）
 
-### 4.1 `mm_prompt`（`multimodal.h:52-63`）
+### 4.1 `mm_prompt`（`multimodal.h:52-94`）
 
 ```cpp
 struct mm_prompt {
@@ -362,19 +362,19 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
 `plan_videos`（`multimodal.cpp:241-279`）、`mm_build_prompt_mixed_device` 的规划趟
 （`mm_build_prompt_mixed_device`，`multimodal.cpp`）。
 
-### 4.3 token 扩展与 M-RoPE（`mm_expand_prompt`，`multimodal.cpp:40-132`）
+### 4.3 token 扩展与 M-RoPE（`mm_expand_prompt`，`multimodal.cpp:45-138`）
 
 所有七个入口的扩展都走这一个函数——这也是“host 与 device 返回相同 token/position 布局”的机制保证：
 两边只在 `blocks` 的构造上分叉，扩展与位置计算完全共用。
 
 * pad token id 查表 `kPadName[3] = {"<|image_pad|>", "<|video_pad|>", "<|audio_pad|>"}`
   （`multimodal.cpp:19`）；tokenizer 里没有就抛 `mm: tokenizer has no <…> token`
-  （`multimodal.cpp:21-27`）。
-* 按 `parse_special=true` 分词 `rendered`（`multimodal.cpp:48`），统计每种 pad 的出现次数，要求与
+  （`multimodal.cpp:21-32`）。
+* 按 `parse_special=true` 分词 `rendered`（`multimodal.cpp:53`），统计每种 pad 的出现次数，要求与
   `blocks` 里同 pad 的块数一致，否则抛 `placeholder count does not match block count`
-  （`multimodal.cpp:55-59`）；块按 pad 在 `rendered` 中出现的顺序被消费。
-* 预算的第二次检查：`Σ n_tok` 必须等于调用者传入的 `total_rows`（`multimodal.cpp:70-72`）。
-* 对每个 pad（`nx = out_w`，`base = 当前 pos`，`gwh = out_w*out_h`），`multimodal.cpp:90-108`：
+  （`multimodal.cpp:60-64`）；块按 pad 在 `rendered` 中出现的顺序被消费。
+* 预算的第二次检查：`Σ n_tok` 必须等于调用者传入的 `total_rows`（`multimodal.cpp:76-78`）。
+* 对每个 pad（`nx = out_w`，`base = 当前 pos`，`gwh = out_w*out_h`），`multimodal.cpp:96-114`：
 
   | kind | 每 token 的 `(t, h, w)` | 块消耗的位置 |
   |---|---|---|
@@ -383,20 +383,20 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
   | `MM_KIND_AUDIO` | `(base + i, 0, 0)` —— TM-RoPE，纯时间流 | `n_pos = n_tok` |
 
   即**图像消耗 `max(nx,ny)` 个位置，而不是每 token 一个**：这是图像路径最容易被搞错的地方。
-  循环结束后 `pos = base + b.n_pos`（`multimodal.cpp:108`）。
-* 文本 token 每 token 进一个位置，`t,h,w` 三段都等于 `pos`（`multimodal.cpp:112-115`）。
-* `img_row` 在块内填 `off[bi] + i`，块外填 `-1`（`multimodal.cpp:92` / `111`）。
+  循环结束后 `pos = base + b.n_pos`（`multimodal.cpp:114`）。
+* 文本 token 每 token 进一个位置，`t,h,w` 三段都等于 `pos`（`multimodal.cpp:118-121`）。
+* `img_row` 在块内填 `off[bi] + i`，块外填 `-1`（`multimodal.cpp:98` / `111`）。
 * mrope 按 section-major 写：section 0/1/2 = temporal/row/col，section 3 = temporal 的副本（第 4 段
-  0 对，不参与旋转，`multimodal.cpp:124-129`）。
-* 收尾检查所有块都被消费（`multimodal.cpp:118-120`），`pos_after = pos`。
+  0 对，不参与旋转，`multimodal.cpp:130-135`）。
+* 收尾检查所有块都被消费（`multimodal.cpp:124-126`），`pos_after = pos`。
 
 ### 4.4 入口
 
 | 入口 | 位置 | 说明 |
 |---|---|---|
-| `mm_build_prompt` | `multimodal.cpp:173-176` | host：规划 → `mm_expand_prompt` → 分配 `embd` → 逐图 `encode_host` 拷到 `offset[k]*n_embd` |
+| `mm_build_prompt` | `multimodal.cpp:201-215` | host：规划 → `mm_expand_prompt` → 分配 `embd` → 逐图 `encode_host` 拷到 `offset[k]*n_embd` |
 | `mm_build_prompt_device` | `multimodal.cpp` 的 `mm_build_prompt_device` | 规划 → 逐图 `encode_device` 写 `d_out + offset[k]*n_embd` → `mm_expand_prompt` → `p.d_embd = d_out` |
-| `mm_build_prompt_video` / `..._device` | `multimodal.cpp:283-316` | 见 [13-audio-video.md §2](13-audio-video.md) |
+| `mm_build_prompt_video` / `..._device` | `multimodal.cpp:298-333` | 见 [13-audio-video.md §2](13-audio-video.md) |
 | `mm_build_prompt_audio` / `..._device` | `multimodal.cpp` 的 `mm_build_prompt_audio` | 见 [13-audio-video.md §3](13-audio-video.md) |
 | `mm_build_prompt_mixed_device` | `mm_build_prompt_mixed_device` | 混合装配，见 [13-audio-video.md §4](13-audio-video.md) |
 
@@ -470,15 +470,15 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
 
 * **CLI `gen`**（`main.cpp` 的多模态 CLI 分支）：`--image`/`--video` 各自先 `ensure_vm()` 惰性加载 `--mmproj`
   （缺失即抛 `--image/--video requires --mmproj`，`main.cpp:430-432`）并从视觉超参建 cfg
-  （`min_pixels=8*patch_area`、`max_pixels=kMaxImgTokens*patch_area`）；`--audio` 走 `ensure_am()`
+  （`min_pixels=(qwen3vl ? 64 : 8)*patch_area`（Qwen3-VL 的 65536）、`max_pixels=kMaxImgTokens*patch_area`）；`--audio` 走 `ensure_am()`
   （`main.cpp:446-460`）。三个循环分别解码/预处理并向 `order` 追加 `mm_media_ref`。随后构造一条
   `chat_msg`：媒体 `chat_part` 按 `order` 顺序在前、文本 part 在后，`render_chat(..., true, thinking)`
   渲染，最后 `mm_build_prompt_mixed_device(..., e.d_img_embd, max_video_frames)` + `e.generate_mm`。
 * **服务端**（`handle_chat`，细节见 [09-server.md §6](09-server.md)）：`mm_server`
   （`server.cpp` 里持有 `vision_model`/`audio_model` 那段）在启动时持有 `vision_model` + cfg 与 `audio_model` + acfg，失败非致命
   （打日志、后续请求 400）。`parse_messages` 按顺序收集 `media_part`
-  （`image_url`/`image`、`video_url`/`video`、`input_audio`、`audio_url`，`server.cpp:533-571`），
-  `load_media_bytes`（`server.cpp:455-500`）把 `data:` / 内联 base64 / `http(s)://` 解析成字节
+  （`image_url`/`image`、`video_url`/`video`、`input_audio`、`audio_url`，`request.cpp:287-320`），
+  `load_media_bytes`（`media_fetch.cpp:65`）把 `data:` / 内联 base64 / `http(s)://` 解析成字节
   （`PF_MM_URL_FETCH=0` 关闭远程抓取）。图片 `mm_image_decode_mem` → `mm_image_preprocess`；视频
   `mm_video_decode_mem`（`max_frames`/`max_side` 来自 `server_config`，在 `handle_chat` 里）；音频
   `mm_audio_decode_bytes`。渲染后同样走 `mm_build_prompt_mixed_device`，用**扩展后**的 token 数做长度
@@ -506,3 +506,17 @@ n_pos   = max(out_w, out_h)          // 图像消耗 max(nx,ny) 个位置
 模型缺失、tokenizer 无对应 pad token、或没给音频 mmproj 时对应子测试优雅跳过。
 注意本测试只守住集成逻辑：视觉编码器本身是对着 llama.cpp 的参考**带外**校验的（文件头注释，
 `test_multimodal.cpp:1-4`）。
+
+---
+
+## 8. 历史记录
+
+* **单图 token 预算曾是 1024**（`kMaxImgPatches = 4096`）：MinerU 的 1036×1036 版面页是
+  1369 个合并 token，旧的 1024 放不下一页。现在是 `kMaxImgTokens = 4096`、
+  `kMaxImgPatches = 16384`。
+* **qwen2vl 的 q|k|v 组合视图曾是加载时立即构建**：现在默认按需构建
+  （`PF_VISION_DEFER_QKV=0` 恢复），省 0.67 s 启动与每页 148 ms H2D。
+* **视觉塔曾上传整个 mmproj 文件**：现在默认只上传设备 kernel 读的 ~3.7 MB
+  （`PF_VISION_COMPACT=0` 恢复整文件映射）。
+* **`min_pixels` 曾对所有塔都是 `8*patch_area`**：Qwen3-VL 的实际 floor 是 65536
+  （`64*patch_area`），现在由 vision kind 选择。

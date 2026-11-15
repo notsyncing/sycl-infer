@@ -75,10 +75,11 @@ full attention、tied `output`。
 
 ### 2.2 M-RoPE
 
-Qwen2-VL 用 **blocked** sections（`[8,12,12,0]`，和 = `n_rot/2`），
-Qwen3.5 用 interleaved（sections 和 32，`n_rot/2` = 128）。
-`qk_norm_rope` 以 `sum(sections) == n_rot/2` 判别，采用 ggml 的 non-imrope
-分支：pairs `[0,8)` 用 t、`[8,20)` 用 row、`[20,32)` 用 col。视觉塔自己的
+Qwen2-VL 用 **blocked** sections（`[8,12,12,0]`）：pairs `[0,8)` 用 t、
+`[8,20)` 用 row、`[20,32)` 用 col。**判别不是 sections 之和**——Qwen3.5 的
+interleaved sections（例如 `[11,11,10,0]`）之和也等于 `n_rot/2`。loader 设置
+`hparams::mrope_interleaved`（qwen2vl 为 0，qwen35/qwen35moe/qwen4exp 为 1），
+`qk_norm_rope` 只在 flag 为 0 且 `sect_dims == n_rot/2` 时走 blocked 分支。视觉塔自己的
 4-section VISION RoPE 在 `vit_rope_launch` 里（每 20 对 row/col，指数按段重启）。
 
 ### 2.3 路径选择

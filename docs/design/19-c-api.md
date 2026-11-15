@@ -849,9 +849,10 @@ SYI_API const char *syi_request_error(const syi_request *request);
 * `syi_request_destroy`：释放请求；如果仍在运行，等价于 `cancel` 后等待终态。
   不得与 `next`/`wait` 并发。
 
-### 8.7 C++ RAII 包装（头文件，非 ABI）
+### 8.7 C++ RAII 包装（设计，**当前未实现**）
 
-`include/sycl_infer/sycl_infer.hpp` 提供可选的 header-only 包装：
+`include/sycl_infer/sycl_infer.hpp` 只是设计中的 header-only 包装；**本仓库尚未提供该文件**，
+`cmake --install` 也不安装它。下面的接口是目标形态，不是当前可链接的 API：
 
 ```cpp
 namespace sycl_infer {
@@ -908,7 +909,7 @@ public:
 
 ```
 include/sycl_infer/sycl_infer.h        C ABI
-include/sycl_infer/sycl_infer.hpp     可选 C++ RAII 包装
+include/sycl_infer/sycl_infer.hpp     （未实现）可选 C++ RAII 包装
 src/capi/model.cpp                    create/destroy/info/tokenize/chat
 src/capi/request.cpp                  request 状态机、next/wait/result
 src/capi/scheduler_bridge.cpp         提交、窗口、FIFO、队列上限
@@ -937,7 +938,7 @@ if(SI_C_API AND NOT SI_ROUTER_ONLY)
     target_link_options(sycl_infer_c PRIVATE
         -Wl,--version-script=${CMAKE_SOURCE_DIR}/cmake/sycl_infer.map)
     install(TARGETS sycl_infer_c EXPORT sycl_inferTargets ...)
-    install(FILES include/sycl_infer/sycl_infer.h include/sycl_infer/sycl_infer.hpp
+    install(FILES include/sycl_infer/sycl_infer.h
             DESTINATION include/sycl_infer)
 endif()
 ```
@@ -1093,6 +1094,9 @@ C API 不改变引擎的容量模型。`max_seq`/`max_slots`/`kv_type`/`moe_vram
 
 ## 12. 测试计划
 
+> 当前仓库只有 `tests/capi/test_capi.cpp`（一个模型-backed 的二进制 `test_capi`，见
+> `docs/design/12-build-and-testing.md`）；下面按子项列的是计划中的扩展，不是已注册的目标。
+
 ### 12.1 无需模型/GPU 的 hermetic 测试
 
 * ABI：`test_capi_abi`——结构体大小/偏移、`struct_size` 兼容、旧版本头文件模拟、
@@ -1139,14 +1143,14 @@ C API 不改变引擎的容量模型。`max_seq`/`max_slots`/`kv_type`/`moe_vram
 
 ---
 
-## 13. 实现里程碑
+## 13. 实现里程碑（历史记录）
 
-### M0：文档与 ABI 冻结（本次）
+### M0：文档与 ABI 冻结（已完成）
 
 * 本文、Python 文档、两份使用说明。
 * 评审通过后再写代码；ABI 变化必须回到本文更新。
 
-### M1：C API 骨架与模型加载
+### M1：C API 骨架与模型加载（已完成）
 
 * `include/sycl_infer/sycl_infer.h`、`src/capi/*`、CMake 目标、版本脚本。
 * `engine_config` 增加 `cpu_threads`、`kv_k`、`kv_v`；KV 类型从进程级改为
@@ -1154,19 +1158,19 @@ C API 不改变引擎的容量模型。`max_seq`/`max_slots`/`kv_type`/`moe_vram
 * `syi_model_create/destroy/info/tokenize/detokenize/render_chat`。
 * hermetic 生命周期/ABI 测试。
 
-### M2：调度桥与批量推理
+### M2：调度桥与批量推理（实现已完成；测试是计划项，见 §12）
 
 * `sequence::collect_all`、停止串、异常边界、请求级超时。
 * admission 窗口/FIFO/队列上限；`syi_request_*` 全套。
 * `test_capi_generate`、`test_capi_batch`、`test_capi_isolation`。
 * 统计与 `syi_model_get_stats`。
 
-### M3：C++ 包装与 SDK 安装
+### M3：C++ 包装与 SDK 安装（部分完成：SDK 安装已完成，C++ 包装未实现）
 
-* `sycl_infer.hpp`、`cmake --install`、pkg-config、CMake config。
+* `cmake --install`、pkg-config、CMake config。C++ RAII 包装（`sycl_infer.hpp`）未实现。
 * C99/C11/C++17 编译测试；`nm -D` 符号检查。
 
-### M4：Python binding 与 wheel
+### M4：Python binding 与 wheel（部分完成：ctypes 包已完成，pytest 套件是计划项）
 
 * 见 [20-python-binding.md](20-python-binding.md)。
 * Python 测试矩阵、wheel 自检（`sycl_infer.doctor`）。

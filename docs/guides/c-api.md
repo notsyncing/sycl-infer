@@ -45,8 +45,7 @@ cmake --install build
 
 ```
 /opt/sycl-infer/
-├── include/sycl_infer/sycl_infer.h
-├── include/sycl_infer/sycl_infer.hpp   # 可选 C++ RAII 包装
+├── include/sycl_infer/sycl_infer.h     # C ABI（C++ 包装 hpp 尚未提供）
 ├── lib/libsycl_infer.so -> libsycl_infer.so.1
 ├── lib/libsycl_infer.so.1
 ├── lib/pkgconfig/sycl_infer.pc

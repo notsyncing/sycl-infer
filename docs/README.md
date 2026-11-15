@@ -1,7 +1,11 @@
 # sycl-infer 设计文档
 
-本目录是 `sycl-infer` 的架构设计与各功能设计文档。文档以源码为准，所有关键结论都标注了对应的
-源文件与行号；遇到与注释冲突时，以代码实现为准（个别历史注释已过时，文中会指出）。
+本目录是 `sycl-infer` 的架构设计与各功能设计文档。文档以源码为准，关键结论标注对应的源文件与
+符号（部分带行号；行号在同一次全量同步中更新）；遇到与注释冲突时，以代码实现为准。
+
+**正文只描述当前代码。** 已被替换的设计、旧的测量数字和一次性诊断结论放在每篇文档末尾的
+“历史记录 / History”节（`PERFORMANCE.md` 是 §10），不混进当前状态的叙述里。最近一次全量同步：
+2026-11-15。
 
 ## 阅读顺序
 
@@ -38,6 +42,7 @@
 
 * [guides/c-api.md](guides/c-api.md) — 如何构建/链接 C 库，单请求、流式、批量、多线程示例，调参与排查。
 * [guides/python.md](guides/python.md) — 如何安装/构建 wheel，Python 快速开始、批量、线程、chat、doctor 与故障排查。
+* [guides/onnx-inprocess.md](guides/onnx-inprocess.md) — 进程内 ONNX executor（`libsycl_infer_onnx`）的用法。
 
 ## 快速定位
 
@@ -80,5 +85,3 @@
 
 **一次性测量报告不进仓库。**`reports/` 在 `.gitignore` 里，其中内容永远不会被提交，所以仓库内
 任何文档都不引用它（含本文件）。有价值的数字必须连同它的测量条件一起写进本文档或 `AGENTS.md`。
-
-- [进程内 ONNX executor](guides/onnx-inprocess.md)

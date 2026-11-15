@@ -362,3 +362,16 @@ Qwen3.8-Flash-Next（`qwen4exp`，104 GiB，512 专家/top-10）走的是**另�
 
 实测、死胡同与完整开关见 [design/18-qwen4exp.md](18-qwen4exp.md)；GPU 侧 kernel 细节见
 [design/03-kernels.md §5.11](03-kernels.md)。
+
+---
+
+## 11. 历史记录
+
+* **“grouped dp4a 在 decode 慢 1.38x”是在错误的 tile 上测的**：当时 `dec_step` 的判据是
+  `n_tok <= 1`，一个**批式** decode（`n_tok = N > 1`）被当成 prefill，跑的是 M=8 的 tile，
+  7/8 是空行。现在 `dec_step` 看 `mode == 0`，decode 用自己的 M=1（单 token）/ M=2（批式）tile，
+  N=6/7/8/9 的步进是平坦的 75.5/78.7/78.7/87.9 ms。
+* **`PF_MOE_PERSIST`（work-stealing expert GEMM）** 在每种配置下都精确、但慢 3%：`PF_MOE_FLAT=1`
+  已经把行 tile 放进 grid，硬件会平衡上万个工作组，没有可去掉的串行化。保留为 A/B。
+* **experts 的 u4 store 与 K-quant 的 `kMoEPB` sweep**：见 `AGENTS.md` 的“routed experts: the
+  dead ends”，不在本文重复。

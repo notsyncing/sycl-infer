@@ -8,7 +8,7 @@
 ## 1. 数据结构
 
 ```cpp
-struct gen_params {                        // sampler.h:10-36
+struct gen_params {                        // sampler.h:14-52
     int    max_tokens = 256;
     float  temperature = 1.0f;
     float  top_p = 0.95f;
@@ -33,7 +33,7 @@ struct sample_logprobs {                   // `sampler.h` 的 `sample_logprobs`�
     std::vector<std::pair<int, float>> top;         // 最高在前的备选项
 };
 
-struct sampler_state {                     // sampler.h:45-50
+struct sampler_state {                     // sampler.h:61-70
     std::mt19937_64 rng;
     void seed(uint64_t s) { rng.seed(s); }
 };
@@ -43,7 +43,7 @@ struct sampler_state {                     // sampler.h:45-50
 
 | 来源 | 覆盖的字段 |
 |---|---|
-| `parse_params`（`src/server/server.cpp:100-158`） | 全部 |
+| `parse_params`（`src/server/request.cpp:24`） | 全部 |
 | CLI `gen`（`main.cpp` 的 CLI `gen` 分支） | 只有 `max_tokens`、`temperature`、`top_p`、`top_k` |
 
 CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是结构体默认的 1.0；CLI 也没有 `--seed`、`--min-p`
@@ -53,12 +53,12 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 `logit_bias`/`logprobs`/`need_score` 默认为空/false 时，`out` 是 `nullptr`、惩罚 pass 不进：默认路径
 既不复制 logits 也不跑 logprobs pass。
 
-`sampler_state` 每个序列一个（`sequence::ss`，`src/server/scheduler.h:24`），在 `scheduler::submit`
-里播种（`scheduler.cpp:55`）。
+`sampler_state` 每个序列一个（`sequence::ss`，`src/server/scheduler.h:26`），在 `scheduler::submit`
+里播种（`scheduler.cpp:74`）。
 
 ---
 
-## 2. 算法（`sample_token`，`src/engine/sampler.cpp:54-181`）
+## 2. 算法（`sample_token`，`src/engine/sampler.cpp:58-218`）
 
 输入是最后一步的 logits、`n_vocab`、`gen_params`、调用方给的 token 历史 `recent` 与 `sampler_state`；
 可选输出 `sample_logprobs * out`（默认 nullptr）。
@@ -107,7 +107,7 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 * **服务器（调度器）**：`sequence::recent` 在 prefill 结束后初始化为**整个 prompt**
   （`scheduler.cpp` 追加惩罚窗口 token 处），之后每个生成 token 追加（`:275`、`:381`）—— 惩罚窗口能看到完整上下文，
   最多回看 `repeat_last_n`（默认 64）个 token。
-* **单序列引擎路径**：`engine::generate_impl`（`engine.cpp:2455`）与 `generate_mtp`
+* **单序列引擎路径**：`engine::generate_impl`（`engine.cpp:4710`）与 `generate_mtp`
   （`spec/mtp.cpp` 的 `mtp_forward` 调用点、`:1435`）传的是 `out`，只含**已生成**的 token，不含 prompt。CLI 又不设置
   penalty，所以这条路上 `do_pen` 实际恒为 false。
 
@@ -123,16 +123,16 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
   停止字符串），不在采样器里；`stop_token_ids` 也没有实现（`parse_stop` 只收字符串或字符串数组，
   `server.cpp:197-213`）。
 * **EOS 判定在引擎/调度器**：`engine::is_eos(tok)` = `tok == tk.eos_id || tok == tk.eot_id`
-  （`src/engine/engine.h:617-619`），调度器里是同一条条件的内联版（`scheduler.cpp:293`、`:385`）；
+  （`src/engine/engine.h:1032-1034`），调度器里是同一条条件的内联版（`scheduler.cpp:221`、`:385`）；
   `ignore_eos` 控制是否忽略。采样器本身不处理 EOS。
 * 采样器**不读任何环境变量**，因此采样行为没有 `PF_*` A/B 开关。
 
 ---
 
-## 4. logprobs 报告（`fill_logprobs`，`sampler.cpp:17-50`）
+## 4. logprobs 报告（`fill_logprobs`，`sampler.cpp:21-54`）
 
 * 定义域是**惩罚 + `logit_bias` 之后、按 `inv_t` 缩放后的完整词表**，与 top_k / top_p / min_p 的截断
-  无关：第 7 步传进去的是 `lg`，不是候选数组 `cand`（`sampler.cpp:177-179`）。
+  无关：第 7 步传进去的是 `lg`，不是候选数组 `cand`（`sampler.cpp:214-216`）。
 * 两遍扫描：第一遍取 `mx`（`:18-24`），第二遍在 `double` 下累加 `exp(lg[i]*inv_t - mx)`（`:26-28`），
   `log_z = log(sum) + mx`（`:29`），`out->logprob = lg[chosen]*inv_t - log_z`（`:30`）。
   `temperature <= 0` 时 `inv_t = 1`，所以贪心路径报告的是 **T=1** 的 log-softmax。
@@ -140,14 +140,13 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
   对整词表建 `pair<float,int>` 再 `partial_sort` 前 k 个（`:39-45`），按 logprob **降序**。比较器只看
   `.first`，而 `std::partial_sort` 不稳定，所以同分项之间的顺序不保证。`tv` 是 `thread_local` 复用，
   但每个要报告的 token 仍要付两遍词表扫描加一次 partial sort。
-* 开关：调度器只在 `gp.wants_logprobs()` 时传 `&lp`，否则传 `nullptr`（`scheduler.cpp:271-274`、
-  `374-377`）；单序列引擎路径**从不**传 `out`（`engine.cpp` 的 `generate_mtp` 调用点、`spec/mtp.cpp:872`、`934`（两个 `mtp_forward` 调用点都不传 `out`）），所以 CLI
+* 开关：调度器只在 `gp.wants_logprobs()` 时传 `&lp`，否则传 `nullptr`（`scheduler.cpp:212`、`374-377`）；单序列引擎路径**从不**传 `out`（`engine.cpp` 的 `generate_mtp` 调用点、`spec/mtp.cpp:872`、`934`（两个 `mtp_forward` 调用点都不传 `out`）），所以 CLI
   没有 logprobs。
-* 上限：`top_logprobs` 被服务器夹到 `[0, 20]`（`server.cpp:151`、`:155`）。chat 的 `logprobs` 是 bool
+* 上限：`top_logprobs` 被服务器夹到 `[0, 20]`（`request.cpp:69-81`）。chat 的 `logprobs` 是 bool
   配 `top_logprobs`；completions 的 `logprobs` 是整数，同时决定 `logprobs` 与 `top_logprobs`
-  （`server.cpp:143-156`）。
+  （`request.cpp:69-81`）。
 * `need_score`：`best_of > n` 时由服务器打开（`handle_completion` 里 `g.need_score = true`，`server.cpp`），它只要求 `logprob`
-  —— 每个生成 token 的 chosen logprob 累加进 `choice_out::score`（`server.cpp:794-797`），再按分数降序
+  —— 每个生成 token 的 chosen logprob 累加进 `choice_out::score`（`server.cpp:226-229`），再按分数降序
   取前 `n`（`handle_completion` 的 `gen = score ? best_of : n`，`server.cpp`）。它不会顺手置位 `top_logprobs`，所以纯打分时 `top` 仍为空
   （`tests/engine/test_sampler.cpp:71-82` 就断言这一点）。
 
@@ -155,21 +154,21 @@ CLI 的 `--temp` 默认 **0.7**（`main.cpp` 的 `--temp` 默认值），不是�
 
 ## 5. 随机数与可复现性
 
-* 发生器是 `std::mt19937_64`（`sampler.h:46`），每序列一个 `sampler_state`；抽样只用一个
-  `std::uniform_real_distribution<double>(0.0, ksum)`（`sampler.cpp:166`）。
+* 发生器是 `std::mt19937_64`（`sampler.h:62`），每序列一个 `sampler_state`；抽样只用一个
+  `std::uniform_real_distribution<double>(0.0, ksum)`（`sampler.cpp:203`）。
 * 播种三处，`seed == 0` 时各用不同的兜底：
 
 | 位置 | `seed == 0` 时的兜底 |
 |---|---|
-| `scheduler::submit`（`scheduler.cpp:55`） | `steady_clock::now().time_since_epoch().count()` |
-| `engine::generate_impl`（`engine.cpp:2371`） | `std::random_device{}()` |
+| `scheduler::submit`（`scheduler.cpp:74`） | `steady_clock::now().time_since_epoch().count()` |
+| `engine::generate_impl`（`engine.cpp:4737`） | `std::random_device{}()` |
 | `engine::generate_mtp`（`spec/mtp.cpp:723`） | `std::random_device{}()` |
 
 * 显式 `seed != 0` 时三处都用请求的 seed，且第 `c` 个 choice 拿 `seed + c`（`gp_for_choice`，
-  `server.cpp:738-744`）。因为每序列一条独立的流，同 seed + 同请求的**随机数序列**与批处理无关；
+  `server.cpp:180-186`）。因为每序列一条独立的流，同 seed + 同请求的**随机数序列**与批处理无关；
   但同 seed 下并发请求的最终输出仍可能不同 —— 那不是采样器，是批量 GEMM 的累加顺序（见
   [09-server.md](09-server.md)）。
-* **贪心短路不消耗随机数**（`sampler.cpp:90-101`），所以 `temperature <= 0` 或 `top_k == 1` 的输出与
+* **贪心短路不消耗随机数**（`sampler.cpp:127-138`），所以 `temperature <= 0` 或 `top_k == 1` 的输出与
   seed 无关。
 * **MTP 路径没有随机采样**：它只在贪时下进入（`engine::generate_impl` 的 `gp.speculative_greedy()` 条件），verify 里的 bonus token 或走
   `sample_token`、或直接用设备 argmax（`spec/mtp.cpp:1354-1357`、`:1435`），对贪心二者等价。
