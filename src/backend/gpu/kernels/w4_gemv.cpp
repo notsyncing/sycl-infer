@@ -2418,6 +2418,13 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
     if (M < 2 || M > 32 || (K % 32) != 0) {
         return false;
     }
+    // M > 13 has an instantiation only for u4 (fmt 0) and grouped int8 (fmt 3):
+    // `nat_gemm_fmt`'s big branch is a no-op for k5/cb4, so reporting success
+    // here would skip the caller's oneDNN fallback and leave the output
+    // unwritten.  Decline those shapes instead.
+    if (M > 13 && fmt != 0 && fmt != 3) {
+        return false;
+    }
     // Sub-group width: a kernel declared with a reqd_sub_group_size the device
     // does not advertise throws at launch, so the width is a capability, and it
     // is read from the queue's device profile (a cached handle compare, not a
