@@ -164,7 +164,8 @@ token 数封在 `kMaxImgTokens` 以内，图像路径上这两个上限实际是
 ### 3.3 上传与指针翻译
 
 `upload`（`vision.cpp` 的 `vision_model::upload`）默认只上传设备内核真正读的张量
-（`PF_VISION_COMPACT=1`，qwen2vl 的 oneDNN 线性层注册成功后只需 norms/biases，约 3.7 MB）。
+（`PF_VISION_COMPACT=1`：`qwen2vl`/`deepseek41v` 的 oneDNN 线性层全部注册成功后只需 norms/biases，
+`qwen2vl` 约 3.7 MB；27B `qwen3vl` 的 `down`（n_ff = 4304）注册失败，仍是整文件 1:1 映射）。
 它把每个张量包成 `weight_span{host, bytes, off}` 交给
 `weights.upload_spans(std::move(spans), need, q, "mmproj ")`：store 持有排序后的 span 表、
 分配设备 blob 并逐 span 拷贝，`dev_ptr` 最终调用 `weights.ptr(host)` 做二分查找
@@ -221,15 +222,33 @@ bias → GELU → `mm.2` → bias）→ `q.wait()`。
 **队列必须 in-order**：各阶段数据依赖但启动器不发事件（没有 `ext_oneapi_submit_barrier`），因此要求
 in-order 队列（引擎队列即是）。测试也显式建 in-order 队列（`test_multimodal.cpp` 里建 in-order 队列处）。
 
-**线性层走 oneDNN int8（`PF_VISION_DNNL`，`qwen2vl` 默认开）**：`vit_gemm` 按 32-token 一组切 M、
+**线性层走 oneDNN int8（`PF_VISION_DNNL`；`qwen2vl` 与 `deepseek41v` 默认开，`qwen3vl` 默认
+关）**：`vit_gemm` 按 32-token 一组切 M、
 每个 tile 重读一遍权重块；5476 个 patch 就是每个线性层约 172 遍权重。`vision_model::upload` 为视
 觉塔建一个私有 `dnnl_gemm`，用 `add_weight(..., eager=false)`（懒模式：只为实际用到的 M 形状构建
 primitive，页面里各 crop 的 patch 数都不同）注册每个线性层与 merger 的 `mm.0`/`mm.2`，每次前向按
 `kMaxB*kMaxT` 行分块 `quantize()` + `gemm()`。`add_weight` 新增接受 F16/F32/BF16 源（mmproj 的
 线性层就是这些类型）。patch embedding 仍走 `vit_gemm`（K=592 不是 32 的倍数，且只占约 1% 的工
-作）；实例没接受的张量逐调用回退到 `vit_gemm`，所以不支持的 projector 仍能跑。校验：页面输出
-md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.9994），见
-`docs/PERFORMANCE.md` §7.4。
+作）；实例没接受的张量逐调用回退到 `vit_gemm`，所以不支持的 projector 仍能跑。**这个实例建在
+`upload(q)` 的队列上，所以只有 GPU 队列才会启用 int8 路径**：`--device cpu` 的 CPU 队列会打印
+`[vision] PF_VISION_DNNL needs a GPU queue; using vit_gemm` 并保持 `vit_gemm`（oneDNN 的 CPU
+int8 路径在合成的 ds41 塔上既慢又超精度门限，不能作为 CPU 前向的替代）。校验：`qwen2vl`
+的页面输出 md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.9994），见
+`docs/PERFORMANCE.md` §7.4；`deepseek41v` 的 17.6 s -> ~1.7 s、cos 0.9996 是 **GPU 队列上的
+塔级测量**，见 `docs/PERFORMANCE.md` §5.5。CPU 文本 + CPU 塔的整页路径实测视觉 18.3 s、
+全页 728 s、输出仍是 `HELLO 123`（2026-11-15，640x320，`--device cpu --cpu-threads 28`）。
+
+**`qwen3vl` 仍是 opt-in，理由是测量而不是"未测"（2026-11-14，27B / 2x A770，Release JIT
+构建，1036x1036 页面 = 5376 patch，单进程）**：`PF_VISION_DNNL=1` 把视觉编码从
+**37.9 s 降到 17.5 s（2.17x）**，生成的描述与 `vit_gemm` 基线内容一致、只有一个同义词差异
+（`layout` -> `spread`）；但 `n_ff = 4304` 不是 32 的倍数，`down` 投影无法注册到 `dnnl_gemm`
+（只注册 326 MiB，"partial"，blob 仍整文件），因此收益只覆盖 qkv/out/up/merger。精度上，
+256x256 合成图的 host/device 探针从恒等路径的 cos 1.0 / rel-L2 1.5e-5 变成 **cos 0.9976 /
+rel-L2 7%**（max|d| 16.3，`max|host|` 96.2），超过 `test_multimodal` 的 5e-3 host/device 门限；
+同一张报纸页的 OCR prompt 在 int8 路径下丢掉了页眉（"The Guardian / Wednesday 11 December
+2024"），正文逐字相同。35B 的 qwen3vl mmproj 在同一合成图上也是 `partial`（312 MiB，cos 0.9970 /
+rel-L2 7.8%），所以这不是 27B 的个例。等 `down` 也能走 int8（需要处理 K % 32 != 0）并复测后再考虑改默认。
+`PF_VISION_DNNL=0` 对三个 kind 都是完整回退。
 
 **多模态 prefill 走 mode 2（`PF_MM_BATCH_PREFILL`，默认开）**：图像 prompt 的 M-RoPE 与 `img_row`
 都是按 token 的、内核按 `[row*kMaxT + t]` 索引，正好是 `mm_write_step` 对 n 个 token 写出的连续
@@ -270,7 +289,7 @@ md5 不变、自检 cos 0.9991（host 参考与 fp32 device 路径本身是 0.99
 ### 3.6 视觉 kernel
 
 全部在 `src/backend/gpu/kernels/vit.cpp`，激活一律 fp32；`vit_gemm` 路径的权重是 BF16/F32（行主序
-`[N][K]`），qwen2vl 的线性层默认改走 oneDNN int8（§3.5）：
+`[N][K]`），`qwen2vl`/`deepseek41v` 的线性层默认改走 oneDNN int8（`qwen3vl` 需 `PF_VISION_DNNL=1`；§3.5）：
 
 | kernel | 启动几何 | 说明 |
 |---|---|---|

@@ -33,7 +33,10 @@ bool echo_on() {
     static const bool on = getenv("SI_ONNX_ECHO") != nullptr;
     return on;
 }
-// PF_ONNX_DNNL / PF_ONNX_MATMUL1X1: on unless set to 0.
+// PF_ONNX_DNNL is the older enable for the convolution branch (on unless set
+// to 0); it does not gate the matmuls, which have PF_ONNX_MATMUL1X1.  The
+// convolution's own policy is PF_ONNX_CONV_DNNL (conv_dnnl_policy()).
+// PF_ONNX_MATMUL1X1: on unless set to 0.
 bool conv_dnnl_on() {
     static const bool on = [] {
         const char * e = getenv("PF_ONNX_DNNL");
@@ -43,13 +46,10 @@ bool conv_dnnl_on() {
 }
 // The convolution primitive's own A/B, separate from the matmul path:
 // PF_ONNX_CONV_DNNL=0 keeps the SYCL kernel for the non-1x1 convolutions.
-bool conv_dnnl_conv_on() {
-    static const bool on = [] {
-        const char * e = getenv("PF_ONNX_CONV_DNNL");
-        return !e || atoi(e) != 0;
-    }();
-    return on;
-}
+// The policy (default 1: N >= 8 and a second sighting) is owned by
+// conv_dnnl.cpp and read here through the same function the launcher uses,
+// so this gate cannot default one way while the launcher defaults another.
+bool conv_dnnl_conv_on() { return conv_dnnl_policy() > 0; }
 bool conv_1x1_matmul_on() {
     static const bool on = [] {
         const char * e = getenv("PF_ONNX_MATMUL1X1");

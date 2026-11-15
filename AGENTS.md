@@ -54,7 +54,13 @@ agnostic: model types are selected through the public registry seam
 SYCL kernel library, a paged-KV continuous-batching engine with a reusable prefix
 cache, and an OpenAI-compatible HTTP server plus a CLI.
 
-The GPU path must keep working on `sycl::gpu_selector_v` and remains the default.
+The GPU path prefers a Level Zero device when one is present and otherwise
+falls back to `sycl::gpu_selector_v` (`src/device/device_select.h`); an explicit
+`ONEAPI_DEVICE_SELECTOR` still wins.  This is not cosmetic: a host that exposes
+the same card through both OpenCL and Level Zero makes `gpu_selector_v` pick
+OpenCL, and the OpenCL backend does not implement the SYCL Graph extension the
+decode path records (the run exits with a graph-extension error while a usable
+Level Zero device is enumerated).
 A host CPU backend (`src/backend/cpu`, selected with `--device cpu`) implements the same
 forward pass on the host and picks AVX2 / AVX-VNNI / AVX-512 at run time.  Dense
 (or hybrid) models can also be split across devices by layer with `--layer-map`
@@ -448,6 +454,9 @@ src/common/     quant.h (ggml block formats + host dequant), w8.{h,cpp} (SIn
                 exit_codes.h (the worker's exit codes: 78 = a startup
                 failure, do not retry)
 src/device/     device_profile.h (the `profile` struct + the registry API),
+                device_select.h (GPU choice: a Level Zero device when one is
+                enumerated, else `sycl::gpu_selector_v`; `ONEAPI_DEVICE_SELECTOR`
+                still wins - the OpenCL backend has no SYCL Graph),
                 device_registry.cpp (the `kDevices[]` list, name -> profile
                 selection, `PF_DEVICE_INFO` report, the cached `wg_clamped`),
                 profiles/<card>.cpp (one card's key, values and matcher each:
@@ -845,7 +854,10 @@ and the mmproj's `clip.projector_type` is cross-checked at load:
   `qwen3vl_merger` (concat 4 patches - a stride reinterpretation - -> mm.0 ->
   GELU -> mm.2).  Both paths agree to ~2e-4; `test_multimodal` checks that.
 * **The vision linears run on the text model's oneDNN int8 matmul**
-  (`PF_VISION_DNNL`, default on for `qwen2vl`; `=0` restores `vit_gemm`).
+  (`PF_VISION_DNNL`, default on for `qwen2vl` and `deepseek41v`; off for
+  `qwen3vl`, whose measured int8 path on the 27B is 2.17x but moves the
+  embedding (cos 0.9976) and drops page masthead OCR - see
+  `docs/PERFORMANCE.md` §5.5; `=0` restores `vit_gemm`).
   `vit_gemm` tiles M in 32-token groups and re-reads each weight block per
   tile - at 5476 patches that is ~172 passes over every linear; oneDNN reads
   each weight once per <=1024-row chunk.  `vision_model::upload` registers the
@@ -978,6 +990,23 @@ request (see [`docs/design/13-audio-video.md`](docs/design/13-audio-video.md)):
   vision-style blocks->post_ln->optional projection, emitting one embedding per
   remaining frame (= one token, one M-RoPE position each); `out_width` must equal
   text `n_embd`.
+  The five tower linears (fused qkv, attn out, ffn up/down, and the optional
+  `a.out` projection) can run on the text model's oneDNN int8 matmul instead of
+  `vit_gemm` (`PF_AUDIO_DNNL=1`).  `audio_model::linear_dnnl` mirrors
+  `vision_model::linear_dnnl`: M is chunked at `kMaxB*kMaxT`, activations are
+  quantized `do_split=false`, and residual/alpha keep the block order (`L.out`
+  and `L.down` carry the residual; `L.up` and the final projection do not).
+  `upload()` registers each tensor with `add_weight(host_ptr, host_ptr, type, K,
+  N, eager=false)`; a tensor the instance rejects falls back to `vit_gemm` per
+  call, so a partial registration is still correct.  K (=E or ff) must be a
+  multiple of 32.  **Default off**: there is no real audio mmproj in the test
+  set, and on the synthetic tower (E=64, 1 head, ff=128, 1 block,
+  `projection_dim=128`, 40 mel frames) the int8 path measures host/device
+  `max|diff|` **0.0722** (mean 0.0139, rms 0.0177, cos 0.99985) against
+  `test_multimodal`'s `5e-3 * max(1, max|host|)` = **0.0167** - 4.3x over the
+  exact-path gate - while the default `vit_gemm` path measures 2.4e-6.  So it
+  stays opt-in until a real mmproj can be measured on its own output.  The
+  upload prints one `[audio] dnnl int8 linears: n/m registered, X MiB` line.
 * Mixed requests are assembled by `mm_build_prompt_mixed_device`
   (`multimodal.cpp`): `mm_media_ref order` lists blocks in placeholder order,
   each media is encoded into its slice of `d_img_embd`, total rows capped at
@@ -1240,6 +1269,13 @@ silently produces a wrong number rather than an error.
   after syncing (`find src tests -name '*.cpp' -o -name '*.h' | xargs touch`, because
   rsync preserves mtimes and make will otherwise skip the recompile — which once
   had me reading a stale binary's output as a result).
+* **Do not pin OpenCL to "make the device selector deterministic".**  `sycl::gpu_selector_v`
+  used to choose this box's OpenCL GPU even though Level Zero was enumerated, and
+  the decode command graph does not exist on OpenCL (the run exits 78 with a
+  graph-extension error).  `src/device/device_select.h` now prefers Level Zero and
+  falls back to `gpu_selector_v`; an explicit `ONEAPI_DEVICE_SELECTOR` still wins.
+  A benchmark that sets `OPENCL` as a workaround is measuring a path the engine
+  cannot run.
 * **`llama-benchy` needs `--tokenizer Qwen/Qwen3.8-27B`, and only `https_proxy`.**
   The model *id* the server reports is `Qwen3.8-27B`, but that is not a Hub repo id;
   asking for it 401s and then burns minutes in a retry loop with the GPU idle.  Set
@@ -3246,6 +3282,18 @@ levers that remain are the same dense-Q5_K store question and the attention
 core.  Recommended: **18000 MB text-only** (ctx 32768 still fits: 495+838 MB
 free on card 0), 16000 when the vision tower's ~866 MB must fit.
 
+**2026-11-14 re-measure (warm page cache, 18000 MB, 234-token prompt):** 172.0
+ms/token prefill (attn 33.8-35.4, MoE 130.2-131.7, hit 70.3 %) and 136.1
+ms/token decode on an 80-token prompt differenced over 64 forward-only tokens.
+The earlier 124.3 decode and 156.4 prefill cells remain valid for their own
+conditions; the box drifts ~13 % between days and the bank hit rate is
+prompt-dependent.  The MoE is still 75-83 % of the prefill.  A batched dense
+prefill (one `forward_chunk`, oneDNN int8 at M=32/64) is **not implemented**;
+the per-shape microbench, the +2.4 GB int8-store cost, the state that must stay
+per-token and the 1.14-1.23x ceiling are in
+[`docs/design/23-deepseek41.md`](docs/design/23-deepseek41.md)
+("Batched prefill + oneDNN dense").
+
 Bank hit is saturated at ~60 % decode (R 20-24 against 384 experts);
 17000-19000 MB buys 1 % decode and 3-5 % prefill.  Two GEMV experiments bound it: growing the vec GEMV's work-group
 (16/32 rows instead of 8) is **neutral** (attention 89.8/90.4 vs 92.7 ms,
@@ -3305,8 +3353,8 @@ load-bearing:**
 1036x1036 page, `MTMD_DEBUG_EMBEDDINGS` gives 1369 tokens x 896 and a vision
 cos of **0.999997** (max|diff| 33 on a 69 RMS); a text prompt's first top-1
 matches (id 220); the layout boxes and text contents match (a few boxes differ
-by 1-2/1000).  The vision self-check (`PF_MINERU_DEBUG=1`) compares the host and
-device towers on a small crop.
+by 1-2/1000).  The vision self-check (`sycl-infer-mineru --debug`, crop side
+`PF_MINERU_PROBE`, default 56) compares the host and device towers.
 
 **Precision:** the int8 oneDNN path is the default and produces the same layout
 as f32.  `PF_F32=1` dequantizes the decoder linears and runs the generic f32
@@ -3544,17 +3592,45 @@ device is the 686 ms -> 282 ms.
   `Identity` borrow a dead input's buffer, and an elementwise op may reuse a
   same-shape input buffer; **never in a `Loop` body** - its carried values
   are read again on the next iteration and per-op liveness cannot see that.
-* **The convolutions run on oneDNN** (`src/backend/onnx/conv_dnnl.cpp`, the
-  `PF_ONNX_DNNL` switch, default on; group-1 only).  The weights stay in the
-  runtime's (C, kh, kw, M) layout and are reordered once into the
-  primitive's layout and cached; the epilogue (bias/scale/add/activation)
-  stays a separate kernel, so its semantics are the SYCL conv's exactly.
-  The layout call went 265 -> 208-215 ms and the whole 17-page document
-  1 150 -> 1 039-1 120 ms/page, with the digest **unchanged**.  The first
-  document after a service start pays ~5-7 s for primitive creation
-  (~100 shapes).  A **deconvolution** path was tried and **reverted**: its
-  output was wrong on the detector's 2x2 stride-2 transposed convolutions,
-  and the UNET's deconvs are only 26 ms of its forward.
+* **The convolutions run on oneDNN** (`src/backend/onnx/conv_dnnl.cpp`;
+  group-1 only - a grouped/depthwise convolution and every `ConvTranspose`
+  stay on the SYCL kernel).  `PF_ONNX_CONV_DNNL` is the convolution
+  primitive's policy and **one function reads it** (`conv_dnnl_policy()`,
+  default **1**): 1 builds a primitive from the *second* sighting of a
+  (weight, N, geometry) key and only for `N >= 8`, 0 never, 2 on the first
+  sighting at every batch.  The call-site gate and the launcher used to
+  default in opposite directions (gate on, launcher 0), so every non-1x1
+  convolution stayed on SYCL and per-model `"dnnl": true` did nothing.
+  The weights stay in the runtime's (C, kh, kw, M) layout and are reordered
+  once into the primitive's layout and cached; the epilogue
+  (bias/scale/add/activation) stays a separate kernel, so its semantics are
+  the SYCL conv's exactly.  Measured 2026-11-14 (one 101-page document,
+  layout batch 16, det batch 32, one A770, Release JIT, warm): the whole
+  document 101.0 -> 98.8 s (**2.2%**), the layout batch-16 call
+  2 709 -> 2 199 ms (**-19%**) and the det batch-32 call 891 -> 959 ms
+  (**+7.6%**); batch 2/4 are identical, which is the `N >= 8` boundary.
+  Markdown md5 identical throughout.  Policy 2 is 109.3 s warm (batch-1
+  crops dominate) and its old second-run md5 flip did not reproduce here;
+  it stays an A/B.  The first document after a service start pays ~5-7 s for
+  primitive creation (~100 shapes).  A **grouped/depthwise convolution**
+  (184 nodes across the model set: 27 in each layout detector, 17 in the OCR
+  detector, 57 in the formula recogniser, ...) stays on SYCL: it is 1-9% of
+  the forward and the warm oneDNN grouped primitive (mapping verified
+  element-wise, max abs 4.8e-07) is **2-4x slower**
+  (detector 47 -> 94.8 ms, layout 16 -> 61.5 ms), so there is no switch.
+  A **deconvolution** path was implemented, compared element-wise against
+  `conv_transpose2d_launch` (max abs 4.8e-07..7.6e-06) and **not enabled**.
+  The mapping is the part to keep: oneDNN's deconv weights are
+  `[dst][src][kh][kw]` (ONNX's ConvTranspose weight is `[src][dst/g]`), and
+  `padding_r = pads_end - output_padding` - the earlier attempt used `+`
+  and the convolution's weight order.  It is 4-26x faster per **batched**
+  call (det 78.8 -> 12.3 ms, UNET 5.24 -> 0.19), but its stream has to be
+  waited for and that drains the queued oneDNN convolutions behind each
+  call (the document's 528 deconv calls mix batch-1 crops and batch-32
+  detector calls): the 101-page document is 63.3/63.7 s on SYCL against
+  68.3/68.1 s on oneDNN with identical Markdown, so
+  `exec_conv_transpose` keeps the SYCL kernel (design/17 has the
+  measurements).
 * **bf16/XMX was probed, not adopted.**  oneDNN bf16 reaches 9-19 TFLOP/s
   on the shapes where XMX helps (C128 100x100 -> M256: 0.16 vs 0.56 ms f32;
   C96 64x240 -> M96: 0.13 vs 0.57) but the gain is shape-dependent (1.0x on
@@ -4346,6 +4422,17 @@ parts, **default off**; base64 `data:` URLs always work),
 addresses - an internal media server, and SSRF exposure again),
 `PF_AV_FFMPEG` (audio/video decode CLI path, default `ffmpeg`).
 
+**ONNX path**
+`PF_ONNX_CONV_DNNL`
+(the convolution primitive's policy: **1 default** = second sighting of a
+key and `N >= 8`, 0 = SYCL always, 2 = first sighting at every batch),
+`PF_ONNX_DNNL=0` (the older convolution switch, same effect as
+`PF_ONNX_CONV_DNNL=0`; it does not touch the matmuls),
+`PF_ONNX_MATMUL1X1=0` (keep a 1x1 stride-1 group-1 convolution on the direct
+kernel), `PF_ONNX_MM_DNNL_MIN=<MACs>` (keep a MatMul below that size on the
+SYCL kernel), `PF_ONNX_DNNL_BF16=1` (bf16 math on the f32 descriptors; an
+accuracy/speed A/B, not the default).
+
 **Diagnostics**
 `PF_GUIDED_DEBUG=1` (JSON-schema guided decoding: the compiled vocabulary's
 EOS ids, a dead-end report, and per-apply time plus simulated-token count),
@@ -4522,8 +4609,8 @@ call's activation quantizer into its u4 GEMV - 552 -> 142 launches/step,
 **Expert split / ncmoe / three-tier expert cache** (`--moe-resident N`,
 `--moe-vram-mb MB`, `--moe-ram-mb MB`; routed-MoE models only, see
 [`docs/design/15-moe-ncmoe.md`](docs/design/15-moe-ncmoe.md))
-`PF_MINERU_DEBUG` (MinerU: raw layout, per-block prints, host-vs-device vision self-check),
-`PF_MINERU_PROBE` (self-check crop side, default 56),
+`sycl-infer-mineru --debug` (MinerU: raw layout, per-block prints, host-vs-device
+vision self-check; not an env var - the crop side is `PF_MINERU_PROBE`),
 `PF_MINERU_NOMROPE` / `PF_MINERU_ZERO_EMBD` / `PF_MINERU_DUMP_EMBD` (MinerU A/B dumps),
 `PF_MINERU_TIME` (MinerU: one line per image with prep / vision / prefill-to-first-token /
 decode / total ms, plus the mmproj load+upload time),
@@ -4531,12 +4618,26 @@ decode / total ms, plus the mmproj load+upload time),
 the per-stage totals over all layers - ln1, qkv, rope, attn, out, ln2, up, act, down -
 taken with a `q.wait()` per stage, so only the diagnostic pays for them),
 `PF_VISION_DNNL` (vision linears on the oneDNN int8 matmul; default **on** for
-`qwen2vl` and **off** for `qwen3vl`, whose BF16 tower has not been measured here;
+`qwen2vl` and `deepseek41v`, **off** for `qwen3vl`: its measured int8 path is
+2.17x faster (27B, 1036x1036 page, 37.9 -> 17.5 s) but `n_ff = 4304` leaves
+`down` on `vit_gemm`, the host/device embedding moves to cos 0.9976 / rel-L2
+7 % (the exact path is 1.0 / 1.5e-5) and an OCR prompt drops the page masthead,
+so it stays opt-in - `docs/PERFORMANCE.md` §5.5;
 `0` restores `vit_gemm`),
 `PF_VISION_COMPACT=0` (restore the whole-file mmproj blob; the default uploads only
 the 3.7 MB the device kernels read),
 `PF_VISION_DEFER_QKV=0` (build the combined qwen2vl q|k|v f32 view at load; the
 default builds it on demand, saving 0.67 s and 148 ms of H2D per page),
+`PF_VISION_DNNL` (vision tower linears on the oneDNN int8 matmul; default on
+for `qwen2vl` and `deepseek41v`, off for `qwen3vl`; **GPU queue only** - a CPU
+queue prints one fallback line and keeps `vit_gemm`, so the CLI `--device cpu`
+path (18.3 s tower, 728 s full page, `HELLO 123`) is not the 17.6 -> 1.7 s
+GPU-queue cell),
+`PF_AUDIO_DNNL` (audio tower linears on the oneDNN int8 matmul; **default off**:
+the only available tower is synthetic, where the int8 path moves the
+host/device `max|diff|` to 7.2e-2 against `test_multimodal`'s 1.7e-2 gate, so it
+stays opt-in until a real audio mmproj is measured; `0` keeps `vit_gemm`.
+`docs/design/13-audio-video.md` §3.2.1 has the shapes and numbers),
 `PF_DNNL_LAZY` (text oneDNN primitive ladder lazy: create each M on first use,
 except M=1, which is primed for the recorded decode graph; default on for a
 multi-device partition without MTP/DFlash),
@@ -5026,10 +5127,11 @@ attention (`PF_DEC_GROUP`) is exactly the sharing kernel - "one warp owns all
 HPG heads of a kv head: K/V are loaded once per key and reused from registers
 for every head" - and it is the one thing that could have taken the 8x K/V
 re-read out of the decode attention at 256k.  But it requires the **256-wide
-head** (`constexpr int HD = 256`) and the 35B A3B has head_dim 128, so
-`PF_DEC_GROUP=1` silently falls back to the classic kernel: **50.0 vs 49.9
-ms/tok at 64k and 90.0 vs 90.1 at 256k**, identical because the knob does
-nothing.  The file's older "5x slower on the A770" note was measured on a model
+head** (`constexpr int HD = 256`) and a **4:1 GQA group**
+(`n_head / n_head_kv == 4`); the 35B A3B has head_dim 256 but 16 query / 2 kv
+heads (8:1), so `PF_DEC_GROUP=1` silently falls back to the classic kernel:
+**50.0 vs 49.9 ms/tok at 64k and 90.0 vs 90.1 at 256k**, identical because the
+knob does nothing.  The file's older "5x slower on the A770" note was measured on a model
 whose classic kernel has 4 query heads per kv head; on one with 8 the grouped
 kernel would have 8x fewer warps, which is the wrong direction for a
 latency-bound kernel.

@@ -145,6 +145,51 @@ log-mel [n_frames][n_mel]
   ln2 → up → +bias → GELU → `x += down_b` → down GEMM 带 residual（`audio_model::encode_device` 的 FFN 段，
   `500-501` 的注释明说是"mirroring the vision encoder's block order"）。
 
+#### 3.2.1 线性层的 oneDNN int8 路径（`PF_AUDIO_DNNL`，opt-in）
+
+五个线性层——融合 `attn_qkv`、`attn_out`、`ffn_up`、`ffn_down` 和可选的 `a.out` 投影——可以改走文本
+模型同一条 oneDNN int8 matmul，开关是 **`PF_AUDIO_DNNL`，默认 0（关）**：
+
+* `audio_model::upload` 在开关打开时新建一个私有 `dnnl_gemm`，对每层
+  `a.blk.N.{attn_qkv,attn_out,ffn_up,ffn_down}` 和 `a.out` 调
+  `add_weight(host_ptr, host_ptr, type, K, N, eager=false)`。融合 qkv 本来就是 `[3E][E]`，直接注册，
+  不需要像 qwen2vl 那样拼三个张量。`eager=false` 跳过 prefill 的 M 阶梯，因为这座塔只会请求
+  语句长度决定的少数几个 `n_out`。
+* 每个调用点写成 `if (!linear_dnnl(...)) vit_gemm_launch(...)`。`linear_dnnl` 的契约和
+  `vision_model::linear_dnnl` 相同：M 按 `kMaxB*kMaxT` 分块，激活用
+  `quantize(..., do_split=false)`，`out = alpha*W*x + residual`。未注册（或 oneDNN 拒绝的形状）
+  的张量逐次回退 `vit_gemm`，所以**部分注册仍然正确**，只是那几层回到旧速度。
+* 残差/偏置顺序保持不变：`L.out` 和 `L.down` 的 GEMM 带 `residual`（`vit_add_bias` 先把 bias 加进
+  residual），`L.up` 和最终 `a.out` 投影不带 residual、由随后的 `vit_add_bias` 加 bias。`W == E`
+  时仍直接 `vit_copy`，`a.out` 不参与（与 host 参考一致）。
+* 形状约束：`add_weight` 要求 `K % 32 == 0` 且 `K <= kActMaxK`；这里 K 是 E 或 ff。**N 没有 32 的
+  约束**（`a.out` 的 `proj_dim` 可以是任意值），oneDNN 的 M 也是任意行数。
+* 打开时 upload 打印一行 `[audio] dnnl int8 linears: n/m registered, X MiB`。
+
+**合成塔对拍（不是真实音频模型）。** 测试集中没有真实音频 mmproj，所以唯一的证据是一个合成的
+AuT 塔：`E=64, n_head=1 (head_dim=64), ff=128, n_layer=1, n_mel=128, n_pos=64,
+projection_dim=128`，conv `C=64`，全部 F32 随机权重，40 帧 log-mel（`n_out=20`）。
+`test_multimodal` 的 `test_audio_encoder` 门限是 `max|host-dev| <= 5e-3 * max(1, max|host|)`：
+
+| `PF_AUDIO_DNNL` | max\|d\| | mean\|d\| | rms | cos | 门限 | 结论 |
+|---:|---:|---:|---:|---:|---:|---|
+| 0（`vit_gemm`） | **2.4e-06** | 3.8e-07 | 4.9e-07 | 1.00000000 | 1.67e-02 | 通过 |
+| 1（oneDNN int8） | **0.0722** | 0.0139 | 0.0177 | 0.99985 | 1.67e-02 | **超门限 4.3x** |
+
+（`max|host|` = 3.348，门限 = 0.0167；数字来自 `test_audio_encoder` 和一个直接调用
+`encode_host`/`encode_device` 的探针，40 帧，2x A770、oneAPI 2026.2、JIT Release。）
+
+**因此默认保持 0，且不放松测试门限。** int8 路径的误差是权重/激活的 per-32-group 量化
+（cos 0.99985 对应约 1.7 % 相对 L2），在 1 层、随机权重的合成塔上就已经如此；真实塔通常更深、
+`ff` 更大，误差会继续累积。等拿到真实音频 mmproj 后应在**它自己的输出**上重测：若误差落在门限内
+且确有速度收益，才考虑改默认。合成塔的 wall（约 0.94 ms -> 0.59 ms，20 行、1 层）只反映 launch
+开销，**不作为性能结论**，所以不进 `docs/PERFORMANCE.md`。
+
+合成 GGUF 自身的两个形状细节（生成脚本不在仓库里）：conv 权重在文件里的 dims 是
+`(tap, 1, in, out)`，而 `conv1d_all`/`at_conv1d_launch` 读取的行内布局是 `[out][tap][in]`（与它们的
+`wr[tap*x_in + i]` 索引一致）；所有张量必须是 F32（F64 会被 `dequant_row` 以
+`unsupported weight type 28` 拒绝）。
+
 ### 3.3 缺权重时的行为
 
 `--audio` / `input_audio` 请求在音频塔未加载时收到明确错误：服务端返回 400
@@ -227,7 +272,7 @@ prompt；decode 侧 `engine::mm_decode_rope_` 让模型自有的 decode 入口�
   序号（帧序），无分段。Q 与 K 在 fused qkv 行的前 2/3。
 
 上传整塔权重后复用 `vit_gemm`/`vit_layernorm`/`vit_gelu`/`vit_add_bias`/`vit_add`/`vit_attn`/
-`vit_copy`。
+`vit_copy`（线性层可改走 oneDNN int8，见 §3.2.1；默认仍是 `vit_gemm`）。
 
 ## 6. 调用点
 

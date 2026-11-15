@@ -1112,8 +1112,9 @@ i4 读取细节：`i4_ld4` 用**一次对齐 16-bit 加载**取 4 个 nibble（`
 
 ## 12. 视觉编码器 kernel（`vit.cpp`）
 
-mmproj 的线性层在文件里是 BF16（type 30）或 F32（type 0）、行主序 `[N][K]`。qwen2vl 默认把它们
-注册到文本模型的 oneDNN int8 矩阵乘（`PF_VISION_DNNL`），只有 norms/biases、patch embedding 和未被接受的张量仍由
+mmproj 的线性层在文件里是 BF16（type 30）或 F32（type 0）、行主序 `[N][K]`。`qwen2vl` 与
+`deepseek41v` 默认把它们注册到文本模型的 oneDNN int8 矩阵乘（`PF_VISION_DNNL`；`qwen3vl` 默认
+不注册、需 `=1`，原因见 `docs/PERFORMANCE.md` §5.5），只有 norms/biases、patch embedding 和未被接受的张量仍由
 `vit_*` kernel 直接读；`vit_gemm` 仍是 host 参考与回退路径。
 
 | kernel | 说明 |

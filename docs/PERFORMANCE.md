@@ -529,7 +529,20 @@ process pays the one-time f32 dequantization of the ~5.7 GiB dense weights
 | chat `2+2` / image chat (thinking off) | `4` / `HELLO 123` |
 | prefix cache, 42-token prompt (32 reused) | 114.5 s -> **41.8 s** (2.74x), logits identical |
 | prefix cache, 12-token exact repeat | 45.5 s -> **17.0 s** (2.68x) |
-| vision tower, 640x320 -> 202 tokens | 17.6 s device (bf16 `vit_gemm`); `PF_VISION_DNNL=1` ~1.7 s, cos 0.9996 vs clip |
+| vision tower, 640x320 -> 202 tokens | **17.6 s on the bf16 `vit_gemm` path -> ~1.7 s with the default oneDNN int8 linears** (`PF_VISION_DNNL` is on for `deepseek41v` since 2026-11-14), cos 0.9996 vs clip. This is a **GPU-queue tower** cell; the CLI `--device cpu` path encodes on the CPU queue, prints the fallback line, measures 18.3 s with `vit_gemm` and a 728 s full-page wall, and still outputs `HELLO 123` (2026-11-15) |
+| vision tower, **27B `qwen3vl`**, 1036x1036 -> 1344 tokens | **37.9 s** with the default `vit_gemm`; **17.5 s** with `PF_VISION_DNNL=1` (opt-in) - see the note below |
+
+The `qwen3vl` row: 27B (`Qwen3.8-27B-UD-Q4_K_M` + `mmproj-BF16`), 2x A770
+(`--layer-map 0-31:gpu.0,32-63:gpu.1`), **Release JIT** build, one process per
+cell, `gen --image` of a 1036x1036 newspaper page, greedy, 2026-11-14.  The
+`[vtime]` encode totals are 37915 ms (`vit_gemm`) and 17490 ms (int8),
+`np=5376 n_out=1344 L=27`.  It stays opt-in rather than default because
+`n_ff = 4304` is not a multiple of 32, so only qkv/out/up/merger register
+(`[vtime] dnnl vision: partial`, 326 MiB) and `down` keeps `vit_gemm`; the
+host/device probe on a 256x256 synthetic image is cos 0.9976 / rel-L2 7 %
+against 1.0 / 1.5e-5 for the exact path (`test_multimodal`'s 5e-3 host/device
+check fails), and an OCR prompt loses the page masthead while the body text
+matches.  `PF_VISION_DNNL=0` disables the path for every tower.
 
 GPU kernel microbenchmarks (one A770, AOT/JIT device code, warm clocks):
 
@@ -543,9 +556,31 @@ GPU kernel microbenchmarks (one A770, AOT/JIT device code, warm clocks):
 | compressor | ratio 2, 8 groups | 0.051 ms | - |
 | indexer score | 512 rows, 32x128 | 0.014 ms | - |
 
-The host decode is 1.08 tok/s.  **GPU path (2x A770, measured 2026-11-07,
-JIT, ctx 512, `--device gpu --layer-map 0-19:gpu.0,20-39:gpu.1
---moe-vram-mb 16000 --max-slots 1`, greedy, one process per cell):** dense
+The host decode is 1.08 tok/s.  **GPU path (2x A770, re-measured
+2026-11-14 on the current HEAD, i.e. with the dense k5 stores; Release JIT,
+ctx 512, `--device gpu --layer-map 0-19:gpu.0,20-39:gpu.1 --max-slots 1`,
+greedy, model pages warm -- one process per cell, the *second* process after a
+first one faulted the 155 GiB of expert pages in).**  Prefill-only
+(`--max-tokens 0`, `PF_DS41_TIME=2 PF_DS41_STATS=1`): 234-token prompt
+**172.0 ms/token at 18000 MB** (attn 33.8-35.4 + MoE 130.2-131.7, bank hit
+70.3 %) and **183.8 at 16000 MB** (attn 35.8 + MoE 140.5, hit 67.1 %); a
+12-token prompt (`The capital of France is Paris and the capital of Germany
+is`, 16 words) reads 262.1 on its first forward and ~200 steady (attn 26.5 +
+MoE 165.6, hit 58.0 %).  Decode, differenced over 64 forward-only tokens from
+an 80-token prompt: **136.1 ms/token (7.35 tok/s)** at 18000 MB.  The dense
+projections sum to **28.8 ms/token** (sum of per-call microbench times over 40
+layers: `wq_a` 0.117, `wq_b` 0.125, `wkv` 0.024, `wo_a` 8x0.027, `wo_b` 0.123,
+shared ffn 0.113 ms per layer), against an `attn` phase of 33.8-35.4 ms that
+also contains the MLA core.  The pre-store paragraph below (2026-11-07) quotes
+271-276 decode and 156-175 prefill; those predate the k5 stores and a warm
+page cache and are superseded by the cells above.  The batched-dense
+alternative, its per-shape oneDNN microbench and the 1.15-1.18x ceiling are in
+`design/23-deepseek41.md` ("Batched prefill + oneDNN dense"); no batched
+prefill is implemented.
+
+**GPU path (2026-11-07, pre-dense-store).**  ctx 512, `--device gpu
+--layer-map 0-19:gpu.0,20-39:gpu.1 --moe-vram-mb 16000 --max-slots 1`, greedy,
+one process per cell: dense
 5.74 GiB is resident (3.4 / 2.35 GiB), the bank is 14.6 GiB split across the
 two cards (card0 20 / card1 22 slots of its own expert half), the hit rate is
 **59.8 %**, and each layer's routed experts are split so both PCIe links upload
@@ -728,6 +763,126 @@ never crosses the wire; the executor now holds 443 MiB at batch 1 instead of
 input buffers.  The full table and the dead ends are in
 [`design/17-onnx-service.md`](design/17-onnx-service.md).
 
+### 7.1.1 The oneDNN convolution policy (`PF_ONNX_CONV_DNNL`)
+
+The convolution primitive has its own policy; the default is **1** (build
+from the second sighting of a (weight, N, geometry) key, and only for
+`N >= 8`).  Conditions: one Arc A770 16 GB, Release **JIT** build
+(`-DSI_ONNX=ON`), warm page cache, one process per cell, 2026-11-14.  The
+document is a 101-page annual report, the pipeline's default batches
+(layout 16, OCR det 32, table structure 64), and `RapidDoc`'s in-process
+`libsycl_infer_onnx` backend.
+
+Whole document (Markdown md5 `2f49cef6...` in every cell):
+
+| policy | first run (pays first-use JIT) | warm run | vs policy 0 |
+|---|---:|---:|---:|
+| 0 (`PF_ONNX_CONV_DNNL=0`) | 109.9 s | **101.0 s** | - |
+| **1 (default)** | 108.3 s | **98.8 s** | **-2.2 s (-2.2%)** |
+| 2 | 119.3 s | 109.3 s | +8.3 s (+8.2%) |
+
+Isolated model calls, steady state (best/typical of 5-6 reps):
+
+| model | batch | spatial | policy 0 | policy 1 | delta |
+|---|---:|---|---:|---:|---:|
+| layout (`pp_doclayoutv3`) | 2 | 800x800 | 383 ms | 383 ms | 0 |
+| layout | 4 | 800x800 | 718 ms | 722 ms | 0 |
+| layout | 8 | 800x800 | 1 374-1 397 ms | 1 117-1 131 ms | **-19%** |
+| layout | 16 | 800x800 | 2 699-2 728 ms | 2 198-2 212 ms | **-19%** |
+| OCR det (`PP-OCRv6_det_small`) | 32 | 960x960 | 891-931 ms | 959-1 003 ms | **+7.6%** |
+
+Two things follow, and both are why the default is a policy rather than a
+flag.  The gain is **one model**: the layout detector's 800x800 batches (six
+of the seven calls are batch >= 8; the 5-page tail stays on SYCL), and that
+is the whole 2.2 s of the document.  The detector is slightly slower because
+61 of its 83 convolutions are 1x1 and already take the oneDNN matmul path,
+leaving only the 3x3 remainder to pay the primitive's overhead.  And the `N >= 8` boundary is measured, not
+assumed: batch 4 is identical and batch 8 is the first size where oneDNN
+wins.  Policy 2 applies the primitive to batch-1 crops (the table UNET),
+which is where its extra 10 s comes from; its historical second-run md5 flip
+(one OCR cell) did **not** reproduce on this document in three consecutive
+runs, but the speed result alone keeps it opt-in.  `"dnnl": false` per
+model is a bigger hammer - it disables the matmuls too - and measures
+3 141 ms against the default's 2 199 ms on the layout batch-16 call.
+
+### 7.1.2 Grouped/depthwise Conv and ConvTranspose: measured, not enabled
+
+Two coverage gaps were priced before any code was kept.  Conditions: one
+Arc A770 16 GB, Release JIT, 2026-11-14; the device time is
+`SI_ONNX_TIME=1` (a wait after every operator, so **only the shares** are
+meaningful), and the kernel cells are standalone launches with the oneDNN
+primitive warmed.
+
+**Grouped/depthwise `Conv`.**  Group>1 nodes are spread across the whole
+set (184 in the 13 model files here; 27 in each layout detector, 17 in the
+OCR detector, 57 in the formula recogniser, 15 in the classifier, 14 in the
+recogniser/seal detector, 13 in the orientation model).  The share was
+measured on the two that dominate the document's time:
+
+| model (call) | group>1 nodes | share of the operator sum | group>1 ms |
+|---|---:|---:|---:|
+| layout, batch 16, 800x800 | 27 | 1.0-1.5% | 16 of 1 049 |
+| OCR det, batch 32, 960x960 | 17 | 9.0% | 47 of 520 |
+
+(The operator sum is `SI_ONNX_TIME`'s waits; the call's wall time also
+contains host/upload work, so the wall share is smaller.)
+
+A oneDNN grouped primitive is expressible with the weights as
+`[G][O/G][I/G][kh][kw]` (a strided view of the runtime's `(C,kh,kw,M/g)`);
+that mapping was checked element-wise against the SYCL kernel (max abs
+4.8e-07), so the rejection is on speed only.  Warm, it is **2x slower** on the detector's shapes (47 -> 94.8 ms) and
+**4x slower** on the layout's (16 -> 61.5 ms); the first call also pays the
+primitive build.  With a 1-9% share that is not recoverable, so the SYCL
+kernel stays and no switch was kept.
+
+**`ConvTranspose`.**  Four calls matter: the OCR detector's 2x2 stride-2
+(`C24 -> M24` 240x240 -> 480x480 and `C24 -> M1` 480x480 -> 960x960, pads 0)
+and the table UNET's 3x3 stride-2 with pads 1 / output_padding 1
+(`C128 -> M64` 36x128 -> 72x256, `C64 -> M16` 72x256 -> 144x512).  A oneDNN
+`deconvolution_forward` compared element-wise with
+`conv_transpose2d_launch` on random data:
+
+| case | max abs | rel RMS |
+|---|---:|---:|
+| det 24->24, 2x2 s2 | 4.8e-07 | 7.7e-08 |
+| det 24->1, 2x2 s2 | 0 | 0 |
+| UNET 128->64, 3x3 s2 p1 op1 | 7.6e-06 | 3.6e-07 |
+| UNET 64->16, 3x3 s2 p1 op1 | 5.3e-06 | 2.7e-07 |
+| grouped 8->12 (g4), 3x3 s2 p1 op1 | 8.9e-08 | 4.4e-08 |
+| dilation 2, 3x3 s1 p1 | 2.4e-07 | 1.0e-07 |
+
+The mapping that makes them agree is in
+[design/17-onnx-service.md](design/17-onnx-service.md): oneDNN's deconv
+weights are `[dst][src][kh][kw]` (the transpose of ONNX's ConvTranspose
+weight), and `padding_r = pads_end - output_padding` (oneDNN has no output
+padding).  Warm kernel cells (SYCL -> oneDNN): detector 24->24 **78.8 ->
+12.3 ms (6.4x)**, detector 24->1 12.7 -> 12.2, UNET 128->64 **5.24 -> 0.19
+(26x)**, UNET 64->16 **2.56 -> 0.65 (3.9x)**.
+
+The document, however, goes the other way.  Its 528 deconv calls mix
+batch-1 table/UNET crops (80x80 -> 160x160 and similar, where the kernels
+cost 0.05-0.5 ms) with the detector's batch-32 calls, and every oneDNN call
+must be waited for before the caller's next SYCL operation (a oneDNN stream
+is not ordered against a following `memcpy`; without the wait the output
+reads zeros, 3/3 reproductions).  That wait drains the oneDNN convolution
+work queued behind it: the instrumented run logged **8.4 s of deconv time
+over the document** (a 41.8 ms first call of a shape, 3.7 ms steady on one
+detector shape whose standalone kernel is 12.3 ms), and the wall is +4.8 s:
+
+| 101-page document | warm | Markdown |
+|---|---:|---|
+| SYCL deconvolution | **63.3 / 63.7 s** | identical |
+| oneDNN deconvolution | 68.3 / 68.1 s (**+7.5%**) | identical |
+
+(The in-process harness here batches differently from §7.1.1's 98.8 s cell and
+the 63-67 s arms run with `formula_enable=False`; the formula-on arms are
+66.4 s (SYCL) and 71.4 s (oneDNN), so only the within-session delta is
+compared.)  OneDNN also refuses a
+primitive for one constructible shape, `N=32 C=24 480x480 -> M24` (`N<=16`
+works).  The batched-call win is real, but the document does not batch its
+deconvolutions and an 8% end-to-end regression is not a default, so
+`exec_conv_transpose` keeps the SYCL kernel and the code was reverted.
+
 ### 7.2 The formula recogniser
 
 The only model here whose loop runs the body (1 742 operators) per iteration:
@@ -856,9 +1011,11 @@ empty KV) and `b` is the attention over the KV:
 | 27B | 74.3 ms | 0.439 µs/token |
 | 35B A3B | 37.8 ms | 0.202 µs/token |
 
-The 27B's slope is 2.2x the 35B's because its 16 attention layers have
-head_dim 256 over 4 kv heads (each kv head is read six times per layer), while
-the 35B's 20 attention layers have head_dim 128 over 8 kv heads.
+The 27B's slope is 2.2x the 35B's because its 16 full-attention layers have
+24 query / 4 kv heads at head_dim 256 (six query heads per kv head), while the
+35B has 10 full-attention layers with 16 query / 2 kv heads at the same
+head_dim 256 (eight query heads per kv head), so the 27B reads more KV and
+re-reads each kv head more often per token.
 
 **qwen4exp is the exception: its decode steps up at the sparse-QSA boundary and
 grows with depth.**  The 512-depth cell (QSA off/dense) is 88.2 ms; the sparse

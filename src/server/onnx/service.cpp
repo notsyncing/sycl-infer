@@ -12,6 +12,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "device/device_select.h"
 #include "httplib.h"
 #include "json.hpp"
 
@@ -69,23 +70,29 @@ bool parse_model_spec(const std::string & spec, std::string & id, std::string & 
 sycl::device pick_device(const std::string & name) {
     if (name == "CPU" || name == "cpu" || name == "host") return sycl::device{sycl::cpu_selector_v};
     if (name == "AUTO" || name == "auto" || name.empty()) {
-        if (sycl::device{sycl::gpu_selector_v}.is_gpu()) return sycl::device{sycl::gpu_selector_v};
+        // Prefer Level Zero when the same card is also visible through OpenCL
+        // (device_select.h).  The ONNX executor does not record a command graph,
+        // but the LLM workers that share this host do, and a `gpu.N` index must
+        // address the same list everywhere.
+        const std::vector<sycl::device> gpus = si::dev::gpu_devices();
+        if (!gpus.empty()) return gpus.front();
         return sycl::device{sycl::cpu_selector_v};
     }
     if (name.rfind("GPU.", 0) == 0 || name.rfind("gpu.", 0) == 0) {
         const int idx = atoi(name.c_str() + 4);
-        int n = 0;
-        for (const auto & d : sycl::device{sycl::gpu_selector_v}.get_devices()) {
-            if (n++ == idx) return d;
+        const std::vector<sycl::device> gpus = si::dev::gpu_devices();
+        if (idx < 0 || idx >= (int)gpus.size()) {
+            throw std::runtime_error("there is no GPU with the index " + name);
         }
-        throw std::runtime_error("there is no GPU with the index " + name);
+        return gpus[(size_t)idx];
     }
     if (name == "GPU" || name == "gpu") {
-        if (!sycl::device{sycl::gpu_selector_v}.is_gpu()) {
+        const std::vector<sycl::device> gpus = si::dev::gpu_devices();
+        if (gpus.empty()) {
             fprintf(stderr, "[onnx] no GPU is available; running on the CPU\n");
             return sycl::device{sycl::cpu_selector_v};
         }
-        return sycl::device{sycl::gpu_selector_v};
+        return gpus.front();
     }
     throw std::runtime_error("unknown device '" + name + "'");
 }

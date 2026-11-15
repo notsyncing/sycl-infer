@@ -610,7 +610,10 @@ in the captured corpus: the captured pages have no formulas.)
 **The performance** (one Arc A770, one 800x800 page, the layout detector):
 **129-141 ms of service call**, of which the convolutions are 93-103 ms, the
 top-k **4**, the matmuls 9 (bias and the fused activation included) and the
-Concats 5.5.  The mask-to-box head - six reductions and ten 48 MB intermediates in
+Concats 5.5.  The non-1x1 convolutions run oneDNN's f32 primitive above
+batch 7 and from the second sighting of a shape (`PF_ONNX_CONV_DNNL`,
+default `1`); on a 101-page document that is 2.2% of the whole pipeline and
+19% of the layout model's batch-16 call, with byte-identical Markdown.  The mask-to-box head - six reductions and ten 48 MB intermediates in
 the model as exported - is one 0.2 ms scan now.  The service's call is
 129-141 ms at batch 1 and 146 ms per page at batch 2; the pipeline drops the
 48 MB mask output (`drop_outputs`), so it never crosses the wire.  The full

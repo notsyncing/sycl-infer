@@ -127,8 +127,10 @@ attention 内核；为此增加了：
 * `vit_quick_gelu_launch`（视觉 block）和 `vit_gelu_errf_launch`（merger）；
 * `vit_silu_mul_launch`（f32 文本路径的 `silu(gate)*up`）。
 
-**线性层走文本模型的 oneDNN int8 矩阵乘**（`PF_VISION_DNNL`，qwen2vl 默认
-开）。`vit_gemm` 按 32-token 一组切 M、每个 tile 重读一遍权重：5476 个 patch
+**线性层走文本模型的 oneDNN int8 矩阵乘**（`PF_VISION_DNNL`；`qwen2vl` 与
+`deepseek41v` 默认开，`qwen3vl` 默认关、需显式 `=1`——三种 kind 的默认值
+与 `qwen3vl` 的实测原因见 `docs/design/10-multimodal.md` §3.5）。
+`vit_gemm` 按 32-token 一组切 M、每个 tile 重读一遍权重：5476 个 patch
 就是每个线性层 172 遍权重。`vision_model::upload` 建一个私有 `dnnl_gemm`，
 懒注册（`add_weight(..., eager=false)`）32 层的 qkv/out/up/down 与 merger 的
 `mm.0`/`mm.2`，每次前向按 `kMaxB*kMaxT` 行分块量化 + 相乘。qwen2vl 的
@@ -376,7 +378,7 @@ SIGSEGV，所以整页差距远大于单步差距；单请求的保守数字引�
 |---|---|
 | `PF_F32=1` | 文本线性层走 f32（默认 int8） |
 | `PF_VISION_F32=1` | 视觉线性层反量化成 f32（qwen2vl 默认走 oneDNN int8；qwen3vl 保持文件里的 BF16/F32；合并的 qkv f32 视图只在 host/回退时按需构建） |
-| `PF_VISION_DNNL=0` | 视觉线性层回退到 `vit_gemm`（qwen2vl 默认走 oneDNN int8） |
+| `PF_VISION_DNNL=0` | 视觉线性层回退到 `vit_gemm`（`qwen2vl`/`deepseek41v` 默认走 oneDNN int8；`qwen3vl` 默认 `vit_gemm`，`=1` 才启用） |
 | `PF_VIT_ATTN=N` | 80 维头的 attention 形状（`70` 默认 = ILP 48/32/1024、SG16、RQ2/RQP2；0=32/32/512 回退；1=64/16/512，2=32/32/1024，3=16/32/512，4=32/32/256，5=64/16/1024，6=48/32/1024 非 ILP，7=16/64/1024，60=48/32/1024 SG16，71=SG32，72=RQ4，73=RQP4，76=BQ52，51=f32 oneDNN opt-in） |
 | `PF_VISION_COMPACT=0` | 恢复整文件 mmproj 上传（默认只上传设备内核读的 3.7 MB） |
 | `PF_VISION_DEFER_QKV=0` | 加载时构建合并的 q/k/v f32 副本（默认按需） |
@@ -387,7 +389,7 @@ SIGSEGV，所以整页差距远大于单步差距；单请求的保守数字引�
 | `PF_MM_BATCH_PREFILL=0` | 多模态 prefill 回退到每 32 token 一个 mode-1 chunk |
 | `PF_MINERU_TIME=1` | 每张图一行：prep / vision / prefill / decode / total ms，以及 mmproj 加载+上传时间 |
 | `PF_VISION_TIME=1` | 每个视觉 encode 一行阶段耗时（patch / merger / post_ln + 32 层合计），带每阶段 `q.wait()` |
-| `PF_MINERU_DEBUG=1` | 打印 layout raw、每个 block 的耗时/大小、host-vs-device 视觉自检 |
+| `--debug`（CLI，非环境变量） | 打印 layout raw、每个 block 的耗时/大小、host-vs-device 视觉自检 |
 | `PF_MINERU_PROBE=N` | 自检裁剪边长（默认 56；56 是 16 patch / 4 merged token） |
 | `PF_MINERU_NOMROPE=1` | 把所有 M-RoPE section 置为 t（A/B） |
 | `PF_MINERU_ZERO_EMBD=1` | 把图像 embedding 清零（确认 embedding 确实被使用） |

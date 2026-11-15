@@ -883,15 +883,36 @@ void vision_model::upload(sycl::queue & q) {
     // 1.32 GB file), so the 1.28 GB of f16 linears is neither copied nor kept
     // resident.
     //
-    // Default on for the qwen2vl tower (verified: identical page md5, self-check
-    // cos 0.9991, 5x on the layout image).  Off for qwen3vl: that tower is
-    // BF16/head_dim 64-72 and there is no model here to verify it against, so
-    // the flag is left as the opt-in until it is measured (PF_VISION_DNNL=1).
+    // Per-tower default (all three are measured; docs/design/10-multimodal.md
+    // and docs/PERFORMANCE.md carry the numbers and conditions):
+    //  * qwen2vl: on.  Identical layout-page md5, self-check cos 0.9991, ~5x
+    //    on the 1036x1036 page.
+    //  * deepseek41v: on.  640x320 page 17.6 s -> ~1.7 s, cos 0.9996 vs clip
+    //    (docs/PERFORMANCE.md §5.5); re-measured at the tower level 1305 ->
+    //    146 ms on 324 patches with every linear registered.
+    //  * qwen3vl: off.  Measured on the 27B / 2x A770 with a 1036x1036 page
+    //    (5376 patches): 37915 -> 17490 ms (2.17x), but n_ff = 4304 is not a
+    //    multiple of 32, so the `down` projection cannot register and the blob
+    //    stays whole-file (326 MiB registered, "partial"; `down` alone is
+    //    ~136 MiB).  The host/device probe moves to cos 0.9976 / rel-L2 7%
+    //    (the exact path is 1.0 / 1.5e-5 and test_multimodal's 5e-3
+    //    host/device check fails), and an OCR prompt on a newspaper page drops
+    //    the masthead while the text
+    //    body stays identical.  Opt-in (PF_VISION_DNNL=1) until `down` can join
+    //    the int8 path and the deviation is re-checked, rather than moving the
+    //    default of the reference (0.8B) tower on 27B-only evidence.
     bool all = false;
     // PF_VISION_COMPACT=0 restores the whole-file blob (fallback/debug A/B).
     const bool compact_ok = si::env::i32("PF_VISION_COMPACT", 1) != 0;
-    const int dnnl_dflt = kind == model_profile::vision_kind::qwen2vl ? 1 : 0;
-    if (si::env::i32("PF_VISION_DNNL", dnnl_dflt) != 0) {
+    const int dnnl_dflt =
+        (kind == model_profile::vision_kind::qwen2vl || kind == model_profile::vision_kind::deepseek41v) ? 1 : 0;
+    const int dnnl_req = si::env::i32("PF_VISION_DNNL", dnnl_dflt);
+    // The oneDNN instance is built on this queue.  A CPU queue (--device cpu)
+    // would run the int8 matmul on oneDNN's CPU engine, which is both much
+    // slower than vit_gemm for this tower and not the path the measurement was
+    // taken on; keep the tower on vit_gemm there.  The GPU tower (a GPU queue)
+    // gets the int8 path.
+    if (dnnl_req != 0 && q.get_device().is_gpu()) {
         gemm = new dnnl_gemm(q);
         all = true;
         auto add = [&](const vt & w) {
@@ -942,6 +963,8 @@ void vision_model::upload(sycl::queue & q) {
             fprintf(stderr, "[vtime] dnnl vision: %s, %.1f MiB int8 weights\n", all ? "on" : "partial",
                     (double)gemm->weight_bytes() / 1048576.0);
         }
+    } else if (dnnl_req != 0) {
+        fprintf(stderr, "[vision] PF_VISION_DNNL needs a GPU queue; using vit_gemm\n");
     }
 
     // Weight blob.  Compact when every linear is on the int8 path; otherwise

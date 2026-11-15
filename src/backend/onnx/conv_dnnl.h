@@ -24,6 +24,18 @@ namespace onnx {
 // detector) keep oneDNN; the variable ones run the SYCL kernel.
 void conv_dnnl_set_enabled(bool on);
 bool conv_dnnl_enabled();
+// The convolution primitive's policy, from `PF_ONNX_CONV_DNNL`:
+//   0 - never: every convolution runs the SYCL kernel.
+//   1 - the default: build a primitive from the *second* sighting of a
+//       (weight, N, geometry) key, and only for N >= 8.  The fixed-shape
+//       models (the layout detector's 800x800 batches) amortise it; a
+//       variable-shape model keeps the SYCL kernel.
+//   2 - build on the first sighting, at every batch size.
+// One function is the only reader of the variable, so the call-site gate and
+// the launcher cannot disagree about it (`ops_exec.cpp` used to default the
+// gate on while the launcher defaulted the policy to 0, which silently kept
+// every non-1x1 convolution on the SYCL kernel whatever `"dnnl": true` said).
+int conv_dnnl_policy();
 // The device memory oneDNN holds for the weight reorders and the shared
 // scratchpad (it is allocated outside the executor's pool).
 void conv_dnnl_mem(size_t * weights, size_t * scratch);

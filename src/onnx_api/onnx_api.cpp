@@ -21,6 +21,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "device/device_select.h"
 #include "exec.h"
 #include "graph.h"
 #include "json.hpp"
@@ -54,22 +55,22 @@ sycl::device pick_device(const std::string & name) {
         return sycl::device{sycl::cpu_selector_v};
     }
     if (n == "auto") {
-        try {
-            return sycl::device{sycl::gpu_selector_v};
-        } catch (...) {
-            return sycl::device{sycl::cpu_selector_v};
-        }
+        const std::vector<sycl::device> gpus = si::dev::gpu_devices();
+        if (!gpus.empty()) return gpus.front();
+        return sycl::device{sycl::cpu_selector_v};
     }
     if (n.rfind("gpu.", 0) == 0) {
         const int idx = std::atoi(n.c_str() + 4);
-        const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-        if (idx < 0 || idx >= (int)devs.size()) {
+        const std::vector<sycl::device> gpus = si::dev::gpu_devices();
+        if (idx < 0 || idx >= (int)gpus.size()) {
             throw std::runtime_error("there is no GPU with index " + std::to_string(idx));
         }
-        return devs[(size_t)idx];
+        return gpus[(size_t)idx];
     }
     if (n == "gpu") {
-        return sycl::device{sycl::gpu_selector_v};
+        const std::vector<sycl::device> gpus = si::dev::gpu_devices();
+        if (gpus.empty()) throw std::runtime_error("there is no GPU available");
+        return gpus.front();
     }
     throw std::runtime_error("unknown device '" + name + "'");
 }

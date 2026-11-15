@@ -167,7 +167,9 @@ struct vision_model {
     // device copy of the weights: the whole file 1:1, or a compact span set
     // (src/backend/weight_store.h) when every linear is on the oneDNN path.
     weight_store weights;
-    // PF_VISION_DNNL (default on for qwen2vl): every vision linear runs through
+    // PF_VISION_DNNL (default on for qwen2vl and deepseek41v, off for
+    // qwen3vl - see src/mm/vision.cpp's upload() for the measurements): every
+    // vision linear runs through
     // the text model's oneDNN int8 matmul instead of vit_gemm.  `gemm` is a
     // private instance created on upload; each call falls back to vit_gemm for a
     // key the instance does not hold (so a projector with an unsupported shape

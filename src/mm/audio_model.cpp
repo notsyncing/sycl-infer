@@ -1,12 +1,16 @@
 #include "audio_model.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
 #include "kernels.h"
 #include "quant.h"
 #include "enc_common.h"
+#include "dnnl_gemm.h"
+#include "env.h"
 
 namespace si {
 
@@ -150,7 +154,12 @@ void audio_model::load(const std::string & path) {
         L.ln2 = bind_f32_opt(f, pre + "ln2.weight");
         L.ln2_b = bind_f32_opt(f, pre + "ln2.bias");
     }
-    out = bind_vt(f, "a.out.weight");
+    // `a.out` is optional when projection_dim <= 0: the tower width already
+    // equals the text width and encode_host/encode_device take the W == E copy
+    // branch, so a file that omits the projection must still load.
+    if (hp.proj_dim > 0 || f.find("a.out.weight") != nullptr) {
+        out = bind_vt(f, "a.out.weight");
+    }
     out_b = bind_f32_opt(f, "a.out.bias");
 }
 
@@ -159,11 +168,82 @@ audio_model::~audio_model() {
         weights.release(*dev_q);
     }
     free_dev_ptrs(dev_q, {d_cw, d_mel, d_pos, d_x, d_ln, d_qkv, d_attn, d_ffn, d_post});
+    delete gemm;
+    gemm = nullptr;
+}
+
+// One audio linear on the oneDNN int8 matmul, chunked to the activation
+// scratch's row cap (the text model's largest prefill batch).  Same contract as
+// vision_model::linear_dnnl: returns false when the weight is not registered so
+// the caller runs vit_gemm and stays correct.
+bool audio_model::linear_dnnl(sycl::queue & q, const void * key, const float * x, int x_stride, int T, int K,
+                              float * out, int out_stride, const float * residual, float alpha, int N) {
+    (void)q;
+    (void)N;
+    if (!gemm || !key || T <= 0 || K <= 0) {
+        return false;
+    }
+    if (!gemm->has_weight(key)) {
+        return false;
+    }
+    const int kChunk = kMaxB * kMaxT;
+    for (int t = 0; t < T; t += kChunk) {
+        const int m = std::min(kChunk, T - t);
+        // do_split=false: these are prefill-shaped (whole-utterance) calls, so
+        // the quantizer must not take the decode/verify split-plane branch.
+        const act_view v = gemm->quantize(x + (size_t)t * x_stride, nullptr, x_stride, x_stride, m, K, false);
+        if (!v.valid()) {
+            return false;
+        }
+        if (!gemm->gemm(v, key, residual ? residual + (size_t)t * out_stride : nullptr, alpha, m, K,
+                        out + (size_t)t * out_stride, out_stride)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void audio_model::upload(sycl::queue & q) {
     pin_dev_queue(dev_q, q, "audio tower");
+    if (weights.uploaded()) {
+        return;
+    }
     weights.upload_contiguous(gguf.map_base, gguf.map_size, q, "audio ");
+    if (si::env::i32("PF_AUDIO_DNNL", 0) == 0) {
+        return;
+    }
+    if (!q.get_device().is_gpu()) {
+        // The int8 path is a GPU matmul; a CPU queue would run it on oneDNN's
+        // CPU engine (the synthetic A/B measured that path is slower and over
+        // the accuracy gate).  Keep the tower on vit_gemm there.
+        fprintf(stderr, "[audio] PF_AUDIO_DNNL needs a GPU queue; using vit_gemm\n");
+        return;
+    }
+    // The tower is small (a few MiB) and its linears are all f32, so the
+    // conversion is cheap; the point of the switch is the A/B, not a startup
+    // win.  eager=false keeps the prefill primitive ladder out of it: the only
+    // M shapes this tower asks for are the utterance's n_out values.
+    gemm = new dnnl_gemm(q);
+    int n_ok = 0, n_try = 0;
+    auto add = [&](const vt & w) {
+        if (!w.data) {
+            return;
+        }
+        n_try++;
+        if (gemm->add_weight(w.data, w.data, w.type, w.K, w.N, /*eager=*/false)) {
+            n_ok++;
+        }
+    };
+    for (const vision_layer & L : layers) {
+        add(L.qkv);
+        add(L.out);
+        add(L.up);
+        add(L.down);
+    }
+    add(out);
+    fprintf(stderr, "[audio] dnnl int8 linears: %d/%d registered, %.2f MiB\n", n_ok, n_try,
+            (double)gemm->weight_bytes() / 1048576.0);
+    gemm->report_load("audio");
 }
 
 audio_input audio_model::make_input(const audio_model & am, const float * mel, int n_frames) {
@@ -404,20 +484,29 @@ void audio_model::encode_device(sycl::queue & q, const audio_input & in, float *
     for (int il = 0; il < hp.n_layer; il++) {
         const vision_layer & L = layers[il];
         vit_layernorm_launch(q, d_ln, E, devf(L.ln1), devf(L.ln1_b), d_attn, E, n_out, E, hp.eps);
-        vit_gemm_launch(q, dev_ptr(L.qkv.data), L.qkv.type, 3 * E, E, d_attn, E, d_qkv, 3 * E, n_out, 1.f, nullptr);
+        if (!linear_dnnl(q, L.qkv.data, d_attn, E, n_out, E, d_qkv, 3 * E, nullptr, 1.f, 3 * E)) {
+            vit_gemm_launch(q, dev_ptr(L.qkv.data), L.qkv.type, 3 * E, E, d_attn, E, d_qkv, 3 * E, n_out, 1.f,
+                            nullptr);
+        }
         vit_add_bias_launch(q, d_qkv, 3 * E, devf(L.qkv_b), n_out, 3 * E);
         at_rope1d_launch(q, d_qkv, 3 * E, n_out, NH, HD, hp.rope_base);
         vit_attn_launch(q, d_qkv, 3 * E, d_x, E, n_out, NH, HD, scale);
         // x += out_b, then x += attn_out_proj (residual through the GEMM),
         // mirroring the vision encoder's block order
         vit_add_bias_launch(q, d_ln, E, devf(L.out_b), n_out, E);
-        vit_gemm_launch(q, dev_ptr(L.out.data), L.out.type, E, E, d_x, E, d_ln, E, n_out, 1.f, d_ln);
+        if (!linear_dnnl(q, L.out.data, d_x, E, n_out, E, d_ln, E, d_ln, 1.f, E)) {
+            vit_gemm_launch(q, dev_ptr(L.out.data), L.out.type, E, E, d_x, E, d_ln, E, n_out, 1.f, d_ln);
+        }
         vit_layernorm_launch(q, d_ln, E, devf(L.ln2), devf(L.ln2_b), d_attn, E, n_out, E, hp.eps);
-        vit_gemm_launch(q, dev_ptr(L.up.data), L.up.type, ff, E, d_attn, E, d_ffn, ff, n_out, 1.f, nullptr);
+        if (!linear_dnnl(q, L.up.data, d_attn, E, n_out, E, d_ffn, ff, nullptr, 1.f, ff)) {
+            vit_gemm_launch(q, dev_ptr(L.up.data), L.up.type, ff, E, d_attn, E, d_ffn, ff, n_out, 1.f, nullptr);
+        }
         vit_add_bias_launch(q, d_ffn, ff, devf(L.up_b), n_out, ff);
         vit_gelu_launch(q, d_ffn, (size_t)n_out * ff);
         vit_add_bias_launch(q, d_ln, E, devf(L.down_b), n_out, E);
-        vit_gemm_launch(q, dev_ptr(L.down.data), L.down.type, E, ff, d_ffn, ff, d_ln, E, n_out, 1.f, d_ln);
+        if (!linear_dnnl(q, L.down.data, d_ffn, ff, n_out, ff, d_ln, E, d_ln, 1.f, E)) {
+            vit_gemm_launch(q, dev_ptr(L.down.data), L.down.type, E, ff, d_ffn, ff, d_ln, E, n_out, 1.f, d_ln);
+        }
     }
 
     if (post_ln) {
@@ -430,7 +519,9 @@ void audio_model::encode_device(sycl::queue & q, const audio_input & in, float *
     if (W == E) {
         vit_copy_launch(q, d_x, E, d_out, W, n_out, E);
     } else {
-        vit_gemm_launch(q, dev_ptr(out.data), out.type, W, E, d_x, E, d_out, W, n_out, 1.f, nullptr);
+        if (!linear_dnnl(q, out.data, d_x, E, n_out, E, d_out, W, nullptr, 1.f, W)) {
+            vit_gemm_launch(q, dev_ptr(out.data), out.type, W, E, d_x, E, d_out, W, n_out, 1.f, nullptr);
+        }
         vit_add_bias_launch(q, d_out, W, devf(out_b), n_out, W);
     }
     q.wait();

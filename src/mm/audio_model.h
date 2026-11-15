@@ -90,6 +90,18 @@ struct audio_model {
 
     // device copy of the weights: the whole mmproj file 1:1
     weight_store weights;
+    // PF_AUDIO_DNNL (default off - there is no real audio mmproj in the test
+    // set, so the opt-in is not enabled on synthetic evidence): every tower
+    // linear runs through the text model's oneDNN int8 matmul instead of
+    // vit_gemm.  Created on upload, deleted by the destructor.  Each call falls
+    // back to vit_gemm for a tensor the instance did not accept, so a partial
+    // registration still runs correctly.
+    dnnl_gemm * gemm = nullptr;
+    // One audio linear: out[0..T)[0..N) = alpha * W * x + residual, chunked to
+    // the oneDNN activation scratch's M cap.  Returns false when this weight is
+    // not on the dnnl path (the caller uses vit_gemm).
+    bool linear_dnnl(sycl::queue & q, const void * key, const float * x, int x_stride, int T, int K, float * out,
+                     int out_stride, const float * residual, float alpha, int N);
     // Queue every device allocation below was made on (see vision.h: same
     // one-queue-per-model rule, shared helpers in enc_common.h).
     sycl::queue * dev_q = nullptr;

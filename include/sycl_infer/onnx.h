@@ -27,8 +27,11 @@ SYI_ONNX_API int syi_onnx_abi_version(void);
 SYI_ONNX_API const char *syi_onnx_last_error(void);
 
 /* Load one ONNX file.  `device` is GPU, GPU.N, CPU, AUTO (case-insensitive).
-   `drop_outputs` is a comma-separated list (or NULL); `dnnl` selects the
-   oneDNN convolution path. */
+   `drop_outputs` is a comma-separated list (or NULL); `dnnl` enables oneDNN
+   for this model (0 = every oneDNN path off: the convolution primitive, the
+   1x1 matmul and the plain MatMul).  The convolution primitive's own policy
+   is PF_ONNX_CONV_DNNL (default 1: N >= 8 and a second sighting of the
+   shape), and the environment variable is the explicit A/B. */
 SYI_ONNX_API int syi_onnx_create(const char *path, const char *id, const char *device,
                                  const char *drop_outputs, int dnnl,
                                  syi_onnx_model **out_model);

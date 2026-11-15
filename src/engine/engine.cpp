@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "device/device_profile.h"
+#include "device/device_select.h"
 #include "model_profile.h"
 #include "quant.h"
 #include "common/w4.h"
@@ -134,7 +135,9 @@ static sycl::queue make_queue(int device_req, sycl::context * ctx) {
         // shared multi-GPU context: the primary queue is its first device
         return sycl::queue(*ctx, ctx->get_devices().front(), in_order_prof);
     }
-    return sycl::queue(sycl::gpu_selector_v, in_order_prof);
+    // Prefer Level Zero when the same card is also visible through OpenCL:
+    // the decode command graph is Level Zero only.  See device_select.h.
+    return sycl::queue(si::dev::gpu_device(), in_order_prof);
 }
 
 // A --layer-map that places layers on two or more distinct GPUs shares one
@@ -143,10 +146,8 @@ static std::shared_ptr<sycl::context> make_md_context(const std::string & layer_
     if (layer_map.empty()) {
         return nullptr;
     }
-    std::vector<sycl::device> gpus;
-    try {
-        gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
-    } catch (...) {
+    std::vector<sycl::device> gpus = si::dev::gpu_devices();
+    if (gpus.empty()) {
         return nullptr;
     }
     if (gpus.size() < 2) {
@@ -348,7 +349,7 @@ engine::engine(const engine_config & cfg)
         // trunk evenly; --layer-map overrides this and may place layers on cpu.
         int ngpu = 0;
         try {
-            ngpu = (int)sycl::device::get_devices(sycl::info::device_type::gpu).size();
+            ngpu = (int)si::dev::gpu_devices().size();
         } catch (...) {
             ngpu = 1;
         }
@@ -1590,56 +1591,6 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
     size_t bank_bytes = 0;
     int banked_layers = 0;
     std::vector<const void *> registered;
-
-    auto pack_tensor = [&](const moe_wt & t, uint8_t ** out) -> size_t {
-        size_t vb, sb, pl;
-        u4_plane_of(t.K, t.N, vb, sb, pl);
-        const size_t bytes = pl * (size_t)t.E;
-        const double p0 = now();
-        std::atomic<int> bad{0};
-        std::vector<std::thread> th;
-        const int NT = 8;
-        for (int w = 0; w < NT; w++) {
-            th.emplace_back([&, w] {
-                si::w4t s;
-                for (int e = w; e < t.E; e += NT) {
-                    if (!si::w4_pack(t.type, t.plane(e), t.K, t.N, s)) {
-                        bad = 1;
-                        return;
-                    }
-                    uint8_t * d = stage + (size_t)e * pl;
-                    std::memcpy(d, s.vals.data(), vb);
-                    std::memcpy(d + vb, s.scale.data(), sb);
-                    std::memcpy(d + vb + sb, s.off.data(), sb);
-                }
-            });
-        }
-        for (auto & x : th) {
-            x.join();
-        }
-        pack_s += now() - p0;
-        if (bad) {
-            return 0;
-        }
-        uint8_t * bank = sycl::malloc_device<uint8_t>(bytes, qd);
-        if (!bank) {
-            fprintf(stderr, "[moe] u4 bank: device allocation of %.1f MiB failed\n", (double)bytes / (1024.0 * 1024.0));
-            return 0;
-        }
-        const double c0 = now();
-        qd.memcpy(bank, stage, bytes).wait();
-        copy_s += now() - c0;
-        for (int e = 0; e < t.E; e++) {
-            uint8_t * b = bank + (size_t)e * pl;
-            if (!D.add_weight_w4_dev((const void *)b, b, b + vb, b + vb + sb, t.K, t.N)) {
-                fprintf(stderr, "[moe] u4 bank: oneDNN rejected the store (K=%d N=%d e=%d)\n", t.K, t.N, e);
-                return 0;
-            }
-            registered.push_back((const void *)b);
-        }
-        *out = bank;
-        return bytes;
-    };
 
     // Pack gate and up into ONE per-expert plane so a single N=2N GEMM computes
     // both: vals [2N][K/2] (gate rows then up rows), then the f16 scale plane
@@ -3644,7 +3595,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
     owned_queues_.reserve((size_t)gpu_indices.size());
 
     {
-        std::vector<sycl::device> all_gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+        std::vector<sycl::device> all_gpus = si::dev::gpu_devices();
         for (size_t i = 0; i < gpu_indices.size(); i++) {
             const int phys = gpu_indices[(size_t)i];
             const int bidx = (int)i;
@@ -3653,7 +3604,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
             if ((size_t)phys < all_gpus.size()) {
                 target = all_gpus[(size_t)phys];
             } else {
-                target = sycl::device(sycl::gpu_selector_v);
+                target = si::dev::gpu_device();
             }
             // Carry the queue properties (including enable_profiling when a
             // device-timeline diagnostic asked for it) on the per-partition

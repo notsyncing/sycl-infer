@@ -6,6 +6,7 @@
 // match order and pick the first whose matcher accepts the name SYCL reports.
 // Adding a card is one new file plus one row below.
 #include "device/device_profile.h"
+#include "device/device_select.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -239,7 +240,7 @@ int wg_clamped_impl(int want, const sycl::device * dev) {
         limit = record_for(*dev).max_wg;
     } else {
         static const int limit0 = [] {
-            auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+            auto devs = si::dev::gpu_devices();
             if (devs.empty()) {
                 return 32;
             }
@@ -394,7 +395,7 @@ const profile & active() {
         // do have a profile for resolve as "unknown".
         std::string name;
         try {
-            auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+            auto devs = si::dev::gpu_devices();
             if (!devs.empty()) {
                 name = devs[0].get_info<sycl::info::device::name>();
             }

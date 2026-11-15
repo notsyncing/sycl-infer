@@ -60,7 +60,8 @@ model-owned `model_profile::fwd_kind` 或 `arch/...` include；新行为进 `arc
 ### 2.1 构造（`engine.cpp:91-512`）
 
 1. **模型/分词器**：`m.load(path)` → `tk.load(m.gguf)`。队列由 `make_queue(device_req)`
-   （`engine.cpp:38-52`）选择：GPU（`sycl::gpu_selector_v`，默认）或 CPU
+   （`engine.cpp` 的 `make_queue`）选择：GPU（`si::dev::gpu_device()`：有 Level Zero
+   设备时优先 L0，否则回退 `sycl::gpu_selector_v`，默认）或 CPU
    （`sycl::cpu_selector_v`，`--device cpu`），都带 `property::queue::in_order`（视觉阶段/CPU
    分配依赖顺序）。`resolve_device`（`engine.cpp:19-36`）还负责一件事：**一个不含 `gpu` 的
    `--layer-map` 直接解析成 CPU**，否则主队列是 GPU 队列而所有层都在 CPU 后端上，prefill 侥幸

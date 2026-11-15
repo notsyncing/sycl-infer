@@ -113,6 +113,41 @@ std::string make_key(const void * w, int N, int C, int H, int W, int M, int kh, 
 void conv_dnnl_set_enabled(bool on) { g_enabled = on; }
 bool conv_dnnl_enabled() { return g_enabled; }
 
+int conv_dnnl_policy() {
+    // The one reader of PF_ONNX_CONV_DNNL.  `ops_exec.cpp`'s call-site gate
+    // and this file's launcher both call it, so they cannot disagree.
+    //
+    // Default 1.  Measured on one 101-page document (layout batch 16,
+    // detector batch 32, warm page cache, one A770, Release JIT,
+    // 2026-11-14): the layout model's 800x800 batch-16 call goes
+    // 2 709 -> 2 199 ms (19% faster), the detector's 960x960 batch-32 call
+    // 891 -> 959 ms (8% slower; 61 of its 83 convolutions are 1x1 and take
+    // the matmul path, so only the 3x3 remainder is affected), and the whole
+    // document 101.0 -> 98.8 s (2.2% faster).  The Markdown is byte-identical
+    // to the SYCL path on every run.
+    //
+    // Policy 1 does not build a primitive for a shape seen once, and not
+    // below N=8: a variable-shape model (the table UNET) would accumulate a
+    // primitive and its JIT code per shape, and a batch-1 crop is 4.4x
+    // slower on oneDNN than on the SYCL kernel (49.5 s against 11.3 s for
+    // one document's 292 calls).  The 8 threshold is measured: batch 4 is
+    // identical (719 vs 722 ms) and batch 8 is 19% faster on the same model.
+    //
+    // Policy 2 (build on first sight, every batch) is an A/B only.  It
+    // reaches the same layout steady state but pays the batch-1 slowdowns:
+    // the same document measured 109.3 s warm against the default's 98.8.
+    // The historical report of a flipped OCR cell on the second run of one
+    // process (600552, 92fd5b97 against 115a5b4a) was NOT reproduced on this
+    // document with this build - both runs matched the SYCL path's md5 - but
+    // it is the reason policy 2 stays opt-in.
+    static const int policy = [] {
+        const char * p = getenv("PF_ONNX_CONV_DNNL");
+        const int v = p ? atoi(p) : 1;
+        return v < 0 ? 0 : (v > 2 ? 2 : v);
+    }();
+    return policy;
+}
+
 bool matmul_dnnl_launch(sycl::queue & q, const float * a, const float * b, float * y, int64_t M,
                         int64_t K, int64_t N) {
     if (!g_enabled) return false;
@@ -228,26 +263,19 @@ bool conv_dnnl_launch(sycl::queue & q, const float * x, const float * w, float *
         }
     }
     if (!e) {
-        // The policy, once per unseen key.  A key seen for the first time
-        // runs the SYCL kernel; a second sighting builds the primitive.
-        // Default off.  The primitive is *not* the problem - with it the
-        // layout detector runs 22% faster - but enabling it flips one OCR
-        // cell in 600552 on the second and later runs of one process (the
-        // first run matches, the repeats do not: 92fd5b97 against 115a5b4a),
-        // and the SYCL convolution is stable across repeats.  A benchmark
-        // whose Markdown depends on how many times the process has run the
-        // document is not a benchmark, so the A/B stays opt-in.
-        static const int policy = [] {
-            const char * p = getenv("PF_ONNX_CONV_DNNL");
-            return p ? atoi(p) : 0;
-        }();
+        // The policy, once per unseen key.  Under the default (1) a key seen
+        // for the first time runs the SYCL kernel and a second sighting
+        // builds the primitive, so a variable-shape model never accumulates
+        // one; PF_ONNX_CONV_DNNL=2 builds on the first sighting, which is
+        // what made every variable-shape model slower.
+        const int policy = conv_dnnl_policy();
         if (policy <= 0) return false;
         // A batch-1 call is a table crop or a single page: oneDNN's
         // convolution is 4.4x slower there than the SYCL kernel on the UNET's
         // shapes (49.5 s against 11.3 s for one document's 292 calls), and
         // there is no reused shape to amortise a primitive against.  The
-        // fixed-shape models that do benefit (the layout detector, the
-        // detector's page tiles) run at N >= 8.
+        // fixed-shape models that benefit (the layout detector at batch 8 and
+        // above) run at N >= 8; batch 4 measures identical to the SYCL path.
         if (policy == 1 && N < 8) return false;
         if (policy == 1 && g_seen.size() < kSeenCap) {
             if (g_seen.insert(key).second) return false;

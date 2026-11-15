@@ -791,8 +791,31 @@ same-shape, same-type input buffer that dies there.  Both are disabled in a
 per-op liveness cannot see.  The aliasing and in-place reuse cut the
 layout's executor footprint roughly in half (below).
 
-**The convolutions run on oneDNN** (`src/backend/onnx/conv_dnnl.cpp`,
-`PF_ONNX_DNNL=0` turns it off).  The runtime's weights stay in their own
+**The convolutions run on oneDNN** (`src/backend/onnx/conv_dnnl.cpp`).
+`PF_ONNX_CONV_DNNL` is the convolution primitive's policy, and one function
+(`conv_dnnl_policy()`) is its only reader - the call-site gate in
+`ops_exec.cpp` and the launcher both call it, so they cannot default in
+opposite directions (they used to: the gate defaulted on, the launcher's
+policy defaulted to 0, and every non-1x1 convolution silently stayed on the
+SYCL kernel whatever the per-model `"dnnl"` flag said).  `PF_ONNX_DNNL=0` is
+the older convolution switch and stays as an A/B; it has the same effect as
+`PF_ONNX_CONV_DNNL=0` and does not touch the 1x1 matmul or the plain MatMul
+(`PF_ONNX_MATMUL1X1` and `PF_ONNX_MM_DNNL_MIN` are theirs; a per-model
+`"dnnl": false` is the switch that disables all three).
+
+| value | behaviour |
+|---|---|
+| `0` | every non-1x1 convolution runs the SYCL kernel |
+| `1` (**default**) | build a primitive from the *second* sighting of a (weight, N, geometry) key, and only for `N >= 8` |
+| `2` | build on the first sighting, at every batch size |
+
+A grouped/depthwise convolution, a diagnostic probe and a `ConvTranspose`
+stay on the SYCL kernel; the policy only selects between the two paths for a
+group-1 convolution.  Both gaps were measured against oneDNN and are
+recorded below rather than implemented - the grouped primitive is 2-4x
+slower and the transposed one, although 4-26x faster on a batched call, is
+slower on the document because its stream has to be drained.  The runtime's
+weights stay in their own
 (C, kh, kw, M) layout; the primitive's layout is reordered into once per
 weight and cached, and the bias/scale/add/activation epilogue stays a
 separate kernel so its semantics are the SYCL conv's exactly.  Measured on
@@ -805,6 +828,21 @@ the model's own shapes against the SYCL kernel:
 | C96 64x240 -> M96 | 1.62 | 0.57 | **0.13** |
 | C256 50x50 -> M512 | 1.31 | 0.20 | 0.17 |
 
+**Measured end to end** (one 101-page document, layout batch 16, detector
+batch 32, warm page cache, one A770, Release JIT, 2026-11-14): policy 0
+101.0 s warm / 109.9 s first run; the default (policy 1) 98.8 / 108.3 s
+(**2.2 s, 2.2% faster**) with byte-identical Markdown (`2f49cef6...`).
+Isolated: the layout model's 800x800 batch-16 call is 2 709 -> 2 199 ms
+(**-19%**, which is the whole gain), the OCR detector's 960x960 batch-32
+call is 891 -> 959 ms (**+7.6%** - 61 of its 83 convolutions are 1x1 and
+already take the matmul path, so only the 3x3 remainder is affected), and
+batch 2 / batch 4 are identical (383/383 and 718/722 ms), which is where
+the `N >= 8` gate comes from.  Policy 2 reaches the same layout steady
+state but applies the primitive to batch-1 crops as well: 109.3 s warm
+(8% slower than the default).  Its historical second-run md5 flip was
+**not** reproduced on this document with this build - three consecutive
+runs matched `2f49cef6...` - but it remains an opt-in A/B.
+
 bf16 reaches 9-19 TFLOP/s on the shapes where the XMX unit helps, but the
 gain is shape-dependent (1.0x on several) and the layout detector's accuracy
 is sensitive to bf16 (the engine's earlier all-bf16 layout produced a 17%
@@ -814,10 +852,85 @@ descriptors - was tried on the real layout: the digest is **identical**
 (boxes and tables unchanged), but the call is **not faster** (233 ms against
 208-225 for f32; the probe's fast bf16 path used bf16 *memory descriptors*,
 which would need an f32<->bf16 conversion pass per conv in a mixed graph).
-So bf16 is rejected on speed here, not on accuracy.  The
-deconvolution was tried the same way and **reverted**: its output was wrong
-on the detector's 2x2 stride-2 transposed convolutions, and the table UNET's
-transposed convolutions are only 26 ms of its forward.
+So bf16 is rejected on speed here, not on accuracy.
+
+#### Grouped/depthwise Conv and ConvTranspose: measured, not enabled
+
+Group>1 nodes are spread across the whole set (184 in the 13 model files
+here): 27 in each layout detector (`pp_doclayoutv2/v3`), 17 in the OCR
+detector, 57 in the formula recogniser, 15 in the classifier, 14 in the
+recogniser and the seal detector, and 13 in the orientation model.  The
+share was measured on the two that dominate the document's time - the
+layout detector (27 nodes: 128/512/1024-wide 3x3 and 192/384-wide 5x5) and
+`PP-OCRv6_det_small` (17: 48/96/192/384-wide 3x3).  Per-operator device timing
+(`SI_ONNX_TIME=1`, which waits after every operator, so only the shares are
+meaningful) puts them at **1.0-1.5% of the layout batch-16 operator sum**
+(16 ms of 1 049 ms warm) and **9.0% of the detector batch-32 operator sum**
+(47 ms of 520 ms); the call's wall time also contains host/upload work that
+is not in the operator sum, so the wall share is smaller.  A oneDNN grouped primitive is expressible - the weights are
+`[G][O/G][I/G][kh][kw]` with the runtime's `(C,kh,kw,M/g)` buffer as a
+strided view; that mapping was checked element-wise against the SYCL kernel
+(max abs 4.8e-07), so the rejection is speed only - and on the same shapes
+it is **2x slower on the detector
+(47 -> 95 ms warm) and 4x slower on the layout (16 -> 62 ms)**; the first
+call also pays the primitive build.  A 1-9% share cannot pay that, so the
+group>1 path remains the SYCL kernel and no group switch was kept.
+
+`ConvTranspose` has four calls that matter: the OCR detector's 2x2 stride-2
+(`C24 -> M24` at 240x240 -> 480x480 and `C24 -> M1` at 480x480 -> 960x960,
+no padding) and the table UNET's 3x3 stride-2 with `pads 1` and
+`output_padding 1` (`C128 -> M64` at 36x128 -> 72x256 and `C64 -> M16` at
+72x256 -> 144x512).  A oneDNN `deconvolution_forward` was written and
+compared element-by-element with `conv_transpose2d_launch` on random data.
+Three things are the mapping, and the earlier attempt got the first one
+wrong:
+
+* oneDNN's deconvolution weights are the forward convolution's
+  `[OC][IC][kh][kw]`, i.e. **`[dst channels][src channels]`**, while ONNX's
+  ConvTranspose weight is `[src][dst/g]`.  The reorder is from the runtime's
+  `(kh,kw,C,M/g)` buffer to oneDNN's `[M][C][kh][kw]` (grouped:
+  `[G][M/g][C/g][kh][kw]`), **not** the group-1 convolution's `[M][C]` view
+  with the convolution's strides.
+* oneDNN has **no output-padding argument**.  Its output is
+  `(I-1)*stride - padding_l - padding_r + (K-1)*dilation + 1`, so the ONNX
+  size is reached by **`padding_r = pads_end - output_padding`** (not
+  `+ output_padding`), and the extra rows/columns then sit at the
+  bottom/right, which is where ONNX puts them.  A call that would need a
+  negative effective padding (output padding with no matching `pads_end`)
+  cannot be expressed and stays on SYCL.
+* the oneDNN stream is not ordered against a following SYCL `memcpy`: the
+  readback returns zeros unless the execute is waited for
+  (`stream::wait()`), reproduced 3/3 times.  The convolution path's epilogue
+  has not shown the problem in practice (it is enqueued behind the graph's
+  other work), but that is timing, not ordering; for the deconvolution the
+  immediate readback makes the wait mandatory.
+
+With that, the comparison is exact to the f32 summation order:
+
+| case | max abs | rel RMS |
+|---|---:|---:|
+| det 24->24, 2x2 s2 | 4.8e-07 | 7.7e-08 |
+| det 24->1, 2x2 s2 | 0 | 0 |
+| UNET 128->64, 3x3 s2 p1 op1 | 7.6e-06 | 3.6e-07 |
+| UNET 64->16, 3x3 s2 p1 op1 | 5.3e-06 | 2.7e-07 |
+| grouped 8->12 (g4), 3x3 s2 p1 op1 | 8.9e-08 | 4.4e-08 |
+| dilation 2, 3x3 s1 p1 | 2.4e-07 | 1.0e-07 |
+
+A batched call is much faster (SYCL -> oneDNN): detector 24->24 240x240
+**78.8 -> 12.3 ms (6.4x)**, detector 24->1 480x480 12.7 -> 12.2, UNET
+128->64 **5.24 -> 0.19 (26x)**, UNET 64->16 **2.56 -> 0.65 (3.9x)**.  It
+does not make the document faster.  Its 528 deconv calls mix batch-1
+table/UNET crops (80x80 -> 160x160 and similar, 0.05-0.5 ms per kernel) with
+the detector's batch-32 calls, and the mandatory stream wait drains the
+oneDNN convolution work queued behind each one: the instrumented run logged
+8.4 s of deconv time over the document (41.8 ms for the first call of a
+shape, 3.7 ms steady where the standalone kernel is 12.3 ms).  The 101-page
+document measures **63.3/63.7 s with SYCL and 68.3/68.1 s with the
+primitive** (identical Markdown in both arms).  oneDNN also refuses a primitive for one
+constructible shape (`N=32 C=24 480x480 -> M24`; `N<=16` is fine).  So
+`exec_conv_transpose` keeps the SYCL kernel and the code was reverted: the
+batched-call win is real, but the document's deconvs are not batched and an
+8% end-to-end regression is not a default.
 
 **The uploads were 3 508 copies of 707 MB per call**, and they are now **366
 copies of 7.4 MB**: the constant mirrors survive the call, the host values
@@ -1375,7 +1488,8 @@ remote workers through a `remote` entry).
 | `SI_ONNX_UPLOADDBG=1` | the uploads of one call: the totals, the top slots by bytes, and every operator whose input preparation took more than 2 ms |
 | `SI_ONNX_MIRRORCHK=1` | verify every reused device mirror against its host bytes (the `host_gen`/`dev_gen` invariant); slow, because each check waits for the device |
 | `SI_ONNX_MEMDBG=1` | per-run device allocations: the total, the live set, the pool, and the buffers that are held but were not counted (they are the reused pool buffers that a constant mirror kept) |
-| `PF_ONNX_DNNL=0` | keep the convolutions on the SYCL kernel (the oneDNN f32 path is the default; a grouped/depthwise convolution always uses the SYCL one) |
+| `PF_ONNX_DNNL=0` | the older convolution switch: keep the convolution primitive on the SYCL kernel (same effect as `PF_ONNX_CONV_DNNL=0`; the 1x1 matmul and the plain MatMul have their own switches) |
+| `PF_ONNX_CONV_DNNL=0\|1\|2` | the convolution primitive's policy: `0` = SYCL always, `1` (**default**) = second sighting of a key and `N >= 8`, `2` = first sighting at every batch size.  A grouped/depthwise convolution and a `ConvTranspose` always use the SYCL kernel: both oneDNN paths were measured and rejected (2-4x slower grouped kernels; the transposed one is fast per batched call but the mandatory stream drain makes the document 8% slower) |
 | `PF_ONNX_MATMUL1X1=0` | keep a 1x1 stride-1 group-1 convolution on the direct kernel instead of the per-image oneDNN matmul (the default) |
 | `PF_ONNX_MM_DNNL_MIN=<n>` | keep a MatMul below `n` MACs (`M*K*N`) on the SYCL kernel instead of oneDNN (default 0 = every matmul on oneDNN; measured worse for the recogniser, where `2 582 -> 2 715 ms` at a 25M threshold) |
 | `SI_ONNX_LOOP_ALIAS=0` | keep the copy for a Loop body's `Reshape`/`Squeeze`/`Unsqueeze` instead of aliasing a dying input's buffer (the default is the alias; only safe because every body input is pinned) |
@@ -1388,13 +1502,22 @@ layout model's 48 MB mask is dropped - and the postprocess falls back to
 rectangles, so check the shapes your documents need before using it on
 rotated or irregular layouts.
 
-It also takes `"dnnl": false` per model: the convolutions use the SYCL kernel
-instead of oneDNN.  The oneDNN primitive (and its JIT code) is cached per
-input shape, so a model whose input size changes with every request - the
-OCR detector, the table UNET - accumulates gigabytes over a document.  The
-shipped config keeps oneDNN for the fixed-shape layout and turns it off for
-the variable-shape models; the service held 15.9 GiB with it on everywhere
-and 8.2 GiB with it off (layout batch 1).
+It also takes `"dnnl": false` per model.  That is a bigger hammer than
+`PF_ONNX_CONV_DNNL=0`: it turns off everything oneDNN would take for this
+model's executor (the convolution primitive, the 1x1 matmul and the plain
+MatMul), while the environment variable leaves the matmuls on.  Measured on
+the layout model's 800x800 batch-16 call: `"dnnl": false` 3 141 ms, conv-off
+2 709 ms, default 2 199 ms.  `"dnnl": true` (the default) allows oneDNN to
+the extent the policy permits; the environment variable is the explicit A/B
+and still wins.
+
+The primitive (and its JIT code) is cached per (weight, N, geometry) key, so
+a model whose input size changes with every request - the OCR detector, the
+table UNET - would accumulate one per shape.  Policy 1's second-sighting
+rule is what keeps that from growing, and the per-model flag remains for a
+caller that needs the primitives gone entirely.  The service held 15.9 GiB
+with oneDNN on everywhere and 8.2 GiB with it off (layout batch 1) in the
+measurement that introduced the flag.
 
 ## The client side
 
