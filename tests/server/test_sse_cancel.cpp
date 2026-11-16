@@ -257,12 +257,72 @@ static void test_disconnect_cancels_generation(int port) {
     CHECK(joined);
 }
 
+// A client can also go away while the engine is still prefilling: no token
+// has been produced, so the SSE writer has nothing to write and a blocking
+// queue pop would never notice.  The provider must probe the socket while it
+// waits, or the whole prompt keeps prefilling after the client is gone.
+static void test_disconnect_during_silence(int port) {
+    auto sc = std::make_shared<sse_session>();
+    sc->q = std::make_shared<sse_queue>();
+    sc->remaining = 1;
+    // No producer and no items: stands in for a long prefill before its first
+    // token.  Nothing but the writer's own periodic probe can discover the
+    // disconnect here.
+
+    httplib::Server srv;
+    srv.Post("/sse", [&](const httplib::Request &, httplib::Response & res) { serve_sse_chunked(res, sc); });
+    std::thread sth([&] { srv.listen("127.0.0.1", port); });
+    CHECK(wait_for([&] { return srv.is_running(); }));
+
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd >= 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    CHECK(::connect(fd, (sockaddr *)&sa, sizeof(sa)) == 0);
+    const std::string req = "POST /sse HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+    CHECK(::send(fd, req.data(), req.size(), MSG_NOSIGNAL) == (ssize_t)req.size());
+
+    // Read the response header.  After it the provider runs and the queue is
+    // silent, which is the state under test.
+    std::string buf;
+    char tmp[4096];
+    const auto t0 = std::chrono::steady_clock::now();
+    while (buf.find("200") == std::string::npos &&
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() < 3000) {
+        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) {
+            break;
+        }
+        buf.append(tmp, (size_t)n);
+    }
+    CHECK(buf.find("200") != std::string::npos);
+
+    {
+        linger lg{1, 0}; // RST
+        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
+    ::close(fd);
+
+    // One probe a second, so this must land well inside the timeout.  With a
+    // blocking pop the writer is parked and the generation would continue.
+    CHECK(wait_for([&] { return sc->cancelled(); }, 4000));
+    CHECK(sc->cancelled());
+    // Unblock the provider if the check failed, so stop() cannot hang.
+    sc->q->finish();
+    srv.stop();
+    sth.join();
+    sc->join();
+}
+
 int main(int argc, char ** argv) {
     const int port = argc > 1 ? atoi(argv[1]) : 18131;
     test_sequence_cancel_wakes_consumer();
     test_track_after_cancel();
     test_backpressure_bounds();
     test_disconnect_cancels_generation(port);
+    test_disconnect_during_silence(port + 1);
     if (g_fail) {
         fprintf(stderr, "test_sse_cancel: %d check(s) failed\n", g_fail);
         return 1;

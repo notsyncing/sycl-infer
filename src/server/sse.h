@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -22,11 +23,12 @@
 // generation test (the output looks identical; only the wasted work and the
 // blocked worker thread differ).
 //
-// Cancellation has exactly one input: httplib's `ContentProviderResourceReleaser`
-// bool, which is false both when a write fails and when the peer hung up.  It
-// is the only disconnect signal httplib offers, and the previous code ignored
-// it - a client that closed the tab left the sequence decoding to max_tokens
-// while the HTTP worker thread sat in join().
+// Cancellation has exactly one input: the socket's state, as the writer sees
+// it.  `sink.write` returning false is the direct signal; the periodic
+// `sink.is_writable()` probe covers a long silent prefill; and httplib's
+// `ContentProviderResourceReleaser` bool is the final backstop.  A client that
+// closed the tab must not leave the sequence decoding to max_tokens while the
+// HTTP worker thread sits in join().
 namespace si {
 
 // Items produced by the generation thread(s), consumed by the HTTP writer.
@@ -93,10 +95,22 @@ struct sse_queue {
         std::lock_guard<std::mutex> lk(m);
         return overflowed;
     }
-    // false once finished or cancelled
-    bool pop(std::string & out) {
+    // false once finished or cancelled.  With `timeout_ms >= 0` the call also
+    // returns false on a timeout, and `timed_out` says which: the SSE writer
+    // uses that to probe the socket while a long prefill has produced no
+    // tokens yet (httplib only checks the peer between provider calls).
+    bool pop(std::string & out, int timeout_ms = -1, bool * timed_out = nullptr) {
         std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return !items.empty() || done || cancelled; });
+        const auto ready = [&] { return !items.empty() || done || cancelled; };
+        bool have = true;
+        if (timeout_ms < 0) {
+            cv.wait(lk, ready);
+        } else {
+            have = cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready);
+        }
+        if (timed_out) {
+            *timed_out = !have;
+        }
         if (cancelled || items.empty()) {
             return false;
         }
@@ -204,7 +218,22 @@ inline void serve_sse_chunked(httplib::Response & res, const std::shared_ptr<sse
         "text/event-stream",
         [sc](size_t, httplib::DataSink & sink) {
             std::string item;
-            if (!sc->q->pop(item)) {
+            bool timed_out = false;
+            // Wait with a timeout: a long prefill produces no items for
+            // seconds or minutes, and httplib only checks the peer *between*
+            // provider calls.  A blocking pop would therefore not notice a
+            // client that vanished during the prefill until the first token -
+            // the whole prompt would still be prefilled.  One probe a second
+            // costs nothing and cancels the sequence at the next scheduler
+            // chunk boundary (the in-flight forward is not interruptible).
+            if (!sc->q->pop(item, 1000, &timed_out)) {
+                if (timed_out) {
+                    if (sink.is_writable && !sink.is_writable()) {
+                        sc->cancel();
+                        return false;
+                    }
+                    return true; // nothing to hand over yet; probe again
+                }
                 sink.done();
                 return true;
             }
