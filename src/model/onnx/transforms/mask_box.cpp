@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "transform.h"
 #include "transform_util.h"
 
@@ -319,7 +321,7 @@ bool mask_box(graph_build & g) {
             fused.attribute.push_back(as);
             g.nodes[(size_t)gt] = fused;
             if (getenv("SI_ONNX_TRACE")) {
-                fprintf(stderr,
+                si::logf(
                         "[onnx] the fusion: %s (mask head: rows from '%s', grids '%s'/'%s', "
                         "sentinel %g) -> one scan\n",
                         fused.name.c_str(), mm_out.c_str(), grid_a.c_str(), grid_b.c_str(), sentinel);

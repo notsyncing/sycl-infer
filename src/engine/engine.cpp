@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "engine.h"
 #include "device/device_profile.h"
 #include "device/device_select.h"
@@ -49,7 +51,7 @@ struct load_timer {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        fprintf(stderr, "[load] %-30s %8.1f ms\n", what,
+        si::logf("[load] %-30s %8.1f ms\n", what,
                 std::chrono::duration<double, std::milli>(now - last).count());
         last = now;
     }
@@ -58,7 +60,7 @@ struct load_timer {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        fprintf(stderr, "[load] %-30s %8.1f ms\n", what,
+        si::logf("[load] %-30s %8.1f ms\n", what,
                 std::chrono::duration<double, std::milli>(now - first).count());
         last = now;
     }
@@ -272,7 +274,7 @@ engine::engine(const engine_config & cfg)
         const bool has_vid_pad = tk.token_to_id.count("<|video_pad|>") != 0;
         const bool has_aud_pad = tk.token_to_id.count("<|audio_pad|>") != 0;
         if (!has_img_pad && !has_vid_pad && !has_aud_pad) {
-            fprintf(stderr,
+            si::logf(
                     "[mm] %s: this GGUF has no image/video/audio pad token, so multimodal input is "
                     "unavailable (the text path is unaffected)\n",
                     mp_->key);
@@ -299,11 +301,11 @@ engine::engine(const engine_config & cfg)
         // The has_mtp check below would also catch this file, but the profile
         // gate is what keeps a model without the verify state from being
         // enabled by a future file that happens to bundle a NextN block.
-        fprintf(stderr, "[mtp] %s: %s - MTP disabled\n", mp_->key, mp_->spec.why ? mp_->spec.why : "unsupported");
+        si::logf("[mtp] %s: %s - MTP disabled\n", mp_->key, mp_->spec.why ? mp_->spec.why : "unsupported");
         mtp.mtp_k = 0;
     }
     if (mtp.mtp_k > 0 && !m.has_mtp) {
-        fprintf(stderr, "[mtp] model has no NextN (blk.%d.nextn.*) layer - MTP disabled\n", m.hp.n_layer);
+        si::logf("[mtp] model has no NextN (blk.%d.nextn.*) layer - MTP disabled\n", m.hp.n_layer);
         mtp.mtp_k = 0;
     }
     if (mtp.mtp_k > 12) {
@@ -318,7 +320,7 @@ engine::engine(const engine_config & cfg)
     // that is wrong in a way only a reference can see, the split holds MTP at the
     // depth it is measured correct at.
     if (mtp.mtp_on && moe_cfg_.resident_per_layer > 0 && mtp.mtp_k > 1) {
-        fprintf(stderr,
+        si::logf(
                 "[mtp] note: the expert split is verified at k=1 only, so --mtp %d is held at 1 while "
                 "--moe-resident/--moe-vram-mb is set (use --mtp with a fully-resident expert bank for k>1)\n",
                 mtp.mtp_k);
@@ -364,7 +366,7 @@ engine::engine(const engine_config & cfg)
         } else {
             layer_map = "0-" + std::to_string(n - 1) + ":gpu.0";
         }
-        fprintf(stderr, "[%s] no --layer-map: using %s\n", mp_->key, layer_map.c_str());
+        si::logf("[%s] no --layer-map: using %s\n", mp_->key, layer_map.c_str());
     }
     if (!layer_map.empty()) {
         setup_multi_device(layer_map);
@@ -374,7 +376,7 @@ engine::engine(const engine_config & cfg)
         // per-tensor (multi-device) upload can express that: the whole-blob
         // single-device path copies every tensor verbatim.  Say so instead of
         // silently paying 12 GB of raw gate/up and then not using it.
-        fprintf(stderr,
+        si::logf(
                 "[moe] PF_MOE_U4BANK needs the per-tensor upload path - pass --layer-map 0-%d:gpu.0 (or "
                 "PF_MOE_U4BANK=0); keeping the raw routed experts\n",
                 m.hp.n_layer - 1);
@@ -394,7 +396,7 @@ engine::engine(const engine_config & cfg)
         }
         const si::dev::profile_split sp = si::dev::check_profiles_homogeneous(gpu_names);
         if (!sp.homogeneous) {
-            fprintf(stderr,
+            si::logf(
                     "[dev] WARNING: the layer map spans GPUs with different device profiles: '%s' is '%s' but "
                     "'%s' is '%s'.  Each partition now runs its own card's tuning, which is correct, but the "
                     "two sides are measured on different hardware.\n",
@@ -413,13 +415,13 @@ engine::engine(const engine_config & cfg)
         // The draft head needs the oneDNN int8 row-major weight path (the same
         // one the multi-device decode uses); everything else would fall back to
         // a much slower per-call GEMM chain.
-        fprintf(stderr, "[mtp] MTP needs a multi-device oneDNN int8 partition (%s) - disabled\n",
+        si::logf("[mtp] MTP needs a multi-device oneDNN int8 partition (%s) - disabled\n",
                 multi_dev ? (md_xmx ? "ok" : "no XMX") : "single device");
         mtp.mtp_on = false;
         mtp.mtp_k = 0;
     }
     if (mtp.mtp_on && (mtp.mtp_dev < 0 || mtp.mtp_dev >= (int)backends_.size())) {
-        fprintf(stderr, "[mtp] --mtp-device %d out of range (%zu device(s)) - using 0\n", mtp.mtp_dev, backends_.size());
+        si::logf("[mtp] --mtp-device %d out of range (%zu device(s)) - using 0\n", mtp.mtp_dev, backends_.size());
         mtp.mtp_dev = 0;
     }
     // DFlash / DFlash2 drafter (--spec-type dflash2): its own GGUF, its own K/V
@@ -441,18 +443,18 @@ engine::engine(const engine_config & cfg)
         // A declared capability, not a silent fallback: a model whose forward
         // does not produce the draft/verify state says so once and stays on the
         // plain decode, exactly as the MTP gate above does.
-        fprintf(stderr, "[dflash] %s: %s - DFlash disabled\n", mp_->key,
+        si::logf("[dflash] %s: %s - DFlash disabled\n", mp_->key,
                 mp_->spec.why && *mp_->spec.why ? mp_->spec.why : "unsupported");
         draft_requested_ = false;
     } else if (!cfg.draft_path.empty()) {
         if (mtp.mtp_on) {
-            fprintf(stderr, "[dflash] --spec-draft-model and --mtp are exclusive; MTP off\n");
+            si::logf("[dflash] --spec-draft-model and --mtp are exclusive; MTP off\n");
             mtp.mtp_on = false;
             mtp.mtp_k = 0;
         }
         setup_dflash(cfg.draft_path);
         if (!dfl.dflash_on_) {
-            fprintf(stderr, "[dflash] speculative decoding unavailable - plain decode\n");
+            si::logf("[dflash] speculative decoding unavailable - plain decode\n");
         }
     }
     if (cpu_mode) {
@@ -649,7 +651,7 @@ engine::engine(const engine_config & cfg)
                     states = per_node > 0 ? (int)(vram_bytes / per_node) : 0;
                     vram_bytes = (size_t)std::max(states, 0) * per_node;
                 }
-                fprintf(stderr,
+                si::logf(
                         "[pc] tiers clamped to --kv-cap-mb %d: vram=%d checkpoints, ram=%.0f MB, disk=%.0f MB\n",
                         cfg.kv_cap_mb, states, (double)ram_bytes / (1024.0 * 1024.0), (double)disk_bytes / (1024.0 * 1024.0));
             }
@@ -846,7 +848,7 @@ engine::engine(const engine_config & cfg)
             }
             const double own = (double)dev_used_bytes_[d];
             const double kv = d == 0 ? (double)kv_bytes_total() : 0.0;
-            fprintf(stderr,
+            si::logf(
                     "[mem] dev %zu own=%.0f MB (kv=%.0f + rest=%.0f) total=%.0f driver_free=%.0f unaccounted=%.0f MB\n",
                     d, own / 1048576.0, kv / 1048576.0, (own - kv) / 1048576.0, (double)total / 1048576.0,
                     (double)dfree / 1048576.0, ((double)total - own - (double)dfree) / 1048576.0);
@@ -884,7 +886,7 @@ engine::~engine() {
         // tier's hit rate is what tells you whether the disk tier is still being
         // touched.
         const size_t ram_h = moe_cache_.ram_hits(), ram_m = moe_cache_.ram_misses();
-        fprintf(stderr,
+        si::logf(
                 "[moe] expert cache: bank %d/%d resident per layer (calibrated %zu pairs), RAM tier %.1f MB "
                 "hits=%zu misses=%zu (%.1f%%)\n",
                 moe_cache_.resident(), moe_cache_.n_expert(), moe_cache_.resident_pairs(),
@@ -1487,7 +1489,7 @@ void engine::setup_moe_slots() {
         }
     }
     if (mixed) {
-        fprintf(stderr, "[moe] %zu of %zu layers use a different expert quant type than layer 0 "
+        si::logf("[moe] %zu of %zu layers use a different expert quant type than layer 0 "
                         "(down plane %zu vs %zu bytes) - strides are per-layer\n", mixed, nL, moe_slot_db_max,
                 moe_slot_db[0]);
     }
@@ -1495,7 +1497,7 @@ void engine::setup_moe_slots() {
     for (int il = 0; il < hp.n_layer; il++) {
         per_layer += m.layers[(size_t)il].moe.bytes();
     }
-    fprintf(stderr, "[moe] %d experts, top-%d, expert_ff %d, shared_ff %d: %.2f GiB of routed experts (%.1f MiB/layer)\n",
+    si::logf("[moe] %d experts, top-%d, expert_ff %d, shared_ff %d: %.2f GiB of routed experts (%.1f MiB/layer)\n",
             hp.n_expert, hp.n_expert_used, hp.n_ff_exp, hp.n_ff_shexp, (double)per_layer / (1024.0 * 1024.0 * 1024.0),
             (double)(per_layer / (size_t)std::max(1, hp.n_layer)) / (1024.0 * 1024.0));
 }
@@ -1580,7 +1582,7 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
     }
     uint8_t * stage = sycl::malloc_host<uint8_t>(stage_bytes, qd);
     if (!stage) {
-        fprintf(stderr, "[moe] u4 gate/up bank: pinned staging allocation failed - keeping the raw experts\n");
+        si::logf("[moe] u4 gate/up bank: pinned staging allocation failed - keeping the raw experts\n");
         return false;
     }
     auto now = [] {
@@ -1656,7 +1658,7 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         for (int e = 0; e < tg.E; e++) {
             uint8_t * b = bank + (size_t)e * pl2;
             if (!D.add_weight_w4_dev((const void *)b, b, b + vb2, b + vb2 + sb2, K, 2 * N)) {
-                fprintf(stderr, "[moe] u4 bank: oneDNN rejected the fused store (K=%d N=%d e=%d)\n", K, 2 * N, e);
+                si::logf("[moe] u4 bank: oneDNN rejected the fused store (K=%d N=%d e=%d)\n", K, 2 * N, e);
                 return 0;
             }
             registered.push_back((const void *)b);
@@ -1709,7 +1711,7 @@ bool engine::setup_moe_u4_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
     sycl::free(stage, qd);
     if (banked_layers) {
         moe_u4_any_ = true;
-        fprintf(stderr,
+        si::logf(
                 "[moe] u4 gate/up bank (dev %d): %d layers, %.1f MiB on device, packed %.2f s in %.2f s of copies "
                 "(%.2f s total, %zu experts)\n",
                 dev, banked_layers, (double)bank_bytes / (1024.0 * 1024.0), pack_s, copy_s, now() - t_start,
@@ -1810,7 +1812,7 @@ bool engine::setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         }
         uint8_t * stage = sycl::malloc_host<uint8_t>(bytes, qd);
         if (!stage) {
-            fprintf(stderr, "[moe] down int8 bank: %.1f MiB staging failed\n", (double)bytes / (1024.0 * 1024.0));
+            si::logf("[moe] down int8 bank: %.1f MiB staging failed\n", (double)bytes / (1024.0 * 1024.0));
             break;
         }
         const size_t row_bytes = (size_t)quant_row_bytes(T.type, K);
@@ -1863,7 +1865,7 @@ bool engine::setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         uint8_t * bank = sycl::malloc_device<uint8_t>(bytes, qd);
         if (!bank) {
             sycl::free(stage, qd);
-            fprintf(stderr, "[moe] down int8 bank: %.1f MiB device allocation failed\n",
+            si::logf("[moe] down int8 bank: %.1f MiB device allocation failed\n",
                     (double)bytes / (1024.0 * 1024.0));
             break;
         }
@@ -1876,7 +1878,7 @@ bool engine::setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         }
         if (!all_ok) {
             sycl::free(bank, qd);
-            fprintf(stderr, "[moe] down int8 bank: oneDNN rejected layer %d\n", il);
+            si::logf("[moe] down int8 bank: oneDNN rejected layer %d\n", il);
             continue;
         }
         m.page_out_host(T.data, T.total_bytes());
@@ -1901,7 +1903,7 @@ bool engine::setup_moe_down_i8_bank(int dev, dnnl_gemm & D, sycl::queue & qd) {
         D.warm_i8(m.hp.n_ff_exp, m.hp.n_embd, Ms, 5);
         moe_i8_any_ = true;
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0;
-        fprintf(stderr, "[moe] down int8 bank (dev %d): %d layers, %.1f MiB on device (%.2f s)\n", dev, banked,
+        si::logf("[moe] down int8 bank (dev %d): %d layers, %.1f MiB on device (%.2f s)\n", dev, banked,
                 (double)used / (1024.0 * 1024.0), dt);
         return true;
     }
@@ -2083,7 +2085,7 @@ void engine::finalize_moe_banks() {
                 upload_raw_tensor(dev, M.down_exps, "down_exps");
             }
         }
-        fprintf(stderr,
+        si::logf(
                 "[moe] expert banks (dev %d): %s; room %.0f MB above a %ld MB reserve, "
                 "gate/up u4 %.0f MB vs raw %.0f MB, down int8 %.0f MB vs raw %.0f MB\n",
                 dev,
@@ -2534,7 +2536,7 @@ void engine::build_f32_weights() {
     const int maxk = std::max(m.hp.n_embd, m.hp.n_ff);
     const size_t act = (size_t)kMaxB * kMaxT * (size_t)maxk;
     d_f32act = (float *)dev_alloc_on(0, act * sizeof(float));
-    fprintf(stderr, "[dev] f32 GEMM path: %zu tensors\n", f32_weights_.size());
+    si::logf("[dev] f32 GEMM path: %zu tensors\n", f32_weights_.size());
 }
 
 void engine::upload_device_weights(int dev) {
@@ -2776,10 +2778,10 @@ void engine::upload_device_weights(int dev) {
                     bad++;
                 }
             }
-            fprintf(stderr, "[moe] verify dev=%d %-34s bytes=%zu mismatched=%zu%s\n", dev, t.name.c_str(),
+            si::logf("[moe] verify dev=%d %-34s bytes=%zu mismatched=%zu%s\n", dev, t.name.c_str(),
                     t.nbytes(), bad, bad ? "" : "  OK");
             if (bad && have_first) {
-                fprintf(stderr, "[moe]   first mismatch at %zu (%.4f%% into the tensor)\n", first,
+                si::logf("[moe]   first mismatch at %zu (%.4f%% into the tensor)\n", first,
                         100.0 * (double)first / (double)back.size());
             }
         }
@@ -2805,12 +2807,12 @@ void engine::upload_device_weights(int dev) {
     }
     t_pageout = ms_since(t_p);
     if (ldtime) {
-        fprintf(stderr,
+        si::logf(
                 "[load]   upload dev %d: %zu tensors %.0f MB | malloc %.1f, enqueue %.1f, tokemb %.1f, wait %.1f, "
                 "pageout %.1f ms\n",
                 dev, n, (double)bytes / (1024.0 * 1024.0), t_malloc, t_enq, t_tokemb, t_wait, t_pageout);
     }
-    fprintf(stderr, "[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
+    si::logf("[dev] device %d: uploaded %zu tensors (%d layers), %.1f MB\n", dev, n, needed_by_layer,
             (double)bytes / (1024.0 * 1024.0));
 }
 
@@ -2827,7 +2829,7 @@ void engine::build_rope_freqs(int n_rot, float base) {
         yarn_orig_ctx_ = m.hp.n_ctx;
         if (yarn_on_ && yarn_orig_ctx_ <= 0) {
             const std::string * arch = m.gguf.get_str("general.architecture");
-            fprintf(stderr, "[yarn] model declares no %s.context_length - pass --yarn-orig-ctx, disabling\n",
+            si::logf("[yarn] model declares no %s.context_length - pass --yarn-orig-ctx, disabling\n",
                     arch ? arch->c_str() : "?");
             yarn_on_ = false;
         }
@@ -2844,7 +2846,7 @@ void engine::build_rope_freqs(int n_rot, float base) {
     yp.attn_factor = yarn_attn_factor_;
     if (n_pairs <= 0) {
         if (yp.on) {
-            fprintf(stderr, "[yarn] model has n_rot=%d, nothing to scale - disabled\n", n_rot);
+            si::logf("[yarn] model has n_rot=%d, nothing to scale - disabled\n", n_rot);
         }
         yarn_on_ = false;
         return;
@@ -2854,7 +2856,7 @@ void engine::build_rope_freqs(int n_rot, float base) {
     float factor = yp.factor > 0.0f ? yp.factor
                                     : (yp.orig_ctx > 0 ? (float)max_seq / (float)yp.orig_ctx : 1.0f);
     if (yp.on && factor <= 1.0f) {
-        fprintf(stderr,
+        si::logf(
                 "[yarn] factor %.3f <= 1 (max_seq=%d, trained ctx=%d) - nothing to extend, disabled\n", factor, max_seq,
                 yp.orig_ctx);
         yarn_on_ = false;
@@ -2874,7 +2876,7 @@ void engine::build_rope_freqs(int n_rot, float base) {
     // The kernels index the table by pair index, so its length is not a detail:
     // assert it here rather than let a kernel read past the upload.
     if ((int)h_rope_freqs_.size() != n_pairs) {
-        fprintf(stderr, "[yarn] internal error: table has %zu entries, kernels will read %d - disabled\n",
+        si::logf("[yarn] internal error: table has %zu entries, kernels will read %d - disabled\n",
                 h_rope_freqs_.size(), n_pairs);
         h_rope_freqs_.clear();
         d_rope_mscale_ = 1.0f;
@@ -2913,7 +2915,7 @@ void engine::build_rope_freqs(int n_rot, float base) {
             }
         }
     }
-    fprintf(stderr,
+    si::logf(
             "[yarn] on: factor=%.3f (max_seq=%d, trained ctx=%d) base=%.0f n_rot=%d beta=%.0f/%.0f "
             "mscale=%.4f pairs: %d stretched, %d ramped, %d untouched\n",
             factor, max_seq, yp.orig_ctx, base, n_rot, yp.beta_fast, yp.beta_slow, d_rope_mscale_, n_stretched,
@@ -3056,7 +3058,7 @@ void engine::release_host_weight_pages() {
         // token strings) is dead too
         m.page_out_host(m.gguf.map_base, m.gguf.data_offset);
     }
-    fprintf(stderr, "[mem] released %.1f MB of host-resident GGUF pages (RSS)%s\n",
+    si::logf("[mem] released %.1f MB of host-resident GGUF pages (RSS)%s\n",
             (double)dropped / (1024.0 * 1024.0), m.keep_file_cache ? ", page cache kept" : "");
 }
 
@@ -3323,7 +3325,7 @@ bool engine::setup_md_dnnl() {
                 if (!mp_->rep.raw_gemv_decode) {
                     m.page_out_tensor(m.output);
                 }
-                fprintf(stderr, "[w4] LM head u4 store: %s (K=%d N=%d G=%d, %.4f B/weight; int8 fallback kept)\n",
+                si::logf("[w4] LM head u4 store: %s (K=%d N=%d G=%d, %.4f B/weight; int8 fallback kept)\n",
                         ok ? "registered" : "failed - keeping the int8 head", (int)m.output.K, (int)m.output.N,
                         si::w4_group(), 0.5 + 4.0 / (double)si::w4_group());
             } else {
@@ -3361,14 +3363,14 @@ bool engine::setup_md_dnnl() {
                         const wt & hd = draft_head();
                         mtp.mtp_head_w2_ = D->add_weight_w2(mtp.mtp_head_w2_key_, hd.data, hd.type, hd.K, hd.N);
                         if (si::env::flag("PF_MTP_MEM")) {
-                            fprintf(stderr, "[mtp] draft LM head: %d rows x %d K, %s\n", (int)hd.N, (int)hd.K,
+                            si::logf("[mtp] draft LM head: %d rows x %d K, %s\n", (int)hd.N, (int)hd.K,
                                     mtp.mtp_head_w2_ ? "2-bit copy ok" : "2-bit copy failed");
                         }
                     }
                     if (si::env::flag("PF_MTP_MEM")) {
                         const wt & hd = draft_head();
                         auto pr = [&](const char * nm, const wt & t) {
-                            fprintf(stderr, "[mtp] layer %-12s K=%d N=%d type=%d\n", nm, (int)t.K, (int)t.N,
+                            si::logf("[mtp] layer %-12s K=%d N=%d type=%d\n", nm, (int)t.K, (int)t.N,
                                     (int)t.type);
                         };
                         const mtp_layer_t & M = m.mtp;
@@ -3392,7 +3394,7 @@ bool engine::setup_md_dnnl() {
                         head_split_K_ = hd.K;
                         head_split_pending_ = hd.N / 2 > 0;
                     }
-                    fprintf(stderr, "[mtp] draft LM head: %s%s\n",
+                    si::logf("[mtp] draft LM head: %s%s\n",
                             mtp.mtp_head_w4_ ? "u4 copy registered" : "u4 conversion failed - keeping int8",
                             mtp.mtp_head_w2_ ? " + 2-bit copy (0.375 B/w)" : "");
                 }
@@ -3442,7 +3444,7 @@ bool engine::setup_md_dnnl() {
             lt.lap(lb);
         }
         if (dev_ok) {
-            fprintf(stderr, "[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
+            si::logf("[dev] device %zu weights: %d u4, %d k5, %d codebook, %d int8, %.1f MiB on device\n", d,
                     n_w4, n_k5, n_cb, n_i8, (double)D->weight_bytes() / (1024.0 * 1024.0));
             // The stores live in the oneDNN partition, which allocates them
             // itself, so the engine's own allocation counter does not see
@@ -3473,7 +3475,7 @@ bool engine::setup_md_dnnl() {
                     mtp.mtp_head_half_ = half;
                     mtp.d_mtp_hnorm1 = (float *)dev_alloc_on(1, (size_t)m.hp.n_embd * 4);
                     mtp.h_head_stage = (float *)alloc_bytes((size_t)m.hp.n_embd * 4);
-                    fprintf(stderr, "[mtp] draft LM head: split across 2 GPUs, %d rows each (%.0f MB extra)\n", half,
+                    si::logf("[mtp] draft LM head: split across 2 GPUs, %d rows each (%.0f MB extra)\n", half,
                             (double)head_split_K_ * head_split_N_ * 0.625 / (1024.0 * 1024.0));
                 }
                 head_split_pending_ = false;
@@ -3489,10 +3491,10 @@ bool engine::setup_md_dnnl() {
             dnnl_register_queue(*dev_queues_[d], dnnl_dev_[d].get());
             any = true;
         } else {
-            fprintf(stderr, "[dev] oneDNN: device %zu has no convertible layer weights\n", d);
+            si::logf("[dev] oneDNN: device %zu has no convertible layer weights\n", d);
         }
     }
-    fprintf(stderr, "[dev] oneDNN multi-device: %s\n", any ? "enabled" : "unavailable (dp4a fallback)");
+    si::logf("[dev] oneDNN multi-device: %s\n", any ? "enabled" : "unavailable (dp4a fallback)");
     if (!any) {
         dnnl_dev_.clear();
     }
@@ -3620,7 +3622,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
             }
             dev_queues_[(size_t)bidx] = owned_queues_.back().get();
             backends_[(size_t)bidx] = make_gpu_backend(*dev_queues_[(size_t)bidx]);
-            fprintf(stderr, "[dev] backend %d -> gpu.%d (%s)\n", bidx, phys,
+            si::logf("[dev] backend %d -> gpu.%d (%s)\n", bidx, phys,
                     target.get_info<sycl::info::device::name>().c_str());
         }
     }
@@ -3698,7 +3700,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
         const bool pipe_env = !(epp && atoi(epp) == 0);
         md_pf_phases_ = phs;
         pf_pipe_ok_ = two_phase && gpu_only && pipe_env;
-        fprintf(stderr, "[md] prefill pipeline: %s (%zu phases)\n", pf_pipe_ok_ ? "on" : "off", phs.size());
+        si::logf("[md] prefill pipeline: %s (%zu phases)\n", pf_pipe_ok_ ? "on" : "off", phs.size());
     }
 
     // Per-device weight representation.  Preference order, gated by device
@@ -3724,7 +3726,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
         // arrays are used: for the grouped-scale shapes here oneDNN selects
         // jit:gemm:any (and ocl:ref:any with a blocked layout), so name the
         // path for what it is.
-        fprintf(stderr, "[dev] multi-device weight path: %s\n",
+        si::logf("[dev] multi-device weight path: %s\n",
                 md_xmx       ? "oneDNN int8 matmul (jit:gemm:any)"
                 : arch_dense_store() ? "ds41 dense oneDNN k5/int8 stores"
                 : md_int8    ? "SIn int8 (dp4a)"
@@ -3779,7 +3781,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
                 continue;
             }
             const bool in_map = weight_maps_[d].count(L0.wqkv.data) != 0;
-            fprintf(stderr, "[diag] dev=%zu wqkv host=%p in_map=%d has_w=%d w4=%d k5=%d cb4=%d w8=%d\n", d,
+            si::logf("[diag] dev=%zu wqkv host=%p in_map=%d has_w=%d w4=%d k5=%d cb4=%d w8=%d\n", d,
                     L0.wqkv.data, (int)in_map, (int)dnnl_dev_[d]->has_weight(L0.wqkv.data),
                     (int)dnnl_dev_[d]->has_weight_w4(L0.wqkv.data), (int)dnnl_dev_[d]->has_weight_k5(L0.wqkv.data),
                     (int)dnnl_dev_[d]->has_weight_cb4(L0.wqkv.data),
@@ -3792,16 +3794,16 @@ void engine::setup_multi_device(const std::string & layer_map) {
                 const moe_wt * w;
             } ts[] = {{"gate", &M.gate_exps}, {"up", &M.up_exps}, {"down", &M.down_exps}};
             for (const auto & e : ts) {
-                fprintf(stderr, "[diag] %-5s type=%2d K=%5d N=%5d E=%d plane_bytes=%9zu rows*N=%9zu total=%9zu\n", e.nm,
+                si::logf("[diag] %-5s type=%2d K=%5d N=%5d E=%d plane_bytes=%9zu rows*N=%9zu total=%9zu\n", e.nm,
                         (int) e.w->type, e.w->K, e.w->N, e.w->E, e.w->plane_bytes,
                         quant_row_bytes(e.w->type, e.w->K) * (size_t) e.w->N, e.w->total_bytes());
             }
         }
-        fprintf(stderr, "[diag] weight_maps sizes:");
+        si::logf("[diag] weight_maps sizes:");
         for (size_t d = 0; d < weight_maps_.size(); d++) {
-            fprintf(stderr, " dev%zu=%zu", d, weight_maps_[d].size());
+            si::logf(" dev%zu=%zu", d, weight_maps_[d].size());
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
         // the group that carries wqkv also carries ssm_beta/ssm_alpha (K=n_embd,
         // N=dt_rank = 32 rows), and dnnl_call is all-or-nothing per call - so if
         // oneDNN cannot take those two, the qkv GEMV loses the fast path with them
@@ -3815,7 +3817,7 @@ void engine::setup_multi_device(const std::string & layer_map) {
             } ts[] = {{"wqkv", &L0.wqkv}, {"wgate", &L0.wgate}, {"ssm_out", &L0.ssm_out},
                       {"ssm_beta", &L0.ssm_beta}, {"ssm_alpha", &L0.ssm_alpha}};
             for (const auto & e : ts) {
-                fprintf(stderr, "[diag] dev=%zu %-10s type=%d K=%d N=%d has_w=%d\n", d, e.nm, (int)e.t->type, e.t->K,
+                si::logf("[diag] dev=%zu %-10s type=%d K=%d N=%d has_w=%d\n", d, e.nm, (int)e.t->type, e.t->K,
                         e.t->N, (int)dnnl_dev_[d]->has_weight(e.t->data));
             }
             break;
@@ -3831,14 +3833,14 @@ void engine::setup_multi_device(const std::string & layer_map) {
         const void * dkey = wptr(0, m.output.data);
         if (dnnl_dev_[0]->add_weight(dkey, m.output.data, m.output.type, m.output.K, m.output.N, true,
                                      si::env::flag("PF_DNNL_LAZY"))) {
-            fprintf(stderr, "[dev] tied LM head: oneDNN int8 conversion keyed by its device copy\n");
+            si::logf("[dev] tied LM head: oneDNN int8 conversion keyed by its device copy\n");
         }
         dnnl_dev_[0]->report_load("tied head");
     }
     // CPU partitions keep weight_maps_ empty: wptr() then returns the host mmap
     // pointer directly (their weights are never copied to a device)
     lt.total("setup_multi_device total");
-    fprintf(stderr, "[dev] multi-device layer map: %s (%d backends)\n", layer_map.c_str(), ndev);
+    si::logf("[dev] multi-device layer map: %s (%d backends)\n", layer_map.c_str(), ndev);
 }
 
 void engine::alloc_buffers() {
@@ -3951,7 +3953,7 @@ void engine::alloc_buffers() {
         finalize_moe_banks();
         moe_cache_.init(m, moe_cfg_, (int) m.hp.n_expert);
         if (!moe_cache_.all_resident() && moe_cache_.active()) {
-            fprintf(stderr, "[moe] expert cache: host expert split active, the decode graph is disabled\n");
+            si::logf("[moe] expert cache: host expert split active, the decode graph is disabled\n");
         }
         setup_moe_slots();
         if (!moe_as_.empty()) {
@@ -4049,10 +4051,10 @@ void engine::alloc_buffers() {
                     mtp.mtp_cand_ok_ = mtp.mtp_head_w8_ != nullptr && mtp.mtp_head_wsc_ != nullptr;
                 }
                 if (!mtp.mtp_cand_ok_) {
-                    fprintf(stderr, "[mtp] candidate head: no grouped int8 head on device 0, using the full readout\n");
+                    si::logf("[mtp] candidate head: no grouped int8 head on device 0, using the full readout\n");
                     mtp.mtp_cand_cap_ = 0;
                 } else {
-                    fprintf(stderr, "[mtp] candidate head: cap=%d margin=%.2f rows=%d\n", mtp.mtp_cand_cap_,
+                    si::logf("[mtp] candidate head: cap=%d margin=%.2f rows=%d\n", mtp.mtp_cand_cap_,
                             mtp.mtp_cand_margin_, mtp.mtp_head_rows_);
                 }
             }
@@ -4079,12 +4081,12 @@ void engine::alloc_buffers() {
                         default: return "unknown";
                     }
                 };
-                fprintf(stderr, "[mtp] mem: q_dev=%s dev0=%s mtp.mtp_dev=%d\n",
+                si::logf("[mtp] mem: q_dev=%s dev0=%s mtp.mtp_dev=%d\n",
                         q.get_device().get_info<sycl::info::device::name>().c_str(),
                         dev_queues_.empty() || !dev_queues_[0] ? "-"
                                                               : dev_queues_[0]->get_device().get_info<sycl::info::device::name>().c_str(),
                         mtp.mtp_dev);
-                fprintf(stderr, "[mtp] mem: main_h=%s last_hidden=%s xnorm0=%s hprev=%s hist=%s\n", ty(mtp.d_mtp_main_h),
+                si::logf("[mtp] mem: main_h=%s last_hidden=%s xnorm0=%s hprev=%s hist=%s\n", ty(mtp.d_mtp_main_h),
                         ty(d_last_hidden), ty(as_[0].xnorm), ty(mtp.d_mtp_hprev), ty(mtp.d_mtp_hist_[d]));
             }
             mtp.d_mtp_hist_[d] =
@@ -4424,7 +4426,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
         pf_info_ = inf;
         pc_capture_begin(slot, toks, start, pos0, n, /*single_boundary=*/true);
         if (dbg_pfb) {
-            fprintf(stderr, "[pfb] pipe n=%d NCH=%d parity=%d\n", n, NCH, parity);
+            si::logf("[pfb] pipe n=%d NCH=%d parity=%d\n", n, NCH, parity);
         }
         record_forward(2, plan_pfb_, d_segs_pfb, n, d_segs_pfb, 0, &md_pf_phases_[0], inf);
         pf_pipe_pending_ = true;
@@ -4436,7 +4438,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     setup_pf_info(d_info, toks, start, n, slot, pos0);
     pc_capture_begin(slot, toks, start, pos0, n, /*single_boundary=*/true);
     if (dbg_pfb) {
-        fprintf(stderr, "[pfb] n=%d NCH=%d segs=%zu x8=%p\n", n, NCH, plan_pfb_.segs.size(), (void *)d_x8);
+        si::logf("[pfb] n=%d NCH=%d segs=%zu x8=%p\n", n, NCH, plan_pfb_.segs.size(), (void *)d_x8);
     }
     static const bool nog = si::env::flag("PF_NOGRAPH");
     // oneDNN primitives cannot be recorded into a SYCL command graph, so the
@@ -4448,7 +4450,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     if ((nog || use_dnnl || multi_dev) && !plan_pfb_.segs.empty()) {
         const auto tp0 = std::chrono::steady_clock::now();
         if (dbg_pfb) {
-            fprintf(stderr, "[pfb] direct record_forward(2)\n");
+            si::logf("[pfb] direct record_forward(2)\n");
         }
         record_forward(2, plan_pfb_, d_segs_pfb, n, d_segs_pfb);
         if (multi_dev) {
@@ -4457,7 +4459,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
             q.wait();
         }
         if (dbg_pfb) {
-            fprintf(stderr, "[pfb] n=%d wall %.3f s\n", n,
+            si::logf("[pfb] n=%d wall %.3f s\n", n,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
         }
         d_info->pc_active = 0;
@@ -4480,7 +4482,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
         throw std::runtime_error("prefill_batch: no recorded variant for this size");
     }
     if (dbg_pfb) {
-        fprintf(stderr, "[pfb] graph replay ntok=%d\n", v->ntok);
+        si::logf("[pfb] graph replay ntok=%d\n", v->ntok);
     }
     q.ext_oneapi_graph(*v->e);
     q.wait();
@@ -4904,7 +4906,7 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
         }
         out.push_back(tok);
         if (dbg_gen) {
-            fprintf(stderr, "[gen] step=%d pos=%d id=%d eos=%d\n", step, pos, tok, (int)is_eos(tok));
+            si::logf("[gen] step=%d pos=%d id=%d eos=%d\n", step, pos, tok, (int)is_eos(tok));
         }
         if (!gp.ignore_eos && is_eos(tok)) {
             break;
@@ -4947,7 +4949,7 @@ std::vector<int> engine::generate_impl(const std::vector<int> & prompt, const mm
     if (arg_time) {
         const double loop_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_loop).count();
-        fprintf(stderr,
+        si::logf(
                 "[q4arg] dev_argmax=%d steps=%d sample=%.3f fetch=%.3f total=%.3f loop=%.3f ms/step\n",
                 (int)use_dev_argmax, arg_n, arg_n ? arg_ms / arg_n : 0.0, arg_n ? fetch_ms / arg_n : 0.0,
                 arg_n ? (arg_ms + fetch_ms) / arg_n : 0.0, arg_n ? loop_ms / arg_n : 0.0);

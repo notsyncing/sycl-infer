@@ -1,3 +1,5 @@
+#include "log.h"
+
 // MTP (NextN) speculative decoding for the qwen35 family.
 //
 // The GGUF ships one extra full-attention block after the main layers
@@ -45,7 +47,7 @@ bool mtp_dbg() {
 #define MTPDBG(...)                                                                                                    \
     do {                                                                                                               \
         if (mtp_dbg()) {                                                                                               \
-            fprintf(stderr, "[mtp] " __VA_ARGS__);                                                                     \
+            si::logf("[mtp] " __VA_ARGS__);                                                                     \
         }                                                                                                              \
     } while (0)
 
@@ -78,7 +80,7 @@ void engine::build_mtp_plan() {
             dev_queue(mtp.mtp_dev).memcpy(raw[i], ts[i]->data, bytes).wait();
             bytes_total += bytes;
         }
-        fprintf(stderr, "[mtp] PF_MTP_LAYER_EXACT: raw layer copies on device %d (%.0f MB)\n", mtp.mtp_dev,
+        si::logf("[mtp] PF_MTP_LAYER_EXACT: raw layer copies on device %d (%.0f MB)\n", mtp.mtp_dev,
                 bytes_total / (1024.0 * 1024.0));
     }
     auto seg = [&](const wt & w, const float * x, int xs, float * out, int os, const float * res, int ri = -1) {
@@ -185,7 +187,7 @@ void engine::build_mtp_plan() {
         }
         mtp.d_segs_mtp_exact = alloc_elems<gemv_seg>(x.size());
         q.memcpy(mtp.d_segs_mtp_exact, x.data(), x.size() * sizeof(gemv_seg)).wait();
-        fprintf(stderr, "[mtp] exact seg copy: %zu segs, %d raw pointers bound\n", x.size(), bound);
+        si::logf("[mtp] exact seg copy: %zu segs, %d raw pointers bound\n", x.size(), bound);
     }
 }
 
@@ -321,7 +323,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
         if (edbg) {
             static int seen = 0;
             if (seen++ < 12) {
-                fprintf(stderr, "[exact] ci=%d M=%d groups=%d nsb=%d filter=%d\n", ci, M, gc, p.calls[(size_t)ci].nsb,
+                si::logf("[exact] ci=%d M=%d groups=%d nsb=%d filter=%d\n", ci, M, gc, p.calls[(size_t)ci].nsb,
                         exact_only);
             }
         }
@@ -377,7 +379,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                fprintf(stderr, "[mtp] head split GEMM failed (lo=%d hi=%d) - falling back to the unsplit readout\n",
+                si::logf("[mtp] head split GEMM failed (lo=%d hi=%d) - falling back to the unsplit readout\n",
                         (int)lo_ok, (int)hi_ok);
             }
         } else {
@@ -390,7 +392,7 @@ void engine::mtp_gemv(int ci, int M, int step) {
                     if (hl[(size_t)i] > hl[(size_t)bh]) bh = i;
                 int32_t di = -1;
                 dev_queue(0).memcpy(&di, mtp.d_mtp_tok_ + step, sizeof(di)).wait();
-                fprintf(stderr, "[mtp] head split step=%d dev=%d host=%d val=%.9g\n", step, di, bh, hl[(size_t)bh]);
+                si::logf("[mtp] head split step=%d dev=%d host=%d val=%.9g\n", step, di, bh, hl[(size_t)bh]);
             }
             return;
         }
@@ -458,7 +460,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
     auto dmark = [&](const char * tag) {
         if (dstep) {
             const auto t2 = dnow();
-            fprintf(stderr, "[mtp] draft n=%d %-10s %.2f ms\n", n, tag, dms(dt, t2));
+            si::logf("[mtp] draft n=%d %-10s %.2f ms\n", n, tag, dms(dt, t2));
             dt = t2;
         }
     };
@@ -516,7 +518,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
         static bool once = false;
         if (!once) {
             once = true;
-            fprintf(stderr, "[mtp] attn_layers=%d mtp_local=%d multi_dev=%d\n", attn_layers(), mtp.mtp_attn_local_,
+            si::logf("[mtp] attn_layers=%d mtp_local=%d multi_dev=%d\n", attn_layers(), mtp.mtp_attn_local_,
                     (int)multi_dev);
             for (int a = 0; a <= attn_layers() - 1; a++) {
                 const char *p1;
@@ -524,7 +526,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
                 const char *p3;
                 const char *p4;
                 kv_layer_ptrs(a, p1, p2, p3, p4);
-                fprintf(stderr, "[mtp]   attn a=%2d dev=%d kp=%p vp=%p\n", a, attn_dev(a), (void *)p1, (void *)p2);
+                si::logf("[mtp]   attn a=%2d dev=%d kp=%p vp=%p\n", a, attn_dev(a), (void *)p1, (void *)p2);
             }
         }
     }
@@ -579,7 +581,7 @@ void engine::mtp_forward(const int32_t * toks, const float * h, const float * hp
             std::vector<float> h(8), hn(8);
             dev_queue(mtp.mtp_dev).memcpy(h.data(), mtp.d_mtp_x, 32).wait();
             dev_queue(mtp.mtp_dev).memcpy(hn.data(), mtp.d_mtp_hnorm, 32).wait();
-            fprintf(stderr, "[exact] step=%d x[0:4]=%.4f %.4f %.4f %.4f hnorm[0:4]=%.4f %.4f %.4f %.4f\n", step,
+            si::logf("[exact] step=%d x[0:4]=%.4f %.4f %.4f %.4f hnorm[0:4]=%.4f %.4f %.4f %.4f\n", step,
                     h[0], h[1], h[2], h[3], hn[0], hn[1], hn[2], hn[3]);
         }
     }
@@ -659,7 +661,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     }
     MTPDBG("verify record_forward n=%d pos=%d\n", n, pos0);
     if (si::env::flag("PF_MTP_INFOCHK")) {
-        fprintf(stderr, "[mtp] infochk before rf: mtp_dt=%d pc_active=%d slot0=%d slot1=%d sizeof=%zu\n",
+        si::logf("[mtp] infochk before rf: mtp_dt=%d pc_active=%d slot0=%d slot1=%d sizeof=%zu\n",
                 d_info->mtp_dt, d_info->pc_active, d_info->pc_row_slot[0], d_info->pc_row_slot[1],
                 sizeof(step_info));
     }
@@ -705,7 +707,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
     MTPDBG("verify record_forward returned, syncing\n");
     sync_all();
     if (submit_dbg) {
-        fprintf(stderr, "[mtp] verify submit=%.2f ms  wall-after-submit=%.2f ms\n", t_submit, t_ms(t_submit0, t_now()));
+        si::logf("[mtp] verify submit=%.2f ms  wall-after-submit=%.2f ms\n", t_submit, t_ms(t_submit0, t_now()));
     }
     if (const char * sd = si::env::str("PF_MTP_SNAPDUMP"); sd && pos0 == 0) {
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
@@ -719,16 +721,16 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
                 fwrite(row.data(), 4, gdn_per, f);
             }
             fclose(f);
-            fprintf(stderr, "[mtp] snapdump %s n=%d\n", sd, n);
+            si::logf("[mtp] snapdump %s n=%d\n", sd, n);
         }
     }
     if (si::env::flag("PF_MTP_SNAPCHK") && pos0 == 22) {
-        fprintf(stderr, "[mtp] gdnmap:");
+        si::logf("[mtp] gdnmap:");
         for (int il = 0; il < std::min(8, hp.n_layer); il++) {
-            fprintf(stderr, " il%d(dev%d,gl%d)", il, layer_dev_[(size_t)il],
+            si::logf(" il%d(dev%d,gl%d)", il, layer_dev_[(size_t)il],
                     hp.is_recr(il) ? layer_gdn_local_[(size_t)il] : -1);
         }
-        fprintf(stderr, "  ng_dev=[%d,%d]\n", n_gdn_dev_[0], n_gdn_dev_.size() > 1 ? n_gdn_dev_[1] : -1);
+        si::logf("  ng_dev=[%d,%d]\n", n_gdn_dev_[0], n_gdn_dev_.size() > 1 ? n_gdn_dev_[1] : -1);
     }
     if (si::env::flag("PF_MTP_SNAPCHK") && pos0 == 0) {
         const size_t gdn_per = (size_t)hp.dt_rank * hp.d_state * hp.d_state;
@@ -750,7 +752,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
                 }
                 return mx;
             }();
-            fprintf(stderr, "[mtp] snapchk dev=%d slot(last=%d)-vs-live maxdiff=%.6f\n", dev, n - 1, dlast);
+            si::logf("[mtp] snapchk dev=%d slot(last=%d)-vs-live maxdiff=%.6f\n", dev, n - 1, dlast);
             std::vector<float> probe(gdn_per);
             for (int t = 0; t < n && t < 8; t++) {
                 qd.memcpy(probe.data(), mtp.d_mtp_hist_[(size_t)dev] + (size_t)t * (size_t)ng * per, gdn_per * 4).wait();
@@ -762,7 +764,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
                     }
                     mx = std::max(mx, (double)std::fabs(probe[i]));
                 }
-                fprintf(stderr, "[mtp] snapchk dev=%d slot %d: nonzero=%zu max|.|=%.4f\n", dev, t, nz, mx);
+                si::logf("[mtp] snapchk dev=%d slot %d: nonzero=%zu max|.|=%.4f\n", dev, t, nz, mx);
             }
             qd.memcpy(live.data(), as_[(size_t)dev].gdn_state, gdn_per * 4).wait();
             double d = 0, nb = 0, n0 = 0;
@@ -771,7 +773,7 @@ void engine::mtp_verify(const std::vector<int> & toks, int n, int slot, int pos0
                 nb = std::max(nb, (double)std::fabs(live[i]));
                 n0 = std::max(n0, (double)std::fabs(s0[i]));
             }
-            fprintf(stderr, "[mtp] snapchk dev=%d slot0-vs-live maxdiff=%.6f |live|=%.4f |slot0|=%.4f\n", dev, d, nb,
+            si::logf("[mtp] snapchk dev=%d slot0-vs-live maxdiff=%.6f |live|=%.4f |slot0|=%.4f\n", dev, d, nb,
                     n0);
         }
     }
@@ -886,7 +888,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         blocks.push_back(b);
     }
     if (dbg_gen && matched > 0) {
-        fprintf(stderr, "[mtp] prefix cache: reused %d prompt tokens\n", matched);
+        si::logf("[mtp] prefix cache: reused %d prompt tokens\n", matched);
     }
     set_table(0, blocks);
 
@@ -920,7 +922,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 std::vector<float> lg((size_t)hp.n_vocab);
                 fetch_logits(0, lg.data());
                 const int am = argmax_f(lg.data(), hp.n_vocab);
-                fprintf(stderr, "[mtp] dec %d argmax=%d\n", i, am);
+                si::logf("[mtp] dec %d argmax=%d\n", i, am);
             }
         }
         for (int i = 0; i < nprompt; i++) {
@@ -944,7 +946,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         const int fit = batched_prefill_fit(rem);
         const int nb = (fit >= 1 && fit <= rem) ? fit : std::min(kMaxT, rem);
         if (dbg_gen) {
-            fprintf(stderr, "[mtp] prefill batch pos=%d n=%d\n", pos, nb);
+            si::logf("[mtp] prefill batch pos=%d n=%d\n", pos, nb);
         }
         // mode 2 is the prefill path the multi-device engine actually uses; its
         // output norm leaves the per-position main hidden in d_xnorm
@@ -955,7 +957,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         // it must be flushed before the draft head reads it.
         prefill_flush();
         if (dbg_gen) {
-            fprintf(stderr, "[mtp] prefill batch done\n");
+            si::logf("[mtp] prefill batch done\n");
         }
         // mtp_capture copies the batch's rows in token order, and mtp_concat
         // indexes the hidden by the *global* slot (r*tpb + t) with h_prev only
@@ -969,7 +971,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             const float * hprev = off > 0 ? (mtp.d_mtp_main_h + (size_t)(off - 1) * hp.n_embd) : mtp.d_mtp_hprev;
             mtp_forward(chunk.data(), h, hprev, n, 0, pos + off, /*with_head=*/false);
             if (dbg_gen) {
-                fprintf(stderr, "[mtp] mtp prefill piece off=%d n=%d\n", off, n);
+                si::logf("[mtp] mtp prefill piece off=%d n=%d\n", off, n);
             }
         }
         dev_queue(0).memcpy(mtp.d_mtp_hprev, mtp.d_mtp_main_h + (size_t)(nb - 1) * hp.n_embd, (size_t)hp.n_embd * 4).wait();
@@ -1001,7 +1003,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                                                               - hb[(size_t)(i - 1) * hp.n_embd + j]));
                 }
             }
-            fprintf(stderr, "[mtp] hvec[%d] ||.|=%.4f d_prev=%.6f v=%.4f,%.4f,%.4f\n", i, std::sqrt(n), dprev,
+            si::logf("[mtp] hvec[%d] ||.|=%.4f d_prev=%.6f v=%.4f,%.4f,%.4f\n", i, std::sqrt(n), dprev,
                     hb[(size_t)i * hp.n_embd], hb[(size_t)i * hp.n_embd + 1], hb[(size_t)i * hp.n_embd + 2]);
         }
         {
@@ -1011,7 +1013,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             for (int j = 0; j < hp.n_embd; j++) {
                 d = std::max(d, (double)std::fabs(lh[(size_t)j] - hb[(size_t)21 * hp.n_embd + j]));
             }
-            fprintf(stderr, "[mtp] hvec d(last_hidden, capt[21])=%.6f\n", d);
+            si::logf("[mtp] hvec d(last_hidden, capt[21])=%.6f\n", d);
         }
     }
     std::vector<float> logits = run_head();
@@ -1035,7 +1037,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         for (int i = 0; i < dn; i++) {
             const int want = (i + 1 < nprompt) ? prompt[(size_t)i + 1] : ((i < 32) ? tok : tok);
             const int got = argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
-            fprintf(stderr, "[mtp] row %2d tok=%6d -> %6d want %6d %s\n", i, prompt[(size_t)i], got, want,
+            si::logf("[mtp] row %2d tok=%6d -> %6d want %6d %s\n", i, prompt[(size_t)i], got, want,
                     got == want ? "OK" : "XX");
         }
         {
@@ -1048,7 +1050,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 std::vector<float> lg2 = run_head();
                 const int got = argmax_f(lg2.data(), hp.n_vocab);
                 const int want = (i + 1 < nprompt) ? prompt[(size_t)i + 1] : tok;
-                fprintf(stderr, "[mtp] mainhead(xnorm[%d]) -> %d want %d %s\n", i, got, want, got == want ? "OK" : "XX");
+                si::logf("[mtp] mainhead(xnorm[%d]) -> %d want %d %s\n", i, got, want, got == want ? "OK" : "XX");
             }
         }
         {
@@ -1063,7 +1065,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 for (int j = 0; j < hp.n_embd; j++) {
                     n += (double)buf[(size_t)i * hp.n_embd + j] * buf[(size_t)i * hp.n_embd + j];
                 }
-                fprintf(stderr, "[mtp]   ||xnorm[%d]||=%.4f\n", i, std::sqrt(n));
+                si::logf("[mtp]   ||xnorm[%d]||=%.4f\n", i, std::sqrt(n));
             }
             q.memcpy(cat.data(), mtp.d_mtp_cat, (size_t)nr * 2 * hp.n_embd * 4).wait();
             q.memcpy(buf.data(), mtp.d_mtp_x, (size_t)nr * hp.n_embd * 4).wait();
@@ -1078,7 +1080,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     nx += (double)buf[(size_t)i * hp.n_embd + j] * buf[(size_t)i * hp.n_embd + j];
                     nhn += (double)hn[(size_t)i * hp.n_embd + j] * hn[(size_t)i * hp.n_embd + j];
                 }
-                fprintf(stderr, "[mtp]   row %d ||e||=%.4f ||hh||=%.4f ||x||=%.4f ||hnorm||=%.4f\n", i,
+                si::logf("[mtp]   row %d ||e||=%.4f ||hh||=%.4f ||x||=%.4f ||hnorm||=%.4f\n", i,
                         std::sqrt(ne), std::sqrt(nh), std::sqrt(nx), std::sqrt(nhn));
             }
         }
@@ -1118,7 +1120,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 dumpf(mtp.d_mtp_hnorm, (size_t)dn * hp.n_embd);
                 fwrite(h_logits, 4, (size_t)dn * hp.n_vocab, f);
                 fclose(f);
-                fprintf(stderr, "[mtp] dumped %s (ni=%d dn=%d)\n", dp, ni, dn);
+                si::logf("[mtp] dumped %s (ni=%d dn=%d)\n", dp, ni, dn);
             }
         }
     }
@@ -1134,7 +1136,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         for (size_t i = 0; i < pv.size(); i++) {
             const int got = argmax_f(h_logits + i * (size_t)hp.n_vocab, hp.n_vocab);
             const int want = (i + 1 < (size_t)nprompt) ? prompt[i + 1] : tok;
-            fprintf(stderr, "[mtp] vprobe row %2zu tok=%6d -> %6d want %6d %s\n", i, prompt[i], got, want,
+            si::logf("[mtp] vprobe row %2zu tok=%6d -> %6d want %6d %s\n", i, prompt[i], got, want,
                     got == want ? "OK" : "XX");
         }
     }
@@ -1150,7 +1152,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             for (int j = 0; j < hp.n_embd; j++) {
                 nb = std::max(nb, (double)std::fabs(a[j]));
             }
-            fprintf(stderr, "[mtp] hostcmp capt[%d] ||.|=%.4f v=%.4f,%.4f,%.4f\n", i, nb, a[0], a[1], a[2]);
+            si::logf("[mtp] hostcmp capt[%d] ||.|=%.4f v=%.4f,%.4f,%.4f\n", i, nb, a[0], a[1], a[2]);
         }
         {
             const float * a = mtp.d_mtp_main_h + (size_t)(nprompt - 1) * hp.n_embd;
@@ -1160,7 +1162,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 d = std::max(d, (double)std::fabs(a[j] - b[j]));
                 nb = std::max(nb, (double)std::fabs(b[j]));
             }
-            fprintf(stderr, "[mtp] hostcmp capt[last] vs d_last_hidden: maxdiff=%.6f |last_hidden|=%.4f\n", d, nb);
+            si::logf("[mtp] hostcmp capt[last] vs d_last_hidden: maxdiff=%.6f |last_hidden|=%.4f\n", d, nb);
         }
     }
     if (const char * sp = si::env::str("PF_MTP_STATEDUMP")) {
@@ -1178,7 +1180,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fwrite(base.data(), 4, gdn_per, f);
             fwrite(cv.data(), 4, conv_per, f);
             fclose(f);
-            fprintf(stderr, "[mtp] statedump %s (decode_h=%d)\n", sp, (int)decode_h);
+            si::logf("[mtp] statedump %s (decode_h=%d)\n", sp, (int)decode_h);
         }
     }
     if (decode_h) {
@@ -1212,7 +1214,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             fwrite(prompt.data(), 4, prompt.size(), f);
             fwrite(mtp.d_mtp_main_h, 4, (size_t)nprompt * hp.n_embd, f);
             fclose(f);
-            fprintf(stderr, "[mtp] hdumps %s (nprompt=%d decode_h=%d)\n", hd, nprompt,
+            si::logf("[mtp] hdumps %s (nprompt=%d decode_h=%d)\n", hd, nprompt,
                     (int)(si::env::flag("PF_MTP_DECODE_H")));
         }
     }
@@ -1228,7 +1230,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         mtp_forward(t23.data(), mtp.d_mtp_main_h, d_h0, (int)t23.size(), 0, 0, /*with_head=*/true);
         sync_all();
         dev_queue(0).memcpy(h_logits, d_logits + (size_t)(t23.size() - 1) * hp.n_vocab, (size_t)hp.n_vocab * 4).wait();
-        fprintf(stderr, "[mtp] drafttest in-pass row %zu (tok=%d) -> %d  (single-token draft gives %d)\n",
+        si::logf("[mtp] drafttest in-pass row %zu (tok=%d) -> %d  (single-token draft gives %d)\n",
                 t23.size() - 1, tok, argmax_f(h_logits, hp.n_vocab),
                 /* reported by the caller */ -1);
         // and the same row as a standalone single-token call
@@ -1236,7 +1238,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
         mtp_forward(&t22, nullptr, mtp.d_mtp_hprev, 1, 0, nprompt, /*with_head=*/true);
         dev_queue(0).wait();
         dev_queue(0).memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
-        fprintf(stderr, "[mtp] drafttest single row %d (tok=%d) -> %d\n", nprompt, t22,
+        si::logf("[mtp] drafttest single row %d (tok=%d) -> %d\n", nprompt, t22,
                 argmax_f(h_logits, hp.n_vocab));
         sycl::free(d_h0, dev_queue(0));
     }
@@ -1250,11 +1252,11 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             std::vector<float> lg2 = run_head();
             const int got = argmax_f(lg2.data(), hp.n_vocab);
             const int want = (i + 1 < nprompt) ? prompt[(size_t)i + 1] : tok;
-            fprintf(stderr, "[mtp] hprobe capt[%d] -> %d want %d %s\n", i, got, want, got == want ? "OK" : "XX");
+            si::logf("[mtp] hprobe capt[%d] -> %d want %d %s\n", i, got, want, got == want ? "OK" : "XX");
         }
     }
     if (dbg_gen) {
-        fprintf(stderr, "[mtp] step=0 pos=%d id=%d eos=%d\n", pos, tok, (int)is_eos(tok));
+        si::logf("[mtp] step=0 pos=%d id=%d eos=%d\n", pos, tok, (int)is_eos(tok));
     }
     if ((!gp.ignore_eos && is_eos(tok)) || !cb(tok)) {
         pc_retire(0, blocks);
@@ -1348,12 +1350,12 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     for (int32_t v : ids) {
                         nf += (v >= 0);
                     }
-                    fprintf(stderr, "[canddbg] steps=%d hit=%d/%d (%.1f%%) set=%d/%d per-step:", h_steps, h_cand,
+                    si::logf("[canddbg] steps=%d hit=%d/%d (%.1f%%) set=%d/%d per-step:", h_steps, h_cand,
                             h_full, 100.0 * h_cand / std::max(h_full, 1), nf, mtp.mtp_cand_cap_);
                     for (int s2 = 0; s2 < k; s2++) {
-                        fprintf(stderr, " %d%%", h_full_s[s2] ? 100 * h_cand_s[s2] / h_full_s[s2] : 0);
+                        si::logf(" %d%%", h_full_s[s2] ? 100 * h_cand_s[s2] / h_full_s[s2] : 0);
                     }
-                    fprintf(stderr, "\n");
+                    si::logf("\n");
                 }
             }
             if (dev_chain) {
@@ -1406,7 +1408,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                         }
                     }
                 }
-                fprintf(stderr, "[mtp] lstat step=%d pos=%d max=%.3f min=%.3f mean=%.4f nan=%d top=%d(%.2f) %d(%.2f) %d(%.2f)\n",
+                si::logf("[mtp] lstat step=%d pos=%d max=%.3f min=%.3f mean=%.4f nan=%d top=%d(%.2f) %d(%.2f) %d(%.2f)\n",
                         i, pos + i, mx, mn, sum / hp.n_vocab, nan, t3[0], b3[0], t3[1], b3[1], t3[2], b3[2]);
             }
             hprev = mtp.d_mtp_raw; // the raw MTP hidden at this row seeds the next
@@ -1464,7 +1466,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                     rc = std::max(rc, (double)std::fabs(cv_save[d][i]));
                 }
             }
-            fprintf(stderr, "[mtp] statediff pos=%d gdn=%.3e (|.|=%.2f) conv=%.3e (|.|=%.2f)\n", pos, dg, rg, dc,
+            si::logf("[mtp] statediff pos=%d gdn=%.3e (|.|=%.2f) conv=%.3e (|.|=%.2f)\n", pos, dg, rg, dc,
                     rc);
             for (size_t d = 0; d < as_.size(); d++) {
                 if (nst[d] == 0) {
@@ -1473,7 +1475,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 dev_queue((int)d).memcpy(as_[d].gdn_state, st_save[d].data(), nst[d] * 4).wait();
                 dev_queue((int)d).memcpy(as_[d].conv_state, cv_save[d].data(), ncv[d] * 4).wait();
             }
-            fprintf(stderr, "[mtp] decchk pos=%d tok=%d plain-decode=%d\n", pos, tt, plain);
+            si::logf("[mtp] decchk pos=%d tok=%d plain-decode=%d\n", pos, tt, plain);
         }
         MTPDBG("verify start\n");
         static const int vn_env = [] {
@@ -1511,7 +1513,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 for (int i = 0; i <= k; i++) {
                     const int h = argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
                     if (h != (int)mtp.h_argmax[i]) {
-                        fprintf(stderr, "[mtp] amchk MISMATCH row=%d dev=%d host=%d\n", i, (int)mtp.h_argmax[i], h);
+                        si::logf("[mtp] amchk MISMATCH row=%d dev=%d host=%d\n", i, (int)mtp.h_argmax[i], h);
                     }
                 }
             }
@@ -1529,15 +1531,15 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             return have_dev_argmax ? (int)mtp.h_argmax[i] : argmax_f(h_logits + (size_t)i * hp.n_vocab, hp.n_vocab);
         };
         if (mtp_dbg()) {
-            fprintf(stderr, "[mtp] pos=%d drafts:", pos);
+            si::logf("[mtp] pos=%d drafts:", pos);
             for (int i = 1; i <= k; i++) {
-                fprintf(stderr, " %d", cand[(size_t)i]);
+                si::logf(" %d", cand[(size_t)i]);
             }
-            fprintf(stderr, "  target:");
+            si::logf("  target:");
             for (int i = 0; i < k; i++) {
-                fprintf(stderr, " %d", row_argmax(i));
+                si::logf(" %d", row_argmax(i));
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
         int j = 0;
         static const bool no_accept = si::env::flag("PF_MTP_NOACCEPT");
@@ -1561,11 +1563,11 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 steps_reach[s2]++;
             }
             if (steps_cyc % 32 == 0) {
-                fprintf(stderr, "[mtp] steps: cycles=%ld reach:", steps_cyc);
+                si::logf("[mtp] steps: cycles=%ld reach:", steps_cyc);
                 for (int s2 = 0; s2 < k; s2++) {
-                    fprintf(stderr, " %ld%%", 100L * steps_reach[s2 + 1] / steps_cyc);
+                    si::logf(" %ld%%", 100L * steps_reach[s2 + 1] / steps_cyc);
                 }
-                fprintf(stderr, "  (mean accepted %.2f)\n", (double)j / steps_cyc);
+                si::logf("  (mean accepted %.2f)\n", (double)j / steps_cyc);
             }
         }
         // adopt the main model's token at the first mismatch (or past the drafts)
@@ -1580,7 +1582,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 }
                 out.push_back(cand[(size_t)i]);
                 if (dbg_gen) {
-                    fprintf(stderr, "[mtp] accept pos=%d id=%d\n", pos + i, cand[(size_t)i]);
+                    si::logf("[mtp] accept pos=%d id=%d\n", pos + i, cand[(size_t)i]);
                 }
                 if ((!gp.ignore_eos && is_eos(cand[(size_t)i])) || !emit_cb(cand[(size_t)i])) {
                     pc_retire(0, blocks);
@@ -1593,7 +1595,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             tok = bonus;
             out.push_back(tok);
             if (dbg_gen) {
-                fprintf(stderr, "[mtp] cycle pos=%d accepted=%d bonus=%d\n", pos, j, tok);
+                si::logf("[mtp] cycle pos=%d accepted=%d bonus=%d\n", pos, j, tok);
             }
             if ((!gp.ignore_eos && is_eos(tok)) || !emit_cb(tok)) {
                 break;
@@ -1664,14 +1666,14 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             }
         }
         if (mt && (t_cycles % 4 == 0)) {
-            fprintf(stderr,
+            si::logf(
                     "[mtp] time: cycles=%d tok=%d acc=%.2f | draft=%.1f verify=%.1f commit=%.1f rb=%.1f "
                     "ms/cycle | %.1f ms/token\n",
                     t_cycles, t_tok, (double)t_acc / t_cycles, t_draft / t_cycles, t_verify / t_cycles,
                     t_commit / t_cycles, t_rb / t_cycles, (t_draft + t_verify + t_commit + t_rb) / t_tok);
-            fprintf(stderr, "[mtp] emit: %.1f ms/cycle  cb: %.1f  argmax-blk: %.1f\n", t_emit / t_cycles,
+            si::logf("[mtp] emit: %.1f ms/cycle  cb: %.1f  argmax-blk: %.1f\n", t_emit / t_cycles,
                     t_cb / t_cycles, t_am / t_cycles);
-            fprintf(stderr, "[mtp] cycle-wall: %.1f ms (sum %.1f = draft+verify+commit+rb+emit), gap %.1f ms/cycle\n",
+            si::logf("[mtp] cycle-wall: %.1f ms (sum %.1f = draft+verify+commit+rb+emit), gap %.1f ms/cycle\n",
                     t_cyc / t_cycles, (t_draft + t_verify + t_commit + t_rb + t_emit) / t_cycles,
                     (t_cyc - (t_draft + t_verify + t_commit + t_rb + t_emit)) / t_cycles);
         }
@@ -1702,7 +1704,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
                 d = std::max(d, (double)std::fabs(rb[i] - ref[i]));
                 nb = std::max(nb, (double)std::fabs(ref[i]));
             }
-            fprintf(stderr, "[mtp] statechk pos=%d j=%d rollback-vs-ref maxdiff=%.6f |ref|=%.4f\n", pos, j, d, nb);
+            si::logf("[mtp] statechk pos=%d j=%d rollback-vs-ref maxdiff=%.6f |ref|=%.4f\n", pos, j, d, nb);
             mtp.h_save_.clear();
         }
         if (si::env::flag("PF_MTP_AUTOTEST")) {
@@ -1713,7 +1715,7 @@ std::vector<int> engine::generate_mtp(const std::vector<int> & prompt, const gen
             q.wait();
             dev_queue(0).memcpy(h_logits, d_logits, (size_t)hp.n_vocab * 4).wait();
             int plain = argmax_f(h_logits, hp.n_vocab);
-            fprintf(stderr, "[mtp] autotest pos=%d j=%d bonus=%d plain-decode=%d %s\n", pos, j, tok, plain,
+            si::logf("[mtp] autotest pos=%d j=%d bonus=%d plain-decode=%d %s\n", pos, j, tok, plain,
                     plain == tok ? "SAME" : "DIFF");
             mtp_rollback(j);
         }

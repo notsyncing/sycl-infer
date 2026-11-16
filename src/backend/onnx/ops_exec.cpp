@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include <cstdio>
 
 #include <cmath>
@@ -202,7 +204,7 @@ std::vector<float> act_params(const op_ctx & c, const std::string & name) {
         float p[2] = {0.0f, 0.0f};
         hardsigmoid_params(c.opset, alpha, beta, p);
         if (trace_on()) {
-            fprintf(stderr, "[onnx] the %s: opset %lld alpha %g beta %g -> %g %g\n", name.c_str(),
+            si::logf("[onnx] the %s: opset %lld alpha %g beta %g -> %g %g\n", name.c_str(),
                     (long long)c.opset, alpha, beta, p[0], p[1]);
         }
         return {p[0], p[1]};
@@ -212,7 +214,7 @@ std::vector<float> act_params(const op_ctx & c, const std::string & name) {
         float p[2] = {0.0f, 0.0f};
         hardswish_params(p);
         if (trace_on()) {
-            fprintf(stderr, "[onnx] the %s: opset %lld -> %g %g\n", name.c_str(), (long long)c.opset,
+            si::logf("[onnx] the %s: opset %lld -> %g %g\n", name.c_str(), (long long)c.opset,
                     p[0], p[1]);
         }
         return {p[0], p[1]};
@@ -669,12 +671,12 @@ void exec_conv(op_ctx & c) {
     int tm = 8;
     while (tm > 1 && (mg % tm != 0)) tm /= 2;
     if (trace_on()) {
-        fprintf(stderr,
+        si::logf(
                 "[onnx] the conv: N %d C %d H %d W %d M %d Ho %d Wo %d kh %d kw %d sh %d sw %d ph %d pw %d "
                 "dh %d dw %d group %d tm %d act %d params",
                 N, C, H, W, M, Ho, Wo, kh, kw, sh, sw, eph, epw, dh, dw, (int)group, tm, (int)act);
-        for (size_t k = 0; k < 4; ++k) fprintf(stderr, " %g", ap.p[k]);
-        fprintf(stderr, "\n");
+        for (size_t k = 0; k < 4; ++k) si::logf(" %g", ap.p[k]);
+        si::logf("\n");
     }
     // oneDNN's f32 convolution for the group-1 calls: the primitive picks
     // its own blocked layout and vectorised loop, which measured 1.3-4.5x
@@ -804,15 +806,15 @@ bool size_resize(op_ctx & c, std::vector<std::vector<int64_t>> & out) {
     std::vector<int64_t> s;
     std::vector<float> sc;
     if (trace_on()) {
-        fprintf(stderr, "[onnx] the resize's size: the input's rank %zu, the sizes %zu (host %zu, dtype %d), the scales %zu (host %zu)\n",
+        si::logf("[onnx] the resize's size: the input's rank %zu, the sizes %zu (host %zu, dtype %d), the scales %zu (host %zu)\n",
                 x->shape.size(), sizes ? sizes->count : 0, sizes ? sizes->host.size() : 0,
                 sizes ? (int)sizes->dtype : -1, scales ? scales->count : 0,
                 scales ? scales->host.size() : 0);
         if (sizes) {
             const std::vector<int64_t> v = read_i64(sizes);
-            fprintf(stderr, "    the sizes:");
-            for (int64_t d : v) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "\n");
+            si::logf("    the sizes:");
+            for (int64_t d : v) si::logf(" %lld", (long long)d);
+            si::logf("\n");
         }
     }
     if (sizes && sizes->count > 0) {
@@ -841,16 +843,16 @@ bool size_resize(op_ctx & c, std::vector<std::vector<int64_t>> & out) {
 void exec_resize(op_ctx & c) {
     const tensor * x = c.in[0];
     if (trace_on()) {
-        fprintf(stderr, "[onnx] the resize: the input");
-        for (int64_t d : x->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  the output");
-        for (int64_t d : c.out[0]->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  the inputs %zu", c.in.size());
+        si::logf("[onnx] the resize: the input");
+        for (int64_t d : x->shape) si::logf(" %lld", (long long)d);
+        si::logf("  the output");
+        for (int64_t d : c.out[0]->shape) si::logf(" %lld", (long long)d);
+        si::logf("  the inputs %zu", c.in.size());
         for (size_t i = 1; i < c.in.size(); ++i) {
-            fprintf(stderr, " [%s dtype %d count %zu host %zu]", c.in[i]->name.c_str(),
+            si::logf(" [%s dtype %d count %zu host %zu]", c.in[i]->name.c_str(),
                     (int)c.in[i]->dtype, c.in[i]->count, c.in[i]->host.size());
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     std::string mode = c.attr_s("mode");
     if (mode.empty()) mode = "nearest";
@@ -1254,20 +1256,20 @@ void exec_scatter_nd(op_ctx & c) {
     const std::vector<double> u = read_host_values(c.q, upd, ints);
     const int64_t n_idx = k > 0 ? (int64_t)ids.size() / k : 0;
     if (trace_on()) {
-        fprintf(stderr, "[onnx] the scatter: the data '%s' [%lld] %zu elements, the indices '%s' "
+        si::logf("[onnx] the scatter: the data '%s' [%lld] %zu elements, the indices '%s' "
                         "%zu elements (k %lld), the updates '%s' %zu elements, the output %zu\n",
                 data->name.c_str(), (long long)rank, data->count, idx->name.c_str(), ids.size(),
                 (long long)k, upd->name.c_str(), upd->count, c.out[0]->count);
-        for (size_t i = 0; i < ids.size() && i < 8; ++i) fprintf(stderr, " %lld", (long long)ids[i]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "    the hosts: the data %zu, the indices %zu, the updates %zu (the dtypes %d %d %d)\n",
+        for (size_t i = 0; i < ids.size() && i < 8; ++i) si::logf(" %lld", (long long)ids[i]);
+        si::logf("\n");
+        si::logf("    the hosts: the data %zu, the indices %zu, the updates %zu (the dtypes %d %d %d)\n",
                 data->host.size(), idx->host.size(), upd->host.size(),
                 (int)data->dtype, (int)idx->dtype, (int)upd->dtype);
-        fprintf(stderr, "    the values: the data");
-        for (size_t i = 0; i < res.size() && i < 4; ++i) fprintf(stderr, " %g", res[i]);
-        fprintf(stderr, " the updates");
-        for (size_t i = 0; i < u.size() && i < 4; ++i) fprintf(stderr, " %g", u[i]);
-        fprintf(stderr, " the output's type %d, the count %zu\n", (int)c.out[0]->dtype,
+        si::logf("    the values: the data");
+        for (size_t i = 0; i < res.size() && i < 4; ++i) si::logf(" %g", res[i]);
+        si::logf(" the updates");
+        for (size_t i = 0; i < u.size() && i < 4; ++i) si::logf(" %g", u[i]);
+        si::logf(" the output's type %d, the count %zu\n", (int)c.out[0]->dtype,
                 c.out[0]->count);
     }
     for (int64_t n = 0; n < n_idx; ++n) {
@@ -1643,13 +1645,13 @@ void exec_matmul(op_ctx & c) {
         bs[i] = pb < blead.size() ? b_str[pb] : 0;
     }
     if (trace_on()) {
-        fprintf(stderr, "[onnx] the batched MatMul: a");
-        for (int64_t d : a->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  b");
-        for (int64_t d : b->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  out");
-        for (int64_t d : c.out[0]->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  M %lld K %lld N %lld\n", (long long)M, (long long)K, (long long)N);
+        si::logf("[onnx] the batched MatMul: a");
+        for (int64_t d : a->shape) si::logf(" %lld", (long long)d);
+        si::logf("  b");
+        for (int64_t d : b->shape) si::logf(" %lld", (long long)d);
+        si::logf("  out");
+        for (int64_t d : c.out[0]->shape) si::logf(" %lld", (long long)d);
+        si::logf("  M %lld K %lld N %lld\n", (long long)M, (long long)K, (long long)N);
     }
     // The formula recogniser's self-attention PV: P[..., 1, S] x V[..., S, D],
     // with the head axis as the batch.  It is the one matmul whose K grows
@@ -1976,17 +1978,17 @@ void exec_slice(op_ctx & c) {
     const std::vector<int64_t> axes = c.in.size() > 3 ? read_i64(c.in[3]) : std::vector<int64_t>();
     const std::vector<int64_t> steps = c.in.size() > 4 ? read_i64(c.in[4]) : std::vector<int64_t>();
     if (trace_on()) {
-        fprintf(stderr, "[onnx] the slice '%s': the input [", x->name.c_str());
-        for (int64_t d : x->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "] the starts");
-        for (int64_t v : starts) fprintf(stderr, " %lld", (long long)v);
-        fprintf(stderr, " the ends");
-        for (int64_t v : ends) fprintf(stderr, " %lld", (long long)v);
-        fprintf(stderr, " the axes");
-        for (int64_t v : axes) fprintf(stderr, " %lld", (long long)v);
-        fprintf(stderr, " the steps");
-        for (int64_t v : steps) fprintf(stderr, " %lld", (long long)v);
-        fprintf(stderr, " (the axes' dtype %d, the steps' dtype %d)\n",
+        si::logf("[onnx] the slice '%s': the input [", x->name.c_str());
+        for (int64_t d : x->shape) si::logf(" %lld", (long long)d);
+        si::logf("] the starts");
+        for (int64_t v : starts) si::logf(" %lld", (long long)v);
+        si::logf(" the ends");
+        for (int64_t v : ends) si::logf(" %lld", (long long)v);
+        si::logf(" the axes");
+        for (int64_t v : axes) si::logf(" %lld", (long long)v);
+        si::logf(" the steps");
+        for (int64_t v : steps) si::logf(" %lld", (long long)v);
+        si::logf(" (the axes' dtype %d, the steps' dtype %d)\n",
                 c.in.size() > 3 ? (int)c.in[3]->dtype : -1,
                 c.in.size() > 4 ? (int)c.in[4]->dtype : -1);
         // The raw bytes of the bounds' host copies: a value that is right
@@ -1994,10 +1996,10 @@ void exec_slice(op_ctx & c) {
         // overwritten.
         for (size_t k = 1; k < c.in.size() && k < 5; ++k) {
             const std::vector<uint8_t> & h = c.in[k]->host;
-            fprintf(stderr, "    the in[%zu] '%s': the host %zu bytes", k, c.in[k]->name.c_str(),
+            si::logf("    the in[%zu] '%s': the host %zu bytes", k, c.in[k]->name.c_str(),
                     h.size());
-            for (size_t b = 0; b < h.size() && b < 16; ++b) fprintf(stderr, " %02x", h[b]);
-            fprintf(stderr, "\n");
+            for (size_t b = 0; b < h.size() && b < 16; ++b) si::logf(" %02x", h[b]);
+            si::logf("\n");
         }
     }
     const int64_t rank = (int64_t)x->shape.size();
@@ -2117,7 +2119,7 @@ void exec_slice(op_ctx & c) {
         c.out[0]->host = raw;
         c.out[0]->on_host = true;
         if (trace_on()) {
-            fprintf(stderr, "    the slice's int output '%s': %zu bytes, the dtype %d\n",
+            si::logf("    the slice's int output '%s': %zu bytes, the dtype %d\n",
                     c.out[0]->name.c_str(), c.out[0]->host.size(), (int)c.out[0]->dtype);
         }
         return;
@@ -2195,11 +2197,11 @@ void exec_slice(op_ctx & c) {
         base += st_of[(size_t)d] * in_stride[(size_t)d];
     }
     if (trace_on()) {
-        fprintf(stderr, "[onnx] the slice's copy: the rank %lld the out", (long long)rank);
-        for (int64_t d = 0; d < rank; ++d) fprintf(stderr, " %lld", (long long)out[(size_t)d]);
-        fprintf(stderr, " the src");
-        for (int64_t d = 0; d < rank; ++d) fprintf(stderr, " %lld", (long long)src[(size_t)d]);
-        fprintf(stderr, " the base %lld\n", (long long)base);
+        si::logf("[onnx] the slice's copy: the rank %lld the out", (long long)rank);
+        for (int64_t d = 0; d < rank; ++d) si::logf(" %lld", (long long)out[(size_t)d]);
+        si::logf(" the src");
+        for (int64_t d = 0; d < rank; ++d) si::logf(" %lld", (long long)src[(size_t)d]);
+        si::logf(" the base %lld\n", (long long)base);
     }
     int64_t s = 1;
     for (int64_t i = rank - 1; i >= 0; --i) {
@@ -2435,20 +2437,20 @@ void exec_scatter_elements(op_ctx & c) {
     const std::vector<double> u = read_host_values(c.q, upd, ints);
     std::vector<double> res = read_host_values(c.q, data, ints);
     if (trace_on()) {
-        fprintf(stderr,
+        si::logf(
                 "[onnx] the scatter elements: the data '%s' [%lld] %zu elements (the dtype %d), the "
                 "indices '%s' %zu elements (the dtype %d), the updates '%s' %zu elements (the dtype %d), "
                 "the output %zu (the dtype %d), the axis %lld\n",
                 data->name.c_str(), (long long)rank, data->count, (int)data->dtype, idx->name.c_str(),
                 ids.size(), (int)idx->dtype, upd->name.c_str(), upd->count, (int)upd->dtype,
                 c.out[0]->count, (int)c.out[0]->dtype, (long long)axis);
-        fprintf(stderr, "    the indices:");
-        for (size_t i = 0; i < ids.size() && i < 8; ++i) fprintf(stderr, " %lld", (long long)ids[i]);
-        fprintf(stderr, "\n    the updates:");
-        for (size_t i = 0; i < u.size() && i < 8; ++i) fprintf(stderr, " %g", u[i]);
-        fprintf(stderr, "\n    the data:");
-        for (size_t i = 0; i < res.size() && i < 8; ++i) fprintf(stderr, " %g", res[i]);
-        fprintf(stderr, "\n");
+        si::logf("    the indices:");
+        for (size_t i = 0; i < ids.size() && i < 8; ++i) si::logf(" %lld", (long long)ids[i]);
+        si::logf("\n    the updates:");
+        for (size_t i = 0; i < u.size() && i < 8; ++i) si::logf(" %g", u[i]);
+        si::logf("\n    the data:");
+        for (size_t i = 0; i < res.size() && i < 8; ++i) si::logf(" %g", res[i]);
+        si::logf("\n");
     }
     // The updates carry a slice of the axis dim, or one value per index.
     const bool host_slice_form = u.size() >= (size_t)(data->count) && data->count > 0;

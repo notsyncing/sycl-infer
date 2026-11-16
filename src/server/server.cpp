@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "server.h"
 
 #include "control.h"
@@ -635,12 +637,12 @@ int serve(engine & e, const server_config & cfg) {
     if (cfg.control_port > 0) {
         std::string err;
         if (!ctl.start(cfg.control_host, cfg.control_port, err)) {
-            fprintf(stderr, "[ctl] %s\n", err.c_str());
+            si::logf("[ctl] %s\n", err.c_str());
         } else {
-            fprintf(stderr, "[ctl] control plane on %s:%d%s\n", cfg.control_host.c_str(), ctl.port(),
+            si::logf("[ctl] control plane on %s:%d%s\n", cfg.control_host.c_str(), ctl.port(),
                     ctl.needs_token() ? " (token required)" : " (NO token: loopback only)");
             if (cfg.control_host != "127.0.0.1" && cfg.control_host != "localhost" && !ctl.needs_token()) {
-                fprintf(stderr,
+                si::logf(
                         "[ctl] bound to %s with NO token - anyone who can reach it can stop this worker and "
                         "read its device report; set --control-token or keep it on a private network\n",
                         cfg.control_host.c_str());
@@ -666,11 +668,11 @@ int serve(engine & e, const server_config & cfg) {
                 mm.cfg.std[c] = mm.vm.hp.std[c];
             }
             mm.ready = true;
-            fprintf(stderr, "[mm] vision projector loaded: %s (%d layers, %dx%d patches, merge %d)\n",
+            si::logf("[mm] vision projector loaded: %s (%d layers, %dx%d patches, merge %d)\n",
                     cfg.mmproj_path.c_str(), mm.vm.hp.n_layer, mm.vm.hp.image_size, mm.vm.hp.image_size,
                     mm.vm.hp.merge);
         } catch (const std::exception & ex) {
-            fprintf(stderr, "[mm] cannot load mmproj %s: %s (image input disabled)\n", cfg.mmproj_path.c_str(),
+            si::logf("[mm] cannot load mmproj %s: %s (image input disabled)\n", cfg.mmproj_path.c_str(),
                     ex.what());
         }
     }
@@ -684,10 +686,10 @@ int serve(engine & e, const server_config & cfg) {
             mm.acfg.f_min = mm.am.hp.f_min;
             mm.acfg.f_max = mm.am.hp.f_max;
             mm.audio_ready = true;
-            fprintf(stderr, "[mm] audio projector loaded: %s (n_layer=%d, n_embd=%d, proj_dim=%d)\n",
+            si::logf("[mm] audio projector loaded: %s (n_layer=%d, n_embd=%d, proj_dim=%d)\n",
                     cfg.audio_mmproj_path.c_str(), mm.am.hp.n_layer, mm.am.hp.n_embd, mm.am.hp.proj_dim);
         } catch (const std::exception & ex) {
-            fprintf(stderr, "[mm] cannot load audio mmproj %s: %s (audio input disabled)\n",
+            si::logf("[mm] cannot load audio mmproj %s: %s (audio input disabled)\n",
                     cfg.audio_mmproj_path.c_str(), ex.what());
         }
     }
@@ -765,9 +767,9 @@ int serve(engine & e, const server_config & cfg) {
         // logging both as context_length_exceeded reported an empty prompt as
         // "0 tokens > max_seq=N"
         if (v.too_long) {
-            fprintf(stderr, "[http] 400 context_length_exceeded: prompt=%zu tokens > max_seq=%d\n", n_tok, e.max_seq);
+            si::logf("[http] 400 context_length_exceeded: prompt=%zu tokens > max_seq=%d\n", n_tok, e.max_seq);
         } else {
-            fprintf(stderr, "[http] 400 invalid_request_error: prompt is empty\n");
+            si::logf("[http] 400 invalid_request_error: prompt is empty\n");
         }
         res.status = 400;
         res.set_content(v.body, "application/json"); // already serialized by request.cpp
@@ -951,7 +953,7 @@ int serve(engine & e, const server_config & cfg) {
         const auto t_tok0 = std::chrono::steady_clock::now();
         auto prompt = e.tk.encode(text);
         if (srv_t) {
-            fprintf(stderr, "[http] tokenize=%.2f ms chars=%zu tokens=%zu\n",
+            si::logf("[http] tokenize=%.2f ms chars=%zu tokens=%zu\n",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0).count(),
                     text.size(), prompt.size());
         }
@@ -1058,7 +1060,7 @@ int serve(engine & e, const server_config & cfg) {
             for (const std::string & t : cp.texts) {
                 chars += t.size();
             }
-            fprintf(stderr, "[http] tokenize=%.2f ms chars=%zu prompts=%zu\n",
+            si::logf("[http] tokenize=%.2f ms chars=%zu prompts=%zu\n",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tok0).count(),
                     chars, cp.tokens.size());
         }
@@ -1174,19 +1176,19 @@ int serve(engine & e, const server_config & cfg) {
     // there is no authentication, and remote media fetches are off.
     switch (url_fetch_mode()) {
     case url_fetch_policy::disabled:
-        fprintf(stderr, "[http] remote media URLs are OFF (data: URLs still work);"
+        si::logf("[http] remote media URLs are OFF (data: URLs still work);"
                         " set PF_MM_URL_FETCH=1 to allow http(s)\n");
         break;
     case url_fetch_policy::public_only:
-        fprintf(stderr, "[http] remote media URLs: publicly routable addresses only\n");
+        si::logf("[http] remote media URLs: publicly routable addresses only\n");
         break;
     case url_fetch_policy::allow_private:
-        fprintf(stderr, "[http] remote media URLs: PF_MM_URL_ALLOW_PRIVATE=1 -"
+        si::logf("[http] remote media URLs: PF_MM_URL_ALLOW_PRIVATE=1 -"
                         " private/loopback destinations reachable (SSRF exposure)\n");
         break;
     }
     if (cfg.host != "127.0.0.1" && cfg.host != "localhost") {
-        fprintf(stderr, "[http] bound to %s with NO authentication - put a reverse proxy in front\n",
+        si::logf("[http] bound to %s with NO authentication - put a reverse proxy in front\n",
                 cfg.host.c_str());
     }
     fflush(stdout);
@@ -1206,10 +1208,10 @@ int serve(engine & e, const server_config & cfg) {
     watchdog.join();
     g_term_requested.store(false);
     if (!listening) {
-        fprintf(stderr, "failed to listen on %s:%d\n", cfg.host.c_str(), cfg.port);
+        si::logf("failed to listen on %s:%d\n", cfg.host.c_str(), cfg.port);
         return 1;
     }
-    fprintf(stderr, "[srv] shutting down, flushing prefix cache\n");
+    si::logf("[srv] shutting down, flushing prefix cache\n");
     return 0;
 }
 

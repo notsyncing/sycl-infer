@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "kernels.h"
 #include "device/device_profile.h"
 #include "kernel_utils.h"
@@ -193,7 +195,7 @@ static void dp4a_row_gemm_impl(queue & q, const w8t & w, const int8_t * x8, cons
         static bool once = true;
         if (once) {
             once = false;
-            fprintf(stderr, "[mtk] K=%d N=%d TB=%d tstride=%d n_tt=%d grid=%d\n", K, N, TB, tstride, n_tt, grid);
+            si::logf("[mtk] K=%d N=%d TB=%d tstride=%d n_tt=%d grid=%d\n", K, N, TB, tstride, n_tt, grid);
         }
     }
 #endif
@@ -844,7 +846,7 @@ void dp4a_gemm_launch(queue & q, const w8t & w, const int8_t * x8, const sycl::f
     if (use_row && TB > 32 && (TB % 32) == 0 && TB <= kMaxB * kMaxT && w.N > 0) {
         static const bool dbg_mt = si::env::flag("PF_DBG_MT");
         if (dbg_mt) {
-            fprintf(stderr, "[mt] K=%d N=%d TB=%d type=%u\n", w.K, w.N, TB, w.type);
+            si::logf("[mt] K=%d N=%d TB=%d type=%u\n", w.K, w.N, TB, w.type);
         }
         // 2 rows per lane (halves the per-cell x/meta loads)
         static const int arch = [] {

@@ -1,3 +1,5 @@
+#include "log.h"
+
 // QSA (query-side sparse attention) for qwen4exp.
 //
 // Up to `indexer_top_k` keys the reference's selector covers every visible
@@ -697,7 +699,7 @@ void engine::qsa_reset_slot(int slot) {
         }
     }
     if (qdbg) {
-        fprintf(stderr, "[qsa] reset slot=%d: cleared %d layer state(s)\n", slot, had);
+        si::logf("[qsa] reset slot=%d: cleared %d layer state(s)\n", slot, had);
     }
 }
 
@@ -786,7 +788,7 @@ void engine::qsa_devattn_ensure(int dev) {
     d.cap_pool = npool_cap;
     d.dev = dev;
     if (si::env::flag("PF_Q4_QSADBG")) {
-        fprintf(stderr, "[qsa] devattn scratch dev=%d keys=%d blocks=%d wave=%d\n", dev, cap, blocks, wave);
+        si::logf("[qsa] devattn scratch dev=%d keys=%d blocks=%d wave=%d\n", dev, cap, blocks, wave);
     }
 }
 
@@ -875,7 +877,7 @@ void engine::qsa_devattn_run(int a, int dev, int slot, int pos, const std::vecto
              nullptr, nullptr);
     cbe.attn_combine(part, qbuf, attn_out, x.sinfo, nh, hd, nsp, 1, 1);
     if (si::env::flag("PF_Q4_QSADBG")) {
-        fprintf(stderr, "[qsa] devattn a=%d slot=%d nsel=%d nblk=%d nsp=%d\n", a, slot, nsel, nblk, nsp);
+        si::logf("[qsa] devattn a=%d slot=%d nsel=%d nblk=%d nsp=%d\n", a, slot, nsel, nblk, nsp);
     }
 }
 
@@ -942,7 +944,7 @@ void engine::qsa_devattn_prefill_run(int a, int dev, int n_tok, int slot, const 
                          1);
     }
     if (si::env::flag("PF_Q4_QSADBG")) {
-        fprintf(stderr, "[qsa] devattn prefill a=%d slot=%d n_tok=%d wave=%d nsp=%d\n", a, slot, n_tok, W, nsp);
+        si::logf("[qsa] devattn prefill a=%d slot=%d n_tok=%d wave=%d nsp=%d\n", a, slot, n_tok, W, nsp);
     }
 }
 
@@ -978,7 +980,7 @@ void engine::qsa_gather_positions(int a, int slot, const int32_t * positions, in
     sycl::queue & qd = dev_queue(dev);
     static const bool qdbg = si::env::flag("PF_Q4_QSADBG");
     if (qdbg) {
-        fprintf(stderr,
+        si::logf(
                 "[qsa] gather a=%d slot=%d npos=%d kdt=%d vdt=%d kblk=%zu vblk=%zu krow=%zu vrow=%zu "
                 "kp=%p vp=%p ks=%p vs=%p cpu=%d\n",
                 a, slot, npos, (int)kdt, (int)vdt, kblk, vblk, krow, vrow, (const void *)kp, (const void *)vp,
@@ -1081,7 +1083,7 @@ void engine::qsa_gather_positions(int a, int slot, const int32_t * positions, in
         qd.wait();
     }
     if (qdbg) {
-        fprintf(stderr, "[qsa] gather copied nb=%d runs=%d first_blk=%d last_blk=%d\n", nb,
+        si::logf("[qsa] gather copied nb=%d runs=%d first_blk=%d last_blk=%d\n", nb,
                 (int)st.grun_start.size(), st.gblk.front(), st.gblk.back());
     }
     st.gk.resize((size_t)npos * (size_t)kvd);
@@ -1191,7 +1193,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
     static const bool qtime = si::env::flag("PF_QSA_TIME");
     double q_t0 = qtime ? qsa_now_ms() : 0.0;
     if (qdbg) {
-        fprintf(stderr, "[qsa] enter a=%d n_tok=%d pos0=%d tpb=%d rows=%d\n", a, n_tok, inf->pos[0], inf->tpb,
+        si::logf("[qsa] enter a=%d n_tok=%d pos0=%d tpb=%d rows=%d\n", a, n_tok, inf->pos[0], inf->tpb,
                 inf->n_rows);
     }
     const int n_embd = hp.n_embd;
@@ -1310,7 +1312,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
             q4x_.qsa.copy_ms += qsa_now_ms() - q_t0;
         }
         if (qdbg) {
-            fprintf(stderr, "[qsa] deferred a=%d n_tok=%d\n", a, n_tok);
+            si::logf("[qsa] deferred a=%d n_tok=%d\n", a, n_tok);
         }
         return false;
     }
@@ -1399,7 +1401,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                      idx_early ? st.iq : nullptr, idx_early ? st.ik : nullptr, inf);
 
     if (qdbg) {
-        fprintf(stderr, "[qsa] caches updated need=%d\n", (int)need);
+        si::logf("[qsa] caches updated need=%d\n", (int)need);
     }
     if (a == 0) {
         if (const char * qp = std::getenv("PF_QSA_Q")) {
@@ -1520,7 +1522,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
             }
             x.hcnt[i] = nsel;
             if (qdbg) {
-                fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, posv[(size_t)i], slotv[(size_t)i], nsel);
+                si::logf("[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, posv[(size_t)i], slotv[(size_t)i], nsel);
             }
         });
         if (qtime) {
@@ -1553,7 +1555,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                 q4x_.qsa.nsel += nsel;
             }
             if (qdbg) {
-                fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, pos, slot, nsel);
+                si::logf("[qsa] row=%d pos=%d slot=%d nsel=%d\n", i, pos, slot, nsel);
             }
             const double q_att0 = qtime ? qsa_now_ms() : 0.0;
             qsa_devattn_run(a, dev, slot, pos, sel, qbuf, attn_out);
@@ -1627,7 +1629,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
                     continue;
                 }
                 if (qdbg) {
-                    fprintf(stderr, "[qsa] row=%d pos=%d slot=%d nsel=%d (union=%d)\n", i, posv[(size_t)i],
+                    si::logf("[qsa] row=%d pos=%d slot=%d nsel=%d (union=%d)\n", i, posv[(size_t)i],
                             slotv[(size_t)i], nsel, (int)st.gpos.size());
                 }
                 st.gsel.resize((size_t)nsel);
@@ -1695,7 +1697,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         }
     }
     if (qdbg) {
-        fprintf(stderr, "[qsa] attention done, writing out\n");
+        si::logf("[qsa] attention done, writing out\n");
     }
     if (const char * dp = si::env::str("PF_QSA_ATTN_DUMP")) {
         if (a == qsa_dump_layer()) {
@@ -1735,7 +1737,7 @@ bool engine::qsa_attention(int a, const layer_t & L, int dev, int n_tok, const s
         hs->out_pending = !is_cpu(dev);
     }
     if (qdbg) {
-        fprintf(stderr, "[qsa] out written\n");
+        si::logf("[qsa] out written\n");
     }
     return true;
 }

@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "model.h"
 
 #include <sys/mman.h>
@@ -74,7 +76,7 @@ void report(const model_profile & p) {
     if (!si::env::flag("PF_MODEL_INFO")) {
         return;
     }
-    fprintf(stderr,
+    si::logf(
             "[model] profile: %s (%s)\n"
             "[model]   forward: %s, moe owner: %s\n"
             "[model]   residual: hyper-connections %s (%d streams, low rank %d)\n"

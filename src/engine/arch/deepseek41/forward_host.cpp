@@ -1,3 +1,5 @@
+#include "log.h"
+
 // dev/ds41_gen.cpp — standalone CPU reference forward + greedy generation for
 // DeepSeek-V4.1-Flash (`deepseek41`).
 //
@@ -1374,7 +1376,7 @@ static void forward(Ctx & c, const std::vector<int> & ids, std::vector<float> & 
             for (int i = 0; i < T * dim; i++) {
                 ss += (double)h[(size_t)i] * h[(size_t)i];
             }
-            fprintf(stderr, "[ds41] layer %2d rms(h[last]) %.6f\n", li, std::sqrt(ss / (T * dim)));
+            si::logf("[ds41] layer %2d rms(h[last]) %.6f\n", li, std::sqrt(ss / (T * dim)));
         }
     }
 
@@ -1927,7 +1929,7 @@ static void forward_one(Ctx & c, int tok, DecState & st, std::vector<float> * lo
             for (int i = 0; i < dim; i++) {
                 ss += (double)h[(size_t)i] * (double)h[(size_t)i];
             }
-            fprintf(stderr, "[ds41] layer %2d rms(h[last]) %.6f\n", li, std::sqrt(ss / (double)dim));
+            si::logf("[ds41] layer %2d rms(h[last]) %.6f\n", li, std::sqrt(ss / (double)dim));
         }
     }
     st.pos++;
@@ -2001,7 +2003,7 @@ static void pc_store(uint64_t h, int consumed, const DecState & st, const std::v
     const size_t b = pc_state_bytes(st) + logits.size() * sizeof(float);
     if (b > pc_cache().max_entry_bytes()) {
         if (dbg) {
-            fprintf(stderr, "[ds41pc] skip hash=%016llx consumed=%d bytes=%zu (cap/4=%zu)\n", (unsigned long long)h,
+            si::logf("[ds41pc] skip hash=%016llx consumed=%d bytes=%zu (cap/4=%zu)\n", (unsigned long long)h,
                     consumed, b, pc_cache().max_entry_bytes());
         }
         return;
@@ -2021,7 +2023,7 @@ static void pc_store(uint64_t h, int consumed, const DecState & st, const std::v
     p.logits = logits;
     const bool ok = pc_cache().insert(h, consumed, std::move(p), b);
     if (dbg) {
-        fprintf(stderr, "[ds41pc] %s hash=%016llx consumed=%d bytes=%zu entries=%zu total=%zu\n",
+        si::logf("[ds41pc] %s hash=%016llx consumed=%d bytes=%zu entries=%zu total=%zu\n",
                 ok ? "store" : "reject", (unsigned long long)h, consumed, b, pc_cache().size(), pc_cache().bytes());
     }
 }
@@ -2104,7 +2106,7 @@ std::vector<int> ds41_generate(model & m, tokenizer & tk, const std::vector<int>
         for (int r : mm ? mm->img_row : std::vector<int>{}) {
             n_img_rows += r >= 0 ? 1 : 0;
         }
-        fprintf(stderr, "[ds41mm] prompt=%zu img_row=%zu image_rows=%d embd=%zu d_embd=%p n_img=%d\n",
+        si::logf("[ds41mm] prompt=%zu img_row=%zu image_rows=%d embd=%zu d_embd=%p n_img=%d\n",
                 prompt.size(), mm ? mm->img_row.size() : 0, n_img_rows, mm ? mm->embd.size() : 0,
                 mm ? (const void *)mm->d_embd : nullptr, mm ? mm->n_img : 0);
     }
@@ -2135,7 +2137,7 @@ std::vector<int> ds41_generate(model & m, tokenizer & tk, const std::vector<int>
             }
         }
         if (si::env::flag("PF_DS41_PC_DEBUG")) {
-            fprintf(stderr, "[ds41pc] %s prompt=%zu resumed=%zu%s\n", reused ? "hit" : "miss", ids.size(), resumed,
+            si::logf("[ds41pc] %s prompt=%zu resumed=%zu%s\n", reused ? "hit" : "miss", ids.size(), resumed,
                     reused && resumed == ids.size() ? " (exact)" : "");
         }
     }
@@ -2162,9 +2164,9 @@ std::vector<int> ds41_generate(model & m, tokenizer & tk, const std::vector<int>
         const int n = std::min<int>(8, (int)ord.size());
         std::partial_sort(ord.begin(), ord.begin() + n, ord.end(),
                           [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
-        fprintf(stderr, "[ds41mm] first top8:");
-        for (int i = 0; i < n; i++) fprintf(stderr, " %d:%.3f", ord[(size_t)i], logits[(size_t)ord[(size_t)i]]);
-        fprintf(stderr, " | tokens[0..3]=%d,%d,%d,%d img_row=%d,%d,%d\n",
+        si::logf("[ds41mm] first top8:");
+        for (int i = 0; i < n; i++) si::logf(" %d:%.3f", ord[(size_t)i], logits[(size_t)ord[(size_t)i]]);
+        si::logf(" | tokens[0..3]=%d,%d,%d,%d img_row=%d,%d,%d\n",
                 ids[0], ids.size() > 1 ? ids[1] : -1, ids.size() > 2 ? ids[2] : -1, ids.size() > 3 ? ids[3] : -1,
                 mm->img_row.size() > 1 ? mm->img_row[1] : -1, mm->img_row.size() > 2 ? mm->img_row[2] : -1,
                 mm->img_row.size() > 3 ? mm->img_row[3] : -1);

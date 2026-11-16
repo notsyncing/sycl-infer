@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "vision.h"
 
 #include "env.h"
@@ -44,7 +46,7 @@ struct vision_load_timer {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        fprintf(stderr, "[load]   vision %-24s %8.1f ms\n", what,
+        si::logf("[load]   vision %-24s %8.1f ms\n", what,
                 std::chrono::duration<double, std::milli>(now - last).count());
         last = now;
     }
@@ -53,7 +55,7 @@ struct vision_load_timer {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        fprintf(stderr, "[load]   vision %-24s %8.1f ms\n", what,
+        si::logf("[load]   vision %-24s %8.1f ms\n", what,
                 std::chrono::duration<double, std::milli>(now - first).count());
         last = now;
     }
@@ -960,11 +962,11 @@ void vision_model::upload(sycl::queue & q) {
         gemm->report_load("vision");
         lt.lap("int8 convert (add_weight)");
         if (si::env::flag("PF_VISION_TIME")) {
-            fprintf(stderr, "[vtime] dnnl vision: %s, %.1f MiB int8 weights\n", all ? "on" : "partial",
+            si::logf("[vtime] dnnl vision: %s, %.1f MiB int8 weights\n", all ? "on" : "partial",
                     (double)gemm->weight_bytes() / 1048576.0);
         }
     } else if (dnnl_req != 0) {
-        fprintf(stderr, "[vision] PF_VISION_DNNL needs a GPU queue; using vit_gemm\n");
+        si::logf("[vision] PF_VISION_DNNL needs a GPU queue; using vit_gemm\n");
     }
 
     // Weight blob.  Compact when every linear is on the int8 path; otherwise
@@ -1506,7 +1508,7 @@ void vision_model::encode_host(const vision_input & in, std::vector<float> & out
             sq += (double) v[i] * v[i];
             mx = std::max(mx, std::fabs((double) v[i]));
         }
-        fprintf(stderr, "[mm] host %-12s sum=%.5f sumsq=%.5f max=%.5f\n", tag, sm, sq, mx);
+        si::logf("[mm] host %-12s sum=%.5f sumsq=%.5f max=%.5f\n", tag, sm, sq, mx);
     };
     for (int il = 0; il < hp.n_layer; il++) {
         const vision_layer & L = layers[il];
@@ -1826,7 +1828,7 @@ void encode_device_ds(vision_model & vm, sycl::queue & q, const vision_input & i
     if (vt.on) {
         const double total =
             std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_all0).count();
-        fprintf(stderr,
+        si::logf(
                 "[vtime] ds41v np=%d n_out=%d L=%d: total=%.1f ms | patch=%.1f merger=%.1f post_ln=%.2f | "
                 "layers=%.1f (ln1=%.1f qkv=%.1f rope=%.1f attn=%.1f out=%.1f ln2=%.1f gate_up=%.1f act=%.1f "
                 "down=%.1f)\n",
@@ -1899,7 +1901,7 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
         d_ffn = (float *)sycl::malloc_device((size_t)np * ff * 4, q);
         d_mm0 = (float *)sycl::malloc_device((size_t)n_out * hidden * 4, q);
         if (si::env::flag("PF_MM_DIAG")) {
-            fprintf(stderr,
+            si::logf(
                     "[mm] scratch np=%d E=%d ff=%d hidden=%d n_out=%d patch_K=%d -> patch_in %.1f qkv %.1f "
                     "ffn %.1f mm0 %.1f MiB\n",
                     np, E, ff, hidden, n_out, patch_K, np * (double) patch_K * 4 / 1048576.0,
@@ -1950,7 +1952,7 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
             sq += (double) v * v;
             mx = std::max(mx, std::fabs((double) v));
         }
-        fprintf(stderr, "[mm] dev %-12s sum=%.5f sumsq=%.5f max=%.5f\n", tag, sm, sq, mx);
+        si::logf("[mm] dev %-12s sum=%.5f sumsq=%.5f max=%.5f\n", tag, sm, sq, mx);
     };
     for (int il = 0; il < hp.n_layer; il++) {
         const vision_layer & L = layers[il];
@@ -2052,7 +2054,7 @@ void vision_model::encode_device(sycl::queue & q, const vision_input & in, float
     if (vt.on) {
         const double total =
             std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_all0).count();
-        fprintf(stderr,
+        si::logf(
                 "[vtime] np=%d n_out=%d L=%d: total=%.1f ms | patch=%.1f merger=%.1f post_ln=%.2f | "
                 "layers=%.1f (ln1=%.1f qkv=%.1f rope=%.1f attn=%.1f out=%.1f ln2=%.1f up=%.1f act=%.1f down=%.1f)\n",
                 np, n_out, hp.n_layer, total, vt.patch, vt.mm, vt.post_ln, vt.layers, vt.ln1, vt.qkv, vt.rope,

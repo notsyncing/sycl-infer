@@ -1,3 +1,5 @@
+#include "log.h"
+
 // Mixture-of-Experts kernels: router, per-expert gate/up and down, and the
 // weighted reduction.
 //
@@ -935,7 +937,7 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
                 alt_max = std::fmax(alt_max, d);
                 alt_bad += !(h_log_raw[i] == h_log_alt[i]);
             }
-            fprintf(stderr, "[moertchk] logits %s vs %s: bad=%d/%zu maxdiff=%.3g\n", rt_gemv ? "gemv" : "tiled",
+            si::logf("[moertchk] logits %s vs %s: bad=%d/%zu maxdiff=%.3g\n", rt_gemv ? "gemv" : "tiled",
                     rt_gemv ? "tiled" : "gemv", alt_bad, h_log_alt.size(), (double)alt_max);
             // the selected path's raw logits are what the comparisons below run on
             q.memcpy(logits, h_log_raw.data(), h_log_raw.size() * sizeof(float)).wait();
@@ -973,7 +975,7 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
             lmax = std::fmax(lmax, d);
             l_bad += !(h_log_old[i] == h_log_new[i]);
         }
-        fprintf(stderr, "[moertchk] n=%d ne=%d ids_bad=%d/%zu wts_bad=%d/%zu logits_bad=%d maxdiff=%.3g\n", n_tok,
+        si::logf("[moertchk] n=%d ne=%d ids_bad=%d/%zu wts_bad=%d/%zu logits_bad=%d maxdiff=%.3g\n", n_tok,
                 n_expert, id_bad, h_ids_old.size(), w_bad, h_wts_old.size(), l_bad, (double)lmax);
     }
     if (rt_time && !rt_old && !do_chk) {
@@ -992,7 +994,7 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
         // function-local static would pin this to the first card.
         const int cu = si::dev::for_queue(q).hw.compute_units;
         const size_t lgroups = (size_t)n_tok * (size_t)n_expert;
-        fprintf(stderr,
+        si::logf(
                 "[moert] n=%d ne=%d wg=%d cu=%d lgroups=%zu lwarps=%zu fgroups=%d fwg=%d fwarps=%d "
                 "logits=%.4f fused=%.4f gap=%.4f ms\n",
                 n_tok, n_expert, fwg, cu, lgroups, lgroups, n_tok, fwg,
@@ -1010,7 +1012,7 @@ void moe_router_launch(queue & q, const void * gate_inp, uint32_t gp_type, const
         auto st = [](const sycl::event & e) {
             return (double)e.get_profiling_info<sycl::info::event_profiling::command_start>() / 1.0e6;
         };
-        fprintf(stderr, "[moert] n=%d ne=%d logits=%.3f softmax=%.3f topk=%.3f wts=%.3f gap01=%.3f gap12=%.3f gap23=%.3f ms\n",
+        si::logf("[moert] n=%d ne=%d logits=%.3f softmax=%.3f topk=%.3f wts=%.3f gap01=%.3f gap12=%.3f gap23=%.3f ms\n",
                 n_tok, n_expert, ms(e0), ms(e1), ms(e2), ms(e3), st(e1) - (st(e0) + ms(e0)),
                 st(e2) - (st(e1) + ms(e1)), st(e3) - (st(e2) + ms(e2)));
     }
@@ -2050,7 +2052,7 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
             return false;                                                                                                 \
         }                                                                                                                \
         if (dbg) {                                                                                                       \
-            fprintf(stderr, "[grp] fuse=%d qt=%u M=%d C=%d NSG=%d HOIST=%d KC=0 RB=%d K=%d N=%d grid=%zu n_expert=%d n_pairs=%d flat=%d persist=%d\n", FUSE,  \
+            si::logf("[grp] fuse=%d qt=%u M=%d C=%d NSG=%d HOIST=%d KC=0 RB=%d K=%d N=%d grid=%zu n_expert=%d n_pairs=%d flat=%d persist=%d\n", FUSE,  \
                     (unsigned)QT, MV, C, NSG, HV, RB, K, N,                                                       \
                     (size_t)((n_pairs + MV - 1) / MV + n_expert) * (size_t)(N / RB), n_expert, n_pairs, flat ? 1 : 0, persist ? 1 : 0);  \
         }                                                                                                                \
@@ -2067,7 +2069,7 @@ static bool moe_grp_go(queue & q, const char * w0, const char * w1, size_t plane
             return false;                                                                                                 \
         }                                                                                                                \
         if (dbg) {                                                                                                       \
-            fprintf(stderr, "[grp] fuse=%d qt=%u M=%d C=%d NSG=%d HOIST=%d KC=%d RB=%d K=%d N=%d grid=%zu n_expert=%d n_pairs=%d flat=%d persist=%d\n",   \
+            si::logf("[grp] fuse=%d qt=%u M=%d C=%d NSG=%d HOIST=%d KC=%d RB=%d K=%d N=%d grid=%zu n_expert=%d n_pairs=%d flat=%d persist=%d\n",   \
                     FUSE, (unsigned)QT, MV, C, NSG, HV, KCV, RB, K, N,                                                    \
                     (size_t)((n_pairs + MV - 1) / MV + n_expert) * (size_t)(N / RB), n_expert, n_pairs, flat ? 1 : 0, persist ? 1 : 0);                               \
         }                                                                                                                \

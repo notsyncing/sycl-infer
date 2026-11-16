@@ -134,11 +134,28 @@ struct fake_worker {
             }
             if (body.value("stream", false)) {
                 res.set_header("Content-Type", "text/event-stream");
+                // The router asks for this even when the client did not, so it
+                // can log the token counts; it must drop the chunk again from
+                // the client's view (see test_stream_usage_hidden).
+                bool include_usage = false;
+                if (body.contains("stream_options") && body["stream_options"].is_object()) {
+                    include_usage = body["stream_options"].value("include_usage", false);
+                }
                 auto n = std::make_shared<int>(0);
+                auto sent_usage = std::make_shared<bool>(false);
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [this, n](size_t, httplib::DataSink & sink) -> bool {
+                    [this, n, sent_usage, include_usage](size_t, httplib::DataSink & sink) -> bool {
                         if (*n >= chunks) {
+                            if (include_usage && !*sent_usage) {
+                                *sent_usage = true;
+                                const std::string usage =
+                                    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\","
+                                    "\"choices\":[],\"usage\":{\"prompt_tokens\":11,"
+                                    "\"completion_tokens\":7,\"total_tokens\":18,"
+                                    "\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n";
+                                return sink.write(usage.data(), usage.size());
+                            }
                             sink.done();
                             return true;
                         }
@@ -551,11 +568,59 @@ void test_onnx_binary_route() {
     fx.stop();
 }
 
+// The router asks the worker for the usage chunk so it can log the token
+// counts, but a client that did not request `stream_options.include_usage`
+// must not see it: the router suppresses exactly that frame.
+void test_stream_usage_hidden() {
+    router_fixture fx;
+    fx.worker.chunks = 2;
+    fx.worker.chunk_delay_ms = 0;
+    fx.start();
+    httplib::Client cli("127.0.0.1", fx.port);
+    cli.set_read_timeout(20, 0);
+    std::string all;
+    auto res = cli.Post("/v1/chat/completions", httplib::Headers(), "{\"model\":\"router-model\",\"stream\":true}",
+                        "application/json",
+                        [&](const char * data, size_t len) {
+                            all.append(data, len);
+                            return true;
+                        });
+    CHECK(!!res, "the streaming request must succeed");
+    CHECK(all.find("chunk 1") != std::string::npos, "the content stream must arrive");
+    CHECK(all.find("\"usage\"") == std::string::npos,
+          "a client that did not ask for usage must not receive the usage chunk");
+    fx.stop();
+}
+
+void test_stream_usage_requested() {
+    router_fixture fx;
+    fx.worker.chunks = 2;
+    fx.worker.chunk_delay_ms = 0;
+    fx.start();
+    httplib::Client cli("127.0.0.1", fx.port);
+    cli.set_read_timeout(20, 0);
+    std::string all;
+    auto res = cli.Post("/v1/chat/completions", httplib::Headers(),
+                        "{\"model\":\"router-model\",\"stream\":true,"
+                        "\"stream_options\":{\"include_usage\":true}}",
+                        "application/json",
+                        [&](const char * data, size_t len) {
+                            all.append(data, len);
+                            return true;
+                        });
+    CHECK(!!res, "the streaming request must succeed");
+    CHECK(all.find("\"usage\"") != std::string::npos, "a client that asked for usage must receive it");
+    CHECK(all.find("\"cached_tokens\":5") != std::string::npos, "the cached token count must arrive");
+    fx.stop();
+}
+
 int main() {
     test_non_streaming();
     test_unknown_model();
     test_model_down();
     test_sse_is_not_buffered();
+    test_stream_usage_hidden();
+    test_stream_usage_requested();
     test_cancel_propagates();
     test_models_aggregate();
     test_pipelines_list();

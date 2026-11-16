@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include <cstdio>
 
 #include "ops.h"
@@ -67,9 +69,9 @@ bool shape_layer_norm(const op_ctx & c, std::vector<std::vector<int64_t>> & out)
 bool shape_conv(const op_ctx & c, std::vector<std::vector<int64_t>> & out) {
     const tensor * x = c.in[0];
     if (getenv("SI_ONNX_TRACE")) {
-        fprintf(stderr, "[onnx] the conv's shape: the input '%s' [", x->name.c_str());
-        for (int64_t d : x->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "]\n");
+        si::logf("[onnx] the conv's shape: the input '%s' [", x->name.c_str());
+        for (int64_t d : x->shape) si::logf(" %lld", (long long)d);
+        si::logf("]\n");
     }
     const tensor * w = c.in[1];
     const int64_t N = x->shape[0];
@@ -334,11 +336,11 @@ bool shape_matmul(const op_ctx & c, std::vector<std::vector<int64_t>> & out) {
         if (bl[p] == 1) bl[p] = blead[i];
     }
     if (getenv("SI_ONNX_TRACE")) {
-        fprintf(stderr, "[onnx] the MatMul: a");
-        for (int64_t d : a->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  b");
-        for (int64_t d : b->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "\n");
+        si::logf("[onnx] the MatMul: a");
+        for (int64_t d : a->shape) si::logf(" %lld", (long long)d);
+        si::logf("  b");
+        for (int64_t d : b->shape) si::logf(" %lld", (long long)d);
+        si::logf("\n");
     }
     std::vector<int64_t> res = bl;
     res.push_back(sa[sa.size() - 2]);
@@ -450,25 +452,25 @@ bool shape_reshape(const op_ctx & c, std::vector<std::vector<int64_t>> & out) {
     // The target shape is a constant input.
     if (c.in.size() < 2 || !c.in[1]->on_host) {
         if (getenv("SI_ONNX_TRACE")) {
-            fprintf(stderr,
+            si::logf(
                     "[onnx] the reshape has no target: the inputs %zu, the target's on_host %d, the "
                     "target's dtype %d, the input's dtype %d, the host %zu\n",
                     c.in.size(), c.in.size() > 1 ? (int)c.in[1]->on_host : -1,
                     c.in.size() > 1 ? (int)c.in[1]->dtype : -1, c.in[0]->dtype,
                     c.in.size() > 1 ? c.in[1]->host.size() : 0);
             if (c.in.size() > 1) {
-                fprintf(stderr, "    the target is '%s'\n", c.in[1]->name.c_str());
+                si::logf("    the target is '%s'\n", c.in[1]->name.c_str());
             }
         }
         return false;
     }
     std::vector<int64_t> shape = read_i64(c.in[1]);
     if (getenv("SI_ONNX_TRACE")) {
-        fprintf(stderr, "[onnx] the reshape's target:");
-        for (int64_t d : shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, "  (the input's count %zu", c.in[0]->count);
-        for (int64_t d : c.in[0]->shape) fprintf(stderr, " %lld", (long long)d);
-        fprintf(stderr, ", the target's host %zu)\n", c.in[1]->host.size());
+        si::logf("[onnx] the reshape's target:");
+        for (int64_t d : shape) si::logf(" %lld", (long long)d);
+        si::logf("  (the input's count %zu", c.in[0]->count);
+        for (int64_t d : c.in[0]->shape) si::logf(" %lld", (long long)d);
+        si::logf(", the target's host %zu)\n", c.in[1]->host.size());
     }
     const bool allowzero = c.attr_i("allowzero", 0) != 0;
     // An empty target: the output is a scalar (a rank-0 value with one
@@ -578,19 +580,19 @@ bool shape_slice(const op_ctx & c, std::vector<std::vector<int64_t>> & out) {
     if (getenv("SI_ONNX_SHAPE")) {
         // The slice's inputs, one line: a slice of a rank-0 value is the
         // value itself, and the shape function has to say so.
-        fprintf(stderr, "[onnx] the slice's shape: %zu inputs", c.in.size());
+        si::logf("[onnx] the slice's shape: %zu inputs", c.in.size());
         for (size_t i = 0; i < c.in.size(); ++i) {
             const tensor * t = c.in[i];
             if (!t) {
-                fprintf(stderr, " | in[%zu]: NULL", i);
+                si::logf(" | in[%zu]: NULL", i);
                 continue;
             }
-            fprintf(stderr, " | in[%zu]: '%s' dtype=%d count=%zu host=%zu on_host=%d shape=[", i,
+            si::logf(" | in[%zu]: '%s' dtype=%d count=%zu host=%zu on_host=%d shape=[", i,
                     t->name.c_str(), (int)t->dtype, t->count, t->host.size(), (int)t->on_host);
-            for (int64_t d : t->shape) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "]");
+            for (int64_t d : t->shape) si::logf(" %lld", (long long)d);
+            si::logf("]");
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     const tensor * x = c.in[0];
     if (c.in.size() < 3) return false;

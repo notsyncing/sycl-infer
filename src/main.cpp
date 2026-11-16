@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include <algorithm>
 #include <climits>
 #include <cstdio>
@@ -285,7 +287,7 @@ int main(int argc, char ** argv) {
         // error rather than silently overwriting the default with ""
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) {
-                fprintf(stderr, "error: %s requires a value\n", a.c_str());
+                si::logf("error: %s requires a value\n", a.c_str());
                 bad_arg = true;
                 return "";
             }
@@ -362,7 +364,7 @@ int main(int argc, char ** argv) {
             const std::string v = next();
             kv_dtype_t kt, vt;
             if (!kv_dtype_parse_pair(v.c_str(), kt, vt)) {
-                fprintf(stderr, "error: --kv-type expects i4|i8|bf16|f16|f32, or K:V "
+                si::logf("error: --kv-type expects i4|i8|bf16|f16|f32, or K:V "
                                 "(e.g. i8:i4)\n");
                 return 1;
             }
@@ -372,7 +374,7 @@ int main(int argc, char ** argv) {
         } else if (a == "--spec-type") {
             const std::string v = next();
             if (v != "none" && v != "mtp" && v != "dflash2" && v != "dflash") {
-                fprintf(stderr, "error: --spec-type expects none|mtp|dflash2\n");
+                si::logf("error: --spec-type expects none|mtp|dflash2\n");
                 return 1;
             }
             spec_type = v;
@@ -428,7 +430,7 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!ok) {
-                fprintf(stderr, "error: --q4-tail-skip expects a non-negative integer\n");
+                si::logf("error: --q4-tail-skip expects a non-negative integer\n");
                 bad_arg = true;
             } else {
                 q4_tail_skip = std::atoi(v.c_str());
@@ -463,7 +465,7 @@ int main(int argc, char ** argv) {
             } else if (v == "auto") {
                 device = -1;
             } else {
-                fprintf(stderr, "error: --device expects cpu|gpu|auto\n");
+                si::logf("error: --device expects cpu|gpu|auto\n");
                 return 1;
             }
         } else if (a == "--cpu-threads") {
@@ -472,7 +474,7 @@ int main(int argc, char ** argv) {
             usage(argv[0]);
             return 0;
         } else if (!a.empty() && a[0] == '-') {
-            fprintf(stderr, "error: unknown option %s\n", a.c_str());
+            si::logf("error: unknown option %s\n", a.c_str());
             usage(argv[0]);
             return 1;
         } else {
@@ -493,11 +495,11 @@ int main(int argc, char ** argv) {
         try {
             ctx = model_context_length(model_path);
         } catch (const std::exception & ex) {
-            fprintf(stderr, "error: cannot read model context length: %s\n", ex.what());
+            si::logf("error: cannot read model context length: %s\n", ex.what());
             return 1;
         }
         if (ctx <= 0) {
-            fprintf(stderr, "error: model does not declare a context length (%s)\n", model_path.c_str());
+            si::logf("error: model does not declare a context length (%s)\n", model_path.c_str());
             return 1;
         }
     }
@@ -542,7 +544,7 @@ int main(int argc, char ** argv) {
             stype = "dflash2";
         }
         if (stype == "dflash2" && spec_draft.empty()) {
-            fprintf(stderr, "error: --spec-type dflash2 needs --spec-draft-model <drafter.gguf>\n");
+            si::logf("error: --spec-type dflash2 needs --spec-draft-model <drafter.gguf>\n");
             return 1;
         }
         if (stype != "none" && stype.empty()) {
@@ -596,8 +598,8 @@ int main(int argc, char ** argv) {
         try {
             ep = std::make_unique<engine>(ec);
         } catch (const std::exception & ex) {
-            fprintf(stderr, "error: %s\n", ex.what());
-            fprintf(stderr, "(exit %d: a startup failure - do not retry, the same attempt would fail the same way)\n",
+            si::logf("error: %s\n", ex.what());
+            si::logf("(exit %d: a startup failure - do not retry, the same attempt would fail the same way)\n",
                     kExitStartupFailure);
             return kExitStartupFailure;
         }
@@ -605,9 +607,9 @@ int main(int argc, char ** argv) {
         {
             const char * isa = cpu_isa_spec();
             if (e.cpu_mode) {
-                fprintf(stderr, "[dev] backend=cpu (isa=%s, threads=%d), kv in host RAM\n", isa, cpu_thread_count());
+                si::logf("[dev] backend=cpu (isa=%s, threads=%d), kv in host RAM\n", isa, cpu_thread_count());
             } else {
-                fprintf(stderr, "[dev] backend=gpu (%s)\n",
+                si::logf("[dev] backend=gpu (%s)\n",
                         e.q.get_device().get_info<sycl::info::device::name>().c_str());
             }
         }
@@ -628,7 +630,7 @@ int main(int argc, char ** argv) {
             } else {
                 snprintf(kvname, sizeof(kvname), "%s:%s", kv_dtype_name(kv_k_dtype()), kv_dtype_name(kv_v_dtype()));
             }
-            fprintf(stderr,
+            si::logf(
                     "[ctx] max_seq=%d tokens%s, kv_blocks=%d (%d tokens), kv_pool=%.0f MB, "
                     "kv_cap=%d blocks (%.0f MB, %s), kv_type=%s (%.0f KB/token)\n",
                     e.max_seq, ctx_full ? " (full)" : (ctx_auto ? " (auto)" : ""), n_blocks, n_blocks * kBlockSize,
@@ -639,7 +641,7 @@ int main(int argc, char ** argv) {
             try {
                 if (e.q.get_device().has(sycl::aspect::ext_intel_free_memory)) {
                     const uint64_t free_b = e.q.get_device().get_info<sycl::ext::intel::info::device::free_memory>();
-                    fprintf(stderr, "[ctx] device free memory %.0f MB, KV reservation %.0f MB%s\n",
+                    si::logf("[ctx] device free memory %.0f MB, KV reservation %.0f MB%s\n",
                             (double)free_b / (1024.0 * 1024.0), cap_mb,
                             (double)free_b < cap_mb * 0.5 ? " (WARNING: KV cap exceeds half the free memory)" : "");
                 }
@@ -657,7 +659,7 @@ int main(int argc, char ** argv) {
             if (!control_token_file.empty()) {
                 std::ifstream f(control_token_file, std::ios::binary);
                 if (!f) {
-                    fprintf(stderr, "error: cannot read the control token file '%s'\n", control_token_file.c_str());
+                    si::logf("error: cannot read the control token file '%s'\n", control_token_file.c_str());
                     return 1;
                 }
                 std::string tok;
@@ -685,7 +687,7 @@ int main(int argc, char ** argv) {
             } else if (!json_schema_path.empty()) {
                 std::ifstream sf(json_schema_path, std::ios::binary);
                 if (!sf) {
-                    fprintf(stderr, "error: cannot read the JSON schema '%s'\n", json_schema_path.c_str());
+                    si::logf("error: cannot read the JSON schema '%s'\n", json_schema_path.c_str());
                     return 1;
                 }
                 const std::string schema_text((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
@@ -700,7 +702,7 @@ int main(int argc, char ** argv) {
             const bool dump_gen = si::env::flag("PF_DUMP_GEN");
             auto emit = [&](int tok) {
                 if (dump_gen) {
-                    fprintf(stderr, "[gen] id=%d '%s'\n", tok, e.tk.token_piece(tok).c_str());
+                    si::logf("[gen] id=%d '%s'\n", tok, e.tk.token_piece(tok).c_str());
                 }
                 fputs(ub.push(e.tk.token_piece(tok)).c_str(), stdout);
                 fflush(stdout);
@@ -748,12 +750,12 @@ int main(int argc, char ** argv) {
                         vm_owned.upload(e.q);
                         if (si::env::flag("PF_MM_DIAG")) {
                             for (const sycl::device & d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
-                                fprintf(stderr, "[mm] %-28s total %.0f MiB, allocatable %.0f MiB\n",
+                                si::logf("[mm] %-28s total %.0f MiB, allocatable %.0f MiB\n",
                                         d.get_info<sycl::info::device::name>().c_str(),
                                         d.get_info<sycl::info::device::global_mem_size>() / 1048576.0,
                                         d.get_info<sycl::info::device::max_mem_alloc_size>() / 1048576.0);
                             }
-                            fprintf(stderr, "[mm] vision weights %.0f MiB on %s\n", vm_owned.weights.device_bytes() / 1048576.0,
+                            si::logf("[mm] vision weights %.0f MiB on %s\n", vm_owned.weights.device_bytes() / 1048576.0,
                                     e.q.get_device().get_info<sycl::info::device::name>().c_str());
                         }
                         img_cfg.patch_size = vm.hp.patch_size;
@@ -856,13 +858,13 @@ int main(int argc, char ** argv) {
             if (si::env::flag("PF_DUMP_PROMPT")) {
                 if (!raw) {
                     std::vector<chat_msg> msgs = {{"user", prompt}};
-                    fprintf(stderr, "[prompt] %s\n", render_chat(e.m.chat_template, msgs, true, thinking).c_str());
+                    si::logf("[prompt] %s\n", render_chat(e.m.chat_template, msgs, true, thinking).c_str());
                 }
-                fprintf(stderr, "[prompt ids]");
+                si::logf("[prompt ids]");
                 for (int tkv : toks) {
-                    fprintf(stderr, " %d", tkv);
+                    si::logf(" %d", tkv);
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
             const char * rp = si::env::str("PF_GEN_REPEAT");
             const int nrep = rp ? std::max(1, atoi(rp)) : 1;
@@ -874,12 +876,12 @@ int main(int argc, char ** argv) {
                 fputs(ub.flush().c_str(), stdout);
                 printf("\n");
                 const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                fprintf(stderr, "[gen] repeat %d: %.3f s\n", rep, dt);
+                si::logf("[gen] repeat %d: %.3f s\n", rep, dt);
             }
             return 0;
         }
     } catch (const std::exception & ex) {
-        fprintf(stderr, "error: %s\n", ex.what());
+        si::logf("error: %s\n", ex.what());
         return kExitRuntimeError;
     }
     usage(argv[0]);

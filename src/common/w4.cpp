@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "w4.h"
 
 #include "quant.h"
@@ -121,7 +123,7 @@ int w4_group() {
             return v;
         }
         if (e && v != kW4Group) {
-            fprintf(stderr, "[w4] PF_W4_GROUP=%d not supported (32|64|128), using 32\n", v);
+            si::logf("[w4] PF_W4_GROUP=%d not supported (32|64|128), using 32\n", v);
         }
         return kW4Group;
     }();

@@ -1,3 +1,5 @@
+#include "log.h"
+
 // ---------------------------------------------------------------------------
 // Host MoE kernels for the CPU partition.
 //
@@ -160,14 +162,14 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
     };
     const double tg0 = grp_t ? ms_now() : 0.0;
     if (std::getenv("PF_Q4_GRPDBG")) {
-        fprintf(stderr, "[grp] enter n_tok=%d np=%d\n", n_tok, np);
+        si::logf("[grp] enter n_tok=%d np=%d\n", n_tok, np);
     }
     cnt.assign((size_t)E, 0);
     off.assign((size_t)E + 1, 0);
     pairs.resize((size_t)np);
     for (int pr = 0; pr < np; pr++) {
         if (ids[pr] < 0 || ids[pr] >= E) {
-            fprintf(stderr, "[moe] bad expert id %d at pair %d (E=%d)\n", ids[pr], pr, E);
+            si::logf("[moe] bad expert id %d at pair %d (E=%d)\n", ids[pr], pr, E);
             return;
         }
         cnt[(size_t)ids[pr]]++;
@@ -188,7 +190,7 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
         }
     }
     if (std::getenv("PF_Q4_GRPDBG")) {
-        fprintf(stderr, "[grp] maxP=%d e=%d\n", maxP, maxE);
+        si::logf("[grp] maxP=%d e=%d\n", maxP, maxE);
     }
     x8.resize((size_t)K * n_tok);
     x8m.resize((size_t)G * n_tok * 2);
@@ -196,7 +198,7 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
     cpu_xq(x, nullptr, x_stride, 0, x8.data(), x8m.data(), xq8m.data(), nullptr, n_tok, K);
     const double tx1 = grp_t ? ms_now() : 0.0;
     if (std::getenv("PF_Q4_GRPDBG")) {
-        fprintf(stderr, "[grp] xq done\n");
+        si::logf("[grp] xq done\n");
     }
     hbuf.assign((size_t)np * n_ff, 0.f);
     if (isa().qgemv_sb == nullptr) {
@@ -211,7 +213,7 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
         const int b = off[(size_t)e], P = off[(size_t)e + 1] - b;
         const int gd = grp_done.fetch_add(1);
         if (std::getenv("PF_Q4_GRPDBG") && (e == 0 || (gd % 64) == 0)) {
-            fprintf(stderr, "[grp] expert e=%d P=%d done=%d\n", e, P, gd);
+            si::logf("[grp] expert e=%d P=%d done=%d\n", e, P, gd);
         }
         if (P <= 0) {
             return;
@@ -222,10 +224,10 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
         const bool fp = std::getenv("PF_Q4_GRPDBG") && first_pos.fetch_add(1) == 0;
         const bool fp2 = std::getenv("PF_Q4_GRPDBG") && P >= 2 && first_two.fetch_add(1) == 0;
         if (fp2) {
-            fprintf(stderr, "[grp] first P>=2 e=%d P=%d\n", e, P);
+            si::logf("[grp] first P>=2 e=%d P=%d\n", e, P);
         }
         if (fp) {
-            fprintf(stderr, "[grp] first P>0 e=%d P=%d\n", e, P);
+            si::logf("[grp] first P>0 e=%d P=%d\n", e, P);
         }
         thread_local std::vector<int8_t> x8e;
         thread_local std::vector<float> xme, gbuf, ubuf;
@@ -264,21 +266,21 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
         const char * gp = (const char *)M.gate_exps.data + (size_t)e * M.gate_exps.plane_bytes;
         const char * up = (const char *)M.up_exps.data + (size_t)e * M.up_exps.plane_bytes;
         if (fp) {
-            fprintf(stderr, "[grp] first gemm start\n");
+            si::logf("[grp] first gemm start\n");
         }
         cpu_i8_gemm_batch_serial(12, gp, x8e.data(), xme.data(), xqe.data(), K, n_ff, PP, gbuf.data(), n_ff);
         if (fp2) {
-            fprintf(stderr, "[grp] P2 gate done\n");
+            si::logf("[grp] P2 gate done\n");
         }
         if (fp) {
-            fprintf(stderr, "[grp] first gemm gate done\n");
+            si::logf("[grp] first gemm gate done\n");
         }
         cpu_i8_gemm_batch_serial(12, up, x8e.data(), xme.data(), xqe.data(), K, n_ff, PP, ubuf.data(), n_ff);
         if (fp2) {
-            fprintf(stderr, "[grp] P2 up done\n");
+            si::logf("[grp] P2 up done\n");
         }
         if (fp) {
-            fprintf(stderr, "[grp] first gemm up done\n");
+            si::logf("[grp] first gemm up done\n");
         }
         for (int v = 0; v < P; v++) {
             for (int i = 0; i < n_ff; i++) {
@@ -286,18 +288,18 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
             }
         }
         if (fp2) {
-            fprintf(stderr, "[grp] P2 h done\n");
+            si::logf("[grp] P2 h done\n");
         }
         if (fp) {
-            fprintf(stderr, "[grp] first h done\n");
+            si::logf("[grp] first h done\n");
         }
     });
     const double tg1 = grp_t ? ms_now() : 0.0;
     if (std::getenv("PF_Q4_GRPDBG")) {
-        fprintf(stderr, "[moe] grouped pass1 done n_tok=%d np=%d\n", n_tok, np);
+        si::logf("[moe] grouped pass1 done n_tok=%d np=%d\n", n_tok, np);
     }
     if (!M.down_i8 || !M.down_sc || M.down_K != Kd || M.down_N != K) {
-        fprintf(stderr, "[moe] grouped down store missing/mismatched (%p %p K=%d N=%d)\n", (void *)M.down_i8,
+        si::logf("[moe] grouped down store missing/mismatched (%p %p K=%d N=%d)\n", (void *)M.down_i8,
                 (void *)M.down_sc, M.down_K, M.down_N);
         return;
     }
@@ -307,7 +309,7 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
     cpu_xq(hbuf.data(), nullptr, Kd, 0, x8h.data(), hmeta.data(), hsum.data(), nullptr, np, Kd);
     const double th1 = grp_t ? ms_now() : 0.0;
     if (std::getenv("PF_Q4_GRPDBG")) {
-        fprintf(stderr, "[moe] grouped pass2 start\n");
+        si::logf("[moe] grouped pass2 start\n");
     }
     par(E, [&](int e) {
         const int b = off[(size_t)e], P = off[(size_t)e + 1] - b;
@@ -326,7 +328,7 @@ static void moe_experts_grouped_i8(const cpu_moe & M, const float * x, int x_str
     });
     if (grp_t && std::getenv("PF_Q4_GRPDBG")) {
         const double te = ms_now();
-        fprintf(stderr, "[grp] one call: xq=%.0f gate=%.0f hxq=%.0f down=%.0f ms\n", tx1 - tg0, tg1 - tx1,
+        si::logf("[grp] one call: xq=%.0f gate=%.0f hxq=%.0f down=%.0f ms\n", tx1 - tg0, tg1 - tx1,
                 th1 - tg1, te - th1);
     }
 }
@@ -551,7 +553,7 @@ void cpu_moe_experts_i8(const cpu_moe & M, const float * x, int x_stride, int n_
     }
     if (cmd) {
         const double e = cm_ms();
-        fprintf(stderr, "[q4cmd] pairs=%d xq=%.3f per_pair=%.3f tot=%.3f ms\n", n_pairs, cm_xq - cm0,
+        si::logf("[q4cmd] pairs=%d xq=%.3f per_pair=%.3f tot=%.3f ms\n", n_pairs, cm_xq - cm0,
                 (e - cm_xq) / std::max(1, n_pairs), e - cm0);
     }
 }

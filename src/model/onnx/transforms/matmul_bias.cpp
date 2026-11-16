@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "transform.h"
 #include "transform_util.h"
 
@@ -83,7 +85,7 @@ bool matmul_bias(graph_build & g) {
         g.nodes[i].input.push_back(bias_name);
         changed = true;
         if (getenv("SI_ONNX_TRACE")) {
-            fprintf(stderr, "[onnx] the fusion: %s <- %s (bias %s)\n", n.name.c_str(),
+            si::logf("[onnx] the fusion: %s <- %s (bias %s)\n", n.name.c_str(),
                     an.name.c_str(), bias_name.c_str());
         }
     }

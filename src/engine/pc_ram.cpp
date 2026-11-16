@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "pc_ram.h"
 
 #include <cstdint>
@@ -108,7 +110,7 @@ void pc_ram_store::print_stats(const char * tag) const {
     if (!active_) {
         return;
     }
-    fprintf(stderr, "[pcr] %s: %zu records (%.1f MB / %.1f MB)\n", tag, index_.size(),
+    si::logf("[pcr] %s: %zu records (%.1f MB / %.1f MB)\n", tag, index_.size(),
             (double)bytes_ / (1024.0 * 1024.0), max_bytes_ ? (double)max_bytes_ / (1024.0 * 1024.0) : 0.0);
 }
 

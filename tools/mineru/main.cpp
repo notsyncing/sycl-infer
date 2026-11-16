@@ -1,3 +1,5 @@
+#include "log.h"
+
 // sycl-infer-mineru: the standalone MinerU two-step reference client.
 //
 // It is deliberately NOT part of the server and NOT a pipeline: the steps use
@@ -60,7 +62,7 @@ int main(int argc, char ** argv) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) {
-                fprintf(stderr, "error: %s requires a value\n", a.c_str());
+                si::logf("error: %s requires a value\n", a.c_str());
                 return std::string();
             }
             return argv[++i];
@@ -82,7 +84,7 @@ int main(int argc, char ** argv) {
             } else if (v == "auto") {
                 device = -1;
             } else {
-                fprintf(stderr, "error: --device expects cpu|gpu|auto\n");
+                si::logf("error: --device expects cpu|gpu|auto\n");
                 return 1;
             }
         } else if (a == "--layer-map") {
@@ -100,11 +102,11 @@ int main(int argc, char ** argv) {
         } else if (a == "-h" || a == "--help") {
             help = true;
         } else if (!a.empty() && a[0] == '-') {
-            fprintf(stderr, "error: unknown option %s\n", a.c_str());
+            si::logf("error: unknown option %s\n", a.c_str());
             usage(argv[0]);
             return 1;
         } else {
-            fprintf(stderr, "error: unexpected argument '%s'\n", a.c_str());
+            si::logf("error: unexpected argument '%s'\n", a.c_str());
             usage(argv[0]);
             return 1;
         }
@@ -115,22 +117,22 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (image.empty()) {
-        fprintf(stderr, "error: --image <page.png> is required\n");
+        si::logf("error: --image <page.png> is required\n");
         usage(argv[0]);
         return 1;
     }
     if (model.empty()) {
-        fprintf(stderr, "error: --model <gguf> is required\n");
+        si::logf("error: --model <gguf> is required\n");
         return 1;
     }
     if (mmproj.empty()) {
-        fprintf(stderr, "error: --mmproj <mmproj.gguf> is required\n");
+        si::logf("error: --mmproj <mmproj.gguf> is required\n");
         return 1;
     }
     if (!kv_type.empty()) {
         kv_dtype_t kt, vt;
         if (!kv_dtype_parse_pair(kv_type.c_str(), kt, vt)) {
-            fprintf(stderr, "error: --kv-type expects i4|i8|bf16|f16|f32, or K:V\n");
+            si::logf("error: --kv-type expects i4|i8|bf16|f16|f32, or K:V\n");
             return 1;
         }
         kv_dtype_set_kv(kt, vt);
@@ -147,8 +149,8 @@ int main(int argc, char ** argv) {
         engine e(ec);
         return run_mineru(e, mmproj, image, opt, stdout);
     } catch (const std::exception & ex) {
-        fprintf(stderr, "error: %s\n", ex.what());
-        fprintf(stderr, "(exit %d: a startup failure - do not retry, the same attempt would fail the same way)\n",
+        si::logf("error: %s\n", ex.what());
+        si::logf("(exit %d: a startup failure - do not retry, the same attempt would fail the same way)\n",
                 kExitStartupFailure);
         return kExitStartupFailure;
     }

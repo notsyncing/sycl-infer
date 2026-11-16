@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "scheduler.h"
 
 #include <algorithm>
@@ -213,7 +215,7 @@ static sample_outcome sample_and_emit(engine & e, std::shared_ptr<sequence> & s,
     sample_logprobs lp;
     const int tok = sample_token(logits, n_vocab, s->gp, s->recent, s->ss, want_lp ? &lp : nullptr);
     if (dbg()) {
-        fprintf(stderr, "[sched]   sampled seq=%d tok=%d\n", s->id, tok);
+        si::logf("[sched]   sampled seq=%d tok=%d\n", s->id, tok);
     }
     s->recent.push_back(tok);
     s->n_generated++;
@@ -459,12 +461,12 @@ void scheduler::loop() {
                         // Per-chunk prefill time: a single long prompt then yields
                         // the marginal prefill throughput at every depth (the
                         // chunk at pos P is pp<n>@P).  Host-only diagnostic.
-                        fprintf(stderr, "[srv] chunk pos=%d n=%d ms=%.2f\n", s->prompt_pos, n,
+                        si::logf("[srv] chunk pos=%d n=%d ms=%.2f\n", s->prompt_pos, n,
                                 dms(t_pf0, t_pf1));
                     }
                     s->n_chunks++;
                     if (dbg()) {
-                        fprintf(stderr, "[sched] prefill seq=%d slot=%d chunk pos=%d n=%d (prompt %zu)\n", s->id,
+                        si::logf("[sched] prefill seq=%d slot=%d chunk pos=%d n=%d (prompt %zu)\n", s->id,
                                 s->slot, s->prompt_pos, n, s->prompt.size());
                     }
                     s->prompt_pos += n;
@@ -502,7 +504,7 @@ void scheduler::loop() {
                             // `prefill` is the last chunk's forward; `prefill_total`
                             // sums all chunk forwards (the first token cannot be
                             // sampled before every prompt token has been prefilled)
-                            fprintf(stderr,
+                            si::logf(
                                     "[srv] prefill=%.1f fetch=%.2f sample=%.2f to_first_tok=%.1f ms "
                                     "(wait=%.2f admit=%.2f prefill_total=%.1f chunks=%d reused=%d total=%.1f)\n",
                                     ms(t_pf0, t_pf1), ms(t_fl0, t_sm0), ms(t_sm0, t_now), ms(t_pf0, t_now), s->wait_ms,
@@ -583,7 +585,7 @@ void scheduler::loop() {
                 // against a ~65 ms decode step.
                 if (s->out_queue_full()) {
                     if (dbg()) {
-                        fprintf(stderr, "[sched] seq=%d paused: out_q >= %zu\n", s->id,
+                        si::logf("[sched] seq=%d paused: out_q >= %zu\n", s->id,
                                 sequence::kMaxOutQueue);
                     }
                     continue;
@@ -650,11 +652,11 @@ void scheduler::loop() {
                 }
                 lk2.lock();
                 if (dbg()) {
-                    fprintf(stderr, "[sched] decode nb=%d:", nb);
+                    si::logf("[sched] decode nb=%d:", nb);
                     for (int r = 0; r < nb; r++) {
-                        fprintf(stderr, " seq=%d slot=%d pos=%d tok=%d", batch[r]->id, slots[r], poss[r], toks[r]);
+                        si::logf(" seq=%d slot=%d pos=%d tok=%d", batch[r]->id, slots[r], poss[r], toks[r]);
                     }
-                    fprintf(stderr, "\n");
+                    si::logf("\n");
                 }
                 did_work = true;
                 for (int r = 0; r < nb; r++) {

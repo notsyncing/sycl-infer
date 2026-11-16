@@ -39,7 +39,8 @@ private:
     void handle_pipelines(const httplib::Request & req, httplib::Response & res);
     void handle_pipeline_run(const httplib::Request & req, httplib::Response & res);
     void forward(const httplib::Request & req, httplib::Response & res, const std::shared_ptr<model_slot> & slot,
-                 const std::string & path, const std::string & body, const std::string & log_model);
+                 const std::string & path, const std::string & body, const std::string & log_model,
+                 bool collect_usage, bool forward_usage_frame);
     // The ONNX binary data plane: the model is the first field of the
     // request body, so the router can route it without decoding the tensors.
     void handle_onnx_run(const httplib::Request & req, httplib::Response & res);

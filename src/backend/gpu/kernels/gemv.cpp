@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "kernels.h"
 #include "device/device_profile.h"
 #include "kernel_utils.h"
@@ -767,7 +769,7 @@ static void gemv_group_impl(queue & q, uint32_t type, const gemv_seg * segs, int
     static const bool dbg_g = si::env::flag("PF_DBG_GEMV");
     if (dbg_g) {
         // the segments live on the device, so only log the host side here
-        fprintf(stderr, "[gemv] type=%u n_segs=%d total_rows=%d TB=%d nsb=%d segs=%p\n", type, n_segs,
+        si::logf("[gemv] type=%u n_segs=%d total_rows=%d TB=%d nsb=%d segs=%p\n", type, n_segs,
                 total_rows, TB, nsb, (const void *)segs);
     }
     static const int cfg1 = gemv_env_cfg("GEMV_CFG1");

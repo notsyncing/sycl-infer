@@ -1,3 +1,5 @@
+#include "log.h"
+
 // 4-bit (u4) and grouped int8 decode GEMV kernels: the M==1 counterparts of
 // dnnl_gemm::gemm_w4 / gemm.
 //
@@ -2472,7 +2474,7 @@ bool nat_gemm_launch(queue & q, int fmt, const void * w0, const void * w1, const
         const int mi = M < 14 ? M : 0;
         if (!seen[fmt][mi]) {
             seen[fmt][mi] = true;
-            fprintf(stderr, "[nat] fmt=%d M=%d K=%d N=%d sg=%d\n", fmt, M, K, N, sg8 ? 8 : 16);
+            si::logf("[nat] fmt=%d M=%d K=%d N=%d sg=%d\n", fmt, M, K, N, sg8 ? 8 : 16);
         }
     }
     const uint8_t * b0 = (const uint8_t *)w0;

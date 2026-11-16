@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "mineru.h"
 
 #include <algorithm>
@@ -178,7 +180,7 @@ std::string ask(engine & e, model_bundle & mb, const std::vector<uint8_t> & rgb,
         }
     }
     if (debug) {
-        fprintf(stderr, "[mineru] %s image %dx%d -> %dx%d (%d tokens)\n", type.c_str(), img.width, img.height, ow, oh,
+        si::logf("[mineru] %s image %dx%d -> %dx%d (%d tokens)\n", type.c_str(), img.width, img.height, ow, oh,
                 n_out);
     }
 
@@ -201,7 +203,7 @@ std::string ask(engine & e, model_bundle & mb, const std::vector<uint8_t> & rgb,
             }
         }
         if (first >= 0) {
-            fprintf(stderr, "[mineru] prompt %d tokens, first image token %d, mrope t/h/w = %d/%d/%d, "
+            si::logf("[mineru] prompt %d tokens, first image token %d, mrope t/h/w = %d/%d/%d, "
                             "next text t=%d\n",
                     n, first, p.mrope[first], p.mrope[n + first], p.mrope[2 * n + first],
                     p.mrope[3 * n + first]);
@@ -238,7 +240,7 @@ std::string ask(engine & e, model_bundle & mb, const std::vector<uint8_t> & rgb,
         const double t_end = now_ms();
         const double prefill = t_first > 0 ? t_first - t_vision : t_end - t_vision;
         const double decode = t_first > 0 ? t_end - t_first : 0;
-        fprintf(stderr,
+        si::logf(
                 "[mineru-time] %-8s img=%dx%d n_out=%d prompt=%d gen=%zu | prep=%.1f vision=%.1f prefill=%.1f "
                 "decode=%.1f total=%.1f ms\n",
                 type.c_str(), img.width, img.height, n_out, (int)p.tokens.size(), ids.size(),
@@ -255,11 +257,11 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
     int w = 0, h = 0;
     std::string err;
     if (!mm_image_decode_file(image_path, rgb, w, h, &err)) {
-        fprintf(stderr, "error: cannot decode image '%s': %s\n", image_path.c_str(), err.c_str());
+        si::logf("error: cannot decode image '%s': %s\n", image_path.c_str(), err.c_str());
         return 1;
     }
     if (!e.m.prof || e.m.prof->vision != model_profile::vision_kind::qwen2vl) {
-        fprintf(stderr, "error: mineru needs the qwen2vl architecture (profile vision tower), got '%s'\n",
+        si::logf("error: mineru needs the qwen2vl architecture (profile vision tower), got '%s'\n",
                 e.m.prof ? e.m.prof->key : "no profile");
         return 1;
     }
@@ -275,11 +277,11 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
     mb.vm.load(mmproj_path, vkind);
     std::string why;
     if (!mb.vm.runnable(&why)) {
-        fprintf(stderr, "error: mmproj loaded but cannot run: %s\n", why.c_str());
+        si::logf("error: mmproj loaded but cannot run: %s\n", why.c_str());
         return 1;
     }
     if (mb.vm.hp.proj_dim != e.m.hp.n_embd) {
-        fprintf(stderr, "error: vision projector width %d != text n_embd %d\n", mb.vm.hp.proj_dim, e.m.hp.n_embd);
+        si::logf("error: vision projector width %d != text n_embd %d\n", mb.vm.hp.proj_dim, e.m.hp.n_embd);
         return 1;
     }
     mb.vm.upload(e.q);
@@ -287,12 +289,12 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
         const double t1 = std::chrono::duration<double, std::milli>(
                               std::chrono::high_resolution_clock::now().time_since_epoch())
                               .count();
-        fprintf(stderr, "[mineru-time] mmproj load+upload = %.0f ms (vision dnnl %s)\n", t1 - t_load0,
+        si::logf("[mineru-time] mmproj load+upload = %.0f ms (vision dnnl %s)\n", t1 - t_load0,
                 mb.vm.gemm ? "on" : "off");
     }
     mb.d_out = sycl::malloc_device<float>((size_t)kMaxImgTokens * (size_t)e.m.hp.n_embd, e.q);
     if (!mb.d_out) {
-        fprintf(stderr, "error: cannot allocate the image embedding buffer\n");
+        si::logf("error: cannot allocate the image embedding buffer\n");
         return 1;
     }
 
@@ -341,20 +343,20 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
                 hn += (double)hout[i] * hout[i];
                 dn += (double)dout[i] * dout[i];
             }
-            fprintf(stderr,
+            si::logf(
                     "[mineru] vision self-check: %dx%d patches -> %d merged, host|max|=%.4g, max|diff|=%.4g, "
                     "nonfinite=%d, cos=%.6f, rms ratio=%.4f\n",
                     pim.width, pim.height, nd, hmax, md, bad, hn > 0 && dn > 0 ? dot / std::sqrt(hn * dn) : 0.0,
                     hn > 0 ? std::sqrt(dn / hn) : 0.0);
-            fprintf(stderr, "[mineru] h[0..7]=");
+            si::logf("[mineru] h[0..7]=");
             for (int i = 0; i < 8 && i < n; i++) {
-                fprintf(stderr, " %.5g", hout[i]);
+                si::logf(" %.5g", hout[i]);
             }
-            fprintf(stderr, "\n[mineru] d[0..7]=");
+            si::logf("\n[mineru] d[0..7]=");
             for (int i = 0; i < 8 && i < n; i++) {
-                fprintf(stderr, " %.5g", dout[i]);
+                si::logf(" %.5g", dout[i]);
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
 
         // ---- step 1: layout on the squashed 1036x1036 page ----
@@ -363,7 +365,7 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
         mm_image_resize_rgb(rgb.data(), w, h, page.data(), side, side);
         const std::string layout_raw = ask(e, mb, page, side, side, layout_prompt(), "[layout]", opt.max_tokens, opt.debug);
         if (opt.debug) {
-            fprintf(stderr, "[mineru] layout raw:\n%s\n", layout_raw.c_str());
+            si::logf("[mineru] layout raw:\n%s\n", layout_raw.c_str());
         }
         std::vector<mineru_block> blocks = mineru_parse_layout(layout_raw);
 
@@ -397,7 +399,7 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
             crop = resize_by_need(crop, cw, ch, cw, ch);
             b.content = ask(e, mb, crop, cw, ch, content_prompt(b.type), b.type, opt.max_tokens, opt.debug);
             if (opt.debug) {
-                fprintf(stderr, "[mineru] %s %.3f %.3f %.3f %.3f -> %zu bytes\n", b.type.c_str(), b.bbox[0],
+                si::logf("[mineru] %s %.3f %.3f %.3f %.3f -> %zu bytes\n", b.type.c_str(), b.bbox[0],
                         b.bbox[1], b.bbox[2], b.bbox[3], b.content.size());
             }
         }
@@ -435,7 +437,7 @@ int run_mineru(engine & e, const std::string & mmproj_path, const std::string & 
         }
         fputs("]\n", out);
     } catch (const std::exception & ex) {
-        fprintf(stderr, "error: mineru: %s\n", ex.what());
+        si::logf("error: mineru: %s\n", ex.what());
         rc = 1;
     }
     sycl::free(mb.d_out, e.q);

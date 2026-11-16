@@ -1,3 +1,5 @@
+#include "log.h"
+
 // GGUF chat template rendering, delegated to the vendored minja library
 // (third_party/minja, MIT): a full Jinja engine, the same one llama.cpp uses.
 // We feed it the tokenizer.chat_template source, the conversation as JSON, the
@@ -90,7 +92,7 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
                 }
             } catch (const std::exception & ex) {
                 if (dbg) {
-                    fprintf(stderr, "[chat_template] bad tools json: %s\n", ex.what());
+                    si::logf("[chat_template] bad tools json: %s\n", ex.what());
                 }
             }
         }
@@ -104,7 +106,7 @@ bool render_chat_template(const std::string & tmpl, const std::vector<chat_msg> 
         return true;
     } catch (const std::exception & ex) {
         if (dbg) {
-            fprintf(stderr, "[chat_template] %s\n", ex.what());
+            si::logf("[chat_template] %s\n", ex.what());
         }
         return false;
     }

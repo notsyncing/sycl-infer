@@ -1,3 +1,5 @@
+#include "log.h"
+
 // sycl-infer-onnx: the ONNX model service.
 //
 // A separate binary from the LLM engine on purpose: it needs neither the
@@ -62,7 +64,7 @@ int main(int argc, char ** argv) {
         const std::string a = argv[i];
         auto next = [&](const char * what) -> std::string {
             if (i + 1 >= argc) {
-                fprintf(stderr, "%s needs a value\n", what);
+                si::logf("%s needs a value\n", what);
                 exit(2);
             }
             return argv[++i];
@@ -96,7 +98,7 @@ int main(int argc, char ** argv) {
             usage(argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "unknown option '%s'\n", a.c_str());
+            si::logf("unknown option '%s'\n", a.c_str());
             usage(argv[0]);
             return 2;
         }

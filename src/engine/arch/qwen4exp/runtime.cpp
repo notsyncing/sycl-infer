@@ -1,3 +1,5 @@
+#include "log.h"
+
 // qwen4exp's arch_ops hooks (see arch/arch_ops.h).  The forward itself stays in
 // arch/qwen4exp/forward.cpp and qsa.cpp; these are the entry points the generic
 // engine calls from its constructor/destructor and from the forward and
@@ -51,7 +53,7 @@ void arch_ops_registry::q4_destroy(engine & e) {
     // unchanged.  The row sets hist_report to null so it is not printed twice.
     q4_hist_report(e);
     if (e.q4x_.engram_hits_ + e.q4x_.engram_misses_ > 0) {
-        fprintf(stderr, "[q4] engram cache: %zu hits / %zu misses (%.1f%% hit rate)\n", e.q4x_.engram_hits_,
+        si::logf("[q4] engram cache: %zu hits / %zu misses (%.1f%% hit rate)\n", e.q4x_.engram_hits_,
                 e.q4x_.engram_misses_,
                 100.0 * (double)e.q4x_.engram_hits_ / (double)(e.q4x_.engram_hits_ + e.q4x_.engram_misses_));
     }
@@ -222,11 +224,11 @@ std::vector<float> arch_ops_registry::q4_run_head(engine & e) {
                 }
             }
         }
-        fprintf(stderr, "[q4] top5:");
+        si::logf("[q4] top5:");
         for (int j = 0; j < 5; j++) {
-            fprintf(stderr, " %d(%.4f)", top[j], e.h_logits[top[j]]);
+            si::logf(" %d(%.4f)", top[j], e.h_logits[top[j]]);
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     return std::vector<float>(e.h_logits, e.h_logits + e.m.hp.n_vocab);
 }

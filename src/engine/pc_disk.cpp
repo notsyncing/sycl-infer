@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "pc_disk.h"
 
 #include <algorithm>
@@ -82,7 +84,7 @@ bool pc_disk_store::open(const std::string & dir, size_t max_bytes) {
     std::error_code ec;
     std::filesystem::create_directories(dir_, ec);
     if (ec) {
-        fprintf(stderr, "[pcd] cannot create %s: %s\n", dir_.c_str(), ec.message().c_str());
+        si::logf("[pcd] cannot create %s: %s\n", dir_.c_str(), ec.message().c_str());
         return false;
     }
     size_t n_ok = 0, n_bad = 0, n_unknown = 0;
@@ -134,7 +136,7 @@ bool pc_disk_store::open(const std::string & dir, size_t max_bytes) {
     }
     active_ = true;
     if (n_ok || n_bad || n_unknown) {
-        fprintf(stderr, "[pcd] %s: %zu records (%.1f MB), %zu discarded, %zu unknown%s\n", dir_.c_str(), n_ok,
+        si::logf("[pcd] %s: %zu records (%.1f MB), %zu discarded, %zu unknown%s\n", dir_.c_str(), n_ok,
                 (double)bytes_ / (1024.0 * 1024.0), n_bad, n_unknown, max_bytes_ ? "" : " (unbounded)");
     }
     return true;
@@ -332,7 +334,7 @@ void pc_disk_store::print_stats(const char * tag) const {
     if (!active_) {
         return;
     }
-    fprintf(stderr, "[pcd] %s: %zu records (%.1f MB / %.1f MB) in %s\n", tag, index_.size(),
+    si::logf("[pcd] %s: %zu records (%.1f MB / %.1f MB) in %s\n", tag, index_.size(),
             (double)bytes_ / (1024.0 * 1024.0), max_bytes_ ? (double)max_bytes_ / (1024.0 * 1024.0) : 0.0,
             dir_.c_str());
 }

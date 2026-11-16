@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "transform.h"
 #include "transform_util.h"
 
@@ -38,7 +40,7 @@ bool elementwise_activation(graph_build & g) {
         g.dead[ai] = true;
         g.alias[an.output[0]] = n.output[0];
         if (getenv("SI_ONNX_TRACE")) {
-            fprintf(stderr, "[onnx] the fusion: %s <- %s (elementwise epilogue %s)\n",
+            si::logf("[onnx] the fusion: %s <- %s (elementwise epilogue %s)\n",
                     n.name.c_str(), an.name.c_str(), an.op_type.c_str());
         }
     }

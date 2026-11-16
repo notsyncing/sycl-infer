@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "dnnl_gemm.h"
 
 #include <algorithm>
@@ -836,7 +838,7 @@ struct dnnl_gemm::impl {
             if (it != weights.end()) {
                 N = it->second.N;
             }
-            fprintf(stderr, "[actqshape] %d M=%d K=%d N=%d groups=%d values=%d\n", actsum_n, M, K, N,
+            si::logf("[actqshape] %d M=%d K=%d N=%d groups=%d values=%d\n", actsum_n, M, K, N,
                     (M * (K / kW4Group)), M * K);
         }
     }
@@ -920,7 +922,7 @@ struct dnnl_gemm::impl {
             e.prim = matmul(matmul::primitive_desc(eng, xmd, wmd, dmd));
             e.ok = true;
         } catch (const std::exception & ex) {
-            fprintf(stderr, "[dnnl] attn_qk_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+            si::logf("[dnnl] attn_qk_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
         }
         auto ins = attn_qk_prims.emplace(k, std::move(e));
         return &ins.first->second;
@@ -940,7 +942,7 @@ struct dnnl_gemm::impl {
             e.prim = matmul(matmul::primitive_desc(eng, xmd, wmd, dmd));
             e.ok = true;
         } catch (const std::exception & ex) {
-            fprintf(stderr, "[dnnl] attn_pv_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+            si::logf("[dnnl] attn_pv_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
         }
         auto ins = attn_pv_prims.emplace(k, std::move(e));
         return &ins.first->second;
@@ -1007,7 +1009,7 @@ struct dnnl_gemm::impl {
                 static bool once = true;
                 if (once) {
                     once = false;
-                    fprintf(stderr, "[dnnl] w4 correction prim M=%d ng=%d N=%d failed, using the scalar epilogue: %s\n",
+                    si::logf("[dnnl] w4 correction prim M=%d ng=%d N=%d failed, using the scalar epilogue: %s\n",
                             M, ng, N, ex.what());
                 }
             }
@@ -1124,13 +1126,13 @@ dnnl_gemm::~dnnl_gemm() {
                 h = (h ^ (uint64_t)((hs[i] >> (k * 8)) & 0xFF)) * 1099511628211ULL;
             }
         }
-        fprintf(stderr, "[actq] calls=%d checksum=%016llx\n", p->actsum_n, (unsigned long long)h);
+        si::logf("[actq] calls=%d checksum=%016llx\n", p->actsum_n, (unsigned long long)h);
         if (p->accsum && p->accsum_n > 0) {
             std::vector<int64_t> ha((size_t)p->accsum_n);
             p->q.memcpy(ha.data(), p->accsum, (size_t)p->accsum_n * 8).wait();
-            fprintf(stderr, "[accsum] calls=%d\n", p->accsum_n);
+            si::logf("[accsum] calls=%d\n", p->accsum_n);
             for (int i = 0; i < p->accsum_n; i++) {
-                fprintf(stderr, "[accsumslot] %d %lld\n", i, (long long)ha[i]);
+                si::logf("[accsumslot] %d %lld\n", i, (long long)ha[i]);
             }
         }
         // Per-slot values, so two runs can be diffed to find the FIRST call whose
@@ -1138,7 +1140,7 @@ dnnl_gemm::~dnnl_gemm() {
         // instrumentation: slot 0 differing means the divergence is born at the
         // very first quantized GEMM of the run.
         for (int i = 0; i < p->actsum_n; i++) {
-            fprintf(stderr, "[actqslot] %d %lld %lld\n", i, (long long)hq[i], (long long)hs[i]);
+            si::logf("[actqslot] %d %lld %lld\n", i, (long long)hq[i], (long long)hs[i]);
         }
     }
     // Every long-lived allocation was registered in owned_ at creation;
@@ -1383,7 +1385,7 @@ bool dnnl_gemm::add_weight_rows(const void * key, const char * const * rows, uin
             static bool once = true;
             if (once) {
                 once = false;
-                fprintf(stderr, "[dnnl] make_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+                si::logf("[dnnl] make_prim M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
             }
         }
     }
@@ -1402,7 +1404,7 @@ bool dnnl_gemm::add_weight_rows(const void * key, const char * const * rows, uin
         total_bad += p->pf_qbad;
         p->pf_qbad = 0;
         nchk++;
-        fprintf(stderr, "[qchk] %3d K=%-5d N=%-6d mismatches(total)=%ld\n", nchk, K, N, total_bad);
+        si::logf("[qchk] %3d K=%-5d N=%-6d mismatches(total)=%ld\n", nchk, K, N, total_bad);
     }
     if (p->pf_on) {
         p->pf_prim_ms +=
@@ -1605,7 +1607,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     const bool listed = filtered && si::w4_only_allows(cls, layer);
     if (!key || !host_data || (filtered ? !listed : !(any_type || si::w4_supported(ggml_type)))) {
         if (w4info) {
-            fprintf(stderr, "[w4] reject key=%p: precheck type=%u any=%d cls=%s layer=%d listed=%d\n", key,
+            si::logf("[w4] reject key=%p: precheck type=%u any=%d cls=%s layer=%d listed=%d\n", key,
                     ggml_type, (int)any_type, cls ? cls : "-", layer, (int)listed);
         }
         return false;
@@ -1613,7 +1615,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     const int G = si::w4_group();
     if (K <= 0 || N <= 0 || (K % G) != 0 || K > kActMaxK) {
         if (w4info) {
-            fprintf(stderr, "[w4] reject key=%p: K=%d N=%d maxK=%d\n", key, K, N, (int)kActMaxK);
+            si::logf("[w4] reject key=%p: K=%d N=%d maxK=%d\n", key, K, N, (int)kActMaxK);
         }
         return false;
     }
@@ -1630,7 +1632,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     const bool use_any = filtered ? !native : any_type;
     if (!(use_any ? si::w4_pack_any(ggml_type, host_data, K, N, w) : si::w4_pack(ggml_type, host_data, K, N, w))) {
         if (w4info) {
-            fprintf(stderr, "[w4] reject key=%p: pack failed type=%u K=%d N=%d\n", key, ggml_type, K, N);
+            si::logf("[w4] reject key=%p: pack failed type=%u K=%d N=%d\n", key, ggml_type, K, N);
         }
         return false;
     }
@@ -1658,7 +1660,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     }
     const auto pf_t1 = std::chrono::steady_clock::now();
     if (w4info) {
-        fprintf(stderr, "[w4] register key=%p type=%u K=%d N=%d (%.4f B/weight)\n", key, ggml_type, K, N,
+        si::logf("[w4] register key=%p type=%u K=%d N=%d (%.4f B/weight)\n", key, ggml_type, K, N,
                 (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
     }
     e.vals = p->dev_alloc<uint8_t>(w.vals.size());
@@ -1715,7 +1717,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
                 // int8 - the LM head (248320 rows) is rejected here, so a
                 // "register" line printed before it reads as a conversion that
                 // never happens.
-                fprintf(stderr, "[w4] reject key=%p type=%u K=%d N=%d: cap_M*N=%zu > acc_cap=%zu\n", key, ggml_type,
+                si::logf("[w4] reject key=%p type=%u K=%d N=%d: cap_M*N=%zu > acc_cap=%zu\n", key, ggml_type,
                         K, N, (size_t)p->cap_M * (size_t)N, p->acc_cap);
             }
             p->dev_erase(e.vals);
@@ -1737,7 +1739,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
                 static bool once = true;
                 if (once) {
                     once = false;
-                    fprintf(stderr, "[dnnl] make_prim4 M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
+                    si::logf("[dnnl] make_prim4 M=%d K=%d N=%d failed: %s\n", M, K, N, ex.what());
                 }
             }
         }
@@ -1754,7 +1756,7 @@ bool dnnl_gemm::add_weight_w4(const void * key, const void * host_data, uint32_t
     }
     e.ok = any;
     if (w4info) {
-        fprintf(stderr, "[w4] %s key=%p type=%u K=%d N=%d (%.4f B/weight)\n", any ? "register" : "reject(no M ladder)",
+        si::logf("[w4] %s key=%p type=%u K=%d N=%d (%.4f B/weight)\n", any ? "register" : "reject(no M ladder)",
                 key, ggml_type, K, N,
                 (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N));
     }
@@ -1913,7 +1915,7 @@ bool dnnl_gemm::add_weight_w2(const void * key, const void * host_data, uint32_t
     p->q.memcpy(e.off, w.off.data(), w.off.size() * 2).wait();
     e.ok = true;
     if (si::env::flag("PF_W2_INFO")) {
-        fprintf(stderr, "[w2] %s: K=%d N=%d  %.4f B/weight  rel L2 vs source = %.3f%%\n", (const char *)key, K, N,
+        si::logf("[w2] %s: K=%d N=%d  %.4f B/weight  rel L2 vs source = %.3f%%\n", (const char *)key, K, N,
                 (double)(w.vals.size() + w.scale.size() * 2 + w.off.size() * 2) / ((double)K * N), 100.0 * w.rel_l2);
     }
     auto ins = p->w2weights.emplace(key, std::move(e));
@@ -1933,7 +1935,7 @@ bool dnnl_gemm::gemm_w2(const act_view & v, const void * key, const float * resi
     auto it = p->w2weights.find(key);
     if (it == p->w2weights.end() || !it->second.ok || M != 1 || it->second.K != K) {
         if (dbg) {
-            fprintf(stderr, "[w2] miss: entry=%d ok=%d M=%d K=%d (entry K=%d)\n",
+            si::logf("[w2] miss: entry=%d ok=%d M=%d K=%d (entry K=%d)\n",
                     (int)(it != p->w2weights.end()), (int)(it != p->w2weights.end() && it->second.ok), M, K,
                     it == p->w2weights.end() ? -1 : it->second.K);
         }
@@ -1941,7 +1943,7 @@ bool dnnl_gemm::gemm_w2(const act_view & v, const void * key, const float * resi
     }
     if (!view_is_current(v) || M != v.m || K != v.k || !p->axg || !p->asa || !p->xs) {
         if (dbg) {
-            fprintf(stderr, "[w2] miss: view gen=%u/%u curM=%d/%d curK=%d/%d axg=%p asa=%p xs=%p\n", v.gen,
+            si::logf("[w2] miss: view gen=%u/%u curM=%d/%d curK=%d/%d axg=%p asa=%p xs=%p\n", v.gen,
                     p->act_gen, M, p->cur_M, K, p->cur_K, (void *)p->axg, (void *)p->asa, (void *)p->xs);
         }
         return false;
@@ -1949,7 +1951,7 @@ bool dnnl_gemm::gemm_w2(const act_view & v, const void * key, const float * resi
     if (dbg) {
         static int once = 0;
         if (once++ < 4) {
-            fprintf(stderr, "[w2] hit: M=%d K=%d N=%d\n", M, K, it->second.N);
+            si::logf("[w2] hit: M=%d K=%d N=%d\n", M, K, it->second.N);
         }
     }
     const impl::w4_entry & w = it->second;
@@ -1968,7 +1970,7 @@ void dnnl_gemm::report_load(const char * who) const {
         return;
     }
     const double tot = p->pf_conv_ms + p->pf_copy_ms + p->pf_prim_ms;
-    fprintf(stderr,
+    si::logf(
             "[load]   dnnl %-12s %3d tensors: conv %7.1f ms (spawn %.1f), copy %6.1f ms, prim %6.1f ms (%.1f)\n", who,
             p->pf_n, p->pf_conv_ms, p->pf_spawn_ms, p->pf_copy_ms, p->pf_prim_ms, tot);
 }
@@ -2045,7 +2047,7 @@ int dnnl_gemm::warmup() {
     }
     p->q.wait();
     if (tdbg) {
-        fprintf(stderr, "[dnnl] warmup %d prims: %.1f ms\n", n,
+        si::logf("[dnnl] warmup %d prims: %.1f ms\n", n,
                 std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count());
     }
     // SYCL-side warmup: quantizer + vec4 epilogue on dummy data
@@ -2461,7 +2463,7 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
     static int n_fail = 0;
     if (!p->prims4.count(impl::pkey(M, K, w.N)) && M > p->cap_M) {
         if (n_fail++ < 5) {
-            fprintf(stderr, "[dnnl] w4 gemm cannot run M=%d K=%d N=%d (no primitive)\n", M, K, w.N);
+            si::logf("[dnnl] w4 gemm cannot run M=%d K=%d N=%d (no primitive)\n", M, K, w.N);
         }
         return false;
     }
@@ -2489,7 +2491,7 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
         if (nrep < 6) {
             nrep++;
             const bool has_axe = p->axe != nullptr && p->axo != nullptr;
-            fprintf(stderr,
+            si::logf(
                     "[w4] gemm_w4 M=%d K=%d N=%d key=%p actsv=%d split=%d axe=%d/%d out=%p res=%p alpha=%.2f "
                     "(buckets: 1=%ld 32=%ld 64=%ld big=%ld)\n",
                     M, K, w.N, key, (int)p->acts_valid, (int)v.split, (int)(p->axe != nullptr), (int)has_axe,
@@ -2585,7 +2587,7 @@ bool dnnl_gemm::gemm_w4(const act_view & v, const void * key, const float * resi
                 static bool once = true;
                 if (once) {
                     once = false;
-                    fprintf(stderr, "[dnnl] w4 residual-fused correction M=%d ng=%d N=%d failed: %s\n", M, ng, N,
+                    si::logf("[dnnl] w4 residual-fused correction M=%d ng=%d N=%d failed: %s\n", M, ng, N,
                             ex.what());
                 }
             }
@@ -2778,7 +2780,7 @@ bool dnnl_gemm::gemm_i8_csr(const void * key, const int8_t * xq, const uint16_t 
         static bool once_fail = true;
         if (once_fail) {
             once_fail = false;
-            fprintf(stderr, "[dnnl] i8 csr correction unavailable M=%d K=%d N=%d cok=%d csrc=%d offmem=%d\n", M, K,
+            si::logf("[dnnl] i8 csr correction unavailable M=%d K=%d N=%d cok=%d csrc=%d offmem=%d\n", M, K,
                     w.N, (int)pe.cok, (int)(corr != nullptr), (int)w.offmem_ok);
         }
         w4_epilogue_launch(p->q, direct ? out : p->accf, xs, w.off, asa, out, out_stride, nullptr, 1.0f, M, w.N, w.ng,

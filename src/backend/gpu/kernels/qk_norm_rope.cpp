@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "kernels.h"
 #include "env.h"
 #include "common/rope.h"
@@ -50,13 +52,13 @@ struct kv_sum_holder {
             for (int i = 0; i < n * 3; i++) {
                 hh = (hh ^ (uint64_t)h[i]) * 1099511628211ULL;
             }
-            fprintf(stderr, "[kvsum] calls=%d checksum=%016llx\n", n, (unsigned long long)hh);
+            si::logf("[kvsum] calls=%d checksum=%016llx\n", n, (unsigned long long)hh);
             for (int i = 0; i < n; i++) {
-                fprintf(stderr, "[kvsumslot] %d %lld %lld nrows=%d nreal=%d pos=%d\n", i, (long long)h[3 * i],
+                si::logf("[kvsumslot] %d %lld %lld nrows=%d nreal=%d pos=%d\n", i, (long long)h[3 * i],
                         (long long)h[3 * i + 1], (int)ex_nrows[i], (int)ex_nreal[i], (int)h[3 * i + 2]);
             }
         } catch (sycl::exception & e) {
-            fprintf(stderr, "[kvsum] readback failed: %s\n", e.what());
+            si::logf("[kvsum] readback failed: %s\n", e.what());
         }
     }
     int slot(queue & qq) {

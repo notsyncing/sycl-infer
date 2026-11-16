@@ -1,3 +1,5 @@
+#include "log.h"
+
 // DFlash / DFlash2 speculative decoding for the qwen35 family.
 //
 // The GGUF loaded with --spec-draft-model is a *block-diffusion drafter*: a 5-layer
@@ -174,10 +176,10 @@ void df_conv_check(sycl::queue & q, const float * in, const float * dyn, const f
                 hs0 += acc * acc;
             }
         }
-        fprintf(stderr, "[dflash] convchk %s: conv-only rms=%.6f (host+res=%.6f, dev=%.6f)\n", tag,
+        si::logf("[dflash] convchk %s: conv-only rms=%.6f (host+res=%.6f, dev=%.6f)\n", tag,
                 std::sqrt(hs0 / n), std::sqrt(hs / n), std::sqrt(ds / n));
     }
-    fprintf(stderr, "[dflash] convchk %s: host rms=%.6f dev rms=%.6f rms err=%.6g worst=%.6g at row %d c%d\n", tag,
+    si::logf("[dflash] convchk %s: host rms=%.6f dev rms=%.6f rms err=%.6g worst=%.6g at row %d c%d\n", tag,
             std::sqrt(hs / n), std::sqrt(ds / n), std::sqrt(std::fabs(hs - ds) / n), worst, wi, wc);
 }
 
@@ -196,7 +198,7 @@ void df_stage(sycl::queue & q, const char * tag, const float * p, size_t n) {
         amax = std::max(amax, (double)std::fabs(h[i]));
         bad += !std::isfinite(h[i]);
     }
-    fprintf(stderr, "[dfstage] %-14s n=%zu rms=%.5f max=%.4g nonfinite=%d first=%.6g\n", tag, n, std::sqrt(s / (double)n),
+    si::logf("[dfstage] %-14s n=%zu rms=%.5f max=%.4g nonfinite=%d first=%.6g\n", tag, n, std::sqrt(s / (double)n),
             amax, bad, h[0]);
 }
 
@@ -269,7 +271,7 @@ void df_attn_check(sycl::queue & q, const float * qbuf, int row_stride, int M, c
             }
         }
         const int nq = n_head * head_dim;
-        fprintf(stderr, "[dflash] attnchk row %d (keys %d..%d): host rms=%.5f dev rms=%.5f maxdiff=%.4g\n", r2, lo, hi,
+        si::logf("[dflash] attnchk row %d (keys %d..%d): host rms=%.5f dev rms=%.5f maxdiff=%.4g\n", r2, lo, hi,
                 std::sqrt(hs / nq), std::sqrt(os / nq), worst);
     }
 }
@@ -287,19 +289,19 @@ void df_rowrms(sycl::queue & q, const float * p, int M, int width, const char * 
         if (FILE * f = fopen(bp2.c_str(), "wb")) {
             fwrite(v.data(), 4, v.size(), f);
             fclose(f);
-            fprintf(stderr, "[dflash-sig] %s written to %s (%zu bytes)\n", tag, bp2.c_str(), v.size() * 4);
+            si::logf("[dflash-sig] %s written to %s (%zu bytes)\n", tag, bp2.c_str(), v.size() * 4);
         }
     }
-    fprintf(stderr, "[dflash] rowrms %s:", tag);
+    si::logf("[dflash] rowrms %s:", tag);
     for (int m = 0; m < M; m++) {
         double ss = 0, am = 0;
         for (int j = 0; j < width; j++) {
             ss += (double)v[(size_t)m * width + j] * v[(size_t)m * width + j];
             am = std::max(am, std::fabs((double)v[(size_t)m * width + j]));
         }
-        fprintf(stderr, " r%d=%.4f/%.4g", m, std::sqrt(ss / width), am);
+        si::logf(" r%d=%.4f/%.4g", m, std::sqrt(ss / width), am);
     }
-    fprintf(stderr, "\n");
+    si::logf("\n");
 }
 
 // Per-position rms / max / first for a whole device tensor, printed in the same
@@ -356,7 +358,7 @@ void df_sig(sycl::queue & q, const float * p, int M, int width, const char * tag
             if (FILE * f = fopen(bp2.c_str(), "wb")) {
                 fwrite(v.data(), 4, v.size(), f);
                 fclose(f);
-                fprintf(stderr, "[dflash-sig] %s written to %s (%zu bytes)\n", tag, bp2.c_str(), v.size() * 4);
+                si::logf("[dflash-sig] %s written to %s (%zu bytes)\n", tag, bp2.c_str(), v.size() * 4);
             }
         }
     }
@@ -367,7 +369,7 @@ void df_sig(sycl::queue & q, const float * p, int M, int width, const char * tag
             ss += (double)x * x;
             am = std::max(am, std::fabs((double)x));
         }
-        fprintf(stderr, "[dflash-sig] %s pos %d rms=%.5f max=%.4g first=%.6g\n", tag, m, std::sqrt(ss / width), am,
+        si::logf("[dflash-sig] %s pos %d rms=%.5f max=%.4g first=%.6g\n", tag, m, std::sqrt(ss / width), am,
                 v[(size_t)m * width]);
     }
 }
@@ -410,7 +412,7 @@ void df_gemm_check(sycl::queue & q, const wt & w, const float * x_dev, int xs, f
             }
         }
     }
-    fprintf(stderr, "[dflash] gemmchk %s: K=%d N=%d M=%d up=%d worst=%.6g at col %d\n", tag, w.K, w.N, M,
+    si::logf("[dflash] gemmchk %s: K=%d N=%d M=%d up=%d worst=%.6g at col %d\n", tag, w.K, w.N, M,
             up ? 1 : 0, worst, wc);
 }
 
@@ -435,7 +437,7 @@ void df_proj_check(sycl::queue & q, const wt & w, const float * x_dev, int M, fl
             float one = 0.f;
             q.memcpy(&one, dyn_dev + (size_t)m * w.N + c2, 4).wait();
             if (m == 0 && c2 < 4 * 97) {
-                fprintf(stderr, "[dflash] projchk %s col %d: host=%.6g dev=%.6g\n", tag, c2, a, one);
+                si::logf("[dflash] projchk %s col %d: host=%.6g dev=%.6g\n", tag, c2, a, one);
             }
         }
     }
@@ -450,7 +452,7 @@ static inline float silu_test(float x) {
 #define DFDBG(...)                                                                                                      \
     do {                                                                                                                 \
         if (si::env::flag("PF_DFLASH_DEBUG")) {                                                                                 \
-            fprintf(stderr, __VA_ARGS__);                                                                                \
+            si::logf(__VA_ARGS__);                                                                                \
         }                                                                                                                \
     } while (0)
 
@@ -462,27 +464,27 @@ void engine::setup_dflash(const std::string & draft_path) {
     // single-device setup reaches this method before that table exists, and a
     // non-primary draft cannot use the shared LM head's primary-device logits.
     if (!multi_dev || !md_xmx || dfl.df_dev_ != 0 || !dnnl_for(0)) {
-        fprintf(stderr, "[dflash] needs a multi-device oneDNN GPU partition with draft on device 0 - disabled\n");
+        si::logf("[dflash] needs a multi-device oneDNN GPU partition with draft on device 0 - disabled\n");
         return;
     }
     auto dm = std::make_unique<dflash_model>();
     try {
         dm->load(draft_path, m.hp.n_embd, m.hp.n_vocab);
     } catch (const std::exception & e) {
-        fprintf(stderr, "[dflash] draft model rejected: %s\n", e.what());
+        si::logf("[dflash] draft model rejected: %s\n", e.what());
         return;
     }
     // The draft block itself fits the per-call token buffer, and the verifier
     // needs one logits row for the anchor plus each drafted token.
     if (dm->hp.block_size < 2 || dm->hp.block_size > kMaxT) {
-        fprintf(stderr, "[dflash] draft block_size=%d is outside [2,%d] - disabled\n", dm->hp.block_size, kMaxT);
+        si::logf("[dflash] draft block_size=%d is outside [2,%d] - disabled\n", dm->hp.block_size, kMaxT);
         return;
     }
     // every dflash.target_layers entry must be a real target layer *input*
     for (int i = 0; i < dm->hp.n_tgt_layer; i++) {
         const int il = dm->hp.tgt_layer[i];
         if (il < 0 || il >= m.hp.n_layer) {
-            fprintf(stderr, "[dflash] draft model rejected: target_layers[%d] = %d is out of range [0, %d)\n", i, il,
+            si::logf("[dflash] draft model rejected: target_layers[%d] = %d is out of range [0, %d)\n", i, il,
                     m.hp.n_layer);
             return;
         }
@@ -499,7 +501,7 @@ void engine::setup_dflash(const std::string & draft_path) {
         auto chk = [&](const void * p, const char * nm) {
             if (p == nullptr || dfl.dfm_->weights.ptr(p) == nullptr) {
                 missing++;
-                fprintf(stderr, "[dflash] missing device copy: %s\n", nm);
+                si::logf("[dflash] missing device copy: %s\n", nm);
             }
         };
         chk(dfl.dfm_->enc_norm, "enc.output_norm");
@@ -514,7 +516,7 @@ void engine::setup_dflash(const std::string & draft_path) {
             }
             return std::sqrt(s2 / n);
         };
-        fprintf(stderr, "[dflash] norm rms: enc=%.6f out=%.6f (n_embd=%d)\n", frms2(dfl.dfm_->enc_norm, hp.n_embd),
+        si::logf("[dflash] norm rms: enc=%.6f out=%.6f (n_embd=%d)\n", frms2(dfl.dfm_->enc_norm, hp.n_embd),
                 frms2(dfl.dfm_->output_norm, hp.n_embd), hp.n_embd);
     }
     if (si::env::flag("PF_DFLASH_NDEVCHK")) {
@@ -528,7 +530,7 @@ void engine::setup_dflash(const std::string & draft_path) {
             const float * dp = dfl.dfm_->dev_f32(hs[t]);
             std::vector<float> dv((size_t)wn3[t]);
             if (dp == nullptr) {
-                fprintf(stderr, "[dflash] ndevchk %s: dev_f32 is NULL\n", nm[t]);
+                si::logf("[dflash] ndevchk %s: dev_f32 is NULL\n", nm[t]);
                 continue;
             }
             dev_queue(dfl.df_dev_).memcpy(dv.data(), dp, dv.size() * 4).wait();
@@ -537,14 +539,14 @@ void engine::setup_dflash(const std::string & draft_path) {
             for (int i = 0; i < wn3[t]; i++) {
                 if (hs[t][i] != dv[i]) {
                     if (nbad < 3) {
-                        fprintf(stderr, "   ndevchk %s[%d]: host=%.6f dev=%.6f\n", nm[t], i, hs[t][i], dv[i]);
+                        si::logf("   ndevchk %s[%d]: host=%.6f dev=%.6f\n", nm[t], i, hs[t][i], dv[i]);
                     }
                     nbad++;
                 }
                 hs3 += (double)hs[t][i] * hs[t][i];
                 ds3 += (double)dv[i] * dv[i];
             }
-            fprintf(stderr, "[dflash] ndevchk %s: %d/%d mismatches, host rms=%.6f dev rms=%.6f\n", nm[t], nbad, wn3[t],
+            si::logf("[dflash] ndevchk %s: %d/%d mismatches, host rms=%.6f dev rms=%.6f\n", nm[t], nbad, wn3[t],
                     std::sqrt(hs3 / wn3[t]), std::sqrt(ds3 / wn3[t]));
     }
     }
@@ -559,7 +561,7 @@ void engine::setup_dflash(const std::string & draft_path) {
             chk(L.ffn_conv_base, "ffn_conv_base");
         }
         if (missing) {
-            fprintf(stderr, "[dflash] draft model rejected: %d tensors lack a device copy\n", missing);
+            si::logf("[dflash] draft model rejected: %d tensors lack a device copy\n", missing);
             return;
         }
     }
@@ -602,7 +604,7 @@ void engine::setup_dflash(const std::string & draft_path) {
                 n_int8++;
             } else {
                 n_fail++;
-                fprintf(stderr, "[dflash] no weight store for %s (K=%d N=%d type=%d)\n", nm, t.K, t.N, (int)t.type);
+                si::logf("[dflash] no weight store for %s (K=%d N=%d type=%d)\n", nm, t.K, t.N, (int)t.type);
             }
         }
         return ok || ok4;
@@ -649,9 +651,9 @@ void engine::setup_dflash(const std::string & draft_path) {
     } else {
         dfl.df_head_key_ = wkey(dfl.df_dev_, m.output.data);
     }
-    fprintf(stderr, "[dflash] weight stores: u4=%d int8=%d failed=%d\n", n_u4, n_int8, n_fail);
+    si::logf("[dflash] weight stores: u4=%d int8=%d failed=%d\n", n_u4, n_int8, n_fail);
     if (n_fail > 0) {
-        fprintf(stderr, "[dflash] %d draft tensors have no weight store - disabled\n", n_fail);
+        si::logf("[dflash] %d draft tensors have no weight store - disabled\n", n_fail);
         return;
     }
                 // ---- geometry ----
@@ -746,7 +748,7 @@ void engine::setup_dflash(const std::string & draft_path) {
             dfl.df_sel_no_ = no;
         }
         if (dfl.df_sel_pv_ == nullptr || dfl.df_sel_nv_ == nullptr) {
-            fprintf(stderr, "[dflash] the DFlash2 selector codebooks have no u4 store - disabled\n");
+            si::logf("[dflash] the DFlash2 selector codebooks have no u4 store - disabled\n");
             return;
         }
     }
@@ -770,7 +772,7 @@ void engine::setup_dflash(const std::string & draft_path) {
     dfl.d_df_info = (step_info *)alloc_bytes(sizeof(step_info));
     memset(dfl.d_df_info, 0, sizeof(step_info));
         dfl.dflash_on_ = true;
-    fprintf(stderr,
+    si::logf(
             "[dflash] %s: %d layers, n_embd %d, %d q heads / %d kv, head_dim %d, block %d (n_max %d), %s, "
             "conv k%d/g%d, selector rank %d top-%d, target layers [%s], device %d, %.2f GiB of GGUF weights\n",
             draft_path.c_str(), hp.n_layer, hp.n_embd, hp.n_head, hp.n_head_kv, hp.head_dim, dfl.df_block_, dfl.df_k_,
@@ -784,7 +786,7 @@ void engine::setup_dflash(const std::string & draft_path) {
                 return s.c_str();
             }(),
             dfl.df_dev_, (double)dfl.dfm_->bytes() / (1024.0 * 1024.0 * 1024.0));
-        fprintf(stderr, "[dflash] draft LM head: %s (%d rows x %d, the target's), ring %d tokens, %s KV\n",
+        si::logf("[dflash] draft LM head: %s (%d rows x %d, the target's), ring %d tokens, %s KV\n",
             dfl.df_head_w4_ ? "u4 copy" : "int8", m.output.N, m.output.K, dfl.df_ring_,
             dfl.df_kv_bytes_ == 4 ? "f32" : "f16");
 }
@@ -876,7 +878,7 @@ void engine::df_inject(int M, int pos0, int feat_row) {
                     os3 += (double)oc[(size_t)r2 * hp.n_embd + k2] * oc[(size_t)r2 * hp.n_embd + k2];
                     ws3 += (double)wc2[k2] * wc2[k2];
                 }
-                fprintf(stderr, "[dflash] ninv row %d: in(fc) rms=%.5f  out rms=%.5f  |w| rms=%.5f  eps=%.6g "
+                si::logf("[dflash] ninv row %d: in(fc) rms=%.5f  out rms=%.5f  |w| rms=%.5f  eps=%.6g "
                                 "n=%d nrows=%d\n",
                         r2, std::sqrt(xs3 / hp.n_embd), std::sqrt(os3 / hp.n_embd), std::sqrt(ws3 / hp.n_embd),
                         hp.rms_eps, hp.n_embd, n);
@@ -894,7 +896,7 @@ void engine::df_inject(int M, int pos0, int feat_row) {
                     ss += (double)v[j2] * v[j2];
                     am = std::max(am, (double)std::fabs(v[j2]));
                 }
-                fprintf(stderr, "[dflash-inj] inp_g row %d rms=%.5f max=%.4g first=%.6g top:", r2,
+                si::logf("[dflash-inj] inp_g row %d rms=%.5f max=%.4g first=%.6g top:", r2,
                         std::sqrt(ss / hp.n_embd), am, v[0]);
                 for (int c = 0; c < 8; c++) {
                     int bi = 0;
@@ -906,10 +908,10 @@ void engine::df_inject(int M, int pos0, int feat_row) {
                         }
                         (void)j2;
                     }
-                    fprintf(stderr, " %d=%+.4g", bi, v[bi]);
+                    si::logf(" %d=%+.4g", bi, v[bi]);
                     v[bi] = 0.f; // exclude, so the next pick is a different channel
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
         }
                 for (int i = 0; i < n; i++) {
@@ -943,16 +945,16 @@ void engine::df_inject(int M, int pos0, int feat_row) {
         std::vector<float> all((size_t)std::max(M, 1) * hp.n_feat);
         dq.memcpy(all.data(), dfl.d_df_feat, all.size() * 4).wait();
         for (int r2 = 0; r2 < std::min(M, 2); r2++) {
-            fprintf(stderr, "[dflash] slotrms row %d:", r2);
+            si::logf("[dflash] slotrms row %d:", r2);
             for (int t2 = 0; t2 < hp.n_tgt_layer; t2++) {
                 double ss = 0;
                 for (int k2 = 0; k2 < hp.n_embd; k2++) {
                     const float v = all[(size_t)r2 * hp.n_feat + (size_t)t2 * hp.n_embd + k2];
                     ss += (double)v * v;
                 }
-                fprintf(stderr, " s%d=%.5f", t2, std::sqrt(ss / hp.n_embd));
+                si::logf(" s%d=%.5f", t2, std::sqrt(ss / hp.n_embd));
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
     }
     DFDBG("inject M=%d pos0=%d feat_row=%d\n", M, pos0, feat_row);
@@ -1010,7 +1012,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         // residual, and the swap is what makes the layer output the next layer's
         // input.  If the two alias, the swap is a no-op and the FFN's output lands on
         // top of the residual it was supposed to be added to.
-        fprintf(stderr, "[dflash] ptrs h=%p c=%p b=%p gu=%p\n", (void *)dfl.d_df_h, (void *)dfl.d_df_c, (void *)dfl.d_df_b,
+        si::logf("[dflash] ptrs h=%p c=%p b=%p gu=%p\n", (void *)dfl.d_df_h, (void *)dfl.d_df_c, (void *)dfl.d_df_b,
                 (void *)dfl.d_df_gu);
     }
 
@@ -1040,7 +1042,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 ds += (double)ev[(size_t)r2 * hp.n_embd + k2] * ev[(size_t)r2 * hp.n_embd + k2];
                 worst = std::max(worst, std::fabs((double)er[k2] - ev[(size_t)r2 * hp.n_embd + k2]));
             }
-            fprintf(stderr, "[dflash] embchk row %d (tok %d): host rms=%.6f dev rms=%.6f worst=%.6g\n", r2, toks[r2],
+            si::logf("[dflash] embchk row %d (tok %d): host rms=%.6f dev rms=%.6f worst=%.6g\n", r2, toks[r2],
                     std::sqrt(es / hp.n_embd), std::sqrt(ds / hp.n_embd), worst);
         }
     }
@@ -1094,7 +1096,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                     rmsd += (a - b) * (a - b);
                     hs += b * b;
                 }
-                fprintf(stderr, "[dflash] basechk attn blk.%d: worst=%.6g rmsdiff=%.6g hostrms=%.6f\n", il, worst,
+                si::logf("[dflash] basechk attn blk.%d: worst=%.6g rmsdiff=%.6g hostrms=%.6f\n", il, worst,
                         std::sqrt(rmsd / nb4), std::sqrt(hs / nb4));
             }
             if (df_dbg() && (il == 0 || si::env::flag("PF_DFLASH_PROJCHKALL")) && si::env::flag("PF_DFLASH_PROJCHK")) {
@@ -1121,7 +1123,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                         fwrite(bv.data(), 4, bv.size(), f);
                         fclose(f);
                     }
-                    fprintf(stderr, "[dflash-sig] conv inputs written (dyn %zu, base %zu)\n", dv.size(), bv.size());
+                    si::logf("[dflash-sig] conv inputs written (dyn %zu, base %zu)\n", dv.size(), bv.size());
                 }
             }
             if (df_dbg() && si::env::flag("PF_DFLASH_SIGALL") && si::env::flag("PF_DFLASH_BIN")) {
@@ -1294,12 +1296,12 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                         }
                         wrms = std::sqrt(wrms / hp.head_dim);
                     }
-                    fprintf(stderr, "[dflash] qk il=0: Q rms=%.4f (q_norm rms=?)  K(buf) rms=%.4f  K(ring) rms=%.4f  "
+                    si::logf("[dflash] qk il=0: Q rms=%.4f (q_norm rms=?)  K(buf) rms=%.4f  K(ring) rms=%.4f  "
                                     "k_norm rms=%.4f\n",
                             std::sqrt(qs2 / nhq), std::sqrt(kbuf2 / (hp.n_head_kv * hp.head_dim)),
                             std::sqrt(kring2 / (hp.n_head_kv * hp.head_dim)), wrms);
                 }
-                fprintf(stderr, "[dflash] ring il=0 V rms (pos %d..%d):", lo2, pv);
+                si::logf("[dflash] ring il=0 V rms (pos %d..%d):", lo2, pv);
                 for (int q2 = lo2; q2 <= pv; q2++) {
                     const size_t cell = (size_t)(q2 % dfl.df_ring_) * hp.n_head_kv * hp.head_dim;
                     double ss = 0;
@@ -1307,9 +1309,9 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                         const double v = f16_bits(vr[cell + j2]);
                         ss += v * v;
                     }
-                    fprintf(stderr, " %d:%.2f", q2, std::sqrt(ss / (hp.n_head_kv * hp.head_dim)));
+                    si::logf(" %d:%.2f", q2, std::sqrt(ss / (hp.n_head_kv * hp.head_dim)));
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
             df_conv_launch(dq, dfl.d_df_c, dfl.d_df_dyn, dfl.dfm_->dev_f32(L.attn_conv_base), dfl.d_df_h, dfl.d_df_h, M, hp.n_embd,
                            hp.n_embd, hp.conv_k, hp.conv_group, hp.conv_proj, /*side=*/1);
@@ -1381,7 +1383,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                     am = std::max(am, (double)std::fabs(silu_test(g) * u2));
                 }
             }
-            fprintf(stderr, "[dflash] ffngu: |gate|=%.4f |up|=%.4f max|silu(g)*u|=%.4g\n",
+            si::logf("[dflash] ffngu: |gate|=%.4f |up|=%.4f max|silu(g)*u|=%.4g\n",
                     std::sqrt(gn / (M * hp.n_ff)), std::sqrt(un / (M * hp.n_ff)), am);
         }
         std::vector<float> chk_gu;
@@ -1411,7 +1413,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                         mx2 = std::max(mx2, (double)std::fabs(g2[j2]));
                         mu = std::max(mu, (double)std::fabs(u2[j2]));
                     }
-                    fprintf(stderr, "[dflash] ffndyn row %d: gate rms=%.4g max=%.4g (%.0fx) up rms=%.4g max=%.4g\n",
+                    si::logf("[dflash] ffndyn row %d: gate rms=%.4g max=%.4g (%.0fx) up rms=%.4g max=%.4g\n",
                             r2, std::sqrt(sg / hp.n_ff), mx2, mx2 / (std::sqrt(sg / hp.n_ff) + 1e-30),
                             std::sqrt(su / hp.n_ff), mu);
                 }
@@ -1446,7 +1448,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 drr += (double)dr[i] * dr[i];
                 cnt++;
             }
-            fprintf(stderr, "[dflash] gemmchk ffn_down  host rms=%.4f dev rms=%.4f ratio=%.4f (n=%d)\n",
+            si::logf("[dflash] gemmchk ffn_down  host rms=%.4f dev rms=%.4f ratio=%.4f (n=%d)\n",
                     std::sqrt(xr / cnt), std::sqrt(drr / cnt), std::sqrt(drr / (xr + 1e-30)), cnt);
 
         }
@@ -1505,7 +1507,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         // and print the RMSNorm as 82% of the draft layer.
         const double devspan = df_ts_ms(df_seg_dev1, false) - df_ts_ms(df_seg_dev0, true);
         const double sum = df_seg[0] + df_seg[1] + df_seg[2] + df_seg[3] + df_seg[5] + df_seg[6] + df_seg[7];
-        fprintf(stderr,
+        si::logf(
                 "[dflash-sg] anorm=%.2f acproj=%.2f aconv0=%.2f attn=%.2f | "
                 "ffn_norm+cproj+cconv=%.2f gate_up=%.2f down+cconv=%.2f "
                 "| sum=%.2f devspan=%.2f hostwall=%.2f ms\n",
@@ -1548,7 +1550,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
             for (int j2 = 0; j2 < hp.n_head_kv * hp.head_dim; j2++) {
                 ss += (double)vr[cell * hp.head_dim + j2] * vr[cell * hp.head_dim + j2];
             }
-            fprintf(stderr, "[dflash] vring row %d (pos %d) rms=%.4f top:", r2, pos0 + r2,
+            si::logf("[dflash] vring row %d (pos %d) rms=%.4f top:", r2, pos0 + r2,
                     std::sqrt(ss / (hp.n_head_kv * hp.head_dim)));
             {
                 // compare the top channels against llama.cpp's REF_V dump: same
@@ -1560,19 +1562,19 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
                 std::partial_sort(top.begin(), top.begin() + 6, top.end(),
                                   std::greater<std::pair<float, int> >());
                 for (int k = 0; k < 6; k++) {
-                    fprintf(stderr, " %d=%+.4g", top[k].second, top[k].first);
+                    si::logf(" %d=%+.4g", top[k].second, top[k].first);
                 }
             }
-            fprintf(stderr, " per-head:");
+            si::logf(" per-head:");
             for (int kh2 = 0; kh2 < hp.n_head_kv; kh2++) {
                 double s2 = 0;
                 for (int d2 = 0; d2 < hp.head_dim; d2++) {
                     const double v = vr[cell * hp.head_dim + kh2 * hp.head_dim + d2];
                     s2 += v * v;
                 }
-                fprintf(stderr, " h%d=%.2f", kh2, std::sqrt(s2 / hp.head_dim));
+                si::logf(" h%d=%.2f", kh2, std::sqrt(s2 / hp.head_dim));
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
     }
     const int K = hp.sel_top_k;
@@ -1602,7 +1604,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
         for (int c2 = 0; c2 < K; c2++) {
             us1 += (double)vv[1 * K + c2] * vv[1 * K + c2];
         }
-        fprintf(stderr, "[dflash] gate rms=%.5f unary rms=%.5f row1 rms=%.4f\n",
+        si::logf("[dflash] gate rms=%.5f unary rms=%.5f row1 rms=%.4f\n",
                 std::sqrt(gs / gg.size()), std::sqrt(us / vv.size()), std::sqrt(us1 / K));
     }
     df_sel_launch(dq, dfl.d_df_ids, dfl.d_df_vals, dfl.d_df_gate, dfl.df_sel_pv_, dfl.df_sel_ps_, dfl.df_sel_po_, dfl.df_sel_nv_, dfl.df_sel_ns_,
@@ -1615,7 +1617,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     // exactly the attribution that cannot be trusted - print both.
     if (tt_dbg) {
         const auto tt3 = tt_now();
-        fprintf(stderr,
+        si::logf(
                 "[dflash-tt] HOST topk=%.3f selhidden=%.3f sel=%.3f (total %.3f ms)\n",
                 std::chrono::duration<double, std::milli>(tt1 - tt0).count(),
                 std::chrono::duration<double, std::milli>(tt2 - tt1).count(),
@@ -1624,7 +1626,7 @@ void engine::df_block(int pos0, const int32_t * toks, int M) {
     }
     if (si::env::flag("PF_DFLASH_BTIME")) {
         const auto t_b4 = now_t();
-        fprintf(stderr, "[dflash-bt] embed+layers=%.1f outnorm+head+topk+sel=%.1f | total=%.1f ms\n",
+        si::logf("[dflash-bt] embed+layers=%.1f outnorm+head+topk+sel=%.1f | total=%.1f ms\n",
                 ms_t(t_b0, t_b1), ms_t(t_b1, t_b4), ms_t(t_b0, t_b4));
     }
 }
@@ -1679,15 +1681,15 @@ bool engine::df_gemm_head(const float * x, int M) {
                         }
                     }
                 }
-                fprintf(stderr, "[dflash] headchk row %d dev:", r);
+                si::logf("[dflash] headchk row %d dev:", r);
                 for (int c = 0; c < 5; c++) {
-                    fprintf(stderr, " %d(%.3f)", bi[c], bv[c]);
+                    si::logf(" %d(%.3f)", bi[c], bv[c]);
                 }
-                fprintf(stderr, "   exact:");
+                si::logf("   exact:");
                 for (int c = 0; c < 5; c++) {
-                    fprintf(stderr, " %d(%.3f)", bi[c], acc[bi[c]]);
+                    si::logf(" %d(%.3f)", bi[c], acc[bi[c]]);
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
         }
         return true;
@@ -1734,7 +1736,7 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
         auto de = [&](const sycl::event & lo, const sycl::event & hi) {
             return (df_ts_ms(hi, false) - df_ts_ms(lo, true));
         };
-        fprintf(stderr,
+        si::logf(
                 "[dflash-tt] DEV topk=%.2f selhidden=%.2f sel=%.2f (total %.2f) | host_block=%.2f ms\n",
                 de(tt_e[0], tt_e[1]), de(tt_e[1], tt_e[2]), de(tt_e[2], tt_e[3]), de(tt_e[0], tt_e[3]),
                 ms_t(tt_d0, tt_now()) - (de(tt_e[3], tt_e[3])));
@@ -1749,14 +1751,14 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
         dq.memcpy(kval.data(), dfl.d_df_vals, kval.size() * 4).wait();
         dq.memcpy(hb.data(), dfl.d_df_b, hb.size() * 4).wait();
         if (df_dbg()) {
-            fprintf(stderr, "[dflash] topk raw (M=%d K=%d):", M, K);
+            si::logf("[dflash] topk raw (M=%d K=%d):", M, K);
             for (int i = 0; i < M; i++) {
-                fprintf(stderr, "  r%d ids:", i);
+                si::logf("  r%d ids:", i);
                 for (int c = 0; c < K; c++) {
-                    fprintf(stderr, " %d", (int)kid[(size_t)i * K + c]);
+                    si::logf(" %d", (int)kid[(size_t)i * K + c]);
                 }
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
         for (int i = 0; i < M; i++) {
             double n2 = 0;
@@ -1785,29 +1787,29 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
                         }
                     }
                 }
-                fprintf(stderr, "[dflash] host logits row1 top:");
+                si::logf("[dflash] host logits row1 top:");
                 for (int c = 0; c < 5; c++) {
-                    fprintf(stderr, " %d(%.4f)", bi[c], bv[c]);
+                    si::logf(" %d(%.4f)", bi[c], bv[c]);
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
-            fprintf(stderr, "[dflash] row %d |h|=%.4f top:", i, std::sqrt(n2));
+            si::logf("[dflash] row %d |h|=%.4f top:", i, std::sqrt(n2));
             for (int c = 0; c < 5 && c < K; c++) {
-                fprintf(stderr, " %d(%.3f)", (int)kid[(size_t)i * K + c], kval[(size_t)i * K + c]);
+                si::logf(" %d(%.3f)", (int)kid[(size_t)i * K + c], kval[(size_t)i * K + c]);
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
         for (int pp = 1; pp < M; pp++) {
             const float * r = dfl.h_df_lattice.data() + (size_t)pp * row;
-            fprintf(stderr, "[dflash-lat] pos %d ids:", pp);
+            si::logf("[dflash-lat] pos %d ids:", pp);
             for (int c = 0; c < K; c++) {
-                fprintf(stderr, " %.0f", r[c]);
+                si::logf(" %.0f", r[c]);
             }
-            fprintf(stderr, "  scores:");
+            si::logf("  scores:");
             for (int c = 0; c < 4; c++) {
-                fprintf(stderr, " %.4f", r[K + c]);
+                si::logf(" %.4f", r[K + c]);
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
     }
     const auto dtt2 = dtt_now();
@@ -1820,15 +1822,15 @@ std::vector<int> engine::df_draft(int pos0, int anchor_tok, int n_max) {
     }
     if (dtt) {
         auto d = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        fprintf(stderr, "[dflash-dt] block=%.2f tail_copy=%.2f walk=%.3f ms\n", d(dtt0, dtt1), d(dtt1, dtt2),
+        si::logf("[dflash-dt] block=%.2f tail_copy=%.2f walk=%.3f ms\n", d(dtt0, dtt1), d(dtt1, dtt2),
                 d(dtt2, dtt_now()));
     }
     if (df_dbg()) {
-        fprintf(stderr, "[dflash] block pos=%d anchor=%d cand:", pos0, anchor_tok);
+        si::logf("[dflash] block pos=%d anchor=%d cand:", pos0, anchor_tok);
         for (int i = 1; i < M; i++) {
-            fprintf(stderr, " %d", cand[(size_t)i]);
+            si::logf(" %d", cand[(size_t)i]);
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     return cand;
 }
@@ -1921,7 +1923,7 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         const auto tc2 = now_t();
         t_verify += ms_t(tc1, tc2);
         if (si::env::flag("PF_DFLASH_VFCHK")) {
-            fprintf(stderr, "[dflash-vf] pos=%d rows=%d vf_dec_ok=%d vf_rows=%d graphs=%d\n", pos,
+            si::logf("[dflash-vf] pos=%d rows=%d vf_dec_ok=%d vf_rows=%d graphs=%d\n", pos,
                     n_ver + 1, (int)vf_dec_ok, vf_dec_rows,
                     (int)vf_dec_.size());
         }
@@ -1935,15 +1937,15 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
             j++;
         }
         if (df_dbg()) {
-            fprintf(stderr, "[dflash] verify pos=%d anchor=%d cand:", pos, cand[0]);
+            si::logf("[dflash] verify pos=%d anchor=%d cand:", pos, cand[0]);
             for (int i = 1; i < (int)cand.size(); i++) {
-                fprintf(stderr, " %d", cand[(size_t)i]);
+                si::logf(" %d", cand[(size_t)i]);
             }
-            fprintf(stderr, "  target:");
+            si::logf("  target:");
             for (int i = 0; i < (int)cand.size(); i++) {
-                fprintf(stderr, " %d", (int)mtp.h_argmax[i]);
+                si::logf(" %d", (int)mtp.h_argmax[i]);
             }
-            fprintf(stderr, "  j=%d\n", j);
+            si::logf("  j=%d\n", j);
         }
         if (steps_dbg) {
             steps_cyc++;
@@ -1951,11 +1953,11 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
                 steps_reach[s2]++;
             }
             if (steps_cyc % 32 == 0) {
-                fprintf(stderr, "[dflash] steps: cycles=%ld reach:", steps_cyc);
+                si::logf("[dflash] steps: cycles=%ld reach:", steps_cyc);
                 for (int s2 = 0; s2 < dfl.df_k_; s2++) {
-                    fprintf(stderr, " %ld%%", 100L * steps_reach[s2 + 1] / steps_cyc);
+                    si::logf(" %ld%%", 100L * steps_reach[s2 + 1] / steps_cyc);
                 }
-                fprintf(stderr, "  (mean accepted %.2f)\n", (double)j / steps_cyc);
+                si::logf("  (mean accepted %.2f)\n", (double)j / steps_cyc);
             }
         }
         for (int i = 1; i <= j; i++) {
@@ -2009,16 +2011,16 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
                 }
             }
             const int lo = pos > 2 ? pos - 2 : 0;
-            fprintf(stderr, "[dflash] injtrace pos=%d j=%d anchor=%d bonus=%d ringV:", pos, j, cand[0], bonus);
+            si::logf("[dflash] injtrace pos=%d j=%d anchor=%d bonus=%d ringV:", pos, j, cand[0], bonus);
             for (int p2 = lo; p2 <= pos + dfl.df_k_ + 1; p2++) {
                 double ss = 0;
                 const size_t cell = (size_t)(p2 % dfl.df_ring_) * hp.n_head_kv;
                 for (int j2 = 0; j2 < hp.n_head_kv * hp.head_dim; j2++) {
                     ss += (double)vr[cell * hp.head_dim + j2] * vr[cell * hp.head_dim + j2];
                 }
-                fprintf(stderr, " %d:%.2f", p2, std::sqrt(ss / (hp.n_head_kv * hp.head_dim)));
+                si::logf(" %d:%.2f", p2, std::sqrt(ss / (hp.n_head_kv * hp.head_dim)));
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
             // Ring-wide coverage.  A mask row attends over every committed position,
             // so a shortfall here is a pure magnitude deficit on exactly the rows that
             // diverge from the reference, and it grows with the context - which is
@@ -2043,7 +2045,7 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
                     mx = std::max(mx, rv[p2]);
                     sum += rv[p2];
                 }
-                fprintf(stderr, "[dflash] ringcov: positions 0..%d nonzero=%d/%d rms min=%.4g mean=%.4g max=%.4g\n",
+                si::logf("[dflash] ringcov: positions 0..%d nonzero=%d/%d rms min=%.4g mean=%.4g max=%.4g\n",
                         pos, nz, std::min(pos + 1, dfl.df_ring_), mn, sum / std::max(1, std::min(pos + 1, dfl.df_ring_)), mx);
             }
         }
@@ -2059,7 +2061,7 @@ std::vector<int> engine::generate_dflash(const std::vector<int> & prompt, const 
         t_tok += j + 1;
         t_acc += j;
         if (mt && (t_cycles % 4 == 0)) {
-            fprintf(stderr,
+            si::logf(
                     "[dflash] time: cycles=%d tok=%d acc=%.2f | draft=%.1f verify=%.1f rb=%.1f inject=%.1f "
                     "emit=%.1f cycle=%.1f ms | %.2f ms/token\n",
                     t_cycles, t_tok, (double)t_acc / t_cycles, t_draft / t_cycles, t_verify / t_cycles,

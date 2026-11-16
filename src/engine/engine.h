@@ -1,4 +1,6 @@
 #pragma once
+
+#include "log.h"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -320,7 +322,7 @@ struct engine {
         }
         const float * p = as_.empty() ? d_rope_freqs : as_[(size_t)dev].rope_freqs;
         if (!p) {
-            fprintf(stderr, "[yarn] internal error: no frequency table for device %d - disabling YaRN\n", dev);
+            si::logf("[yarn] internal error: no frequency table for device %d - disabling YaRN\n", dev);
             const_cast<engine *>(this)->h_rope_freqs_.clear();
             const_cast<engine *>(this)->d_rope_mscale_ = 1.0f;
             return nullptr;

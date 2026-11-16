@@ -1,3 +1,5 @@
+#include "log.h"
+
 // DeepSeek-V4.1-Flash GPU forward (`deepseek41`), the device counterpart of the
 // validated host forward in arch/deepseek41/forward_host.cpp.  See docs/design/23-deepseek41.md.
 //
@@ -918,10 +920,10 @@ ds41_gpu_state::ds41_gpu_state(engine & en)
     if (!dv.empty() && dv[0].estage) {
         crew = std::make_unique<ds41_copy_crew>();
     }
-    fprintf(stderr, "[ds41] head: type=%u K=%d N=%d rowbytes=%zu | tok_embd type=%u K=%d\n",
+    si::logf("[ds41] head: type=%u K=%d N=%d rowbytes=%zu | tok_embd type=%u K=%d\n",
             (unsigned)m.output.type, m.output.K, m.output.N,
             (size_t)ggml_row_bytes(m.output.type, (uint64_t)m.output.K), (unsigned)m.tok_embd.type, m.tok_embd.K);
-    fprintf(stderr,
+    si::logf(
             "[ds41] expert bank: budget=%d MB%s, %.1f MiB resident (card0 R=%d, card1 R=%d), "
             "E=%d top%d, expert type %u/%u/%u%s\n",
             bank_budget_mb, split_exp ? " (split across cards)" : "", (double)total_bank_bytes / 1048576.0,
@@ -1332,10 +1334,10 @@ void ds41_gpu_state::attention(int li, int dev, const float * x, float * oo) {
 
     // qr = rms(wq_a x, q_a_norm)
     gemv1(dev, wk(dev, ds41_layer_of(L).wq_a.data), ds41_layer_of(L).wq_a.type, ds41_layer_of(L).wq_a.K, ds41_layer_of(L).wq_a.N, x, t.qr);
-    if (dbg) { q.memcpy(sstage, t.qr, (size_t)q_lora*sizeof(float)).wait(); double ss=0; for(int i=0;i<q_lora;i++) ss+=(double)sstage[i]*sstage[i]; fprintf(stderr, "[ds41g]   qr rms %.6f\n", std::sqrt(ss/(double)q_lora)); }
+    if (dbg) { q.memcpy(sstage, t.qr, (size_t)q_lora*sizeof(float)).wait(); double ss=0; for(int i=0;i<q_lora;i++) ss+=(double)sstage[i]*sstage[i]; si::logf("[ds41g]   qr rms %.6f\n", std::sqrt(ss/(double)q_lora)); }
     rms(dev, t.qr, ds41_layer_of(L).q_a_norm, t.qr, q_lora);
     gemv1(dev, wk(dev, ds41_layer_of(L).wq_b.data), ds41_layer_of(L).wq_b.type, ds41_layer_of(L).wq_b.K, ds41_layer_of(L).wq_b.N, t.qr, t.qb);
-    if (dbg) { q.memcpy(sstage, t.qb, 64*sizeof(float)).wait(); double ss=0; for(int i=0;i<64;i++) ss+=(double)sstage[i]*sstage[i]; fprintf(stderr, "[ds41g]   q[0:64] rms %.6f\n", std::sqrt(ss/64.0)); }
+    if (dbg) { q.memcpy(sstage, t.qb, 64*sizeof(float)).wait(); double ss=0; for(int i=0;i<64;i++) ss+=(double)sstage[i]*sstage[i]; si::logf("[ds41g]   q[0:64] rms %.6f\n", std::sqrt(ss/64.0)); }
     ds41_rope_launch(q, t.qb, H, D, rot_off, n_rot, pos, 0, fc, false);
 
     // window K row
@@ -1386,8 +1388,8 @@ void ds41_gpu_state::attention(int li, int dev, const float * x, float * oo) {
         gemv1(dev, wab + (size_t)g * (size_t)out_rank * row_b, ds41_layer_of(L).wo_a.type, gsz, out_rank,
               t.ob + (size_t)g * (size_t)gsz, t.og + (size_t)g * (size_t)out_rank);
     }
-    if (dbg) { q.memcpy(sstage, t.og, (size_t)out_rank*sizeof(float)).wait(); double ss=0; for(int i=0;i<out_rank;i++) ss+=(double)sstage[i]*sstage[i]; fprintf(stderr, "[ds41g]   og rms %.6f\n", std::sqrt(ss/(double)out_rank));
-        q.memcpy(sstage, t.ob, (size_t)std::min(64,H*D)*sizeof(float)).wait(); ss=0; double mx=0; for(int i=0;i<std::min(64,H*D);i++){ss+=(double)sstage[i]*sstage[i]; mx=std::max(mx,(double)std::fabs(sstage[i]));} fprintf(stderr, "[ds41g]   attn pre-wo rms %.6f max %.6f\n", std::sqrt(ss/64.0), mx); }
+    if (dbg) { q.memcpy(sstage, t.og, (size_t)out_rank*sizeof(float)).wait(); double ss=0; for(int i=0;i<out_rank;i++) ss+=(double)sstage[i]*sstage[i]; si::logf("[ds41g]   og rms %.6f\n", std::sqrt(ss/(double)out_rank));
+        q.memcpy(sstage, t.ob, (size_t)std::min(64,H*D)*sizeof(float)).wait(); ss=0; double mx=0; for(int i=0;i<std::min(64,H*D);i++){ss+=(double)sstage[i]*sstage[i]; mx=std::max(mx,(double)std::fabs(sstage[i]));} si::logf("[ds41g]   attn pre-wo rms %.6f max %.6f\n", std::sqrt(ss/64.0), mx); }
     gemv1(dev, wk(dev, ds41_layer_of(L).wo_b.data), ds41_layer_of(L).wo_b.type, ds41_layer_of(L).wo_b.K, ds41_layer_of(L).wo_b.N, t.og, oo);
 }
 
@@ -1716,7 +1718,7 @@ void ds41_gpu_state::forward_token(int tok, bool want_logits, const mm_prompt * 
         if (dbg) {
             q.memcpy(sstage, t.x, (size_t)dim * sizeof(float)).wait();
             double ss = 0; for (int i=0;i<dim;i++) ss += (double)sstage[i]*sstage[i];
-            fprintf(stderr, "[ds41g]  L%d x rms %.6f\n", li, std::sqrt(ss/(double)dim));
+            si::logf("[ds41g]  L%d x rms %.6f\n", li, std::sqrt(ss/(double)dim));
         }
         if (!abl_noattn) {
             double a0 = 0;
@@ -1733,7 +1735,7 @@ void ds41_gpu_state::forward_token(int tok, bool want_logits, const mm_prompt * 
         if (dbg) {
             q.memcpy(sstage, t.ob, (size_t)dim * sizeof(float)).wait();
             double ss = 0; for (int i=0;i<dim;i++) ss += (double)sstage[i]*sstage[i];
-            fprintf(stderr, "[ds41g]  L%d attn out rms %.6f\n", li, std::sqrt(ss/(double)dim));
+            si::logf("[ds41g]  L%d attn out rms %.6f\n", li, std::sqrt(ss/(double)dim));
         }
         ds41_hc_post_launch(q, t.ob, t.res, t.a_post, t.a_comb, t.h, hc, dim);
 
@@ -1762,7 +1764,7 @@ void ds41_gpu_state::forward_token(int tok, bool want_logits, const mm_prompt * 
         if (dbg) {
             q.memcpy(sstage, t.y, (size_t)dim * sizeof(float)).wait();
             double ss = 0; for (int i=0;i<dim;i++) ss += (double)sstage[i]*sstage[i];
-            fprintf(stderr, "[ds41g]  L%d moe out rms %.6f\n", li, std::sqrt(ss/(double)dim));
+            si::logf("[ds41g]  L%d moe out rms %.6f\n", li, std::sqrt(ss/(double)dim));
         }
         ds41_hc_post_launch(q, t.y, t.res, t.f_post, t.f_comb, t.h, hc, dim);
         q.memcpy(t.pre_prev, t.f_pre, (size_t)hc * sizeof(float));
@@ -1770,7 +1772,7 @@ void ds41_gpu_state::forward_token(int tok, bool want_logits, const mm_prompt * 
             q.memcpy(sstage, t.h, (size_t)dim * sizeof(float)).wait();
             double ss = 0;
             for (int i = 0; i < dim; i++) ss += (double)sstage[i] * sstage[i];
-            fprintf(stderr, "[ds41g] layer %2d rms(h[s0]) %.6f\n", li, std::sqrt(ss / (double)dim));
+            si::logf("[ds41g] layer %2d rms(h[s0]) %.6f\n", li, std::sqrt(ss / (double)dim));
         }
     }
     pos++;
@@ -1832,7 +1834,7 @@ ds41_gpu_state * ds41_gpu_create(engine & e) {
     try {
         return new ds41_gpu_state(e);
     } catch (const std::exception & ex) {
-        fprintf(stderr, "[ds41] GPU forward unavailable: %s (falling back to the host forward)\n", ex.what());
+        si::logf("[ds41] GPU forward unavailable: %s (falling back to the host forward)\n", ex.what());
         return nullptr;
     }
 }
@@ -1897,14 +1899,14 @@ std::vector<int> ds41_gpu_generate(model & m, tokenizer & tk, const std::vector<
         dump_logits(step + 1);
     }
     if (st.timing) {
-        fprintf(stderr, "[ds41g] %llu forwards, %.2f ms/token total", (unsigned long long)st.tm.tok,
+        si::logf("[ds41g] %llu forwards, %.2f ms/token total", (unsigned long long)st.tm.tok,
                 st.tm.tok ? st.tm.total / (double)st.tm.tok : 0.0);
         if (st.timing >= 2 && st.tm.tok) {
-            fprintf(stderr, ", attn %.2f + moe %.2f + head %.2f ms/token",
+            si::logf(", attn %.2f + moe %.2f + head %.2f ms/token",
                     st.tm.attn / (double)st.tm.tok, st.tm.moe / (double)st.tm.tok,
                     st.tm.head / (double)st.tm.tok);
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     if (st.stats) {
         size_t up = 0;
@@ -1919,7 +1921,7 @@ std::vector<int> ds41_gpu_generate(model & m, tokenizer & tk, const std::vector<
             mb += b.miss_bytes;
         }
         const double total = (double)(hits + misses);
-        fprintf(stderr, "[ds41g] expert plane uploads=%zu bank hit=%.1f%% (%llu/%llu) miss=%.1f MiB\n", up,
+        si::logf("[ds41g] expert plane uploads=%zu bank hit=%.1f%% (%llu/%llu) miss=%.1f MiB\n", up,
                 total > 0 ? 100.0 * (double)hits / total : 0.0,
                 (unsigned long long)hits, (unsigned long long)total, (double)mb / 1048576.0);
     }

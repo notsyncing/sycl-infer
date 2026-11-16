@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "graph.h"
 
 #include <algorithm>
@@ -110,7 +112,7 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
     exec_graph g;
     g.opset = opset;
     if (getenv("SI_ONNX_LOOPDBG")) {
-        fprintf(stderr, "[onnx] the builder: %s, %zu nodes, %zu initializers, %zu inputs\n",
+        si::logf("[onnx] the builder: %s, %zu nodes, %zu initializers, %zu inputs\n",
                 path.c_str(), graph.node.size(), graph.initializer.size(), graph.input.size());
     }
 
@@ -325,7 +327,7 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
             }
             if (getenv("SI_ONNX_TRACE") && !produced.count(name) && !is_init.count(name) &&
                 !is_graph_input.count(name)) {
-                fprintf(stderr, "[onnx] the graph: '%s' reads '%s', which nothing produces\n",
+                si::logf("[onnx] the graph: '%s' reads '%s', which nothing produces\n",
                         n.name.c_str(), name.c_str());
             }
             op.in.push_back(resolve_input(name));
@@ -388,12 +390,12 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
             if (wi < 0) throw std::runtime_error("a convolution without a weight");
             const tensor w = values[wi].t;
             if (verbose) {
-                fprintf(stderr, "[onnx] conv %s: the weight slot %d holds %zu bytes, dims",
+                si::logf("[onnx] conv %s: the weight slot %d holds %zu bytes, dims",
                         n.name.c_str(), wi, w.host.size());
                 for (size_t k = 0; k < w.shape.size(); ++k) {
-                    fprintf(stderr, " %lld", (long long)w.shape[k]);
+                    si::logf(" %lld", (long long)w.shape[k]);
                 }
-                fprintf(stderr, " group %lld\n", (long long)grp);
+                si::logf(" group %lld\n", (long long)grp);
             }
             if (!w.host.empty()) {
                 values[wi].t = n.op_type == "Conv" ? transpose_conv_weight(w, grp)
@@ -426,12 +428,12 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
             auto apit = conv_act_params.find(idx);
             if (apit != conv_act_params.end()) op.act_params = apit->second;
             if (getenv("SI_ONNX_TRACE") && !op.activation.empty()) {
-                fprintf(stderr, "[onnx] the fused %s: the activation %s", n.name.c_str(),
+                si::logf("[onnx] the fused %s: the activation %s", n.name.c_str(),
                         op.activation.c_str());
                 for (size_t k = 0; k < op.act_params.size(); ++k) {
-                    fprintf(stderr, " %g", op.act_params[k]);
+                    si::logf(" %g", op.act_params[k]);
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
         }
         return op;
@@ -560,7 +562,7 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
                 op.if_else_end = oe;
             }
             if (getenv("SI_ONNX_LOOPDBG")) {
-                fprintf(stderr, "[onnx] the builder: the If at the node %zu: %s ops [%d, %d)\n", i,
+                si::logf("[onnx] the builder: the If at the node %zu: %s ops [%d, %d)\n", i,
                         a.name.c_str(), ob, oe);
             }
         }
@@ -591,11 +593,11 @@ exec_graph build_graph_from_graph(const onnxpb::graph_proto & graph, int64_t ops
         g.tensors[i].name = names[i];
     }
     if (getenv("SI_ONNX_LOOPDBG")) {
-        fprintf(stderr, "[onnx] the builder: %s: %zu ops, %zu tensors\n", path.c_str(), g.ops.size(),
+        si::logf("[onnx] the builder: %s: %zu ops, %zu tensors\n", path.c_str(), g.ops.size(),
                 g.tensors.size());
     }
     if (verbose) {
-        fprintf(stderr, "[onnx] %s: %zu ops, %zu tensors, opset %lld\n", path.c_str(), g.ops.size(),
+        si::logf("[onnx] %s: %zu ops, %zu tensors, opset %lld\n", path.c_str(), g.ops.size(),
                 g.tensors.size(), (long long)g.opset);
     }
     return g;

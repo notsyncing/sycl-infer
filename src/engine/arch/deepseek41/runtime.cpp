@@ -1,3 +1,5 @@
+#include "log.h"
+
 // DeepSeek-V4.1-Flash's arch_ops hooks (see arch/arch_ops.h).  These are the
 // lifecycle and request-path decisions that used to live as an engine-level
 // architecture branch in engine.cpp/server.cpp; the forward implementations
@@ -19,7 +21,7 @@ void arch_ops_registry::ds41_setup(engine & e) {
         const char * eg = si::env::str("PF_DS41_GPU");
         const bool gpu_default = !(eg && atoi(eg) == 0);
         if (gpu_default && !e.multi_dev) {
-            fprintf(stderr, "[ds41] --device gpu without a layer map: keeping the host forward "
+            si::logf("[ds41] --device gpu without a layer map: keeping the host forward "
                             "(pass --layer-map 0-%d:gpu.0)\n", e.m.hp.n_layer - 1);
         } else if (gpu_default) {
             bool any_cpu = false;
@@ -27,7 +29,7 @@ void arch_ops_registry::ds41_setup(engine & e) {
                 any_cpu = any_cpu || d != 0;
             }
             if (any_cpu) {
-                fprintf(stderr, "[ds41] the GPU forward needs an all-GPU --layer-map; "
+                si::logf("[ds41] the GPU forward needs an all-GPU --layer-map; "
                                 "keeping the host forward\n");
             } else {
                 e.ds41x_.gpu = ds41_gpu_create(e);

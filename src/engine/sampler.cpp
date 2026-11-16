@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "sampler.h"
 
 #include "guided.h"
@@ -108,7 +110,7 @@ int sample_token(const float * logits, int n_vocab, const gen_params & gp, const
             static std::atomic<bool> warned{false};
             bool expected = false;
             if (warned.compare_exchange_strong(expected, true)) {
-                fprintf(stderr, "[guided] constraint exhausted; continuing without it\n");
+                si::logf("[guided] constraint exhausted; continuing without it\n");
             }
         }
     }

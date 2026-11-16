@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "supervisor.h"
 
 #include "config.h"
@@ -338,7 +340,7 @@ void supervisor::stop() {
             nlohmann::json params;
             params["timeout_s"] = 30;
             const bool ok = kv.second->call(rpc::kShutdown, params, result, err, 5000);
-            fprintf(stderr, "[router] the control plane of '%s': shutdown %s%s%s\n", kv.first.c_str(),
+            si::logf("[router] the control plane of '%s': shutdown %s%s%s\n", kv.first.c_str(),
                     ok ? "accepted" : "FAILED", ok ? "" : " - ", ok ? "" : err.c_str());
         }
     }
@@ -351,7 +353,7 @@ void supervisor::stop() {
         }
         if (pid > 0) {
             ::kill(pid, SIGTERM);
-            fprintf(stderr, "[router] SIGTERM -> the worker of '%s' (pid %d)\n", slot->cfg.id.c_str(), (int)pid);
+            si::logf("[router] SIGTERM -> the worker of '%s' (pid %d)\n", slot->cfg.id.c_str(), (int)pid);
         }
     }
     // The grace period belongs to the supervisor's own threads: each of them
@@ -757,7 +759,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
                 if (!vram_admit(*slot, why)) {
                     group_leave(m.device_group, slot->group_index, restart);
                     slot->set_state(model_state::failed, "the VRAM budget refused the model: " + why);
-                    fprintf(stderr, "[router] model '%s' was not started: %s\n", m.id.c_str(), why.c_str());
+                    si::logf("[router] model '%s' was not started: %s\n", m.id.c_str(), why.c_str());
                     fflush(stderr);
                     return;
                 }
@@ -822,7 +824,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
             std::string cerr;
             if (m.control_port > 0) {
                 if (!refresh_control(*slot, true, cerr)) {
-                    fprintf(stderr, "[router] model '%s': the control plane is not usable (%s)\n", m.id.c_str(),
+                    si::logf("[router] model '%s': the control plane is not usable (%s)\n", m.id.c_str(),
                             cerr.c_str());
                 }
             } else {
@@ -862,7 +864,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
 
         // Ready.  (The state and the identity were published above, in the
         // branch that got here.)  Now watch it.
-        fprintf(stderr, "[router] model '%s' is up (%s)\n", m.id.c_str(), slot->http_base().c_str());
+        si::logf("[router] model '%s' is up (%s)\n", m.id.c_str(), slot->http_base().c_str());
         fflush(stderr);
 
         if (m.remote) {
@@ -877,7 +879,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
             std::string cerr;
             if (m.control_port > 0) {
                 if (!refresh_control(*slot, true, cerr)) {
-                    fprintf(stderr, "[router] model '%s': the control plane is not usable (%s)\n", m.id.c_str(),
+                    si::logf("[router] model '%s': the control plane is not usable (%s)\n", m.id.c_str(),
                             cerr.c_str());
                 }
             } else {
@@ -946,7 +948,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
                             fails = 0;
                         } else if (++fails >= cfg_.health_failures) {
                             hung = true;
-                            fprintf(stderr, "[router] the worker of '%s' is not answering (%d failures) -> replacing it\n",
+                            si::logf("[router] the worker of '%s' is not answering (%d failures) -> replacing it\n",
                                     slot->cfg.id.c_str(), fails);
                             ::kill(pid, SIGTERM);
                             sleep_ms(500);
@@ -995,7 +997,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
                             break; // already reaped
                         }
                         if (g_now_ms() >= deadline) {
-                            fprintf(stderr, "[router] the worker of '%s' did not exit in 10s -> SIGKILL\n",
+                            si::logf("[router] the worker of '%s' did not exit in 10s -> SIGKILL\n",
                                     slot->cfg.id.c_str());
                             ::kill(pid, SIGKILL);
                             ::waitpid(pid, &st, 0);
@@ -1060,7 +1062,7 @@ void supervisor::run(std::shared_ptr<model_slot> slot) {
             for (int i = 1; i < attempt && backoff < 60; i++) {
                 backoff *= 2;
             }
-            fprintf(stderr, "[router] model '%s' died (%s); restarting in %ds\n", m.id.c_str(), reason.c_str(),
+            si::logf("[router] model '%s' died (%s); restarting in %ds\n", m.id.c_str(), reason.c_str(),
                     backoff);
             fflush(stderr);
             for (int waited = 0; waited < backoff * 10 && !stopping_.load(); waited++) {

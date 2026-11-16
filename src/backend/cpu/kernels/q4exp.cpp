@@ -1,3 +1,5 @@
+#include "log.h"
+
 // Host kernels for the qwen4exp additions: hyper-connection mixing, the PLE
 // n-gram module, and the QSA indexer's small scans.  Everything else in the
 // architecture reuses the ordinary CPU GEMV / GDN / MoE kernels.
@@ -721,7 +723,7 @@ void cpu_q4_ple_apply(const float * value, const float * gate, const float * w_c
     }
     if (pat) {
         const double pe = pnow();
-        fprintf(stderr, "[q4pa] n=%d gated=%.3f rms=%.3f conv=%.3f hist=%.3f total=%.3f ms\n", n_tok, pt1 - pt0,
+        si::logf("[q4pa] n=%d gated=%.3f rms=%.3f conv=%.3f hist=%.3f total=%.3f ms\n", n_tok, pt1 - pt0,
                 pt2 - pt1, pt3 - pt2, pe - pt3, pe - pt0);
     }
 }

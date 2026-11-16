@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "audio_model.h"
 
 #include <algorithm>
@@ -216,7 +218,7 @@ void audio_model::upload(sycl::queue & q) {
         // The int8 path is a GPU matmul; a CPU queue would run it on oneDNN's
         // CPU engine (the synthetic A/B measured that path is slower and over
         // the accuracy gate).  Keep the tower on vit_gemm there.
-        fprintf(stderr, "[audio] PF_AUDIO_DNNL needs a GPU queue; using vit_gemm\n");
+        si::logf("[audio] PF_AUDIO_DNNL needs a GPU queue; using vit_gemm\n");
         return;
     }
     // The tower is small (a few MiB) and its linears are all f32, so the
@@ -241,7 +243,7 @@ void audio_model::upload(sycl::queue & q) {
         add(L.down);
     }
     add(out);
-    fprintf(stderr, "[audio] dnnl int8 linears: %d/%d registered, %.2f MiB\n", n_ok, n_try,
+    si::logf("[audio] dnnl int8 linears: %d/%d registered, %.2f MiB\n", n_ok, n_try,
             (double)gemm->weight_bytes() / 1048576.0);
     gemm->report_load("audio");
 }

@@ -1,3 +1,5 @@
+#include "log.h"
+
 // CPU GDN recurrence (mirror of src/backend/gpu/kernels/gdn.cpp, C=1 mapping):
 // per (row, head, state column) sequential scan over the chunk's tokens, with
 // the per-32-token prefix-cache state snapshot.
@@ -84,7 +86,7 @@ void cpu_gdn(const float * conv_out, const float * alpha, const float * dt_bias,
                     // because the kernel cannot see the pool's size.
                     if (cpu_pc_guard && snap.cap_floats > 0
                         && at + (int64_t)head_dim * head_dim > snap.cap_floats) {
-                        fprintf(stderr,
+                        si::logf(
                                 "[pcguard] GDN snapshot past pool: stt=%d head=%d at=%lld +%lld > cap=%lld "
                                 "(stride=%lld layer_off=%lld, gdn_per=%d)\n",
                                 stt, head, (long long)at, (long long)(head_dim * head_dim), (long long)snap.cap_floats,

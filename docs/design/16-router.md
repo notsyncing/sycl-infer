@@ -192,7 +192,7 @@ JSON，**允许注释**：`//` 行注释与 `/* */` 块注释都会被剥离。�
 |---|---|---|
 | `router.listen` | 否 | 路由器的 HTTP 监听 `host:port`（默认 `127.0.0.1:8080`）。**对外暴露要放在反向代理后面**（worker 的 HTTP 本身无鉴权，见 [09-server.md](09-server.md)） |
 | `router.auth.bearer_tokens` | 否 | 路由器层的 Bearer 鉴权（也接受顶层 `router.bearer_tokens`）。`/health` 始终免鉴权——探针不该带 token |
-| `router.access_log` | 否 | 每个请求一行日志（方法、路径、状态、模型、耗时） |
+| `router.access_log` | 否 | 每个请求一行日志（方法、路径、状态、模型、耗时）。此外每个 completion 响应（`/v1/chat/completions`、`/v1/completions`）都会另打一行 `[router] completion model=... prompt_tokens=... completion_tokens=... cached_tokens=...`，**不受这个开关影响**；流式请求的 usage 由路由器向 worker 请求（`stream_options.include_usage`），客户端没要时该 chunk 不会转发给客户端 |
 | `router.request_timeout_s` | 否 | 数据面代理的上游超时（流式请求要 >= 生成时长） |
 | `router.startup_timeout_s` | 否 | 等一个 worker 就绪的上限。27B 加载 ~80 s，默认给足 |
 | `router.health_interval_s` / `router.health_failures` | 否 | 存活探测的周期与连续失败次数（超过即判定 worker 失联并重启） |
@@ -556,7 +556,11 @@ supervisor（systemd、docker、k8s）看的：重启策略可以按退出码区
 "崩了，可以重试"。
 
 worker 的日志：stdout/stderr 重定向到 `<log_dir>/<id>.log`，`/router/status` 里有它的尾巴
-（`last_error`）——**否则"模型起不来"只有一行 `device alloc failed`，没有上下文**。
+（`last_error`）——**否则"模型起不来"只有一行 `device alloc failed`，没有上下文**。所有
+stderr 日志行都以 `[YYYY-MM-DD HH:MM:SS.mmm]` 时间戳开头（`src/common/log.h` 的
+`si::logf`：调用线程只做格式化并把整条消息投递到一个有界队列，单独一个写线程负责
+加时间戳和写 stderr，所以日志不会把业务线程串行化；它按"行首"加前缀，所以由多次
+`fprintf` 拼成的一行只会有一个时间戳。正常退出时 atexit 会排空队列）。
 
 ### 8.3 优雅停机
 

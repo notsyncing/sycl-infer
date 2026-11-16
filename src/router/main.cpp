@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "config.h"
 #include "proxy.h"
 #include "registry.h"
@@ -90,7 +92,7 @@ int main(int argc, char ** argv) {
             usage(argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "error: unknown option '%s'\n", a.c_str());
+            si::logf("error: unknown option '%s'\n", a.c_str());
             usage(argv[0]);
             return 1;
         }
@@ -104,7 +106,7 @@ int main(int argc, char ** argv) {
     try {
         cfg = load_config_file(config_path);
     } catch (const std::exception & ex) {
-        fprintf(stderr, "error: %s\n", ex.what());
+        si::logf("error: %s\n", ex.what());
         return 1;
     }
 
@@ -122,10 +124,10 @@ int main(int argc, char ** argv) {
         reg.add(m);
     }
 
-    fprintf(stderr, "[router] listening on %s:%d with %zu model(s)\n", cfg.listen_host.c_str(), cfg.listen_port,
+    si::logf("[router] listening on %s:%d with %zu model(s)\n", cfg.listen_host.c_str(), cfg.listen_port,
             cfg.models.size());
     for (const auto & slot : reg.all()) {
-        fprintf(stderr, "[router]   %-24s %-28s budget=%llu MB%s\n", slot->cfg.id.c_str(),
+        si::logf("[router]   %-24s %-28s budget=%llu MB%s\n", slot->cfg.id.c_str(),
                 slot->http_base().c_str(), (unsigned long long)slot->cfg.vram_budget_mb,
                 slot->cfg.remote ? " (remote: connect only)" : "");
     }
@@ -158,9 +160,9 @@ int main(int argc, char ** argv) {
     g_term.store(true);
     watchdog.join();
     if (!listening) {
-        fprintf(stderr, "[router] failed to listen on %s:%d\n", cfg.listen_host.c_str(), cfg.listen_port);
+        si::logf("[router] failed to listen on %s:%d\n", cfg.listen_host.c_str(), cfg.listen_port);
     }
-    fprintf(stderr, "[router] shutting down (signal %d)\n", g_term_signal.load());
+    si::logf("[router] shutting down (signal %d)\n", g_term_signal.load());
     // Stop the workers last: they flush their prefix cache on the way out.
     sup.stop();
     return listening ? 0 : 1;

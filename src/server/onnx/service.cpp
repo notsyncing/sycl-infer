@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "service.h"
 
 #include <cstdio>
@@ -89,7 +91,7 @@ sycl::device pick_device(const std::string & name) {
     if (name == "GPU" || name == "gpu") {
         const std::vector<sycl::device> gpus = si::dev::gpu_devices();
         if (gpus.empty()) {
-            fprintf(stderr, "[onnx] no GPU is available; running on the CPU\n");
+            si::logf("[onnx] no GPU is available; running on the CPU\n");
             return sycl::device{sycl::cpu_selector_v};
         }
         return gpus.front();
@@ -145,14 +147,14 @@ int serve_onnx(const onnx_service_config & cfg) {
     for (const std::string & spec : cfg.models) {
         std::string id, path, dev;
         if (!parse_model_spec(spec, id, path, dev)) {
-            fprintf(stderr, "[onnx] bad --model spec '%s' (want id=path[:device])\n", spec.c_str());
+            si::logf("[onnx] bad --model spec '%s' (want id=path[:device])\n", spec.c_str());
             return 2;
         }
         models.emplace_back(id, path);
         if (!dev.empty()) model_devices[id] = dev;
     }
     if (models.empty()) {
-        fprintf(stderr, "[onnx] no models: pass --config <file.json> or --model id=path\n");
+        si::logf("[onnx] no models: pass --config <file.json> or --model id=path\n");
         return 2;
     }
 
@@ -184,7 +186,7 @@ int serve_onnx(const onnx_service_config & cfg) {
         s->id = m.first;
         s->path = m.second;
         s->device = dev;
-        fprintf(stderr, "[onnx] loading '%s' on %s (%s)\n", s->id.c_str(), dev.c_str(), s->path.c_str());
+        si::logf("[onnx] loading '%s' on %s (%s)\n", s->id.c_str(), dev.c_str(), s->path.c_str());
         try {
             s->graph = onnx::build_graph(s->path, true);
             s->ex.reset(new onnx::executor(s->graph, queue_for(dev)));
@@ -198,19 +200,19 @@ int serve_onnx(const onnx_service_config & cfg) {
             // A model that cannot be loaded is a reported failure, not a
             // reason to take the whole service down: the other models are
             // still useful, and the client gets a clear error for this one.
-            fprintf(stderr, "[onnx]   FAILED: %s\n", e.what());
+            si::logf("[onnx]   FAILED: %s\n", e.what());
             served_models.push_back(std::move(s));
             continue;
         }
-        fprintf(stderr, "[onnx]   %s: inputs", s->id.c_str());
+        si::logf("[onnx]   %s: inputs", s->id.c_str());
         for (const auto & t : s->graph.input_slots) {
-            fprintf(stderr, " %s", s->graph.tensors[t].name.c_str());
+            si::logf(" %s", s->graph.tensors[t].name.c_str());
         }
-        fprintf(stderr, "\n[onnx]   %s: outputs", s->id.c_str());
+        si::logf("\n[onnx]   %s: outputs", s->id.c_str());
         for (const auto & t : s->graph.output_slots) {
-            fprintf(stderr, " %s", s->graph.tensors[t].name.c_str());
+            si::logf(" %s", s->graph.tensors[t].name.c_str());
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
         served_models.push_back(std::move(s));
     }
 
@@ -319,7 +321,7 @@ int serve_onnx(const onnx_service_config & cfg) {
                 if (keep[i]) outs.emplace_back(out_names[i], out_bufs[i]);
             }
             if (getenv("SI_ONNX_LOOPDBG")) {
-                fprintf(stderr, "[onnx] the service: the run of '%s' with %zu inputs\n",
+                si::logf("[onnx] the service: the run of '%s' with %zu inputs\n",
                         target->id.c_str(), feeds.size());
             }
             target->ex->run(feeds, outs);
@@ -354,14 +356,14 @@ int serve_onnx(const onnx_service_config & cfg) {
                              std::chrono::steady_clock::time_point b) {
                     return std::chrono::duration<double, std::milli>(b - a).count();
                 };
-                fprintf(stderr,
+                si::logf(
                         "[onnx] http: '%s': the request %zu bytes, the decode %.1f ms, the run "
                         "%.1f ms, the encode %.1f (%.1f MB), the set_content %.1f\n",
                         target->id.c_str(), req.body.size(), ms(th0, th1), ms(th1, th2), ms(th2, th3),
                         encoded.size() / 1048576.0, ms(th3, th4));
             }
         } catch (const std::exception & e) {
-            fprintf(stderr, "[onnx] the request failed: %s\n", e.what());
+            si::logf("[onnx] the request failed: %s\n", e.what());
             send_binary(res, onnxwire::encode_response(3, e.what(), {}));
         }
     });
@@ -383,7 +385,7 @@ int serve_onnx(const onnx_service_config & cfg) {
         if (!cfg.control_token_file.empty()) {
             std::ifstream f(cfg.control_token_file, std::ios::binary);
             if (!f) {
-                fprintf(stderr, "[onnx] cannot read the control token file '%s'\n",
+                si::logf("[onnx] cannot read the control token file '%s'\n",
                         cfg.control_token_file.c_str());
                 return 1;
             }
@@ -430,19 +432,19 @@ int serve_onnx(const onnx_service_config & cfg) {
             report, [&]() { srv.stop(); }, token);
         std::string err;
         if (!control->start(cfg.control_host, cfg.control_port, err)) {
-            fprintf(stderr, "[onnx] control plane: %s\n", err.c_str());
+            si::logf("[onnx] control plane: %s\n", err.c_str());
             return 1;
         }
-        fprintf(stderr, "[onnx] control plane on %s:%d%s\n", cfg.control_host.c_str(),
+        si::logf("[onnx] control plane on %s:%d%s\n", cfg.control_host.c_str(),
                 control->port(), control->needs_token() ? " (token required)" : "");
     }
 
-    fprintf(stderr, "[onnx] listening on %s:%d (%zu models)\n", cfg.host.c_str(), cfg.port,
+    si::logf("[onnx] listening on %s:%d (%zu models)\n", cfg.host.c_str(), cfg.port,
             served_models.size());
     const bool listening = srv.listen(cfg.host.c_str(), cfg.port);
     if (control) control->stop();
     if (!listening) {
-        fprintf(stderr, "[onnx] failed to listen on %s:%d\n", cfg.host.c_str(), cfg.port);
+        si::logf("[onnx] failed to listen on %s:%d\n", cfg.host.c_str(), cfg.port);
         return 1;
     }
     return 0;

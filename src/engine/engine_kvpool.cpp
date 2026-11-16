@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "engine.h"
 
 #include <algorithm>
@@ -436,7 +438,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         kv_map2 = ok && kv_vbase % mb2 == 0 && kv_vbase_v % mb2 == 0 && ((size_t)pool_cap * block_bytes) % mb2 == 0
                   && ((size_t)pool_cap * v_block_bytes) % mb2 == 0;
     } catch (const std::exception & ex) {
-        fprintf(stderr, "[kv] virtual USM unavailable (%s)\n", ex.what());
+        si::logf("[kv] virtual USM unavailable (%s)\n", ex.what());
     }
     kv_virtual = ok;
     if (kv_virtual && !kv_map2) {
@@ -446,7 +448,7 @@ void engine::kv_setup(int n_attn, int initial_blocks) {
         if (initial_blocks > 16) {
             initial_blocks = 16;
         }
-        fprintf(stderr, "[kv] reservation is not 2 MB aligned: growth uses <2 MB extents\n");
+        si::logf("[kv] reservation is not 2 MB aligned: growth uses <2 MB extents\n");
     }
     if (!kv_virtual) {
         // fixed pool fallback: no growth, no shrink
@@ -544,7 +546,7 @@ bool engine::kv_grow(int want) {
         }
     } catch (const std::exception & ex2) {
         // leave the extent unmapped; the blocks are simply not available
-        fprintf(stderr, "[kv] grow failed (%s): pool stays at %d blocks\n", ex2.what(), pool_blocks);
+        si::logf("[kv] grow failed (%s): pool stays at %d blocks\n", ex2.what(), pool_blocks);
         return false;
     }
     for (int b = first; b < first + count; b++) {
@@ -671,7 +673,7 @@ void engine::kv_release_pool() {
 void engine::pool_print(const char * tag) const {
     const double mb = 1024.0 * 1024.0;
     const double block_mb = (double)(kv_block_bytes() + kv_v_block_bytes()) * attn_layers() / mb;
-    fprintf(stderr,
+    si::logf(
             "[kv] %s: pool=%d blocks (%.0f MB), cap=%d (%.0f MB), in_use=%d, peak=%llu, "
             "grows=%llu shrinks=%llu%s\n",
             tag, pool_blocks, pool_blocks * block_mb, pool_cap, pool_cap * block_mb, pool_used_blocks(),

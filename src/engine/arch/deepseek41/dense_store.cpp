@@ -1,3 +1,5 @@
+#include "log.h"
+
 // DeepSeek-V4.1-Flash's dense linear stores, moved out of generic engine.cpp so
 // the generic engine has no architecture-specific store setup.  The member
 // declaration stays in engine.h (it is one architecture method, and the
@@ -156,7 +158,7 @@ bool engine::setup_ds41_dense_store() {
     }
     ds41x_.dense_store = (n_k5 + n_i8) > 0;
     if (ds41x_.dense_store) {
-        fprintf(stderr,
+        si::logf(
                 "[ds41] dense stores: %zu k5 + %zu int8 oneDNN tensors, %.0f MB%s "
                 "(PF_DS41_DENSE_STORE=0 restores the raw GEMV)\n",
                 n_k5, n_i8, (double)bytes / 1048576.0, add_q8 ? "" : " (Q8_0 kept raw)");

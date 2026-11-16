@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "kv_type.h"
 
 #include <atomic>
@@ -100,7 +102,7 @@ void from_env(kv_dtype_t & k, kv_dtype_t & v) {
         return;
     }
     if (!kv_dtype_parse_pair(e, k, v)) {
-        fprintf(stderr, "[kv] unknown PF_KV_TYPE='%s' (i4|i8|bf16|f16|f32, or K:V), using i8\n", e);
+        si::logf("[kv] unknown PF_KV_TYPE='%s' (i4|i8|bf16|f16|f32, or K:V), using i8\n", e);
         k = v = kv_dtype_t::i8;
     }
 }

@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "engine.h"
 
 #include <algorithm>
@@ -89,7 +91,7 @@ void engine::pc_disk_init() {
     }
     pcd_enabled = pcd->active();
     if (pcd_enabled) {
-        fprintf(stderr, "[pcd] disk prefix cache %s: %zu records, %.0f MB budget\n", dir.c_str(), pcd->count(),
+        si::logf("[pcd] disk prefix cache %s: %zu records, %.0f MB budget\n", dir.c_str(), pcd->count(),
                 pc_disk_bytes ? (double)pc_disk_bytes / (1024.0 * 1024.0) : 0.0);
     }
 }
@@ -99,7 +101,7 @@ void engine::pc_ram_init() {
     pcr->open(pc_ram_bytes);
     pcr_enabled = pcr->active();
     if (pcr_enabled) {
-        fprintf(stderr, "[pcr] RAM prefix cache: %.0f MB budget\n", (double)pc_ram_bytes / (1024.0 * 1024.0));
+        si::logf("[pcr] RAM prefix cache: %.0f MB budget\n", (double)pc_ram_bytes / (1024.0 * 1024.0));
     }
 }
 
@@ -151,14 +153,14 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
         sycl::queue & qd = dev_queue(attn_dev(l));
         qd.memcpy(blob.data() + off, kp + (size_t)block * kb, kb);
         if (guard && off + kb > blob.size()) {
-            fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +kb=%zu > blob=%zu (need=%zu)\n", l, off,
+            si::logf("[pcguard] SERIALIZE past end: layer %d off=%zu +kb=%zu > blob=%zu (need=%zu)\n", l, off,
                     kb, blob.size(), need);
         }
         pc_blob_note(off + kb);
         off += kb;
         qd.memcpy(blob.data() + off, vp + (size_t)block * vb, vb);
         if (guard && off + vb > blob.size()) {
-            fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +vb=%zu > blob=%zu (need=%zu)\n", l, off,
+            si::logf("[pcguard] SERIALIZE past end: layer %d off=%zu +vb=%zu > blob=%zu (need=%zu)\n", l, off,
                     vb, blob.size(), need);
         }
         pc_blob_note(off + vb);
@@ -169,19 +171,19 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
                 // `nullptr + block*sb`, which is not null but an arbitrary small
                 // address - a silent read of unrelated memory, and the one place
                 // the scale planes are only conditionally present
-                fprintf(stderr, "[pcguard] SERIALIZE null scale plane: layer %d ksc=%p vsc=%p sb=%zu\n", l,
+                si::logf("[pcguard] SERIALIZE null scale plane: layer %d ksc=%p vsc=%p sb=%zu\n", l,
                         (const void *)ksc, (const void *)vsc, sb);
             }
             qd.memcpy(blob.data() + off, ksc + (size_t)block * sb, sb);
             if (guard && off + sb > blob.size()) {
-                fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +sb=%zu > blob=%zu (need=%zu)\n", l, off,
+                si::logf("[pcguard] SERIALIZE past end: layer %d off=%zu +sb=%zu > blob=%zu (need=%zu)\n", l, off,
                         sb, blob.size(), need);
             }
             pc_blob_note(off + sb);
             off += sb;
             qd.memcpy(blob.data() + off, vsc + (size_t)block * sb, sb);
             if (guard && off + sb > blob.size()) {
-                fprintf(stderr, "[pcguard] SERIALIZE past end: layer %d off=%zu +sb=%zu > blob=%zu (need=%zu)\n", l, off,
+                si::logf("[pcguard] SERIALIZE past end: layer %d off=%zu +sb=%zu > blob=%zu (need=%zu)\n", l, off,
                         sb, blob.size(), need);
             }
             pc_blob_note(off + sb);
@@ -189,7 +191,7 @@ void engine::pc_serialize_block(int block, std::vector<uint8_t> & blob) {
         }
     }
     if (guard && off != need) {
-        fprintf(stderr, "[pcguard] SERIALIZE wrote %zu bytes but sized the blob %zu\n", off, need);
+        si::logf("[pcguard] SERIALIZE wrote %zu bytes but sized the blob %zu\n", off, need);
     }
     sync_all();
 }
@@ -208,13 +210,13 @@ void engine::pc_deserialize_block(const uint8_t * blob, int block) {
         kv_layer_ptrs(l, kp, vp, ksc, vsc);
         sycl::queue & qd = dev_queue(attn_dev(l));
         if (guard && off + kb > pc_block_blob_bytes()) {
-            fprintf(stderr, "[pcguard] DESERIALIZE reads past blob: layer %d off=%zu +kb=%zu > blob_bytes=%zu\n", l, off,
+            si::logf("[pcguard] DESERIALIZE reads past blob: layer %d off=%zu +kb=%zu > blob_bytes=%zu\n", l, off,
                     kb, pc_block_blob_bytes());
         }
         qd.memcpy((void *)(kp + (size_t)block * kb), blob + off, kb);
         off += kb;
         if (guard && off + vb > pc_block_blob_bytes()) {
-            fprintf(stderr, "[pcguard] DESERIALIZE reads past blob: layer %d off=%zu +vb=%zu > blob_bytes=%zu\n", l, off,
+            si::logf("[pcguard] DESERIALIZE reads past blob: layer %d off=%zu +vb=%zu > blob_bytes=%zu\n", l, off,
                     vb, pc_block_blob_bytes());
         }
         qd.memcpy((void *)(vp + (size_t)block * vb), blob + off, vb);
@@ -225,7 +227,7 @@ void engine::pc_deserialize_block(const uint8_t * blob, int block) {
                 // dereference - the offset makes the pointer a small valid-looking
                 // address, so this is exactly the kind of store that corrupts an
                 // unrelated heap block with no diagnostic
-                fprintf(stderr, "[pcguard] DESERIALIZE null scale plane: layer %d ksc=%p vsc=%p sb=%zu\n", l,
+                si::logf("[pcguard] DESERIALIZE null scale plane: layer %d ksc=%p vsc=%p sb=%zu\n", l,
                         (const void *)ksc, (const void *)vsc, sb);
             }
             qd.memcpy((void *)(ksc + (size_t)block * sb), blob + off, sb);
@@ -325,7 +327,7 @@ void engine::pc_flush_to_disk() {
     for (const auto & p : order) {
         pc_node_to_disk(p.second);
     }
-    fprintf(stderr, "[pcd] flushed on exit: %zu nodes, disk now %zu records (%.1f MB)\n", pc_nodes_.size(),
+    si::logf("[pcd] flushed on exit: %zu nodes, disk now %zu records (%.1f MB)\n", pc_nodes_.size(),
             pcd->count(), (double)pcd->bytes() / (1024.0 * 1024.0));
 }
 
@@ -443,9 +445,9 @@ int engine::pc_promote_bytes(const pc_disk_meta & meta, const uint8_t * blob, co
         const size_t within = bad == want ? 0 : bad % per;
         const char * which = within < kb ? "K" : (within < kb + vb ? "V" : (within < kb + vb + sb ? "Kscale" : "Vscale"));
         if (bad == want && back.size() == want) {
-            fprintf(stderr, "[pcverify] block=%d depth=%d %zu bytes: IDENTICAL\n", block, meta.depth, want);
+            si::logf("[pcverify] block=%d depth=%d %zu bytes: IDENTICAL\n", block, meta.depth, want);
         } else {
-            fprintf(stderr, "[pcverify] block=%d depth=%d want=%zu got=%zu MISMATCH first_bad=%zu "
+            si::logf("[pcverify] block=%d depth=%d want=%zu got=%zu MISMATCH first_bad=%zu "
                             "(layer %zu, %s, +%zu)\n",
                     block, meta.depth, want, back.size(), bad, layer, which, within);
         }
@@ -678,7 +680,7 @@ int engine::pc_state_take() {
     const int ni = pc_state_owner[best];
     static const bool pcdbg = si::env::flag("PF_PC_DEBUG");
     if (pcdbg) {
-        fprintf(stderr, "[pcdbg] state_take st=%d node=%d ref=%d depth=%d demote=%d\n", best, ni,
+        si::logf("[pcdbg] state_take st=%d node=%d ref=%d depth=%d demote=%d\n", best, ni,
                 pc_nodes_[ni].refcount, pc_nodes_[ni].depth,
                 (int)((pcr_enabled || pcd_enabled) && pc_nodes_[ni].refcount <= 0));
     }
@@ -842,7 +844,7 @@ int engine::pc_admit(int slot, const std::vector<int> & prompt, std::vector<int>
         const pc_ram_entry * re = (ni < 0 && pcr_enabled) ? pcr->find(h, tk) : nullptr;
         const pc_disk_meta * de = (ni < 0 && !re && pcd_enabled) ? pcd->find(h, tk) : nullptr;
         if (pcdbg) {
-            fprintf(stderr, "[pcdbg] admit L=%d blk=%d h=%llx vram=%d ram=%d disk=%d\n", L, i, (unsigned long long)h,
+            si::logf("[pcdbg] admit L=%d blk=%d h=%llx vram=%d ram=%d disk=%d\n", L, i, (unsigned long long)h,
                     ni, re ? 1 : 0, de ? 1 : 0);
         }
         if (ni < 0 && !re && !de) {
@@ -1220,7 +1222,7 @@ void engine::pc_commit(int slot, const std::vector<int> & toks, const std::vecto
         const uint64_t h = pc_hash_block(ps.chain, tk);
         const int found = pc_find(h, tk);
         if (pcdbg) {
-            fprintf(stderr, "[pcdbg] commit slot=%d blk=%d done=%d h=%llx found=%d\n", slot, i, done,
+            si::logf("[pcdbg] commit slot=%d blk=%d done=%d h=%llx found=%d\n", slot, i, done,
                     (unsigned long long)h, found);
         }
         if (found < 0) {
@@ -1277,7 +1279,7 @@ void engine::pc_print_stats(const char * tag) const {
     }
     const double state_mb = (double)pc_state_floats * 4.0 / (1024.0 * 1024.0);
     const uint64_t lookups = pc_stat_hits + pc_stat_misses;
-    fprintf(stderr,
+    si::logf(
             "[pc] %s: nodes=%zu (with state %d), refs=%llu, hits=%llu/%llu (%.0f%%), reused=%llu tok, "
             "captured=%llu, evicted nodes=%llu states=%llu, checkpoint=%.1f MB x %d = %.0f MB",
             tag, pc_nodes_.size(), with_state, (unsigned long long)refs, (unsigned long long)pc_stat_hits,
@@ -1286,14 +1288,14 @@ void engine::pc_print_stats(const char * tag) const {
             (unsigned long long)pc_stat_evict_nodes, (unsigned long long)pc_stat_evict_states, state_mb, pc_max_states,
             state_mb * pc_max_states);
     if (pcr_enabled) {
-        fprintf(stderr, ", ram stores=%llu loads=%llu spills=%llu records=%zu", (unsigned long long)pc_stat_ram_stores,
+        si::logf(", ram stores=%llu loads=%llu spills=%llu records=%zu", (unsigned long long)pc_stat_ram_stores,
                 (unsigned long long)pc_stat_ram_loads, (unsigned long long)pc_stat_ram_spills, pcr->count());
     }
     if (pcd_enabled) {
-        fprintf(stderr, ", disk spills=%llu loads=%llu records=%zu", (unsigned long long)pc_stat_spills,
+        si::logf(", disk spills=%llu loads=%llu records=%zu", (unsigned long long)pc_stat_spills,
                 (unsigned long long)pc_stat_loads, pcd->count());
     }
-    fprintf(stderr, "\n");
+    si::logf("\n");
 }
 
 } // namespace si

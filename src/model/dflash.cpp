@@ -1,3 +1,5 @@
+#include "log.h"
+
 // DFlash / DFlash2 draft-model loader.  See dflash.h for what the architecture is.
 #include "dflash.h"
 
@@ -76,7 +78,7 @@ void dflash_model::load(const std::string & path, int target_n_embd, int target_
     hp.n_rot = hp.head_dim;
     if (const gguf_kv * sec = gguf.meta("dflash.rope.dimension_sections")) {
         if (sec->is_arr() && !sec->arr.empty()) {
-            fprintf(stderr, "[dflash] rope: head_dim=%d dimension_sections[0]=%d -> rotating %d dims\n", hp.head_dim,
+            si::logf("[dflash] rope: head_dim=%d dimension_sections[0]=%d -> rotating %d dims\n", hp.head_dim,
                     (int)sec->arr[0].i64, hp.n_rot);
         }
     }
@@ -241,7 +243,7 @@ size_t dflash_model::bytes() const {
             const wt * tw[9] = {&L.wq, &L.wk, &L.wv, &L.wo, &L.ffn_gate, &L.ffn_up, &L.ffn_down, &L.attn_conv_proj,
                                 &L.ffn_conv_proj};
             for (int i = 0; i < 9; i++) {
-                fprintf(stderr, "[dflash] %-7s type=%d K=%d N=%d\n", tyn[i], (int)tw[i]->type, tw[i]->K, tw[i]->N);
+                si::logf("[dflash] %-7s type=%d K=%d N=%d\n", tyn[i], (int)tw[i]->type, tw[i]->K, tw[i]->N);
             }
         }
         add(L.wq);

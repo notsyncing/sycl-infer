@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "proxy.h"
 
 #include "config.h"
@@ -32,6 +34,47 @@ using ojson = nlohmann::ordered_json;
 
 namespace {
 
+// The token counts the worker reports in an OpenAI `usage` object.  A
+// completion response always carries one; a stream carries it in a final
+// usage-only chunk, which the router asks for with `stream_options` and then
+// suppresses unless the client asked for it (see `forward`).
+struct usage_info {
+    bool have = false;
+    long long prompt = 0;     // input tokens
+    long long completion = 0; // output tokens
+    long long cached = 0;     // prompt tokens served from the prefix cache
+};
+
+bool usage_from_object(const ojson & j, usage_info & u) {
+    if (!j.is_object()) {
+        return false;
+    }
+    const auto it = j.find("usage");
+    if (it == j.end() || !it->is_object()) {
+        return false;
+    }
+    u.prompt = it->value("prompt_tokens", 0LL);
+    u.completion = it->value("completion_tokens", 0LL);
+    u.cached = 0;
+    // OpenAI nests it under prompt_tokens_details; the DeepSeek-style alias is
+    // the same number at the top level, so either is enough.
+    if (const auto pd = it->find("prompt_tokens_details"); pd != it->end() && pd->is_object()) {
+        u.cached = pd->value("cached_tokens", 0LL);
+    } else {
+        u.cached = it->value("prompt_cache_hit_tokens", 0LL);
+    }
+    u.have = true;
+    return true;
+}
+
+void log_usage(const std::string & model, const usage_info & u) {
+    if (!u.have) {
+        return;
+    }
+    si::logf("[router] completion model=%s prompt_tokens=%lld completion_tokens=%lld cached_tokens=%lld\n",
+             model.empty() ? "-" : model.c_str(), u.prompt, u.completion, u.cached);
+}
+
 // The state shared between the proxy's upstream thread and httplib's writer
 // thread (the one that runs the chunked provider).
 struct proxy_stream {
@@ -47,7 +90,65 @@ struct proxy_stream {
     bool cancelled = false; // the client went away
     std::string error;
     std::shared_ptr<httplib::Client> client;
+
+    // Completion streams: the SSE frame buffer, what to do with the usage
+    // chunk, and the counts it carries.
+    bool collect_usage = false;
+    bool forward_usage_frame = false;
+    std::string rx;
+    usage_info usage;
 };
+
+// Append an upstream SSE chunk and forward every COMPLETE frame.  A completion
+// stream's last content frame before [DONE] is the usage-only chunk; it is
+// parsed (the router's per-response token log needs it) and dropped unless the
+// client asked for it.  Called with stream.m held.
+void feed_stream(proxy_stream & stream, const char * data, size_t len) {
+    stream.rx.append(data, len);
+    for (;;) {
+        // SSE events end with a blank line; accept both the LF and the CRLF
+        // spelling so an upstream other than this engine's worker still
+        // streams frame by frame.
+        const size_t lf = stream.rx.find("\n\n");
+        const size_t crlf = stream.rx.find("\r\n\r\n");
+        size_t end = std::string::npos;
+        size_t frame_len = 0;
+        if (crlf != std::string::npos && (lf == std::string::npos || crlf <= lf)) {
+            end = crlf;
+            frame_len = 4;
+        } else if (lf != std::string::npos) {
+            end = lf;
+            frame_len = 2;
+        } else {
+            break;
+        }
+        std::string frame = stream.rx.substr(0, end + frame_len);
+        stream.rx.erase(0, end + frame_len);
+        bool usage_frame = false;
+        if (stream.collect_usage && frame.compare(0, 5, "data:") == 0 &&
+            frame.find("\"usage\"") != std::string::npos) {
+            const size_t b = frame.find('{');
+            if (b != std::string::npos) {
+                try {
+                    const ojson j = ojson::parse(frame.substr(b));
+                    usage_info u;
+                    if (usage_from_object(j, u)) {
+                        stream.usage = u;
+                        const auto ch = j.find("choices");
+                        usage_frame = ch == j.end() || (ch->is_array() && ch->empty());
+                    }
+                } catch (...) {
+                    // Not a JSON frame (or not one this router understands):
+                    // forward it untouched.
+                }
+            }
+        }
+        if (usage_frame && !stream.forward_usage_frame) {
+            continue;
+        }
+        stream.chunks.push_back(std::move(frame));
+    }
+}
 
 // Hop-by-hop headers must not be forwarded (RFC 9110 7.6.1), and neither
 // may the ones httplib computes itself.  The comparison is case-insensitive:
@@ -178,7 +279,7 @@ void proxy::access_log(const std::string & method, const std::string & path, int
     if (!cfg_.access_log) {
         return;
     }
-    fprintf(stderr, "[router] %s %s -> %d model=%s %.1fms\n", method.c_str(), path.c_str(), status,
+    si::logf("[router] %s %s -> %d model=%s %.1fms\n", method.c_str(), path.c_str(), status,
             model.empty() ? "-" : model.c_str(), ms);
     fflush(stderr);
 }
@@ -432,27 +533,51 @@ void proxy::handle_completions(const httplib::Request & req, httplib::Response &
     // worker's own id from here on: the worker's /v1/models/{id} and the
     // router's alias then agree.
     std::string body = req.body;
+    bool client_include_usage = false;
     {
         std::string advertised;
         {
             std::lock_guard<std::mutex> lk(slot->mtx);
             advertised = slot->advertised_id;
         }
-        if (!advertised.empty() && advertised != model) {
-            try {
-                ojson j = ojson::parse(body);
-                if (j.is_object()) {
+        try {
+            ojson j = ojson::parse(body);
+            if (j.is_object()) {
+                bool changed = false;
+                if (!advertised.empty() && advertised != model) {
                     j["model"] = advertised;
+                    changed = true;
+                }
+                // A streamed completion only carries a `usage` chunk when the
+                // client asks for one.  The router has to know the counts for
+                // its own log line, so it asks the worker for the chunk and
+                // drops it again unless the client wanted it (see forward()).
+                const bool stream = j.value("stream", false);
+                if (stream && j.contains("stream_options") && j["stream_options"].is_object()) {
+                    client_include_usage = j["stream_options"].value("include_usage", false);
+                }
+                if (stream && !client_include_usage) {
+                    if (!j.contains("stream_options") || j["stream_options"].is_null()) {
+                        j["stream_options"] = ojson::object();
+                    }
+                    if (j["stream_options"].is_object()) {
+                        j["stream_options"]["include_usage"] = true;
+                        changed = true;
+                    }
+                }
+                if (changed) {
                     body = j.dump();
                 }
-            } catch (...) {
-                // A body the router cannot parse is forwarded unchanged and
-                // the worker reports the error.
             }
+        } catch (...) {
+            // A body the router cannot parse is forwarded unchanged and
+            // the worker reports the error.
         }
     }
 
-    forward(req, res, slot, path, body, model);
+    // handle_completions is only reached for /v1/chat/completions and
+    // /v1/completions, so every response here is a completion response.
+    forward(req, res, slot, path, body, model, true, client_include_usage);
 }
 
 void proxy::handle_pipelines(const httplib::Request & req, httplib::Response & res) {
@@ -542,12 +667,13 @@ void proxy::handle_pipeline_run(const httplib::Request & req, httplib::Response 
         }
     }
     const std::string path = "/v1/pipelines/" + id + "/run";
-    forward(req, res, owner, path, req.body, id);
+    forward(req, res, owner, path, req.body, id, false, false);
 }
 
 void proxy::forward(const httplib::Request & req, httplib::Response & res,
                     const std::shared_ptr<model_slot> & slot, const std::string & path,
-                    const std::string & body, const std::string & model) {
+                    const std::string & body, const std::string & model, bool collect_usage,
+                    bool forward_usage_frame) {
     const auto t0 = std::chrono::steady_clock::now();
     httplib::Headers headers;
     for (const auto & kv : req.headers) {
@@ -578,6 +704,16 @@ void proxy::forward(const httplib::Request & req, httplib::Response & res,
             }
             const char * ct = httplib::detail::get_header_value(up->headers, "Content-Type", "application/json", 0);
             res.set_content(up->body, ct);
+            if (collect_usage && up->status >= 200 && up->status < 300) {
+                try {
+                    usage_info u;
+                    if (usage_from_object(ojson::parse(up->body), u)) {
+                        log_usage(model, u);
+                    }
+                } catch (...) {
+                    // A body that is not JSON (an error page, say) has no usage.
+                }
+            }
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         access_log(req.method, req.path, res.status, model, ms);
@@ -588,6 +724,8 @@ void proxy::forward(const httplib::Request & req, httplib::Response & res,
     // is forwarded chunk by chunk through the provider.
     auto stream = std::make_shared<proxy_stream>();
     stream->client = cli;
+    stream->collect_usage = collect_usage;
+    stream->forward_usage_frame = forward_usage_frame;
 
     std::thread([stream, cli, path, headers, body]() {
         // Client::send() with a hand-built request, because the POST
@@ -613,7 +751,11 @@ void proxy::forward(const httplib::Request & req, httplib::Response & res,
             if (stream->cancelled) {
                 return false;
             }
-            stream->chunks.emplace_back(data, len);
+            if (stream->collect_usage) {
+                feed_stream(*stream, data, len);
+            } else {
+                stream->chunks.emplace_back(data, len);
+            }
             stream->cv.notify_all();
             return true;
         };
@@ -622,6 +764,12 @@ void proxy::forward(const httplib::Request & req, httplib::Response & res,
             std::lock_guard<std::mutex> lk(stream->m);
             if (!up) {
                 stream->error = httplib::to_string(up.error());
+            }
+            // A frame the upstream never terminated is still the client's
+            // data: hand it over rather than holding it for ever.
+            if (stream->collect_usage && !stream->rx.empty()) {
+                stream->chunks.push_back(std::move(stream->rx));
+                stream->rx.clear();
             }
             stream->done = true;
             stream->cv.notify_all();
@@ -736,6 +884,12 @@ void proxy::forward(const httplib::Request & req, httplib::Response & res,
             const double ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
             access_log(log_method, log_path, success ? 200 : 499, log_model, ms);
+            usage_info u;
+            {
+                std::lock_guard<std::mutex> lk(stream->m);
+                u = stream->usage;
+            }
+            log_usage(log_model, u);
             if (success) {
                 return;
             }

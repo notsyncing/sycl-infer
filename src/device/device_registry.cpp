@@ -1,3 +1,5 @@
+#include "log.h"
+
 // Device registry: the list of cards, and the selection that reads it.
 //
 // This file knows nothing about any particular GPU.  Each card owns a
@@ -324,7 +326,7 @@ bool profile_flag(const sycl::queue & q, const char * env_name, bool profile_def
 
 void report(const profile & p, const char * how, bool warn_unknown) {
     if (si::env::flag("PF_DEVICE_INFO")) {
-        fprintf(stderr,
+        si::logf(
                 "[dev] profile=%s  (%s)\n"
                 "      provenance: %s\n"
                 "      hw: eus=%d max_wg=%d slm=%d B xmx(dpas)=%d\n"
@@ -353,7 +355,7 @@ void report(const profile & p, const char * how, bool warn_unknown) {
                 p.wt.dpas_in_gemm);
     }
     if (warn_unknown && std::strcmp(p.key, "unknown") == 0) {
-        fprintf(stderr,
+        si::logf(
                 "[dev] WARNING: no device profile matches this GPU; tuned values are guesses "
                 "copied from arc_a770.  Add a file under src/device/profiles/ and a row in "
                 "kDevices -- see AGENTS.md.\n");
@@ -383,7 +385,7 @@ const profile & active() {
                 report(p, "forced by PF_DEVICE_PROFILE / build");
                 return &p;
             }
-            fprintf(stderr, "[dev] device profile '%s' is not a registered card; "
+            si::logf("[dev] device profile '%s' is not a registered card; "
                             "falling back to auto-detect\n",
                     baked);
         }

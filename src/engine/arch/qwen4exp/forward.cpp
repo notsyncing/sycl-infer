@@ -1,3 +1,5 @@
+#include "log.h"
+
 // Qwen3.8-Flash-Next forward path.
 //
 // The architecture replaces every layer norm with hyper-connections, adds an
@@ -205,7 +207,7 @@ void engine::q4_build_down_i8() {
         nlayers++;
     }
     const double c1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    fprintf(stderr, "[q4] down int8 store: %d layer(s), %.1f GiB in %.1f s\n", nlayers,
+    si::logf("[q4] down int8 store: %d layer(s), %.1f GiB in %.1f s\n", nlayers,
             (double)bytes / (1024.0 * 1024.0 * 1024.0), c1 - c0);
 }
 
@@ -279,7 +281,7 @@ void engine::q4_alloc() {
         const int sel_env = SI_ENV_I32("PF_QSA_SEL_DEV", 0);
         q4x_.qsa.sel_dev = sel_env != 0 && q4x_.qsa.idx_dev && q4x_.qsa.devattn && sel_cap;
         if (sel_env != 0 && !q4x_.qsa.sel_dev) {
-            fprintf(stderr, "[q4] QSA: device selector disabled (needs PF_QSA_IDX_DEV, PF_QSA_DEVATTN, "
+            si::logf("[q4] QSA: device selector disabled (needs PF_QSA_IDX_DEV, PF_QSA_DEVATTN, "
                             "%d pools <= 512, idx_head_dim %d <= 256)\n",
                     q4_hp(hp).idx_top_k / kp_cfg, q4_hp(hp).idx_head_dim);
         }
@@ -294,7 +296,7 @@ void engine::q4_alloc() {
         q4x_.qsa.pending.resize((size_t)attn_layers());
         q4x_.qsa.early_ev.resize((size_t)attn_layers());
         q4x_.qsa.idx_slot.resize((size_t)attn_layers());
-        fprintf(stderr, "[q4] QSA: host indexer, top-%d of %d-key pools (ctx %d > %d)\n", q4_hp(hp).idx_top_k, q4_hp(hp).idx_kpool,
+        si::logf("[q4] QSA: host indexer, top-%d of %d-key pools (ctx %d > %d)\n", q4_hp(hp).idx_top_k, q4_hp(hp).idx_kpool,
                 max_seq, q4_hp(hp).idx_top_k);
     }
     if (q4_hp(hp).ple_layer >= 0 && q4x_.engram_ram_mb_ > 0 && q4_hp(hp).ple_head_dim > 0) {
@@ -310,7 +312,7 @@ void engine::q4_alloc() {
         q4x_.engram_cap_ = p2;
         q4x_.engram_tag_.assign(q4x_.engram_cap_, -1);
         q4x_.engram_row_.assign(q4x_.engram_cap_ * (size_t)q4_hp(hp).ple_head_dim, 0.f);
-        fprintf(stderr, "[q4] engram RAM tier: %zu rows (%.0f MiB) + mmap disk tier\n", q4x_.engram_cap_,
+        si::logf("[q4] engram RAM tier: %zu rows (%.0f MiB) + mmap disk tier\n", q4x_.engram_cap_,
                 (double)(q4x_.engram_cap_ * row_bytes) / (1024.0 * 1024.0));
     }
     if (q4_hp(hp).ple_layer >= 0) {
@@ -498,7 +500,7 @@ void engine::q4_prefault() {
         t.join();
     }
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0;
-    fprintf(stderr,
+    si::logf(
             "[q4] prefaulted %.1f GiB of host-side weights in %.1f s (%llu) [skipped %.1f GiB already pinned/device]\n",
             (double)total / (1024.0 * 1024.0 * 1024.0), dt, acc.load(), (double)skipped / (1024.0 * 1024.0 * 1024.0));
 }
@@ -553,7 +555,7 @@ void engine::q4_upload_init(int nd, size_t max_plane) {
         }
         char * p = (char *)sycl::malloc_host(bytes, dev_queue(d));
         if (!p) {
-            fprintf(stderr, "[q4] upload staging: %.1f MB pinned allocation failed; using direct copies\n",
+            si::logf("[q4] upload staging: %.1f MB pinned allocation failed; using direct copies\n",
                     (double)bytes / (1024.0 * 1024.0));
             for (int e = 0; e < d; e++) {
                 if (q4x_.q4_up_stage_[(size_t)e]) {
@@ -589,7 +591,7 @@ void engine::q4_upload_init(int nd, size_t max_plane) {
         q4x_.q4_up_q_[(size_t)d] =
             std::make_unique<sycl::queue>(qd.get_context(), qd.get_device(), upq_props);
     }
-    fprintf(stderr, "[q4] upload staging: %d x %.2f MB pinned per device (async copy queue)\n", q4x_.q4_up_slots_,
+    si::logf("[q4] upload staging: %d x %.2f MB pinned per device (async copy queue)\n", q4x_.q4_up_slots_,
             (double)q4x_.q4_up_stride_ / (1024.0 * 1024.0));
 }
 
@@ -700,7 +702,7 @@ void engine::q4_alloc_banks() {
             const size_t bu = (size_t)L.moe.up_exps.E * L.moe.up_exps.plane_bytes;
             const size_t bd = (size_t)L.moe.down_exps.E * L.moe.down_exps.plane_bytes;
             if (bg >= (2ull << 30) || bu >= (2ull << 30) || bd >= (2ull << 30)) {
-                fprintf(stderr, "[q4] mirror: layer %d tensor >= 2 GiB, leaving it on the host\n", il);
+                si::logf("[q4] mirror: layer %d tensor >= 2 GiB, leaving it on the host\n", il);
                 continue;
             }
             if (!sm[(size_t)dev]) {
@@ -720,7 +722,7 @@ void engine::q4_alloc_banks() {
                 if (b.g) sycl::free(b.g, q);
                 if (b.u) sycl::free(b.u, q);
                 if (b.d) sycl::free(b.d, q);
-                fprintf(stderr, "[q4] mirror: pinned allocation failed at layer %d\n", il);
+                si::logf("[q4] mirror: pinned allocation failed at layer %d\n", il);
                 continue;
             }
             std::memcpy(b.g, L.moe.gate_exps.data, bg);
@@ -738,7 +740,7 @@ void engine::q4_alloc_banks() {
             total += bg + bu + bd;
             nbank++;
         }
-        fprintf(stderr, "[q4] pinned expert mirror: %d layers, %.1f GiB (GPU reads over PCIe)\n", nbank,
+        si::logf("[q4] pinned expert mirror: %d layers, %.1f GiB (GPU reads over PCIe)\n", nbank,
                 (double)total / (1024.0 * 1024.0 * 1024.0));
         if (nbank) {
             return;
@@ -760,7 +762,7 @@ void engine::q4_alloc_banks() {
     // allocation, both for the A/B.
     const char * bk = si::env::str("PF_Q4_BANK");
     if (bk && bk[0] == '0') {
-        fprintf(stderr, "[q4] VRAM expert bank disabled by PF_Q4_BANK=0\n");
+        si::logf("[q4] VRAM expert bank disabled by PF_Q4_BANK=0\n");
         return;
     }
     const int nd = multi_dev ? (int)backends_.size() : 1;
@@ -845,7 +847,7 @@ void engine::q4_alloc_banks() {
             }
         }
         if (R < 8) {
-            fprintf(stderr, "[q4] hot bank: budget too small for 8 slots/layer, all experts stay on the host\n");
+            si::logf("[q4] hot bank: budget too small for 8 slots/layer, all experts stay on the host\n");
             return;
         }
         int nbank = 0;
@@ -872,7 +874,7 @@ void engine::q4_alloc_banks() {
         size_t q5sb_bytes = 0;
         double q5sb_s = 0.0;
         if (q5sb_on && !q5sb_ok) {
-            fprintf(stderr, "[q4] q5_1 down repack: disabled (needs PF_Q4_PIN_SRC=1 and PF_Q4_CPU_MISS=0)\n");
+            si::logf("[q4] q5_1 down repack: disabled (needs PF_Q4_PIN_SRC=1 and PF_Q4_CPU_MISS=0)\n");
         }
         size_t pin_bytes = 0;
         int pin_layers = 0;
@@ -964,7 +966,7 @@ void engine::q4_alloc_banks() {
                     if (b.hu) sycl::free(b.hu, pin_q);
                     if (b.hd) sycl::free(b.hd, pin_q);
                     b.hg = b.hu = b.hd = nullptr;
-                    fprintf(stderr, "[q4] pinned expert source: allocation failed at layer %d; using staging\n", il);
+                    si::logf("[q4] pinned expert source: allocation failed at layer %d; using staging\n", il);
                 }
             }
             q4x_.q4_bank_layer_[(size_t)il] = b;
@@ -984,17 +986,17 @@ void engine::q4_alloc_banks() {
         }
         q4x_.q4_lru_age_.assign(q4x_.q4_r_off_.back(), 0);
         q4x_.q4_lru_heat_.assign(q4x_.q4_r_off_.back(), 0.f);
-        fprintf(stderr, "[q4] hot expert bank: %d slots/layer, %d layers, %.1f GiB (calibrating on first prefill)\n", R,
+        si::logf("[q4] hot expert bank: %d slots/layer, %d layers, %.1f GiB (calibrating on first prefill)\n", R,
                 nbank, (double)total / (1024.0 * 1024.0 * 1024.0));
         if (pin_src) {
             const double gbps = pin_read_s > 0.0 ? (double)pin_bytes / 1e9 / pin_read_s : 0.0;
-            fprintf(stderr,
+            si::logf(
                     "[q4] pinned expert source: %d layers, %.1f GiB in %.1f s (%.2f GB/s, %s, %d workers)\n", pin_layers,
                     (double)pin_bytes / (1024.0 * 1024.0 * 1024.0), pin_read_s, gbps, pread_on ? "pread" : "memcpy",
                     pread_on ? pread_w : 1);
         }
         if (q5sb_layers > 0) {
-            fprintf(stderr, "[q4] q5_1 down repack: %d layers, %.1f GiB in %.2f s\n", q5sb_layers,
+            si::logf("[q4] q5_1 down repack: %d layers, %.1f GiB in %.2f s\n", q5sb_layers,
                     (double)q5sb_bytes / (1024.0 * 1024.0 * 1024.0), q5sb_s);
         }
         size_t max_plane = 0;
@@ -1049,19 +1051,19 @@ void engine::q4_alloc_banks() {
                     }
                     q4x_.q4_hot_ready_ = true;
                     q4x_.q4_cal_done_ = true; // a static slot map is authoritative
-                    fprintf(stderr, "[q4] hot bank: slot map loaded from %s (static calibration)\n", sf);
+                    si::logf("[q4] hot bank: slot map loaded from %s (static calibration)\n", sf);
                 } else {
-                    fprintf(stderr, "[q4] slot map %s is short (%zu/%zu); ignored\n", sf, n, q4x_.q4_sm_host_.size());
+                    si::logf("[q4] slot map %s is short (%zu/%zu); ignored\n", sf, n, q4x_.q4_sm_host_.size());
                 }
             } else {
-                fprintf(stderr, "[q4] slot map %s not readable\n", sf);
+                si::logf("[q4] slot map %s not readable\n", sf);
             }
         }
         const char * cf = si::env::str("PF_Q4_CAL_LOAD");
         if (cf) {
             FILE * f = fopen(cf, "rb");
             if (!f) {
-                fprintf(stderr, "[q4] calibration file %s not readable; will calibrate on the first prefill\n", cf);
+                si::logf("[q4] calibration file %s not readable; will calibrate on the first prefill\n", cf);
             } else {
                 q4x_.q4_cal_.resize((size_t)hp.n_layer * (size_t)E);
                 const size_t n = fread(q4x_.q4_cal_.data(), sizeof(uint32_t), q4x_.q4_cal_.size(), f);
@@ -1070,7 +1072,7 @@ void engine::q4_alloc_banks() {
                     q4x_.q4_cal_pairs_ = 1;
                     q4_hot_calibrate();
                 } else {
-                    fprintf(stderr, "[q4] calibration file %s is short (%zu/%zu); ignored\n", cf, n, q4x_.q4_cal_.size());
+                    si::logf("[q4] calibration file %s is short (%zu/%zu); ignored\n", cf, n, q4x_.q4_cal_.size());
                     q4x_.q4_cal_.clear();
                 }
             }
@@ -1084,7 +1086,7 @@ void engine::q4_alloc_banks() {
                 continue;
             }
             const layer_t & L = m.layers[(size_t)il];
-            fprintf(stderr, "[q4bank] cand il=%d dev=%d g=%u u=%u d=%u\n", il, dev, L.moe.gate_exps.type,
+            si::logf("[q4bank] cand il=%d dev=%d g=%u u=%u d=%u\n", il, dev, L.moe.gate_exps.type,
                     L.moe.up_exps.type, L.moe.down_exps.type);
         }
         return;
@@ -1163,9 +1165,9 @@ void engine::q4_alloc_banks() {
                 for (int i = 0; i < 256; i++) {
                     bad += got[(size_t)i] != want[(size_t)i];
                 }
-                fprintf(stderr, "[q4bank] il=%d %s dev=%p host=%p bad=%d\n", il, nm, dp, sp, bad);
+                si::logf("[q4bank] il=%d %s dev=%p host=%p bad=%d\n", il, nm, dp, sp, bad);
             };
-            fprintf(stderr, "[q4bank] il=%d g=%p u=%p d=%p types g=%u u=%u d=%u\n", il, b.g, b.u, b.d,
+            si::logf("[q4bank] il=%d g=%p u=%p d=%p types g=%u u=%u d=%u\n", il, b.g, b.u, b.d,
                     L.moe.gate_exps.type, L.moe.up_exps.type, L.moe.down_exps.type);
             chk("g", b.g, L.moe.gate_exps.data, bg);
             chk("u", b.u, L.moe.up_exps.data, bu);
@@ -1180,7 +1182,7 @@ void engine::q4_alloc_banks() {
         nbank++;
     }
     if (nbank) {
-        fprintf(stderr, "[q4] VRAM expert bank: %d of %d layers (%.1f MiB total, %zu MiB/device budget)\n", nbank,
+        si::logf("[q4] VRAM expert bank: %d of %d layers (%.1f MiB total, %zu MiB/device budget)\n", nbank,
                 hp.n_layer, (double)total / (1024.0 * 1024.0), per_dev / (1024ull * 1024ull));
     }
 }
@@ -1640,7 +1642,7 @@ void engine::q4_hot_calibrate() {
     const size_t pairs = q4x_.q4_cal_pairs_;
     std::fill(q4x_.q4_cal_.begin(), q4x_.q4_cal_.end(), 0);
     q4x_.q4_cal_pairs_ = 0;
-    fprintf(stderr, "[q4] hot calibration: %d..%d slots/layer on %d layers, %zu experts copied, %.1f GiB, %zu pairs\n",
+    si::logf("[q4] hot calibration: %d..%d slots/layer on %d layers, %zu experts copied, %.1f GiB, %zu pairs\n",
             q4x_.q4_hot_r_, q4x_.q4_hot_r_ == 0 ? 0 : q4x_.R_cur_.empty() ? 0 : q4x_.R_cur_[0], layers, copied,
             (double)bytes / (1024.0 * 1024.0 * 1024.0), pairs);
     const char * sf = si::env::str("PF_Q4_SM_SAVE");
@@ -1649,7 +1651,7 @@ void engine::q4_hot_calibrate() {
         if (f) {
             fwrite(q4x_.q4_sm_host_.data(), sizeof(int32_t), q4x_.q4_sm_host_.size(), f);
             fclose(f);
-            fprintf(stderr, "[q4] hot calibration: slot map saved to %s\n", sf);
+            si::logf("[q4] hot calibration: slot map saved to %s\n", sf);
         }
     }
 }
@@ -1675,7 +1677,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     static const bool q4trace = std::getenv("PF_Q4_QSADBG") != nullptr;
     auto to_host = [&](int d, void * dst, const void * src, size_t bytes) {
         if (q4trace) {
-            fprintf(stderr, "[q4] to_host d=%d bytes=%zu\n", d, bytes);
+            si::logf("[q4] to_host d=%d bytes=%zu\n", d, bytes);
         }
         if (is_cpu(d)) {
             std::memcpy(dst, src, bytes);
@@ -1685,7 +1687,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
     };
     auto from_host = [&](int d, void * dst, const void * src, size_t bytes) {
         if (q4trace) {
-            fprintf(stderr, "[q4] from_host d=%d bytes=%zu\n", d, bytes);
+            si::logf("[q4] from_host d=%d bytes=%zu\n", d, bytes);
         }
         if (is_cpu(d)) {
             std::memcpy(dst, src, bytes);
@@ -1717,7 +1719,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
             }
         }
-        fprintf(stderr, "[q4] L%-2d %-22s rms=%.6g max=%.6g first=%.6g %.6g %.6g %.6g\n", q4_il, tag,
+        si::logf("[q4] L%-2d %-22s rms=%.6g max=%.6g first=%.6g %.6g %.6g %.6g\n", q4_il, tag,
                 std::sqrt(ss / (double)n), mx, h[0], h[1], h[2], h[3]);
         if (streams == 0 && n % (size_t)n_tok == 0 && n_tok > 1) {
             const size_t per = n / (size_t)n_tok;
@@ -1726,7 +1728,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 for (size_t i = 0; i < per; i++) {
                     q += (double)h[(size_t)t * per + i] * h[(size_t)t * per + i];
                 }
-                fprintf(stderr, "[q4] L%-2d   tok%d rms=%.6g\n", q4_il, t, std::sqrt(q / (double)per));
+                si::logf("[q4] L%-2d   tok%d rms=%.6g\n", q4_il, t, std::sqrt(q / (double)per));
             }
         }
         if (streams > 0 && h.size() % (size_t)streams == 0) {
@@ -1736,7 +1738,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 for (size_t i = 0; i < per; i++) {
                     q += (double)h[(size_t)s * per + i] * h[(size_t)s * per + i];
                 }
-                fprintf(stderr, "[q4] L%-2d   stream%d rms=%.6g\n", q4_il, s, std::sqrt(q / (double)per));
+                si::logf("[q4] L%-2d   stream%d rms=%.6g\n", q4_il, s, std::sqrt(q / (double)per));
             }
         }
     };
@@ -1878,7 +1880,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             // so an async copy stays valid; the kernel is enqueued after it on
             // the same in-order queue and therefore reads the new descriptor.
             if (q4trace) {
-                fprintf(stderr, "[q4] seg copy d=%d K=%d N=%d\n", d, w.K, w.N);
+                si::logf("[q4] seg copy d=%d K=%d N=%d\n", d, w.K, w.N);
             }
             std::memcpy(b.host_segs + si, &s, sizeof(s));
             if (gs_on) {
@@ -1903,7 +1905,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             t_gemvk += tk;
             n_gemv_calls++;
             if (si::env::flag("PF_Q4_GEMVDET")) {
-                fprintf(stderr, "[q4gemv] d=%d K=%d N=%d type=%u segc=%.3f enq=%.3f wait=%.3f ms\n", d, w.K, w.N,
+                si::logf("[q4gemv] d=%d K=%d N=%d type=%u segc=%.3f enq=%.3f wait=%.3f ms\n", d, w.K, w.N,
                         w.type, tc_last, te - tk0, tk - (te - tk0));
             }
         } else {
@@ -2015,14 +2017,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             t_gemvk += tk;
             n_gemv_calls++;
             if (si::env::flag("PF_Q4_GEMVDET")) {
-                fprintf(stderr, "[q4gemv] group d=%d n=%d total=%d mixed=%d enq=%.3f wait=%.3f ms:", d, m, total,
+                si::logf("[q4gemv] group d=%d n=%d total=%d mixed=%d enq=%.3f wait=%.3f ms:", d, m, total,
                         (int)mixed, te - tk0, tk - (te - tk0));
                 for (int i = 0; i < n; i++) {
                     if (it[i].w->data) {
-                        fprintf(stderr, " [type=%u K=%d N=%d]", it[i].w->type, it[i].w->K, it[i].w->N);
+                        si::logf(" [type=%u K=%d N=%d]", it[i].w->type, it[i].w->K, it[i].w->N);
                     }
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
         }
     };
@@ -2556,7 +2558,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                                     plev[a].get_profiling_info<sycl::info::event_profiling::command_end>()) /
                            1.0e6;
                 };
-                fprintf(stderr, "[q4pleg] dev=%d key=%.4f val=%.4f total=%.4f ms\n", dev, kdur(0, 1), kdur(1, 2),
+                si::logf("[q4pleg] dev=%d key=%.4f val=%.4f total=%.4f ms\n", dev, kdur(0, 1), kdur(1, 2),
                         kdur(0, 2));
             }
             cpu_q4_ple_gate(q4x_.q4_ple_key_, q4x_.q4_host_res_, q4_layer(L).ple.norm_key, q4_layer(L).ple.norm_query, q4x_.q4_ple_gate_, nullptr, n_tok,
@@ -2617,7 +2619,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 const double idx_ms = pl_g0 - pl_wall0;
                 const double d2h = pl_c1 - pl_g2, gate_ms = pl_ga - pl_c1;
                 const double apply_ms = pl_ap - pl_ga, h2d = pl_c2 - pl_ap;
-                fprintf(stderr,
+                si::logf(
                         "[q4ple] n=%d faults=%ld/%ld hits=%zu miss=%zu | idx=%.3f gather=%.3f proj=%.3f d2h=%.3f "
                         "gate=%.3f apply=%.3f h2d=%.3f misc=%.3f block=%.3f ms\n",
                         n_tok, ple_ru1.ru_minflt - ple_ru0.ru_minflt, ple_ru1.ru_majflt - ple_ru0.ru_majflt,
@@ -2783,7 +2785,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
                 if (max_nkv > q4_hp(hp).idx_top_k && !warned_qsa && q4_hp(hp).idx_kpool > 1) {
                     warned_qsa = true;
-                    fprintf(stderr,
+                    si::logf(
                             "[q4] WARNING: context %d exceeds the QSA budget %d; dense attention is used and the "
                             "result will diverge from the reference at this depth.\n",
                             max_nkv, q4_hp(hp).idx_top_k);
@@ -2921,7 +2923,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 // the per-stage numbers below are this layer's FFN and not the
                 // token mixer's queue behind it.  Diagnostic only.
                 qd.wait();
-                fprintf(stderr, "[q4hot] il=%d pre=%.1f", il, now_ms() - thl);
+                si::logf("[q4hot] il=%d pre=%.1f", il, now_ms() - thl);
                 thl = now_ms();
             }
             double ts0 = 0.0;
@@ -2949,7 +2951,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 const double ts = now_ms();
                 qd.wait();
                 const double t = now_ms();
-                fprintf(stderr, "[q4rt] il=%d router=%.3f sub=%.3f drain=%.3f", il, t - trt, ts - trt, t - ts);
+                si::logf("[q4rt] il=%d router=%.3f sub=%.3f drain=%.3f", il, t - trt, ts - trt, t - ts);
                 trt = t;
             }
             if (hist_on || (q4x_.q4_hot_ && mode != 0)) {
@@ -3021,11 +3023,11 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     qd.memcpy(q4x_.q4_moe_ids_, A.ids, (size_t)np * sizeof(int32_t)).wait();
                 }
                 if (q4rt) {
-                    fprintf(stderr, " copy=%.3f\n", now_ms() - trt);
+                    si::logf(" copy=%.3f\n", now_ms() - trt);
                 }
                 if (htt) {
                     const double t = now_ms();
-                    fprintf(stderr, " ids=%.1f", t - ti0);
+                    si::logf(" ids=%.1f", t - ti0);
                     thl = t;
                 }
                 const int E = hp.n_expert;
@@ -3057,7 +3059,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
                 if ((int)act.size() > R) {
                     if (si::env::flag("PF_Q4_PF_ONEPASS")) {
-                        fprintf(stderr,
+                        si::logf(
                                 "[q4] hot bank: layer %d selects %zu experts against %d slots "
                                 "(PF_Q4_PF_ONEPASS=1: pairs whose expert did not fit are dropped)\n",
                                 il, act.size(), R);
@@ -3178,7 +3180,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         pf_act += (int)act.size();
                         pf_upb += (size_t)ncopy * (bank->sg + bank->su + bank->sd);
                         if (si::env::flag("PF_Q4_PF_STATS")) {
-                            fprintf(stderr, "[q4pf2] il=%d act=%zu hot=%d kept=%d batches=%zu copies=%d\n", il,
+                            si::logf("[q4pf2] il=%d act=%zu hot=%d kept=%d batches=%zu copies=%d\n", il,
                                     act.size(), h, kept_n, pf_bstart.size() - 1, ncopy);
                         }
                     }
@@ -3437,13 +3439,13 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         // compare against what was uploaded.
                         one(bd, (const char *)bank->d, dsrc, bank->sd);
                     }
-                    fprintf(stderr, "[q4hotchk] il=%d act=%zu bad=%d/%d/%d\n", il, act.size(), bg, bu, bd);
+                    si::logf("[q4hotchk] il=%d act=%zu bad=%d/%d/%d\n", il, act.size(), bg, bu, bd);
                 }
                 if (htt) {
                     const double tl = now_ms();
                     qd.wait();
                     const double t = now_ms();
-                    fprintf(stderr, " lru=%.1f sel=%.2f ev=%.2f sm=%.2f up=%.1f lwait=%.1f miss=%d upmb=%.2f",
+                    si::logf(" lru=%.1f sel=%.2f ev=%.2f sm=%.2f up=%.1f lwait=%.1f miss=%d upmb=%.2f",
                             tl - thl, (tl - thl) - (l_ev1 - l_ev0) - (l_sm1 - l_ev1), l_ev1 - l_ev0, l_sm1 - l_ev1,
                             t - tl, q4x_.q4_up_wait_ms_ - q4_up_wait_snap, upmiss,
                             (double)upbytes / (1024.0 * 1024.0));
@@ -3551,7 +3553,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 if (htt) {
                     qd.wait();
                     const double t = now_ms();
-                    fprintf(stderr, " aq=%.1f", t - thl);
+                    si::logf(" aq=%.1f", t - thl);
                     thl = t;
                 }
                 // PF_Q4_SHOVER (default on): submit the shared expert's three
@@ -3592,7 +3594,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 if (htt) {
                     qd.wait();
                     const double t = now_ms();
-                    fprintf(stderr, " gu=%.1f", t - thl);
+                    si::logf(" gu=%.1f", t - thl);
                     thl = t;
                 }
                 quant_h();
@@ -3618,7 +3620,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                                         kt[a].get_profiling_info<sycl::info::event_profiling::command_end>()) /
                                1.0e6;
                     };
-                    fprintf(stderr, "[q4kt] il=%d dev=%d nact=%d np=%d gtype=%u dtype=%u gu=%.4f dn=%.4f\n", il, dev,
+                    si::logf("[q4kt] il=%d dev=%d nact=%d np=%d gtype=%u dtype=%u gu=%.4f dn=%.4f\n", il, dev,
                             n_act, np, (unsigned)L.moe.gate_exps.type, (unsigned)L.moe.down_exps.type, kdur(0, 1),
                             kdur(2, 3));
                 }
@@ -3686,7 +3688,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 }
                 if (cmiss_time) {
                     qd.wait();
-                    fprintf(stderr,
+                    si::logf(
                             "[q4cm] il=%d np=%d gpu=%d cpu=%zu tail=%d submit=%.3f host=%.3f wall=%.3f\n", il, np,
                             np - (int)cmiss_pr.size() - cmiss_tail, cmiss_pr.size(), cmiss_tail, t_cmiss_submit,
                             t_cmiss_host, now_ms() - tcg0);
@@ -3694,7 +3696,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 if (htt) {
                     qd.wait();
                     const double t = now_ms();
-                    fprintf(stderr, " dn=%.1f", t - thl);
+                    si::logf(" dn=%.1f", t - thl);
                     thl = t;
                 }
             } else {
@@ -3800,7 +3802,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 if (htt) {
                     qd.wait();
                     const double t = now_ms();
-                    fprintf(stderr, " 2pass=%.1f act=%zu batches=%zu", t - thl, act.size(), pf_bstart.size() - 1);
+                    si::logf(" 2pass=%.1f act=%zu batches=%zu", t - thl, act.size(), pf_bstart.size() - 1);
                     thl = t;
                 }
             }
@@ -3868,7 +3870,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         wpr = pr;
                     }
                 }
-                fprintf(stderr, "[q4ffcmp] il=%d np=%d cos=%.6f rms=%.4f max=%.4f worst=%.4f pr=%d\n", il, np,
+                si::logf("[q4ffcmp] il=%d np=%d cos=%.6f rms=%.4f max=%.4f worst=%.4f pr=%d\n", il, np,
                         dot / (std::sqrt(na * nb) + 1e-30), std::sqrt(na / (nb + 1e-30)), mx, worst, wpr);
                 if (si::env::flag("PF_Q4_FFCMP_H")) {
                     std::vector<float> gh((size_t)np * (size_t)hp.n_ff_exp);
@@ -3898,7 +3900,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         a2 += gg * gg;
                         c2 += hh * hh;
                     }
-                    fprintf(stderr, "[q4ffcmp]   h pair0 e=%d cos=%.5f rms=%.4f\n", e0,
+                    si::logf("[q4ffcmp]   h pair0 e=%d cos=%.5f rms=%.4f\n", e0,
                             d2 / (std::sqrt(a2 * c2) + 1e-30), std::sqrt(a2 / (c2 + 1e-30)));
                 }
                 if (si::env::flag("PF_Q4_FFCMP_MAP")) {
@@ -3919,7 +3921,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                                 bi = q;
                             }
                         }
-                        fprintf(stderr, "[q4ffcmp]   pr=%d best=%d cos=%.4f\n", pr, bi, best);
+                        si::logf("[q4ffcmp]   pr=%d best=%d cos=%.4f\n", pr, bi, best);
                     }
                 }
             }
@@ -3929,7 +3931,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             if (htt) {
                 qd.wait();
                 const double t = now_ms();
-                fprintf(stderr, " red=%.1f", t - thl);
+                si::logf(" red=%.1f", t - thl);
                 thl = t;
             }
             const double tsh0 = htt ? now_ms() : 0.0;
@@ -3975,7 +3977,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             if (htt) {
                 qd.wait();
                 const double t = now_ms();
-                fprintf(stderr, " sh=%.1f tot=%.1f\n", t - tsh0, t - th0);
+                si::logf(" sh=%.1f tot=%.1f\n", t - tsh0, t - th0);
                 thl = t;
             }
             if (q4time) {
@@ -3996,7 +3998,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                               hp.n_expert, k, b.router_logits, b.router_ids, b.router_wts);
             sycl::queue & qd = DQ(dev);
             if (q4trace) {
-                fprintf(stderr, "[q4] router copies d=%d n=%d\n", dev, n_tok);
+                si::logf("[q4] router copies d=%d n=%d\n", dev, n_tok);
             }
             qd.memcpy(q4x_.q4_host_mix_, b.mixed, (size_t)n_tok * n_embd * sizeof(float));
             qd.memcpy(q4x_.q4_moe_ids_, b.router_ids, (size_t)n_tok * k * sizeof(int32_t));
@@ -4051,16 +4053,16 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                         }
                     }
                 }
-                fprintf(stderr, "[q4] L0 moe_logits tok%d:", t);
+                si::logf("[q4] L0 moe_logits tok%d:", t);
                 for (int j = 0; j < 5; j++) {
-                    fprintf(stderr, " %d(%.4f)", bi[j], q4x_.q4_moe_logits_[t * hp.n_expert + bi[j]]);
+                    si::logf(" %d(%.4f)", bi[j], q4x_.q4_moe_logits_[t * hp.n_expert + bi[j]]);
                 }
-                fprintf(stderr, "\n");
-                fprintf(stderr, "[q4] L0 moe_ids tok%d:", t);
+                si::logf("\n");
+                si::logf("[q4] L0 moe_ids tok%d:", t);
                 for (int j = 0; j < k; j++) {
-                    fprintf(stderr, " %d(%.3f)", q4x_.q4_moe_ids_[t * k + j], q4x_.q4_moe_wts_[t * k + j]);
+                    si::logf(" %d(%.3f)", q4x_.q4_moe_ids_[t * k + j], q4x_.q4_moe_wts_[t * k + j]);
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
         }
         const double te0 = q4time ? now_ms() : 0.0;
@@ -4124,14 +4126,14 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
 
     q4x_.q4_hotchk_done_ = true;
     if (pf_layers && si::env::flag("PF_Q4_PF_STATS")) {
-        fprintf(stderr,
+        si::logf(
                 "[q4pf] mode=%d n=%d layers=%d act=%d batches=%d upload=%.1f MiB (%.2f s at 2 GB/s)\n", mode, n_tok,
                 pf_layers, pf_act, pf_batches, (double)pf_upb / (1024.0 * 1024.0),
                 (double)pf_upb / (2.0e9));
     }
     if (q4time) {
         const double total = now_ms() - t_start;
-        fprintf(stderr,
+        si::logf(
                 "[q4] fwd n=%d moe_host=%.1f rest=%.1f | route=%.1f experts=%.1f shared=%.1f copies=%.1f ms\n", n_tok,
                 t_moe, total - t_moe, t_route, t_exp, t_shared, t_cp);
     }
@@ -4139,7 +4141,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         if (!qsatime) {
             return;
         }
-        fprintf(stderr,
+        si::logf(
                 "[qsa] fwd mode=%d n=%d total=%.2f wall=%.2f | copy=%.2f gemv=%.2f upd=%.2f sel=%.2f attn=%.2f "
                 "ms (rows=%ld nsel=%ld)\n",
                 mode, n_tok, t_qsa, now_ms() - t_wall0, q4x_.qsa.copy_ms, q4x_.qsa.gemv_ms, q4x_.qsa.upd_ms, q4x_.qsa.sel_ms,
@@ -4166,7 +4168,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         }
         q4x_.q4_up_prof_.clear();
         const double rate = dma > 0.01 ? mib * 1.048576 / dma : 0.0;
-        fprintf(stderr,
+        si::logf(
                 "[q4up] n=%d calls=%zu bytes=%.1f MiB copy=%.2f enq=%.2f wait=%.2f dma=%.2f ms (%.2f GB/s)\n", n_tok,
                 q4x_.q4_up_calls_ - up_n0, mib, cms, q4x_.q4_up_enq_ms_ - up_e0, q4x_.q4_up_wait_ms_ - up_w0, dma, rate);
     }
@@ -4284,7 +4286,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
             static bool reported = false;
             if (!reported) {
                 reported = true;
-                fprintf(stderr, "[q4] PF_Q4_HEAD_W4=%s (u4 LM head, opt-in/lossy)\n",
+                si::logf("[q4] PF_Q4_HEAD_W4=%s (u4 LM head, opt-in/lossy)\n",
                         head_w4_done ? "on"
                                      : "requested but unavailable (no u4 store or M>1) - using the raw head");
             }
@@ -4322,11 +4324,11 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                     }
                 }
             }
-            fprintf(stderr, "[q4] decode logits:");
+            si::logf("[q4] decode logits:");
             for (int j = 0; j < 5; j++) {
-                fprintf(stderr, " %d(%.4f)", bi[j], lg[(size_t)bi[j]]);
+                si::logf(" %d(%.4f)", bi[j], lg[(size_t)bi[j]]);
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
     }
     // The deferred QSA update's copies precede the head in the in-order queue,
@@ -4349,7 +4351,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 (double)(htime1.get_profiling_info<sycl::info::event_profiling::command_end>()
                          - htime0.get_profiling_info<sycl::info::event_profiling::command_start>())
                 / 1.0e6;
-            fprintf(stderr, "[q4head] n=%d head=%.3f ms w4=%d\n", n_tok, hms, (int)head_w4_done);
+            si::logf("[q4head] n=%d head=%.3f ms w4=%d\n", n_tok, hms, (int)head_w4_done);
         } catch (...) {
         }
     }
@@ -4378,7 +4380,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         }
         static const bool shover_flag = si::env::i32("PF_Q4_SHOVER", 1) != 0;
         static const bool shpref_flag = si::env::i32("PF_Q4_SHPREF", 1) != 0;
-        fprintf(stderr,
+        si::logf(
                 "[q4sh] n=%d shared gemv=%.3f ms (%d) gate_add=%.3f ms (%d) total=%.3f ms"
                 " | fuse=%d over=%d pref=%d\n",
                 n_tok, gemv, ngemv, gadd, ngadd, gemv + gadd, (int)shfuse, (int)shover_flag, (int)shpref_flag);
@@ -4432,19 +4434,19 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 } catch (...) {
                 }
                 devspan += last_end - d0s;
-                fprintf(stderr, "[q4seg] device %d span=%.2f ms (%zu barriers)\n", d, last_end - d0s, idx.size());
+                si::logf("[q4seg] device %d span=%.2f ms (%zu barriers)\n", d, last_end - d0s, idx.size());
             }
         }
         double sum = 0;
-        fprintf(stderr, "[q4seg] n=%d device segments (ms):", n_tok);
+        si::logf("[q4seg] n=%d device segments (ms):", n_tok);
         for (int i = 0; i < 15; i++) {
             sum += acc[i];
             if (cnt[i] || acc[i] != 0) {
-                fprintf(stderr, " %s=%.2f(%d)", kSegName[i], acc[i], cnt[i]);
+                si::logf(" %s=%.2f(%d)", kSegName[i], acc[i], cnt[i]);
             }
         }
         const double total = now_ms() - t_start;
-        fprintf(stderr, " | sum=%.2f devspan=%.2f total=%.2f ms\n", sum, devspan, total);
+        si::logf(" | sum=%.2f devspan=%.2f total=%.2f ms\n", sum, devspan, total);
     }
     print_qsa();
     if (hctime) {
@@ -4457,7 +4459,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
                 / 1.0e6;
             hc_n[p.first]++;
         }
-        fprintf(stderr, "[q4hc] n=%d norm=%.3f(%d) silu=%.3f(%d) mix=%.3f(%d) comb=%.3f(%d) total=%.3f ms\n", n_tok,
+        si::logf("[q4hc] n=%d norm=%.3f(%d) silu=%.3f(%d) mix=%.3f(%d) comb=%.3f(%d) total=%.3f ms\n", n_tok,
                 hc_ms[0], hc_n[0], hc_ms[1], hc_n[1], hc_ms[2], hc_n[2], hc_ms[3], hc_n[3],
                 hc_ms[0] + hc_ms[1] + hc_ms[2] + hc_ms[3]);
     }
@@ -4471,7 +4473,7 @@ void engine::q4_forward(int mode, int n_tok, bool with_head) {
         const double sum = t_emb + t_ple + t_xc + t_head + ha + hf + t_gg + t_gc + t_gn + t_go + t_ag + t_ar + t_ac
                            + t_ao;
         const double nl = std::max(1, hp.n_layer);
-        fprintf(stderr,
+        si::logf(
                 "[q4ph] n=%d total=%.1f rest=%.1f sum=%.1f | emb=%.1f ple=%.1f xc=%.1f head=%.1f cpurest=%.1f"
                 " | hact norm=%.1f(%.2f) gemv=%.1f(%.2f) [lo=%.1f up=%.1f inj=%.1f] silu=%.1f mix=%.1f comb=%.1f"
                 " | hffn norm=%.1f(%.2f) gemv=%.1f(%.2f) [lo=%.1f up=%.1f inj=%.1f] silu=%.1f mix=%.1f comb=%.1f"
@@ -4508,7 +4510,7 @@ void engine::q4_hist_report() const {
             return;
         }
         std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
-        fprintf(stderr, "[q4hist] %s: %zu pairs, %zu/%d slots used, total=%llu\n", tag, pairs, v.size(),
+        si::logf("[q4hist] %s: %zu pairs, %zu/%d slots used, total=%llu\n", tag, pairs, v.size(),
                 n_layer * n_expert, (unsigned long long)tot);
         uint64_t cum = 0;
         size_t vi = 0;
@@ -4517,7 +4519,7 @@ void engine::q4_hist_report() const {
             while (vi < v.size() && vi < B) {
                 cum += v[vi++].first;
             }
-            fprintf(stderr, "[q4hist]   top-%-5zu %6.2f%%\n", B, 100.0 * (double)cum / (double)tot);
+            si::logf("[q4hist]   top-%-5zu %6.2f%%\n", B, 100.0 * (double)cum / (double)tot);
         }
         std::vector<uint64_t> per((size_t)n_layer, 0);
         for (size_t i = 0; i < H.size(); i++) {
@@ -4531,7 +4533,7 @@ void engine::q4_hist_report() const {
             }
             return 100.0 * (double)c / (double)tot;
         };
-        fprintf(stderr, "[q4hist]   whole layers: top-8 %.1f%%, top-10 %.1f%%, top-12 %.1f%%\n", share(8),
+        si::logf("[q4hist]   whole layers: top-8 %.1f%%, top-10 %.1f%%, top-12 %.1f%%\n", share(8),
                 share(10), share(12));
         // uniform per-layer slot allocation: R experts kept in every layer
         const int Rs[] = {64, 96, 129, 155, 192, 256};
@@ -4545,7 +4547,7 @@ void engine::q4_hist_report() const {
                     c += row[(size_t)i];
                 }
             }
-            fprintf(stderr, "[q4hist]   per-layer R=%-3d %6.2f%%\n", R, 100.0 * (double)c / (double)tot);
+            si::logf("[q4hist]   per-layer R=%-3d %6.2f%%\n", R, 100.0 * (double)c / (double)tot);
         }
     };
     go("prefill", q4x_.q4_hist_pre_, q4x_.q4_hist_pre_pairs_);
@@ -4560,7 +4562,7 @@ void engine::q4_hist_report() const {
             }
             fwrite(out.data(), sizeof(uint32_t), out.size(), f);
             fclose(f);
-            fprintf(stderr, "[q4hist] saved calibration to %s\n", cf);
+            si::logf("[q4hist] saved calibration to %s\n", cf);
         }
     }
 }

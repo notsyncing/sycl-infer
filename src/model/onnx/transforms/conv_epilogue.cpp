@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "transform.h"
 #include "transform_util.h"
 
@@ -34,7 +36,7 @@ bool conv_epilogue(graph_build & g) {
                 if (op == a) is_act = true;
             }
             if (getenv("SI_ONNX_TRACE") && n.op_type == "Conv") {
-                fprintf(stderr, "[onnx] the fusion: %s <- %s (%s)\n", n.name.c_str(),
+                si::logf("[onnx] the fusion: %s <- %s (%s)\n", n.name.c_str(),
                         cn.name.c_str(), op.c_str());
             }
             // The fold replaces the folded value's *name* with the

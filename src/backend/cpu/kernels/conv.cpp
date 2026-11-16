@@ -1,3 +1,5 @@
+#include "log.h"
+
 // CPU conv (+ L2 norm) and conv state update (mirror of
 // src/backend/gpu/kernels/conv.cpp).  `cross_row` reads taps from the
 // materialized previous chunk row; the state update also writes the
@@ -104,7 +106,7 @@ void cpu_conv_state_update(const float * qkv_raw, float * conv_state, const cpu_
                 // so an offset that fits the GDN half can still overrun the slot;
                 // see the matching check in cpu_gdn
                 if (cpu_pc_guard && snap.cap_floats > 0 && at + 1 > snap.cap_floats) {
-                    fprintf(stderr,
+                    si::logf(
                             "[pcguard] conv snapshot past pool: cap=%d at=%lld > cap_floats=%lld "
                             "(stride=%lld layer_off=%lld gdn_per=%d conv_dim=%d)\n",
                             cap, (long long)at, (long long)snap.cap_floats, (long long)snap.stride,

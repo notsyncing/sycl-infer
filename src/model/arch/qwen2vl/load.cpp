@@ -1,3 +1,5 @@
+#include "log.h"
+
 // Qwen2-VL text trunk (MinerU2.5-Pro-2605-1.2B is a Qwen2-VL decoder).
 //
 // This is a plain dense decoder: every layer is full grouped-query attention
@@ -44,7 +46,7 @@ void load_qwen2vl(model & m) {
         }
     }
 
-    fprintf(stderr, "[qwen2vl] n_embd=%d n_ff=%d n_head=%d n_head_kv=%d head_dim=%d n_rot=%d sections=[%d,%d,%d,%d]\n",
+    si::logf("[qwen2vl] n_embd=%d n_ff=%d n_head=%d n_head_kv=%d head_dim=%d n_rot=%d sections=[%d,%d,%d,%d]\n",
             hp.n_embd, hp.n_ff, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_rot, hp.rope_sections[0],
             hp.rope_sections[1], hp.rope_sections[2], hp.rope_sections[3]);
     const auto * toks = f.meta("tokenizer.ggml.tokens");

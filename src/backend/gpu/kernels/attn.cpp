@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "kernels.h"
 #include "device/device_profile.h"
 #include "kernel_utils.h"
@@ -334,7 +336,7 @@ void attn_launch(queue & q, const float * qbuf, const float * gate, const void *
         const int hpg = n_head / n_head_kv;
         static const bool dbg = si::env::flag("PF_ATTN_DBG");
         if (dbg) {
-            fprintf(stderr, "[attn] flash kernel: hpg=%d n_splits=%d n_rows=%d n_real=%d\n", hpg, n_splits, n_rows,
+            si::logf("[attn] flash kernel: hpg=%d n_splits=%d n_rows=%d n_real=%d\n", hpg, n_splits, n_rows,
                     n_real);
         }
         const sycl::half * ksc = (const sycl::half *)kscales;

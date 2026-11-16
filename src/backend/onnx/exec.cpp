@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "exec.h"
 
 #include <algorithm>
@@ -381,11 +383,11 @@ void * executor::acquire(size_t bytes) {
         trim_pool();
         p = sycl::malloc_device(alloc_bytes, q_);
         if (p) {
-            fprintf(stderr,
+            si::logf(
                     "[onnx] device allocation of %zu bytes failed; trimmed the pool (including "
                     "Loop bodies) and retried\n", bytes);
         } else {
-            fprintf(stderr,
+            si::logf(
                     "[onnx] device allocation of %zu bytes failed after trimming: live=%zu "
                     "pooled=%zu free=%zu\n",
                     bytes, live_bytes_calc(), pooled_bytes_calc(), free_mem_bytes());
@@ -437,7 +439,7 @@ void executor::release(void * p, size_t bytes) {
     (void)bytes;
     if (!p) return;
     if (loop_dbg_) {
-        fprintf(stderr, "[onnx] the release: %p (%zu bytes)\n", p, bytes);
+        si::logf("[onnx] the release: %p (%zu bytes)\n", p, bytes);
     }
     // The buffer goes back under its *real* size, not the size this caller
     // asked for.  The record stays: the buffer is handed out again later,
@@ -680,7 +682,7 @@ void executor::materialize_int(int slot) {
     if (!t.host.empty()) return;
     if (!st.dev || !st.bytes) return;
     if (intdev_dbg_) {
-        fprintf(stderr, "[onnx] intdev: '%s' comes back to the host (%zu bytes, the dtype %d)\n",
+        si::logf("[onnx] intdev: '%s' comes back to the host (%zu bytes, the dtype %d)\n",
                 t.name.c_str(), st.bytes, (int)t.dtype);
     }
     t.host.resize(st.bytes);
@@ -897,7 +899,7 @@ void executor::prepare_inputs(exec_op & op) {
         const double dt = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - tp0).count();
         if (dt > 2.0) {
-            fprintf(stderr,
+            si::logf(
                     "[onnx] prepare: %s %.1f ms (%zu inputs, %zu uploads, %.1f MB; the alloc "
                     "%.1f, the copy %.1f)\n",
                     op.node->op_type.c_str(), dt, op.in.size(), copies, copy_bytes / 1048576.0,
@@ -976,7 +978,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     executor * bexec = loop_body(op_index);
     const exec_graph & bg = bexec->graph();
     if (loop_dbg_) {
-        fprintf(stderr, "[onnx] the loop: the body is built (%zu ops, %zu tensors)\n", bg.ops.size(),
+        si::logf("[onnx] the loop: the body is built (%zu ops, %zu tensors)\n", bg.ops.size(),
                 bg.tensors.size());
     }
 
@@ -1026,7 +1028,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         }
         cond = value_is_true(h, g_.tensors[in[1]].dtype);
         if (loop_dbg_) {
-            fprintf(stderr, "[onnx] the loop: the condition '%s': %zu bytes, the dtype %d, the value %d\n",
+            si::logf("[onnx] the loop: the condition '%s': %zu bytes, the dtype %d, the value %d\n",
                     g_.tensors[in[1]].name.c_str(), h.size(), (int)g_.tensors[in[1]].dtype, (int)cond);
         }
     }
@@ -1231,31 +1233,31 @@ void executor::run_loop(size_t op_index, exec_op & op) {
     };
 
     if (loop_dbg_) {
-        fprintf(stderr, "[onnx] the loop: %zu carried values\n", carried.size());
-        fprintf(stderr, "[onnx] the loop: the trip count %lld, the condition %d\n", (long long)M,
+        si::logf("[onnx] the loop: %zu carried values\n", carried.size());
+        si::logf("[onnx] the loop: the trip count %lld, the condition %d\n", (long long)M,
                 (int)cond);
         for (size_t i = 0; i < carried.size(); ++i) {
-            fprintf(stderr, "   carried[%zu]: the shape [", i);
-            for (int64_t d : carried[i].shape) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "] the bytes %zu\n", carried[i].data.size());
+            si::logf("   carried[%zu]: the shape [", i);
+            for (int64_t d : carried[i].shape) si::logf(" %lld", (long long)d);
+            si::logf("] the bytes %zu\n", carried[i].data.size());
         }
-        fprintf(stderr, "   the body's %zu inputs:", bg.input_slots.size());
+        si::logf("   the body's %zu inputs:", bg.input_slots.size());
         for (int s2 : bg.input_slots) {
-            fprintf(stderr, " %s[", bg.tensors[s2].name.c_str());
-            for (int64_t d : bg.tensors[s2].shape) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "]");
+            si::logf(" %s[", bg.tensors[s2].name.c_str());
+            for (int64_t d : bg.tensors[s2].shape) si::logf(" %lld", (long long)d);
+            si::logf("]");
         }
-        fprintf(stderr, "\n   the body's %zu outputs:", bg.output_slots.size());
+        si::logf("\n   the body's %zu outputs:", bg.output_slots.size());
         for (int s2 : bg.output_slots) {
-            fprintf(stderr, " %s[", bg.tensors[s2].name.c_str());
-            for (int64_t d : bg.tensors[s2].shape) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "]");
+            si::logf(" %s[", bg.tensors[s2].name.c_str());
+            for (int64_t d : bg.tensors[s2].shape) si::logf(" %lld", (long long)d);
+            si::logf("]");
         }
-        fprintf(stderr, "\n   the body's %zu ops:", bg.ops.size());
+        si::logf("\n   the body's %zu ops:", bg.ops.size());
         for (size_t i = 0; i < bg.ops.size() && i < 60; ++i) {
-            fprintf(stderr, " %zu:%s", i, bg.ops[i].node->op_type.c_str());
+            si::logf(" %zu:%s", i, bg.ops[i].node->op_type.c_str());
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     // The outer scope: the values the body reads from this graph.  This
     // graph computes them before the Loop, and the body's own copy is what
@@ -1277,14 +1279,14 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         state_[r.second].last_use = std::max(state_[r.second].last_use, (int)op_index);
     }
     if (loop_dbg_) {
-        fprintf(stderr, "[onnx] the loop: %zu outer refs\n", bg.outer_refs.size());
+        si::logf("[onnx] the loop: %zu outer refs\n", bg.outer_refs.size());
         for (const auto & r : bg.outer_refs) {
             const tensor & src = g_.tensors[r.second];
             const float * v = src.count && state_[r.second].dev
                                   ? (const float *)state_[r.second].dev : nullptr;
             float first = 0.0f;
             if (v) q_download(q_, v, &first, 4);
-            fprintf(stderr, "   '%s' <- '%s' (count %zu, dev %s, the first %g)\n",
+            si::logf("   '%s' <- '%s' (count %zu, dev %s, the first %g)\n",
                     bg.tensors[r.first].name.c_str(), src.name.c_str(), src.count,
                     state_[r.second].dev ? "yes" : "NULL", first);
         }
@@ -1303,7 +1305,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             const tensor & d = bexec->graph().tensors[r.first];
             float hv = -1.0f;
             if (!d.host.empty()) std::memcpy(&hv, d.host.data(), 4);
-            fprintf(stderr, "[onnx] the copy: the slot %d '%s' on_host %d, the host bytes %zu, the first %g, dev %p\n",
+            si::logf("[onnx] the copy: the slot %d '%s' on_host %d, the host bytes %zu, the first %g, dev %p\n",
                     r.first, d.name.c_str(), (int)d.on_host, d.host.size(), hv, d.dev);
         }
     }
@@ -1341,7 +1343,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         if (loopmem) {
             size_t dw = 0, ds = 0;
             conv_dnnl_mem(&dw, &ds);
-            fprintf(stderr,
+            si::logf(
                     "[onnx] loop iter=%lld body_live=%.1f MiB body_pooled=%.1f MiB "
                     "body_allocs=%zu dnnl_w=%.1f MiB dnnl_s=%.1f MiB\n",
                     (long long)iters_run, bexec->live_bytes_calc() / 1048576.0,
@@ -1429,7 +1431,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             const int cs = bg.output_slots.empty() ? -1 : bg.output_slots[0];
             cond = value_is_true(out_bufs[0], cs >= 0 ? bg.tensors[cs].dtype : onnxpb::FLOAT);
             if (loop_dbg_ && (iter < 3 || iter % 64 == 0)) {
-                fprintf(stderr, "[onnx] the loop: the iteration %lld, the condition %d\n",
+                si::logf("[onnx] the loop: the iteration %lld, the condition %d\n",
                         (long long)iter, (int)cond);
             }
         }
@@ -1533,7 +1535,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         }
     }
     if (looptime && iters_run) {
-        fprintf(stderr,
+        si::logf(
                 "[onnx] loop time: %lld iterations, the body run avg %.3f ms (min %.3f max %.3f), "
                 "the feeds avg %.3f ms, the post avg %.3f ms "
                 "(cond %.3f, carried %.3f, scans %.3f, trim %.3f over %ld; chain %.3f over %ld)\n",
@@ -1561,7 +1563,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
             n_ops += n;
         }
         std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) { return a.ms > b.ms; });
-        fprintf(stderr,
+        si::logf(
                 "[onnx] loop opstat: %lld iterations, %d ops, %.1f ms (%.3f ms/iteration), "
                 "%ld blocking downloads, the final wait %.1f ms (%.3f/iteration), "
                 "the feed-upload wait %.1f ms, the feeds %.1f ms, the readback enqueue %.1f ms\n",
@@ -1570,7 +1572,7 @@ void executor::run_loop(size_t op_index, exec_op & op) {
                 iters_run ? (bexec->wait_ms_ - w0) / iters_run : 0.0,
                 bexec->wait0_ms_ - w00, bexec->feed_ms_ - f0, bexec->rb_ms_ - r0);
         for (size_t i = 0; i < rows.size() && i < 24; ++i) {
-            fprintf(stderr, "   %-18s %8.2f ms total %7.3f ms/iteration x%d, %ld dl, %ld up\n",
+            si::logf("   %-18s %8.2f ms total %7.3f ms/iteration x%d, %ld dl, %ld up\n",
                     rows[i].name.c_str(), rows[i].ms,
                     iters_run ? rows[i].ms / iters_run : 0.0, rows[i].n,
                     rows[i].dl, rows[i].up);
@@ -1586,13 +1588,13 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         }
     }
     if (loop_dbg_) {
-        fprintf(stderr, "[onnx] the loop: after the run, the body's outputs:");
+        si::logf("[onnx] the loop: after the run, the body's outputs:");
         for (int s2 : bg.output_slots) {
-            fprintf(stderr, " %s[", bg.tensors[s2].name.c_str());
-            for (int64_t d : bg.tensors[s2].shape) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "]");
+            si::logf(" %s[", bg.tensors[s2].name.c_str());
+            for (int64_t d : bg.tensors[s2].shape) si::logf(" %lld", (long long)d);
+            si::logf("]");
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     // The outputs: the final values of the loop-carried dependencies, and
     // then the scans (the iterations along a new axis).
@@ -1672,10 +1674,10 @@ void executor::run_loop(size_t op_index, exec_op & op) {
         }
         g_.tensors[s].host = raw;
         if (loop_dbg_) {
-            fprintf(stderr, "[onnx] the loop: the output %zu '%s': %zu bytes, the shape [", k,
+            si::logf("[onnx] the loop: the output %zu '%s': %zu bytes, the shape [", k,
                     g_.tensors[s].name.c_str(), raw.size());
-            for (int64_t d : shape) fprintf(stderr, " %lld", (long long)d);
-            fprintf(stderr, "]\n");
+            for (int64_t d : shape) si::logf(" %lld", (long long)d);
+            si::logf("]\n");
         }
         st.is_const = false;
         st.bytes = raw.size();
@@ -1706,7 +1708,7 @@ void executor::report_leak() const {
     for (size_t s = 0; s < state_.size(); ++s) {
         if (!state_[s].dev) continue;
         if (is_output((int)s)) continue;
-        fprintf(stderr, "[onnx] leak: slot %zu '%s' %zu bytes, the last use %d\n", s,
+        si::logf("[onnx] leak: slot %zu '%s' %zu bytes, the last use %d\n", s,
                 g_.tensors[s].name.c_str(), state_[s].bytes, state_[s].last_use);
         ++n;
     }
@@ -1725,15 +1727,15 @@ void executor::report_leak() const {
         }
         for (const auto & kv : owners) {
             if (kv.second.size() < 2) continue;
-            fprintf(stderr, "[onnx] leak: the buffer %p is held by", kv.first);
-            for (size_t s : kv.second) fprintf(stderr, " %s", g_.tensors[s].name.c_str());
-            fprintf(stderr, "\n");
+            si::logf("[onnx] leak: the buffer %p is held by", kv.first);
+            for (size_t s : kv.second) si::logf(" %s", g_.tensors[s].name.c_str());
+            si::logf("\n");
         }
     }
-    fprintf(stderr,
+    si::logf(
             "[onnx] leak: %zu live slots, %zu live bytes, %zu pooled bytes, %zu live allocations\n",
             n, live_bytes_calc(), pooled_bytes_calc(), live_.size());
-    fprintf(stderr,
+    si::logf(
             "[onnx] leak: the pool holds %zu buffers, %zu bytes; the allocations total %zu bytes "
             "over %zu entries\n",
             pool_buffers, pool_bytes, alloc_total, alloc_size_.size());
@@ -1783,7 +1785,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
     double ht_upload = 0.0, ht_alloc = 0.0, ht_ctx = 0.0;
     size_t ht_n = 0, ht_n_upload = 0;
     if (loop_dbg_) {
-        fprintf(stderr, "[onnx] the run: %zu inputs, %zu ops\n", inputs.size(), g_.ops.size());
+        si::logf("[onnx] the run: %zu inputs, %zu ops\n", inputs.size(), g_.ops.size());
     }
     // The inputs.  Their shape comes with them: the graph's own input shape
     // is often dynamic (a text crop, a page), and the buffers are sized
@@ -1927,7 +1929,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 skip_end_ = op.if_then_end;
             }
             if (loop_dbg_) {
-                fprintf(stderr, "[onnx] the if: the condition %d, the then [%d, %d), the else [%d, %d)\n",
+                si::logf("[onnx] the if: the condition %d, the then [%d, %d), the else [%d, %d)\n",
                         (int)cond, op.if_then_begin, op.if_then_end, op.if_else_begin, op.if_else_end);
             }
             continue;
@@ -1953,7 +1955,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         }
         if (all_const) {
             if (loop_dbg_) {
-                fprintf(stderr, "[onnx] the op %zu %s is const (skipped)\n", i,
+                si::logf("[onnx] the op %zu %s is const (skipped)\n", i,
                         op.node->op_type.c_str());
             }
             // An operator the runtime does not implement is an error here
@@ -1971,10 +1973,10 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             continue;
         }
         if (trace_on()) {
-            fprintf(stderr, "[onnx] op %zu %s\n", i, op.node->op_type.c_str());
+            si::logf("[onnx] op %zu %s\n", i, op.node->op_type.c_str());
         }
         if (loop_dbg_) {
-            fprintf(stderr, "[onnx] the op %zu %s runs\n", i, op.node->op_type.c_str());
+            si::logf("[onnx] the op %zu %s runs\n", i, op.node->op_type.c_str());
         }
         // The timestamps are taken only when a diagnostic needs them: six
         // clock reads per operator is ~1 us, and the table structurer's Loop
@@ -2215,27 +2217,27 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 static const bool chain_dbg = getenv("SI_ONNX_CHAINDBG") != nullptr;
                 const long chain_dl0 = chain_dbg ? g_q_downloads.load() : 0;
                 if (chain_dbg) {
-                    fprintf(stderr, "[onnx] chain: op %zu %s %s", i, op.node->op_type.c_str(),
+                    si::logf("[onnx] chain: op %zu %s %s", i, op.node->op_type.c_str(),
                             op.node->name.c_str());
                     for (int si : op.in) {
                         if (si < 0) {
-                            fprintf(stderr, " | -");
+                            si::logf(" | -");
                             continue;
                         }
-                        fprintf(stderr, " | '%s' d%d n%zu host%zu dev%d sder%d",
+                        si::logf(" | '%s' d%d n%zu host%zu dev%d sder%d",
                                 g_.tensors[si].name.c_str(), (int)g_.tensors[si].dtype,
                                 g_.tensors[si].count, host_of(si).size(),
                                 state_[si].dev ? 1 : 0,
                                 si < (int)shape_derived_.size() ? shape_derived_[si] : -1);
                     }
-                    fprintf(stderr, "\n");
+                    si::logf("\n");
                 }
                 for (int si : op.in) {
                     if (si < 0) continue;
                     if (state_[si].dev && host_of(si).empty()) materialize_int(si);
                 }
                 if (chain_dbg) {
-                    fprintf(stderr, "[onnx] chain: op %zu %s downloads %ld\n", i,
+                    si::logf("[onnx] chain: op %zu %s downloads %ld\n", i,
                             op.node->op_type.c_str(), g_q_downloads.load() - chain_dl0);
                 }
                 // Every input is on the host now: the uploads the device
@@ -2382,13 +2384,13 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             throw std::runtime_error(what);
         }
         if (trace_ && op.node->op_type == "Reshape") {
-            fprintf(stderr, "[onnx] the reshape's shape: %d", (int)have_shape);
+            si::logf("[onnx] the reshape's shape: %d", (int)have_shape);
             for (const auto & sh : shapes) {
-                fprintf(stderr, " [");
-                for (int64_t d : sh) fprintf(stderr, "%lld ", (long long)d);
-                fprintf(stderr, "]");
+                si::logf(" [");
+                for (int64_t d : sh) si::logf("%lld ", (long long)d);
+                si::logf("]");
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
         for (size_t k = 0; k < ctx.out.size(); ++k) {
             if (have_shape && k < shapes.size()) {
@@ -2406,10 +2408,10 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             if (trace_) {
                 for (int64_t d : ctx.out[k]->shape) {
                     if (d == 0) {
-                        fprintf(stderr, "[onnx] op %zu %s: the output '%s' has a zero dim:", i,
+                        si::logf("[onnx] op %zu %s: the output '%s' has a zero dim:", i,
                                 op.node->op_type.c_str(), ctx.out[k]->name.c_str());
-                        for (int64_t e : ctx.out[k]->shape) fprintf(stderr, " %lld", (long long)e);
-                        fprintf(stderr, "\n");
+                        for (int64_t e : ctx.out[k]->shape) si::logf(" %lld", (long long)e);
+                        si::logf("\n");
                         break;
                     }
                 }
@@ -2419,16 +2421,16 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // The shapes of every operator's inputs and outputs.  This is
             // the trace that finds a wrong shape: a value whose shape does
             // not match the operator that produced it.
-            fprintf(stderr, "[onnx] op %zu %s\n", i, op.node->op_type.c_str());
+            si::logf("[onnx] op %zu %s\n", i, op.node->op_type.c_str());
             for (size_t k = 0; k < ctx.in.size(); ++k) {
-                fprintf(stderr, "    in  %s: [", ctx.in[k]->name.c_str());
-                for (int64_t d : ctx.in[k]->shape) fprintf(stderr, " %lld", (long long)d);
-                fprintf(stderr, " ] count=%zu\n", ctx.in[k]->count);
+                si::logf("    in  %s: [", ctx.in[k]->name.c_str());
+                for (int64_t d : ctx.in[k]->shape) si::logf(" %lld", (long long)d);
+                si::logf(" ] count=%zu\n", ctx.in[k]->count);
             }
             for (size_t k = 0; k < ctx.out.size(); ++k) {
-                fprintf(stderr, "    out %s: [", ctx.out[k]->name.c_str());
-                for (int64_t d : ctx.out[k]->shape) fprintf(stderr, " %lld", (long long)d);
-                fprintf(stderr, " ] count=%zu\n", ctx.out[k]->count);
+                si::logf("    out %s: [", ctx.out[k]->name.c_str());
+                for (int64_t d : ctx.out[k]->shape) si::logf(" %lld", (long long)d);
+                si::logf(" ] count=%zu\n", ctx.out[k]->count);
             }
         }
         // The dump of the inputs happens *before* the operator runs: after it,
@@ -2451,7 +2453,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 const bool ints = t->dtype == onnxpb::INT64 || t->dtype == onnxpb::INT32;
                 const size_t esz = ints ? (t->dtype == onnxpb::INT64 ? 8u : 4u) : 4u;
                 const bool on_host = t->on_host && !t->host.empty();
-                fprintf(stderr, "[onnx] op %zu %s in[%zu] %s:", i, op.node->op_type.c_str(), c,
+                si::logf("[onnx] op %zu %s in[%zu] %s:", i, op.node->op_type.c_str(), c,
                         t->name.c_str());
                 if (on_host) {
                     const size_t have = t->host.size() / esz;
@@ -2459,15 +2461,15 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                         if (esz == 8) {
                             int64_t x = 0;
                             std::memcpy(&x, t->host.data() + b * 8, 8);
-                            fprintf(stderr, " %lld", (long long)x);
+                            si::logf(" %lld", (long long)x);
                         } else if (ints) {
                             int32_t x = 0;
                             std::memcpy(&x, t->host.data() + b * 4, 4);
-                            fprintf(stderr, " %d", x);
+                            si::logf(" %d", x);
                         } else {
                             float x = 0.0f;
                             std::memcpy(&x, t->host.data() + b * 4, 4);
-                            fprintf(stderr, " %.9g", x);
+                            si::logf(" %.9g", x);
                         }
                     }
                 } else if (t->dev && n) {
@@ -2478,20 +2480,20 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                             if (esz == 8) {
                                 int64_t x = 0;
                                 std::memcpy(&x, raw + b * 8, 8);
-                                fprintf(stderr, " %lld", (long long)x);
+                                si::logf(" %lld", (long long)x);
                             } else {
                                 int32_t x = 0;
                                 std::memcpy(&x, raw + b * 4, 4);
-                                fprintf(stderr, " %d", x);
+                                si::logf(" %d", x);
                             }
                         }
                     } else {
                         float v[64] = {0};
                         q_download(q_, t->dev, v, n * 4);
-                        for (size_t b = 0; b < n; ++b) fprintf(stderr, " %.9g", v[b]);
+                        for (size_t b = 0; b < n; ++b) si::logf(" %.9g", v[b]);
                     }
                 }
-                fprintf(stderr, "  @%p\n", (const void *)t->dev);
+                si::logf("  @%p\n", (const void *)t->dev);
             }
         }
         // The output buffers.  Each one gets a guard band behind it, so an
@@ -2610,7 +2612,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                     if (s < 0) continue;
                     if (int_dtype(g_.tensors[s].dtype) && state_[s].dev && host_of(s).empty()) {
                         if (intdev_dbg_) {
-                            fprintf(stderr, "[onnx] intdev: the host path of %zu (%s) reads '%s'\n", i,
+                            si::logf("[onnx] intdev: the host path of %zu (%s) reads '%s'\n", i,
                                     op.node->op_type.c_str(), g_.tensors[s].name.c_str());
                         }
                         materialize_int(s);
@@ -2624,7 +2626,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 // host operator that downloads a tensor shows up here, and
                 // that is the only way to see the queue drains that hide
                 // inside e->exec.
-                fprintf(stderr, "[onnx] ophost: %zu %s %.3f\n", i,
+                si::logf("[onnx] ophost: %zu %s %.3f\n", i,
                         op.node->op_type.c_str(),
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t_sub).count());
@@ -2642,7 +2644,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             if (time_dbg_ || sample_time_) {
                 const double ms = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - t_op).count();
-                fprintf(stderr, "[onnx] time: op %zu %s %s %.3f ms\n", i,
+                si::logf("[onnx] time: op %zu %s %s %.3f ms\n", i,
                         op.node->op_type.c_str(), op.node->name.c_str(), ms);
             }
             if (dump_dbg_) {
@@ -2673,20 +2675,20 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                                 q_download(q_, ctx.out[k]->dev, raw, n * esz);
                             }
                         }
-                        fprintf(stderr, "[onnx] op %zu %s out[%zu] %s [i%zu]:", i,
+                        si::logf("[onnx] op %zu %s out[%zu] %s [i%zu]:", i,
                                 op.node->op_type.c_str(), k, ctx.out[k]->name.c_str(), esz * 8);
                         for (size_t b = 0; b < n; ++b) {
                             if (esz == 8) {
                                 int64_t x = 0;
                                 std::memcpy(&x, raw + b * 8, 8);
-                                fprintf(stderr, " %lld", (long long)x);
+                                si::logf(" %lld", (long long)x);
                             } else {
                                 int32_t x = 0;
                                 std::memcpy(&x, raw + b * 4, 4);
-                                fprintf(stderr, " %d", (int)x);
+                                si::logf(" %d", (int)x);
                             }
                         }
-                        fprintf(stderr, "\n");
+                        si::logf("\n");
                         continue;
                     }
                     float v[64] = {0};
@@ -2699,10 +2701,10 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                             q_download(q_, ctx.out[k]->dev, v, n * 4);
                         }
                     }
-                    fprintf(stderr, "[onnx] op %zu %s out[%zu] %s:", i, op.node->op_type.c_str(), k,
+                    si::logf("[onnx] op %zu %s out[%zu] %s:", i, op.node->op_type.c_str(), k,
                             ctx.out[k]->name.c_str());
-                    for (size_t b = 0; b < n; ++b) fprintf(stderr, " %.9g", v[b]);
-                    fprintf(stderr, "\n");
+                    for (size_t b = 0; b < n; ++b) si::logf(" %.9g", v[b]);
+                    si::logf("\n");
                 }
             }
             if (dump_file_dbg_) {
@@ -2774,7 +2776,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                            guard.size());
                 for (size_t b = 0; b < guard.size(); ++b) {
                     if (guard[b] != 0xAB) {
-                        fprintf(stderr,
+                        si::logf(
                                 "[onnx] op %zu %s wrote past the output '%s' (the count %zu, the bytes "
                                 "%zu, the dtype %d, the guard[%zu] = 0x%02x)\n",
                                 i, op.node->op_type.c_str(), ctx.out[k]->name.c_str(),
@@ -2834,7 +2836,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 g_.tensors[s].host.clear();
             }
             if (intdev_dbg_ && int_out) {
-                fprintf(stderr, "[onnx] intout: %s %s %s\n", on_host ? "host" : "dev",
+                si::logf("[onnx] intout: %s %s %s\n", on_host ? "host" : "dev",
                         op.node->op_type.c_str(), g_.tensors[s].name.c_str());
             }
             st.is_const = false;
@@ -2891,12 +2893,12 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
                 // bytes for a mirror to disagree with.
                 st.dev_gen = st.host_gen;
                 if (trace_) {
-                    fprintf(stderr, "[onnx] the op %zu %s writes the slot %d ('%s')\n", i,
+                    si::logf("[onnx] the op %zu %s writes the slot %d ('%s')\n", i,
                             op.node->op_type.c_str(), s, g_.tensors[s].name.c_str());
                 }
             }
             if (trace_on() && op.node->op_type == "Concat") {
-                fprintf(stderr,
+                si::logf(
                         "[onnx] the concat's output '%s': the dtype %d, the host %zu, on_host %d\n",
                         ctx.out[k]->name.c_str(), (int)ctx.out[k]->dtype, ctx.out[k]->host.size(),
                         (int)ctx.out[k]->on_host);
@@ -2935,7 +2937,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             if (state_[s].last_use == (int)i && state_[s].dev && !is_output(s) &&
                 !state_[s].is_const && !state_[s].pinned) {
                 if (trace_) {
-                    fprintf(stderr, "[onnx] the release: op %zu releases '%s' (%zu bytes)\n", i,
+                    si::logf("[onnx] the release: op %zu releases '%s' (%zu bytes)\n", i,
                             g_.tensors[s].name.c_str(), state_[s].bytes);
                 }
                 release(state_[s].dev, state_[s].bytes);
@@ -3122,18 +3124,18 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             });
         }
         if (topn > 0 && order.size() > (size_t)topn) order.resize((size_t)topn);
-        fprintf(stderr, "[onnx] uploads: %zu copies, %.2f MB", upload_count_,
+        si::logf("[onnx] uploads: %zu copies, %.2f MB", upload_count_,
                 upload_bytes_ / 1048576.0);
         for (int s : order) {
-            fprintf(stderr, " | '%s' %u x %.1f KB", g_.tensors[s].name.c_str(),
+            si::logf(" | '%s' %u x %.1f KB", g_.tensors[s].name.c_str(),
                     (unsigned)upload_by_slot_[s], upload_bytes_by_slot_[s] / 1024.0);
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
     if (hosttime) {
         const double total = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - t0).count();
-        fprintf(stderr,
+        si::logf(
                 "[onnx] host: %zu ops: prepare %.1f ms (the upload %.1f over %zu uploads "
                 "(%.1f MB), the allocation %.1f, the rest %.1f; %zu pool misses), "
                 "submit %.1f ms, write-back %.1f ms, the other %.1f ms of %.1f ms\n",
@@ -3158,7 +3160,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             ++lost_n;
             ++lost_sz[kv.second];
         }
-        fprintf(stderr,
+        si::logf(
                 "[onnx] mem: %zu allocations, %zu bytes total (%zu mallocs), live %zu (peak %zu), "
                 "pooled %zu, lost %zu in %zu buffers\n",
                 alloc_size_.size(), total, malloc_count_, live_bytes_calc(), peak_live_,
@@ -3168,14 +3170,14 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         std::sort(pool_sizes.begin(), pool_sizes.end(),
                   [](auto & a, auto & b) { return a.first * a.second > b.first * b.second; });
         for (size_t i = 0; i < pool_sizes.size() && i < 8; ++i) {
-            fprintf(stderr, "[onnx]   pool: %zu bytes x %zu\n", pool_sizes[i].first,
+            si::logf("[onnx]   pool: %zu bytes x %zu\n", pool_sizes[i].first,
                     pool_sizes[i].second);
         }
         size_t dw = 0, ds = 0;
         conv_dnnl_mem(&dw, &ds);
-        fprintf(stderr, "[onnx]   oneDNN: reordered weights %zu bytes, scratch %zu bytes\n", dw, ds);
+        si::logf("[onnx]   oneDNN: reordered weights %zu bytes, scratch %zu bytes\n", dw, ds);
         for (const auto & kv : lost_sz) {
-            fprintf(stderr, "[onnx]   lost: %zu bytes x %zu\n", kv.first, kv.second);
+            si::logf("[onnx]   lost: %zu bytes x %zu\n", kv.first, kv.second);
         }
         // Which slot holds each lost buffer (the largest by bytes).
         std::vector<std::pair<size_t, int>> held;
@@ -3190,7 +3192,7 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
         std::sort(held.begin(), held.end(), [](auto & a, auto & b) { return a.first > b.first; });
         for (size_t i = 0; i < held.size() && i < 12; ++i) {
             const int s = held[i].second;
-            fprintf(stderr, "[onnx]   held %zu bytes: slot %d %s const %d last_use %d\n", held[i].first,
+            si::logf("[onnx]   held %zu bytes: slot %d %s const %d last_use %d\n", held[i].first,
                     s, s >= 0 ? g_.tensors[s].name.c_str() : "(no slot)", s >= 0 ? (int)state_[s].is_const : -1,
                     s >= 0 ? state_[s].last_use : -1);
         }

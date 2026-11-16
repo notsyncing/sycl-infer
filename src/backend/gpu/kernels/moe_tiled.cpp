@@ -1,3 +1,5 @@
+#include "log.h"
+
 // Grouped, CSR-driven tiled expert GEMM for the routed-expert prefill.
 //
 // One workgroup per (active expert, BN-column block, 256 by default); the
@@ -438,7 +440,7 @@ bool moe_tiled_gemm_launch(queue & q, const void * bank, size_t slot_stride,
         const int avg = n_pairs / (n_act_max > 0 ? n_act_max : 1);
         bm = tiled_bm(avg, top_k);
         if (si::env::flag("PF_MOE_TILED_DBG")) {
-            std::fprintf(stderr, "[tiled] top_k=%d n_act_max=%d n_pairs=%d avg=%d -> BM=%d\n",
+            si::logf("[tiled] top_k=%d n_act_max=%d n_pairs=%d avg=%d -> BM=%d\n",
                          top_k, n_act_max, n_pairs, avg, bm);
         }
     }
@@ -465,7 +467,7 @@ bool moe_tiled_gemm_launch(queue & q, const void * bank, size_t slot_stride,
         wg = kTiledWideNT;
         slm_need = kTiledWideSlm;
         if (si::env::flag("PF_MOE_TILED_DBG")) {
-            std::fprintf(stderr, "[tiled] wide gate/up: BM=64 BN=512 (%zu B SLM, %d threads)\n",
+            si::logf("[tiled] wide gate/up: BM=64 BN=512 (%zu B SLM, %d threads)\n",
                          slm_need, wg);
         }
     }

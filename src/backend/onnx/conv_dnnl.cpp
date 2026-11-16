@@ -1,3 +1,5 @@
+#include "log.h"
+
 // The oneDNN convolution path of the ONNX runtime.
 //
 // The SYCL conv kernel is register-tiled and word-parallel, and measured
@@ -187,7 +189,7 @@ bool matmul_dnnl_launch(sycl::queue & q, const float * a, const float * b, float
     } catch (const std::exception & ex) {
         static bool said = false;
         if (!said) {
-            fprintf(stderr, "[onnx] oneDNN matmul fell back for %lldx%lldx%lld: %s\n", (long long)M,
+            si::logf("[onnx] oneDNN matmul fell back for %lldx%lldx%lld: %s\n", (long long)M,
                     (long long)K, (long long)N, ex.what());
             said = true;
         }
@@ -381,7 +383,7 @@ bool conv_dnnl_launch(sycl::queue & q, const float * x, const float * w, float *
         // the log.
         static bool said = false;
         if (!said) {
-            fprintf(stderr, "[onnx] oneDNN conv fell back for C%d %dx%d -> M%d: %s\n", C, H, W, M,
+            si::logf("[onnx] oneDNN conv fell back for C%d %dx%d -> M%d: %s\n", C, H, W, M,
                     ex.what());
             said = true;
         }

@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "exec.h"
 
 #include <algorithm>
@@ -65,20 +67,20 @@ void executor::fold_constants() {
         }
         if (!all_const) {
             if (getenv("SI_ONNX_LOOPDBG")) {
-                fprintf(stderr, "[onnx] the fold: the op %zu %s is not const:", i,
+                si::logf("[onnx] the fold: the op %zu %s is not const:", i,
                         op.node->op_type.c_str());
                 for (int s : op.in) {
                     if (s < 0) continue;
-                    fprintf(stderr, " '%s'(const=%d)", g_.tensors[s].name.c_str(),
+                    si::logf(" '%s'(const=%d)", g_.tensors[s].name.c_str(),
                             (int)state_[s].is_const);
                 }
-                fprintf(stderr, "\n");
+                si::logf("\n");
             }
             continue;
         }
 
         if ((getenv("SI_ONNX_TRACE") != nullptr)) {
-            fprintf(stderr, "[onnx] fold %zu %s\n", i, op.node->op_type.c_str());
+            si::logf("[onnx] fold %zu %s\n", i, op.node->op_type.c_str());
         }
         op_ctx ctx(q_, *op.node);
         ctx.opset = g_.opset;
@@ -107,7 +109,7 @@ void executor::fold_constants() {
         }
         if (!e->shape(ctx, shapes)) {
             if (getenv("SI_ONNX_TRACE")) {
-                fprintf(stderr, "[onnx] the fold: the op %zu %s has no shape\n", i,
+                si::logf("[onnx] the fold: the op %zu %s has no shape\n", i,
                         op.node->op_type.c_str());
             }
             continue;
@@ -208,7 +210,7 @@ void executor::fold_constants() {
             }
             producer_[s] = (int)i;
             if (getenv("SI_ONNX_TRACE")) {
-                fprintf(stderr, "[onnx] the op %zu %s writes the slot %d ('%s')\n", i,
+                si::logf("[onnx] the op %zu %s writes the slot %d ('%s')\n", i,
                         op.node->op_type.c_str(), s, g_.tensors[s].name.c_str());
             }
             // The new buffer must not be another value's buffer: the pool

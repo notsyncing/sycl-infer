@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "moe_cache.h"
 
 #include "engine.h"
@@ -58,11 +60,11 @@ void moe_cache::init(const model & m, const moe_cache_cfg & cfg, int n_slots_nee
     }
     (void) n_slots_needed;
     if (active()) {
-        fprintf(stderr, "[moe] expert cache: %d of %d experts resident per layer", resident_, n_expert_);
+        si::logf("[moe] expert cache: %d of %d experts resident per layer", resident_, n_expert_);
         if (cfg_.ram_tier) {
-            fprintf(stderr, ", RAM tier %zu MB", cfg_.ram_mb);
+            si::logf(", RAM tier %zu MB", cfg_.ram_mb);
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
 }
 
@@ -133,7 +135,7 @@ void engine::moe_cpu_experts(size_t moe_il, const moe_t & M, int n_tok, int top_
     static long long n_calls = 0;
     n_calls++;
     if (si::env::flag("PF_MOE_CPUDBG") && (n_calls % 40) == 0) {
-        fprintf(stderr, "[moe] cpu expert pass: call %lld, il=%zu, n_tok=%d, n_pairs=%d\n", n_calls, moe_il, n_tok,
+        si::logf("[moe] cpu expert pass: call %lld, il=%zu, n_tok=%d, n_pairs=%d\n", n_calls, moe_il, n_tok,
                 n_pairs);
     }
     std::vector<int> cpu_pairs;
@@ -154,7 +156,7 @@ void engine::moe_cpu_experts(size_t moe_il, const moe_t & M, int n_tok, int top_
     }
 
     if (si::env::flag("PF_MOE_CPUDBG")) {
-        fprintf(stderr, "[moe] cpu expert pass: il=%zu n_tok=%d spilled %zu of %d pairs\n", moe_il, n_tok, cpu_pairs.size(),
+        si::logf("[moe] cpu expert pass: il=%zu n_tok=%d spilled %zu of %d pairs\n", moe_il, n_tok, cpu_pairs.size(),
                 n_pairs);
     }
     // The activation rows the spilled pairs need.  xbuf is the MoE's *own*
@@ -270,7 +272,7 @@ void engine::moe_calibrate(int dev) {
     for (int32_t v : host) {
         resident += (v >= 0) ? 1 : 0;
     }
-    fprintf(stderr, "[moe] expert cache: calibration done, %zu of %zu (layer, expert) pairs resident on the device\n",
+    si::logf("[moe] expert cache: calibration done, %zu of %zu (layer, expert) pairs resident on the device\n",
             resident, moe_all_.size() * (size_t) hp.n_expert);
 }
 

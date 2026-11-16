@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "engine.h"
 #include "device/device_profile.h"
 #include "backend/gpu/kernels/moe_tiled.h" // the tiled prefill expert GEMM
@@ -444,7 +446,7 @@ static void dbg_dump_seg(sycl::queue & q, const gemv_seg & sg, int call, int tb,
         s1 += v * v;
         mx = sycl::fmax(mx, sycl::fabs((float)v));
     }
-    fprintf(stderr,
+    si::logf(
             "[seg] call=%2d type=%-2u K=%-5d rows=%-5d x_stride=%-6d out_stride=%-6d alpha=%.2f res=%d "
             "up=%d up_stride=%-6d xq_xs=%-6d xq_us=%-6d tb=%-2d nsb=%-4d nch=%d | sum=%12.6f sumsq=%14.6f max=%.6f\n",
             call, sg.type, sg.K, sg.n_rows, sg.x_stride, sg.out_stride, (double)sg.alpha, sg.residual ? 1 : 0,
@@ -476,7 +478,7 @@ static bool dev_read_back(sycl::queue & q, void * dst, const void * src, size_t 
         static bool warned = false;
         if (!warned) {
             warned = true;
-            fprintf(stderr,
+            si::logf(
                     "[dump] %s DISABLED: %s\n"
                     "       A recorded command graph is replayed on this queue and SYCL will not\n"
                     "       wait on its events.  This diagnostic needs a direct replay - run the\n"
@@ -507,7 +509,7 @@ static void dbg_dump_fp(sycl::queue & q, const float * d, int n, const char * ta
             am = i;
         }
     }
-    fprintf(stderr, "[dump] %-5s il=%2d dev=%d sum=%.6f sumsq=%.6f max=%.6f@%d\n", tag, il, dev, s0, s1, mx, am);
+    si::logf("[dump] %-5s il=%2d dev=%d sum=%.6f sumsq=%.6f max=%.6f@%d\n", tag, il, dev, s0, s1, mx, am);
 }
 
 // PF_DUMP_RAW=<prefix>: write the full activation vector of one layer to
@@ -575,7 +577,7 @@ struct launch_count {
             return;
         }
         pass++;
-        fprintf(stderr,
+        si::logf(
                 "[lc] pass=%ld mode=%d xq=%ld (mergeable-adjacent=%ld) gemm-seg=%ld (mergeable-adjacent=%ld) "
                 "norm=%ld gdn=%ld attn=%ld  total=%ld  fusible=%ld\n",
                 pass, mode, xq, xq_merge, seg, seg_merge, norm, gdn, attn, xq + seg + norm + gdn + attn,
@@ -738,15 +740,15 @@ struct moe_time_report {
         for (int i = 0; i < 6; i++) {
             sum += moe_time_ms[i];
         }
-        fprintf(stderr, "[moe] phases: ");
+        si::logf("[moe] phases: ");
         for (int i = 0; i < 6; i++) {
-            fprintf(stderr, "%s=%.1f ", moe_time_nm[i], moe_time_ms[i]);
+            si::logf("%s=%.1f ", moe_time_nm[i], moe_time_ms[i]);
         }
-        fprintf(stderr, "sum=%.1f ms", sum);
+        si::logf("sum=%.1f ms", sum);
         if (moe_time_calls) {
-            fprintf(stderr, "  calls=%d n_tok=%d n_pairs=%d", moe_time_calls, moe_time_ntok, moe_time_pairs);
+            si::logf("  calls=%d n_tok=%d n_pairs=%d", moe_time_calls, moe_time_ntok, moe_time_pairs);
         }
-        fprintf(stderr, "\n");
+        si::logf("\n");
     }
 };
 static moe_time_report moe_time_report_;
@@ -813,7 +815,7 @@ auto moe_call = [&](size_t idx) {
                 dev_queue(dev).memcpy(b.data(), d_x, b.size() * sizeof(float)).wait();
                 double sum = 0, sumsq = 0, mx = 0;
                 for (float v : b) { sum += v; sumsq += (double)v * v; mx = std::max(mx, std::fabs((double)v)); }
-                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_in-0", sum, sumsq, mx);
+                si::logf("[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_in-0", sum, sumsq, mx);
             }
             const int n_act = std::min(hp.n_expert, n_pairs);
             moe_time_calls++;
@@ -892,7 +894,7 @@ auto moe_call = [&](size_t idx) {
                         }
                         sa += (double) acc_h[i] * acc_h[i];
                     }
-                    fprintf(stderr, "[moe] cpu-branch dev=%d il=%d n_tok=%d ids0=%d sum_w=%.4g rms_x=%.5g rms_acc=%.5g nan=%ld\n",
+                    si::logf("[moe] cpu-branch dev=%d il=%d n_tok=%d ids0=%d sum_w=%.4g rms_x=%.5g rms_acc=%.5g nan=%ld\n",
                             dev, moe_il, n_tok, n_tok > 0 ? ids_h[0] : -1,
                             (double) std::accumulate(wts_h.begin(), wts_h.begin() + std::min<size_t>(wts_h.size(), (size_t) k), 0.0),
                             std::sqrt(sx / (n_tok * hp.n_embd)), std::sqrt(sa / (double) acc_h.size()), bad);
@@ -1109,7 +1111,7 @@ auto moe_call = [&](size_t idx) {
                 for (float v : xr_h) {
                     sx2 += (double) v * v;
                 }
-                fprintf(stderr, "[moe] gpu-branch dev=%d il=%d n_tok=%d rms_x=%.5g\n", dev, moe_il, n_tok,
+                si::logf("[moe] gpu-branch dev=%d il=%d n_tok=%d rms_x=%.5g\n", dev, moe_il, n_tok,
                         std::sqrt(sx2 / (double) xr_h.size()));
             }
             mtimer.lap(4);
@@ -1196,18 +1198,18 @@ auto moe_call = [&](size_t idx) {
                 const auto in_order = makespan(false);
                 const auto lpt = makespan(true);
                 const long perfect = (in_order.second + 511) / 512;
-                fprintf(stderr,
+                si::logf(
                         "[moe hist] n_tok=%d top_k=%d n_active=%d/%d mean=%.1f max=%d  <=8:%d <=16:%d <=24:%d "
                         "<=32:%d  tiles=%.0f (weight re-read x%.2f)\n",
                         n_tok, k, hn[0], hp.n_expert, (double)wsum / std::max(1, tot), mx, w8, w16, w24, w32, wtile,
                         wtile / std::max(1, tot));
-                fprintf(stderr,
+                si::logf(
                         "[moe sched] M=%d nwg=%d  in-order makespan %ld tile-units, LPT %ld, perfect %ld  ->  LPT is "
                         "worth %.0f%% of the expert-GEMM time\n",
                         tile_m, nwg, in_order.first, lpt.first, perfect,
                         100.0 * (in_order.first - lpt.first) / std::max(1L, in_order.first));
                 for (int i = 0; i <= hp.n_expert; i++) {
-                    if (h[i]) fprintf(stderr, "[moe hist]   pairs=%3d experts=%d\n", i, h[i]);
+                    if (h[i]) si::logf("[moe hist]   pairs=%3d experts=%d\n", i, h[i]);
                 }
             }
             }
@@ -1224,7 +1226,7 @@ auto moe_call = [&](size_t idx) {
                         sumsq += (double) p[i] * p[i];
                         mx = std::max(mx, std::fabs((double) p[i]));
                     }
-                    fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+                    si::logf("[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
                 };
                 std::vector<float> rr((size_t)n_tok * hp.n_embd);
                 if (dev_read_back(qq, rr.data(), d_x, rr.size() * 4, "PF_MOE_REFDUMP")) {
@@ -1283,7 +1285,7 @@ auto moe_call = [&](size_t idx) {
                         else amax = std::max(amax, std::fabs((double)ab[i]));
                     }
                     if (bh || ba) {
-                        fprintf(stderr, "[moe] il=%2d NONFINITE h=%zu (first pair %d, id %d) acc=%zu (first pair %d, id %d)"
+                        si::logf("[moe] il=%2d NONFINITE h=%zu (first pair %d, id %d) acc=%zu (first pair %d, id %d)"
                                         " |max h=%.4g acc=%.4g\n", moe_il, bh, hpair,
                                 hpair >= 0 ? hi[hpair % k] : -1, ba, apair, apair >= 0 ? hi[apair % k] : -1, hmax, amax);
                         // which rows, and does the address the kernel derives for
@@ -1297,7 +1299,7 @@ auto moe_call = [&](size_t idx) {
                                 }
                             }
                         }
-                        fprintf(stderr, "[moe]   bad acc rows %d..%d of %d\n", rlo, rhi, hp.n_embd);
+                        si::logf("[moe]   bad acc rows %d..%d of %d\n", rlo, rhi, hp.n_embd);
                         const moe_t & M = m.layers[(size_t)moe_il].moe;
                         std::vector<int32_t> smh((size_t)hp.n_expert);
                         qq.memcpy(smh.data(), d_moe_slotmap + (size_t)moe_il * hp.n_expert,
@@ -1306,7 +1308,7 @@ auto moe_call = [&](size_t idx) {
                             const int e = hi[j], sl = smh[e];
                             const char * db = (const char *)wptr(dev, M.down_exps.data);
                             const size_t off = (size_t)sl * moe_slot_db[(size_t)moe_il];
-                            fprintf(stderr, "[moe]   expert %d slot %d off %zu (plane %zu, tensor %zu)\n", e, sl, off,
+                            si::logf("[moe]   expert %d slot %d off %zu (plane %zu, tensor %zu)\n", e, sl, off,
                                     M.down_exps.plane_bytes, M.down_exps.total_bytes());
                             if (sl < 0) continue;
                             for (int row : {0, hp.n_embd / 2, hp.n_embd - 1}) {
@@ -1314,7 +1316,7 @@ auto moe_call = [&](size_t idx) {
                                 std::vector<char> got(176);
                                 qq.memcpy(got.data(), db + roff, 176).wait();
                                 const char * hb = (const char *)M.down_exps.data + roff;
-                                fprintf(stderr, "[moe]     row %4d @%zu %s (host d=%.4g dev d=%.4g)\n", row, roff,
+                                si::logf("[moe]     row %4d @%zu %s (host d=%.4g dev d=%.4g)\n", row, roff,
                                         memcmp(got.data(), hb, 176) == 0 ? "matches host" : "DIFFERS",
                                         (float)*(const uint16_t *)hb,
                                         (float)*(const uint16_t *)got.data());
@@ -1339,9 +1341,9 @@ auto moe_call = [&](size_t idx) {
                 // the norm weight's rms is the *floor* on |xnorm|: RMSNorm
                 // returns x/rms(x) * w, so a correct layer gives |xnorm| ~ |w|
                 const double wref = std::sqrt(sw / hp.n_embd);
-                fprintf(stderr, "[moe] il=%2d ids", moe_il);
-                for (int i = 0; i < 8; i++) fprintf(stderr, " %d/%.4g", hi[i], hw[i]);
-                fprintf(stderr, " |rms xnorm=%.4g (w=%.4g) h=%.4g acc=%.4g d_x=%.4g\n", std::sqrt(sn / hp.n_embd),
+                si::logf("[moe] il=%2d ids", moe_il);
+                for (int i = 0; i < 8; i++) si::logf(" %d/%.4g", hi[i], hw[i]);
+                si::logf(" |rms xnorm=%.4g (w=%.4g) h=%.4g acc=%.4g d_x=%.4g\n", std::sqrt(sn / hp.n_embd),
                         wref, std::sqrt(sh / hp.n_ff_exp), std::sqrt(sa / hp.n_embd), std::sqrt(sx / hp.n_embd));
             }
             return;
@@ -1352,7 +1354,7 @@ auto moe_call = [&](size_t idx) {
             dev_queue(dev).memcpy(b.data(), d_x, b.size() * sizeof(float)).wait();
             double sum = 0, sumsq = 0, mx = 0;
             for (float v : b) { sum += v; sumsq += (double)v * v; mx = std::max(mx, std::fabs((double)v)); }
-            fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_out-0", sum, sumsq, mx);
+            si::logf("[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", "ffn_out-0", sum, sumsq, mx);
         }
         if (!abl_noshexp) {
             if (on_cpu) {
@@ -1377,14 +1379,14 @@ auto moe_call = [&](size_t idx) {
         const int gc = plan.calls[idx].group_count;
         if (dbg_pfb2) {
             const gemv_seg & s0 = plan.segs[plan.groups[gb].off];
-            fprintf(stderr, "[gemv_at] idx=%zu groups=%d first_w8=%d mode=%d rows=%d", idx, gc, s0.w8.vals ? 1 : 0,
+            si::logf("[gemv_at] idx=%zu groups=%d first_w8=%d mode=%d rows=%d", idx, gc, s0.w8.vals ? 1 : 0,
                     mode, rows);
             if (plan.calls[idx].tb == 1) {
-                fprintf(stderr, " HEAD x=%p out=%p out_stride=%d n_rows=%d type=%u d_x=%p d_logits=%p",
+                si::logf(" HEAD x=%p out=%p out_stride=%d n_rows=%d type=%u d_x=%p d_logits=%p",
                         (const void *)s0.x, (void *)s0.out, s0.out_stride, s0.n_rows, s0.type, (void *)d_x,
                         (void *)d_logits);
             }
-            fprintf(stderr, "\n");
+            si::logf("\n");
         }
         // DP4A path: quantize this call's activations once, then run the
         // int8 GEMMs (segments with a w8 view) and fp32 GEMVs (the rest)
@@ -1486,7 +1488,7 @@ auto moe_call = [&](size_t idx) {
                         // letting it surface as an all-zero activation
                         if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_dnnl > 0) {
                             dbg_refdump_dnnl--;
-                            fprintf(stderr,
+                            si::logf(
                                     "[dump] dnnl_call=false idx=%d seg=%d type=%d K=%d w8=%d need=%d has_w=%d w4=%d k5=%d "
                                     "cb4=%d kk=%d xqK=%d\n",
                                     (int)idx, j, (int)sj.type, (int)sj.K, sj.w8.vals ? 1 : 0, (int)need,
@@ -1621,7 +1623,7 @@ auto moe_call = [&](size_t idx) {
                         xn += std::fabs((double)v);
                     }
                 }
-                fprintf(stderr, "[dump] xq0 M=%d K=%d |x[..256]|=%.6f view{m=%d k=%d split=%d gen=%u valid=%d}\n", tbm, xq.K,
+                si::logf("[dump] xq0 M=%d K=%d |x[..256]|=%.6f view{m=%d k=%d split=%d gen=%u valid=%d}\n", tbm, xq.K,
                         xn, av.m, av.k, (int)av.split, av.gen, (int)av.valid());
             }
             g_lc.calls++;
@@ -1659,7 +1661,7 @@ auto moe_call = [&](size_t idx) {
             const gemv_seg & s0 = plan.segs[gr.off];
             if (dbg_refdump && !engine::g_capturing_ && dbg_refdump_path && idx == 0) {
                 dbg_refdump_path = false;
-                fprintf(stderr,
+                si::logf(
                         "[dump] grp0 idx=%d mode=%d tbm=%d K=%d n_rows=%d out_stride=%d w8=%d i8=%d dnnl_call=%d\n",
                         (int)idx, mode, (int) tbm, (int) s0.K, (int) s0.n_rows, (int) s0.out_stride, s0.w8.vals ? 1 : 0,
                         s0.i8 ? 1 : 0, (int)dnnl_call);
@@ -1785,7 +1787,7 @@ auto moe_call = [&](size_t idx) {
                             static long fused = 0, tried = 0;
                             tried++;
                             fused += decoded;
-                            fprintf(stderr, "[fused] M=%d gr.n=%d K=%d -> %d (tried=%ld fused=%ld)\n", tbm, gr.n,
+                            si::logf("[fused] M=%d gr.n=%d K=%d -> %d (tried=%ld fused=%ld)\n", tbm, gr.n,
                                     plan.segs[gr.off].K, (int)decoded, tried, fused);
                         }
                     }
@@ -1821,7 +1823,7 @@ auto moe_call = [&](size_t idx) {
                         c_fb++;
                         static int nrep = 0;
                         if (w4dbg && nrep++ < 3) {
-                            fprintf(stderr,
+                            si::logf(
                                     "[w4] segment fell through: w4=%ld i8=%ld fb=%ld (mode=%d M=%d K=%d w4key=%d)\n",
                                     c_w4, c_i8, c_fb, mode, tbm, sj.K, (int)D->has_weight_w4(sj.w));
                         }
@@ -2032,7 +2034,7 @@ auto moe_call = [&](size_t idx) {
             if (si::env::flag("PF_MTP_INFOCHK") && inf->pc_active) {
                 static int cnt = 0;
                 if (cnt++ < 4) {
-                    fprintf(stderr, "[mtp] infochk rf: mtp_dt=%d pc_active=%d dev=%d nhist=%zu hist=%p\n", inf->mtp_dt,
+                    si::logf("[mtp] infochk rf: mtp_dt=%d pc_active=%d dev=%d nhist=%zu hist=%p\n", inf->mtp_dt,
                             inf->pc_active, dev, mtp.d_mtp_hist_.size(), (void *)mtp.d_mtp_hist_[(size_t)dev]);
                 }
             }
@@ -2159,7 +2161,7 @@ auto moe_call = [&](size_t idx) {
                                1.0f / std::sqrt((float)hp.d_state), state_slots_, 1, 0, T, T, snap);
                     if (tdbg && !engine::g_capturing_) {
                         q.wait();
-                        fprintf(stderr, "[t] layer %d gdn=%.2f ms\n", il, tms(t0, tnow()));
+                        si::logf("[t] layer %d gdn=%.2f ms\n", il, tms(t0, tnow()));
                     }
                 } else {
                     for (int r0 = 0; r0 < NCH; r0++) {
@@ -2176,7 +2178,7 @@ auto moe_call = [&](size_t idx) {
                     const int rr0 = (mode == 2) ? r0 : 0;
                     const int rn = (mode == 2) ? 1 : nrows;
                     if (dbg_g) {
-                        fprintf(stderr,
+                        si::logf(
                                 "[gdn] mode=%d r0=%d rr0=%d rn=%d gdn_nr=%d info_n_rows=%d "
                                 "active=%d tpb=%d\n",
                                 mode, r0, rr0, rn, gdn_nr, inf->n_rows, inf->active[rr0], inf->tpb);
@@ -2361,7 +2363,7 @@ auto moe_call = [&](size_t idx) {
                     sumsq += (double)p[i] * p[i];
                     mx = std::max(mx, std::fabs((double)p[i]));
                 }
-                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+                si::logf("[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
             };
             // `rows` is the flat live-token count; in mode 2 `nrows` is the
             // chunk-row count and `T` is kMaxT, so either of those reads past
@@ -2382,7 +2384,7 @@ auto moe_call = [&](size_t idx) {
                     sumsq += (double)p[i] * p[i];
                     mx = std::max(mx, std::fabs((double)p[i]));
                 }
-                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+                si::logf("[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
             };
             std::vector<float> h((size_t)rows * hp.n_embd);
             dev_queue(dev).memcpy(h.data(), d_xnorm, h.size() * sizeof(float)).wait();
@@ -2452,7 +2454,7 @@ auto moe_call = [&](size_t idx) {
                     sumsq += (double)p[i] * p[i];
                     mx = std::max(mx, std::fabs((double)p[i]));
                 }
-                fprintf(stderr, "[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
+                si::logf("[dump] %-20s sum=%.6f sumsq=%.6f max=%.6f\n", nm, sum, sumsq, mx);
             };
             const size_t R = (size_t)rows * hp.n_embd;
             std::vector<float> h(R), fo(R);
@@ -2495,7 +2497,7 @@ auto moe_call = [&](size_t idx) {
                     for (int e = 0; e < hp.n_expert; e++) {
                         tot += (int64_t) off[(size_t) e + 1] - off[(size_t) e];
                     }
-                    fprintf(stderr, "[dump] csr off[0]=%d off[n]=%d total=%lld (want %lld) n_active=%d\n", off[0],
+                    si::logf("[dump] csr off[0]=%d off[n]=%d total=%lld (want %lld) n_active=%d\n", off[0],
                             off[hp.n_expert], (long long) tot, (long long) rows * hp.n_expert_used, na[0]);
                 }
                 dev_queue(dev).memcpy(fo.data(), d_moe_shout, R * sizeof(float)).wait();
@@ -2503,16 +2505,16 @@ auto moe_call = [&](size_t idx) {
                 {
                     std::vector<float> g1((size_t) rows);
                     dev_queue(dev).memcpy(g1.data(), d_moe_sg, g1.size() * 4).wait();
-                    fprintf(stderr, "[dump] moe_gate-0/t0=%.8f  tL=%.8f\n", g1[0], g1[rows - 1]);
+                    si::logf("[dump] moe_gate-0/t0=%.8f  tL=%.8f\n", g1[0], g1[rows - 1]);
                 }
                 {
                     std::vector<int32_t> ii((size_t)rows * hp.n_expert_used);
                     dev_queue(dev).memcpy(ii.data(), d_moe_ids, ii.size() * 4).wait();
-                    fprintf(stderr, "[dump] moe_ids-0   ");
+                    si::logf("[dump] moe_ids-0   ");
                     for (int j = 0; j < hp.n_expert_used; j++) {
-                        fprintf(stderr, " %d", ii[(size_t)(rows - 1) * hp.n_expert_used + j]);
+                        si::logf(" %d", ii[(size_t)(rows - 1) * hp.n_expert_used + j]);
                     }
-                    fprintf(stderr, "\n");
+                    si::logf("\n");
                 }
                 {
                     // silu(gate)*up for the top-ranked expert of two tokens: the
@@ -2551,7 +2553,7 @@ auto moe_call = [&](size_t idx) {
         if (dbg_dump) {
             if (il == 0) {
                 dbg_call_no++;
-                fprintf(stderr, "[dump] call=%d extents mode=%d rows=%d nrows=%d nreal=%d NCH=%d\n", dbg_call_no, mode,
+                si::logf("[dump] call=%d extents mode=%d rows=%d nrows=%d nreal=%d NCH=%d\n", dbg_call_no, mode,
                         rows, nrows, nreal, NCH);
             }
             dbg_dump_fp(dev_queue(cur_dev), d_x, hp.n_embd, "layer", il, cur_dev);
@@ -2882,12 +2884,12 @@ void engine::warm_bank_path() {
             act_view v = D->quantize(A.gather, nullptr, K, K, Mt, K, /*do_split=*/false);
             if (!v.valid() || !D->gemm_w4(v, bg, nullptr, 1.0f, Mt, K, A.gu, N) ||
                 !D->gemm_w4(v, bu, nullptr, 1.0f, Mt, K, A.gu + (size_t)Mt * N, N)) {
-                fprintf(stderr, "[moe] u4 bank warmup: prefill prim M=%d failed (dev %zu)\n", Mt, d);
+                si::logf("[moe] u4 bank warmup: prefill prim M=%d failed (dev %zu)\n", Mt, d);
             }
         }
         qd.wait();
     }
-    fprintf(stderr, "[moe] u4 bank warmup: %.2f s\n",
+    si::logf("[moe] u4 bank warmup: %.2f s\n",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
@@ -2910,7 +2912,7 @@ void engine::build_md_dec_graphs() {
     // recorded; fall back to the direct replay for any mixed map
     for (const md_phase & ph : phs) {
         if (ph.dev < 0 || (size_t)ph.dev >= dev_kind_.size() || dev_kind_[(size_t)ph.dev] != 0) {
-            fprintf(stderr, "[md] decode command graphs: skipped (device %d is not a GPU partition)\n", ph.dev);
+            si::logf("[md] decode command graphs: skipped (device %d is not a GPU partition)\n", ph.dev);
             return;
         }
     }
@@ -2941,7 +2943,7 @@ void engine::build_md_dec_graphs() {
     md_dec_ok = true;
     // leave the members on the primary device for any runtime use
     bind_acts(0);
-    fprintf(stderr, "[md] decode command graphs: %zu phase(s) over %zu backend(s)\n", md_dec_.size(), backends_.size());
+    si::logf("[md] decode command graphs: %zu phase(s) over %zu backend(s)\n", md_dec_.size(), backends_.size());
 }
 
 void engine::replay_md_dec_graphs() {
@@ -3007,7 +3009,7 @@ void engine::build_md_verify_graphs() {
         // (dnnl_capture_guard throws), so the verify keeps the direct replay.
         // The DECODE's banked path is `moe_u4_gemv_launch`, pure SYCL kernels,
         // and does record - see build_md_dec_graphs.
-        fprintf(stderr, "[md] verify command graphs: skipped (u4 expert bank prefill GEMM is oneDNN)\n");
+        si::logf("[md] verify command graphs: skipped (u4 expert bank prefill GEMM is oneDNN)\n");
         return;
     }
     // phase split: one graph per contiguous device run, the head on the primary
@@ -3052,7 +3054,7 @@ void engine::build_md_verify_graphs() {
             mg.g->end_recording();
             mg.e = std::make_unique<sx::command_graph<sx::graph_state::executable>>(mg.g->finalize());
         } catch (const std::exception & ex) {
-            fprintf(stderr, "[mtp] verify graphs: phase dev=%d not recordable (%s) - direct replay\n", ph.dev, ex.what());
+            si::logf("[mtp] verify graphs: phase dev=%d not recordable (%s) - direct replay\n", ph.dev, ex.what());
             // leave the queue out of the recording state before dropping the
             // graph, or every later submission on it fails
             try {
@@ -3077,7 +3079,7 @@ void engine::build_md_verify_graphs() {
     d_info->mtp_dt = 0;
     d_info->mtp_dry = 0;
     bind_acts(0);
-    fprintf(stderr, "[mtp] verify command graphs: %zu phase(s), %d rows\n", vf_dec_.size(), rows);
+    si::logf("[mtp] verify command graphs: %zu phase(s), %d rows\n", vf_dec_.size(), rows);
 }
 
 bool engine::vf_graph_usable(int rows, int pos0) const {

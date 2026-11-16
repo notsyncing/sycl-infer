@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include "kernels.h"
 #include "kernel_utils.h"
 
@@ -337,14 +339,14 @@ struct xmx_sum_holder {
                     hbs_h = (hbs_h ^ (uint64_t)hbs[2 * i + k]) * 1099511628211ULL;
                 }
             }
-            fprintf(stderr, "[xmxsum] calls=%d kv=%016llx bs=%016llx\n", n, (unsigned long long)hkv_h,
+            si::logf("[xmxsum] calls=%d kv=%016llx bs=%016llx\n", n, (unsigned long long)hkv_h,
                     (unsigned long long)hbs_h);
             for (int i = 0; i < n; i++) {
-                fprintf(stderr, "[xmxsumslot] %d %lld %lld %lld\n", i, (long long)hkv[i], (long long)hbs[2 * i],
+                si::logf("[xmxsumslot] %d %lld %lld %lld\n", i, (long long)hkv[i], (long long)hbs[2 * i],
                         (long long)hbs[2 * i + 1]);
             }
         } catch (sycl::exception & e) {
-            fprintf(stderr, "[xmxsum] readback failed: %s\n", e.what());
+            si::logf("[xmxsum] readback failed: %s\n", e.what());
         }
     }
     int slot(queue & qq) {
@@ -860,17 +862,17 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
                         srow += row_nr(info, r);
                     }
                 }
-                fprintf(stderr, "[xmx] HPG=%d n_rows=%d sum_row_nr=%d cap=%d M=%d ", HPG, n_rows, srow,
+                si::logf("[xmx] HPG=%d n_rows=%d sum_row_nr=%d cap=%d M=%d ", HPG, n_rows, srow,
                         HPG * kMaxQ, M);
             }
-            fprintf(stderr, "max_nkv=%d nblk@%d=", max_nkv, kBlk);
+            si::logf("max_nkv=%d nblk@%d=", max_nkv, kBlk);
             for (int k0 = 0; k0 < max_nkv;) {
                 const int blk = (max_nkv - k0 > kBlk) ? kBlk : xmx_tail_blk(max_nkv - k0);
-                fprintf(stderr, "%d", blk);
-                if (blk < kBlk) fprintf(stderr, "(%d)", std::min(blk, max_nkv - k0));
+                si::logf("%d", blk);
+                if (blk < kBlk) si::logf("(%d)", std::min(blk, max_nkv - k0));
                 k0 += blk;
             }
-            fprintf(stderr, " total_cols=%d\n", max_nkv);
+            si::logf(" total_cols=%d\n", max_nkv);
         }
         // Build the per-row (qbuf row, query head, causal limit) on the device
         // from `info`.  Three host->device q.memcpy per kv head used to do this;
@@ -981,7 +983,7 @@ bool attn_xmx_launch(queue & q, const float * qbuf, const float * gate, const vo
             // the matmul cost a step function of the key length rather than linear
             // (primitive creation is ~15 ms per new shape, so the width is fixed
             // and padded instead) - the number that explains a surprising total.
-            fprintf(stderr,
+            si::logf(
                     "[xmx] %ld calls %.2f ms total %.3f/call | gather %.3f  qk %.3f  softmax %.3f  pv %.3f "
                     "(ms/call) cols/call %.0f  blks/call %.1f\n",
                     acc_n, acc_ms, acc_ms / acc_n, g_ga / d, g_qk / d, g_sm / d, g_pv / d, (double)g_cols / d,
