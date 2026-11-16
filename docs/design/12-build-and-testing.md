@@ -57,7 +57,14 @@ SYCL device pass 之外。新增 CPU 内核要同时加入 `SI_CPU_SOURCES`（`C
 vendored 的 llama.cpp Unicode 表留了一个故意未用的 helper，编译单元上加 `-Wno-unused-function`
 （`CMakeLists.txt:190-193`）。
 
-二进制：`sycl-infer`（`src/main.cpp`）。测试按后端分树：`tests/backend/cpu/`（含 `kernels/`）与
+二进制：`sycl-infer`（`src/main.cpp`）。**每个 kernel launcher 都必须有单元测试。**  `ci/kernel_test_map.txt` 为 `kernels.h` /
+`cpu_types.h` 的每个入口指定测试；`ci/check_kernel_coverage.py`（hermetic ctest
+`kernel_coverage`）在新增 kernel 没有测试、测试文件不提及 launcher、或 `!integration`
+行没有具体理由时失败。`!integration` 行是**有记录的债**，不是豁免。参考阶梯：hermetic
+标量参考 > CPU 孪生（其自身必须有标量测试）> 数据搬移的逐位/性质检查。详见
+[AGENTS.md](../../AGENTS.md) 的 “Kernel unit tests (mandatory)”。
+
+测试按后端分树：`tests/backend/cpu/`（含 `kernels/`）与
 `tests/backend/gpu/`（含 `kernels/`），共享 harness 在 `tests/common/`。
 
 ### 1.3 测试目标
@@ -197,6 +204,18 @@ icpx -fsycl -std=c++17 -O2 dev/<tool>.cpp -o dev/<tool> \
 | `test_mm_step` | 无 | CPU | `mm_write_step` 的逐 token M-RoPE/`img_row` 切片（含 chunk 边界落在图像块中间）、越界切片/过小 section stride 必须抛错、`has_encoded_embd` 的缺编码器判据 |
 | `test_dev_profile` | 无 | CPU | 设备 profile 的判定与回退（A770 / Iris / 混合 / 未知），`moe.*`、`shape.*` 的取值，以及 `unknown` 行必须是 A770 的完整拷贝且硬件事实清零 |
 | `test_multimodal` | 0.8B + mmproj | CPU+GPU | 图像预处理几何、host/device 视觉编码器、位置与 prompt 布局、逐 kernel 对照；音频解码/mel、AuT 塔 |
+| `test_cpu_elementwise_units` | 无 | CPU | `cpu_copy_row`/`cpu_embed`/`cpu_gated_norm`/`cpu_xq`/q4 HC/arbitrary-K GEMV vs 测试内标量参考（hermetic） |
+| `test_cpu_attn_units` | 无 | CPU | `cpu_conv_l2`/`cpu_conv_state_update`/`cpu_attn`（f32+i8，fused+split）/`cpu_qk_norm_rope` vs 标量参考（hermetic） |
+| `test_cpu_gemv_units` | 无 | CPU | `cpu_i8_gemv/gemm`、`cpu_dp4a_gemv/gemm`、qwen4exp down store/grouped down vs dequant 参考（hermetic） |
+| `test_cpu_moe_qsa_units` | 无 | CPU | host MoE 镜像（router/experts/reduce/epilogue）与 QSA bf16 GEMV/score/sparse attention vs 标量参考（hermetic） |
+| `test_cpu_q4_units` | 无 | CPU | Q5_1/Q8_0 原生 down、Q5_1 panel repack、batched int8 expert GEMM、PLE gate/apply vs 标量参考（hermetic） |
+| `test_w8_layout` | 无 | CPU | SIn 的 128 行分块布局：padded allocation、per-row stride、slab copy 与 blocked 读取（hermetic） |
+| `test_kernel_units` | 无 | GPU | 无模型的 GPU kernel 单测：copy_row、gated_norm、q4 HC/repeat/up/inject、MTP capture/argmax、w4 split、ViT/AT 逐元素、MoE CSR/scatter/reduce、fused HC inject+mix |
+| `test_kernel_units_native` | 无 | GPU | u4/k5/cb4/w2 存储的 GEMV/expand 与 `nat_gemm`，以及 i8-grouped GEMV 的 M 行/多段/融合量化 vs 存储定义（model-free） |
+| `test_kernel_units_moe_qsa` | 无 | GPU | MoE u4 gather/scatter/silu、MTP candidate readout、QSA scratch/gather/score/topk/indexer/idx_update、down correction（model-free） |
+| `test_kernel_units_moe2` | 无 | GPU | 路由专家 bank 的 Q5_1/Q8_0/i8/u4 GEMV、grouped gate/up 与 u4、row GEMV、`w4_grp_quant`、`gemv_mix_q8_f32`、`kv_store_sum`（model-free） |
+| `test_kernel_units_attn2` | 无 | GPU | `gdn_conv`/`gdn_head` vs conv_l2/gdn/gated_norm、DFlash qknorm/attn/combine/sel、`attn_xmx` vs classic（model-free） |
+| `kernel_coverage` | 无 | CPU | `ci/check_kernel_coverage.py`：`kernels.h`/`cpu_types.h` 的 162 个 launcher 全部有单测行（当前 162/162）；测试文件必须存在、注册且提到 launcher；`!integration` 仅保留给确实不可单测的项且必须带理由 |
 | `test_gpu_stages` | 0.8B | GPU | 每个 kernel vs CPU 参考（强制 `PF_DP4A=0`）；调用 rmsnorm/embed/qk_norm_rope/attn/conv/gdn/gated_norm |
 | `test_gemv` | 0.8B | GPU | 每个真实 GGUF 张量的 GEMV vs CPU 反量化参考，多 TB（强制 `PF_DP4A=0`） |
 | `test_dp4a` | 0.8B | GPU | SIn 重排 + DP4A GEMM vs 同量化输入的 CPU 参考，报告相对 fp32 的量化误差 |

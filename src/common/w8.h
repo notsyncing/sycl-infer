@@ -83,6 +83,11 @@ bool w8_q6_scale_only_ok(uint32_t ggml_type, const void * src, int K, int N);
 size_t w8_vals_bytes(uint32_t type, int K, int N);
 size_t w8_meta_count(uint32_t type, int K, int N);
 size_t w8_meta_bytes(uint32_t type, int K, int N, bool scale_only = false);
+// Per-row strides of the blocked layout (one logical row), used by the slab
+// copy that builds a w8 tensor.  Distinct from w8_vals_bytes(...,1), which is
+// the *allocation* size of a one-row tensor and is padded to kRB rows.
+size_t w8_row_vals_bytes(uint32_t type, int K);
+size_t w8_row_meta_bytes(uint32_t type, int K, bool scale_only = false);
 // the layout type the kernels must use (12 = 4-bit G=32 when PF_SI4 is set)
 uint32_t w8_effective_type(uint32_t type);
 

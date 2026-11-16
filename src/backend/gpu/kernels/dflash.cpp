@@ -68,8 +68,12 @@ void df_capture_launch(queue & q, const float * src, float * dst, int n_rows, in
     if (n_rows <= 0 || n <= 0) {
         return;
     }
-    q.parallel_for(nd_range<1>((size_t)n_rows * n, 256), [=](nd_item<1> it) {
+    const size_t total = (size_t)n_rows * n;
+    q.parallel_for(nd_range<1>(((total + 255) / 256) * 256, 256), [=](nd_item<1> it) {
         const size_t i = it.get_global_id(0);
+        if (i >= total) {
+            return;
+        }
         const int t = (int)(i / n);
         dst[(size_t)t * dst_row_stride + (i % n)] = src[i];
     });
@@ -166,9 +170,12 @@ void df_add_launch(queue & q, const float * a, const float * b, float * out, int
     if (n_rows <= 0 || n <= 0) {
         return;
     }
-    q.parallel_for(nd_range<1>((size_t)n_rows * n, 256), [=](nd_item<1> it) {
+    const size_t total = (size_t)n_rows * n;
+    q.parallel_for(nd_range<1>(((total + 255) / 256) * 256, 256), [=](nd_item<1> it) {
         const size_t i = it.get_global_id(0);
-        out[i] = a[i] + b[i];
+        if (i < total) {
+            out[i] = a[i] + b[i];
+        }
     });
 }
 

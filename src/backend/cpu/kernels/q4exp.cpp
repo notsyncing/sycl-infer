@@ -22,10 +22,18 @@ namespace si {
 namespace {
 
 __attribute__((target("avx2"))) inline int32_t dot32_u8s8(const uint8_t * a, const int8_t * b) {
+    // Widen both operands to 16 bits and use madd.  _mm256_maddubs_epi16
+    // saturates each pair to int16, and the 0..255 biased weights this helper
+    // is used for (the int8 down store is q+128) reach 255*127*2 = 64 770, so
+    // the saturating form silently clipped large positive pairs.  The widened
+    // form accumulates in int32 and is exact.
     const __m256i va = _mm256_loadu_si256((const __m256i *)a);
     const __m256i vb = _mm256_loadu_si256((const __m256i *)b);
-    const __m256i p = _mm256_maddubs_epi16(va, vb);
-    const __m256i s = _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+    const __m128i alo = _mm256_castsi256_si128(va), ahi = _mm256_extracti128_si256(va, 1);
+    const __m128i blo = _mm256_castsi256_si128(vb), bhi = _mm256_extracti128_si256(vb, 1);
+    const __m256i a0 = _mm256_cvtepu8_epi16(alo), a1 = _mm256_cvtepu8_epi16(ahi);
+    const __m256i b0 = _mm256_cvtepi8_epi16(blo), b1 = _mm256_cvtepi8_epi16(bhi);
+    __m256i s = _mm256_add_epi32(_mm256_madd_epi16(a0, b0), _mm256_madd_epi16(a1, b1));
     __m128i lo = _mm256_castsi256_si128(s);
     const __m128i hi = _mm256_extracti128_si256(s, 1);
     lo = _mm_add_epi32(lo, hi);

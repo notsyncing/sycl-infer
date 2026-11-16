@@ -655,6 +655,11 @@ si_add_test(test_cpuref      tests/backend/cpu/test_cpuref.cpp)
 si_add_test(test_pc_cpu      tests/backend/cpu/test_pc_cpu.cpp)
 si_add_test(test_cpu_gemv    tests/backend/cpu/kernels/test_cpu_gemv.cpp)
 si_add_test(test_cpu_gdn     tests/backend/cpu/kernels/test_cpu_gdn.cpp)
+si_add_test(test_cpu_elementwise_units tests/backend/cpu/kernels/test_cpu_elementwise_units.cpp)
+si_add_test(test_cpu_attn_units tests/backend/cpu/kernels/test_cpu_attn_units.cpp)
+si_add_test(test_cpu_gemv_units tests/backend/cpu/kernels/test_cpu_gemv_units.cpp)
+si_add_test(test_cpu_moe_qsa_units tests/backend/cpu/kernels/test_cpu_moe_qsa_units.cpp)
+si_add_test(test_cpu_q4_units tests/backend/cpu/kernels/test_cpu_q4_units.cpp)
 si_add_test(test_forward     tests/backend/gpu/test_forward.cpp)
 si_add_test(test_gpu_vs_ref  tests/backend/gpu/test_gpu_vs_ref.cpp)
 si_add_test(test_pc_gpu      tests/backend/gpu/test_pc_gpu.cpp)
@@ -675,6 +680,7 @@ si_add_test(test_kv_type     tests/backend/gpu/kernels/test_kv_type.cpp)
 si_add_test(test_chat_builtin tests/server/test_chat_builtin.cpp)
 si_add_test(test_chat_deepseek tests/server/test_chat_deepseek.cpp)
 si_add_test(test_quant_synth tests/model/test_quant_synth.cpp)
+si_add_test(test_w8_layout   tests/model/test_w8_layout.cpp)
 si_add_test(test_w4_gemm     tests/backend/gpu/kernels/test_w4_gemm.cpp)
 si_add_test(test_k5_gemv     tests/backend/gpu/kernels/test_k5_gemv.cpp)
 si_add_test(test_w4_vs_i8    tests/backend/gpu/kernels/test_w4_vs_i8.cpp)
@@ -715,6 +721,11 @@ si_add_host_test(test_gguf_split
     tests/model/test_gguf_split.cpp)
 
 si_add_test(test_ds41_ops    tests/backend/gpu/kernels/test_ds41_ops.cpp)
+si_add_test(test_kernel_units tests/backend/gpu/kernels/test_kernel_units.cpp)
+si_add_test(test_kernel_units_native tests/backend/gpu/kernels/test_kernel_units_native.cpp)
+si_add_test(test_kernel_units_moe_qsa tests/backend/gpu/kernels/test_kernel_units_moe_qsa.cpp)
+si_add_test(test_kernel_units_moe2 tests/backend/gpu/kernels/test_kernel_units_moe2.cpp)
+si_add_test(test_kernel_units_attn2 tests/backend/gpu/kernels/test_kernel_units_attn2.cpp)
 si_add_test(test_gpu_stages
     tests/backend/gpu/kernels/test_gpu_stages.cpp
     tests/backend/gpu/kernels/rmsnorm_stage.cpp
@@ -737,7 +748,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_guided test_pc_disk test_pc_ram test_cpu_gdn test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_guided test_pc_disk test_pc_ram test_cpu_gdn test_cpu_elementwise_units test_cpu_attn_units test_cpu_gemv_units test_cpu_moe_qsa_units test_cpu_q4_units test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_w8_layout test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()
@@ -753,6 +764,10 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME arch_boundaries COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ci/check_arch_boundaries.py)
         set_tests_properties(arch_boundaries PROPERTIES LABELS "hermetic")
+        # Every kernel launcher has a unit test (or a tracked !integration row
+        # with a reason and the test that covers it).  See AGENTS.md.
+        add_test(NAME kernel_coverage COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ci/check_kernel_coverage.py)
+        set_tests_properties(kernel_coverage PROPERTIES LABELS "hermetic")
     endif()
     if(NOT SI_ROUTER_ONLY)
         # The CLI's own contract: --help exits 0 and documents the flags a
@@ -804,7 +819,7 @@ if(BUILD_TESTING)
         # These kernel tests need the GPU but no model; they were built and
         # never registered, so a regression could only be found by running the
         # binary by hand.
-        foreach(name IN ITEMS test_moe_kernels test_moe_tiled test_enc_own test_dflash_kernels)
+        foreach(name IN ITEMS test_kernel_units test_kernel_units_native test_kernel_units_moe_qsa test_kernel_units_moe2 test_kernel_units_attn2 test_moe_kernels test_moe_tiled test_enc_own test_dflash_kernels)
             add_test(NAME ${name} COMMAND ${name})
             # GPU-only (no model), and test_moe_tiled is >15 min under JIT:
             # keep them out of -L hermetic so that label stays CPU-only and fast.

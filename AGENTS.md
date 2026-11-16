@@ -396,6 +396,8 @@ from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
                            # scoped override and nested restore (no device)
 ./build/test_quant_synth   # synthetic Q8_0/Q5_0/Q5_1/F16/BF16 blocks and the
                            # SIn size/rejection guards (no GGUF, no GPU)
+./build/test_w8_layout     # SIn 128-row blocking, padded allocation and the
+                           # slab-copy row stride (no GGUF, no GPU)
 ./build/test_chat_builtin  # the no-template ChatML fallback: roles, thinking,
                            # tools, tool_calls, media placeholders (no GGUF)
 ./build/test_request_parse / test_response_json / test_control
@@ -414,6 +416,16 @@ from the AOT tree and pass the 4-shard GGUF as `argv[1]`.
 ./build/test_cpuref        # CPU reference head (CPU only)
 ./build/test_cpu_gdn       # cpu_gdn with an *asymmetric* head count (CPU only)
 ./build/test_cpu_gemv      # host GEMV/RMSNorm vs dequant reference (CPU only)
+./build/test_cpu_elementwise_units # copy/embed/gated-norm/xq/q4 HC + arbitrary-K GEMV
+./build/test_cpu_attn_units       # conv/conv-state/paged attention/qk-norm+rope
+./build/test_cpu_gemv_units       # dp4a/i8 GEMV+GEMM, q4 down stores
+./build/test_cpu_moe_qsa_units    # host MoE mirror + QSA score/attention
+./build/test_cpu_q4_units         # Q5_1/Q8_0 down, panel repack, PLE gate/apply
+./build/test_kernel_units         # GPU copy/gated-norm/q4-HC/vit/at/MoE-housekeeping
+./build/test_kernel_units_native  # u4/k5/cb4/w2 stores and the grouped int8 GEMVs
+./build/test_kernel_units_moe_qsa # MoE scatter, MTP candidate readout, QSA gather/selector
+./build/test_kernel_units_moe2      # routed-expert bank GEMVs, grouped experts, mixed dispatch
+./build/test_kernel_units_attn2     # fused GDN variants, DFlash draft kernels, attn_xmx
 ./build/test_gpu_stages    # every kernel vs the CPU reference (GPU)
 ./build/test_gemv          # GEMV vs CPU dequant reference (GPU)
 ./build/test_dp4a          # SIn repack + DP4A GEMM vs CPU reference (GPU)
@@ -460,6 +472,84 @@ invisible), so **any change that can affect the single-token path must run
 `test_decode_vs_prefill`**; and `test_sched` is the only coverage of a
 **batched** decode — a single-token check cannot see "the engine computed only
 some of the rows".
+
+### Kernel unit tests (mandatory)
+
+**Every kernel entry point has a unit test, and the test is part of the change
+that adds or changes the kernel.**  This is not the same thing as the stage /
+end-to-end tests above: those need a model and a forward, so a refactor of one
+kernel can only be reported as "the model's output changed", which is
+indistinguishable from a different kernel's regression.  A kernel unit test
+constructs its own inputs and compares one launcher's output with an
+independent reference.
+
+The rule applies to both trees:
+
+| launcher tree | declaration | test lives in |
+|---|---|---|
+| `src/backend/gpu/kernels/*.cpp` | `src/backend/gpu/kernels/kernels.h` | `tests/backend/gpu/kernels/test_*_units.cpp` (GPU) |
+| `src/backend/cpu/kernels/*.cpp` | `src/backend/cpu/cpu_types.h` | `tests/backend/cpu/kernels/test_cpu_*_units.cpp` (hermetic) |
+
+A declaration is not covered by a launcher's *name* appearing in a comment, by
+a wrapper used from another kernel, or by an end-to-end run.  It is covered
+when a test calls it (directly or through the one-line CPU twin it is being
+compared against) and asserts its output.
+
+**The reference ladder, in order of preference:**
+
+1. **Hermetic scalar reference.**  Generate small deterministic inputs, compute
+   the expected output with a few lines of plain C++ in the test, compare with
+   an absolute + relative tolerance.  This is the only reference that can fail
+   independently of the implementation under test.  CPU kernels must be
+   covered this way.
+2. **CPU twin.**  A GPU launcher may be compared against its `cpu_*` twin when
+   the geometry makes a scalar reference disproportionate (attention over a
+   paged pool, a quantized GEMV).  The CPU twin must itself have a hermetic
+   scalar test, so this is a differential check of the device port, not a
+   second implementation validating the first.
+3. **Exactness or a property** for data-movement kernels: pack/expand
+   round-trips, a permutation check, `argmax` ties, byte equality.
+
+**What a kernel unit test must do:**
+
+* use a **fixed seed** and a shape that exercises the tails: a K that is not a
+  power of two, a row count that is not a multiple of the work-group width, an
+  inactive row/slot, a zero group, the last partial tile;
+* assert **both** the value and the size, and print `max|diff|` against
+  `max|expected|` so a failure names the kernel and the scale;
+* use a tolerance that is the kernel's own: bit-exact for a copy/pack, ~1e-6
+  relative for a fp32 reduction, the quantized path's documented error for an
+  int8/u4 kernel (never a blanket `2e-3` on a quantized dot);
+* be **model-free** wherever the kernel does not require a GGUF.  Model-backed
+  stage tests are additional coverage, not a substitute;
+* be registered in `CMakeLists.txt`, in `ctest`, and under the `hermetic` label
+  if it needs no GPU.  GPU-only tests go in the `gpu;kernel` group, which is
+  registered by `-DSI_REGISTER_GPU_TESTS=ON` and needs no model.
+
+**The coverage map is the enforcement.**  Every declaration in `kernels.h` and
+`cpu_types.h` has a row in `ci/kernel_test_map.txt` naming the test(s) that
+cover it.  `ci/check_kernel_coverage.py` (registered as the hermetic
+`kernel_coverage` ctest) fails when:
+
+* a declared kernel has no map row (a new kernel without a test);
+* a map row names a test file that does not exist or does not mention the
+  launcher;
+* a row is marked `!integration` without a reason, or an integration-only row
+  names a test that is not itself registered for that kernel's backend.
+
+Run it before finishing a kernel change:
+
+```bash
+python3 ci/check_kernel_coverage.py           # coverage report + gate
+python3 ci/check_kernel_coverage.py --list    # every row, by tree
+ctest --test-dir build -R kernel_coverage --output-on-failure
+```
+
+Every launcher in the tree is now unit-tested (162/162 at the time of
+writing); `!integration` remains available for a genuinely untestable entry
+point, but the row must name a specific reason and the test that covers it, and
+it is tracked debt rather than an exemption from the principle.  Adding a
+kernel whose only coverage is "some forward test" fails the gate.
 
 ## Repository layout
 
@@ -652,7 +742,10 @@ tests/mm/       test_multimodal.cpp (preprocessing, vision encoder, video/audio
 ci/             check_arch_boundaries.py: the hermetic gate that fails when a
                 generic engine/model file names an architecture, a per-model
                 state member or a model-owned fwd_kind (see
-                docs/design/24-arch-modules.md)
+                docs/design/24-arch-modules.md);
+                check_kernel_coverage.py + kernel_test_map.txt: the hermetic
+                gate that every kernel launcher in kernels.h / cpu_types.h has
+                a unit test (or a tracked !integration row with a reason)
 src/pipeline/   request-level multi-step orchestration (see
                 docs/design/22-pipelines.md).  `pipeline.h` / `registry.{h,cpp}`
                 define the interface, id registry and availability filter.  The
@@ -824,7 +917,13 @@ interface, request/response shapes and migration plan.
    ```
 2. Declare the launch function in `src/backend/gpu/kernels/kernels.h`.
 3. Add the `.cpp` to `CMakeLists.txt`.
-4. Add a stage test next to the others (see below).
+4. **Add a model-free unit test** in
+   `tests/backend/gpu/kernels/test_<family>_units.cpp` (or the matching
+   `test_*_units.cpp`) and a row in `ci/kernel_test_map.txt`; run
+   `python3 ci/check_kernel_coverage.py`.  The model-backed stage test below
+   is additional coverage, not the unit test.
+5. Add a stage test next to the others (see below) when the kernel runs inside
+   a forward and has a CPU-reference snapshot.
 
 Shared device helpers (dequantization, KV element access, sub-group reductions,
 SIn/DP4A expansion, `gemm_ws`) live in `src/backend/gpu/kernels/kernel_utils.h` under
@@ -845,6 +944,10 @@ other card and an unknown one can differ; see "Device profiles" below.
    SYCL device pass).
 3. Use `par(...)` for parallelism and `isa().dot_f32` / `isa().dot_i8` for the
    ISA-dispatched inner products; structural loops can be plain scalar.
+4. **Add a hermetic scalar unit test** in
+   `tests/backend/cpu/kernels/test_cpu_<family>_units.cpp` and a row in
+   `ci/kernel_test_map.txt`; run `python3 ci/check_kernel_coverage.py`.  The
+   CPU kernel is the reference for its GPU twin, so this test is not optional.
 
 See [`docs/design/03-kernels.md`](docs/design/03-kernels.md) for the kernel
 library layout and per-kernel launch geometry.
@@ -4311,6 +4414,10 @@ branch on the model name at the use site.**
   `snake_case`, constants `kFoo`, device pointers `d_foo`, host copies `h_foo`.
 * Comments explain *why* (often a measurement) — keep them when refactoring.
 * The `src/` and `tests/` trees are parallel: one file per kernel/kernel-stage.
+* **A kernel is not finished until its unit test exists.**  A new or changed
+  launcher in `kernels.h` / `cpu_types.h` needs a model-free test that calls it
+  and a row in `ci/kernel_test_map.txt`; `ci/check_kernel_coverage.py` is what
+  makes that mechanical.  See "Kernel unit tests (mandatory)" under Testing.
 * **Reuse or extend the engine's existing machinery before building a parallel
   path - prefer refactoring or extending it over adding a second one.**  The
   MoE cache, the plan/record/forward hooks, the prefill chunker, the device
@@ -5337,6 +5444,16 @@ the point where the experts' depth-independent share stops shrinking.
 The rules that are not obvious from the code, and what breaks when they are
 broken.  Each one is a thing that *was* broken, or that fails silently.
 
+* **A kernel without a unit test is not finished.**  An end-to-end run cannot
+  tell which of ~500 launchers moved a logit, and a stage test needs a model
+  and a forward.  `ci/kernel_test_map.txt` names the test for every launcher in
+  `kernels.h` and `cpu_types.h`, and `ci/check_kernel_coverage.py` fails the
+  build when a new declaration has no row, when a row points at a test that
+  never calls the launcher, or when an `!integration` row gives no reason.  The
+  reason is not ceremony: the `ggml_float_to_half` subnormal bug and the Q6_K
+  8-lane expert index bug both changed numbers that no aggregate test could
+  see, and both are now pinned by a hermetic kernel test.
+
 * **A generic engine/model file must not name an architecture, a per-model
   state member or a model-owned `fwd_kind`.**  `engine.cpp`, `graph.cpp`,
   `engine_prefix_cache.cpp`, `engine_kvpool.cpp`, `server.cpp`, `model.cpp` and
@@ -6344,13 +6461,24 @@ broken.  Each one is a thing that *was* broken, or that fails silently.
 
 ```bash
 cmake --build build -j$(nproc)          # must be warning-free (except the linker notes)
-ctest --test-dir build -L hermetic --output-on-failure   # 39/39: profiles, kv_type, quant,
+ctest --test-dir build -L hermetic --output-on-failure   # 46/46: profiles, kv_type, quant,
                                         # chat, sampler, guided, CLI, test_arch_ops,
-                                        # arch_boundaries
+                                        # arch_boundaries, kernel_coverage, and the
+                                        # hermetic CPU kernel unit suites
 ./build/test_arch_ops                   # the arch_ops dispatch table (hermetic)
 ./build/test_guided                     # JSON-schema guided decoding (hermetic)
 python3 ci/check_arch_boundaries.py     # generic engine/model files name no architecture
                                         # (or: ctest --test-dir build -R arch_boundaries)
+python3 ci/check_kernel_coverage.py     # every launcher has a unit test (or a tracked
+                                        # !integration row with a reason)
+ctest --test-dir build -R kernel_coverage --output-on-failure
+for t in test_cpu_elementwise_units test_cpu_attn_units test_cpu_gemv_units \
+         test_cpu_moe_qsa_units test_cpu_q4_units; do ./build/$t; done
+./build/test_kernel_units               # GPU kernel units vs the CPU twin/scalar reference
+./build/test_kernel_units_native        # u4/k5/cb4/w2 stores + i8-grouped GEMVs
+./build/test_kernel_units_moe_qsa       # MoE scatter, MTP readout, QSA gather/selector
+./build/test_kernel_units_moe2          # routed-expert banks + grouped experts + gemv_mix
+./build/test_kernel_units_attn2         # gdn_conv/gdn_head, DFlash draft, attn_xmx
 ./build/test_gpu_stages                 # all stages OK
 ./build/test_gpu_vs_ref                 # argmax SAME
 ./build/test_forward                    # default prompt predicted_argmax=248068

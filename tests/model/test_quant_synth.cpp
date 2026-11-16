@@ -120,11 +120,16 @@ int main() {
         block_q4_K q{};
         check(!w8_repack(12, &q, 33, 1, vals, meta, false), "K%32 rejected");
         // Byte-plane sizes agree with 128-row blocking and the group width.
-        check(w8_vals_bytes(12, 256, 1) == (size_t)(256 / 32) * 16, "Q4_K vals bytes, N=1");
-        check(w8_vals_bytes(12, 256, 129) == (size_t)129 * 8 * 16, "Q4_K vals bytes scale with N");
-        check(w8_meta_count(12, 256, 129) == (size_t)129 * 8, "Q4_K meta entries scale with N");
-        check(w8_meta_bytes(14, 256, 1, /*scale_only=*/true) == (size_t)(256 / 16) * 2,
-              "Q6_K meta is scale-only (2 B/group)");
+        // The allocation pads the last row block to kRB; the *slab-copy*
+        // per-row stride must stay unpadded (w8_row_*), or the copy writes a
+        // transposed prefix into the plane.
+        check(w8_vals_bytes(12, 256, 1) == (size_t)128 * 8 * 16, "Q4_K vals bytes, N=1 padded");
+        check(w8_vals_bytes(12, 256, 129) == (size_t)256 * 8 * 16, "Q4_K vals bytes pad to 256");
+        check(w8_meta_count(12, 256, 129) == (size_t)256 * 8, "Q4_K meta entries pad to 256");
+        check(w8_row_vals_bytes(12, 256) == (size_t)8 * 16, "Q4_K row stride is unpadded");
+        check(w8_row_meta_bytes(12, 256) == (size_t)8 * 4, "Q4_K row meta stride is unpadded");
+        check(w8_meta_bytes(14, 256, 1, /*scale_only=*/true) == (size_t)128 * (256 / 16) * 2,
+              "Q6_K meta is scale-only (2 B/group), padded");
     }
 
     printf(g_fail ? "quant synth test FAILED (%d)\n" : "quant synth test OK\n", g_fail);

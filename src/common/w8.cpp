@@ -154,17 +154,36 @@ uint32_t w8_effective_type(uint32_t type) {
 size_t w8_vals_bytes(uint32_t type, int K, int N) {
     const int G = w8_force4() ? 32 : w8_group_size(type);
     const int gb = w8_force4() ? 16 : w8_group_bytes(type);
-    return (size_t)N * (K / G) * gb;
+    // The layout is blocked over kRB (128) rows: group g of row r lives at
+    // ((rb*MG + g)*kRB + ri), so the last row block is padded to kRB rows.  A
+    // size of N*MG*gb is only correct when N is a multiple of 128; for N = 48
+    // the pack would write past the allocation and the copy below would take a
+    // transposed prefix of the plane.
+    const size_t nr = (size_t)((N + kRB - 1) / kRB) * (size_t)kRB;
+    return nr * (K / G) * gb;
 }
 
 size_t w8_meta_count(uint32_t type, int K, int N) {
     const int G = w8_force4() ? 32 : w8_group_size(type);
-    return (size_t)N * (K / G);
+    const size_t nr = (size_t)((N + kRB - 1) / kRB) * (size_t)kRB;
+    return nr * (K / G);
 }
 
 size_t w8_meta_bytes(uint32_t type, int K, int N, bool scale_only) {
     const int e = (scale_only && !w8_force4() && type == 14) ? 2 : 4;
     return w8_meta_count(type, K, N) * (size_t)e;
+}
+
+size_t w8_row_vals_bytes(uint32_t type, int K) {
+    const int G = w8_force4() ? 32 : w8_group_size(type);
+    const int gb = w8_force4() ? 16 : w8_group_bytes(type);
+    return (size_t)(K / G) * (size_t)gb;
+}
+
+size_t w8_row_meta_bytes(uint32_t type, int K, bool scale_only) {
+    const int G = w8_force4() ? 32 : w8_group_size(type);
+    const int e = (scale_only && !w8_force4() && type == 14) ? 2 : 4;
+    return (size_t)(K / G) * (size_t)e;
 }
 
 // Q6_K groups hold w = scale*(q-32); the min stored in the 4-byte meta is

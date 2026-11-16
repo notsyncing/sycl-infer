@@ -60,8 +60,8 @@ static void build_w8_tensor(sycl::queue & q, const wt & t, w8t & out, bool host)
     }
     // repack in slabs to keep host memory bounded (the LM head is ~250 MB)
     const int slab = 4096; // rows per slab
-    const size_t row_vals = w8_vals_bytes(t.type, t.K, 1);
-    const size_t row_meta_b = w8_meta_bytes(t.type, t.K, 1, scale_only);
+    const size_t row_vals = w8_row_vals_bytes(t.type, t.K);
+    const size_t row_meta_b = w8_row_meta_bytes(t.type, t.K, scale_only);
     std::vector<uint8_t> hv((size_t)slab * row_vals);
     std::vector<uint8_t> hm((size_t)slab * row_meta_b);
     const size_t row_bytes = quant_row_bytes(t.type, t.K);
@@ -71,8 +71,12 @@ static void build_w8_tensor(sycl::queue & q, const wt & t, w8t & out, bool host)
         if (!w8_repack(t.type, src, t.K, nr, hv.data(), reinterpret_cast<uint32_t *>(hm.data()), scale_only)) {
             throw std::runtime_error("w8_repack failed");
         }
-        q.memcpy(out.vals + (size_t)r0 * row_vals, hv.data(), (size_t)nr * row_vals);
-        q.memcpy((uint8_t *)out.meta + (size_t)r0 * row_meta_b, hm.data(), (size_t)nr * row_meta_b);
+        // A partial last slab still occupies whole 128-row blocks (w8_repack
+        // indexes (rb*MG + g)*kRB + ri), so copy the padded extent.  The rows
+        // past t.N are never read; the allocation is padded by w8_vals_bytes.
+        const int cp = (nr + kRB - 1) / kRB * kRB;
+        q.memcpy(out.vals + (size_t)r0 * row_vals, hv.data(), (size_t)cp * row_vals);
+        q.memcpy((uint8_t *)out.meta + (size_t)r0 * row_meta_b, hm.data(), (size_t)cp * row_meta_b);
         // the host staging buffers are reused by the next slab: the async copies
         // must complete before we overwrite them (otherwise the transfer races)
         q.wait();
