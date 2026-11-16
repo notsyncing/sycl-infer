@@ -97,6 +97,13 @@ public:
     bool needs_token() const {
         return !token_.empty();
     }
+    // How many connection slots are live.  A finished connection is reaped by
+    // the accept loop within one 200 ms poll; used by test_control to pin
+    // that a dropped peer does not leave a thread behind.
+    size_t open_connections() const {
+        std::lock_guard<std::mutex> lk(conn_mtx_);
+        return conns_.size();
+    }
 
 private:
     // One accepted connection.  The accept loop reaps the finished ones, so
@@ -119,7 +126,7 @@ private:
     std::atomic<bool> stopping_{false};
     std::thread accept_thread_;
     std::vector<std::shared_ptr<conn>> conns_;
-    std::mutex conn_mtx_;
+    mutable std::mutex conn_mtx_;
 };
 
 } // namespace si

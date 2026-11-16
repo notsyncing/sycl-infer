@@ -119,8 +119,10 @@ bool rpc_client::call(const std::string & method, const json & params, json & re
     // the frames that are not our reply.
     for (int attempt = 0; attempt < 8; attempt++) {
         std::string line;
-        if (!reader_.next(fd_, line, timeout_ms)) {
-            err = "the worker did not answer";
+        const rpc::read_status st = reader_.next(fd_, line, timeout_ms);
+        if (st != rpc::read_status::line) {
+            err = st == rpc::read_status::timeout ? "the worker did not answer"
+                                                  : "the worker closed the connection";
             close();
             return false;
         }

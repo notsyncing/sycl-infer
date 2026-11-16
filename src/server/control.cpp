@@ -198,11 +198,18 @@ void control_server::serve_conn(int fd) {
         // A short poll: the connection has to notice the shutdown promptly
         // (stop() joins these threads), and an idle connection must not hold
         // the shutdown up for a minute.
-        if (!reader.next(fd, line, 1000)) {
-            if (stopping_.load()) {
-                break;
+        const rpc::read_status st = reader.next(fd, line, 1000);
+        if (st != rpc::read_status::line) {
+            // A timeout is the only reason to keep waiting.  A closed peer
+            // has to end this thread: poll() keeps reporting the hangup (and
+            // recv() keeps returning 0) immediately, so `continue` here
+            // spins at 100% of a core for the life of the process - one such
+            // thread per dropped control connection (a router reconnect after
+            // a stats timeout leaves exactly one behind).
+            if (st == rpc::read_status::timeout && !stopping_.load()) {
+                continue;
             }
-            continue;
+            break;
         }
         json reply;
         try {

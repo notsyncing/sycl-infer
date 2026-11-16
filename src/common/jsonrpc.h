@@ -139,8 +139,17 @@ inline bool write_all(int fd, const std::string & s) {
     return true;
 }
 
-// Read one line (up to the next '\n').  Returns false on EOF, on a timeout,
-// or on a line that is longer than `max_bytes`.
+// Why `next` returned: a complete line, a poll timeout, or the connection
+// being gone.  The distinction is load-bearing on the server side: a closed
+// peer makes poll() return immediately for ever, so treating EOF as "nothing
+// arrived yet" turns one dropped control connection into a thread that spins
+// at one CPU core until the process exits.
+enum class read_status { line, timeout, closed, error };
+
+// Read one line (up to the next '\n').  `timeout` means no bytes arrived
+// within `timeout_ms`; `closed` means the peer shut the connection down (or
+// an unresolvable socket error ended it); `error` also covers a line longer
+// than `max_bytes`, after which the reader is unusable.
 //
 // The leftover bytes stay in the reader: a frame can arrive split across
 // several reads, and the bytes after the newline belong to the NEXT frame.
@@ -150,17 +159,17 @@ inline bool write_all(int fd, const std::string & s) {
 // forever.
 class line_reader {
 public:
-    bool next(int fd, std::string & out, int timeout_ms, size_t max_bytes = 1u << 20) {
+    read_status next(int fd, std::string & out, int timeout_ms, size_t max_bytes = 1u << 20) {
         out.clear();
         for (;;) {
             const size_t nl = buf_.find('\n');
             if (nl != std::string::npos) {
                 out = buf_.substr(0, nl);
                 buf_.erase(0, nl + 1);
-                return true;
+                return read_status::line;
             }
             if (buf_.size() > max_bytes) {
-                return false;
+                return read_status::error;
             }
             struct pollfd pfd;
             pfd.fd = fd;
@@ -171,10 +180,10 @@ public:
                 if (errno == EINTR) {
                     continue;
                 }
-                return false;
+                return read_status::error;
             }
             if (pr == 0) {
-                return false; // timed out
+                return read_status::timeout;
             }
             char tmp[4096];
             const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
@@ -182,10 +191,10 @@ public:
                 if (errno == EINTR) {
                     continue;
                 }
-                return false;
+                return read_status::error;
             }
             if (n == 0) {
-                return false; // the peer closed
+                return read_status::closed;
             }
             buf_.append(tmp, (size_t)n);
         }

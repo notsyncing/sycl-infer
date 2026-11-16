@@ -259,12 +259,59 @@ void test_no_token_is_open() {
     ctl.stop();
 }
 
+// The reader must say WHY it stopped.  EOF is not a timeout: poll() keeps
+// reporting a hung-up peer immediately, so a caller that conflates the two
+// loops for ever (see test_closed_connection_is_reaped).
+void test_reader_status() {
+    int sv[2];
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    rpc::line_reader r;
+    std::string line;
+    // Nothing written yet: a timeout, not an error or EOF.
+    CHECK(r.next(sv[0], line, 50) == rpc::read_status::timeout, "an idle socket must time out");
+    // Two complete frames, then EOF.  The buffered frames must still be
+    // delivered, and the EOF must be reported once they are gone.
+    const char frames[] = "a\nb\n";
+    CHECK(::send(sv[1], frames, sizeof(frames) - 1, MSG_NOSIGNAL) == (ssize_t)(sizeof(frames) - 1), "send");
+    CHECK(r.next(sv[0], line, 1000) == rpc::read_status::line && line == "a", "the first frame");
+    CHECK(r.next(sv[0], line, 1000) == rpc::read_status::line && line == "b", "the second frame");
+    ::close(sv[1]);
+    CHECK(r.next(sv[0], line, 1000) == rpc::read_status::closed, "a closed peer must be reported as closed");
+    ::close(sv[0]);
+}
+
+// Regression: a control connection whose peer went away used to leave a
+// thread spinning in poll(2) at 100% CPU for the rest of the process (the
+// router reconnects after a stats timeout, so this accumulated with every
+// long request).  The accept loop must reap the finished connection.
+void test_closed_connection_is_reaped() {
+    std::atomic<bool> terminated{false};
+    control_server ctl([]() { return sample_report(); }, [&terminated]() { terminated.store(true); });
+    std::string err;
+    CHECK(ctl.start("127.0.0.1", 0, err), "the control server must start: %s", err.c_str());
+    const int fd = connect_to(ctl.port());
+    CHECK(fd >= 0, "connect");
+    if (fd >= 0) {
+        ::close(fd);
+        // The accept loop reaps once per 200 ms poll.
+        bool reaped = false;
+        for (int i = 0; i < 100 && !reaped; i++) {
+            ::usleep(20 * 1000);
+            reaped = ctl.open_connections() == 0;
+        }
+        CHECK(reaped, "a closed control connection must be reaped, not left spinning in poll(2)");
+    }
+    ctl.stop();
+}
+
 } // namespace
 
 int main() {
     test_protocol();
     test_authentication();
     test_no_token_is_open();
+    test_reader_status();
+    test_closed_connection_is_reaped();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;
