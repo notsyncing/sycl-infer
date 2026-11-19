@@ -2637,8 +2637,12 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
             // and a wait per operator costs the pipeline its depth, which
             // on a model with thousands of small operators is most of the
             // time.  (The host operators read the device themselves, and
-            // `q_download` waits.)
-            if (guard_ || time_dbg_ || sample_time_ || dump_dbg_ || dump_file_dbg_) {
+            // `q_download` waits.  oneDNN's separate stream is ordered at
+            // its own execution sites in conv_dnnl.cpp.)
+            static const bool no_op_barrier = getenv("SI_ONNX_NO_OPBARRIER") != nullptr;
+            static const bool all_op_barrier = getenv("SI_ONNX_OPBARRIER_ALL") != nullptr;
+            const bool ordered = (dnnl_ && !no_op_barrier) || all_op_barrier;
+            if (ordered || guard_ || time_dbg_ || sample_time_ || dump_dbg_ || dump_file_dbg_) {
                 q_.wait();
             }
             if (time_dbg_ || sample_time_) {
@@ -2980,6 +2984,11 @@ void executor::run(const std::vector<onnxwire::tensor> & inputs,
     // device-chained ones never cross the bus), which is the difference
     // between a body iteration dominated by PCIe and one dominated by its
     // kernels.
+    // The oneDNN stream is a separate ordering domain; all of its work for
+    // this call must finish before any output (or the ABI's argmax reduction)
+    // is read.  A wait at the end of the call is cheap and covers the cases
+    // where oneDNN was reached through a path other than conv/matmul.
+    if (dnnl_ || getenv("SI_ONNX_END_WAIT")) q_.wait();
     reduced_.assign(g_.output_slots.size(), {});
     std::vector<char> want_out(g_.output_slots.size(), 0);
     for (const auto & o : outputs) {

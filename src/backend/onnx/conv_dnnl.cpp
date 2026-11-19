@@ -183,9 +183,16 @@ bool matmul_dnnl_launch(sycl::queue & q, const float * a, const float * b, float
                    const_cast<float *>(b));
         memory dst_m(memory::desc({M, N}, memory::data_type::f32, memory::format_tag::ab), ctx->eng,
                      y);
+        // oneDNN's stream is a separate ordering domain from the in-order
+        // SYCL queue: without these barriers the next SYCL kernel can read
+        // this output before the primitive has written it (the PP-OCRv6
+        // recogniser returned an all-NaN logits tensor).  The wait belongs
+        // here, at the stream boundary, not after every operator.
+        q.wait();
         matmul(it->second).execute(ctx->st, {{DNNL_ARG_SRC, src_m},
                                              {DNNL_ARG_WEIGHTS, w_m},
                                              {DNNL_ARG_DST, dst_m}});
+        ctx->st.wait();
     } catch (const std::exception & ex) {
         static bool said = false;
         if (!said) {
@@ -376,7 +383,9 @@ bool conv_dnnl_launch(sycl::queue & q, const float * x, const float * w, float *
             args.insert({DNNL_ARG_SCRATCHPAD,
                          memory(e->pd.scratchpad_desc(), ctx->eng, ctx->scratch)});
         }
+        q.wait();
         convolution_forward(e->pd).execute(ctx->st, args);
+        ctx->st.wait();
     } catch (const std::exception & ex) {
         // A shape or layout oneDNN refuses is not an error: the SYCL kernel
         // handles it.  Say it once, so a silent fallback is still visible in
