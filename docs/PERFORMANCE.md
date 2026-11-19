@@ -1077,10 +1077,12 @@ On a real PDF the validated configuration mixes devices: layout on ONNX
 Runtime (NPU FP16 precision is insufficient even with OpenVINO's own plugin),
 OCR detector on the project GPU (dynamic input sizes), and recogniser plus
 fixed-shape classifiers on NPU.  That run produced 44,738 chars of coherent
-Chinese markdown with all four sampled native-text phrases present; routing
-the recogniser through the project GPU instead produced only 1,367 chars.
-The table stage was not included because its detector also needs dynamic
-shapes.  See `design/17-onnx-service.md` §"The Intel NPU execution path".
+Chinese markdown with all four sampled native-text phrases present.  An
+all-GPU run is also correct after `e1dc553` ordered the oneDNN stream against
+the SYCL queue: 44,735 chars over 122 pages in 136 s.  The earlier 1,367-char
+GPU result was a stream-ordering bug, not a hardware limit.  The table stage
+was not included in either run because its detector client needs dynamic
+canvas shapes.  See `design/17-onnx-service.md` §"The Intel NPU execution path".
 
 ## 8. What the curves mean
 

@@ -1443,6 +1443,11 @@ compiles / imports / executes graphs with `pfnCreate2`,
 OpenVINO dependency.  Command queue, command list and fence are cached per
 compiled graph.
 
+The shared ONNX executor orders oneDNN streams against the in-order SYCL
+queue at each operator boundary when oneDNN is enabled (`conv_dnnl.cpp` and
+`exec.cpp`); without it a long model can read a tensor before oneDNN wrote it
+and return all-NaN logits.  `SI_ONNX_NO_OPBARRIER=1` is the A/B switch.
+
 `src/backend/npu/npu_ir.{h,cpp}` is an ONNX-to-OpenVINO-IR frontend: it maps
 operator types, opsets and port counts to the format the driver accepts,
 folds constants via `src/backend/npu/const_eval.{h,cpp}`, and emits IR XML plus
@@ -1520,9 +1525,12 @@ validated configuration is:
 
 The run produced coherent Chinese markdown (44,738 chars); all four long
 phrases extracted from the PDF's native text layer were present.  There are
-a few OCR character errors (for example 公枳金 for 公积金).  For comparison,
-routing the recogniser through this project's GPU produced only 1,367 chars,
-essentially empty; the NPU recogniser is materially better on this document.
+a few OCR character errors (for example 公枳金 for 公积金).  An all-GPU run is now also correct: the earlier 1,367-char result was a
+oneDNN-stream ordering bug in the executor, not a GPU precision limit.  With
+the stream ordered at the executor's operator boundaries (commit
+`e1dc553`), routing layout, detector, recogniser and classifiers through the
+project's GPU produces 44,735 chars of the same coherent Chinese text.
+The NPU recogniser remains a valid fixed-shape alternative.
 
 Therefore NPU support is real and useful for fixed-shape document stages, but
 a fully NPU-only document pipeline is not currently achievable: the layout
