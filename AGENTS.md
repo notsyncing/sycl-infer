@@ -30,6 +30,7 @@ committed doc is a dead link for everyone who clones the tree.
 | [Repository layout](#repository-layout) | where each module lives |
 | [How to extend](#how-to-extend) | a model, a kernel, a stage test, multimodal |
 | [Architecture modules](docs/design/24-arch-modules.md) | the model/engine layer split, the two registries and the boundary gate |
+| [Embedding models](docs/design/25-embeddings.md) | GGUF BERT encoders (BGE-M3) on CPU/GPU/NPU: SentencePiece, GGUF→ONNX lowering, `/v1/embeddings`, `embed`, `syi_model_embed` |
 | [The ONNX model service](#the-onnx-model-service-the-document-pipeline) | the document pipeline |
 | [Device profiles](#device-profiles-where-a-gpu-specific-number-belongs) | per-card tuning |
 | [Model profiles](#model-profiles-where-an-architectures-policy-belongs) | per-architecture policy |
@@ -867,6 +868,29 @@ See [`docs/design/24-arch-modules.md`](docs/design/24-arch-modules.md),
 [`docs/design/01-model-loading.md`](docs/design/01-model-loading.md) and
 [`docs/design/11-qwen35-model.md`](docs/design/11-qwen35-model.md) for the full
 loading design.
+
+### Add an embedding model
+
+Embedding models (GGUF `general.architecture == bert`, e.g. BGE-M3) are **not**
+loaded through `model::load`: a bidirectional encoder has no LM head, KV pool
+or sampler, so building an autoregressive engine for it would be wrong.  The
+CLI detects the architecture with `embedding::is_embedding_model()` and routes
+to `src/embedding/` before `engine` is constructed.  See
+[`docs/design/25-embeddings.md`](docs/design/25-embeddings.md) for the full
+contract; the load-bearing facts are:
+
+* The GGUF is lowered to an in-memory ONNX graph once.  The same graph runs on
+  the in-process ONNX executor (CPU/GPU) and on the NPU executor — there are no
+  separate per-backend forward kernels to keep in sync.
+* **Embedding tables are copied, not transposed**; matrix weights are.  The
+  attention output transpose is `{0,2,1,3}`.  Both were bugs that produced
+  plausible-looking vectors with no semantic structure.
+* The graph must stay in opset1 primitives: the Lunar Lake NPU driver rejects
+  IR `LayerNorm` and ONNX `Gelu`, so both are decomposed (`ReduceMean`/`Sub`/
+  `Mul`/`Sqrt`/`Div`/`Add`, and `Erf`-based GELU).
+* BGE-M3's tokenizer is SentencePiece Unigram (`tokenizer.ggml.model = t5`),
+  handled by `sp_tokenizer`, not the engine's BPE tokenizer.
+* The encoder's graph axis is `--embed-max-seq`, not `--ctx`.
 
 ### Add a pipeline
 
@@ -6484,6 +6508,8 @@ ctest --test-dir build -L hermetic --output-on-failure   # 46/46: profiles, kv_t
                                         # hermetic CPU kernel unit suites
 ./build/test_arch_ops                   # the arch_ops dispatch table (hermetic)
 ./build/test_guided                     # JSON-schema guided decoding (hermetic)
+./build/test_embed_tokenizer            # SentencePiece tokenizer (hermetic, synthetic GGUF)
+./build/test_embed_bge <bge-m3.gguf>    # CPU/GPU/NPU embedding oracle (model-backed)
 python3 ci/check_arch_boundaries.py     # generic engine/model files name no architecture
                                         # (or: ctest --test-dir build -R arch_boundaries)
 python3 ci/check_kernel_coverage.py     # every launcher has a unit test (or a tracked

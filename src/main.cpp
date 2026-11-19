@@ -14,6 +14,8 @@
 #include "cpu_types.h"
 #include "common/exit_codes.h"
 #include "engine.h"
+#include "embedding/embedding_engine.h"
+#include "embedding/embedding_http.h"
 #include "guided.h"
 #include "image.h"
 #include "model.h"
@@ -56,11 +58,14 @@ static void usage(const char * prog) {
             "commands:\n"
             "  serve                        OpenAI-compatible HTTP server\n"
             "  gen                          generate once from --prompt\n"
+            "  embed                        embed text(s) from --prompt (GGUF BERT encoder,\n"
+            "                               e.g. BGE-M3; also selected automatically for serve)\n"
             "\n"
             "common (both commands):\n"
             "  --model <gguf>               model path (default: %s)\n"
-            "  --device cpu|gpu|auto        compute backend (default auto = PF_DEVICE,\n"
-            "                               else gpu)\n"
+            "  --device cpu|gpu|auto|npu    compute backend (default auto = PF_DEVICE,\n"
+            "                               else gpu); npu is for embedding models\n"
+            "  --embed-max-seq N            embedding sequence length / padding (default 512)\n"
             "  --cpu-threads N              CPU backend worker threads (default: physical\n"
             "                               cores, env PF_CPU_THREADS; 0 = auto)\n"
             "  --layer-map L:dev,...        pipeline-parallel layer placement across\n"
@@ -223,6 +228,8 @@ int main(int argc, char ** argv) {
     int control_port = 0;                     // 0 = the control plane is off
     std::string control_token;                // the control plane's shared secret
     std::string control_token_file;           // ... read from a file (a secret)
+    std::string device_str = "auto"; // --device, kept as text for the NPU embedding path
+    int embed_max_seq = 512;         // --embed-max-seq: fixed axis of the encoder graph
     int ctx = 0; // 0 = auto (kDefaultCtx)
     if (const char * e = si::env::str("PF_CTX")) {
         ctx = atoi(e);
@@ -458,16 +465,19 @@ int main(int argc, char ** argv) {
             yarn_attn_factor = (float)std::atof(next().c_str());
         } else if (a == "--device") {
             const std::string v = next();
-            if (v == "cpu" || v == "host") {
+            device_str = v;
+            if (v == "cpu" || v == "host" || v == "npu") {
                 device = 1;
-            } else if (v == "gpu") {
+            } else if (v == "gpu" || v.rfind("gpu.", 0) == 0) {
                 device = 0;
             } else if (v == "auto") {
                 device = -1;
             } else {
-                si::logf("error: --device expects cpu|gpu|auto\n");
+                si::logf("error: --device expects cpu|gpu|auto|npu\n");
                 return 1;
             }
+        } else if (a == "--embed-max-seq") {
+            embed_max_seq = atoi(next().c_str());
         } else if (a == "--cpu-threads") {
             cpu_set_thread_count(atoi(next().c_str()));
         } else if (a == "-h" || a == "--help") {
@@ -559,6 +569,36 @@ int main(int argc, char ** argv) {
         } else if (stype == "dflash2") {
             draft_k = spec_nmax;
         }
+        // Embedding models (GGUF `bert`, e.g. BGE-M3) are bidirectional
+        // encoders with no LM head or KV cache: route them to the dedicated
+        // embedding engine/HTTP server before the autoregressive engine is
+        // constructed.  The device string is passed through so `--device npu`
+        // selects the NPU executor instead of a SYCL queue.
+        if (embedding::is_embedding_model(model_path)) {
+            embedding::engine_config ecfg;
+            ecfg.model_path = model_path;
+            ecfg.device = device_str;
+            ecfg.max_seq = embed_max_seq;
+            auto ee = std::make_unique<embedding::engine>(ecfg);
+            si::logf("[embed] model=%s device=%s dim=%d seq=%d\n",
+                     model_path.c_str(), ee->device().c_str(), ee->dim(), ecfg.max_seq);
+            if (cmd == "embed") {
+                const auto vecs = ee->embed({prompt});
+                for (size_t i = 0; i + 1 < vecs[0].size(); ++i) printf("%.9g,", vecs[0][i]);
+                if (!vecs[0].empty()) printf("%.9g\n", vecs[0].back());
+                return 0;
+            }
+            if (cmd == "serve") {
+                embedding::server_config scfg;
+                scfg.host = host;
+                scfg.port = port;
+                scfg.model_id = "sycl-infer-embedding";
+                return embedding::serve(*ee, scfg);
+            }
+            si::logf("error: an embedding model only supports the 'embed' and 'serve' commands\n");
+            return 1;
+        }
+
         engine_config ec;
         ec.model_path = model_path;
         ec.max_seq = ctx;

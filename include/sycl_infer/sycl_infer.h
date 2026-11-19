@@ -301,6 +301,36 @@ SYI_API syi_status syi_request_cancel(syi_request *request);
 SYI_API syi_status syi_request_get_result(const syi_request *request, syi_result *out);
 SYI_API const char *syi_request_error(const syi_request *request);
 
+/* ------------------------------------------------------------------ embeddings
+ * GGUF BERT encoders (e.g. BGE-M3).  These are a separate model handle: an
+ * encoder has no KV cache, sampler or token stream, so it does not go through
+ * syi_model/syi_request.  The device string accepts the same values as the
+ * CLI: auto, cpu, gpu, gpu.N and npu.
+ */
+typedef struct syi_embedding_model syi_embedding_model;
+
+typedef struct syi_embedding_options {
+    size_t struct_size;   /* = sizeof(syi_embedding_options) */
+    uint32_t abi_version; /* = SYI_ABI_VERSION */
+    const char *model_path;
+    const char *device;   /* NULL = "auto" */
+    int32_t max_seq;      /* <= 0 = 512 */
+} syi_embedding_options;
+
+SYI_API void syi_embedding_options_init(syi_embedding_options *options);
+SYI_API syi_status syi_embedding_model_create(const syi_embedding_options *options,
+                                              syi_embedding_model **out_model);
+SYI_API void syi_embedding_model_destroy(syi_embedding_model *model);
+SYI_API int32_t syi_embedding_dim(const syi_embedding_model *model);
+SYI_API const char *syi_embedding_device(const syi_embedding_model *model);
+
+/* Synchronous embedding of n_inputs UTF-8 strings.  On success *out_data is a
+ * newly allocated flat float array of n_inputs * dim rows (row-major), to be
+ * released with syi_free(). */
+SYI_API syi_status syi_model_embed(syi_embedding_model *model,
+                                   const char *const *inputs, size_t n_inputs,
+                                   float **out_data, size_t *out_n, size_t *out_dim);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

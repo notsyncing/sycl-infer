@@ -457,6 +457,60 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
         target_link_libraries(si_onnx_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     endif()
 
+    # Embedding models (GGUF BERT encoders such as BGE-M3) reuse the ONNX
+    # runtime and the NPU executor.  They are a separate static library so
+    # the LLM binary/C ABI can link them without pulling in the ONNX service
+    # (which duplicates the device registry sources already in the core).
+    add_library(si_embedding_core STATIC
+        src/model/gguf.cpp
+        src/embedding/sp_tokenizer.cpp
+        src/embedding/bert_model.cpp
+        src/embedding/embedding_engine.cpp
+        src/embedding/embedding_http.cpp
+        src/model/onnx/proto.cpp
+        src/model/onnx/graph.cpp
+        src/model/onnx/transforms/pipeline.cpp
+        src/model/onnx/transforms/transform_util.cpp
+        src/model/onnx/transforms/conv_epilogue.cpp
+        src/model/onnx/transforms/elementwise_activation.cpp
+        src/model/onnx/transforms/matmul_bias.cpp
+        src/model/onnx/transforms/mask_box.cpp
+        src/backend/onnx/ops.cpp
+        src/backend/onnx/ops_shape.cpp
+        src/backend/onnx/ops_exec.cpp
+        src/backend/onnx/kernels.cpp
+        src/backend/onnx/conv_dnnl.cpp
+        src/backend/onnx/exec.cpp
+        src/backend/onnx/constant_fold.cpp
+        src/backend/npu/npu_runtime.cpp
+        src/backend/npu/const_eval.cpp
+        src/backend/npu/npu_ir.cpp
+        src/backend/npu/npu_executor.cpp
+        src/common/onnx_wire.cpp
+    )
+    target_include_directories(si_embedding_core PUBLIC
+        src
+        src/common
+        src/model
+        src/model/onnx
+        src/backend
+        src/backend/onnx
+        src/backend/npu
+        src/device
+        src/server
+        third_party
+        third_party/level_zero_npu
+        ${CMAKE_SOURCE_DIR}/include)
+    if(ZE_API_INCLUDE_DIR)
+        target_include_directories(si_embedding_core PUBLIC "${ZE_API_INCLUDE_DIR}/level_zero")
+    endif()
+    target_link_libraries(si_embedding_core PUBLIC Threads::Threads si_aot_flags ${CMAKE_DL_LIBS} "${DNNL_LIBRARY}")
+    if(OpenSSL_FOUND)
+        target_compile_definitions(si_embedding_core PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
+        target_link_libraries(si_embedding_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    endif()
+    target_link_libraries(sycl-infer PRIVATE si_embedding_core)
+
     add_executable(sycl-infer-onnx src/server/onnx/main.cpp)
     target_link_libraries(sycl-infer-onnx PRIVATE si_onnx_core)
 
@@ -545,6 +599,7 @@ option(SI_C_API "build libsycl_infer (C ABI)" ON)
 if(NOT SI_ROUTER_ONLY AND SI_C_API)
     add_library(sycl_infer_c SHARED
         src/capi/capi.cpp
+        src/capi/capi_embedding.cpp
         src/capi/errors.cpp
     )
     target_include_directories(sycl_infer_c
@@ -555,6 +610,9 @@ if(NOT SI_ROUTER_ONLY AND SI_C_API)
     )
     target_compile_definitions(sycl_infer_c PRIVATE SYI_BUILD)
     target_link_libraries(sycl_infer_c PRIVATE sycl_infer_core Threads::Threads)
+    if(NOT SI_ROUTER_ONLY AND SI_ONNX)
+        target_link_libraries(sycl_infer_c PRIVATE si_embedding_core)
+    endif()
     set_target_properties(sycl_infer_c PROPERTIES
         OUTPUT_NAME sycl_infer
         VERSION 1.0.0
@@ -650,6 +708,17 @@ if (SI_DEV_BENCH)
 endif()
 
 if(NOT SI_ROUTER_ONLY)
+
+# Embedding tests: the tokenizer test is hermetic (synthetic GGUF KV), the
+# BGE-M3 test is model-backed and selects its backend with TEST_EMBED_DEVICE.
+if(SI_ONNX)
+  si_add_host_test(test_embed_tokenizer
+      tests/embedding/test_embed_tokenizer.cpp
+      src/embedding/sp_tokenizer.cpp
+      src/model/gguf.cpp)
+  si_add_test(test_embed_bge tests/embedding/test_embed_bge.cpp)
+  target_link_libraries(test_embed_bge PRIVATE si_embedding_core)
+endif()
 
 si_add_test(test_tokenizer   tests/model/test_tokenizer.cpp)
 si_add_test(test_chat_template tests/model/test_chat_template.cpp)
@@ -767,7 +836,7 @@ si_add_router_test(test_router_control   tests/router/test_router_control.cpp)
 
 if(BUILD_TESTING)
     if(NOT SI_ROUTER_ONLY)
-        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_guided test_pc_disk test_pc_ram test_cpu_gdn test_cpu_elementwise_units test_cpu_attn_units test_cpu_gemv_units test_cpu_moe_qsa_units test_cpu_q4_units test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_w8_layout test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops)
+        foreach(name IN ITEMS test_response_parser test_request_parse test_response_json test_sampler test_guided test_pc_disk test_pc_ram test_cpu_gdn test_cpu_elementwise_units test_cpu_attn_units test_cpu_gemv_units test_cpu_moe_qsa_units test_cpu_q4_units test_sse_cancel test_control test_hparams test_model_profile test_f16conv test_yarn test_kv_type test_chat_builtin test_chat_deepseek test_quant_synth test_w8_layout test_dev_profile test_mm_step test_pipeline_registry test_pipeline_route test_mineru_layout test_ds41_pc test_gguf_split test_arch_ops test_embed_tokenizer)
             add_test(NAME ${name} COMMAND ${name})
             set_tests_properties(${name} PROPERTIES LABELS "hermetic;cpu")
         endforeach()
@@ -823,6 +892,14 @@ if(BUILD_TESTING)
     # Model-backed tests are explicit: a machine without the GGUF or GPU must
     # not claim a green run by silently skipping them.  Keep the 27B split out
     # of the default ctest selection (it requires both A770s and a draft GGUF).
+    # Embedding model path (BGE-M3 GGUF).  Registered separately from the GPU
+    # tests because it is useful on a CPU-only machine too.
+    set(SI_TEST_EMBED_MODEL "" CACHE FILEPATH "BGE-M3 GGUF for the embedding test")
+    if(SI_ONNX AND SI_TEST_EMBED_MODEL)
+        add_test(NAME test_embed_bge COMMAND test_embed_bge "${SI_TEST_EMBED_MODEL}")
+        set_tests_properties(test_embed_bge PROPERTIES LABELS "model;embedding")
+    endif()
+
     option(SI_REGISTER_GPU_TESTS "register GPU/model-backed tests with CTest" OFF)
     set(SI_TEST_08B_MODEL "" CACHE FILEPATH "0.8B GGUF for GPU tests")
     set(SI_TEST_27B_MODEL "" CACHE FILEPATH "27B GGUF for two-GPU tests")

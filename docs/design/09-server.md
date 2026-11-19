@@ -74,6 +74,7 @@ SSE 响应在此之上再加 `Cache-Control: no-cache` 与 `Connection: keep-ali
 | GET | `/v1/models/{id}` | 单个模型（`srv.Get(R"(/v1/models/(.+))")`，`server.cpp` 的 `serve`）；id 既可等于 GGUF `general.name` 也可等于 CLI 默认 `model_id`，否则 404 |
 | POST | `/v1/chat/completions` | 流式 + 非流式；reasoning_content、工具调用/结果、`n`、stop、`stream_options.include_usage`、图片输入 |
 | POST | `/v1/completions` | 纯文本补全；string/string[]/token 数组 prompt、`n`、`echo`、`suffix`、流式 + 非流式 |
+| POST | `/v1/embeddings` | **仅 embedding server**（GGUF BERT 模型，如 BGE-M3）：string/string[] 输入，返回归一化向量；见 [25-embeddings.md](25-embeddings.md) |
 | GET | `/v1/pipelines` | 列出可用 pipeline（见 [22-pipelines.md](22-pipelines.md)）；**模型列表不包含 pipeline**；registry 默认为空 |
 | POST | `/v1/pipelines/{id}/run` | 运行一条 pipeline；专用请求/响应形状，不是 OpenAI 标准端点。MinerU 不在这里，走 `tools/mineru/` 或调用方 |
 | OPTIONS | `.*` | 204 + CORS |
@@ -84,7 +85,7 @@ pipeline 端点只用于满足 [22-pipelines.md](22-pipelines.md) §2 准入规�
 MinerU 这类纯客户端流程不属于这里。只想做普通 qwen2vl 图片对话的客户端继续用
 `/v1/chat/completions`，自己提供 prompt，拿模型原始输出。
 
-无鉴权，无 `/v1/embeddings`、`/tokenize`。
+无鉴权，无 `/tokenize`。`/v1/embeddings` 由独立的 embedding server 提供（GGUF BERT 模型），见 [25-embeddings.md](25-embeddings.md)。
 
 ### 2.4 请求解析
 
@@ -786,5 +787,5 @@ HTTP API **没有任何鉴权**，而绑定地址一旦不是 loopback 就等于
 
 ### 8.6 未提供的端点
 
-`/v1/embeddings`、`/v1/tokenize`、`/v1/detokenize`、`/v1/audio/*`、`/v1/images/*`、
+`/v1/tokenize`、`/v1/detokenize`、`/v1/audio/*`、`/v1/images/*`、
 `/v1/moderations`、`/v1/files`、`/v1/batches` 均未实现。

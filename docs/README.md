@@ -36,6 +36,7 @@
 | 23 | [design/22-pipelines.md](design/22-pipelines.md) | **请求级 Pipeline 机制**：`src/pipeline/` 接口与注册表、准入规则（进程内状态/实测收益/资源账本）、worker 的 `/v1/pipelines/{id}/run`、router 的专用代理、与 `/v1/models`/`/v1/chat/completions` 的边界；MinerU 明确不是 pipeline，迁到 `tools/mineru/` |
 | 24 | [design/23-deepseek41.md](design/23-deepseek41.md) | **DeepSeek-V4.1-Flash（`deepseek41`）**：MLA 注意力（K==V、512 宽、64 头）、组共享压缩 KV、两级 DSA 索引、4 流 mHC、Engram、384 专家 sqrt-softplus 路由；loader/hparams、model profile、host 前向与增量 DecState、前缀缓存、`deepseek41v` 视觉塔、GPU 内核（IQ2 GEMV / MLA / mHC / ops）与不变量 |
 | 25 | [design/24-arch-modules.md](design/24-arch-modules.md) | **架构模块契约**：`src/model/`（文件是什么）与 `src/engine/`（怎么运行）的分层、每架构两层的目录、`kLoaders[]`/`kArchOps[]` 注册表、`arch_hparams`/`arch_layer`/`arch_model_extras` 数据模型、`model_profile` 与 `arch_ops` 的分工、新增 generic-plan / model-owned 架构的步骤，以及边界门禁与 `test_arch_ops` |
+| 26 | [design/25-embeddings.md](design/25-embeddings.md) | **Embedding 模型（GGUF BERT / BGE-M3）**：独立的 SentencePiece tokenizer、GGUF→ONNX 图构建、CPU/GPU/NPU 三后端执行、CLS/mean 池化与 L2 归一化；`/v1/embeddings`、`embed` CLI、`syi_model_embed`，以及 NPU 的 opset1 限制与不变量 |
 | 26 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 面向使用者的说明：
