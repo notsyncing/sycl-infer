@@ -1421,6 +1421,115 @@ batched inference changes which grid wins at a decoder tie - two documents
 (`002474`, `300408`) came out with a different `md5`.  That retry stays
 per-table; it is now the largest single cost in the pipeline.
 
+## The Intel NPU execution path
+
+The ONNX service and the in-process ABI can execute a model on the Intel NPU
+without linking OpenVINO.  The selection is a device string: `device: "npu"`,
+`--model id=path:npu`, or `syi_onnx_create(..., "npu", ...)`.  A per-model map
+is also supported: `syi_onnx_create(..., "map:/path/to/device_map.txt", ...)`
+looks up the ONNX file's basename in that file and replaces the device with
+the value on the matching line; this lets one pipeline mix NPU, GPU and
+non-sycl-infer stages.  The wire protocol is unchanged.
+
+### What the runtime is, and what it is not
+
+`src/backend/npu/npu_runtime.{h,cpp}` loads `libze_loader.so.1` with `dlopen`,
+initialises with `ZE_INIT_DRIVER_TYPE_FLAG_NPU`, finds the `ZE_DEVICE_TYPE_VPU`
+device, obtains `ZE_extension_graph` through `ZE_extension_driver_npu`, and
+compiles / imports / executes graphs with `pfnCreate2`,
+`pfnGetProperties3`, `pfnGetArgumentProperties3`, `pfnSetArgumentValue`,
+`pfnAppendGraphExecute` and a fence.  The Level Zero NPU extension headers in
+`third_party/level_zero_npu/` are MIT-licensed API declarations, not an
+OpenVINO dependency.  Command queue, command list and fence are cached per
+compiled graph.
+
+`src/backend/npu/npu_ir.{h,cpp}` is an ONNX-to-OpenVINO-IR frontend: it maps
+operator types, opsets and port counts to the format the driver accepts,
+folds constants via `src/backend/npu/const_eval.{h,cpp}`, and emits IR XML plus
+a weights blob.  `src/backend/npu/npu_executor.{h,cpp}` binds request tensors
+to graph arguments, converts FP16 at the boundary, and transparently splits a
+batched request into batch-1 graph runs.  The ABI implements the `argmax` and
+`u8` output reductions on the host for the NPU path.
+
+### How a model is prepared
+
+The driver compiles IR, not ONNX and not MLIR.  OpenVINO's own compiler is
+MLIR-based internally, but its public graph interface accepts only
+`NGRAPH_LITE` IR or a native blob, so no MLIR path exists for an independent
+frontend.  For models the in-project frontend cannot convert faithfully, an
+IR asset may be supplied instead: `PF_NPU_IR_FILE=<dir>/<name>.xml` with
+weights in `<name>.xml.bin`, or a `basename /path/ir.xml` line in the device
+map's `npu:<ir-map>` value.  This is a data asset — the binary only reads IR
+XML and weights at runtime.  IR assets were generated offline during
+development with an external converter, which the project never links or
+calls.
+
+NPU graphs are compiled for **static** shapes.  `PF_NPU_STATIC_DIMS=N` bakes
+unresolved dimensions, and `PF_NPU_INPUT_SHAPES=name:d0,d1,...` pins a named
+input.  FP16-compressed IR weights materially improve latency (the OCR
+detector went from 71 ms to 23 ms).  `PF_NPU_BUILD_FLAGS` passes compiler
+flags through for experiments; no flag made the precision-sensitive layout
+detector accurate on NPU.  The remaining `PF_NPU_*` switches are development
+A/B and diagnostics: `PF_NPU_DBG` / `PF_NPU_IRDBG` print executor and IR state,
+`PF_NPU_SHAPE_MAP` supplies shape metadata from a file,
+`PF_NPU_NO_BN_FOLD` / `PF_NPU_NO_BN_BIAS` / `PF_NPU_PAD_ZERO` /
+`PF_NPU_STRIDED` / `PF_NPU_SLICE_SAFE` select frontend lowering variants.
+They are not needed for the validated configuration.
+
+### Model coverage and measured behaviour
+
+Eight real Paddle document models were run on the Lunar Lake NPU (driver 1.38,
+Level Zero graph extension 1.18, compiler 8.3, max opset 11).  Latencies are
+one request on that box; accuracy is against the OpenVINO CPU reference on
+the same input.  See `docs/PERFORMANCE.md` §7.5 for conditions.
+
+| model | input | NPU ms | CPU ms (OpenVINO) | accuracy |
+|---|---|---:|---:|---|
+| PP-DocLayoutV3 | 1x3x800x800 | 238 | – (project CPU cannot run `Pad`) | class argmax 24% on a real page, 58% on synthetic noise |
+| PP-OCRv5 det | 1x3x512x512 | 23 (71 without FP16 IR) | 26 | max|diff| 6.8e-7 vs the project GPU |
+| PP-OCRv5 rec | 1x3x48x320 | 16 | 14 | argmax 100%, max 0.037 on synthetic input |
+| PP-LCNet table cls | 1x3x224x224 | 12.7 | 2.1 | argmax 100% |
+| PP-LCNet doc ori | 1x3x224x224 | 12.6 | 2.7 | argmax 100% |
+| PP-LCNet textline ori | 1x3x80x160 | 13.7 | 4.1 | argmax 100% |
+| RT-DETR wired table | 1x3x640x640 | 86.7 | 550 | reference has inf on synthetic input |
+| RT-DETR wireless table | 1x3x640x640 | 87.5 | 540 | reference has inf on synthetic input |
+
+The NPU wins where the graph is large (6.3x on the table detectors, about
+2.8x on the OCR detector versus this project's GPU).  Small classifiers are
+launch-bound and remain faster on CPU/GPU.
+
+### The real PDF: what works and what does not
+
+A report PDF from `RapidDoc/error_pdfs` was run end-to-end on the NPU machine
+with RapidDoc configured for the in-process ABI and a device map.  The final
+validated configuration is:
+
+* **layout** — ONNX Runtime.  NPU hardware computes FP16 internally; this
+  detector is precision-sensitive.  OpenVINO's own NPU plugin gives the same
+  24% class-label agreement versus ORT on a real page, and
+  `EXECUTION_MODE_HINT=ACCURACY` does not change it.  FP32 IR weights do not
+  help.
+* **OCR detector** — this project's GPU executor.  Its H/W are computed per
+  crop, so a static NPU IR cannot cover a document.
+* **OCR recogniser and fixed-shape classifiers** — NPU with FP16 IR,
+  `RAPID_DOC_OCR_MAX_WH_RATIO=20` to pin the padded width to 960, and the
+  executor's transparent batch split (RapidOCR submits a batch although the
+  graph is compiled for batch 1).
+* **table stage** — not part of this run.  Its detector also has dynamic input
+  sizes that a static NPU IR cannot express.
+
+The run produced coherent Chinese markdown (44,738 chars); all four long
+phrases extracted from the PDF's native text layer were present.  There are
+a few OCR character errors (for example 公枳金 for 公积金).  For comparison,
+routing the recogniser through this project's GPU produced only 1,367 chars,
+essentially empty; the NPU recogniser is materially better on this document.
+
+Therefore NPU support is real and useful for fixed-shape document stages, but
+a fully NPU-only document pipeline is not currently achievable: the layout
+stage is limited by NPU FP16 compute, and the detector stages need dynamic
+shapes.  The independent frontend continues to be developed; it is not yet a
+drop-in replacement for the largest detector graphs.
+
 ## Running under the router
 
 The ONNX worker is now a first-class router backend.  There is no separate

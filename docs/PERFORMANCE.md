@@ -1030,6 +1030,58 @@ fallback, 71/72/73/76 = the other ILP shapes, 51 = f32 oneDNN opt-in),
 this point, including the rejected and opt-in paths, is in
 [`design/21-mineru-qwen2vl.md`](design/21-mineru-qwen2vl.md).
 
+### 7.5 Intel NPU: standalone latency and document models (2026-11-18/19)
+
+Measured on the Lunar Lake box (NPU 4000 / `Intel(R) AI Boost`, driver 1.38,
+Level Zero graph extension 1.18, compiler 8.3, max opset 11).  The runtime is
+independent: it loads the NPU through Level Zero and never links OpenVINO.
+Conditions: Release build, one process per backend, one request, 10 warmup +
+30 timed calls for the tiny graph, static input shapes and FP16 IR weights for
+the document models.
+
+Fixed overhead on the checked-in tiny graph (`x[1,4] @ w[4,3] + b[3] -> relu`,
+`syi_onnx_run_direct`, all backends returning `y = [0, 0.25, 11.5]`):
+
+| backend | load | mean call | best | worst |
+|---|---:|---:|---:|---:|
+| NPU (Level Zero graph) | 3 ms | **0.357 ms** | 0.284 | 0.407 |
+| CPU (SYCL host kernels) | 133 ms | 0.036 ms | 0.022 | 0.052 |
+| GPU (SYCL + oneDNN) | 118 ms | 0.032 ms | 0.031 | 0.038 |
+
+Caching the Level Zero queue, list and fence per graph cut the NPU call from
+7.5 ms.  This table measures launch overhead, not document throughput.
+ONNX Model Zoo MNIST (`mnist-8.onnx`) also runs on NPU: its logits match the
+CPU executor to about 1e-3 (NPU 8.0859 vs CPU 8.0869 for the argmax class).
+
+Eight real document models were run with static-shape IR assets.  Latency is
+one request; accuracy is against the OpenVINO CPU reference on the same input.
+
+| model | input | NPU ms | CPU ms (OpenVINO) | accuracy |
+|---|---|---:|---:|---|
+| PP-DocLayoutV3 | 1x3x800x800 | 238 | – (project CPU cannot run `Pad`) | class argmax 24% on a real page, 58% on synthetic noise |
+| PP-OCRv5 det | 1x3x512x512 | 23 (71 without FP16 IR) | 26 | max|diff| 6.8e-7 vs the project GPU |
+| PP-OCRv5 rec | 1x3x48x320 | 16 | 14 | argmax 100%, max 0.037 on synthetic input |
+| PP-LCNet table cls | 1x3x224x224 | 12.7 | 2.1 | argmax 100% |
+| PP-LCNet doc ori | 1x3x224x224 | 12.6 | 2.7 | argmax 100% |
+| PP-LCNet textline ori | 1x3x80x160 | 13.7 | 4.1 | argmax 100% |
+| RT-DETR wired table | 1x3x640x640 | 86.7 | 550 | reference has inf on synthetic input |
+| RT-DETR wireless table | 1x3x640x640 | 87.5 | 540 | reference has inf on synthetic input |
+
+NPU wins on large graphs (6.3x on the table detectors, about 2.8x on the OCR
+detector versus this project's GPU).  Small classifiers stay faster on CPU.
+The project's own GPU/CPU ONNX executors cannot run the Paddle models with
+computed `Slice` shapes or `Pad`, so only the OCR detector has a direct
+NPU-vs-GPU number here.
+
+On a real PDF the validated configuration mixes devices: layout on ONNX
+Runtime (NPU FP16 precision is insufficient even with OpenVINO's own plugin),
+OCR detector on the project GPU (dynamic input sizes), and recogniser plus
+fixed-shape classifiers on NPU.  That run produced 44,738 chars of coherent
+Chinese markdown with all four sampled native-text phrases present; routing
+the recogniser through the project GPU instead produced only 1,367 chars.
+The table stage was not included because its detector also needs dynamic
+shapes.  See `design/17-onnx-service.md` §"The Intel NPU execution path".
+
 ## 8. What the curves mean
 
 

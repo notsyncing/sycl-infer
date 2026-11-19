@@ -415,6 +415,10 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
         src/backend/onnx/conv_dnnl.cpp
         src/backend/onnx/exec.cpp
         src/backend/onnx/constant_fold.cpp
+        src/backend/npu/npu_runtime.cpp
+        src/backend/npu/const_eval.cpp
+        src/backend/npu/npu_ir.cpp
+        src/backend/npu/npu_executor.cpp
         src/common/onnx_wire.cpp
         src/server/onnx/service.cpp
         src/server/control.cpp
@@ -423,6 +427,8 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
         src
         src/model/onnx
         src/backend/onnx
+        src/backend/npu
+        third_party/level_zero_npu
         src/server/onnx
         src/server
         src/common
@@ -436,7 +442,11 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
         src/device/profiles/iris_xe.cpp
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(si_onnx_core PUBLIC Threads::Threads si_aot_flags)
+    find_path(ZE_API_INCLUDE_DIR NAMES level_zero/ze_api.h)
+    if(ZE_API_INCLUDE_DIR)
+        target_include_directories(si_onnx_core PUBLIC "${ZE_API_INCLUDE_DIR}/level_zero")
+    endif()
+    target_link_libraries(si_onnx_core PUBLIC Threads::Threads si_aot_flags ${CMAKE_DL_LIBS})
     # oneDNN for the group-1 f32 convolution path (conv_dnnl.cpp): the same
     # library the engine's int8 GEMM uses, and the same include/lib search
     # (DNNL_ROOT above).
@@ -515,6 +525,15 @@ if(NOT SI_ROUTER_ONLY AND SI_ONNX)
     # S = 1 bit-exact and the rest rel_rms < 1e-5.
     add_executable(test_onnx_pv tests/onnx/test_onnx_pv.cpp)
     target_link_libraries(test_onnx_pv PRIVATE si_onnx_core)
+
+    # The independent NPU path: a checked-in tiny ONNX graph, compiled by the
+    # NPU driver through the Level Zero graph extension and run on the device.
+    # Skips itself when no NPU is present.
+    add_executable(test_onnx_npu tests/onnx/test_onnx_npu.cpp)
+    target_link_libraries(test_onnx_npu PRIVATE sycl_infer_onnx_c)
+    target_compile_definitions(test_onnx_npu PRIVATE
+        SI_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/onnx/data")
+    set_target_properties(test_onnx_npu PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}")
 endif()
 
 # ------------------------------------------------------------------- C API
@@ -861,5 +880,9 @@ if(BUILD_TESTING)
                     ENVIRONMENT "TEST_LAYER_MAP=0-31:gpu.0,32-63:gpu.1")
             endif()
         endif()
+    endif()
+    if(SI_ONNX)
+        add_test(NAME test_onnx_npu COMMAND test_onnx_npu)
+        set_tests_properties(test_onnx_npu PROPERTIES LABELS "npu;onnx")
     endif()
 endif()

@@ -4588,6 +4588,23 @@ kernel), `PF_ONNX_MM_DNNL_MIN=<MACs>` (keep a MatMul below that size on the
 SYCL kernel), `PF_ONNX_DNNL_BF16=1` (bf16 math on the f32 descriptors; an
 accuracy/speed A/B, not the default).
 
+**NPU device** (no `PF_*` knob): `device: "npu"` in a model's config,
+`--model id=path:npu`, or `syi_onnx_create(..., "npu", ...)` selects an
+independent Level Zero graph-extension path (`src/backend/npu/`); no OpenVINO
+is linked or called.  `syi_onnx_create(..., "map:<file>", ...)` routes each
+ONNX basename to a different device, so one pipeline can mix NPU, GPU and
+non-sycl-infer stages.  NPU graphs need static shapes: `PF_NPU_STATIC_DIMS`
+and `PF_NPU_INPUT_SHAPES` bake them; FP16 IR weights improve latency;
+`PF_NPU_IR_FILE` loads a pre-generated IR asset (XML plus `.xml.bin`) when the
+in-project frontend cannot convert a model faithfully.  The NPU path supports
+host-side `argmax`/`u8` output reductions and transparent batch-1 splitting.
+Fixed-shape document stages (OCR recogniser, classifiers) run on NPU; the
+precision-sensitive layout detector and dynamic-shape detector stages do not
+run correctly on NPU and must be routed elsewhere in a document pipeline.
+Details, measurements and the validated real-PDF configuration are in
+`docs/design/17-onnx-service.md` under "The Intel NPU execution path" and
+`docs/PERFORMANCE.md` §7.5.
+
 **Diagnostics**
 `PF_GUIDED_DEBUG=1` (JSON-schema guided decoding: the compiled vocabulary's
 EOS ids, a dead-end report, and per-apply time plus simulated-token count),

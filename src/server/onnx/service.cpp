@@ -13,6 +13,8 @@
 #include <stdexcept>
 
 #include <sycl/sycl.hpp>
+#include <level_zero/ze_api.h>
+#include <ze_graph_ext.h>
 
 #include "device/device_select.h"
 #include "httplib.h"
@@ -23,6 +25,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include "backend/npu/npu_executor.h"
+#include "backend/npu/npu_runtime.h"
 #include "control.h"
 #include "conv_dnnl.h"
 #include "exec.h"
@@ -59,6 +63,7 @@ bool parse_model_spec(const std::string & spec, std::string & id, std::string & 
         const std::string tail = rest.substr(colon + 1);
         if (tail == "GPU" || tail == "gpu" || tail == "CPU" || tail == "cpu" ||
             tail == "AUTO" || tail == "auto" || tail == "host" ||
+            tail == "NPU" || tail == "npu" ||
             tail.rfind("GPU.", 0) == 0 || tail.rfind("gpu.", 0) == 0) {
             device = tail;
             rest = rest.substr(0, colon);
@@ -67,6 +72,8 @@ bool parse_model_spec(const std::string & spec, std::string & id, std::string & 
     path = rest;
     return !path.empty();
 }
+
+bool is_npu(const std::string & d) { return d == "NPU" || d == "npu"; }
 
 // The SYCL device the models run on.
 sycl::device pick_device(const std::string & name) {
@@ -106,6 +113,7 @@ struct served {
     std::string device;
     onnx::exec_graph graph;
     std::unique_ptr<onnx::executor> ex;
+    std::unique_ptr<si::npu::executor> nx;
     std::mutex mtx; // one inference at a time per model
     uint64_t calls = 0;
     double total_ms = 0.0;
@@ -188,13 +196,26 @@ int serve_onnx(const onnx_service_config & cfg) {
         s->device = dev;
         si::logf("[onnx] loading '%s' on %s (%s)\n", s->id.c_str(), dev.c_str(), s->path.c_str());
         try {
-            s->graph = onnx::build_graph(s->path, true);
-            s->ex.reset(new onnx::executor(s->graph, queue_for(dev)));
-            if (auto it = model_drops.find(s->id); it != model_drops.end()) {
-                s->ex->skip_outputs(it->second);
-            }
-            if (auto it = model_dnnl.find(s->id); it != model_dnnl.end() && !it->second) {
-                s->ex->set_dnnl(false);
+            if (is_npu(dev)) {
+                onnxpb::model_proto mp = onnxpb::parse_model(s->path);
+                std::string nerr;
+                s->nx.reset(new si::npu::executor(mp, nerr));
+                if (!s->nx->valid()) throw std::runtime_error("NPU: " + nerr);
+                si::logf("[onnx]   NPU: %s, graph ext %u.%u, compiler %u.%u, opset %u\n",
+                         si::npu::device_name(),
+                         ZE_MAJOR_VERSION(si::npu::graph_extension_version()),
+                         ZE_MINOR_VERSION(si::npu::graph_extension_version()),
+                         si::npu::compiler_major(), si::npu::compiler_minor(),
+                         si::npu::max_opset());
+            } else {
+                s->graph = onnx::build_graph(s->path, true);
+                s->ex.reset(new onnx::executor(s->graph, queue_for(dev)));
+                if (auto it = model_drops.find(s->id); it != model_drops.end()) {
+                    s->ex->skip_outputs(it->second);
+                }
+                if (auto it = model_dnnl.find(s->id); it != model_dnnl.end() && !it->second) {
+                    s->ex->set_dnnl(false);
+                }
             }
         } catch (const std::exception & e) {
             // A model that cannot be loaded is a reported failure, not a
@@ -205,12 +226,16 @@ int serve_onnx(const onnx_service_config & cfg) {
             continue;
         }
         si::logf("[onnx]   %s: inputs", s->id.c_str());
-        for (const auto & t : s->graph.input_slots) {
-            si::logf(" %s", s->graph.tensors[t].name.c_str());
+        if (s->nx) {
+            for (const auto & n : s->nx->ir().inputs) si::logf(" %s", n.c_str());
+        } else {
+            for (const auto & t : s->graph.input_slots) si::logf(" %s", s->graph.tensors[t].name.c_str());
         }
         si::logf("\n[onnx]   %s: outputs", s->id.c_str());
-        for (const auto & t : s->graph.output_slots) {
-            si::logf(" %s", s->graph.tensors[t].name.c_str());
+        if (s->nx) {
+            for (const auto & n : s->nx->ir().outputs) si::logf(" %s", n.c_str());
+        } else {
+            for (const auto & t : s->graph.output_slots) si::logf(" %s", s->graph.tensors[t].name.c_str());
         }
         si::logf("\n");
         served_models.push_back(std::move(s));
@@ -234,7 +259,7 @@ int serve_onnx(const onnx_service_config & cfg) {
             mj["calls"] = s->calls;
             mj["total_ms"] = s->total_ms;
             mj["last_ms"] = s->last_ms;
-            mj["loaded"] = s->ex != nullptr;
+            mj["loaded"] = s->ex != nullptr || s->nx != nullptr;
             // The device memory the model holds.  The models share one card,
             // so this is what decides how many of them fit - and a model
             // that fails with "device allocation failed" is a model whose
@@ -242,6 +267,11 @@ int serve_onnx(const onnx_service_config & cfg) {
             if (s->ex) {
                 mj["vram_bytes"] = s->ex->live_bytes() + s->ex->pooled_bytes();
                 mj["vram_live_bytes"] = s->ex->live_bytes();
+            } else if (s->nx) {
+                size_t bytes = 0;
+                for (const auto & a : s->nx->args()) bytes += a.bytes;
+                mj["vram_bytes"] = bytes;
+                mj["vram_live_bytes"] = bytes;
             }
             j["models"].push_back(mj);
         }
@@ -256,13 +286,14 @@ int serve_onnx(const onnx_service_config & cfg) {
             mj["id"] = s->id;
             mj["path"] = s->path;
             mj["device"] = s->device;
-            mj["loaded"] = s->ex != nullptr;
+            mj["loaded"] = s->ex != nullptr || s->nx != nullptr;
             json ins = json::array(), outs = json::array();
-            for (const auto & t : s->graph.input_slots) {
-                ins.push_back(s->graph.tensors[t].name);
-            }
-            for (const auto & t : s->graph.output_slots) {
-                outs.push_back(s->graph.tensors[t].name);
+            if (s->nx) {
+                for (const auto & n : s->nx->ir().inputs) ins.push_back(n);
+                for (const auto & n : s->nx->ir().outputs) outs.push_back(n);
+            } else {
+                for (const auto & t : s->graph.input_slots) ins.push_back(s->graph.tensors[t].name);
+                for (const auto & t : s->graph.output_slots) outs.push_back(s->graph.tensors[t].name);
             }
             mj["inputs"] = ins;
             mj["outputs"] = outs;
@@ -298,53 +329,73 @@ int serve_onnx(const onnx_service_config & cfg) {
             send_binary(res, onnxwire::encode_response(2, "unknown model '" + model + "'", {}));
             return;
         }
-        if (!target->ex) {
+        if (!target->ex && !target->nx) {
             send_binary(res, onnxwire::encode_response(2, "model '" + model + "' failed to load", {}));
             return;
         }
         try {
             std::lock_guard<std::mutex> lock(target->mtx);
-            // The inputs, by name.
+            const auto run_start = std::chrono::steady_clock::now();
             std::vector<onnxwire::tensor> feeds = inputs;
-            // The outputs: the graph's, by name.
             std::vector<std::pair<std::string, std::vector<uint8_t> &>> outs;
             std::vector<std::string> out_names;
-            for (const auto & s : target->graph.output_slots) {
-                out_names.push_back(target->graph.tensors[s].name);
+            if (target->nx) {
+                out_names = target->nx->ir().outputs;
+            } else {
+                for (const auto & s : target->graph.output_slots) {
+                    out_names.push_back(target->graph.tensors[s].name);
+                }
             }
             std::vector<std::vector<uint8_t>> out_bufs(out_names.size());
             std::vector<bool> keep(out_names.size(), true);
             for (size_t i = 0; i < out_names.size(); ++i) {
-                // An output the model config dropped is not read back by the
-                // executor and is not put on the wire.
-                keep[i] = !target->ex->output_skipped(i);
+                keep[i] = target->nx || !target->ex->output_skipped(i);
                 if (keep[i]) outs.emplace_back(out_names[i], out_bufs[i]);
             }
             if (getenv("SI_ONNX_LOOPDBG")) {
                 si::logf("[onnx] the service: the run of '%s' with %zu inputs\n",
                         target->id.c_str(), feeds.size());
             }
-            target->ex->run(feeds, outs);
-            // The results, in the wire's format.  The shape comes from the
-            // executor: it is only known once the graph has run.
             std::vector<onnxwire::tensor> results;
-            for (size_t i = 0; i < out_names.size(); ++i) {
-                if (!keep[i]) continue;
-                const onnx::tensor & gt = target->ex->output(i);
-                onnxwire::tensor t;
-                t.name = out_names[i];
-                t.type = gt.dtype == onnxpb::FLOAT
-                            ? onnxwire::dtype::f32
-                            : (gt.dtype == onnxpb::INT64
-                                   ? onnxwire::dtype::i64
-                                   : (gt.dtype == onnxpb::INT32 ? onnxwire::dtype::i32
-                                                                 : onnxwire::dtype::f32));
-                t.shape.assign(gt.shape.begin(), gt.shape.end());
-                t.data = std::move(out_bufs[i]);
-                results.push_back(std::move(t));
+            if (target->nx) {
+                target->nx->run(feeds, outs);
+                for (size_t i = 0; i < out_names.size(); ++i) {
+                    if (!keep[i]) continue;
+                    onnxwire::tensor t;
+                    t.name = out_names[i];
+                    si::npu::arg_desc ad;
+                    if (!target->nx->find_output(out_names[i], ad)) continue;
+                    t.type = ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64
+                                 ? onnxwire::dtype::i64
+                                 : (ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT32
+                                        ? onnxwire::dtype::i32
+                                        : onnxwire::dtype::f32);
+                    t.shape.assign(ad.dims.begin(), ad.dims.end());
+                    t.data = std::move(out_bufs[i]);
+                    results.push_back(std::move(t));
+                }
+            } else {
+                target->ex->run(feeds, outs);
+                for (size_t i = 0; i < out_names.size(); ++i) {
+                    if (!keep[i]) continue;
+                    const onnx::tensor & gt = target->ex->output(i);
+                    onnxwire::tensor t;
+                    t.name = out_names[i];
+                    t.type = gt.dtype == onnxpb::FLOAT
+                                ? onnxwire::dtype::f32
+                                : (gt.dtype == onnxpb::INT64
+                                       ? onnxwire::dtype::i64
+                                       : (gt.dtype == onnxpb::INT32 ? onnxwire::dtype::i32
+                                                                      : onnxwire::dtype::f32));
+                    t.shape.assign(gt.shape.begin(), gt.shape.end());
+                    t.data = std::move(out_bufs[i]);
+                    results.push_back(std::move(t));
+                }
             }
             target->calls++;
-            target->last_ms = target->ex->last_ms();
+            target->last_ms = target->nx ? std::chrono::duration<double, std::milli>(
+                                               std::chrono::steady_clock::now() - run_start).count()
+                                         : target->ex->last_ms();
             target->total_ms += target->last_ms;
             const auto th2 = std::chrono::steady_clock::now();
             std::vector<uint8_t> encoded = onnxwire::encode_response(0, "", results);
@@ -411,7 +462,15 @@ int serve_onnx(const onnx_service_config & cfg) {
             used += dw + ds;
             if (!served_models.empty()) {
                 const std::string & name = served_models.front()->device;
-                try {
+                if (is_npu(name)) {
+                    si::control_report::device_t dev;
+                    dev.index = 0;
+                    dev.name = si::npu::device_name();
+                    dev.total_vram_bytes = 0;
+                    dev.used_bytes = used;
+                    dev.free_vram_bytes = 0;
+                    r.devices.push_back(dev);
+                } else try {
                     sycl::device d = pick_device(name);
                     si::control_report::device_t dev;
                     dev.index = (name.rfind("GPU.", 0) == 0 || name.rfind("gpu.", 0) == 0)

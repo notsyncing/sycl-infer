@@ -20,7 +20,14 @@
 #include <vector>
 
 #include <sycl/sycl.hpp>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <map>
+#include <ze_graph_ext.h>
 
+#include "backend/npu/npu_executor.h"
+#include "backend/npu/npu_runtime.h"
 #include "device/device_select.h"
 #include "exec.h"
 #include "graph.h"
@@ -128,6 +135,7 @@ struct syi_onnx_model {
     sycl::queue *q = nullptr;
     si::onnx::exec_graph graph;
     std::unique_ptr<si::onnx::executor> ex;
+    std::unique_ptr<si::npu::executor> nx;
     std::mutex m;
     std::vector<std::string> last_names;
     std::vector<std::vector<int64_t>> last_shapes;
@@ -136,6 +144,7 @@ struct syi_onnx_model {
     std::string id;
     std::string path;
     std::string device;
+    std::map<std::string, int> nx_reduce;
 };
 
 namespace {
@@ -173,17 +182,66 @@ int syi_onnx_create(const char *path, const char *id, const char *device,
         m->id = (id && *id) ? id : path;
         m->path = path;
         m->device = (device && *device) ? device : "GPU";
-        m->q = &si::queue_for(m->device);
-        m->graph = si::onnx::build_graph(m->path, true);
-        m->ex = std::make_unique<si::onnx::executor>(m->graph, *m->q);
+        std::string devlow = si::lower(m->device);
+        if (devlow.rfind("map:", 0) == 0) {
+            std::string mapfile = m->device.substr(4);
+            std::ifstream mf(mapfile);
+            if (!mf) {
+                mapfile = si::lower(mapfile);
+                mf.open(mapfile);
+            }
+            std::string line;
+            const std::string base = m->path.substr(m->path.find_last_of('/') + 1);
+            while (std::getline(mf, line)) {
+                std::istringstream iss(line);
+                std::string key, val;
+                if (!(iss >> key >> val)) continue;
+                if (si::lower(base).find(si::lower(key)) != std::string::npos) {
+                    m->device = val;
+                    devlow = si::lower(m->device);
+                    break;
+                }
+            }
+        }
+        if (devlow.rfind("npu", 0) == 0) {
+            auto colon = devlow.find(':');
+            if (colon != std::string::npos) {
+                std::string mapfile = m->device.substr(colon + 1);
+                std::ifstream mf(mapfile);
+                if (!mf) {
+                    mapfile = si::lower(mapfile);
+                    mf.open(mapfile);
+                }
+                std::string line;
+                const std::string base = m->path.substr(m->path.find_last_of('/') + 1);
+                while (std::getline(mf, line)) {
+                    std::istringstream iss(line);
+                    std::string key, val;
+                    if (!(iss >> key >> val)) continue;
+                    if (key == base || base.find(key) != std::string::npos) {
+                        setenv("PF_NPU_IR_FILE", val.c_str(), 1);
+                        break;
+                    }
+                }
+            }
+            const auto mp = si::onnxpb::parse_model(m->path);
+            std::string nerr;
+            m->nx = std::make_unique<si::npu::executor>(mp, nerr);
+            unsetenv("PF_NPU_IR_FILE");
+            if (!m->nx->valid()) throw std::runtime_error("NPU: " + nerr);
+        } else {
+            m->q = &si::queue_for(m->device);
+            m->graph = si::onnx::build_graph(m->path, true);
+            m->ex = std::make_unique<si::onnx::executor>(m->graph, *m->q);
 #if SYI_ONNX_NEW_WIRE
-        const auto drops = si::split_csv(drop_outputs);
-        if (!drops.empty()) m->ex->skip_outputs(drops);
-        m->ex->set_dnnl(dnnl != 0);
+            const auto drops = si::split_csv(drop_outputs);
+            if (!drops.empty()) m->ex->skip_outputs(drops);
+            m->ex->set_dnnl(dnnl != 0);
 #else
-        (void)drop_outputs;
-        (void)dnnl;
+            (void)drop_outputs;
+            (void)dnnl;
 #endif
+        }
         *out_model = m.release();
         return 0;
     } catch (const std::bad_alloc &) {
@@ -210,22 +268,26 @@ int syi_onnx_info_json(const syi_onnx_model *model, char **out_json, size_t *out
         j["id"] = model->id;
         j["path"] = model->path;
         j["device"] = model->device;
-        j["loaded"] = model->ex != nullptr;
+        j["loaded"] = model->ex != nullptr || model->nx != nullptr;
         j["inputs"] = json::array();
-        for (int s : model->graph.input_slots) {
-            j["inputs"].push_back(model->graph.tensors[s].name);
-        }
         j["outputs"] = json::array();
-        for (int s : model->graph.output_slots) {
-            j["outputs"].push_back(model->graph.tensors[s].name);
+        if (model->nx) {
+            for (const auto & n : model->nx->ir().inputs) j["inputs"].push_back(n);
+            for (const auto & n : model->nx->ir().outputs) j["outputs"].push_back(n);
+            size_t bytes = 0;
+            for (const auto & a : model->nx->args()) bytes += a.bytes;
+            j["vram_bytes"] = (uint64_t)bytes;
+        } else {
+            for (int s : model->graph.input_slots) j["inputs"].push_back(model->graph.tensors[s].name);
+            for (int s : model->graph.output_slots) j["outputs"].push_back(model->graph.tensors[s].name);
+#if SYI_ONNX_NEW_WIRE
+            if (model->ex) {
+                j["vram_bytes"] = (uint64_t)(model->ex->live_bytes() + model->ex->pooled_bytes());
+            }
+#endif
         }
         auto it = model->graph.metadata.find("character");
         j["character"] = it == model->graph.metadata.end() ? std::string() : it->second;
-#if SYI_ONNX_NEW_WIRE
-        if (model->ex) {
-            j["vram_bytes"] = (uint64_t)(model->ex->live_bytes() + model->ex->pooled_bytes());
-        }
-#endif
         const std::string s = j.dump();
         auto *p = (char *)std::malloc(s.size() + 1);
         if (!p) {
@@ -263,7 +325,7 @@ int syi_onnx_run_wire(const syi_onnx_model *model, const uint8_t *request, size_
         *out_len = enc.size();
         return 0;
     };
-    if (!model || !model->ex) {
+    if (!model || (!model->ex && !model->nx)) {
         si::set_error("model is null or was not loaded");
         return reply(2, "model is null or was not loaded");
     }
@@ -280,8 +342,12 @@ int syi_onnx_run_wire(const syi_onnx_model *model, const uint8_t *request, size_
         std::lock_guard<std::mutex> lk(const_cast<syi_onnx_model *>(model)->m);
         std::vector<si::onnxwire::tensor> feeds = inputs;
         std::vector<std::string> out_names;
-        for (int s : model->graph.output_slots) out_names.push_back(model->graph.tensors[s].name);
-        if (model->ex->has_output_reductions()) {
+        if (model->nx) {
+            out_names = model->nx->ir().outputs;
+        } else {
+            for (int s : model->graph.output_slots) out_names.push_back(model->graph.tensors[s].name);
+        }
+        if (model->ex && model->ex->has_output_reductions()) {
             si::set_error("this model has output reductions configured, and the wire API "
                           "returns whole tensors; use the direct API");
             return reply(2, "this model has output reductions configured; use the direct API");
@@ -291,23 +357,42 @@ int syi_onnx_run_wire(const syi_onnx_model *model, const uint8_t *request, size_
         std::vector<std::pair<std::string, std::vector<uint8_t> &>> outs;
         for (size_t i = 0; i < out_names.size(); ++i) {
 #if SYI_ONNX_NEW_WIRE
-            keep[i] = !model->ex->output_skipped(i);
+            keep[i] = model->nx || !model->ex->output_skipped(i);
 #else
             keep[i] = true;
 #endif
             if (keep[i]) outs.emplace_back(out_names[i], bufs[i]);
         }
-        model->ex->run(feeds, outs);
         std::vector<si::onnxwire::tensor> results;
-        for (size_t i = 0; i < out_names.size(); ++i) {
-            if (!keep[i]) continue;
-            const si::onnx::tensor & gt = model->ex->output(i);
-            si::onnxwire::tensor t;
-            t.name = out_names[i];
-            t.type = si::wire_type(gt.dtype);
-            t.shape.assign(gt.shape.begin(), gt.shape.end());
-            t.data = std::move(bufs[i]);
-            results.push_back(std::move(t));
+        if (model->nx) {
+            model->nx->run(feeds, outs);
+            for (size_t i = 0; i < out_names.size(); ++i) {
+                if (!keep[i]) continue;
+                si::npu::arg_desc ad;
+                if (!model->nx->find_output(out_names[i], ad)) continue;
+                si::onnxwire::tensor t;
+                t.name = out_names[i];
+                t.type = ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64
+                             ? si::onnxwire::dtype::i64
+                             : (ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT32
+                                    ? si::onnxwire::dtype::i32
+                                    : si::onnxwire::dtype::f32);
+                t.shape.assign(ad.dims.begin(), ad.dims.end());
+                t.data = std::move(bufs[i]);
+                results.push_back(std::move(t));
+            }
+        } else {
+            model->ex->run(feeds, outs);
+            for (size_t i = 0; i < out_names.size(); ++i) {
+                if (!keep[i]) continue;
+                const si::onnx::tensor & gt = model->ex->output(i);
+                si::onnxwire::tensor t;
+                t.name = out_names[i];
+                t.type = si::wire_type(gt.dtype);
+                t.shape.assign(gt.shape.begin(), gt.shape.end());
+                t.data = std::move(bufs[i]);
+                results.push_back(std::move(t));
+            }
         }
         const std::vector<uint8_t> enc = si::onnxwire::encode_response(0, "", results);
         auto *p = (uint8_t *)std::malloc(enc.size());
@@ -329,7 +414,7 @@ int syi_onnx_run_wire(const syi_onnx_model *model, const uint8_t *request, size_
 int syi_onnx_run_direct(const syi_onnx_model *model, const syi_onnx_input *inputs,
                         size_t n_inputs, syi_onnx_output *outputs, size_t max_outputs,
                         size_t *out_count) {
-    if (!model || !model->ex || !out_count || (!inputs && n_inputs) ||
+    if (!model || (!model->ex && !model->nx) || !out_count || (!inputs && n_inputs) ||
         (!outputs && max_outputs)) {
         si::set_error("invalid direct-run arguments");
         return -1;
@@ -373,19 +458,24 @@ int syi_onnx_run_direct(const syi_onnx_model *model, const syi_onnx_input *input
         }
 
         std::vector<std::string> names;
-        for (int slot : m.graph.output_slots) names.push_back(m.graph.tensors[slot].name);
+        if (m.nx) {
+            names = m.nx->ir().outputs;
+        } else {
+            for (int slot : m.graph.output_slots) names.push_back(m.graph.tensors[slot].name);
+        }
         std::vector<std::vector<uint8_t>> bufs(names.size());
         std::vector<bool> keep(names.size(), true);
         std::vector<std::pair<std::string, std::vector<uint8_t> &>> outs;
         for (size_t i = 0; i < names.size(); ++i) {
 #if SYI_ONNX_NEW_WIRE
-            keep[i] = !m.ex->output_skipped(i);
+            keep[i] = m.nx || !m.ex->output_skipped(i);
 #else
             keep[i] = true;
 #endif
             if (keep[i]) outs.emplace_back(names[i], bufs[i]);
         }
-        m.ex->run(feeds, outs);
+        if (m.nx) m.nx->run(feeds, outs);
+        else m.ex->run(feeds, outs);
 
         m.last_names.clear();
         m.last_shapes.clear();
@@ -393,9 +483,61 @@ int syi_onnx_run_direct(const syi_onnx_model *model, const syi_onnx_input *input
         m.last_dtype.clear();
         for (size_t i = 0; i < names.size(); ++i) {
             if (!keep[i]) continue;
-            // A reduced output: the executor computed the reduction on the
-            // device and holds only its result.  An argmax exposes two
-            // values (the index and the value at it), a byte cast one.
+            if (m.nx) {
+                si::npu::arg_desc ad;
+                if (!m.nx->find_output(names[i], ad)) continue;
+                const size_t actual_elems = ad.bytes ? bufs[i].size() / ad.bytes : 1;
+                if (actual_elems > 1 && !ad.dims.empty()) ad.dims[0] *= static_cast<int64_t>(actual_elems);
+                auto rit = m.nx_reduce.find(names[i]);
+                int rkind = rit == m.nx_reduce.end() ? 0 : rit->second;
+                std::vector<uint8_t> data = std::move(bufs[i]);
+                if (rkind == 1 && ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_FP32 && !ad.dims.empty()) {
+                    const size_t V = static_cast<size_t>(ad.dims.back());
+                    if (V > 0 && data.size() >= V * 4) {
+                        const size_t outer = data.size() / (V * 4);
+                        std::vector<uint8_t> idx(outer * 8), mx(outer * 4);
+                        const float * src = reinterpret_cast<const float *>(data.data());
+                        int64_t * di = reinterpret_cast<int64_t *>(idx.data());
+                        float * dm = reinterpret_cast<float *>(mx.data());
+                        for (size_t q = 0; q < outer; ++q) {
+                            int64_t best = 0;
+                            float bv = src[q * V];
+                            for (size_t k = 1; k < V; ++k) if (src[q * V + k] > bv) { bv = src[q * V + k]; best = k; }
+                            di[q] = best;
+                            dm[q] = bv;
+                        }
+                        std::vector<int64_t> shp(ad.dims.begin(), ad.dims.end() - 1);
+                        m.last_names.push_back(names[i] + ":argmax");
+                        m.last_shapes.push_back(shp);
+                        m.last_dtype.push_back((int32_t)si::onnxwire::dtype::i64);
+                        m.last_data.push_back(std::move(idx));
+                        m.last_names.push_back(names[i] + ":max");
+                        m.last_shapes.push_back(shp);
+                        m.last_dtype.push_back((int32_t)si::onnxwire::dtype::f32);
+                        m.last_data.push_back(std::move(mx));
+                        continue;
+                    }
+                } else if (rkind == 2) {
+                    const size_t n = data.size() / 4;
+                    std::vector<uint8_t> b(n);
+                    const float * src = reinterpret_cast<const float *>(data.data());
+                    for (size_t q = 0; q < n; ++q) b[q] = static_cast<uint8_t>(std::max(0.f, std::min(255.f, src[q])));
+                    m.last_names.push_back(names[i]);
+                    m.last_shapes.emplace_back(ad.dims.begin(), ad.dims.end());
+                    m.last_dtype.push_back((int32_t)si::onnxwire::dtype::u8);
+                    m.last_data.push_back(std::move(b));
+                    continue;
+                }
+                m.last_names.push_back(names[i]);
+                m.last_shapes.emplace_back(ad.dims.begin(), ad.dims.end());
+                m.last_dtype.push_back(ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64
+                                           ? (int32_t)si::onnxwire::dtype::i64
+                                           : (ad.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT32
+                                                  ? (int32_t)si::onnxwire::dtype::i32
+                                                  : (int32_t)si::onnxwire::dtype::f32));
+                m.last_data.push_back(std::move(data));
+                continue;
+            }
             const size_t nred = m.ex->reduced_count(i);
             if (nred) {
                 for (size_t k = 0; k < nred; ++k) {
@@ -453,7 +595,7 @@ int syi_onnx_run_direct(const syi_onnx_model *model, const syi_onnx_input *input
 }
 
 int syi_onnx_set_output_mode(syi_onnx_model *model, const char *output, const char *mode) {
-    if (!model || !model->ex || !output || !*output) {
+    if (!model || (!model->ex && !model->nx) || !output || !*output) {
         si::set_error("invalid output-mode arguments");
         return -1;
     }
@@ -467,7 +609,16 @@ int syi_onnx_set_output_mode(syi_onnx_model *model, const char *output, const ch
             return -1;
         }
         std::lock_guard<std::mutex> lk(model->m);
-        model->ex->set_output_reduce(output, kind);
+        if (model->nx) {
+            std::string name = output;
+            if (name.empty() || (name[0] >= '0' && name[0] <= '9')) {
+                size_t idx = static_cast<size_t>(std::strtoull(output, nullptr, 10));
+                if (idx < model->nx->ir().outputs.size()) name = model->nx->ir().outputs[idx];
+            }
+            model->nx_reduce[name] = kind;
+        } else {
+            model->ex->set_output_reduce(output, kind);
+        }
         return 0;
     } catch (const std::exception & e) {
         si::set_error(e.what());
@@ -476,7 +627,7 @@ int syi_onnx_set_output_mode(syi_onnx_model *model, const char *output, const ch
 }
 
 int syi_onnx_trim(syi_onnx_model *model) {
-    if (!model || !model->ex) return -1;
+    if (!model || !model->ex || model->nx) return -1;
     try {
         std::lock_guard<std::mutex> lk(model->m);
         model->ex->trim_pool();
