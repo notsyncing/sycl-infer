@@ -490,7 +490,37 @@ int main(void) {
 
 ---
 
-## 12. 常见问题
+## 12. Embedding 模型（GGUF BERT / BGE-M3）
+
+生成式模型之外的另一条句柄：`general.architecture == bert` 的 GGUF 不走
+`engine`/KV/sampler，而是降成一张内存中的 ONNX 图，由 CPU/GPU 的 ONNX 执行器
+或 NPU 执行器运行。一个文件服务三个后端，没有各后端各自的 forward kernel。
+
+```c
+syi_embedding_options eo;
+syi_embedding_options_init(&eo);
+eo.model_path = "/path/to/bge-m3-q8_0.gguf";
+eo.device = "cpu";       /* "auto"/"cpu"/"gpu"/"gpu.N"/"npu"; NULL = auto */
+eo.max_seq = 128;        /* 等价于 CLI 的 --embed-max-seq */
+syi_embedding_model *e = NULL;
+st = syi_embedding_model_create(&eo, &e);
+float *out = NULL; size_t n = 0, dim = 0;
+const char *texts[] = {"hello", "你好"};
+st = syi_model_embed(e, texts, 2, &out, &n, &dim);
+/* out 是 n*dim 个 f32，行主序、已 L2 归一化；用 syi_free(out) 释放 */
+const char *dev = syi_embedding_device(e);
+syi_embedding_model_destroy(e);
+```
+
+要点：编码器没有 LM head，`--ctx` 被忽略，序列轴是 `embed-max-seq`（默认
+512；输入截断或右填充）；BGE-M3 的 tokenizer 是 SentencePiece Unigram，不是
+引擎的 BPE。图里 `LayerNorm` 和 `Gelu` 被拆成 opset1 原语，因为 Lunar Lake
+NPU 驱动拒绝这两个算子。完整契约与后端一致性数字见
+[design/25-embeddings.md](../design/25-embeddings.md)。
+
+---
+
+## 13. 常见问题
 
 **`model load failed: device alloc failed`**
 

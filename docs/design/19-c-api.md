@@ -42,7 +42,10 @@ GGUF 模型并执行批量推理的稳定接口。它是 C++ 引擎的**薄封�
 * **Windows/macOS**：v1 只承诺 Linux x86_64 + Intel GPU/CPU。ABI 头文件保留
   `SYI_API` 的 Windows 分支，但不测试。
 * **HTTP 服务**：C API 不包含 `server.cpp`；宿主自己决定暴露方式。
-* **训练/微调/embedding-only 接口**：只做生成。
+* **训练/微调接口**：只做生成。Embedding-only 模型（GGUF BERT，如 BGE-M3）
+  后来在生成式 ABI 之外单独增加了 `syi_embedding_model` / `syi_model_embed`
+  句柄；它不经过 `syi_model`/调度器/KV，见 §8.8 与
+  [design/25-embeddings.md](25-embeddings.md)。
 
 ---
 
@@ -900,6 +903,30 @@ public:
 ```
 
 包装层只做异常转换和 RAII，不改变语义；C 用户和 C++ 用户看到的是同一个库。
+
+### 8.8 Embedding 模型句柄（生成式 ABI 之外）
+
+`syi_embedding_model` 是独立的句柄：`general.architecture == bert` 的 GGUF
+是双向编码器，没有 LM head / KV / sampler，因此不进 `syi_model` 的调度器。
+`src/capi/capi_embedding.cpp` 包装 `src/embedding/embedding_engine.cpp`：
+GGUF 一次性降成内存中的 ONNX 图，同一张图跑 CPU/GPU 的 `onnx::executor`
+或 NPU 的 Level Zero graph。
+
+| 函数 | 语义 |
+|---|---|
+| `syi_embedding_options_init` / `syi_embedding_model_create` | `model_path`、`device`（`auto`/`cpu`/`gpu`/`gpu.N`/`npu`）、`max_seq`（<=0 = 512） |
+| `syi_model_embed` | 同步编码 `n_inputs` 个 UTF-8 字符串，输出 `n*dim` 个 f32（行主序、已 L2 归一化），`syi_free` 释放 |
+| `syi_embedding_dim` / `syi_embedding_device` | 维数与解析后的设备字符串 |
+| `syi_embedding_model_destroy` | 释放图与执行器 |
+
+序列轴是 `syi_embedding_options::max_seq`（对应 CLI 的 `--embed-max-seq`），
+不是生成式 `syi_model_options::max_seq`/`--ctx`；输入被截断或右填充。
+实现细节、opset1 限制与三后端一致性数字见
+[design/25-embeddings.md](25-embeddings.md)；使用示例见
+[guides/c-api.md](../guides/c-api.md#12-embedding-模型gguf-bert--bge-m3)。
+
+研究用途的 FFN 捕获 API 在独立头文件 `sycl_infer_research.h` 中，
+刻意不属于本 ABI 的表面，见 [design/26-research.md](26-research.md)。
 
 ---
 

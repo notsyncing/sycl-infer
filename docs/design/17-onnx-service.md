@@ -302,6 +302,37 @@ them worth writing down.
 * **The sigmoid is computed stably.**  The device's `exp` is a fast
   approximation; the naive `1/(1+exp(-x))` form is not accurate enough
   where it matters.
+* **oneDNN's stream is a separate ordering domain from the SYCL queue.**
+  Building `dnnl::stream` from the executor's in-order queue does *not* order
+  its primitives against that queue's submissions.  Without explicit waits a
+  following SYCL kernel can read a primitive's output before it was written
+  (the PP-OCRv6 recogniser returned an all-NaN logits tensor).  See below.
+
+### oneDNN stream ordering (the 2026-11-19 fix)
+
+oneDNN primitives run on `ctx->st`, the executor's `dnnl::stream`.  A stream
+is its own ordering domain even when it was made from the same in-order
+`sycl::queue` as every SYCL kernel: ordering is guaranteed *within* a stream,
+not *between* two streams.  This is the same category error as the LLM path's
+`PF_ATTN_STREAM=1` (a second oneDNN stream for the attention matmuls), found
+independently here.
+
+The fix is at the boundaries, not after every operator:
+
+* `src/backend/onnx/conv_dnnl.cpp` waits the queue **before** `execute` (so
+  upstream SYCL kernels have written their inputs) and waits the oneDNN stream
+  **after** it (so the output is complete before the next SYCL kernel reads
+  it) - for both `matmul_dnnl_launch` and `conv_dnnl_launch`;
+* `src/backend/onnx/exec.cpp` adds a queue wait after each operator when
+  oneDNN is enabled (`ordered = dnnl_ && !SI_ONNX_NO_OPBARRIER`), because a
+  model can reach oneDNN through a path other than conv/matmul, and one more
+  wait before any output or `argmax`/`u8` reduction is read back.
+
+`SI_ONNX_OPBARRIER_ALL=1` forces the per-operator wait even with oneDNN off
+(a timing A/B), `SI_ONNX_NO_OPBARRIER=1` removes it, and `SI_ONNX_END_WAIT=1`
+adds an end-of-call wait without oneDNN.  The default is the ordered path: a
+single NaN cell in a 18710-wide logit row is invisible in an average but flips
+the whole CTC decoding.
 
 ### The `Resize`, and the table accuracy
 
@@ -1588,6 +1619,9 @@ remote workers through a `remote` entry).
 | `SI_ONNX_TRACE=1` | the operators, one per line, and the fusion's decisions |
 | `SI_ONNX_TIME=1` | the time of every operator, in milliseconds (it waits per operator, so it measures the operator-plus-drain, not the host dispatch) |
 | `SI_ONNX_OPSTAT=1` | the host time, the blocking downloads and the uploads by operator type, *without* waiting per operator - the only way to see what the host dispatch costs (the Loop body's 157 operators) |
+| `SI_ONNX_NO_OPBARRIER=1` | drop the per-operator queue wait that orders oneDNN's stream against the SYCL executor (default: on when oneDNN is enabled; wrong-output A/B) |
+| `SI_ONNX_OPBARRIER_ALL=1` | force that per-operator queue wait even with oneDNN off (timing A/B) |
+| `SI_ONNX_END_WAIT=1` | add an end-of-call queue wait even without oneDNN |
 | `SI_ONNX_NOFUSE=1` | no fusion (the operators as the model has them) |
 | `SI_ONNX_NOFUSE_ACT=1` | no *activation* fusion (the batch norm still folds) |
 | `SI_ONNX_NOMASKFUSE=1` | keep the layout model's mask head as its ONNX operators (the A/B for `MaskBox`) |

@@ -41,10 +41,25 @@ CTC 的 argmax/max，layout 的 `[N,200,200]` int32 mask 只需要 0/1 字节，
 这两条路径把它们各自降到 16 B/行和 1 B/元素，数值逐位等价（argmax
 平局取最小下标，与 numpy 一致）。
 
-`device` 取 `GPU`、`GPU.N`、`CPU` 或 `AUTO`。同一个设备上的模型共享一个
-in-order `sycl::queue`（和 ONNX service 一样），因此多模型常驻不会各自
-争用设备状态。`drop_outputs` 是逗号分隔的输出名，省掉不读回的 48 MB mask
-之类的输出。
+`device` 取 `GPU`、`GPU.N`、`CPU`、`AUTO` 或 `NPU`；此外 `map:<file>`
+按 ONNX 文件名（basename）把不同模型分到不同设备，因此一条流水线可以让
+公式/分类模型跑 NPU、layout 跑 GPU。`syi_onnx_create` 的 `device` 也接受
+小写。同一个设备上的模型共享一个 in-order `sycl::queue`（和 ONNX service
+一样），因此多模型常驻不会各自争用设备状态。`drop_outputs` 是逗号分隔的
+输出名，省掉不读回的 48 MB mask 之类的输出。
+
+### NPU 注意事项
+
+NPU 走独立的 Level Zero graph 扩展（`src/backend/npu/`），不链接也不调用
+OpenVINO。NPU graph 需要静态形状：`PF_NPU_STATIC_DIMS=N` 补齐未解析维度，
+`PF_NPU_INPUT_SHAPES=name:d0,d1,...` 固定具名输入，`PF_NPU_IR_FILE=<dir>/<name>.xml`
+在前端转换不忠实时加载预先生成的 IR（XML + `.xml.bin`）。输出侧支持 host
+上的 `argmax`/`u8` 归约和透明的 batch-1 拆分。
+
+固定形状的阶段（OCR 识别器、分类器）适合 NPU；精度敏感的 layout 检测器
+（NPU 内部 FP16）和形状随页面变化的检测器在 NPU 上不正确，必须留在 GPU/
+CPU。实测数字与已验证的 PDF 配置见
+[`../design/17-onnx-service.md` 的 “The Intel NPU execution path”](../design/17-onnx-service.md#the-intel-npu-execution-path)。
 
 ## RapidDoc
 

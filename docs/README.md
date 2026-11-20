@@ -5,7 +5,7 @@
 
 **正文只描述当前代码。** 已被替换的设计、旧的测量数字和一次性诊断结论放在每篇文档末尾的
 “历史记录 / History”节（`PERFORMANCE.md` 是 §10），不混进当前状态的叙述里。最近一次全量同步：
-2026-11-15。
+2026-11-20（同步最近 5 个提交：embedding / NPU / ONNX stream 顺序 / FFN research C API）。
 
 ## 阅读顺序
 
@@ -37,7 +37,8 @@
 | 24 | [design/23-deepseek41.md](design/23-deepseek41.md) | **DeepSeek-V4.1-Flash（`deepseek41`）**：MLA 注意力（K==V、512 宽、64 头）、组共享压缩 KV、两级 DSA 索引、4 流 mHC、Engram、384 专家 sqrt-softplus 路由；loader/hparams、model profile、host 前向与增量 DecState、前缀缓存、`deepseek41v` 视觉塔、GPU 内核（IQ2 GEMV / MLA / mHC / ops）与不变量 |
 | 25 | [design/24-arch-modules.md](design/24-arch-modules.md) | **架构模块契约**：`src/model/`（文件是什么）与 `src/engine/`（怎么运行）的分层、每架构两层的目录、`kLoaders[]`/`kArchOps[]` 注册表、`arch_hparams`/`arch_layer`/`arch_model_extras` 数据模型、`model_profile` 与 `arch_ops` 的分工、新增 generic-plan / model-owned 架构的步骤，以及边界门禁与 `test_arch_ops` |
 | 26 | [design/25-embeddings.md](design/25-embeddings.md) | **Embedding 模型（GGUF BERT / BGE-M3）**：独立的 SentencePiece tokenizer、GGUF→ONNX 图构建、CPU/GPU/NPU 三后端执行、CLS/mean 池化与 L2 归一化；`/v1/embeddings`、`embed` CLI、`syi_model_embed`，以及 NPU 的 opset1 限制与不变量 |
-| 26 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
+| 27 | [design/26-research.md](design/26-research.md) | **Research-only FFN C API**：`sycl_infer_research.h` 与 `research/` 的激活捕获 / top-K pattern / 0-1 相似度三层接口；刻意独立于推理 ABI |
+| 28 | [PERFORMANCE.md](PERFORMANCE.md) | **实测性能表**：prefill / decode 按上下文深度与 batch size 的吞吐，按模型、按投机解码路径；每个数字都带硬件、构建、harness 与复现命令 |
 
 面向使用者的说明：
 
@@ -72,6 +73,10 @@
 * 想调优内存/前缀缓存 → [design/05-kv-cache.md](design/05-kv-cache.md)、[design/06-prefix-cache.md](design/06-prefix-cache.md)
 * 想同时部署多个模型、或要给每个模型单独一份显存预算 → [design/16-router.md](design/16-router.md)
 * 想跑文档流水线的 ONNX 模型（版面/OCR/表格/公式）→ [design/17-onnx-service.md](design/17-onnx-service.md)
+* 想在 NPU 上跑固定形状模型，或让一条流水线混合 NPU/GPU/CPU → [design/17-onnx-service.md 的 “The Intel NPU execution path”](design/17-onnx-service.md#the-intel-npu-execution-path)、[guides/onnx-inprocess.md](guides/onnx-inprocess.md)（`device="npu"` / `"map:<file>"`）
+* 想排查 oneDNN stream 与 SYCL queue 的顺序问题（识别器输出 NaN、读回为零）→ [design/17-onnx-service.md](design/17-onnx-service.md) 的“oneDNN stream 顺序”与环境变量表
+* 想跑 embedding 模型（BGE-M3：`embed` CLI、`/v1/embeddings`、`syi_model_embed`）→ [design/25-embeddings.md](design/25-embeddings.md)
+* 想用 research-only 的 FFN 捕获与相似度 C API（不进 README）→ [design/26-research.md](design/26-research.md)
 * 想看实测吞吐（按深度 / batch / 投机路径）→ [PERFORMANCE.md](PERFORMANCE.md)
 * 环境变量总表 → [AGENTS.md](../AGENTS.md#environment-variables)
 * 排查"模型输出不正常"（decode/prefill 不一致、量化路径差异、参考实现不可信等）→ [design/12-build-and-testing.md §7](design/12-build-and-testing.md)
