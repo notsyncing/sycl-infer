@@ -301,6 +301,9 @@ SYI_API syi_status syi_request_cancel(syi_request *request);
 SYI_API syi_status syi_request_get_result(const syi_request *request, syi_result *out);
 SYI_API const char *syi_request_error(const syi_request *request);
 
+/* Research-only C API (FFN activation capture) lives in the separate header
+ * <sycl_infer/sycl_infer_research.h>; it is intentionally not declared here. */
+
 /* ------------------------------------------------------------------ embeddings
  * GGUF BERT encoders (e.g. BGE-M3).  These are a separate model handle: an
  * encoder has no KV cache, sampler or token stream, so it does not go through

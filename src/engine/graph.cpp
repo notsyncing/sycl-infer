@@ -2590,6 +2590,33 @@ auto moe_call = [&](size_t idx) {
                     }
                 }
             }
+            if (const char * fp = si::env::str("PF_DUMP_FFN")) {
+                if (d_ffn) {
+                    const char * se = si::env::str("PF_DUMP_FFN_SLOT");
+                    const int slot = se ? atoi(se) : last_slot;
+                    std::vector<float> hf((size_t)2 * hp.n_ff);
+                    if (dev_read_back(dev_queue(cur_dev), hf.data(),
+                                      d_ffn + (size_t)slot * ffn_stride, hf.size() * 4, "PF_DUMP_FFN")) {
+                        char fpath[512];
+                        snprintf(fpath, sizeof(fpath), "%s.il%02d.bin", fp, il);
+                        if (FILE * ff = fopen(fpath, "wb")) {
+                            fwrite(hf.data(), 4, hf.size(), ff);
+                            fclose(ff);
+                        }
+                    }
+                }
+            }
+        }
+        // Research hook (see research/): in-memory twin of PF_DUMP_FFN, backing
+        // syi_model_capture_ffn.  Not gated on PF_DUMP_LAYERS: the C API needs
+        // it with no env var set.  The research caller pre-sizes ffn_cap_out
+        // for its layers and pins ffn_cap_layer (>=0 one layer, <0 all layers,
+        // row-major by layer).
+        if (ffn_cap_out && d_ffn && (ffn_cap_layer < 0 || ffn_cap_layer == il)) {
+            if (dev_read_back(dev_queue(cur_dev), ffn_cap_out + (size_t)(ffn_cap_layer < 0 ? il : 0) * 2 * hp.n_ff,
+                              d_ffn + (size_t)ffn_cap_slot * ffn_stride, (size_t)2 * hp.n_ff * 4, "FFN capture")) {
+                // filled
+            }
         }
         if (il == stop_layer) {
             break;

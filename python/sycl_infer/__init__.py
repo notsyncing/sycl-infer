@@ -48,6 +48,7 @@ __all__ = [
     "UnsupportedError",
     "ClosedError",
     "doctor",
+    "research",
     "__version__",
     "__abi_version__",
 ]
@@ -177,6 +178,14 @@ def __getattr__(name: str):
         return _capi.load().syi_version_string().decode()
     if name == "__abi_version__":
         return int(_capi.load().syi_abi_version())
+    if name == "research":
+        # Research API lives in its own module; import it explicitly so a
+        # normal inference consumer never loads it.  import_module avoids a
+        # recursion: `from . import research` re-enters __getattr__ here.
+        import importlib
+        _research = importlib.import_module(".research", __name__)
+        globals()["research"] = _research
+        return _research
     raise AttributeError(name)
 
 

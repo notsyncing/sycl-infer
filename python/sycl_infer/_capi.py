@@ -10,8 +10,9 @@ import ctypes
 import ctypes.util
 import os
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 _lib = None
 _lib_path: Optional[str] = None
@@ -19,6 +20,35 @@ _lib_path: Optional[str] = None
 
 class _SString(ctypes.Structure):
     _fields_ = [("data", ctypes.c_char_p), ("size", ctypes.c_size_t)]
+
+
+class _FFNOptions(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("abi_version", ctypes.c_uint32),
+        ("layer", ctypes.c_int32),
+        ("token_slot", ctypes.c_int32),
+    ]
+
+
+class _FFNPatternOptions(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("abi_version", ctypes.c_uint32),
+        ("top_k", ctypes.c_int32),
+        ("half", ctypes.c_int32),
+        ("zscore", ctypes.c_int32),
+    ]
+
+
+class _FFNSimilarityOptions(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("abi_version", ctypes.c_uint32),
+        ("layers", ctypes.POINTER(ctypes.c_int32)),
+        ("n_layers", ctypes.c_size_t),
+        ("chance_baseline", ctypes.c_double),
+    ]
 
 
 class _ModelOptions(ctypes.Structure):
@@ -327,6 +357,27 @@ def _declare(lib) -> None:
     lib.syi_request_get_result.restype = ctypes.c_int
     lib.syi_request_error.argtypes = [ctypes.c_void_p]
     lib.syi_request_error.restype = ctypes.c_char_p
+
+    # research-only C API (see sycl_infer_research.h).  Declared here so the
+    # research module can call them, but not re-exported from __init__.py.
+    lib.syi_ffn_options_init.argtypes = [P(_FFNOptions)]
+    lib.syi_model_capture_ffn.argtypes = [ctypes.c_void_p, P(_FFNOptions), P(ctypes.c_char_p),
+                                          ctypes.c_size_t, P(P(ctypes.c_float)), P(ctypes.c_size_t),
+                                          P(ctypes.c_size_t), P(ctypes.c_size_t)]
+    lib.syi_model_capture_ffn.restype = ctypes.c_int
+    lib.syi_ffn_pattern_options_init.argtypes = [P(_FFNPatternOptions)]
+    lib.syi_ffn_pattern_create.argtypes = [P(ctypes.c_float), ctypes.c_size_t, ctypes.c_size_t,
+                                           ctypes.c_size_t, P(_FFNPatternOptions), P(ctypes.c_void_p)]
+    lib.syi_ffn_pattern_create.restype = ctypes.c_int
+    lib.syi_ffn_pattern_destroy.argtypes = [ctypes.c_void_p]
+    lib.syi_ffn_pattern_top.argtypes = [ctypes.c_void_p, P(P(ctypes.c_int32)), P(P(ctypes.c_float)),
+                                        P(ctypes.c_size_t), P(ctypes.c_size_t), P(ctypes.c_size_t),
+                                        P(ctypes.c_size_t)]
+    lib.syi_ffn_pattern_top.restype = ctypes.c_int
+    lib.syi_ffn_similarity_options_init.argtypes = [P(_FFNSimilarityOptions)]
+    lib.syi_ffn_similarity.argtypes = [ctypes.c_void_p, P(_FFNSimilarityOptions),
+                                       P(P(ctypes.c_double)), P(ctypes.c_size_t)]
+    lib.syi_ffn_similarity.restype = ctypes.c_int
 
 
 def status_string(status: int) -> str:

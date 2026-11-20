@@ -4261,7 +4261,7 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
     // with blocking transfers, and a recorded command graph cannot contain one -
     // and if it were recorded *around*, every decode step would silently drop
     // the experts the device kernels skipped for lack of a slot.
-    static const bool nog = si::env::flag("PF_NOGRAPH") || moe_host_split();
+    const bool nog = si::env::flag("PF_NOGRAPH") || moe_host_split() || capture_mode;
     if (cpu_mode || multi_dev) {
         if (pf8 || multi_dev) {
             // full-chunk path: SI8 on single-device CPU, per-device oneDNN/w8
@@ -4288,6 +4288,16 @@ void engine::prefill_chunk(const std::vector<int> & toks, int start, int n, int 
     }
     if (nog && pf8) {
         record_forward(1, plan_pf8_, d_segs_pf8, kMaxT);
+        q.wait();
+        d_info->pc_active = 0;
+        return;
+    }
+    if (capture_mode) {
+        // Research hook (see research/): capture_mode forces direct replay on
+        // single-device GPU too, but the non-pf8 plan needs its own direct
+        // branch: a graph replay would not run the layer loop that copies into
+        // ffn_cap_out.
+        record_forward(1, plan_pf_, d_segs_pf, kMaxT);
         q.wait();
         d_info->pc_active = 0;
         return;
@@ -4440,7 +4450,7 @@ void engine::prefill_batch(const std::vector<int> & toks, int start, int n, int 
     if (dbg_pfb) {
         si::logf("[pfb] n=%d NCH=%d segs=%zu x8=%p\n", n, NCH, plan_pfb_.segs.size(), (void *)d_x8);
     }
-    static const bool nog = si::env::flag("PF_NOGRAPH");
+    const bool nog = si::env::flag("PF_NOGRAPH") || capture_mode;
     // oneDNN primitives cannot be recorded into a SYCL command graph, so the
     // PF_GEMM_DNNL path always uses the direct (non-graph) replay of mode 2.
     // Multi-device has no recorded graphs at all, so it also always goes direct:

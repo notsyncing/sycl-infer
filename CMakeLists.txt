@@ -601,12 +601,20 @@ if(NOT SI_ROUTER_ONLY AND SI_C_API)
         src/capi/capi.cpp
         src/capi/capi_embedding.cpp
         src/capi/errors.cpp
+        # research-only C API + FFN capture (see research/); links into the same
+        # shared object but has its own public header and stays out of the
+        # inference sources above.
+        research/capi_ffn.cpp
+        research/ffn_capture.cpp
+        research/ffn_pattern.cpp
     )
     target_include_directories(sycl_infer_c
         PUBLIC
             ${CMAKE_SOURCE_DIR}/include
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/capi
+            ${CMAKE_SOURCE_DIR}/research
     )
     target_compile_definitions(sycl_infer_c PRIVATE SYI_BUILD)
     target_link_libraries(sycl_infer_c PRIVATE sycl_infer_core Threads::Threads)
@@ -633,6 +641,8 @@ if(NOT SI_ROUTER_ONLY AND SI_C_API)
         RUNTIME DESTINATION bin)
     install(FILES include/sycl_infer/sycl_infer.h
         DESTINATION include/sycl_infer)
+    install(FILES include/sycl_infer/sycl_infer_research.h
+        DESTINATION include/sycl_infer)
 endif()
 
 if(NOT SI_ROUTER_ONLY AND SI_C_API)
@@ -643,6 +653,17 @@ if(NOT SI_ROUTER_ONLY AND SI_C_API)
         # libdnnl's NEEDED libsvml/imf/intlc/irng live in the oneAPI compiler
         # tree; the test links the shared engine, so give ld their directories.
         target_link_options(test_capi PRIVATE
+            "-Wl,-rpath-link,/opt/intel/oneapi/compiler/2026.2/lib"
+            "-Wl,-rpath-link,/opt/intel/oneapi/dnnl/2026.1/lib")
+    endif()
+
+    # Research-only FFN capture C API test (model-backed, CPU).  Kept next to
+    # the research sources, not under tests/, to keep research isolated.
+    add_executable(test_capi_ffn research/test_capi_ffn.cpp)
+    target_link_libraries(test_capi_ffn PRIVATE sycl_infer_c)
+    set_target_properties(test_capi_ffn PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}")
+    if(UNIX AND NOT APPLE)
+        target_link_options(test_capi_ffn PRIVATE
             "-Wl,-rpath-link,/opt/intel/oneapi/compiler/2026.2/lib"
             "-Wl,-rpath-link,/opt/intel/oneapi/dnnl/2026.1/lib")
     endif()

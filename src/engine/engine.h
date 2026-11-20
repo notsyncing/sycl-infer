@@ -362,6 +362,17 @@ struct engine {
     float * d_vbuf = nullptr;
     float * d_attn_out = nullptr;
     float * d_ffn = nullptr;
+    // --- research capture hooks (see research/) -----------------------------
+    // The only research state that must live in the engine: the layer loop in
+    // record_forward (graph.cpp) reads these to copy an FFN row into a caller
+    // buffer, and prefill_chunk/ prefill_batch read capture_mode to force a
+    // direct (non-graph) replay so that loop actually runs.  Everything else
+    // (tokenization, KV setup, buffer ownership, the C API) is in research/.
+    // ffn_cap_layer < 0 means all layers: row il lands at ffn_cap_out + il*2*n_ff.
+    float * ffn_cap_out = nullptr;
+    int ffn_cap_layer = -1;
+    int ffn_cap_slot = 0;
+    bool capture_mode = false;
     float * d_partials = nullptr;     // prefill partials [R][n_head][n_splits][2+head_dim]
     float * d_partials_dec = nullptr; // decode partials [kMaxB][n_head][dec_splits][2+head_dim]
     float * d_logits = nullptr;       // [kMaxB][vocab]
